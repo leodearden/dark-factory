@@ -7,7 +7,13 @@ import pytest
 from _stores import RunsDb
 from shared.project_layout import runs_db
 
-from client_feed.contract import SchedulerState, Source, VerifyKind
+from client_feed.contract import (
+    NOT_RECORDED,
+    ReviewCounts,
+    SchedulerState,
+    Source,
+    VerifyKind,
+)
 from client_feed.sources.events import (
     EventBatch,
     FactoryStatus,
@@ -20,6 +26,7 @@ from client_feed.sources.events import (
     read_events,
     read_factory_status,
     read_open_escalations,
+    read_review_counts,
 )
 from client_feed.sources.store import StoreProblem, StoreReadError
 
@@ -527,3 +534,87 @@ class TestOpenEscalations:
             read_open_escalations(root)
 
         assert (caught.value.source, caught.value.problem) == (Source.EVENTS, StoreProblem.MISSING)
+
+
+def review(cycle: int, blocking: int, suggestions: int, by_category: dict[str, int]) -> dict:
+    """The orchestrator's review_outcome.py::review_completed_payload shape."""
+    return {
+        'cycle': cycle,
+        'has_blocking_issues': blocking > 0,
+        'blocking_count': blocking,
+        'suggestion_count': suggestions,
+        'by_category': by_category,
+        'by_kind': {'defect': blocking},
+        'kind_flagged': 0,
+        'reviewer_count': 3,
+        'reviewer_errors': 0,
+    }
+
+
+class TestReviewCounts:
+    def test_the_newest_review_supplies_the_counts(self, root: Path, runs: RunsDb) -> None:
+        runs.emit(
+            'review_completed', at=at(0), task_id='7', phase='review',
+            data=review(1, 2, 1, {'correctness': 2, 'style': 1}),
+        )
+        runs.emit(
+            'review_completed', at=at(1), task_id='7', phase='review',
+            data=review(2, 0, 3, {'style': 3}),
+        )
+
+        assert read_review_counts(root, [7]) == {
+            7: ReviewCounts(cycles=2, blocking_count=0, suggestion_count=3, by_category={'style': 3})
+        }
+
+    def test_a_task_with_no_review_row_is_not_recorded(self, root: Path, runs: RunsDb) -> None:
+        runs.task_result(8, review_cycles=4)
+
+        assert read_review_counts(root, [8]) == {8: NOT_RECORDED}
+
+    def test_cycles_fall_back_to_the_run_results_total(self, root: Path, runs: RunsDb) -> None:
+        runs.emit('review_completed', at=at(0), task_id='7', data=review(1, 1, 0, {'style': 1}))
+        runs.task_result(7, review_cycles=1, run_id='run-1')
+        runs.task_result(7, review_cycles=2, run_id='run-2')
+
+        counts = read_review_counts(root, [7])[7]
+
+        assert isinstance(counts, ReviewCounts)
+        assert counts.cycles == 3
+
+    @pytest.mark.parametrize(
+        'malformed',
+        [
+            review(2, -1, 0, {}),
+            {key: value for key, value in review(2, 0, 0, {}).items() if key != 'suggestion_count'},
+            {**review(2, 0, 0, {}), 'by_category': {'style': 'many'}},
+        ],
+    )
+    def test_a_row_that_fails_the_shape_is_not_a_recorded_review(
+        self, root: Path, runs: RunsDb, malformed: dict
+    ) -> None:
+        runs.emit('review_completed', at=at(1), task_id='9', data=malformed)
+        runs.emit('review_completed', at=at(0), task_id='7', data=review(1, 1, 0, {'style': 1}))
+        runs.emit('review_completed', at=at(1), task_id='7', data=malformed)
+
+        counts = read_review_counts(root, [7, 9])
+
+        assert counts == {
+            7: ReviewCounts(cycles=1, blocking_count=1, suggestion_count=0, by_category={'style': 1}),
+            9: NOT_RECORDED,
+        }
+
+    def test_only_the_requested_tasks_are_answered(self, root: Path, runs: RunsDb) -> None:
+        runs.emit('review_completed', at=at(0), task_id='7', data=review(1, 0, 0, {}))
+        runs.emit('review_completed', at=at(0), task_id='8', data=review(1, 0, 0, {}))
+
+        assert set(read_review_counts(root, [8, 8, 11])) == {8, 11}
+
+    def test_an_empty_request_never_opens_the_store(self, root: Path) -> None:
+        assert read_review_counts(root, []) == {}
+        assert not runs_db(root).exists()
+
+    def test_a_missing_store_is_refused(self, root: Path) -> None:
+        with pytest.raises(StoreReadError) as caught:
+            read_review_counts(root, [7])
+
+        assert caught.value.problem is StoreProblem.MISSING
