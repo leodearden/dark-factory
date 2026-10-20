@@ -2977,3 +2977,53 @@ class TestGoverningAddopts:
     )
     def test_every_refusal_is_the_empty_tuple(self, command, contents):
         assert self._addopts(command, contents) == ()
+
+
+class TestExecutedModulePrefixes:
+    """executed_module_prefixes(plan): the module prefixes a plan actually runs."""
+
+    _MODULES = [
+        ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --project orchestrator pytest orchestrator/tests',
+            lint_command='uv run --project orchestrator ruff check orchestrator/src',
+            type_check_command='uv run --project orchestrator pyright orchestrator/src',
+        ),
+        ModuleConfig(
+            prefix='fused_memory',
+            test_command='uv run --project fused_memory pytest fused_memory/tests',
+            lint_command='uv run --project fused_memory ruff check fused_memory/src',
+            type_check_command='uv run --project fused_memory pyright fused_memory/src',
+        ),
+    ]
+
+    def _prefixes(self, files: list[str]) -> frozenset[str]:
+        plan = derive_verify_plan(files, self._MODULES, None, fake_worktree_reader, role='task')
+        return verify_plan_module.executed_module_prefixes(plan)
+
+    def test_a_module_with_no_touched_files_is_not_executed(self):
+        assert self._prefixes(['orchestrator/src/orchestrator/x.py']) == frozenset({'orchestrator'})
+
+    def test_every_touched_module_is_executed(self):
+        files = ['orchestrator/src/orchestrator/x.py', 'fused_memory/src/fused_memory/y.py']
+
+        assert self._prefixes(files) == frozenset({'orchestrator', 'fused_memory'})
+
+    def test_a_trivial_plan_executes_nothing(self):
+        assert self._prefixes(['README.md']) == frozenset()
+
+    def test_a_skipped_slot_beside_a_scoped_slot_still_counts_as_executed(self):
+        test_file = 'orchestrator/tests/test_x.py'
+        plan = VerifyPlan(runs=(
+            PlannedRun('orchestrator', None, ScopeKind.SKIPPED, 'lint: no lint_command configured'),
+            PlannedRun(
+                'orchestrator',
+                parse_config_command(f'uv run --project orchestrator pytest {test_file}'),
+                ScopeKind.FILE_SCOPED,
+                'pytest: touched test files',
+                scoped_targets=(test_file,),
+            ),
+            PlannedRun('fused_memory', None, ScopeKind.SKIPPED, 'no files under prefix'),
+        ))
+
+        assert verify_plan_module.executed_module_prefixes(plan) == frozenset({'orchestrator'})
