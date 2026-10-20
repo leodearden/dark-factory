@@ -131,6 +131,7 @@ from orchestrator.merge_lane.landing_evidence import (
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.recut_ruling import ruling_to_enforce
 from orchestrator.review_inputs import gather_review_subject, review_fork_point
+from orchestrator.review_outcome import review_completed_payload
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.routing import (
     PlanShape,
@@ -8086,6 +8087,16 @@ class TaskWorkflow:
             )
             return None
 
+    def _emit_review_completed(self, cycle: int, reviews: ReviewAggregation) -> None:
+        if self.event_store is None:
+            return
+        self.event_store.emit(
+            EventType.review_completed,
+            task_id=self.task_id,
+            phase='review',
+            data=review_completed_payload(cycle, reviews),
+        )
+
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""
         # Clear stale merge-failure review from prior runs — prevents
@@ -8450,6 +8461,7 @@ class TaskWorkflow:
                     )
                     continue  # re-loop: EXECUTE → VERIFY → REVIEW
 
+                self._emit_review_completed(review_cycle + 1, reviews)
                 # Cap exhausted or nothing in-scope — existing DONE path.
                 # Route suggestions directly to the curator intake (fire-and-
                 # forget); fall back to memory write when there are none.
@@ -8483,6 +8495,7 @@ class TaskWorkflow:
                 self.artifacts.set_review_counters(
                     review_cycles_total=review_cycle
                 )
+            self._emit_review_completed(review_cycle, reviews)
 
             # Archive reviews from this cycle before re-plan overwrites them
             if self.artifacts:
