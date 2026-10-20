@@ -2842,31 +2842,26 @@ class TaskWorkflow:
             # declaration.  The priority guard and file/lock-footprint
             # caps are intentionally absent — a simple task may be
             # high-priority or span several files as long as the change is
-            # mechanically simple.  Falls through to the architect path on
-            # any failure (no plan written, unactionable artifact, no steps
-            # marked done).  metadata.force_full_path is the hard escape
+            # mechanically simple.  Falls through to the architect path when
+            # SIMPLE_TASK gives up (no plan written, no steps marked done,
+            # agent failure).  metadata.force_full_path is the hard escape
             # that always forces the full path.
             if self._should_run_simple_task():
                 self._enter_phase(WorkflowState.PLAN)
                 simple_outcome = await self._run_simple_task()
-                if simple_outcome == WorkflowOutcome.PLANNED:
-                    # Plan written + step(s) marked done by SIMPLE_TASK.
-                    # _execute_iterations will see no pending steps and
-                    # return cleanly, allowing VERIFY to take over.
-                    pass  # fall through to the post-PLAN section below
-                elif simple_outcome != WorkflowOutcome.REQUEUED:
-                    # An exit handler's verdict (DONE, BLOCKED, ESCALATED,
-                    # CANCELLED) ends this dispatch.
-                    return simple_outcome
-                else:
-                    # Fallthrough sentinel — drop the plan so the
-                    # architect path runs cleanly.
+                if simple_outcome is None:
+                    # SIMPLE_TASK gave up — drop the plan so the architect
+                    # path runs cleanly.
                     if self.artifacts is not None:
                         plan_path = self.artifacts.root / 'plan.json'
                         plan_path.unlink(missing_ok=True)
                         (self.artifacts.root / 'plan.lock').unlink(
                             missing_ok=True,
                         )
+                elif simple_outcome != WorkflowOutcome.PLANNED:
+                    # Any other verdict, REQUEUED included, already settled
+                    # this dispatch and ends it.
+                    return simple_outcome
 
             # PLAN (skip if initial_plan was provided — eval mode, or if
             # the SIMPLE_TASK path above already populated self.plan)
@@ -3489,12 +3484,17 @@ class TaskWorkflow:
         :class:`WorkflowCancelled`, caught at this EXACTLY ONE site.
         """
         cancel_kind: Literal['hard', 'soft'] | None = None
-        scope = CancellationScope(self._cancel_event, self._on_terminal_cleanups())
+        scope = CancellationScope(
+            self._cancel_event, self._on_terminal_cleanups(),
+            cancel_grace_secs=self.config.terminal_cleanup_cancel_grace_secs,
+        )
         try:
             outcome = await scope.supervise(self._drive())
         except WorkflowCancelled as wc:
             cancel_kind = wc.kind
             outcome = await self._finalise_cancellation(wc.kind)
+        finally:
+            self._record_abandoned_cleanup(scope.abandoned_entries)
         report = (
             self._terminal_report
             if (
@@ -3523,6 +3523,29 @@ class TaskWorkflow:
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
         return report
+
+    def _record_abandoned_cleanup(self, entries: tuple[str, ...]) -> None:
+        """Make a bounded-but-wedged terminal cleanup loud (task 6660, INV-11).
+
+        An event and an ERROR, no escalation: the scope did return, so the
+        slot and its module locks are released as usual.  A slot that never
+        returns is the harness's to report: ``workflow_slot_wedged``, from
+        ``orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot``.
+        """
+        if not entries:
+            return
+        logger.error(
+            'Task %s: terminal cleanup abandoned %s after a hard-cancel; the '
+            'slot is released, but whatever those entries own may be left behind',
+            self.task_id, list(entries),
+        )
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.workflow_cleanup_abandoned,
+                task_id=self.task_id,
+                phase=self.machine.state.value,
+                data={'entries': list(entries)},
+            )
 
     async def _exit_status_facts(
         self, cancel_kind: Literal['hard', 'soft'] | None,
@@ -4551,9 +4574,12 @@ class TaskWorkflow:
         ``self.modules`` is left UNCHANGED (the scheduler has already
         persisted ``metadata.files=plan_files`` and requeued the task to
         pending on its own). Either way it returns the scheduler's
-        ``BlastRadiusResult`` — callers decide what "not applied" means for
-        their own flow (REQUEUED report, decline-and-fall-through-to-architect,
-        or silent no-op).
+        ``BlastRadiusResult``. A not-applied result means the scheduler has
+        already taken the row out of this slot's hands: either it re-pended
+        the row and released every lock, or (``repend_error``) that write
+        failed with the locks still held. The caller's only correct response
+        is to exit through ``_requeue_on_lock_conflict``;
+        ``_apply_revalidation_skip`` still falls through instead (task 6119).
         """
         new_modules = derive_modules(
             plan_files, self.config.lock_depth, task_id=self.task_id,
@@ -4688,13 +4714,14 @@ class TaskWorkflow:
         lock conflict, stash it on ``self._terminal_report``, and return
         ``WorkflowOutcome.REQUEUED`` (task 2874 amendment).
 
-        Shared by the three sites that convert "the scheduler couldn't
+        Shared by the four sites that convert "the scheduler couldn't
         acquire an additional module lock for a widened file scope" into a
-        requeue: ``_plan()``'s blast-radius path, the escalation-resume
-        scope-grant path, and ``_execute_verify_review_loop()``'s
-        post-replan reconcile. *files* is the full target file set the
-        caller wanted scope to cover (not just the delta) — the missing
-        locks are re-derived from it here so the diagnostic always reflects
+        requeue: ``_plan()``'s blast-radius path, ``_run_simple_task()``'s
+        scope refinement, the escalation-resume scope-grant path, and
+        ``_execute_verify_review_loop()``'s post-replan reconcile. *files*
+        is the full target file set the caller wanted scope to cover (not
+        just the delta) — the missing locks are re-derived from it here so
+        the diagnostic always reflects
         the actual unavailable modules on the same basis as the real
         conflict detection in ``_reconcile_scope_locks``. *reason* is the
         ``TerminalReport.reason`` string callers (and the retry-cap report)
@@ -4859,9 +4886,11 @@ class TaskWorkflow:
           ``BlastRadiusResult.repend_error``, which
           ``_requeue_on_lock_conflict`` hands to the exit-write ledger.
           Routing it through here would be a duplicate write.
-        * ``_run_simple_task`` — its REQUEUED is an internal fall-through
-          sentinel, consumed by ``_drive()``'s ``else:`` arm (drop the plan,
-          run the architect path); it is never returned to the harness.
+        * ``_run_simple_task`` — it no longer uses REQUEUED as a
+          fall-through (its give-up sentinel is ``None``). Any REQUEUED it
+          returns is either ``_requeue_on_lock_conflict``'s (the bullet
+          above) or an exit handler's verdict, whose status write that
+          handler made.
 
         So the strand class this helper closes IS closed for the exits that
         can produce it.  A future REQUEUED return that EXITS the slot is a new
@@ -5679,7 +5708,7 @@ class TaskWorkflow:
             and not RoutingState.from_metadata(metadata).simple_saturated
         )
 
-    async def _run_simple_task(self) -> WorkflowOutcome:
+    async def _run_simple_task(self) -> WorkflowOutcome | None:
         """Lever C — single-agent simple-task path.
 
         Dispatches the SIMPLE_TASK role (sonnet) to explore, register a
@@ -5692,8 +5721,9 @@ class TaskWorkflow:
                 invoking the implementer.
             ``DONE`` — SIMPLE_TASK reported the work is already on main.
             ``BLOCKED`` — SIMPLE_TASK reported the task is unactionable.
-            ``REQUEUED`` (sentinel) — SIMPLE_TASK gave up partway; caller
-                falls through to the architect path.
+            An exit handler may also return ``REQUEUED`` or another verdict.
+            ``None`` — SIMPLE_TASK gave up partway; the caller drops the plan
+                and falls through to the architect path.
         """
         assert self.worktree is not None and self.artifacts is not None
 
@@ -5710,7 +5740,7 @@ class TaskWorkflow:
                 'falling through to architect path',
                 self.task_id, exc,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
 
         if not result.success:
             cls = classify_agent_failure(result)
@@ -5728,7 +5758,7 @@ class TaskWorkflow:
                 'falling through to architect path',
                 self.task_id, cls.kind.value,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
 
         # Architect-style escape hatches — same artifacts so the existing
         # handlers work unchanged.
@@ -5743,7 +5773,7 @@ class TaskWorkflow:
             # Falling through — the architect path's
             # _handle_blocking_dep_report logic re-acquires base_commit
             # context and registers the dependency cleanly.
-            return WorkflowOutcome.REQUEUED
+            return None
 
         plan = self.artifacts.read_plan()
         if not plan or not plan.get('steps'):
@@ -5751,7 +5781,7 @@ class TaskWorkflow:
                 'Task %s: SIMPLE_TASK wrote no plan — falling through',
                 self.task_id,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
 
         # Verify at least one step is done — the SIMPLE_TASK contract is
         # plan + implement + mark-done. Anything less and we let the
@@ -5768,7 +5798,7 @@ class TaskWorkflow:
                 'falling through to architect path',
                 self.task_id,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
 
         # Stamp provenance + acquire plan lock (same shape as _plan()).
         try:
@@ -5779,18 +5809,21 @@ class TaskWorkflow:
                 'falling through',
                 self.task_id, exc,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
         self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id)
         self.plan = self.artifacts.read_plan()
 
-        # Refresh module assignments from the plan's files (handles the
-        # case where the SIMPLE_TASK agent expanded scope by one file).
+        # A conflict means the scheduler already re-pended the row and
+        # released every lock (or, with repend_error, failed that write with
+        # the locks held), so this dispatch exits here.
         plan_files = self.plan.get('files', [])
-        if plan_files:
-            # Silent no-op on lock conflict (same as before this was
-            # extracted into _reconcile_scope_locks): SIMPLE_TASK doesn't
-            # fail out here, it just doesn't re-tighten the lock.
-            await self._reconcile_plan_scope(plan_files)
+        if plan_files and not (
+            scope := await self._reconcile_plan_scope(plan_files)
+        ).applied:
+            return await self._requeue_on_lock_conflict(
+                scope, plan_files, 'plan_blast_radius_lock_conflict',
+                'SIMPLE_TASK plan expansion',
+            )
 
         await self._stamp_optimistic_path('simple_task')
 

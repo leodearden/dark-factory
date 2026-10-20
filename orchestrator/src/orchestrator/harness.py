@@ -25,6 +25,7 @@ from escalation.categories import EscalationCategory
 from escalation.classify import is_done_step_commit_orphan
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
+from shared.asyncio_tasks import abandon_task
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -159,6 +160,13 @@ from orchestrator.service_restart import (
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
+from orchestrator.slot_lease import (
+    SlotLease,
+    SuspendedTask,
+    culprit,
+    suspended_slot_tasks,
+    wedged_slot_escalation,
+)
 from orchestrator.strand_conversion import record_strand_conversion
 from orchestrator.stranded_verified_green import (
     DURABLE_MERGE_FAILURE_STATUSES,
@@ -234,6 +242,9 @@ except ImportError:
     HAS_STEWARD = False
 
 logger = logging.getLogger(__name__)
+
+# Force-release claimant clears that outlived their bound, kept referenced until they unwind.
+_UNDRAINED_CLAIMANT_CLEARS: set[asyncio.Task] = set()
 
 # Maximum number of same-signature blocked→pending re-pends allowed before the
 # 4th flip is withheld and a born-at-L2 human escalation is filed.  A module
@@ -1976,6 +1987,13 @@ class Harness:
         # See task 1491, ITEM 2 (hard-cancel fallback).
         self._workflow_slot_tasks: dict[str, asyncio.Task] = {}
 
+        # Per-task SlotLease (task 6660): the live slot's one-shot release of its
+        # module locks and semaphore permit.  Registered at _run_slot start and
+        # dropped at its exit, or by _force_release_wedged_slot.  Which slot
+        # owns a task id's registrations is decided by this entry's identity.
+        self._slot_leases: dict[str, SlotLease] = {}
+        self._force_released_slots: set[asyncio.Task] = set()
+
         # Per-task cancel CAUSE, stamped by hard_cancel_workflow immediately
         # before task.cancel() and consumed once by _run_slot's
         # `except asyncio.CancelledError` handler (task 3172).  This is the
@@ -3057,36 +3075,7 @@ class Harness:
                     continue
 
                 await sem.acquire()
-                self._task_modules[assignment.task_id] = list(assignment.modules)
-                # Register escalation wake-event BEFORE create_task so Fix #1a
-                # (_on_escalation_resolved orphan-flip gate) sees task_id in
-                # _escalation_events immediately — closing the sub-second race
-                # where a resolving escalation would mis-classify a just-
-                # dispatched task as an orphan and double-flip it.
-                self._register_escalation_event(assignment.task_id)
-                task = asyncio.create_task(
-                    self._run_slot(assignment, sem),
-                    name=f'workflow-{assignment.task_id}',
-                )
-                self._live_tasks.add(task)
-                task.add_done_callback(
-                    functools.partial(self._collect_slot_report, task_reports)
-                )
-                # Guard against the narrow resource-leak window where the slot
-                # task is cancelled before _run_slot's body begins executing
-                # (e.g. hard_cancel_workflow or shutdown sweeping pending tasks
-                # before the event loop schedules the coroutine's first step).
-                # In that case _run_slot's finally block never runs and
-                # _escalation_events[task_id] would leak — permanently
-                # satisfying the active-workflow gate and suppressing both the
-                # stranded_blocked re-file and Fix #1a orphan-flip for that
-                # task forever.  The done_callback fires unconditionally when
-                # the Task reaches any terminal state; pop() is idempotent (a
-                # no-op if _run_slot's finally already removed the entry).
-                _tid = assignment.task_id
-                task.add_done_callback(
-                    lambda _t, tid=_tid: self._escalation_events.pop(tid, None)
-                )
+                self._launch_slot(assignment, sem, task_reports)
 
             self._compute_tallies(task_reports)
 
@@ -10077,6 +10066,8 @@ class Harness:
         # preventing the rapid re-block loop where reconciliation immediately
         # re-dispatches the task before it can make progress.
         arm_requeue_cooldown = False
+        lease = SlotLease(assignment.task_id, self.scheduler, sem)
+        self._slot_lease_registry()[assignment.task_id] = lease
         try:
             logger.info(
                 f'Starting workflow for task {assignment.task_id}: '
@@ -10735,7 +10726,14 @@ class Harness:
                 # Ladder: stamped cause → drain → honest residue.  Never a
                 # guess that an unattributed cancel "must have been" a drain.
                 block_reason=(
-                    self._cancel_causes().pop(assignment.task_id, None)
+                    (
+                        self._cancel_causes().pop(assignment.task_id, None)
+                        if self._owns_slot(assignment.task_id, lease)
+                        # Force-released (task 6660): only the watcher's
+                        # hard-cancel leads there, and the cause registry may
+                        # hold a re-dispatch's entry by now.
+                        else 'terminal_status_cancel'
+                    )
                     or ('shutdown_drain' if getattr(self, '_draining', False)
                         else 'cancelled_unattributed')
                 ),
@@ -10796,31 +10794,13 @@ class Harness:
                 outcome=WorkflowOutcome.BLOCKED,
             )
         finally:
-            self._escalation_events.pop(assignment.task_id, None)
-            self._workflow_cancel_events.pop(assignment.task_id, None)
-            # NB: deliberately do NOT pop _workflow_cancel_at here.  Popping it
-            # in the finally defeated the R3 reconcile grace window — it only
-            # ever overlapped the period the live slot already protected (via
-            # dispatch-table membership), leaving the brief post-exit window
-            # uncovered.  The stamp is instead cleared at (re)dispatch (top of
-            # _run_slot) and lazily pruned by the sweep's grace-check reader.
-            self._workflow_slot_tasks.pop(assignment.task_id, None)
-            # Defensive merge-phase grace clear (task 2753): mirrors the
-            # inline clear at the durable-enqueue boundary in
-            # _submit_to_merge_queue, covering abnormal slot exits (e.g.
-            # WorkflowCancelled raised before that inline clear). Unlike
-            # _workflow_cancel_at above, clearing here is CORRECT: once the
-            # slot exits there is no more pre-enqueue verify to protect — the
-            # workflow either enqueued (and cleared inline) or died — so
-            # releasing the grace immediately is exactly right (the monotonic
-            # stamp would auto-expire regardless; this just does it promptly).
-            self.scheduler.clear_merge_phase(assignment.task_id)
-            self._terminal_cancel_counts.pop(assignment.task_id, None)
-            # Belt-and-braces (task 3172): the ladder above consumes the cause
-            # on the cancel path; this covers every OTHER slot exit so a
-            # stamped-but-unconsumed entry can never leak into a later
-            # re-dispatch of the same task.
-            self._cancel_causes().pop(assignment.task_id, None)
+            # Task 6660: a slot the terminal-status watcher force-released has
+            # already lost its registrations, its claimant and its locks, and a
+            # fresh dispatch of the same id may own all of them now.  Only the
+            # slot whose lease is still the registered one acts on the task.
+            owns_slot = self._owns_slot(assignment.task_id, lease)
+            if owns_slot:
+                self._unregister_slot(assignment.task_id)
             # W9-θ: the former B2 belt-and-suspenders release (any DONE/CANCELLED
             # that missed B1, e.g. authoritative-cancel returning normally from
             # workflow.run()) is retired.  The workflow's own kind-aware
@@ -10832,7 +10812,7 @@ class Harness:
             # above) never ran on_terminal either; that is intentional — see the
             # comment there — the periodic terminal-lane reconciler reclaims it.
             requeued = report is not None and report.outcome == WorkflowOutcome.REQUEUED
-            if report is not None:
+            if report is not None and owns_slot:
                 requeued = await self._apply_retry_cap(
                     assignment.task_id, report, requeued,
                 )
@@ -10868,15 +10848,15 @@ class Harness:
             # tool/param, absent column, or transient error here can never
             # block scheduler.release/sem.release below. plan.lock forensics
             # are left untouched.
-            with contextlib.suppress(Exception):
-                await self.scheduler.set_task_claimant(
-                    assignment.task_id, claimant_run_id=None, heartbeat_at=None,
-                )
+            if owns_slot:
+                with contextlib.suppress(Exception):
+                    await self.scheduler.set_task_claimant(
+                        assignment.task_id, claimant_run_id=None, heartbeat_at=None,
+                    )
             # arm_requeue_cooldown=True (any unhandled workflow-slot exception) arms
             # the existing requeue_cooldown_secs grace window so a freshly-unblocked
             # task is not immediately re-dispatched and re-blocked in a tight loop.
-            self.scheduler.release(assignment.task_id, requeued=requeued or arm_requeue_cooldown)
-            sem.release()
+            lease.release(requeued=requeued or arm_requeue_cooldown)
 
     async def _run_deterministic_slot(self, assignment) -> TaskReport:
         """Run a deterministic gate task via DeterministicRunner.
@@ -11976,6 +11956,13 @@ class Harness:
         its cleanup) has no report.
         """
         self._live_tasks.discard(t)
+        if t in self._force_released_slot_tasks():
+            self._force_released_slot_tasks().discard(t)
+            logger.warning(
+                '%s ended after its slot was force-released; its report is not recorded',
+                t.get_name(),
+            )
+            return
         if t.cancelled():
             logger.warning(
                 '%s was cancelled without returning a report', t.get_name(),
@@ -14422,6 +14409,199 @@ class Harness:
             self._workflow_cancel_causes = causes
         return causes
 
+    def _launch_slot(
+        self, assignment, sem: asyncio.Semaphore, task_reports: list[TaskReport],
+    ) -> asyncio.Task:
+        """Start the slot task for *assignment*, whose *sem* permit is already held."""
+        self._task_modules[assignment.task_id] = list(assignment.modules)
+        # Register escalation wake-event BEFORE create_task so Fix #1a
+        # (_on_escalation_resolved orphan-flip gate) sees task_id in
+        # _escalation_events immediately — closing the sub-second race
+        # where a resolving escalation would mis-classify a just-
+        # dispatched task as an orphan and double-flip it.
+        dispatched_esc_event = self._register_escalation_event(assignment.task_id)
+        task = asyncio.create_task(
+            self._run_slot(assignment, sem),
+            name=f'workflow-{assignment.task_id}',
+        )
+        self._live_tasks.add(task)
+        task.add_done_callback(
+            functools.partial(self._collect_slot_report, task_reports)
+        )
+        # Guard against the narrow resource-leak window where the slot
+        # task is cancelled before _run_slot's body begins executing
+        # (e.g. hard_cancel_workflow or shutdown sweeping pending tasks
+        # before the event loop schedules the coroutine's first step).
+        # In that case _run_slot's finally block never runs and
+        # _escalation_events[task_id] would leak — permanently
+        # satisfying the active-workflow gate and suppressing both the
+        # stranded_blocked re-file and Fix #1a orphan-flip for that
+        # task forever.  The done_callback fires unconditionally when
+        # the Task reaches any terminal state; pop() is idempotent (a
+        # no-op if _run_slot's finally already removed the entry).
+        # Identity-guarded (task 6660): a force-released slot ends
+        # later, maybe after a re-dispatch registered its own event.
+        _tid = assignment.task_id
+        task.add_done_callback(
+            lambda _t, tid=_tid, ev=dispatched_esc_event: (
+                self._escalation_events.pop(tid, None)
+                if self._escalation_events.get(tid) is ev else None
+            )
+        )
+        return task
+
+    def _slot_lease_registry(self) -> dict[str, SlotLease]:
+        """The slot-lease registry, lazily created when absent (``_cancel_causes``'s idiom)."""
+        leases = getattr(self, '_slot_leases', None)
+        if leases is None:
+            leases = {}
+            self._slot_leases = leases
+        return leases
+
+    def _unregister_slot(self, task_id: str) -> None:
+        """Drop every per-slot registration of *task_id*.
+
+        Only the slot that owns them may call this: ``_run_slot``'s ``finally``
+        while its lease is still the registered one, or the watcher's
+        force-release of that slot.
+
+        ``_workflow_cancel_at`` is deliberately NOT dropped: popping it at slot
+        exit defeated the R3 reconcile grace window, which must cover the brief
+        post-exit window.  It is cleared at (re)dispatch (top of ``_run_slot``)
+        and lazily pruned by the sweep's grace-check reader.
+        """
+        self._escalation_events.pop(task_id, None)
+        self._workflow_cancel_events.pop(task_id, None)
+        self._workflow_slot_tasks.pop(task_id, None)
+        self._slot_lease_registry().pop(task_id, None)
+        self._terminal_cancel_counts.pop(task_id, None)
+        # Belt-and-braces (task 3172): the CancelledError ladder consumes the
+        # cause on the cancel path; this covers every OTHER slot exit so a
+        # stamped-but-unconsumed entry can never leak into a later re-dispatch
+        # of the same task.
+        self._cancel_causes().pop(task_id, None)
+        # Defensive merge-phase grace clear (task 2753): mirrors the inline
+        # clear at the durable-enqueue boundary in _submit_to_merge_queue,
+        # covering abnormal slot exits (e.g. WorkflowCancelled raised before
+        # that inline clear).  Unlike _workflow_cancel_at, clearing here is
+        # CORRECT: once the slot is gone there is no pre-enqueue verify left to
+        # protect, so the grace goes now rather than when the monotonic stamp
+        # expires.
+        self.scheduler.clear_merge_phase(task_id)
+
+    def _owns_slot(self, task_id: str, lease: SlotLease) -> bool:
+        """True while *lease* is *task_id*'s registered slot, i.e. not force-released."""
+        return self._slot_lease_registry().get(task_id) is lease
+
+    async def _force_release_wedged_slot(self, task_id: str, status: str, polls: int) -> None:
+        """Release the slot and module locks of a terminal task whose workflow
+        never ended after its hard-cancel.
+
+        The watcher calls this only for rows in ``TERMINAL_STATUSES``, so no
+        live work is ever unlocked.  The coroutine is left running, holding
+        nothing: once its slot is unregistered its ``finally`` no longer acts
+        on the task, and its lease releases at most once.  Same order as that
+        ``finally``: unregister, clear the claimant, then release, so a
+        re-dispatch can never have its fresh claimant cleared.  Loud by INV-11:
+        an ERROR, a ``workflow_slot_force_released`` event and one deduped
+        ``workflow_slot_wedged`` L1 naming the await that holds the slot.
+        """
+        lease = self._slot_lease_registry().get(task_id)
+        slot_task = self._workflow_slot_tasks.get(task_id)
+        if lease is None or slot_task is None or slot_task.done():
+            return
+        modules = sorted(
+            module for module, holder in self.scheduler.lock_table.snapshot_holders().items()
+            if holder == task_id
+        )
+        stuck = suspended_slot_tasks(slot_task)
+        self._force_released_slot_tasks().add(slot_task)
+        self._unregister_slot(task_id)
+        await self._clear_claimant_bounded(task_id)
+        lease.release(requeued=False)
+        blamed = culprit(stuck)
+        logger.error(
+            'Terminal-status watcher: workflow for %s task %s never ended %d polls '
+            'after its hard-cancel; force-released its slot and module locks %s. '
+            'Held by %s at %s',
+            status, task_id, polls, modules, blamed.name, blamed.culprit_frame,
+        )
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.workflow_slot_force_released,
+                task_id=task_id,
+                data={'status': status, 'polls': polls, 'modules': modules},
+            )
+        self._file_slot_wedged_l1(task_id, status, polls, modules, stuck)
+
+    # How long the backstop waits for its claimant clear before releasing anyway.
+    # One set_task_claimant MCP call is bounded at 15s; a stranded one (the
+    # httpcore cancel trap) must not stall the backstop that exists for wedges.
+    _FORCE_RELEASE_CLAIMANT_CLEAR_SECS: float = 20.0
+
+    async def _clear_claimant_bounded(self, task_id: str) -> None:
+        """Clear *task_id*'s claimant, giving up after ``_FORCE_RELEASE_CLAIMANT_CLEAR_SECS``.
+
+        A clear that has not returned by then is cancelled without being
+        awaited and left to unwind; the claimant then self-heals, as any lost
+        clear does (``scheduler.py::Scheduler.set_task_claimant``).
+        """
+        clear = asyncio.create_task(
+            self.scheduler.set_task_claimant(task_id, claimant_run_id=None, heartbeat_at=None),
+            name=f'force-release-claimant-clear-{task_id}',
+        )
+        await asyncio.wait({clear}, timeout=self._FORCE_RELEASE_CLAIMANT_CLEAR_SECS)
+        if clear.done():
+            if not clear.cancelled() and clear.exception() is not None:
+                logger.warning(
+                    'Task %s: claimant clear during force-release failed (non-fatal): %s',
+                    task_id, clear.exception(),
+                )
+            return
+        logger.warning(
+            'Task %s: claimant clear during force-release did not return within '
+            '%.0fs; releasing the slot without it',
+            task_id, self._FORCE_RELEASE_CLAIMANT_CLEAR_SECS,
+        )
+        abandon_task(clear, _UNDRAINED_CLAIMANT_CLEARS)
+
+    def _force_released_slot_tasks(self) -> set[asyncio.Task]:
+        """Slot tasks force-released and not yet ended, lazily created (``_cancel_causes``'s idiom).
+
+        Their eventual report is not recorded: the force-release event is the
+        slot's record, and a late report could land on a re-dispatch's state.
+        """
+        tasks = getattr(self, '_force_released_slots', None)
+        if tasks is None:
+            tasks = set()
+            self._force_released_slots = tasks
+        return tasks
+
+    def _file_slot_wedged_l1(
+        self, task_id: str, status: str, polls: int, modules: list[str],
+        stuck: tuple[SuspendedTask, ...],
+    ) -> None:
+        queue = self._escalation_queue
+        if queue is None:
+            return
+        try:
+            if queue.has_open_l1(task_id, category=EscalationCategory.WORKFLOW_SLOT_WEDGED):
+                return
+            queue.submit(wedged_slot_escalation(
+                escalation_id=queue.make_id(task_id),
+                task_id=task_id,
+                status=status,
+                polls=polls,
+                modules=modules,
+                stuck=stuck,
+                filing_claimant_run_id=self._filing_claimant_run_id,
+            ))
+        except Exception:
+            logger.exception(
+                'Task %s: filing the %s L1 failed; the slot is released regardless',
+                task_id, EscalationCategory.WORKFLOW_SLOT_WEDGED,
+            )
+
     def hard_cancel_workflow(
         self, task_id: str, *, restamp: bool = True, reason: str | None = None
     ) -> bool:
@@ -14430,10 +14610,14 @@ class Harness:
         This is the escalation path when a workflow ignores the soft
         ``cancel_event`` (set by ``cancel_workflow``) for too long.
         Requesting asyncio.Task.cancel() forces a ``CancelledError`` into the
-        coroutine's next await point; the ``_run_slot`` finally block still
-        runs (CancelledError is BaseException, so it bypasses the
-        ``except Exception`` guard at harness.py:1833) ensuring lock release
-        and registry cleanup.
+        coroutine's next await point.  Lock release and registry cleanup
+        happen in ``_run_slot``'s ``finally`` only once the coroutine unwinds,
+        and a cancel-proof await can stop it from ever unwinding.  The run()
+        scope bounds its own terminal cleanup
+        (``orchestrator/src/orchestrator/workflow_types.py::CancellationScope``);
+        for anything else, the terminal-status watcher force-releases the slot
+        ``terminal_status_force_release_polls`` polls later
+        (:meth:`_force_release_wedged_slot`, task 6660).
 
         ``reason`` (task 3172) records WHY, stamped into
         ``_workflow_cancel_causes`` immediately before ``task.cancel()`` and
@@ -15031,6 +15215,10 @@ class Harness:
         cancelled the workflow's ``finally`` block clears the registry entry
         so subsequent scans skip the task naturally.
 
+        A workflow still alive ``config.terminal_status_force_release_polls``
+        polls past the hard-cancel never unwound; the scan then releases its
+        slot and locks itself (:meth:`_force_release_wedged_slot`, task 6660).
+
         Counts are cleared when a task's status is no longer terminal so
         stale state cannot accumulate across transient status fluctuations.
 
@@ -15100,6 +15288,8 @@ class Harness:
                         )
                 if result:
                     cancelled += 1
+                if count >= threshold + self.config.terminal_status_force_release_polls:
+                    await self._force_release_wedged_slot(task_id, status, count)
 
         return cancelled
 

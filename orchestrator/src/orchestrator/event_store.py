@@ -996,6 +996,20 @@ class EventType(StrEnum):
     # verdict='violation' rows with mode='log' before flipping enforce on.
     workflow_exit_contract = 'workflow_exit_contract'
 
+    # A wedged terminal cleanup (task 6660).
+    # workflow_cleanup_abandoned — run()'s CancellationScope cut off on_terminal
+    #   entries that were still running past their grace after a hard-cancel;
+    #   the slot was still released.  Payload {entries}: the entry names, in
+    #   order.
+    # workflow_slot_force_released — the terminal-status watcher released the
+    #   slot and module locks of a workflow that never ended after its
+    #   hard-cancel (the row was already done/cancelled).  Payload
+    #   {status, polls, modules}: the terminal status, the watcher's poll count
+    #   and the modules held at release.  A workflow_slot_wedged L1 goes with it.
+    # task_id is ALSO a first-class column on both.
+    workflow_cleanup_abandoned = 'workflow_cleanup_abandoned'
+    workflow_slot_force_released = 'workflow_slot_force_released'
+
     # Task-verify admission gate (task 5628; plans/verify-admission-fifo-prd.md).
     # Every payload carries `order`, so before/after a policy flip is read from
     # the rows themselves, never from dates. Wall-clock ISO times only.

@@ -971,6 +971,20 @@ mcp__escalation__promote_to_l2(
 
 Add to digest: `PROMOTED (L2 <id>): workflow_exit_contract — <task_id> — <check> <outcome>-><status>`
 
+#### `workflow_slot_wedged`
+
+**Producer.** `orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot` files ONE L1 per task (deduped on an open L1 of this category), `agent_role="orchestrator"`, `severity="blocking"`, `suggested_action="investigate_wedged_workflow"`. The terminal-status watcher saw the task `done`/`cancelled`, hard-cancelled its workflow, and the workflow still had not ended `terminal_status_force_release_polls` polls later, so the harness released its slot and module locks itself (task 6660). A `workflow_slot_force_released` event goes with it.
+
+**Meaning.** Nothing is jammed any more: the slot and locks are free and the task row was already terminal. What remains is a coroutine somewhere that ignores cancellation, which will wedge the next workflow that reaches it. The first line of `detail` is `Culprit: <task name> at <file>:<line> in <function>`: the innermost await outside asyncio of the task holding the slot. That is a terminal-cleanup entry (`workflow-<id>/<entry>`) or the workflow body (`workflow-<id>/body`) when one is alive, else the slot task. The rest of `detail` lists every task of the slot with its await chain.
+
+**Disposition.** Always promote; never close: the cause is a code defect. Quote the Culprit line in the evidence, and `search_tasks` for a task already owning that await before promoting.
+
+**Cluster.** Every pending `workflow_slot_wedged` L1 whose Culprit line names the same `<file>` and `<function>` shares one cause, whichever task it is on.
+
+`root_cause="workflow-slot-wedged:<file>:<function of the Culprit line>"`; options: `A: file a fix for that await (bound it, e.g. shared/src/shared/asyncio_tasks.py::cancel_bounded)`, `B: an existing task already owns it — link it and keep the record open until it lands`, `C: something else`.
+
+Add to digest: `PROMOTED (L2 <id>): workflow_slot_wedged — <task_id> — <Culprit line>`
+
 #### `infra_issue`
 
 Infrastructure problem. Do NOT attempt automated fixes.

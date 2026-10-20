@@ -1000,6 +1000,7 @@
     "orchestrator/tests/test_crash_recovery.py": {"patch_targets": [], "private_reads": 272},
     "orchestrator/tests/test_create_merge_worktree_retry.py": {"patch_targets": [], "private_reads": 27},
     "orchestrator/tests/test_critical_gate.py": {"patch_targets": [], "private_reads": 5},
+    "orchestrator/tests/test_done_phase_wedge.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_dry_run_unblock.py": {"patch_targets": [], "private_reads": 3},
     "orchestrator/tests/test_ephemeral_worktree.py": {"patch_targets": [], "private_reads": 3},
     "orchestrator/tests/test_eval_mcp_isolation.py": {"patch_targets": [], "private_reads": 1},

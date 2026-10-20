@@ -995,7 +995,7 @@ class TestReadyToMergeDispatch:
 
     async def _drive(
         self, tmp_path: Path, *, site: str, with_already_done: bool,
-    ) -> tuple[AsyncMock, AsyncMock, WorkflowOutcome]:
+    ) -> tuple[AsyncMock, AsyncMock, WorkflowOutcome | None]:
         """Drive the REAL dispatch site with exit artifacts a stub agent wrote.
 
         Both handlers are stubbed, so what is observed is purely which branch

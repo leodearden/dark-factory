@@ -422,9 +422,11 @@ For a normal task, `TaskWorkflow._drive()`
    `integration test`, `design ... new`, `implement ... new feature`) and
    `metadata.force_full_path` isn't set, `_run_simple_task()` runs: **one**
    Sonnet agent (role `simple_task`) explores, plans, implements, and
-   commits in a single session. Success falls through to VERIFY; a terminal
-   outcome (done/blocked) ends the workflow there; anything else discards
-   the plan and runs the full architect path instead.
+   commits in a single session. Success falls through to VERIFY; any other
+   verdict ends the dispatch there — done, blocked, or a requeue when the
+   plan's file scope needs a module lock another task holds. Only a give-up
+   (no plan, no step marked done, agent failure) discards the plan and runs
+   the full architect path instead.
 3. **PLAN.** `architect` explores the codebase, verifies its premises, and
    builds a step-by-step TDD plan (alternating test-step, implementation-
    step) via plan-tools (`create_plan`/`add_plan_step`/`confirm_plan`).
