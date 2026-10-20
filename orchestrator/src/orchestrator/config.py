@@ -4443,9 +4443,25 @@ class OrchestratorConfig(BaseSettings):
             '3 x terminal_cleanup_cancel_grace_secs (one abandoned entry: its '
             'grace plus two bounded cancels), so the backstop only fires on '
             'a wedge the bounded cleanup cannot end; the defaults give 450s '
-            'against 360s.'
+            'against 360s. Enforced by a model_validator.'
         ),
     )
+
+    @model_validator(mode='after')
+    def _force_release_waits_out_the_bounded_cleanup(self) -> 'OrchestratorConfig':
+        backstop = self.terminal_status_force_release_polls * self.terminal_status_poll_interval_secs
+        bounded = 3 * self.terminal_cleanup_cancel_grace_secs
+        if backstop <= bounded:
+            raise ValueError(
+                'terminal_status_force_release_polls x terminal_status_poll_interval_secs '
+                f'({self.terminal_status_force_release_polls} x '
+                f'{self.terminal_status_poll_interval_secs} = {backstop}s) must exceed '
+                f'3 x terminal_cleanup_cancel_grace_secs ({bounded}s): one abandoned '
+                'terminal-cleanup entry may take its grace plus two bounded cancels, '
+                'and the slot force-release must not pre-empt a cleanup that is still '
+                'ending on its own. Raise the polls or lower the grace.'
+            )
+        return self
 
     # Stranded-in-progress reconcile sweep — periodic re-run of the
     # startup ``_reconcile_stranded_in_progress`` pass during a long run.
