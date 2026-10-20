@@ -219,6 +219,10 @@ class EventType(StrEnum):
     # /unblock, /do) submit branches without emitting it -> classifier
     # degrades to INDETERMINATE by design.
     workflow_verify = 'workflow_verify'
+    # Client-feed θ (plans/client-feed-prd.md §4 decision 16). Producer:
+    # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._emit_review_completed; data:
+    # orchestrator/src/orchestrator/review_outcome.py::review_completed_payload.
+    review_completed = 'review_completed'
     # Local-vs-remote verdict AGREEMENT.  THREE producers emit this member with
     # deliberately DIFFERENT data shapes — read the producer before the payload:
     #   - verify_runner.DriftDetector.check (the off-lane drift detective) emits
