@@ -992,15 +992,17 @@ class TestAutoHealMainHealthDeferredGuards:
             'compile_error', outcome.failure_cause_hint, outcome.reason,
         )
 
-        # Simulates a concurrent auto-heal already in flight — halted
-        # directly (not via a prior _auto_heal_main_health_deferred call),
-        # mirroring test_merge_queue_auto_heal.py's TestAutoHealIdempotency.
+        # Simulates THIS signature's auto-heal already in flight — its
+        # attempt recorded and the lane halted directly (not via a prior
+        # _auto_heal_main_health_deferred call).  A lane halted by anything
+        # else is task 5471's foreign-halt branch, not this one.
+        worker.auto_heal_registry.record_attempt(sig)
         worker.halt_lane('normal', 'x')
 
         asyncio.run(worker._auto_heal_main_health_deferred(outcome, req))
 
         worker._spawn_main_health_fix_task.assert_not_awaited()
-        assert worker.auto_heal_registry.attempts(sig) == 0, (
+        assert worker.auto_heal_registry.attempts(sig) == 1, (
             f'The idempotency branch must NOT record a second attempt; got '
             f'{worker.auto_heal_registry.attempts(sig)}'
         )

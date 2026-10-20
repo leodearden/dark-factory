@@ -18431,13 +18431,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     async def _spawn_main_health_fix_task(
         self, req: MergeRequest, brk: MainBreak, esc_id: str,
     ) -> None:
-        """Fire-and-forget: submit the HIGH-lane auto-heal fix task for *brk*.
+        """Give *brk* its HIGH-lane auto-heal fix task.
 
-        Worker-side mirror of ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._spawn_main_health_fix_task``;
-        the argument block comes from
-        ``orchestrator/src/orchestrator/main_health_fix_owner.py::build_main_fix_task_arguments``.
-        The POST runs in ``self._background_tasks``, drained on shutdown.
+        Worker-side mirror of ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._spawn_main_health_fix_task``.
+        With a task store wired, the shared filer adopts an open owner of the
+        signature or files one under its lock (task 5471).  Without one, the
+        task is POSTed fire-and-forget in ``self._background_tasks``, drained
+        on shutdown.
         """
+        if self.main_fix_filer is not None:
+            await self.main_fix_filer.ensure(
+                brk, project_root=str(req.config.project_root),
+                spawn_context=FixSpawnContext.AUTO_HEAL, escalation_id=esc_id,
+            )
+            return
         arguments = build_main_fix_task_arguments(
             brk,
             project_root=str(req.config.project_root),
@@ -18487,7 +18494,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         non-mechanical / no escalation_queue and branch (e) attempt-cap each
         ensure a fix-main task (task 5471) and file an escalation naming it;
         branch (idempotency) lane-already-halted folds into the in-flight
-        auto-heal; the (a) happy path records the attempt, halts the 'normal'
+        auto-heal when that heal is this signature's (else the break is owned
+        as in (d)); the (a) happy path records the attempt, halts the 'normal'
         lane, submits/folds the dedup'd halt-owner escalation, registers
         lane-halt ownership, and spawns a HIGH-lane fix task.  Called from the
         deferred main-health probe (:func:`_run_deferred_main_health_probe`,
@@ -18530,6 +18538,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ):
             await self._escalate_owned_main_break(
                 req, outcome, brk, otherwise=MainHealthNextAction.AUTO_HEAL_EXHAUSTED,
+            )
+            return
+
+        # The lane is halted, but not by this signature's heal: this break
+        # needs an owner of its own.
+        if self.is_lane_halted('normal') and self.auto_heal_registry.attempts(sig) == 0:
+            await self._escalate_owned_main_break(
+                req, outcome, brk, otherwise=MainHealthNextAction.NO_FIX_OWNER,
             )
             return
 

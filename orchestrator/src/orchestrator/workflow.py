@@ -12170,12 +12170,20 @@ class TaskWorkflow:
         )
 
     async def _spawn_main_health_fix_task(self, brk: MainBreak, escalation_id: str) -> None:
-        """Fire-and-forget: submit the HIGH-lane auto-heal fix task for *brk*.
+        """Give *brk* its HIGH-lane auto-heal fix task.
 
-        The argument block comes from
-        ``orchestrator/src/orchestrator/main_health_fix_owner.py::build_main_fix_task_arguments``;
-        the POST runs through :meth:`_post_submit_tasks` so the caller is not blocked.
+        With a task store wired, the merge worker's shared filer adopts an
+        open owner of the signature or files one under its lock (task 5471).
+        Without one, the task is POSTed fire-and-forget through
+        :meth:`_post_submit_tasks`.
         """
+        filer = self.merge_worker.main_fix_filer if self.merge_worker is not None else None
+        if filer is not None:
+            await filer.ensure(
+                brk, project_root=str(self.config.project_root),
+                spawn_context=FixSpawnContext.AUTO_HEAL, escalation_id=escalation_id,
+            )
+            return
         arguments = build_main_fix_task_arguments(
             brk,
             project_root=str(self.config.project_root),
@@ -12320,8 +12328,9 @@ class TaskWorkflow:
             → ensure a fix-main task, file the shared L1 naming it, no halt.
         (e) Attempt cap reached (sha-independent signature recurred after prior heal)
             → the same as (d), with the re-break recorded as root cause.
-        (idempotency) Normal lane already halted (auto-heal in flight)
-            → fold escalation, no second halt/spawn.
+        (idempotency) Normal lane already halted by this signature's heal
+            → fold escalation, no second halt/spawn; halted by anything else
+            → owned as in (d).
         (a) Happy path: record attempt; halt 'normal' lane; submit one dedup'd
             L1 escalation; register it as halt-owner; spawn a HIGH-lane fix task.
         Every branch blocks via _mark_blocked(skip_escalation=True).
@@ -12377,6 +12386,14 @@ class TaskWorkflow:
                     f'after auto-heal): {reason[:160]}'
                 ),
                 root_cause=f'main-health-auto-heal-rebreak:{sig}',
+            )
+
+        # The lane is halted, but not by this signature's heal: this break
+        # needs an owner of its own.
+        if self.merge_worker.is_lane_halted('normal') and registry.attempts(sig) == 0:
+            return await self._block_on_owned_main_break(
+                brk, fp, merge_phase=merge_phase,
+                otherwise=MainHealthNextAction.NO_FIX_OWNER,
             )
 
         esc_id = self._file_main_health_l1(

@@ -873,6 +873,7 @@ class TestAutoHealSignatureDerivedFromOutcome:
         shared_merge_worker.is_lane_halted = MagicMock(return_value=False)
         shared_merge_worker.halt_lane = MagicMock()
         shared_merge_worker.set_lane_halt_owner = MagicMock()
+        shared_merge_worker.main_fix_filer = None
 
         # Outcome A: compile_error / TS2322 / StatusBar
         outcome_a = MergeOutcome(

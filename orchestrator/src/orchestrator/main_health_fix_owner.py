@@ -18,9 +18,11 @@ from typing import Protocol
 
 from shared.mcp_envelope import parse_tool_result
 from shared.task_metadata import RetryLedger
-from shared.task_statuses import ACTIVE, TERMINAL
+from shared.task_metadata_wire import coerce_task_metadata
+from shared.task_statuses import ACTIVE, TERMINAL, OwnerLiveness, owner_liveness
 from shared.task_submit import SubmitOutcome, SubmittedTask
 
+from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
 from orchestrator.main_health_actions import MainHealthNextAction
 
 logger = logging.getLogger(__name__)
@@ -155,19 +157,33 @@ class MainFixTaskFiler:
         self._store = store
         self._locks: dict[str, asyncio.Lock] = {}
 
-    async def ensure(self, brk: MainBreak, *, project_root: str) -> FixOwner:
+    async def ensure(
+        self,
+        brk: MainBreak,
+        *,
+        project_root: str,
+        spawn_context: FixSpawnContext = FixSpawnContext.FILED,
+        escalation_id: str | None = None,
+    ) -> FixOwner:
         """Adopt the open fix-main task for *brk*'s signature, or file one.
 
         Never raises.  A failed lookup files nothing: an unreadable store is
         not evidence that no owner exists, and the next break retries.
         """
         sig = brk.signature
+        tasks = SchedulerChronicFlakeTaskClient(self._store, project_root)
         async with self._locks.setdefault(sig, asyncio.Lock()):
             try:
-                open_id = await self._find_open(sig, project_root)
-                if open_id is not None:
-                    return FixOwner(sig, open_id)
-                return await self._file(brk, project_root)
+                hit = await self._find_open(sig, project_root)
+                if hit is not None:
+                    task_id, status = hit
+                    await _finish_half_filed(tasks, task_id, status)
+                    return FixOwner(sig, task_id)
+                arguments = build_main_fix_task_arguments(
+                    brk, project_root=project_root,
+                    spawn_context=spawn_context, escalation_id=escalation_id,
+                )
+                return await _file(tasks, sig, arguments)
             except Exception:
                 logger.warning(
                     'main-health fix owner: could not ensure a fix-main task for '
@@ -175,7 +191,7 @@ class MainFixTaskFiler:
                 )
                 return FixOwner(sig)
 
-    async def _find_open(self, sig: str, project_root: str) -> str | None:
+    async def _find_open(self, sig: str, project_root: str) -> tuple[str, str] | None:
         result = await self._store.dispatch_tool(
             'find_tasks_by_metadata',
             {
@@ -190,50 +206,67 @@ class MainFixTaskFiler:
         if err is not None:
             raise LookupError(f'find_tasks_by_metadata failed: {err}')
         assert rows is not None  # parse_tool_result invariant: (None, err) | (value, None)
-        return str(rows[0]['task_id']) if rows else None
+        return (str(rows[0]['task_id']), str(rows[0]['status'])) if rows else None
 
-    async def _file(self, brk: MainBreak, project_root: str) -> FixOwner:
-        arguments = build_main_fix_task_arguments(
-            brk, project_root=project_root, spawn_context=FixSpawnContext.FILED,
-        )
-        outcome = await self._store.submit_task({**arguments, 'planning_mode': True})
-        sig = brk.signature
-        match outcome:
-            case SubmittedTask(task_id=task_id, combined=False):
-                await self._commit_planning(task_id, project_root)
-                return FixOwner(sig, task_id, filed=True)
-            case SubmittedTask(task_id=task_id, status=status) if (
-                status is not None and status not in TERMINAL
-            ):
-                return FixOwner(sig, task_id)
+
+async def _file(
+    tasks: SchedulerChronicFlakeTaskClient, sig: str, arguments: dict,
+) -> FixOwner:
+    outcome = await tasks.submit_task({**arguments, 'planning_mode': True})
+    match outcome:
+        case SubmittedTask(task_id=task_id, combined=False):
+            await tasks.commit_planning([task_id])
+            return FixOwner(sig, task_id, filed=True)
+        case SubmittedTask(task_id=task_id, status=status) if (
+            status is not None and status not in TERMINAL
+        ):
+            return FixOwner(sig, task_id)
+    logger.warning(
+        'main-health fix owner: filing a fix-main task for signature %s did '
+        'not yield an open task: %r', sig, outcome,
+    )
+    return FixOwner(sig)
+
+
+async def _finish_half_filed(
+    tasks: SchedulerChronicFlakeTaskClient, task_id: str, status: str,
+) -> None:
+    """Release an owner this filer created whose ``commit_planning`` never landed.
+
+    The ``deferred`` arm of
+    ``orchestrator/src/orchestrator/flake_ledger.py::_ensure_owner_task``: a
+    ``planning_mode`` task left ``deferred`` would own its signature forever
+    without ever being dispatched.  A deferral someone stamped
+    (``metadata.deferral``, e.g. a hand carry) is theirs to release, and is
+    left alone, as is a deferred task some other writer filed.
+    """
+    if owner_liveness(status) is not OwnerLiveness.DEFERRED:
+        return
+    task, read_error = await tasks.get_task(task_id)
+    if task is None:
         logger.warning(
-            'main-health fix owner: filing a fix-main task for signature %s did '
-            'not yield an open task: %r', sig, outcome,
+            'main-health fix owner: could not read deferred owner %s (%s); the '
+            'next break retries', task_id, read_error,
         )
-        return FixOwner(sig)
-
-    async def _commit_planning(self, task_id: str, project_root: str) -> None:
-        """Release the filed task from ``deferred``; a failure leaves it filed and owning its signature."""
-        try:
-            result = await self._store.dispatch_tool(
-                'commit_planning',
-                {'project_root': project_root, 'task_ids': task_id, 'target_status': 'pending'},
-                timeout=_LOOKUP_TIMEOUT_SECS,
-            )
-            success, err = parse_tool_result(result, 'success', bool)
-        except Exception as exc:
-            success, err = False, exc
-        if err is not None or not success:
-            logger.warning(
-                'main-health fix owner: commit_planning did not confirm task %s '
-                '(%s); it stays deferred and still owns its signature', task_id, err,
-            )
+        return
+    metadata = coerce_task_metadata(task.get('metadata')) or {}
+    if metadata.get('spawn_context') in set(FixSpawnContext) and 'deferral' not in metadata:
+        logger.info('main-health fix owner: completing the half-filed task %s', task_id)
+        await tasks.commit_planning([task_id])
 
 
 async def ensure_main_fix_owner(
-    filer: MainFixTaskFiler | None, brk: MainBreak, *, project_root: str,
+    filer: MainFixTaskFiler | None,
+    brk: MainBreak,
+    *,
+    project_root: str,
+    spawn_context: FixSpawnContext = FixSpawnContext.FILED,
+    escalation_id: str | None = None,
 ) -> FixOwner:
     """*filer*'s owner for *brk*, or an ownerless :class:`FixOwner` when no task store is wired."""
     if filer is None:
         return FixOwner(brk.signature)
-    return await filer.ensure(brk, project_root=project_root)
+    return await filer.ensure(
+        brk, project_root=project_root,
+        spawn_context=spawn_context, escalation_id=escalation_id,
+    )

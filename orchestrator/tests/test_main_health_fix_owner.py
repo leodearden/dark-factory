@@ -68,11 +68,14 @@ def _envelope(payload: dict) -> dict:
 class FakeTaskStore:
     """An in-memory task store speaking the scheduler's dispatch_tool/submit_task seam."""
 
-    def __init__(self, *, lookup_fails: bool = False, submit_fails: bool = False) -> None:
+    def __init__(
+        self, *, lookup_fails: bool = False, submit_fails: bool = False, commit_fails: bool = False,
+    ) -> None:
         self.tasks: dict[str, dict] = {}
         self.submits: list[dict] = []
         self.lookup_fails = lookup_fails
         self.submit_fails = submit_fails
+        self.commit_fails = commit_fails
 
     def add(self, *, status: str, metadata: dict) -> str:
         task_id = str(9000 + len(self.tasks))
@@ -98,7 +101,12 @@ class FakeTaskStore:
                 and task['status'] in arguments['statuses']
             ]
             return _envelope({'results': rows})
+        if name == 'get_task':
+            task = self.tasks[arguments['id']]
+            return _envelope({'data': {'id': arguments['id'], **task}})
         if name == 'commit_planning':
+            if self.commit_fails:
+                return _envelope({'error': 'timed out', 'error_type': 'TimeoutError'})
             for tid in arguments['task_ids'].split(','):
                 if self.tasks[tid]['status'] == 'deferred':
                     self.tasks[tid]['status'] = arguments['target_status']
@@ -176,6 +184,33 @@ class TestMainFixTaskFiler:
 
         assert len(store.submits) == 1
         assert owner.task_id not in (None, closed)
+
+    def test_a_half_filed_owner_is_released_by_the_next_break(self) -> None:
+        store = FakeTaskStore(commit_fails=True)
+        filer = MainFixTaskFiler(store)
+        first = _ensure(store, TEST_BREAK, filer)
+        assert store.tasks[first.task_id]['status'] == 'deferred'
+        store.commit_fails = False
+
+        second = _ensure(store, TEST_BREAK, filer)
+
+        assert second.task_id == first.task_id
+        assert len(store.submits) == 1
+        assert store.tasks[first.task_id]['status'] == 'pending'
+
+    def test_a_hand_carried_deferral_is_left_alone(self) -> None:
+        store = FakeTaskStore()
+        held = store.add(status='deferred', metadata={
+            SIGNATURE_KEY: TEST_BREAK.signature,
+            'spawn_context': 'main_health_fix_filed',
+            'deferral': {'kind': 'held_by_session', 'reason': 'hand carry'},
+        })
+
+        owner = _ensure(store, TEST_BREAK)
+
+        assert owner.task_id == held
+        assert store.submits == []
+        assert store.tasks[held]['status'] == 'deferred'
 
     def test_concurrent_breaks_of_one_signature_file_one_task(self) -> None:
         store = FakeTaskStore()
@@ -274,16 +309,21 @@ def _make_workflow(
     return workflow
 
 
+FOREIGN_BREAK = MainBreak('compile_error', 'error TS1005: other.tsx', 'another break')
+
+
 def _arrange(case: str, worker: SpeculativeMergeWorker, store: FakeTaskStore | None, brk: MainBreak) -> None:
     if case == 'attempt_cap':
         for _ in range(MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS):
             worker.auto_heal_registry.record_attempt(brk.signature)
-    if case == 'idempotent':
+    in_flight = {'in_flight': brk, 'foreign_halt': FOREIGN_BREAK}.get(case)
+    if in_flight is not None:
+        worker.auto_heal_registry.record_attempt(in_flight.signature)
         worker.halt_lane('normal', 'auto-heal already in flight')
         if store is not None:
             store.add(
                 status='in-progress',
-                metadata={SIGNATURE_KEY: brk.signature, 'spawn_context': 'main_health_auto_heal'},
+                metadata={SIGNATURE_KEY: in_flight.signature, 'spawn_context': 'main_health_auto_heal'},
             )
 
 
@@ -291,8 +331,22 @@ MERGE_LANE_CASES = {
     'non_eligible': TEST_FAILURE_RESULT,
     'attempt_cap': COMPILE_ERROR_RESULT,
     'happy': COMPILE_ERROR_RESULT,
-    'idempotent': COMPILE_ERROR_RESULT,
+    'in_flight': COMPILE_ERROR_RESULT,
+    'foreign_halt': COMPILE_ERROR_RESULT,
 }
+
+VERIFY_ARM_CASES = {
+    'inherited_test_failure': TEST_FAILURE_RESULT,
+    'inherited_compile_error': COMPILE_ERROR_RESULT,
+}
+
+
+def _inherited_info(verify: VerifyResult) -> dict:
+    brk = MainBreak(verify.category or '', verify.cause_hint, 'Verify failure is preexisting on main')
+    return {
+        'reason': brk.reason, 'detail': verify.failure_report(),
+        'category': 'preexisting_main_break', 'fingerprint': 'fp-verify', 'main_break': brk,
+    }
 
 
 def _run_site(
@@ -302,7 +356,7 @@ def _run_site(
     """Drive one classification site; return the break and every next action it filed."""
     queue = EscalationQueue(tmp_path / 'escalations')
     worker = _make_worker(tmp_path, queue, store, monkeypatch)
-    verify = MERGE_LANE_CASES.get(case, TEST_FAILURE_RESULT)
+    verify = {**MERGE_LANE_CASES, **VERIFY_ARM_CASES}[case]
     outcome = _build_main_health_outcome(verify, MAIN_SHA)
     brk = _break_of(outcome)
     _arrange(case, worker, store, brk)
@@ -319,12 +373,7 @@ def _run_site(
             await workflow._auto_heal_main_health(outcome, merge_phase=True)
             await _settle()
             return []
-        inherited = MainBreak(verify.category or '', verify.cause_hint, 'Verify failure is preexisting on main')
-        await workflow._block_on_inherited_break({
-            'reason': inherited.reason, 'detail': verify.failure_report(),
-            'category': 'preexisting_main_break', 'fingerprint': 'fp-verify',
-            'main_break': inherited,
-        })
+        await workflow._block_on_inherited_break(_inherited_info(verify))
         mark_blocked = workflow._mark_blocked
         assert isinstance(mark_blocked, AsyncMock)
         return [mark_blocked.call_args.kwargs['suggested_action']]
@@ -336,7 +385,7 @@ def _run_site(
 
 SITE_CASES = [
     *((site, case) for site in ('deferred_worker', 'sync_workflow') for case in MERGE_LANE_CASES),
-    ('task_verify', 'inherited'),
+    *(('task_verify', case) for case in VERIFY_ARM_CASES),
 ]
 
 
@@ -390,6 +439,32 @@ class TestOneTaskPerSignature:
         asyncio.run(_three_sites())
 
         assert len(store.submits) == 1
+
+    @pytest.mark.parametrize('heal_site', ['deferred_worker', 'sync_workflow'])
+    def test_a_verify_arm_owner_is_adopted_by_the_auto_heal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, heal_site: str,
+    ) -> None:
+        store = FakeTaskStore()
+        queue = EscalationQueue(tmp_path / 'escalations')
+        worker = _make_worker(tmp_path, queue, store, monkeypatch)
+        workflow = _make_workflow(tmp_path, worker, queue, monkeypatch)
+        outcome = _build_main_health_outcome(COMPILE_ERROR_RESULT, MAIN_SHA)
+
+        async def _verify_arm_then_heal() -> None:
+            await workflow._block_on_inherited_break(_inherited_info(COMPILE_ERROR_RESULT))
+            if heal_site == 'deferred_worker':
+                await worker._auto_heal_main_health_deferred(
+                    outcome, _make_req('42', tmp_path / 'task-wt', _make_config(tmp_path)),
+                )
+            else:
+                await workflow._auto_heal_main_health(outcome, merge_phase=True)
+            await _settle()
+
+        asyncio.run(_verify_arm_then_heal())
+
+        assert len(store.open_owners(_break_of(outcome).signature)) == 1, store.tasks
+        assert len(store.submits) == 1
+        assert worker.is_lane_halted('normal')
 
     def test_a_commit_to_a_red_main_does_not_file_a_second_task(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
