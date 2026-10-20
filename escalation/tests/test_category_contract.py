@@ -4,7 +4,8 @@
 every filed ``Escalation.category`` must belong to, and
 ``require_registered_category`` is the one check every enforcement point calls.
 A category some filer passes is pinned by ``test_category_census.py``; the
-lists here pin only what no source the census walks can show.
+lists here pin only what no source the census walks can show, including
+categories filed by producers in other repositories.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ _AGENT_INSTRUCTED = (
 _EXTERNAL_PRODUCERS = (
     pytest.param(
         'validation_lane_red',
-        id='solar-challenge-platform:ci/cadence_alert.py::CATEGORY',
+        id='solar-challenge-platform:src/solar_challenge_platform/ci/cadence_alert.py::CATEGORY',
     ),
 )
 
