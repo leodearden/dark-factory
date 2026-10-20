@@ -1783,8 +1783,12 @@ async def _on_main_probe_worktree(
     git_ops: object,
     main_sha: str,
     body: Callable[[Path], Awaitable[_ProbeOutcome]],
+    *,
+    log_label: str,
 ) -> _ProbeOutcome | None:
     """*body*'s answer in a MAIN_PROBE worktree of *main_sha*; None when the worktree or *body* raised.
+
+    *log_label* names the caller in the failure log line.
 
     warm_seed=True: the probe shares the rolling warm-lane CoW base with the
     ordinary task verifies it adjudicates, so any warm-base artifact bias is
@@ -1800,11 +1804,9 @@ async def _on_main_probe_worktree(
         ) as worktree:
             return await body(worktree)
     except EphemeralWorktreeError as e:
-        logger.warning(
-            'main_baseline_failing_ids: %s — baseline probe disabled for this attempt', e,
-        )
+        logger.warning('%s: %s — main probe disabled for this attempt', log_label, e)
     except Exception:
-        logger.warning('main_baseline_failing_ids: probe raised', exc_info=True)
+        logger.warning('%s: main probe raised', log_label, exc_info=True)
     return None
 
 
@@ -1828,6 +1830,7 @@ async def _whole_tree_main_baseline(
         lambda worktree: run_scoped_verification(
             worktree, config, module_configs, task_files=None, max_retries=0, role='merge',
         ),
+        log_label='main_baseline_failing_ids',
     )
     if probe_result is None:
         return None
@@ -1908,7 +1911,9 @@ async def _probe_modules_on_main(
             *(_probe(worktree, mc) for mc in module_configs), return_exceptions=True,
         )
 
-    results = await _on_main_probe_worktree(git_ops, main_sha, _probe_each)
+    results = await _on_main_probe_worktree(
+        git_ops, main_sha, _probe_each, log_label='main_baseline_failing_ids',
+    )
     if results is None:
         return None
 
@@ -9424,6 +9429,9 @@ async def _wholly_preexisting_after_flake_gate(
     cached = _PROBE_CACHE.get(cache_key)
     if cached is not None and time.monotonic() - cached[0] < _PROBE_CACHE_TTL:
         return True, main_sha
+    # Widened here, not by the caller: at breadth='full' the merge gate ran every
+    # registered module, so a red id from a module the task never touched must still
+    # map to its subproject, while the signature probe keeps the task-scoped set.
     rerun_modules = verify_plan.effective_merge_module_configs(config, module_configs)
     observation = await _on_main_probe_worktree(
         git_ops, main_sha,
@@ -9431,6 +9439,7 @@ async def _wholly_preexisting_after_flake_gate(
             probe_worktree, config, rerun_modules, failing_result,
             call_site=FlakeCallSite.main_probe,
         ),
+        log_label='verify_failure_is_preexisting_on_main mu-fork flake gate',
     )
     if observation is None:
         return True, main_sha
