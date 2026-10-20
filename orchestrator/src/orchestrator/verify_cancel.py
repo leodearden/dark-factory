@@ -328,8 +328,9 @@ def cancel_request(
     killpg=os.killpg,
     failed_pids_out: list | None = None,
     killed_pgid_out: list[int] | None = None,
+    remove_worktree: Callable[[Path], None] | None = None,
 ) -> int:
-    """Cancel the verify-merge identified by the pgid file at *path*.
+    """Cancel the verify-merge or verify-task identified by the pgid file at *path*.
 
     Algorithm
     ---------
@@ -348,8 +349,8 @@ def cancel_request(
 
     3. If any live process could not be killed → return 1 and **retain** the
        pgid file (lets a retry or β's quarantine probe act on it).
-       Otherwise remove the file, report *pgid* on *killed_pgid_out*, and
-       return 0.
+       Otherwise remove the file, reap the recorded worktree (below), report
+       *pgid* on *killed_pgid_out*, and return 0.
 
     Parameters
     ----------
@@ -365,11 +366,17 @@ def cancel_request(
         return-0 paths (step 1) nor on the ``PermissionError`` return-1 path.
         Same out-param idiom as *failed_pids_out*: pass ``[]`` and inspect it
         after the call.
+    remove_worktree:
+        Called with the worktree the killed run recorded
+        (:func:`write_worktree_path`), then the record is removed — ONLY on
+        the swept-and-returned-0 path, after the pgid file is gone.  ``None``
+        retains the record.  Injected because this module cannot import
+        ``git_ops`` (which imports it).
 
     Return value
     ------------
-    * ``0`` — nothing to cancel, OR all processes killed (or already gone) and
-      the file removed.
+    * ``0`` — nothing to cancel, OR all processes killed (or already gone),
+      the file removed and any recorded worktree handed to *remove_worktree*.
     * ``1`` — at least one live process raised ``PermissionError``; file kept.
 
     **``0`` does NOT mean something was killed.**  Three of the four return-0
@@ -475,11 +482,24 @@ def cancel_request(
         # caller was about to declare free.
         return 1
     remove_pgid_file(path)
+    _reap_recorded_worktree(path, remove_worktree)
     # The ONLY path that both swept a real pgid and returned 0 — see the
     # docstring's "0 does NOT mean something was killed" note.
     if killed_pgid_out is not None:
         killed_pgid_out.append(pgid)
     return 0
+
+
+def _reap_recorded_worktree(
+    pgid_path: Path, remove_worktree: Callable[[Path], None] | None,
+) -> None:
+    """Hand the killed run's recorded worktree to *remove_worktree*, then drop the record."""
+    if remove_worktree is None:
+        return
+    worktree = read_worktree_path(pgid_path)
+    if worktree is not None:
+        remove_worktree(worktree)
+    remove_worktree_path(pgid_path)
 
 
 # ---------------------------------------------------------------------------
