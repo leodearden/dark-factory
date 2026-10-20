@@ -310,28 +310,37 @@ class AppliedAttach:
     novel: bool
 
 
-def _pending_titled(cb: Mapping[str, Any], title: str) -> str:
+def _pending_titled(cb: Mapping[str, Any], title: str) -> str | None:
     for candidate in cb.get("candidates") or []:
         if candidate.get("title") == title and candidate.get("disposition") == "pending":
             return candidate["id"]
-    raise ValueError(f"similarity attach: screened cluster {title!r} has no pending candidate")
+    return None
 
 
-def attach(cb: dict, view: View, *, run_id: str) -> tuple[dict, tuple[AppliedAttach, ...]]:
+def attach(
+    cb: dict, view: View, *, run_id: str,
+) -> tuple[dict, tuple[AppliedAttach, ...], tuple[Attach, ...]]:
     """A new codebook in which every attach of *view* joins its entry: a
     backlog candidate by its id, a screened novel cluster by the pending
-    candidate this run's merge gave its title."""
+    candidate this run's merge gave its title. A screened cluster the merge
+    gave no pending candidate is returned unattached rather than raised: it
+    was neither verified nor attached, as census.py::DroppedVerdict records
+    for a verdict with no pending candidate."""
     result = cb
     applied: list[AppliedAttach] = []
+    unattached: list[Attach] = []
     for found, novel in (*((found, False) for found in view.attaches), *((found, True) for found in view.screened)):
         candidate_id = _pending_titled(result, found.item.title) if novel else found.item.key
+        if candidate_id is None:
+            unattached.append(found)
+            continue
         attached_by = similarity_attached_by(found.score, run_id)
         result = prescreen.join_entry(
             result, candidate_id, found.entry_id,
             candidate_fields={"attached_by": attached_by}, sighting_fields={"attached_by": attached_by},
         )
         applied.append(AppliedAttach(candidate_id, found.item.title, found.entry_id, found.score, novel))
-    return result, tuple(applied)
+    return result, tuple(applied), tuple(unattached)
 
 
 @dataclass(frozen=True)
@@ -409,6 +418,7 @@ class AdjudicationReport:
 
     view: View
     attached: tuple[AppliedAttach, ...]
+    unattached: tuple[Attach, ...]
     offered: tuple[QueuedCluster, ...]
     adjudicated: tuple[Adjudicated, ...]
     inconclusive: str | None
@@ -462,6 +472,10 @@ class AdjudicationReport:
                 }
                 for item in self.attached
             ],
+            "unattached": [
+                {"title": item.item.title, "entry_id": item.entry_id, "score": float(item.score)}
+                for item in self.unattached
+            ],
             "inconclusive": self.inconclusive,
         }
 
@@ -471,6 +485,13 @@ def _attached_line(item: Mapping[str, Any]) -> str:
     return (
         f"- attached by similarity {item['score']:.4f}: {prescreen.quoted_title(item['title'])} "
         f"({item['candidate_id']}{novel}) → {item['entry_id']}"
+    )
+
+
+def _unattached_line(item: Mapping[str, Any]) -> str:
+    return (
+        f"- not attached, no pending candidate after the merge: {prescreen.quoted_title(item['title'])} "
+        f"(similarity {item['score']:.4f} → {item['entry_id']}); not verified this run"
     )
 
 
@@ -509,6 +530,7 @@ def report_lines(record: Mapping[str, Any]) -> list[str]:
         *([f"- queue inconclusive: {record['inconclusive']}"] if record["inconclusive"] else []),
         *(_processed_line(item) for item in processed),
         *(_attached_line(item) for item in record["attached"]),
+        *(_unattached_line(item) for item in record["unattached"]),
     ]
 
 

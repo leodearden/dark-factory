@@ -3184,7 +3184,14 @@ def run_census(
             "; ".join(skipped.describe() for skipped in merge.skipped_deletions),
         )
     codebook.warn_unknown_invariant_slugs(merge.invariant_slugs, invariant_slugs, run=run_id)
-    updated_codebook, attached = similarity.attach(updated_codebook, view, run_id=run_id)
+    updated_codebook, attached, unattached = similarity.attach(updated_codebook, view, run_id=run_id)
+    if unattached:
+        logger.warning(
+            "census: %d similarity-screened cluster(s) had no pending candidate after the merge and "
+            "were neither attached nor verified: %s",
+            len(unattached),
+            "; ".join(repr(item.item.title) for item in unattached),
+        )
 
     # ONE list for every verdict this run paid for and dropped, shared by both
     # adjudication loops below -- a per-loop name would fork the tally
@@ -3464,7 +3471,9 @@ def run_census(
     screen_report = prescreen.ScreenReport(
         screen, tuple(surfaced_by_key), tuple(key_attaches), tuple(re_observed), instrument_findings,
     )
-    adjudication_report = similarity.AdjudicationReport(view, attached, offered, adjudicated, queue.inconclusive)
+    adjudication_report = similarity.AdjudicationReport(
+        view, attached, unattached, offered, adjudicated, queue.inconclusive,
+    )
     method = build_method(
         run_id=run_id,
         as_of_sha=as_of_sha,
