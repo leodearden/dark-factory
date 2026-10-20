@@ -148,6 +148,7 @@ class TestNoTaskEffect:
 
         assert len(seen) == 1
         (rec,) = seen
+        assert rec.resolution_action == 'close_only'
         assert effect_for(rec.resolution_action, rec.level, rec.category) == TaskEffect(None, WORKFLOW_NONE)
 
 
