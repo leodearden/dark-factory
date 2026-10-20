@@ -232,25 +232,26 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      4065) — is an infra fault, NOT a verdict: ``infra_issue`` + blocked with
      NO ``gate_escalated_at`` stamp.  See the ``ScriptTimeout`` class
      docstring for the full rationale.
-   - Outer-guard timeout or an unexpected ``run_fn`` error (likewise no
-     verdict — an infra fault, not a check failure): file born-at-L2
-     ``infra_issue`` and block — again NO ``gate_escalated_at`` stamp, so the
-     check is simply re-attempted on the next dispatch.  The outer
-     ``asyncio.wait_for`` guard is the backstop for a seam that never returns
-     AT ALL (a detached/unkillable child, or a hanging custom runner).  All
-     three no-verdict arms file the same category as each other, so their
+   - Outer-guard timeout, an unresolvable factory script root
+     (``FactoryRootUnresolved``, task 6386) or an unexpected ``run_fn`` error
+     (likewise no verdict — an infra fault, not a check failure): file
+     born-at-L2 ``infra_issue`` and block — again NO ``gate_escalated_at``
+     stamp, so the check is simply re-attempted on the next dispatch.  The
+     outer ``asyncio.wait_for`` guard is the backstop for a seam that never
+     returns AT ALL (a detached/unkillable child, or a hanging custom runner).
+     Every no-verdict arm files the same category as the others, so their
      escalation wording is deliberately distinct.
    - RECURRENCE CARRIER (task 4678 / r3, PRD
      ``docs/prds/recurring-deterministic-tasks.md`` R-D6 + contract C-5): when
      the task carries ``metadata.recurrence`` — one link of a recurring chain
-     — those THREE no-verdict arms file ``milestone_check_failed`` instead of
+     — those no-verdict arms file ``milestone_check_failed`` instead of
      ``infra_issue``, so every failure leg of a recurring job sits in one
      deny-listed, discriminable category
      (``escalation.authority.L2_AUTO_CLOSE_DENY_CATEGORIES``) rather than
      vanishing into the fleet's largest bucket.  Three things are deliberately
      NOT changed by that swap: the ``gate_escalated_at`` stamp is still never
      written on a no-verdict leg (task 4065 — the check is re-attempted, not
-     latched into resolve-to-done); the three SUMMARIES stay byte-identical, so
+     latched into resolve-to-done); the SUMMARIES stay byte-identical, so
      wording remains the discriminator telling a human which guard fired; and a
      NON-carrier predicate keeps ``infra_issue`` throughout.  Every DEPLOY path
      is untouched too — the ``category`` override is passed only from
@@ -368,7 +369,11 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from shared.before_done_paths import BeforeDonePaths, resolve_before_done_paths
+from shared.before_done_paths import (
+    BeforeDonePaths,
+    resolve_before_done_paths,
+    resolve_script_base,
+)
 from shared.proc_group import unsafe_pgid_reason
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_metadata import (
@@ -877,7 +882,8 @@ class FactoryRootUnresolved(RuntimeError):
     """before_done.script_root='factory' but ``resolve_dark_factory_root()``
     found no dark-factory checkout.
 
-    ``_run_predicate`` files it through its no-verdict arm, never as a verdict.
+    ``_run_predicate`` files it through a dedicated no-verdict arm, never as a
+    verdict.
     """
 
     def __init__(self, script: str) -> None:
@@ -1432,12 +1438,10 @@ class DeterministicRunner:
         )
 
     def _script_base(self, before_done: dict, project_root: Path) -> Path:
-        if before_done.get('script_root') != 'factory':
-            return project_root
-        factory_root = self._factory_root_resolver()
-        if factory_root is None:
+        base = resolve_script_base(before_done, project_root, self._factory_root_resolver)
+        if base is None:
             raise FactoryRootUnresolved(before_done['script'])
-        return factory_root
+        return base
 
     async def _default_schedule_detached_restart(
         self,
@@ -2983,24 +2987,24 @@ class DeterministicRunner:
           (next bullet but one): its non-carrier text asserts "deliberately not
           milestone_check_failed", which would contradict a carrier's own
           category.
-        - Outer-guard timeout / unexpected error -> likewise an INFRA fault
-          (no verdict was produced): born-at-L2 escalation + blocked
-          (re-attempted on the next dispatch, no ``gate_escalated_at`` stamp).
-          The outer ``asyncio.wait_for`` guard
-          (``timeout_secs + run_timeout_grace_secs``) stays the backstop for a
-          seam that never returns at all.  All three infra arms share one
-          category, so each carries deliberately distinct summary/detail
-          wording — that text is the only thing telling a human which guard
-          fired.
+        - Outer-guard timeout / ``FactoryRootUnresolved`` (task 6386) /
+          unexpected error -> likewise an INFRA fault (no verdict was
+          produced): born-at-L2 escalation + blocked (re-attempted on the next
+          dispatch, no ``gate_escalated_at`` stamp).  The outer
+          ``asyncio.wait_for`` guard (``timeout_secs + run_timeout_grace_secs``)
+          stays the backstop for a seam that never returns at all.  Every infra
+          arm shares one category, so each carries deliberately distinct
+          summary/detail wording — that text is the only thing telling a human
+          which guard fired.
         - CARRIER SPLIT (task 4678 / r3, PRD R-D6 + C-5): for a task carrying
-          ``metadata.recurrence`` — one link of a recurring chain — ALL THREE
-          no-verdict arms above file ``milestone_check_failed`` instead of
+          ``metadata.recurrence`` — one link of a recurring chain — EVERY
+          no-verdict arm above files ``milestone_check_failed`` instead of
           ``infra_issue`` (one ``no_verdict_category``, resolved once from
           ``_is_recurrence_carrier``), so a recurring job's failures never
           disappear into the crowded ``infra_issue`` bucket.  Every OTHER
           predicate — and every deploy path — is unchanged.  Two things do NOT
           move with the label: the STAMP (still no ``gate_escalated_at``,
-          because these are still no-verdict legs) and the three SUMMARIES
+          because these are still no-verdict legs) and the SUMMARIES
           (byte-identical, so the arm discriminator keeps working for carriers
           too).  The single wording change is the ``ScriptTimeout`` arm's
           detail sentence, which on the carrier path names R-D6 as the reason
@@ -3012,7 +3016,7 @@ class DeterministicRunner:
         run_fn = self._script_runner or self._default_run_script
         outer_timeout = before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
 
-        # Task 4678 (r3): resolved ONCE, so all three no-verdict arms below
+        # Task 4678 (r3): resolved ONCE, so the no-verdict arms below
         # cannot drift into different categories for the same task.
         no_verdict_category = (
             MILESTONE_CHECK_FAILED_CATEGORY
@@ -3063,7 +3067,7 @@ class DeterministicRunner:
         except ScriptTimeout as exc:
             # Task 4065: the DEFAULT runner's own per-script timeout fired — no
             # exit code, so no verdict (see ScriptTimeout).  Wording is
-            # deliberately distinct from the two sibling arms: all three file
+            # deliberately distinct from the sibling arms: they all file
             # the SAME category as each other (`no_verdict_category`), so the
             # text is the only thing telling a human WHICH guard fired — which
             # is why task 4678's carrier split moves the category and leaves
@@ -3124,6 +3128,14 @@ class DeterministicRunner:
                 task_id,
                 summary='Predicate check script timed out (no verdict produced)',
                 detail=inner_timeout_detail,
+                category=no_verdict_category,
+            )
+        except FactoryRootUnresolved as exc:
+            # A configuration fault, not a verdict: the script was never located.
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Predicate script root unresolvable',
+                detail='\n'.join([description, str(exc)]),
                 category=no_verdict_category,
             )
         except Exception as exc:

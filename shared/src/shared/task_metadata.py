@@ -47,6 +47,7 @@ __all__ = [
     'is_known_metadata_key',
     'parse_metadata',
     'register_metadata_submodel',
+    'script_root_kind_conflict',
     'validate_model_overrides',
 ]
 
@@ -170,9 +171,10 @@ class BeforeDone(BaseModel):
     ``submit_task`` guard — this model enforces only the type/shape layer.
     With ``script_root='factory'`` the script resolves against
     ``shared.repo_paths.resolve_dark_factory_root()`` while cwd stays
-    project_root; that resolution and its filesystem checks live at
-    ``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``
-    and the orchestrator's deterministic runner.
+    project_root. ``shared.before_done_paths`` resolves that path for both the
+    submit guard and the orchestrator's deterministic runner; only the guard
+    (``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``)
+    checks the resolved file on disk — the runner joins the path and runs it.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -188,12 +190,25 @@ class BeforeDone(BaseModel):
 
     @model_validator(mode='after')
     def _factory_script_root_requires_predicate(self) -> BeforeDone:
-        if self.script_root == 'factory' and self.kind != 'predicate':
-            raise ValueError(
-                f"BeforeDone: script_root='factory' requires kind='predicate' "
-                f'(got kind={self.kind!r}); a deploy runs a script from its own project.'
-            )
+        conflict = script_root_kind_conflict(self.script_root, self.kind)
+        if conflict is not None:
+            raise ValueError(f'BeforeDone: {conflict}')
         return self
+
+
+def script_root_kind_conflict(script_root: str, kind: str) -> str | None:
+    """Why ``before_done`` may not pair *script_root* with *kind*; ``None`` when it may.
+
+    The single statement of the predicate-only rule for factory-rooted scripts,
+    called by ``BeforeDone``, the fused-memory submit guard and
+    ``shared.before_done_paths.resolve_script_base``.
+    """
+    if script_root == 'factory' and kind != 'predicate':
+        return (
+            f"script_root='factory' requires kind='predicate' (got kind={kind!r}); "
+            'a deploy runs a script from its own project.'
+        )
+    return None
 
 
 class DoneProvenance(BaseModel):

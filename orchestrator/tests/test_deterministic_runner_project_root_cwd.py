@@ -396,11 +396,41 @@ class TestFactoryRootedPredicate:
 
         assert outcome == WorkflowOutcome.BLOCKED
         [esc] = queue.get_by_task('6387', status='pending')
+        assert esc.summary == 'Predicate script root unresolvable', esc.summary
         assert esc.category == 'infra_issue'
         assert DARK_FACTORY_ROOT_ENV in esc.detail, esc.detail
         assert FACTORY_SCRIPT in esc.detail, esc.detail
         statuses = [c.args[1] for c in scheduler.set_task_status.await_args_list]
         assert 'done' not in statuses
+
+    async def test_factory_rooted_deploy_is_refused_without_running_the_script(
+        self, project_root: Path, factory_root: Path, elsewhere: Path, marker: Path,
+        queue: EscalationQueue,
+    ) -> None:
+        resolver_calls: list[None] = []
+
+        def _resolver() -> Path:
+            resolver_calls.append(None)
+            return factory_root
+
+        task = _task('6389', {
+            'script': FACTORY_SCRIPT,
+            'script_root': 'factory',
+            'timeout_secs': 10,
+            'env': {'MARKER': str(marker)},
+        })
+        scheduler = _scheduler(task, project_root)
+        runner = DeterministicRunner(
+            scheduler=scheduler, escalation_queue=queue, factory_root_resolver=_resolver,
+        )
+
+        outcome = await runner.run(_assignment(task))
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert not marker.exists()
+        assert resolver_calls == []
+        [esc] = queue.get_by_task('6389', status='pending')
+        assert "requires kind='predicate'" in esc.detail, esc.detail
 
     async def test_project_rooted_deploy_never_consults_the_factory_resolver(
         self, project_root: Path, elsewhere: Path, marker: Path, queue: EscalationQueue,

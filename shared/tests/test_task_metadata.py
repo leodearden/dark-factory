@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from typing import get_args
 
 import pytest
@@ -37,6 +38,7 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
     register_metadata_submodel,
+    script_root_kind_conflict,
     validate_model_overrides,
 )
 
@@ -196,6 +198,23 @@ class TestBeforeDone:
             BeforeDone.model_validate(
                 {'script': 'scripts/x.sh', 'timeout_secs': 60, 'script_root': 'elsewhere'},
             )
+
+    @pytest.mark.parametrize(
+        ('script_root', 'kind', 'refused'),
+        [
+            ('project', 'deploy', False),
+            ('project', 'predicate', False),
+            ('factory', 'predicate', False),
+            ('factory', 'deploy', True),
+        ],
+    )
+    def test_script_root_kind_conflict_matches_the_model(self, script_root, kind, refused):
+        conflict = script_root_kind_conflict(script_root, kind)
+
+        assert (conflict is not None) == refused
+        if conflict is not None:
+            with pytest.raises(ValidationError, match=re.escape(conflict)):
+                BeforeDone(script='scripts/x.sh', timeout_secs=60, kind=kind, script_root=script_root)
 
 
 class TestDoneProvenance:

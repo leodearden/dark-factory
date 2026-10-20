@@ -59,11 +59,12 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, get_args
+from typing import Any
 
 from pydantic import ValidationError
+from shared.before_done_paths import ScriptRootRefused, resolve_script_base
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
-from shared.task_metadata import BeforeDone, Milestone, Recurrence, parse_metadata
+from shared.task_metadata import Milestone, Recurrence, parse_metadata
 
 __all__ = [
     'deterministic_task_error',
@@ -82,9 +83,11 @@ _VALID_KINDS: frozenset[str] = frozenset({'normal', 'deterministic'})
 # boundary.
 _VALID_BEFORE_DONE_KINDS: frozenset[str] = frozenset({'deploy', 'predicate'})
 
-_VALID_SCRIPT_ROOTS: frozenset[str] = frozenset(
-    get_args(BeforeDone.model_fields['script_root'].annotation)
-)
+# How the diagnostics name each before_done.script_root's base directory.
+_SCRIPT_BASE_NAMES: dict[str, str] = {
+    'project': 'project_root',
+    'factory': 'the dark-factory root',
+}
 
 # SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
 # value was discarded — parse_metadata could not produce any dict at all.
@@ -460,11 +463,6 @@ def _validate_before_done(
             hint="Omit 'kind' (defaults to 'deploy'), or set it to 'deploy' or 'predicate'.",
         )
 
-    script_root = before_done.get('script_root', 'project')
-    err = _validate_script_root(script_root, kind)
-    if err is not None:
-        return err
-
     # script: required non-empty string
     script = before_done.get('script')
     if not isinstance(script, str) or not script.strip():
@@ -473,7 +471,16 @@ def _validate_before_done(
             hint="Set 'script' to a relative path of an executable file under project_root.",
         )
 
-    base = _script_base(script_root, project_root, factory_root_resolver)
+    try:
+        base = resolve_script_base(before_done, Path(project_root), factory_root_resolver)
+    except ScriptRootRefused as exc:
+        return _validation_error(
+            str(exc),
+            hint=(
+                "Omit 'script_root' to resolve the script under project_root, or set "
+                "script_root='factory' together with kind='predicate'."
+            ),
+        )
     if base is None:
         return _validation_error(
             "before_done.script_root='factory' but the dark-factory root could not "
@@ -483,8 +490,8 @@ def _validate_before_done(
                 "dark-factory checkout, or use script_root='project'."
             ),
         )
-    base_dir, where = base
-    err = _validate_script_under(script, base_dir, where)
+    where = _SCRIPT_BASE_NAMES[before_done.get('script_root', 'project')]
+    err = _validate_script_under(script, base.resolve(), where)
     if err is not None:
         return err
 
@@ -523,53 +530,6 @@ def _validate_before_done(
             )
 
     return None
-
-
-def _validate_script_root(script_root: Any, kind: str | None) -> dict[str, Any] | None:
-    """Validate before_done.script_root's enum and its predicate-only coupling.
-
-    The same rule as ``BeforeDone._factory_script_root_requires_predicate``,
-    re-enforced here with a targeted submit-time diagnostic.
-    """
-    if not isinstance(script_root, str) or script_root not in _VALID_SCRIPT_ROOTS:
-        valid_list = ', '.join(repr(r) for r in sorted(_VALID_SCRIPT_ROOTS))
-        return _validation_error(
-            f"before_done.script_root={script_root!r} is not valid; must be one of "
-            f"{valid_list}.",
-            hint=(
-                "Omit 'script_root' to resolve the script under project_root, or "
-                f"use one of {valid_list}."
-            ),
-        )
-    effective_kind = kind or 'deploy'
-    if script_root == 'factory' and effective_kind != 'predicate':
-        return _validation_error(
-            "before_done.script_root='factory' requires before_done.kind='predicate' "
-            f'(got {effective_kind!r}).',
-            hint=(
-                "A deploy always runs a script from its own project; remove "
-                "'script_root' or use kind='predicate'."
-            ),
-        )
-    return None
-
-
-def _script_base(
-    script_root: str,
-    project_root: str,
-    factory_root_resolver: Callable[[], Path | None],
-) -> tuple[Path, str] | None:
-    """The directory a before_done script resolves under, with its label.
-
-    ``None`` when ``script_root='factory'`` and the dark-factory root is
-    unresolvable.
-    """
-    if script_root == 'project':
-        return Path(project_root).resolve(), 'project_root'
-    root = factory_root_resolver()
-    if root is None:
-        return None
-    return root.resolve(), 'the dark-factory root'
 
 
 def _validate_script_under(script: str, base: Path, where: str) -> dict[str, Any] | None:
