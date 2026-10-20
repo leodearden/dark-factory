@@ -66,9 +66,9 @@ from _orch_helpers import (
     VERIFY_CLI_PER_TEST_TIMEOUT,
     WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
-from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
 
 from orchestrator.pytest_markers import (
+    WHOLE_TREE_SCAN_TIMEOUT_NAME,
     is_whole_tree_guard_module,
     module_level_marker_names,
     module_level_timeout_arguments,
@@ -348,25 +348,10 @@ def _scans_whole_tree_py(source: str) -> bool:
 
 #: Names that resolve to ``WHOLE_TREE_SCAN_TEST_TIMEOUT`` at import time.  A
 #: bare ``WHOLE_TREE_SCAN_TEST_TIMEOUT`` (the house `from _orch_helpers import`
-#: idiom, used by all 13 members) and the dotted
-#: ``_orch_helpers.WHOLE_TREE_SCAN_TEST_TIMEOUT`` both land here, since only the
-#: trailing name is compared.
-_SANCTIONED_CEILING_NAMES = frozenset({'WHOLE_TREE_SCAN_TEST_TIMEOUT'})
-
-
-def _timeout_call_arg(call: ast.Call) -> ast.expr | None:
-    """The seconds expression a ``pytest.mark.timeout(...)`` *call* pins.
-
-    Both spellings pytest-timeout accepts are read: the positional
-    ``timeout(300)`` and the keyword ``timeout(timeout=300)``.  A call with
-    neither (``timeout()``, or one passing only ``method=``) yields None.
-    """
-    if call.args:
-        return call.args[0]
-    for keyword in call.keywords:
-        if keyword.arg == 'timeout':
-            return keyword.value
-    return None
+#: idiom) and the dotted ``_orch_helpers.WHOLE_TREE_SCAN_TEST_TIMEOUT`` both land
+#: here, since only the trailing name is compared.  The spelling itself is
+#: ``orchestrator.pytest_markers``' -- the same one its family predicate reads.
+_SANCTIONED_CEILING_NAMES = frozenset({WHOLE_TREE_SCAN_TIMEOUT_NAME})
 
 
 def _module_level_timeout_ceiling(source: str) -> float | None:
@@ -401,34 +386,17 @@ def _module_level_timeout_ceiling(source: str) -> float | None:
     legal), the SMALLEST resolvable one wins -- the ambiguity is real and the
     conservative reading is the one that surfaces it.
 
-    ``pytestmark_value``, ``marker_name`` and ``mark_elements`` are imported
-    from :mod:`shared.pytest_mark_grammar` rather than re-derived, for the same
-    reason the family invariant imports ``module_level_marker_names``: the
-    grammar of a module-level ``pytestmark`` (``Assign`` vs ``AnnAssign``,
-    last-assignment-wins, list/tuple element forms) belongs in exactly one
+    The seconds expressions come from
+    :func:`orchestrator.pytest_markers.module_level_timeout_arguments` rather
+    than a fold of this module's own, for the same reason the family invariant
+    imports ``module_level_marker_names``: the grammar of a module-level
+    ``pytestmark`` (``Assign`` vs ``AnnAssign``, last-assignment-wins,
+    list/tuple element forms, positional vs ``timeout=``) belongs in exactly one
     place, and a rename there should break this import loudly at collection
     rather than let two readings of the same syntax drift apart.
     """
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError):
-        return None
-
-    value: ast.expr | None = None
-    for statement in tree.body:
-        bound = pytestmark_value(statement)
-        if bound is not None:
-            value = bound
-    if value is None:
-        return None
-
     resolved: list[float] = []
-    for element in mark_elements(value):
-        if not isinstance(element, ast.Call) or marker_name(element) != 'timeout':
-            continue
-        arg = _timeout_call_arg(element)
-        if arg is None:
-            continue
+    for arg in module_level_timeout_arguments(source):
         if (
             isinstance(arg, ast.Constant)
             and isinstance(arg.value, int | float)
