@@ -116,8 +116,9 @@ def _neutralize_fleet_clock_gates(
     # once again immediately before delegating, to close the read-then-act
     # window), so an unstubbed test reads live machine state twice.
     monkeypatch.setattr(wdog, "_live_fleet_lease", lambda: None)
-    # task 7198: the module-removal waiver reads the same live clock and runs
-    # git against the hardcoded REPO_DIR, on any tick where a clock gate holds.
+    # task 7198: the module-removal waiver probes live systemd unit start times
+    # and runs git against the hardcoded REPO_DIR, on any tick where a clock
+    # gate holds.
     monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
 
 
