@@ -202,6 +202,17 @@ class TestUnwritableWrapperDirectory:
             "orchestrator", "orchestrator.bak-testlabel",
         ]
 
+    def test_sudo_that_passes_the_probe_but_refuses_the_install_changes_nothing(self, world):
+        sudo = world["shims"] / "sudo"
+        sudo.write_text('#!/usr/bin/env bash\nshift\n[ "$1" = true ] && exit 0\nexit 1\n')
+        sudo.chmod(0o755)
+        before = world["shim"].read_text()
+        result = run(world)
+        assert result.returncode != 0
+        assert "is unchanged" in result.stderr and "sudo sed -i" in result.stderr
+        assert world["shim"].read_text() == before
+        assert sorted(p.name for p in world["bindir"].iterdir()) == ["orchestrator"]
+
     def test_check_needs_no_write_access(self, world):
         add_fake_sudo(world, available=False)
         result = run(world, "--check")

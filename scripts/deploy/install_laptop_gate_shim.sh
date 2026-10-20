@@ -25,7 +25,8 @@ set -euo pipefail
 # edit lengthens a line it has already passed. The new content is therefore
 # built aside and renamed over the wrapper (atomic; a running verify keeps the
 # old inode), directly when the directory is writable, else through
-# passwordless `sudo -n`. With neither, the script states so, prints the one
+# passwordless `sudo -n` (tried non-interactively; a refusal leaves the wrapper
+# unchanged). With neither, the script states so, prints the one
 # line to apply by hand, writes nothing and exits non-zero.
 #
 # Usage:
@@ -126,9 +127,13 @@ bash -n "$staged" || fail "edited wrapper does not parse; nothing was written"
 
 # 4. backup, then atomic rename
 backup="$shim.bak-$label"
-"${priv[@]}" cp -p -- "$shim" "$backup"
-"${priv[@]}" install -o "$owner" -g "$group" -m "$perm" "$staged" "$dir/.$(basename "$shim").new.$$"
-"${priv[@]}" mv -f -- "$dir/.$(basename "$shim").new.$$" "$shim"
+new="$dir/.$(basename "$shim").new.$$"
+{
+    "${priv[@]}" cp -p -- "$shim" "$backup" \
+        && "${priv[@]}" install -o "$owner" -g "$group" -m "$perm" "$staged" "$new" \
+        && "${priv[@]}" mv -f -- "$new" "$shim"
+} || { "${priv[@]}" rm -f -- "$new" 2>/dev/null || true
+       fail "privileged install into $dir failed; $shim is unchanged. Apply by hand: $HAND_EDIT"; }
 say "installed; previous wrapper kept at $backup"
 
 # 5. post-check; restore the backup if the installed wrapper misbehaves
