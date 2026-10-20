@@ -1704,15 +1704,21 @@ restart:
 **Module-removal fast path (task 7198).** A watched commit that deletes or
 renames a `.py` module under `orchestrator/src`, `escalation/src` or
 `shared/src` arms a `ModuleNotFoundError` in every running orchestrator that
-imports it lazily (the 2026-10-17 `merge_disposition` incident, task 7098).
-Once `ORCH_MODULE_REMOVAL_GRACE_SECS` (default 600s) has passed since the
-first such commit landed on main after the last verified fleet deploy, the
-staleness backstop waives its min-interval, head start and commit grace and
-delegates the same `restart-all-orchestrators.sh --drain` sweep, which stamps
-the clock as usual. A held fleet lease still blocks it, and a failed git
-probe logs a WARNING and waives nothing. Journal signature: `delegating
-fleet-wide module-removal redeploy`. Code:
-`scripts/orchestrator-watchdog.py::_due_module_removals`.
+started before it and imports it lazily (the 2026-10-17 `merge_disposition`
+incident, task 7098). Once `ORCH_MODULE_REMOVAL_GRACE_SECS` (default 600s) has
+passed since the first such commit landed on main after the oldest running,
+enabled orchestrator unit started, the staleness backstop waives its
+min-interval, head start and commit grace and delegates the same
+`restart-all-orchestrators.sh --drain` sweep. The anchor is that unit's start,
+not the deploy clock: the clock is stamped when a sweep finishes, so a removal
+landing mid-sweep would predate it while units restarted earlier still run the
+old callers. A held fleet lease still blocks it, and a failed probe logs a
+WARNING (throttled like the skip lines) and waives nothing. Turning a module
+into a package (`foo.py` to `foo/__init__.py`) also reads as a removal and
+costs one early redeploy. Journal signature: `delegating fleet-wide
+module-removal redeploy`. Code:
+`scripts/orchestrator-watchdog.py::_due_module_removals`; the git probe is
+`scripts/_watched_module_removals.py::removals_since`.
 
 Both staleness and the coordinator invoke the same
 `restart-all-orchestrators.sh` chokepoint, so **clock-stamping** is defined
