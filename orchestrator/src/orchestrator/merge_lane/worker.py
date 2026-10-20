@@ -51,7 +51,10 @@ from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.flake_recorder import record_merge_flake_suppression
+from orchestrator.flake_recorder import (
+    record_flake_observation,
+    record_merge_flake_suppression,
+)
 from orchestrator.git_ops import (
     PERSISTENT_MERGE_WORKTREE_NAME,
     AdvanceOutcome,
@@ -184,6 +187,7 @@ from orchestrator.suffix_graph import (
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import (
+    FlakeObservationSink,
     VerifyResult,
     _derive_task_files_from_git,
     cached_main_baseline_failing_ids,
@@ -220,6 +224,7 @@ from orchestrator.workflow import _select_train_members
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
+    from orchestrator.flake_ledger import FlakeSuppression
 
 logger = logging.getLogger('orchestrator.merge_lane')
 
@@ -761,11 +766,36 @@ def _build_main_health_outcome(verify: VerifyResult, probe_sha: str) -> MergeOut
     )
 
 
+def _main_probe_flake_sink(
+    req: MergeRequest,
+    *,
+    event_store: EventStore | None,
+    escalation_queue: Any,
+) -> FlakeObservationSink:
+    """Where the main-health classifier's task-mu fork records a flake it
+    suppressed: the flake ledger, attributed to *req*'s task and to the main
+    SHA the isolated re-run ran on, with the INV-4 storm streak reached
+    through the recorder."""
+    async def sink(observation: FlakeSuppression, main_sha: str) -> None:
+        await record_flake_observation(
+            observation,
+            project_root=req.config.project_root,
+            project_id=req.config.fused_memory.project_id,
+            merge_sha=main_sha,
+            task_id=req.task_id,
+            event_store=event_store,
+            escalation_queue=escalation_queue,
+        )
+    return sink
+
+
 async def _classify_main_health_red(
     git_ops: GitOps,
     req: MergeRequest,
     verify: VerifyResult,
     event_store: EventStore | None = None,
+    *,
+    escalation_queue: Any = None,
 ) -> MergeOutcome | None:
     """Probe whether *verify* is a pre-existing break already on bare main HEAD.
 
@@ -799,6 +829,9 @@ async def _classify_main_health_red(
         is_preexisting, probe_sha = await verify_failure_is_preexisting_on_main(
             req.worktree, req.config, req.module_configs, req.task_files,
             verify, git_ops,
+            flake_sink=_main_probe_flake_sink(
+                req, event_store=event_store, escalation_queue=escalation_queue,
+            ),
         )
     except Exception:
         return None
@@ -1325,6 +1358,9 @@ async def _run_deferred_main_health_probe(
         is_preexisting, probe_sha = await verify_failure_is_preexisting_on_main(
             req.worktree, req.config, req.module_configs, req.task_files,
             verify, git_ops,
+            flake_sink=_main_probe_flake_sink(
+                req, event_store=event_store, escalation_queue=escalation_queue,
+            ),
         )
     except Exception:
         logger.warning(
@@ -3456,6 +3492,7 @@ async def _run_post_merge_verify(
         if main_health_probe_handles is None:
             main_health_outcome = await _classify_main_health_red(
                 git_ops, req, verify, event_store,
+                escalation_queue=escalation_queue,
             )
             if main_health_outcome is not None:
                 return main_health_outcome
@@ -5560,6 +5597,8 @@ async def reverify_member_solo(
     module_configs: list[ModuleConfig],
     event_store: EventStore | None = None,
     verifier: VerifyPort = PRODUCTION_VERIFIER,
+    *,
+    escalation_queue: Any = None,
 ) -> SoloVerifyResult:
     """Run post-merge verification on a single train member's un-stacked solo branch.
 
@@ -5597,6 +5636,9 @@ async def reverify_member_solo(
         event_store:    Optional EventStore for telemetry (may be None).
         verifier:       Forwarded to :func:`_run_post_merge_verify`; tests
                         inject a fake through it.
+        escalation_queue: Forwarded to :func:`_run_post_merge_verify`, so a
+                        flake the main-health probe suppresses can still file
+                        the INV-4 storm escalation.
 
     Returns:
         :class:`SoloVerifyResult` with passed/failed verdict and reason.
@@ -5621,6 +5663,7 @@ async def reverify_member_solo(
         event_store=event_store,
         merge_sha=tip_sha,
         verifier=verifier,
+        escalation_queue=escalation_queue,
     )
     if outcome is None:
         # Pass: hand off the live worktree+branch to _attribute_train_failure.
