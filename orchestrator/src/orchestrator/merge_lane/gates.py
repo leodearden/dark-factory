@@ -913,7 +913,10 @@ async def _finalize_advanced_merge(
     from :class:`~orchestrator.git_ops.AdvanceOutcome`.advanced_sha (task
     1997) — callers must pass ``outcome.advanced_sha`` from the
     ``advance_main`` call that preceded this one.  ``None`` (e.g. no rebase
-    occurred) falls back to *merge_commit_fallback*.
+    occurred) falls back to *merge_commit_fallback*.  One caller lands nothing
+    itself: ``worker.py::SpeculativeMergeWorker._finalize_landed_by_successor``
+    passes a verified commit a later landing already carried onto main, so
+    there *advanced_sha* is on main but behind its tip (task 7196).
     """
     cas_retries.pop(req.task_id, None)
     timeouts.pop(req.task_id, None)
@@ -1029,8 +1032,11 @@ async def _finalize_advanced_merge(
     # so consecutive tip-advances count is cleared for this branch.
     if chain_ctx is not None:
         chain_ctx.counts.pop(req.branch.bare_id, None)
-    # Main is now at *advanced_sha* and every post-advance gate passed, so this
-    # tip is one a green gate run has been observed on.  Recorded here — the
+    # *advanced_sha* is on main and every post-advance gate passed, so it is a
+    # commit a green gate run has been observed on.  For every caller but
+    # _finalize_landed_by_successor it is main's tip; that caller's sha sits
+    # behind the tip and can never be a rebase target, so recording it is
+    # inert there.  Recorded here — the
     # single clean-landing return shared by the speculative CAS advance and the
     # train pipeline — so that a LATER request rebased onto it may trust the
     # disjoint-delta fast path (premise P2 in _disjoint_skip_blockers).  A tip

@@ -21220,11 +21220,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     return True
 
                 if result == 'rebased_pending_reverify':
-                    # ι=1894: count this as a merge retry — main advanced under the
-                    # request, so a fresh re-verify is required.  Both cas_failed and
-                    # rebased_pending_reverify are included in retries_per_landing (see
-                    # _note_merge_retry docstring for the rationale).
-                    self._note_merge_retry()
                     rebased_sha, rebased_from, rebased_onto = _rebased_tip(adv_outcome, req.task_id)
                     if await self._git_ops.is_ancestor_checked(current_sha, rebased_onto) is True:
                         await self._finalize_landed_by_successor(
@@ -21233,6 +21228,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         advanced = True
                         return True
+                    # ι=1894: count this as a merge retry — main advanced under the
+                    # request, so a fresh re-verify is required.  Both cas_failed and
+                    # rebased_pending_reverify are included in retries_per_landing (see
+                    # _note_merge_retry docstring for the rationale).
+                    self._note_merge_retry()
 
                     self._note_transition(
                         req.request_id, ItemLifecycleState.FINALIZING,

@@ -237,7 +237,7 @@ async def test_in_flight_follower_of_a_carried_head_is_not_cascaded(tmp_path: Pa
         event_store=_RecordingEventStore(),
     )
     async with running_lane(lane) as run:
-        _inject_two_host_allocator(lane, remote)
+        allocator = _inject_two_host_allocator(lane, remote)
         await queue.put(head)
         await queue.put(follower)
         await wait_responsive(head_entered.wait(), label="the head's verify to enter")
@@ -248,12 +248,14 @@ async def test_in_flight_follower_of_a_carried_head_is_not_cascaded(tmp_path: Pa
         follower_release.set()
         head_outcome = await run.outcome(head)
         follower_outcome = await run.outcome(follower)
+        hosts_free_after_both_landed = allocator.free_host_count()
 
     assert head_outcome.status == 'done', head_outcome
     assert head_outcome.merge_sha == head_merge_commit
     assert follower_outcome.status == 'done', follower_outcome
     remote.cancel_verify.assert_not_awaited()
     assert remote.run_merge_verify.await_count == 1
+    assert hosts_free_after_both_landed == 2
     assert _is_ancestor(scene.repo, successor, 'main')
     assert {'follower.txt', 'carried-head.txt', 'successor.txt'} <= set(
         _git(scene.repo, 'ls-tree', '-r', '--name-only', 'main').splitlines()
