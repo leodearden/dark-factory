@@ -20,7 +20,7 @@ from typing import Any
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import codebook, prescreen
+from legibility import codebook, config, embeddings, prescreen
 
 Vector = tuple[float, ...]
 
@@ -182,3 +182,98 @@ def rank(clusters: Iterable[Sequence[Item]]) -> tuple[QueuedCluster, ...]:
     representative's id."""
     by_id = sorted((_queued(members) for members in clusters), key=lambda q: q.representative.record_id or "")
     return tuple(sorted(by_id, key=lambda q: (q.sessions, _newness(q.representative)), reverse=True))
+
+
+_SCORE_PLACES = 4
+
+
+@dataclass(frozen=True)
+class Attach:
+    """*item* at cosine *score* to entry *entry_id*, at or above the attach
+    threshold."""
+
+    item: Item
+    entry_id: str
+    score: float
+
+
+@dataclass(frozen=True)
+class View:
+    """What one run's similarity stage decided, built once before verify.
+    With *skipped* set, nothing was decided and *requests* counts what the
+    failed attempt spent."""
+
+    settings: config.Adjudication
+    skipped: str | None = None
+    screened: tuple[Attach, ...] = ()
+    attaches: tuple[Attach, ...] = ()
+    queue: tuple[QueuedCluster, ...] = ()
+    depth: tuple[int, int] | None = None
+    requests: int = 0
+    embedded: int = 0
+    cached: int = 0
+    pruned: int = 0
+
+    @classmethod
+    def skipped_by(cls, reason: str, requests: int, settings: config.Adjudication) -> View:
+        return cls(settings=settings, skipped=reason, requests=requests)
+
+    @property
+    def model(self) -> str:
+        return self.settings.embedding_model
+
+    def screens(self, cluster: Mapping[str, Any]) -> bool:
+        """Whether novel *cluster* is screened onto an entry, so no verify
+        call is spent on it."""
+        return any(attach.item.title == cluster["title"] for attach in self.screened)
+
+    def select(self, limit: int) -> tuple[QueuedCluster, ...]:
+        return self.queue[:max(limit, 0)]
+
+
+def _attaches(index: Index, items: Iterable[Item], threshold: float) -> tuple[Attach, ...]:
+    return tuple(
+        Attach(item, nearest.entry.key, round(nearest.score, _SCORE_PLACES))
+        for item in items
+        if (nearest := index.nearest_entry(item)) is not None and nearest.score >= threshold
+    )
+
+
+def build_view(
+    cb: Mapping[str, Any],
+    novel_clusters: Sequence[Mapping[str, Any]],
+    *,
+    embedder: embeddings.Embedder,
+    settings: config.Adjudication,
+) -> View:
+    """Embed *cb*'s open entries and pending candidates and this run's
+    *novel_clusters*, then screen, attach and queue. Never raises for an
+    embedding or cache failure: the whole stage is skipped instead."""
+    items = items_of(cb, novel_clusters)
+    try:
+        embedded = embeddings.vectors_for(
+            [embeddings.Text(item.key, item.record_id, item.text) for item in items],
+            embedder=embedder,
+            model=settings.embedding_model,
+        )
+    except (embeddings.EmbeddingFailed, embeddings.VectorCacheError) as exc:
+        return View.skipped_by(str(exc), exc.requests_made, settings)
+    index = Index.of(items, embedded.vectors)
+    pending = [item for item in items if item.kind is Kind.PENDING]
+    attaches = _attaches(index, pending, settings.attach_min_similarity)
+    attached = {attach.item.key for attach in attaches}
+    rest = [item for item in pending if item.key not in attached]
+    queue = rank(index.clusters(rest, settings.cluster_min_similarity))
+    return View(
+        settings=settings,
+        screened=_attaches(
+            index, (item for item in items if item.kind is Kind.NOVEL), settings.attach_min_similarity,
+        ),
+        attaches=attaches,
+        queue=queue,
+        depth=(len(rest), len(queue)),
+        requests=embedded.requests,
+        embedded=embedded.embedded,
+        cached=embedded.cached,
+        pruned=embedded.pruned,
+    )
