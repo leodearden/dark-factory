@@ -8,8 +8,22 @@ from pathlib import Path
 
 import pytest
 
-from client_feed.contract import NOT_RECORDED, VerifyLeg
-from client_feed.sources.archive import ArchivedRun, read_archived_run
+from client_feed.contract import (
+    FEED_VERSION,
+    NOT_RECORDED,
+    CaseCounts,
+    CaseOutcome,
+    CaseResult,
+    VerifyLeg,
+    VerifyTestResults,
+)
+from client_feed.sources.archive import (
+    ArchivedRun,
+    ArchivedTests,
+    ArchiveProblem,
+    ArchiveReadError,
+    read_archived_run,
+)
 
 TASK_ID = 7
 BASE = datetime(2026, 10, 1, 10, 0, tzinfo=UTC)
@@ -277,3 +291,226 @@ def test_another_tasks_directory_is_never_read(tmp_path: Path, task_id: int) -> 
 
     assert run.legs == NOT_RECORDED
     assert run.tests is None
+
+
+SECRET_MESSAGE = 'assert 0.2 > 0.393'
+SECRET_TEXT = 'SECRET-TRACEBACK-TEXT /home/someone/private/test_a.py:12'
+
+
+def red(name: str, tag: str, type_attribute: str | None = None) -> str:
+    type_part = '' if type_attribute is None else f' type="{type_attribute}"'
+    return (
+        f'<testcase classname="tests.test_a" name="{name}" time="0.5">'
+        f'<{tag} message="{SECRET_MESSAGE}"{type_part}>{SECRET_TEXT}</{tag}>'
+        '</testcase>'
+    )
+
+
+def skipped(name: str, skip_type: str) -> str:
+    return (
+        f'<testcase classname="tests.test_a" name="{name}" time="0.0">'
+        f'<skipped type="{skip_type}" message="{SECRET_MESSAGE}">{SECRET_TEXT}</skipped>'
+        '</testcase>'
+    )
+
+
+def archived_tests(tmp_path: Path, *reports: bytes, max_cases: int = 100) -> ArchivedTests:
+    write_plan(tmp_path, at(0))
+    for index, report in enumerate(reports):
+        write_junit(tmp_path, at(1 + index), report, qualifiers=f'module{index}')
+    tests = read(tmp_path, at(60), max_cases=max_cases).tests
+    assert tests is not None
+    return tests
+
+
+def by_id(tests: ArchivedTests) -> dict[str, CaseResult]:
+    return {case.id: case for case in tests.cases}
+
+
+def test_b7_a_failed_case_reports_its_kind_never_its_message(tmp_path: Path) -> None:
+    tests = archived_tests(
+        tmp_path,
+        junit_xml(passed('test_ok'), red('test_ratio', 'failure'), passed('test_ok_too')),
+    )
+
+    ratio = by_id(tests)['tests.test_a::test_ratio']
+    assert tests.counts.failed == 1
+    assert tests.counts.passed == 2
+    assert ratio.outcome is CaseOutcome.FAILED
+    assert ratio.exception_type == 'failure'
+    assert SECRET_MESSAGE not in repr(tests)
+    assert SECRET_TEXT not in repr(tests)
+    assert '0.393' not in repr(tests)
+
+
+def test_a_failure_type_attribute_is_the_exception_type(tmp_path: Path) -> None:
+    tests = archived_tests(tmp_path, junit_xml(red('test_ratio', 'failure', 'AssertionError')))
+
+    assert tests.cases[0].exception_type == 'AssertionError'
+
+
+@pytest.mark.parametrize(
+    ('testcase', 'outcome', 'exception_type'),
+    [
+        (red('test_x', 'error'), CaseOutcome.ERRORED, 'error'),
+        (red('test_x', 'error', 'ImportError'), CaseOutcome.ERRORED, 'ImportError'),
+        (skipped('test_x', 'pytest.skip'), CaseOutcome.SKIPPED, None),
+        (skipped('test_x', 'pytest.xfail'), CaseOutcome.SKIPPED, None),
+        (passed('test_x'), CaseOutcome.PASSED, None),
+    ],
+    ids=['error', 'typed-error', 'skip', 'xfail', 'passed'],
+)
+def test_outcomes(
+    tmp_path: Path, testcase: str, outcome: CaseOutcome, exception_type: str | None
+) -> None:
+    case = archived_tests(tmp_path, junit_xml(testcase)).cases[0]
+
+    assert (case.outcome, case.exception_type) == (outcome, exception_type)
+    assert SECRET_TEXT not in repr(case)
+
+
+def test_the_first_outcome_child_decides(tmp_path: Path) -> None:
+    testcase = (
+        '<testcase classname="tests.test_a" name="test_x">'
+        '<skipped type="pytest.skip" message="m" /><error message="teardown" />'
+        '</testcase>'
+    )
+
+    assert archived_tests(tmp_path, junit_xml(testcase)).cases[0].outcome is CaseOutcome.SKIPPED
+
+
+@pytest.mark.parametrize(
+    ('attributes', 'case_id', 'duration_ms'),
+    [
+        ('classname="tests.test_a.TestK" name="test_y[p]" time="0.0405"', 'tests.test_a.TestK::test_y[p]', 40),
+        ('classname="" name="test_bare" time="2"', 'test_bare', 2000),
+        ('name="test_no_class"', 'test_no_class', None),
+    ],
+    ids=['classname', 'empty-classname', 'no-classname-no-time'],
+)
+def test_case_ids_and_durations(
+    tmp_path: Path, attributes: str, case_id: str, duration_ms: int | None
+) -> None:
+    case = archived_tests(tmp_path, junit_xml(f'<testcase {attributes} />')).cases[0]
+
+    assert (case.id, case.duration_ms) == (case_id, duration_ms)
+
+
+def test_the_run_duration_sums_its_suites(tmp_path: Path) -> None:
+    tests = archived_tests(
+        tmp_path,
+        junit_xml(passed('test_a'), suite_time='1.5'),
+        junit_xml(passed('test_b'), suite_time='2.25', wrapped=False),
+    )
+
+    assert tests.duration_ms == 3750
+    assert len(tests.cases) == 2
+
+
+def test_a_run_whose_suites_carry_no_time_has_no_duration(tmp_path: Path) -> None:
+    tests = archived_tests(tmp_path, junit_xml(passed('test_a'), suite_time=None))
+
+    assert tests.duration_ms is None
+
+
+def test_red_cases_lead_and_the_listing_is_cut_to_the_cap(tmp_path: Path) -> None:
+    report = junit_xml(
+        passed('test_p1'),
+        red('test_f1', 'failure'),
+        passed('test_p2'),
+        red('test_e1', 'error'),
+        passed('test_p3'),
+    )
+
+    tests = archived_tests(tmp_path, report, max_cases=2)
+
+    assert [case.id for case in tests.cases] == ['tests.test_a::test_f1', 'tests.test_a::test_e1']
+    assert tests.counts == CaseCounts(passed=3, failed=1, skipped=0, errored=1, truncated=3)
+
+
+def test_an_uncut_listing_still_leads_with_red(tmp_path: Path) -> None:
+    report = junit_xml(passed('test_p1'), red('test_e1', 'error'), red('test_f1', 'failure'))
+
+    tests = archived_tests(tmp_path, report, max_cases=100)
+
+    assert [case.id for case in tests.cases] == [
+        'tests.test_a::test_e1',
+        'tests.test_a::test_f1',
+        'tests.test_a::test_p1',
+    ]
+    assert tests.counts.truncated == 0
+
+
+def test_archived_tests_make_a_valid_test_results_event(tmp_path: Path) -> None:
+    report = junit_xml(
+        passed('test_p1'), red('test_f1', 'failure'), skipped('test_s1', 'pytest.skip')
+    )
+    tests = archived_tests(tmp_path, report, max_cases=1)
+
+    event = VerifyTestResults(
+        seq=1,
+        at=at(60),
+        project_id='p',
+        feed_version=FEED_VERSION,
+        run_key='k',
+        counts=tests.counts,
+        duration_ms=tests.duration_ms,
+        cases=tests.cases,
+    )
+
+    assert event.counts.truncated == 2
+
+
+def _assert_names_the_file(error: ArchiveReadError, tmp_path: Path, problem: ArchiveProblem) -> None:
+    assert error.problem is problem
+    assert str(error.relpath).startswith(f'data/verify-logs/{TASK_ID}/attempt-1.')
+    assert f'data/verify-logs/{TASK_ID}/attempt-1.' in str(error)
+    assert str(tmp_path) not in str(error)
+
+
+def _read_error(tmp_path: Path) -> ArchiveReadError:
+    with pytest.raises(ArchiveReadError) as caught:
+        read(tmp_path, at(60))
+    return caught.value
+
+
+@pytest.mark.parametrize(
+    'content',
+    [b'<testsuite/> but not gzip', gzip.compress(junit_xml(passed('test_a')))[:30]],
+    ids=['not-gzip', 'truncated-gzip'],
+)
+def test_an_unreadable_junit_raises_a_typed_error(tmp_path: Path, content: bytes) -> None:
+    write_plan(tmp_path, at(0))
+    path = write_junit(tmp_path, at(1), b'')
+    path.write_bytes(content)
+
+    _assert_names_the_file(_read_error(tmp_path), tmp_path, ArchiveProblem.UNREADABLE)
+
+
+@pytest.mark.parametrize(
+    'content',
+    [
+        b'<testsuites><testsuite>',
+        junit_xml('<testcase name="test_a" time="fast" />'),
+        junit_xml('<testcase name="test_a" time="-1" />'),
+        junit_xml(passed('test_a'), suite_time='soon'),
+    ],
+    ids=['unclosed', 'non-numeric-case-time', 'negative-case-time', 'non-numeric-suite-time'],
+)
+def test_a_malformed_junit_raises_a_typed_error(tmp_path: Path, content: bytes) -> None:
+    write_plan(tmp_path, at(0))
+    write_junit(tmp_path, at(1), content)
+
+    _assert_names_the_file(_read_error(tmp_path), tmp_path, ArchiveProblem.MALFORMED_JUNIT)
+
+
+@pytest.mark.parametrize(
+    'content',
+    ['{"category": "test_failure"}', 'not json', '[]', '{"category": "x", "commands": [{"label": "t", "rc": "1"}]}'],
+    ids=['no-commands', 'not-json', 'not-an-object', 'string-rc'],
+)
+def test_a_malformed_summary_raises_a_typed_error(tmp_path: Path, content: str) -> None:
+    write_plan(tmp_path, at(0))
+    write_summary(tmp_path, at(1)).write_text(content)
+
+    _assert_names_the_file(_read_error(tmp_path), tmp_path, ArchiveProblem.MALFORMED_SUMMARY)
