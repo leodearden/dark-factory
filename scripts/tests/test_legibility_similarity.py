@@ -9,7 +9,15 @@ import json
 import math
 
 import pytest
-from legibility import census_findings, codebook, config, embeddings, similarity, verdict
+from legibility import (
+    census_findings,
+    codebook,
+    config,
+    embeddings,
+    similarity,
+    trickle_state,
+    verdict,
+)
 
 _MODEL = 'text-embedding-3-small'
 
@@ -687,3 +695,127 @@ class TestAdjudicationReport:
         [skipped] = [line for line in lines if 'HTTP 503' in line]
         assert 'no similarity attach' in skipped
         assert 'no queue adjudication' in skipped
+
+
+# ---------------------------------------------------------------------------
+# The queue CLI: the L7 signal, read-only, spending embeddings only
+# ---------------------------------------------------------------------------
+
+_CLOSE = 0.88
+_CLI_VECTORS = {
+    'Entry A': [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    'Near A': [0.95, math.sqrt(1 - 0.95 ** 2), 0.0, 0.0, 0.0, 0.0],
+    'Pair older': [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+    'Pair newer': [0.0, 0.0, _CLOSE, math.sqrt(1 - _CLOSE ** 2), 0.0, 0.0],
+    'Lone': [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+}
+
+
+class _EmbeddingsResponse:
+    def __init__(self, status_code: int, body: object = None, text: str = '') -> None:
+        self.status_code = status_code
+        self._body = body
+        self.text = text
+
+    def json(self) -> object:
+        return self._body
+
+
+class _EmbeddingsPost:
+    """The embeddings endpoint: each posted input gets its _CLI_VECTORS vector,
+    or every request answers *status_code*. Records each URL posted to."""
+
+    def __init__(self, status_code: int = 200) -> None:
+        self.urls: list[str] = []
+        self._status_code = status_code
+
+    def __call__(self, url: str, **kwargs) -> _EmbeddingsResponse:
+        self.urls.append(url)
+        if self._status_code != 200:
+            return _EmbeddingsResponse(self._status_code, text='upstream unavailable')
+        texts = kwargs['json']['input']
+        return _EmbeddingsResponse(200, {
+            'data': [{'index': index, 'embedding': _CLI_VECTORS[text]} for index, text in enumerate(texts)],
+        })
+
+
+def _cli_project(tmp_path, monkeypatch):
+    """A project root whose codebook holds entry-a, a candidate near it, a
+    two-session pair and a singleton; returns (root, codebook path)."""
+    root = tmp_path / 'project'
+    legibility_dir = root / 'docs' / 'legibility'
+    legibility_dir.mkdir(parents=True)
+    (legibility_dir / 'legibility.yaml').write_text(
+        f'project_id: dark_factory\nproject_root: {root}\nescalation_port: 8103\ncwd_prefixes:\n  - {root}\n',
+        encoding='utf-8',
+    )
+    codebook_path = legibility_dir / 'confusion-codebook.yaml'
+    codebook.dump(_codebook(
+        entries=[_entry('entry-a', 'Entry A')],
+        candidates=[
+            _candidate('cand-20260801-1', 'Near A', cause=None, sessions=('s-1',)),
+            _candidate('cand-20260802-1', 'Pair older', cause=None, first_seen='2026-08-02', sessions=('s-2',)),
+            _candidate('cand-20260803-1', 'Pair newer', cause=None, first_seen='2026-08-03', sessions=('s-3',)),
+            _candidate('cand-20260804-1', 'Lone', cause=None, first_seen='2026-08-04', sessions=('s-4',)),
+        ],
+    ), codebook_path)
+    monkeypatch.setenv(embeddings.OPENAI_API_KEY_ENV, 'sk-test-cli-key')
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / 'state'))
+    return root, codebook_path
+
+
+class TestQueueCli:
+    def test_prints_the_queue_from_a_read_only_codebook(self, tmp_path, monkeypatch, capsys, install_fake_httpx):
+        root, codebook_path = _cli_project(tmp_path, monkeypatch)
+        before = codebook_path.read_bytes()
+        post = _EmbeddingsPost()
+        install_fake_httpx(post)
+
+        exit_code = similarity.main(['queue', '--project-root', str(root)])
+
+        out = capsys.readouterr().out
+        assert exit_code == 0
+        lines = out.splitlines()
+        assert _MODEL in out
+        [depth] = [line for line in lines if 'queue depth' in line]
+        assert '3 pending candidate' in depth and '2 cluster' in depth
+        assert 'attachable now: 1 ' in out
+        [pair] = [index for index, line in enumerate(lines) if 'cand-20260803-1' in line]
+        [lone] = [index for index, line in enumerate(lines) if 'cand-20260804-1' in line]
+        assert pair < lone
+        assert '"Pair newer"' in lines[pair] and '2 member' in lines[pair] and '2 session' in lines[pair]
+        assert '"Lone"' in lines[lone] and '1 member' in lines[lone] and '1 session' in lines[lone]
+        assert codebook_path.read_bytes() == before
+        assert post.urls and set(post.urls) == {embeddings.OPENAI_EMBEDDINGS_URL}
+
+    def test_top_bounds_the_clusters_listed(self, tmp_path, monkeypatch, capsys, install_fake_httpx):
+        root, _ = _cli_project(tmp_path, monkeypatch)
+        install_fake_httpx(_EmbeddingsPost())
+
+        exit_code = similarity.main(['queue', '--project-root', str(root), '--top', '1'])
+
+        out = capsys.readouterr().out
+        assert exit_code == 0
+        assert 'cand-20260803-1' in out
+        assert 'cand-20260804-1' not in out
+
+    def test_an_unavailable_endpoint_prints_the_skip_reason_and_exits_1(
+        self, tmp_path, monkeypatch, capsys, install_fake_httpx,
+    ):
+        root, codebook_path = _cli_project(tmp_path, monkeypatch)
+        before = codebook_path.read_bytes()
+        install_fake_httpx(_EmbeddingsPost(status_code=503))
+
+        exit_code = similarity.main(['queue', '--project-root', str(root)])
+
+        out = capsys.readouterr().out
+        assert exit_code == 1
+        [skipped] = [line for line in out.splitlines() if 'similarity stage skipped:' in line]
+        assert 'HTTP 503' in skipped
+        assert codebook_path.read_bytes() == before
+
+    def test_a_missing_project_root_is_a_usage_error(self, capsys):
+        with pytest.raises(SystemExit) as exited:
+            similarity.main(['queue'])
+
+        assert exited.value.code == 2
