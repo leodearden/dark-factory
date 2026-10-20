@@ -3913,6 +3913,36 @@
           "current": 6554
         }
       ]
+    },
+    {
+      "task_id": "3788",
+      "reason": "net-additive bug fix: both main-health probe sites now bind the task-mu fork's flake sink to the flake recorder (one private factory, the escalation queue threaded into _classify_main_health_red), so a load-flaked wholly-preexisting verdict is recorded and reaches the INV-4 storm escalation instead of halting the queue",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22258,
+          "current": 22295
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12521,
+          "current": 12525
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57388,
+          "current": 57425
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31638,
+          "current": 31642
+        }
+      ]
     }
   ]
 }
