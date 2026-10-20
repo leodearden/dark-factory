@@ -290,6 +290,7 @@ def test_a_root_that_is_no_repository_is_refused(
 
     assert refusal.problem is PolicyProblem.NOT_A_REPOSITORY_ROOT
     assert minimal['project_root'] in str(refusal)
+    assert 'not a usable git work tree' in refusal.detail
 
 
 def test_a_root_inside_a_repository_but_not_its_top_is_refused(

@@ -1,5 +1,6 @@
 """Read-only git plumbing confined to one root, over throwaway repositories."""
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -48,12 +49,28 @@ def test_repository_toplevel_of_a_subdirectory_is_the_enclosing_root(repo: Repo)
     assert repository_toplevel(repo.root / 'pkg') == repo.root.resolve()
 
 
-def test_repository_toplevel_is_none_outside_a_repository(tmp_path: Path) -> None:
+def test_repository_toplevel_outside_a_repository_raises_with_gits_own_reason(
+    tmp_path: Path,
+) -> None:
     plain = tmp_path / 'plain'
     plain.mkdir()
 
-    assert repository_toplevel(plain) is None
-    assert repository_toplevel(tmp_path / 'missing') is None
+    with pytest.raises(GitError) as caught:
+        repository_toplevel(plain)
+
+    assert caught.value.returncode == 128
+    assert caught.value.reason != str(caught.value)
+    assert '\n' not in caught.value.reason
+    assert str(plain) not in str(caught.value)
+
+
+def test_repository_toplevel_of_a_missing_root_raises_with_the_os_reason(tmp_path: Path) -> None:
+    with pytest.raises(GitError) as caught:
+        repository_toplevel(tmp_path / 'missing')
+
+    assert caught.value.returncode is None
+    assert 'missing' in caught.value.reason
+    assert str(tmp_path) not in str(caught.value)
 
 
 def test_main_head_reads_main_even_while_another_branch_is_checked_out(repo: Repo) -> None:
@@ -154,6 +171,14 @@ def test_a_non_hex_commit_is_refused_before_git_runs(tmp_path: Path, commit: str
         tree_entries(tmp_path / 'missing', commit)
 
 
+@pytest.mark.parametrize('since', [None, 'a' * 40], ids=['full-walk', 'incremental'])
+def test_last_changes_refuses_a_non_hex_head_before_git_runs(
+    tmp_path: Path, since: str | None
+) -> None:
+    with pytest.raises(ValueError, match='sha'):
+        last_changes(tmp_path / 'missing', '--output=x', since=since)
+
+
 def test_a_non_hex_blob_is_refused_before_it_is_requested(repo: Repo) -> None:
     with pytest.raises(ValueError, match='sha'), blob_reader(repo.root) as read:
         read(f'{"a" * 40}\n{"b" * 40}')
@@ -179,6 +204,17 @@ def test_task_branches_report_how_far_each_is_ahead_of_main(repo: Repo) -> None:
         Branch(name='task/7', task_id=7, ahead=2, last_commit_at=T2),
         Branch(name='task/8', task_id=8, ahead=0, last_commit_at=T1),
         Branch(name='task/spike', task_id=None, ahead=0, last_commit_at=T0),
+    )
+
+
+def test_a_task_branch_whose_name_is_not_utf8_is_skipped(repo: Repo) -> None:
+    repo.write('a.txt', 'a\n')
+    repo.commit('base', when=T0)
+    repo.branch(os.fsdecode(b'task/\xff9'))
+    repo.branch('task/9')
+
+    assert task_branches(repo.root) == (
+        Branch(name='task/9', task_id=9, ahead=0, last_commit_at=T0),
     )
 
 

@@ -55,6 +55,12 @@ class GitError(Exception):
         self.stderr = stderr
         super().__init__(f'git {subcommand} failed (rc {returncode})')
 
+    @property
+    def reason(self) -> str:
+        """git's own first line of complaint, else the str; it may name paths, so it is for the operator only."""
+        lines = self.stderr.strip().splitlines()
+        return lines[0] if lines else str(self)
+
 
 def _git_env() -> dict[str, str]:
     kept = {
@@ -104,13 +110,13 @@ def _require_sha(value: str) -> str:
     return value
 
 
-def repository_toplevel(root: Path) -> Path | None:
-    """The top of the work tree containing `root`, or None when `root` is in none."""
-    if not root.is_dir():
-        return None
-    completed = _run(root, 'rev-parse', '--show-toplevel', ok_returncodes=(0, 128))
-    if completed.returncode != 0:
-        return None
+def repository_toplevel(root: Path) -> Path:
+    """The top of the work tree containing `root`; a GitError whose reason says why there is none usable.
+
+    A missing root, a root in no repository and a repository git refuses (dubious ownership: host
+    config, and so safe.directory, is off here) all fail alike, each with git's or the OS's own reason.
+    """
+    completed = _run(root, 'rev-parse', '--show-toplevel')
     return Path(os.fsdecode(completed.stdout.rstrip(b'\n')))
 
 
@@ -237,8 +243,13 @@ def _task_id(branch: str) -> int | None:
     return int(suffix)
 
 
-def _branch(record: bytes) -> Branch:
-    refname, unix, ahead_behind = record.decode().split('\0')
+def _branch(record: bytes) -> Branch | None:
+    """One for-each-ref record; None for a ref whose name is not UTF-8, which no feed record can carry."""
+    raw_refname, unix, ahead_behind = record.split(b'\0')
+    try:
+        refname = raw_refname.decode()
+    except UnicodeDecodeError:
+        return None
     name = refname.removeprefix(_BRANCH_REFS)
     return Branch(
         name=name,
@@ -249,7 +260,7 @@ def _branch(record: bytes) -> Branch:
 
 
 def task_branches(root: Path) -> tuple[Branch, ...]:
-    """Every refs/heads/task/* branch, by name, with its count of commits main does not have."""
+    """Every refs/heads/task/* branch with a UTF-8 name, by name, with its count of commits main does not have."""
     output = _run(
         root,
         'for-each-ref',
@@ -257,7 +268,7 @@ def task_branches(root: Path) -> tuple[Branch, ...]:
         f'{_BRANCH_REFS}{TASK_BRANCH_PREFIX}',
     ).stdout
     branches = (_branch(record) for record in output.split(b'\n') if record)
-    return tuple(sorted(branches, key=lambda branch: branch.name))
+    return tuple(sorted(filter(None, branches), key=lambda branch: branch.name))
 
 
 @dataclass(frozen=True)
@@ -330,7 +341,8 @@ def _commit_changes(record: bytes) -> tuple[datetime, list[str]]:
 
 def last_changes(root: Path, head: str, *, since: str | None) -> dict[str, datetime]:
     """For each path changed on `head`'s first-parent chain (after `since`), its newest change's committer time."""
-    revisions = _require_sha(head) if since is None else f'{_require_sha(since)}..{head}'
+    head = _require_sha(head)
+    revisions = head if since is None else f'{_require_sha(since)}..{head}'
     output = _run(
         root,
         'log', '--first-parent', _FIRST_PARENT_DIFF, '--no-renames', '--format=%x01%ct',

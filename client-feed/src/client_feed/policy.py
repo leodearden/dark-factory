@@ -243,14 +243,13 @@ def _require_repository_root(config: Path, policy: Policy) -> None:
         raise PolicyError(
             config=config,
             problem=PolicyProblem.NOT_A_REPOSITORY_ROOT,
-            detail=f'project_root {root} could not be checked: {exc}',
+            detail=f'project_root {root} is not a usable git work tree: {exc.reason}',
         ) from exc
-    if toplevel is None or toplevel != root.resolve():
-        where = 'is in no git work tree' if toplevel is None else f'is inside the work tree {toplevel}'
+    if toplevel != root.resolve():
         raise PolicyError(
             config=config,
             problem=PolicyProblem.NOT_A_REPOSITORY_ROOT,
-            detail=f'project_root {root} {where}, not at its top',
+            detail=f'project_root {root} is inside the work tree {toplevel}, not at its top',
         )
 
 
