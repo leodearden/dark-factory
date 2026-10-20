@@ -6,19 +6,27 @@ from pathlib import Path
 import pytest
 from _git_repo import Repo, make_repo
 
+from client_feed.contract import Branch
 from client_feed.sources.git import (
     EntryKind,
     GitError,
+    MergeStats,
     TreeEntry,
     blob_reader,
+    generated_paths,
+    is_ancestor,
+    last_changes,
     main_head,
+    merge_stats,
     repository_toplevel,
+    task_branches,
     tree_entries,
 )
 
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 T1 = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
 T2 = datetime(2026, 1, 3, 12, 0, tzinfo=UTC)
+T3 = datetime(2026, 1, 4, 12, 0, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -149,3 +157,131 @@ def test_a_non_hex_commit_is_refused_before_git_runs(tmp_path: Path, commit: str
 def test_a_non_hex_blob_is_refused_before_it_is_requested(repo: Repo) -> None:
     with pytest.raises(ValueError, match='sha'), blob_reader(repo.root) as read:
         read(f'{"a" * 40}\n{"b" * 40}')
+
+
+def test_task_branches_report_how_far_each_is_ahead_of_main(repo: Repo) -> None:
+    repo.write('a.txt', 'a\n')
+    repo.commit('base', when=T0)
+    for name in ('task/7', 'task/8', 'task/spike', 'feature/x'):
+        repo.branch(name)
+    repo.checkout('task/7')
+    repo.write('seven.txt', '1\n')
+    repo.commit('seven one', when=T1)
+    repo.write('seven.txt', '2\n')
+    repo.commit('seven two', when=T2)
+    repo.checkout('task/8')
+    repo.write('eight.txt', '8\n')
+    repo.commit('eight', when=T1)
+    repo.checkout('main')
+    repo.merge_no_ff('task/8', 'Merge task/8 into main', when=T3)
+
+    assert task_branches(repo.root) == (
+        Branch(name='task/7', task_id=7, ahead=2, last_commit_at=T2),
+        Branch(name='task/8', task_id=8, ahead=0, last_commit_at=T1),
+        Branch(name='task/spike', task_id=None, ahead=0, last_commit_at=T0),
+    )
+
+
+def test_no_task_branches_is_empty(repo: Repo) -> None:
+    repo.write('a.txt', 'a\n')
+    repo.commit('base', when=T0)
+    repo.branch('feature/x')
+
+    assert task_branches(repo.root) == ()
+
+
+def test_merge_stats_count_what_the_merge_landed_on_main(repo: Repo) -> None:
+    repo.write('a.txt', 'one\ntwo\n')
+    repo.commit('base', when=T0)
+    repo.branch('task/7')
+    repo.checkout('task/7')
+    repo.write('a.txt', 'one\nTWO\nthree\n')
+    repo.write('b.txt', 'x\ny\nz\n')
+    repo.commit('work', when=T1)
+    repo.checkout('main')
+    repo.write('c.txt', 'c\n')
+    repo.commit('meanwhile on main', when=T1)
+    merge = repo.merge_no_ff('task/7', 'Merge task/7 into main', when=T2)
+
+    assert merge_stats(repo.root, merge) == MergeStats(files_changed=2, insertions=5, deletions=1)
+
+
+def test_merge_stats_of_a_root_commit_count_its_files(repo: Repo) -> None:
+    repo.write('a.txt', 'one\ntwo\n')
+    repo.write('b.txt', 'b\n')
+    root_commit = repo.commit('base', when=T0)
+
+    assert merge_stats(repo.root, root_commit) == MergeStats(
+        files_changed=2, insertions=3, deletions=0
+    )
+
+
+def test_merge_stats_count_a_pure_rename_as_one_unchanged_file(repo: Repo) -> None:
+    repo.write('old name.txt', ''.join(f'line {n}\n' for n in range(20)))
+    repo.commit('base', when=T0)
+    (repo.root / 'old name.txt').rename(repo.root / 'new name.txt')
+    rename = repo.commit('rename', when=T1)
+
+    assert merge_stats(repo.root, rename) == MergeStats(files_changed=1, insertions=0, deletions=0)
+
+
+def test_merge_stats_count_a_binary_file_without_lines(repo: Repo) -> None:
+    repo.write('a.txt', 'a\n')
+    repo.commit('base', when=T0)
+    repo.write('blob.bin', b'\x00\x01\x02\x00')
+    binary = repo.commit('binary', when=T1)
+
+    assert merge_stats(repo.root, binary) == MergeStats(files_changed=1, insertions=0, deletions=0)
+
+
+def test_generated_paths_read_linguist_attributes_at_the_commit(repo: Repo) -> None:
+    repo.write(
+        '.gitattributes',
+        'src/gen.py linguist-generated\n'
+        'src/gen2.py linguist-generated=true\n'
+        'src/x.py linguist-generated=false\n',
+    )
+    for name in ('gen', 'gen2', 'x', 'plain'):
+        repo.write(f'src/{name}.py', f'{name} = 1\n')
+    commit = repo.commit('base', when=T0)
+    repo.write('.gitattributes', 'src/plain.py linguist-generated\n')
+
+    generated = generated_paths(
+        repo.root, commit, ['src/gen.py', 'src/gen2.py', 'src/x.py', 'src/plain.py']
+    )
+
+    assert generated == frozenset({'src/gen.py', 'src/gen2.py'})
+
+
+def test_generated_paths_of_no_paths_spawns_no_git(tmp_path: Path) -> None:
+    assert generated_paths(tmp_path / 'missing', 'a' * 40, []) == frozenset()
+
+
+def test_last_changes_date_each_path_by_its_newest_first_parent_commit(repo: Repo) -> None:
+    repo.write('a.txt', 'a\n')
+    repo.write('b.txt', 'b\n')
+    repo.commit('base', when=T0)
+    repo.write('b.txt', 'b2\n')
+    second = repo.commit('b again', when=T1)
+    repo.branch('task/7')
+    repo.checkout('task/7')
+    repo.write('c.txt', 'c\n')
+    repo.commit('c on the branch', when=T2)
+    repo.checkout('main')
+    head = repo.merge_no_ff('task/7', 'Merge task/7 into main', when=T3)
+
+    assert last_changes(repo.root, head, since=None) == {'a.txt': T0, 'b.txt': T1, 'c.txt': T3}
+    assert last_changes(repo.root, head, since=second) == {'c.txt': T3}
+    assert last_changes(repo.root, head, since=head) == {}
+
+
+def test_is_ancestor(repo: Repo) -> None:
+    repo.write('a.txt', 'a\n')
+    first = repo.commit('base', when=T0)
+    repo.write('a.txt', 'b\n')
+    second = repo.commit('next', when=T1)
+
+    assert is_ancestor(repo.root, first, second)
+    assert is_ancestor(repo.root, first, first)
+    assert not is_ancestor(repo.root, second, first)
+    assert not is_ancestor(repo.root, '0' * 40, second)
