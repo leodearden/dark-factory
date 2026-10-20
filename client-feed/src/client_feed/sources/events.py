@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -25,7 +25,16 @@ from pydantic import (
 )
 from shared.project_layout import runs_db
 
-from client_feed.contract import CommitSha, NonNegativeInt, SchedulerState, Source, VerifyKind
+from client_feed.contract import (
+    NOT_RECORDED,
+    CommitSha,
+    NonNegativeInt,
+    NotRecorded,
+    ReviewCounts,
+    SchedulerState,
+    Source,
+    VerifyKind,
+)
 from client_feed.sources.store import read_only
 
 
@@ -456,3 +465,56 @@ def read_open_escalations(root: Path) -> OpenEscalations:
     for owner, escalation in opened.values():
         by_task[owner] = (*by_task.get(owner, ()), escalation)
     return OpenEscalations(by_task=MappingProxyType(by_task))
+
+
+class _ReviewCompleted(_Payload):
+    cycle: NonNegativeInt
+    blocking_count: NonNegativeInt
+    suggestion_count: NonNegativeInt
+    by_category: dict[str, NonNegativeInt]
+
+
+def _review_queries(task_ids: tuple[str, ...]) -> tuple[_Query, _Query]:
+    marks = _placeholders(len(task_ids))
+    reviews = _Query(
+        f'SELECT task_id, {_payload_sql(_ReviewCompleted)} FROM events'
+        f' WHERE event_type = ? AND task_id IN ({marks}) ORDER BY id',
+        (StoreEventType.REVIEW_COMPLETED.value, *task_ids),
+    )
+    cycles = _Query(
+        f'SELECT task_id, SUM(review_cycles) FROM task_results'
+        f' WHERE task_id IN ({marks}) GROUP BY task_id',
+        task_ids,
+    )
+    return reviews, cycles
+
+
+def _review_counts(newest: _ReviewCompleted | None, cycles_total: int) -> ReviewCounts | NotRecorded:
+    """The newest valid review's counts; its cycle never under-reports the runs' lifetime total."""
+    if newest is None:
+        return NOT_RECORDED
+    return ReviewCounts(
+        cycles=max(newest.cycle, cycles_total),
+        blocking_count=newest.blocking_count,
+        suggestion_count=newest.suggestion_count,
+        by_category=newest.by_category,
+    )
+
+
+def read_review_counts(
+    root: Path, task_ids: Iterable[int]
+) -> dict[int, ReviewCounts | NotRecorded]:
+    """Each requested task's last recorded review counts, or not_recorded when runs.db holds none."""
+    requested = sorted(set(task_ids))
+    if not requested:
+        return {}
+    reviews, cycles = _read(root, *_review_queries(tuple(str(task_id) for task_id in requested)))
+    newest: dict[int, _ReviewCompleted] = {}
+    for task_id, payload in reviews:
+        parsed = _validated(_ReviewCompleted, payload)
+        if parsed is not None:
+            newest[int(task_id)] = parsed
+    totals = {int(task_id): total or 0 for task_id, total in cycles}
+    return {
+        task_id: _review_counts(newest.get(task_id), totals.get(task_id, 0)) for task_id in requested
+    }
