@@ -11333,6 +11333,39 @@ class TaskWorkflow:
         # to the gate's re-check below.
         return True
 
+    async def _consume_narrowing_exit_report(
+        self, *, merge_phase: bool,
+    ) -> WorkflowOutcome | None:
+        """Honour the exit report the merge-gate narrowing agent left, if any.
+
+        The narrowing pass runs the architect, which holds every ``report_*``
+        exit tool, so it may answer with an exit artifact instead of a
+        narrowed plan.  The three verdicts on the TASK (``already_done``,
+        ``unactionable_task``, ``false_premise``) are routed to their plan-phase
+        handlers, which carry their own validation, and a ``DONE`` /
+        ``BLOCKED`` outcome ends the submit.  The branch-scoped exits
+        (``ready_to_merge``, ``blocking_dependency``) mean nothing here — the
+        merge is already under way and the gate decides — so they are logged
+        and cleared unread; no report outlives the pass.  ``None`` means the
+        gate carries on.
+        """
+        assert self.artifacts is not None
+        for name, read, clear in (
+            ('ready_to_merge', self.artifacts.read_ready_to_merge,
+             self.artifacts.clear_ready_to_merge),
+            ('blocking_dependency', self.artifacts.read_blocking_dependency,
+             self.artifacts.clear_blocking_dependency),
+        ):
+            discarded = read()
+            if discarded is not None:
+                logger.warning(
+                    'Task %s: merge-gate narrowing pass wrote %s.json, which '
+                    'is not an exit at the merge gate — discarding: %s',
+                    self.task_id, name, json.dumps(discarded)[:500],
+                )
+                clear()
+        return await self._route_task_verdict_report(merge_phase=merge_phase)
+
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,
         *, merge_phase: bool = False,
@@ -11550,6 +11583,11 @@ class TaskWorkflow:
                             suggested_action='verify_landing_and_close',
                         )
                     narrowed = await self._try_narrow_plan(check.not_touched)
+                    exit_outcome = await self._consume_narrowing_exit_report(
+                        merge_phase=merge_phase,
+                    )
+                    if exit_outcome is not None:
+                        return exit_outcome
                     if narrowed:
                         # Re-check the (possibly narrowed) plan against the
                         # gate.  ``_task_files`` reads from ``self.plan``,
