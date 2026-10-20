@@ -230,6 +230,30 @@ def self_complement_band(
     )
 
 
+def complement_by_trial(
+    arm: list[ScoreRecord], incumbent: list[ScoreRecord], blocking_gt_by_diff: dict[str, set[str]],
+) -> list[dict]:
+    """Per trial both sides measured, *arm*'s complement over *incumbent*'s same trial."""
+    arm_by_trial = _measured_by_trial(arm)
+    inc_by_trial = _measured_by_trial(incumbent)
+    return [
+        {'trial': t, **_complement_row(arm_by_trial[t], inc_by_trial[t], blocking_gt_by_diff)}
+        for t in sorted(arm_by_trial.keys() & inc_by_trial.keys())
+    ]
+
+
+def clears_self_complement_band(
+    per_trial: list[dict], band: SelfComplementBand, min_trials: int = 3,
+) -> bool:
+    """Pre-registered D7 complement rule: in each of at least *min_trials* trials the
+    candidate's blocking complement share is strictly above the incumbent's own
+    run-to-run maximum (``self_complement_band``). No band or an undefined share fails."""
+    floor = band.blocking_max
+    return floor is not None and len(per_trial) >= min_trials and all(
+        row['blocking_share'] is not None and row['blocking_share'] > floor for row in per_trial
+    )
+
+
 def summarize_arm(
     name: str,
     records: list[ScoreRecord],
