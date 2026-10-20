@@ -1408,7 +1408,7 @@ class UsageGate:
         """The :class:`PoolFrozen` describing this gate right now."""
         return PoolFrozen(
             account_count=self.account_count,
-            capped_account_names=tuple(a.name for a in self._accounts if a.capped),
+            capped_account_names=self.capped_account_names,
             auth_failed_account_names=self.auth_failed_account_names,
             scope=scope,
         )
@@ -1537,6 +1537,8 @@ class UsageGate:
                                 'event': 'all_capped_park',
                                 'elapsed_s': round(now - self._park_started_at, 1),
                                 'account_count': self.account_count,
+                                'capped_accounts': list(self.capped_account_names),
+                                'auth_failed_accounts': list(self.auth_failed_account_names),
                                 'soonest_open_at': (
                                     self.soonest_resets_at.isoformat()
                                     if self.soonest_resets_at
@@ -2975,6 +2977,11 @@ class UsageGate:
     def auth_failed_account_names(self) -> tuple[str, ...]:
         """Names of the accounts currently AUTH_FAILED, in roster order."""
         return tuple(acct.name for acct in self._accounts if acct.auth_failed)
+
+    @property
+    def capped_account_names(self) -> tuple[str, ...]:
+        """Names of the accounts currently capped, in roster order."""
+        return tuple(acct.name for acct in self._accounts if acct.capped)
 
     @property
     def soonest_resets_at(self) -> datetime | None:
