@@ -2024,6 +2024,26 @@ def _pending_cluster(cb: dict, queued: similarity.QueuedCluster) -> dict:
     )
 
 
+def _escalate_skipped_similarity(reason: str, *, project_id: str, escalate_fn) -> None:
+    """Say once, loudly, that this run's similarity stage was skipped. The
+    escalation is best-effort: a raising *escalate_fn* never costs the run."""
+    detail = (
+        f"census: similarity stage skipped -- {reason}. No similarity attach and no queue "
+        "adjudication happened this run; the pending queue is unchanged, and the next run "
+        "retries the whole stage."
+    )
+    logger.warning("%s", detail)
+    try:
+        escalate_fn(
+            category="infra_issue",
+            severity="info",
+            summary=f"legibility census ({project_id}): similarity stage skipped -- {reason}",
+            detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort; the warning above is the real signal
+        logger.warning("census: similarity-skip escalation failed (best-effort): %s", exc)
+
+
 @dataclass(frozen=True)
 class QueueOutcome:
     """What the one queue verify call decided, or why it was inconclusive."""
@@ -2988,6 +3008,8 @@ def run_census(
     view = similarity.build_view(
         codebook_dict, screen.to_verify, embedder=embedder, settings=config.census.adjudication,
     )
+    if view.skipped is not None:
+        _escalate_skipped_similarity(view.skipped, project_id=project_id, escalate_fn=escalate_fn)
     novel_clusters = [cluster for cluster in screen.to_verify if not view.screens(cluster)]
     if max_verify_clusters is None:
         clusters_to_verify = novel_clusters
