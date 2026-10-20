@@ -49,6 +49,7 @@ from shared.task_metadata import RetryLedger
 from orchestrator.branch_stack import UnstackOutcome
 from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
+from orchestrator.deployed_sha import DeployedSha
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_recorder import (
@@ -9517,8 +9518,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         verifier: VerifyPort = PRODUCTION_VERIFIER,
         clock: ClockPort = PRODUCTION_CLOCK,
         remote_runners: Sequence[VerifyRunner] | None = None,
+        deployed_sha: DeployedSha | None = None,
     ):
         self._git_ops = git_ops
+        # Task 6565: handed to every RemoteRunner this worker builds.
+        self._deployed_sha = deployed_sha
         self._queue = queue
         self._event_store = event_store
         # Task η (AFK coverage gap): harness-owned handles for the
@@ -10867,7 +10871,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         project_root = getattr(self._git_ops, 'project_root', None)
         if project_root is not None:
             remotes = list(self._remote_runners) if self._remote_runners is not None else (
-                _build_remote_runners(config, project_root, quarantine=self._runner_quarantine)
+                _build_remote_runners(
+                    config, project_root,
+                    deployed_sha=self._deployed_sha, quarantine=self._runner_quarantine,
+                )
             )
             self._host_allocator = HostAllocator(
                 remotes, quarantine=self._runner_quarantine

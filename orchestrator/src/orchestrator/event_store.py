@@ -352,6 +352,12 @@ class EventType(StrEnum):
     # force-push arm.
     runner_stale = 'runner_stale'
     runner_synced = 'runner_synced'
+    # Task 6565 (design D1): the process's deployed sha is flagged — HEAD moved
+    # while the wire path was being imported (indeterminate), or a tracked
+    # wire-path file was dirty.  Emitted once at startup by
+    # Harness._announce_deployed_sha; data is DeployedSha.to_wire():
+    # {sha, indeterminate, dirty_wire_path}.  The remote gate stays in use.
+    deployed_sha_indeterminate = 'deployed_sha_indeterminate'
     # INV-3 chain-intact enforcement (PRD plans/merge-verdict-integrity-prd.md
     # §3.7 new vocab).  Emitted whenever a verdict (PASS or FAIL) is VOIDED
     # because its verified tree no longer chains onto a still-live prefix — the

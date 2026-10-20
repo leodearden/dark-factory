@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import functools
+import importlib
 import json
 import logging
 import os
@@ -247,6 +248,13 @@ def main(verbose: bool):
 def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | None,
         force_dirty_start: bool, retag_modules: bool, until_idle: bool):
     """Run the orchestrator against a PRD, or execute existing tasks if no PRD given."""
+    from orchestrator.deployed_sha import capture_deployed_sha, resolve_code_checkout
+
+    # Task 6565 (D1): importing the harness loads the whole verify wire path, so
+    # bracketing this one import records which commit the process runs.
+    deployed_sha = capture_deployed_sha(
+        resolve_code_checkout(), lambda: importlib.import_module('orchestrator.harness'),
+    )
     from orchestrator.harness import Harness
 
     delay_secs = _parse_duration(delay) if delay else 0
@@ -255,7 +263,15 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
     except ConfigRequiredError as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
-    harness = Harness(config)
+    if deployed_sha is None and config.enabled_verify_runners:
+        click.echo(
+            'Error: a remote verify runner is enabled but this process cannot read the '
+            'commit it runs (no readable git checkout above its code); the remote gate '
+            'needs that sha (task 6565). Run from a git checkout or disable the runner.',
+            err=True,
+        )
+        sys.exit(1)
+    harness = Harness(config, deployed_sha=deployed_sha)
     logger = logging.getLogger(__name__)
 
     async def _main():

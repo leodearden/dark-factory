@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.types import MergeRequest
@@ -34,7 +35,6 @@ from orchestrator.verify_runner import (
     RemoteRunner,
     VerifyRunnerPool,
     build_merge_verify_spec,
-    resolve_local_df_checkout,
 )
 
 if TYPE_CHECKING:
@@ -49,6 +49,7 @@ def _build_remote_runners(
     config: OrchestratorConfig,
     cwd: str | Path,
     *,
+    deployed_sha: DeployedSha | None = None,
     quarantine: set[str] | None = None,
 ) -> list[RemoteRunner]:
     """Build the list of RemoteRunner instances from operator config (Lever C).
@@ -68,8 +69,11 @@ def _build_remote_runners(
     auto-sync OFF / byte-identical) and df_local_checkout=the dispatcher's own
     DF code root, resolved ONCE here (call-invariant) and shared across every
     runner so sync_if_stale can HEAD-compare remote-vs-local at dispatch.
+
+    *deployed_sha* (task 6565) is the commit this process's wire path was
+    imported from; every runner receives it.
     """
-    _local_df = resolve_local_df_checkout()
+    _local_df = resolve_code_checkout()
     return [
         RemoteRunner(
             name=r.name,
@@ -80,6 +84,7 @@ def _build_remote_runners(
             main_branch=config.git.main_branch,
             df_remote_checkout=r.df_checkout_path,
             df_local_checkout=_local_df,
+            deployed_sha=deployed_sha,
         )
         for r in config.enabled_verify_runners
         if quarantine is None or r.name not in quarantine

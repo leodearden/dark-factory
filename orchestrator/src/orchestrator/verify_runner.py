@@ -61,6 +61,7 @@ from typing import (
 
 from orchestrator import flake_ledger, verify
 from orchestrator.config import EnvProbeConfig, ModuleConfig, VerifyHostPolicy
+from orchestrator.deployed_sha import DeployedSha
 from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_to_json
 from orchestrator.verify import (
     VerifyResult,
@@ -110,7 +111,6 @@ __all__ = [
     "SyncOutcome",
     "REMOTE_LIVENESS_CMD",
     "REMOTE_TOOL_PATH_PRELUDE",
-    "resolve_local_df_checkout",
     "build_merge_verify_spec",
     "_module_config_from_command",
     "run_merge_verify_on_worktree",
@@ -1222,29 +1222,6 @@ class SyncOutcome:
     detail: str | None = None
 
 
-def resolve_local_df_checkout(start: Path | None = None) -> Path | None:
-    """Walk up from *start* to the Dark-Factory repo root (the ``.git`` marker).
-
-    *start* defaults to this module's own file (``Path(__file__)``), so the
-    running orchestrator resolves its OWN source checkout — the trust anchor
-    whose HEAD a remote runner's DF checkout is compared against (INV-2).
-
-    Returns the first ancestor directory containing a ``.git`` entry — a
-    directory in the main checkout, a FILE in a linked git worktree — or
-    ``None`` when no such ancestor exists.  ``None`` is the fail-safe: callers
-    treat an unresolvable local checkout as "auto-sync disabled" (opt-in),
-    never as an error.
-    """
-    here = Path(__file__).resolve() if start is None else start
-    # A file start begins the walk at its parent; a directory start is itself a
-    # candidate.  Either way we ascend to the filesystem root.
-    candidates = [here, *here.parents] if here.is_dir() else list(here.parents)
-    for d in candidates:
-        if (d / '.git').exists():
-            return d
-    return None
-
-
 RemoteVerifySubcommand = Literal['verify-merge', 'verify-task']
 # The single home of the remote verify process pattern.
 REMOTE_VERIFY_PROCESS_PATTERN: str = '|'.join(get_args(RemoteVerifySubcommand))
@@ -1334,6 +1311,7 @@ class RemoteRunner:
         main_branch: str | None = None,
         df_remote_checkout: str | None = None,
         df_local_checkout: str | Path | None = None,
+        deployed_sha: DeployedSha | None = None,
         run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
         ssh_run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
         heartbeat_interval: float | None = None,
@@ -1352,6 +1330,9 @@ class RemoteRunner:
         # _git_remote/_cwd, which are the PROJECT checkout.
         self._df_remote_checkout = df_remote_checkout
         self._df_local_checkout = df_local_checkout
+        # Task 6565: the commit this process's wire path was imported from — the
+        # sha the remote gate must run.
+        self.deployed_sha = deployed_sha
         # Per-runner lock serialising the mutating sync (pull + `uv sync
         # --all-packages` + the post-sync liveness probe) so two concurrent
         # dispatches never `git pull` the same checkout at once (PRD §3.1).

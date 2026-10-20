@@ -8836,7 +8836,8 @@ class TestRemoteRunnerSshRunSeam:
 
 # ---------------------------------------------------------------------------
 # INV-2 (task 2884, plans/merge-verdict-integrity-prd.md §1, §3.1):
-#   SyncOutcome frozen dataclass + resolve_local_df_checkout() helper
+#   SyncOutcome frozen dataclass (the checkout ascent moved to
+#   orchestrator/tests/test_deployed_sha.py with orchestrator.deployed_sha)
 # ---------------------------------------------------------------------------
 
 
@@ -8885,40 +8886,6 @@ class TestSyncOutcome:
         assert out.local_head is None
         assert out.remote_head is None
         assert out.detail is None
-
-
-class TestResolveLocalDfCheckout:
-    """resolve_local_df_checkout walks up to the DF repo root (.git dir/file), None on miss."""
-
-    def test_returns_repo_root_containing_dot_git_from_source_tree(self):
-        from orchestrator.verify_runner import resolve_local_df_checkout
-
-        root = resolve_local_df_checkout()
-        assert root is not None
-        assert isinstance(root, Path)
-        # The stop condition is a `.git` entry (dir in the main checkout, file in
-        # a linked worktree) — either way it must exist on the returned root.
-        assert (root / '.git').exists()
-
-    def test_returns_none_when_start_has_no_git_ancestor(self, tmp_path, monkeypatch):
-        """Fail-safe: no `.git` discoverable on the walk yields None → auto-sync
-        stays inert.  We neutralise the ambient filesystem (a stray `/tmp/.git`
-        exists on some hosts, which would otherwise be found on the walk up from
-        a tmp_path) by forcing every `.git` existence probe to miss."""
-        from orchestrator import verify_runner
-        from orchestrator.verify_runner import resolve_local_df_checkout
-
-        monkeypatch.setattr(verify_runner.Path, 'exists', lambda self: False)
-        assert resolve_local_df_checkout(start=tmp_path) is None
-
-    def test_finds_git_root_from_nested_start(self, tmp_path):
-        """A `.git` marker at an ancestor of the start path is discovered on the walk up."""
-        from orchestrator.verify_runner import resolve_local_df_checkout
-
-        (tmp_path / '.git').mkdir()
-        nested = tmp_path / 'a' / 'b' / 'c'
-        nested.mkdir(parents=True)
-        assert resolve_local_df_checkout(start=nested) == tmp_path
 
 
 # ---------------------------------------------------------------------------

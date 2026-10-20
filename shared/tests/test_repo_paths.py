@@ -93,7 +93,7 @@ class TestResolveDarkFactoryRoot:
         """The walk is keyed on the MARKER, so an inner `.git` cannot terminate it.
 
         Regression pin for the reason this module does not reuse
-        verify_runner.resolve_local_df_checkout: that helper returns the FIRST
+        deployed_sha.resolve_code_checkout: that helper returns the FIRST
         ancestor containing `.git` and stops.  Under a dark-factory checkout
         nested inside an outer git repo (vendored tree, repo-of-repos, an
         editable install under a parent workspace) the first `.git` hit carries

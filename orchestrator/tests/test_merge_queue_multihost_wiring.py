@@ -197,7 +197,7 @@ class TestBuildRemoteRunnersDfCheckout:
 
     - df_remote_checkout == its VerifyRunnerConfig.df_checkout_path (per-runner,
       opt-in; None keeps auto-sync OFF / byte-identical).
-    - df_local_checkout == resolve_local_df_checkout() — the running
+    - df_local_checkout == resolve_code_checkout() — the running
       dispatcher's own DF code root, resolved ONCE and shared across every
       runner in the build.
 

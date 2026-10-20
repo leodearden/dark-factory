@@ -13146,3 +13146,67 @@ def test_print_unit_parity_degrades_to_unknown_on_an_unexpected_failure(
     assert wdog._cli(["--report"]) == 0
     assert "unknown" in _parity_row(capsys.readouterr().out)
     assert any("parity checker exploded" in line for line in logged), logged
+
+
+def test_report_code_sha_column_shows_each_units_deployed_sha_and_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """Task 6565 D1: CODE-SHA sits beside START and is read from the unit's heartbeat.
+
+    ``?`` marks an indeterminate sha and ``*`` a dirty wire path; a heartbeat
+    without the block (a pre-6565 unit) or with a null block reads ``none``,
+    and a unit with no heartbeat file reads ``none`` too.
+    """
+    wdog = _load_watchdog()
+    commit_epoch = 1_800_000_000
+    now = 2_000_000_000.0
+    clean, flagged, old, missing = (
+        synthetic_unit(n) for n in ("clean", "flagged", "old", "missing")
+    )
+    units = [clean, flagged, old, missing]
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            stdout = "".join(f"{u} loaded active running desc\n" for u in units)
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{commit_epoch + 100}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(tmp_path / "absent_clock.json"))
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    monkeypatch.setenv("ORCH_FLEET_DIR", str(fleet_dir))
+    base = {"merge_idle": True, "depth": 0, "queue_empty": True, "ts_epoch": now - 5}
+    blocks = {
+        clean: {"sha": "1" * 40, "indeterminate": False, "dirty_wire_path": False},
+        flagged: {"sha": "2" * 40, "indeterminate": True, "dirty_wire_path": True},
+    }
+    for unit in (clean, flagged):
+        (fleet_dir / f"{unit}.json").write_text(
+            json.dumps({"unit": unit, **base, "deployed_sha": blocks[unit]})
+        )
+    (fleet_dir / f"{old}.json").write_text(json.dumps({"unit": old, **base}))
+
+    wdog.report()
+
+    out = capsys.readouterr().out
+    header = next(line for line in out.splitlines() if line.startswith("UNIT"))
+    assert header.index("START") < header.index("CODE-SHA") < header.index("NEWEST")
+    rows = [line.split() for line in out.splitlines()]
+    # START renders as three tokens ("YYYY-MM-DD HH:MM:SS UTC"), so CODE-SHA is the fifth.
+    code_sha = {row[0]: row[4] for row in rows if row and row[0] in units}
+    assert code_sha == {
+        clean: "1" * 12,
+        flagged: "2" * 12 + "?*",
+        old: "none",
+        missing: "none",
+    }
