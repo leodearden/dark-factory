@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from _eval_refusal import answered, refused_agent_result
 from click.testing import CliRunner
 from shared.cli_invoke import AgentResult
@@ -525,6 +526,27 @@ class TestCampaignBriefing:
         assert result.exit_code == 2, f'{result.output}\n{result.exception!r}'
         assert 'bogus' in result.output
         assert 'diff-only' in result.output and 'd2' in result.output
+        run_trial.assert_not_called()
+
+    @pytest.mark.parametrize('briefings', ['diff-only,d2,d2', 'diff-only,diff-only'])
+    def test_a_repeated_briefing_is_a_usage_error_naming_it(
+        self, tmp_path: Path, briefings: str,
+    ) -> None:
+        result, run_trial = self._invoke(tmp_path, '--arms', 'variant_a', '--briefing', briefings)
+
+        assert result.exit_code == 2, f'{result.output}\n{result.exception!r}'
+        repeated = briefings.rsplit(',', 1)[1]
+        assert f'repeated: {repeated}' in result.output
+        run_trial.assert_not_called()
+
+    @pytest.mark.parametrize('briefings', ['d2', 'd2,diff-only'])
+    def test_d2_without_the_diff_only_incumbent_first_is_a_usage_error(
+        self, tmp_path: Path, briefings: str,
+    ) -> None:
+        result, run_trial = self._invoke(tmp_path, '--arms', 'variant_a', '--briefing', briefings)
+
+        assert result.exit_code == 2, f'{result.output}\n{result.exception!r}'
+        assert 'diff-only' in result.output and 'first' in result.output
         run_trial.assert_not_called()
 
 

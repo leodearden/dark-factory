@@ -1158,6 +1158,11 @@ _CAMPAIGN_DEFAULT_CONFIG = Path('/home/leo/src/dark-factory/dark-factory-orchest
 def _parse_briefings(
     _ctx: click.Context, _param: click.Parameter, value: str,
 ) -> list[ReviewBriefing]:
+    """The generations to run, each once; the diff-only incumbent leads whenever d2 is measured.
+
+    Every arm is paired against the first arm's first generation, so a repeat
+    would collide on its result paths and a leading d2 would pair d2 against itself.
+    """
     valid = [b.value for b in ReviewBriefing]
     names = [name.strip() for name in value.split(',') if name.strip()]
     unknown = [name for name in names if name not in valid]
@@ -1165,7 +1170,16 @@ def _parse_briefings(
         raise click.BadParameter(
             f'{", ".join(unknown) or "(none)"}: each must be one of {", ".join(valid)}',
         )
-    return [ReviewBriefing(name) for name in names]
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise click.BadParameter(f'each generation runs once; repeated: {", ".join(repeated)}')
+    briefings = [ReviewBriefing(name) for name in names]
+    if ReviewBriefing.CONTEXT_COMPLETE in briefings and briefings[0] is not ReviewBriefing.DIFF_ONLY:
+        raise click.BadParameter(
+            f'{ReviewBriefing.DIFF_ONLY.value} must come first: it is the incumbent '
+            f'{ReviewBriefing.CONTEXT_COMPLETE.value} is paired against',
+        )
+    return briefings
 
 
 @cli.command('campaign')
@@ -1175,8 +1189,8 @@ def _parse_briefings(
 @click.option('--split', default='test', help='Corpus split to run (train|selection|test|all)')
 @click.option('--arms', default=None, help='Comma-separated variant names (default: FABLE_EVIDENCE_VARIANTS)')
 @click.option('--briefing', 'briefings', default=ReviewBriefing.DIFF_ONLY.value, callback=_parse_briefings,
-              help='Comma-separated reviewer briefing generations, each run for every arm '
-                   '(diff-only | d2; default: diff-only)')
+              help='Comma-separated reviewer briefing generations, each run once for every arm '
+                   '(diff-only | d2; default: diff-only; diff-only first whenever d2 is listed)')
 @click.option('--diff-cap', default=None, type=int,
               help='Diff truncation in chars (default: runner.DIFF_CAP_CHARS; 0 lifts the cap)')
 @click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
