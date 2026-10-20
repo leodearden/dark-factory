@@ -490,11 +490,18 @@ prints nothing. That is the same rule as [`merge-queue/SKILL.md`](../merge-queue
   commit edited near the branch's change gives the rebased image a different patch id. It can
   also be a commit added to the branch after the landing. Only a reader can tell which, and the
   server-issued `done` must not be overridden ([step 3](#step-3)).
-- **You hold no request-scoped `done`** → run `git cherry main task/<TASK_ID>` alone. Non-empty
-  with every line `-` means the content is on main with no sha you can attribute:
-  **landing-unattributable**. Anything else (any `+` line, or empty output) is the genuine
-  not-landed outcome; what to do with it is the call site's own disposition (`unblock` and
-  `merge-queue` keep polling / resubmit; `unblock-low-risk` aborts).
+- **You hold no request-scoped `done`** → run `git cherry main task/<TASK_ID>` alone.
+  - Non-empty with every line `-`: the content is on main with no sha you can attribute:
+    **landing-unattributable**.
+  - Any `-` line mixed with `+` lines, or `+` lines that may be context drift (see above): **not
+    confirmed landed**. Report it and do **not** `merge_cancel` or resubmit; a reader decides.
+  - The genuine not-landed outcome is reserved for the branch tip not being an ancestor of main
+    (rc=1 here) **and** no main commit patch-equivalent to any branch commit (`git cherry` prints
+    no `-` line: all `+`, or empty output). What to do with it is the call site's own disposition
+    (`unblock` and `merge-queue` keep polling / resubmit; `unblock-low-risk` aborts).
+- **No `last_outcome.merge_sha`** (absent or null, e.g. the rebase+fast-forward no-marker shape)
+  is expected to be rare. It routes to **landing-unattributable**: a human derives and stamps it
+  (`git cherry` all `-` plus a diff check).
 
 <a id="landing-unattributable"></a>
 **Landing-unattributable** is defined once, here. It reuses the server's own term,
