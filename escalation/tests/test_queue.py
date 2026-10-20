@@ -322,6 +322,74 @@ class TestDismissAllPendingAgeAware:
         assert 'severity=blocking' in strand.resolution
 
 
+class TestDismissAllPendingKeep:
+    """``keep`` spares the L0s its predicate selects from the startup sweep.
+
+    The info-L0 router routes info notes before the amnesty and leaves some of
+    them pending (a curator hold, or one it could not route); the sweep that
+    follows must not dismiss those unread (plans/info-l0-disposition-router-prd.md
+    boundary #16).
+    """
+
+    THRESHOLD_SECS = 600.0
+
+    def _seed(self, tmp_path: Path) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-1-1', age_secs=90.0, task_id='1', severity='info'))
+        queue.submit(_aged_escalation('esc-2-1', age_secs=75480.0, task_id='2', severity='info'))
+        queue.submit(_aged_escalation('esc-3-1', age_secs=75480.0, task_id='3'))
+        queue.submit(_aged_escalation('esc-4-1', age_secs=90.0, task_id='4'))
+        queue.submit(_aged_escalation('esc-5-1', age_secs=75480.0, task_id='5', level=1))
+        return queue
+
+    @staticmethod
+    def _is_info(esc: Escalation) -> bool:
+        return esc.severity == 'info'
+
+    def test_kept_records_stay_pending_and_are_not_counted(self, tmp_path: Path):
+        queue = self._seed(tmp_path)
+
+        count = queue.dismiss_all_pending(
+            'Stale from prior run', strand_age_secs=self.THRESHOLD_SECS, keep=self._is_info,
+        )
+
+        assert count == 2
+        for kept_id in ('esc-1-1', 'esc-2-1'):
+            kept = queue.get(kept_id)
+            assert kept is not None
+            assert (kept.status, kept.resolution, kept.resolution_class) == ('pending', None, None)
+
+    def test_records_not_kept_are_swept_with_age_suffix_and_strand_stamp(self, tmp_path: Path):
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending(
+            'Stale from prior run', strand_age_secs=self.THRESHOLD_SECS, keep=self._is_info,
+        )
+
+        strand, fresh = queue.get('esc-3-1'), queue.get('esc-4-1')
+        assert strand is not None and fresh is not None
+        assert (strand.status, strand.resolution_class) == ('dismissed', 'stale-strand')
+        assert (fresh.status, fresh.resolution_class) == ('dismissed', 'benign')
+        assert _pending_secs(fresh.resolution or '') is not None
+
+    def test_keep_none_sweeps_every_pending_l0_as_before(self, tmp_path: Path):
+        queue = self._seed(tmp_path)
+
+        count = queue.dismiss_all_pending('Stale from prior run', keep=None)
+
+        assert count == 4
+        for esc_id in ('esc-1-1', 'esc-2-1', 'esc-3-1', 'esc-4-1'):
+            assert queue.get(esc_id).status == 'dismissed'  # type: ignore[union-attr]
+
+    @pytest.mark.parametrize('keep', [None, lambda esc: True])
+    def test_level_1_is_preserved_either_way(self, tmp_path: Path, keep):
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', keep=keep)
+
+        assert queue.get('esc-5-1').status == 'pending'  # type: ignore[union-attr]
+
+
 class TestDismissAllPendingAgeAwareDegrades:
     """The age-aware sweep degrades honestly — loudly, and never into a false strand.
 
