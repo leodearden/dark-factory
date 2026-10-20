@@ -514,3 +514,91 @@ def test_a_malformed_summary_raises_a_typed_error(tmp_path: Path, content: str) 
     write_summary(tmp_path, at(1)).write_text(content)
 
     _assert_names_the_file(_read_error(tmp_path), tmp_path, ArchiveProblem.MALFORMED_SUMMARY)
+
+
+def write_map(junit: Path, mapping: object) -> Path:
+    """The defect plugin's collection map, written beside its junit as '<junit stem>.tests.json'."""
+    path = junit.with_name(junit.name.removesuffix('.xml.gz') + '.tests.json')
+    path.write_text(mapping if isinstance(mapping, str) else json.dumps(mapping))
+    return path
+
+
+CRITERION_MAP = {
+    'tests/test_a.py::test_x': {'defects': [], 'criterion': 'C-1'},
+    'tests/test_a.py::TestK::test_y[a::b]': {'defects': ['D-1'], 'criterion': 'C-2'},
+    'tests/test_a.py::test_z': {'defects': [], 'criterion': None},
+}
+MAPPED_REPORT = junit_xml(
+    passed('test_x'),
+    passed('test_y[a::b]', 'tests.test_a.TestK'),
+    passed('test_z'),
+    passed('test_unmapped'),
+)
+
+
+def criteria(run: ArchivedRun) -> dict[str, str | None]:
+    assert run.tests is not None
+    return {case.id: case.criterion for case in run.tests.cases}
+
+
+def test_each_case_carries_its_criterion_from_the_map_beside_its_junit(tmp_path: Path) -> None:
+    write_plan(tmp_path, at(0))
+    write_map(write_junit(tmp_path, at(1), MAPPED_REPORT), CRITERION_MAP)
+
+    assert criteria(read(tmp_path, at(60))) == {
+        'tests.test_a::test_x': 'C-1',
+        'tests.test_a.TestK::test_y[a::b]': 'C-2',
+        'tests.test_a::test_z': None,
+        'tests.test_a::test_unmapped': None,
+    }
+
+
+def test_without_a_map_no_case_has_a_criterion(tmp_path: Path) -> None:
+    write_plan(tmp_path, at(0))
+    write_junit(tmp_path, at(1), MAPPED_REPORT)
+
+    assert set(criteria(read(tmp_path, at(60))).values()) == {None}
+
+
+def test_a_map_applies_only_to_its_own_junit(tmp_path: Path) -> None:
+    write_plan(tmp_path, at(0))
+    write_map(write_junit(tmp_path, at(1), junit_xml(passed('test_x')), qualifiers='alpha'), CRITERION_MAP)
+    write_junit(tmp_path, at(2), junit_xml(passed('test_x', 'tests.test_b')), qualifiers='beta')
+
+    assert criteria(read(tmp_path, at(60))) == {
+        'tests.test_a::test_x': 'C-1',
+        'tests.test_b::test_x': None,
+    }
+
+
+@pytest.mark.parametrize(
+    'mapping',
+    [
+        'not json',
+        '[]',
+        {'tests/test_a.py::test_x': {'defects': [], 'criterion': 5}},
+        {'tests/test_a.py::test_x': {'defects': []}},
+        {'tests/test_a.py::test_x': 'C-1'},
+    ],
+    ids=['not-json', 'not-an-object', 'non-string-criterion', 'no-criterion', 'bare-string-entry'],
+)
+def test_a_malformed_map_raises_a_typed_error(tmp_path: Path, mapping: object) -> None:
+    write_plan(tmp_path, at(0))
+    write_map(write_junit(tmp_path, at(1), MAPPED_REPORT), mapping)
+
+    error = _read_error(tmp_path)
+
+    assert error.problem is ArchiveProblem.MALFORMED_MAP
+    assert str(error.relpath).endswith('.tests.json')
+    assert str(tmp_path) not in str(error)
+
+
+def test_a_map_is_never_read_as_a_run_file(tmp_path: Path) -> None:
+    write_plan(tmp_path, at(0))
+    orphan_junit = task_dir(tmp_path) / f'attempt-1.alpha.junit-{stamp(at(1))}.xml.gz'
+    write_map(orphan_junit, 'not json')
+
+    run = read(tmp_path, at(60))
+
+    assert run.legs == NOT_RECORDED
+    assert run.tests is None
