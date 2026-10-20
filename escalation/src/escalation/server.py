@@ -74,6 +74,7 @@ from escalation.models import (
     EvidenceEntry,
     max_severity,
 )
+from escalation.note_to_file import file_note_to_file, note_to_file_refusal
 from escalation.pins import classify_pins
 from escalation.project_root_guard import ProjectRootGuard
 from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
@@ -1757,6 +1758,8 @@ def create_server(
                with resolution_action='close_only' via submit_resolved before
                ANY other gate or lookup, so no argument can mint it pending or
                at L2
+          (claimant stamp, then) esc.note_to_file → file_note_to_file: resolved
+               note-to-file, archived; no downgrade, gate 1-4 or dedupe runs
           1. terminal_state_is_the_bug=True  → bypass (submit normally)
           2. category == 'review_suggestions' → bypass (A4b owns this category)
           3. task_status_lookup is None       → bypass (chokepoint disabled)
@@ -1825,6 +1828,9 @@ def create_server(
                 # Normalise blank/whitespace-only to None so an empty string
                 # never reaches pins._norm_id as a pseudo-value.
                 esc.filing_claimant_run_id = (_claimant or '').strip() or None
+
+        if esc.note_to_file:
+            return file_note_to_file(queue, esc)
 
         # C4/D3: Agent-role severity downgrade — runs FIRST, before the born-at-L2
         # stamp, so the existing level=2 gate and the _submit_or_dedupe L2-bypass
@@ -1942,6 +1948,7 @@ def create_server(
         evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
         project_root: str | None = None,
+        note_to_file: bool = False,
     ) -> dict[str, Any]:
         """Report a non-blocking observation. The agent continues working after this call.
 
@@ -1977,7 +1984,16 @@ def create_server(
         fact.  A single observation is not sufficient to recommend a destructive
         intervention (a ref move / rewind) — re-run or re-measure first.
 
+        *note_to_file* — set True for a record that requests nothing: a note
+        kept for the archive.  Info severity only; any other severity is
+        refused with ``code='note_to_file_requires_info'`` and nothing is
+        written.  The note is filed resolved (``resolution_class:
+        note-to-file``) and archived at filing, so no reviewer, steward or
+        watcher reads it, and the task is untouched.
+
         Response shape (``level`` is present on every branch):
+        - Note to file:           ``{id, status, resolution_class, level}``
+          where status='resolved' and resolution_class='note-to-file'
         - Queued (task alive):    ``{id, status, level}``  where status='queued'
         - Deduped (folded):       ``{id, status, parent_id, child_id, level}``
           (L2 escalations are never deduped — they always produce 'queued')
@@ -2009,6 +2025,8 @@ def create_server(
             require_registered_category(category)
         except UnregisteredEscalationCategory as exc:
             return {'error': str(exc)}
+        if note_to_file and (refusal := note_to_file_refusal(severity)) is not None:
+            return refusal
         esc_id = await asyncio.to_thread(queue.make_id, task_id)
         esc = Escalation(
             id=esc_id,
@@ -2022,6 +2040,7 @@ def create_server(
             worktree=worktree,
             workflow_state=workflow_state,
             evidence=cast(list[EvidenceEntry], evidence or []),
+            note_to_file=note_to_file,
         )
         # Returns {id, status} or resolved record.
         # No 'action' key — that is only on the blocker path.
