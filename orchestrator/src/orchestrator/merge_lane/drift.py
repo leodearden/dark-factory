@@ -1,8 +1,9 @@
 """Lever-C drift-check detective (MQ-refactor task γ).
 
 The drift-check runner (dispatches a local + remote pair through
-:class:`~orchestrator.verify_runner.DriftDetector` in a throwaway worktree),
-the legacy remote-pool builder, and the land-hook cadence gate.  The local
+:class:`~orchestrator.verify_runner.DriftDetector` in a throwaway worktree)
+and the land-hook cadence gate.  The legacy remote-pool builder now lives in
+:mod:`orchestrator.verify_hosts`.  The local
 trust-anchor verifies through the worker's injected
 :class:`~orchestrator.merge_lane.ports.VerifyPort`; this module never imports
 the worker.
@@ -27,63 +28,20 @@ from typing import TYPE_CHECKING, Any
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.types import MergeRequest
+from orchestrator.verify_hosts import build_remote_runners as _build_remote_runners
 from orchestrator.verify_runner import (
     DriftDetector,
     HostAllocator,
     LocalRunner,
-    RemoteRunner,
     VerifyRunnerPool,
     build_merge_verify_spec,
-    resolve_local_df_checkout,
 )
 
 if TYPE_CHECKING:
-    from orchestrator.config import OrchestratorConfig
     from orchestrator.merge_lane.ports import VerifyPort
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 logger = logging.getLogger('orchestrator.merge_lane')
-
-
-def _build_remote_runners(
-    config: OrchestratorConfig,
-    cwd: str | Path,
-    *,
-    quarantine: set[str] | None = None,
-) -> list[RemoteRunner]:
-    """Build the list of RemoteRunner instances from operator config (Lever C).
-
-    Returns REMOTES ONLY — the LocalRunner trust anchor is prepended by callers
-    since it needs call-specific arguments (worktree path, module configs, etc.).
-
-    Filters out disabled runners (enabled=False) and any runner whose name is in
-    the quarantine set (in-memory worker-level quarantine from DriftDetector).
-    quarantine=None is treated as an empty set (no quarantine).
-
-    _build_verify_runners passes main_branch=config.git.main_branch so the
-    remote host receives a freshness push before the merge-sha transport.
-
-    Each runner also receives the INV-2 contract-currency paths (task 2884):
-    df_remote_checkout=r.df_checkout_path (per-runner, opt-in; None keeps
-    auto-sync OFF / byte-identical) and df_local_checkout=the dispatcher's own
-    DF code root, resolved ONCE here (call-invariant) and shared across every
-    runner so sync_if_stale can HEAD-compare remote-vs-local at dispatch.
-    """
-    _local_df = resolve_local_df_checkout()
-    return [
-        RemoteRunner(
-            name=r.name,
-            ssh_host=r.ssh_host,
-            git_remote=r.git_remote,
-            cwd=cwd,
-            config_path=r.config_path,
-            main_branch=config.git.main_branch,
-            df_remote_checkout=r.df_checkout_path,
-            df_local_checkout=_local_df,
-        )
-        for r in config.enabled_verify_runners
-        if quarantine is None or r.name not in quarantine
-    ]
 
 
 # ---------------------------------------------------------------------------
