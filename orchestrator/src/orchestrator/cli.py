@@ -1136,6 +1136,34 @@ def _recorded_merge_worktree_remover(git_ops: 'GitOps') -> Callable[[Path], None
     return remove
 
 
+@main.command('gate-identity')
+def gate_identity():
+    """Print this checkout's gate identity as one JSON line (task 6565, D3).
+
+    ``{"code_sha": <HEAD of the checkout holding this code>,
+    "wire_fingerprint": <remote_gate.wire_fingerprint of the wire classes>}``.
+    A remote gate answers this before any verify is dispatched to it; the
+    dispatcher proceeds only when both values equal its own.  Importing the
+    wire classes to fingerprint them also proves the gate's codec imports.
+    Exits 1 with the cause on stderr when the checkout's HEAD cannot be read.
+    """
+    import subprocess
+
+    from orchestrator.deployed_sha import checkout_head, resolve_code_checkout
+    from orchestrator.remote_gate import local_gate_identity
+
+    checkout = resolve_code_checkout()
+    if checkout is None:
+        click.echo('Error: no git checkout holds this orchestrator code', err=True)
+        sys.exit(1)
+    try:
+        code_sha = checkout_head(checkout)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        click.echo(f'Error: cannot read HEAD of {checkout}: {exc}', err=True)
+        sys.exit(1)
+    click.echo(json.dumps(local_gate_identity(code_sha).to_wire()))
+
+
 @main.command('cancel-verify')
 @click.option('--request-id', required=True,
               help='Request ID passed to the verify-merge or verify-task invocation '

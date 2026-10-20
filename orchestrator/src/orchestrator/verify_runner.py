@@ -62,6 +62,7 @@ from typing import (
 from orchestrator import flake_ledger, verify
 from orchestrator.config import EnvProbeConfig, ModuleConfig, VerifyHostPolicy
 from orchestrator.deployed_sha import DeployedSha
+from orchestrator.remote_gate import RunnerUnavailableKind
 from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_to_json
 from orchestrator.verify import (
     VerifyResult,
@@ -631,14 +632,14 @@ async def run_merge_verify_on_worktree(
 # ---------------------------------------------------------------------------
 
 
-RunnerUnavailableKind = Literal['transport', 'unparseable', 'no_verdict', 'wire_shape']
-
-
 class RunnerUnavailable(Exception):
     """Raised by RemoteRunner when the remote host produced no usable verdict.
 
-    ``kind`` says why: ``transport`` (host down/closed, git push or ssh
-    failure, non-zero ssh exit), ``unparseable`` (stdout is not JSON),
+    ``kind`` (``remote_gate.RunnerUnavailableKind``) says why: ``transport``
+    (host down/closed, git push or ssh failure, non-zero ssh exit), ``gate``
+    (the host was reached but could not produce a ready, handshake-passing
+    gate or the command failed there; ``remote_gate.classify_remote_exit``),
+    ``unparseable`` (stdout is not JSON),
     ``wire_shape`` (JSON of the wrong shape — a contract skew between the two
     hosts), or ``no_verdict`` — the ONE parseable outcome that raises: a result
     whose summary records no verdict (``verify.is_no_verdict_summary``).  Every
