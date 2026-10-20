@@ -66,10 +66,10 @@ from orchestrator.git_ops import (
 )
 from orchestrator.merge_lane.gates import (
     DropGuardResult,
-    GateClearance,
     _check_plan_files_touched_in_branch,
 )
 from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.merge_lane.types import DiskGuardOutcome, QueuedBranch
 from orchestrator.merge_lane.worker import (
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
@@ -16094,6 +16094,7 @@ class TestReverifyRebasedTree:
                     max_enospc=1,
                     merge_sha=rewritten.strip(),
                     run_post_merge_verify=_run_post_merge_verify,
+                    event_store=None,
                 )
             assert result == GateClearance.same_tree, result
             verify_mock.assert_not_called()
@@ -16130,6 +16131,7 @@ class TestReverifyRebasedTree:
                     max_enospc=1,
                     merge_sha=rebased_sha.strip(),
                     run_post_merge_verify=_run_post_merge_verify,
+                    event_store=None,
                 )
             assert result == GateClearance.reverified, result
             verify_mock.assert_called_once()
@@ -16183,6 +16185,7 @@ class TestReverifyRebasedTree:
                     max_timeouts=3,
                     max_enospc=1,
                     run_post_merge_verify=_run_post_merge_verify,
+                    event_store=None,
                 )
             assert result == GateClearance.disjoint, (
                 f'Disjoint: expected GateClearance.disjoint, got {result!r}'
@@ -16243,6 +16246,7 @@ class TestReverifyRebasedTree:
                     max_timeouts=3,
                     max_enospc=1,
                     run_post_merge_verify=_run_post_merge_verify,
+                    event_store=None,
                 )
             assert result == GateClearance.reverified, (
                 f'Re-verify ran and passed: expected GateClearance.reverified, got {result!r}'
@@ -16303,6 +16307,7 @@ class TestReverifyRebasedTree:
                     max_timeouts=3,
                     max_enospc=1,
                     run_post_merge_verify=_run_post_merge_verify,
+                    event_store=None,
                 )
             assert result == GateClearance.reverified, (
                 f'Re-verify ran and passed: expected GateClearance.reverified, got {result!r}'
@@ -16349,6 +16354,7 @@ class TestReverifyRebasedTree:
                     max_timeouts=3,
                     max_enospc=1,
                     run_post_merge_verify=_run_post_merge_verify,
+                    event_store=None,
                 )
             assert result == GateClearance.reverified, (
                 f'Green verify: expected GateClearance.reverified, got {result!r}'
@@ -16395,6 +16401,7 @@ class TestReverifyRebasedTree:
                 max_timeouts=3,
                 max_enospc=1,
                 run_post_merge_verify=_run_post_merge_verify,
+                event_store=None,
             )
         assert result is not None, 'Red verify: expected a MergeOutcome, got None'
         assert isinstance(result, MergeOutcome)
@@ -16450,6 +16457,7 @@ class TestReverifyRebasedTree:
                 max_enospc=1,
                 keep_worktrees={l1, l2},  # RED: TypeError until step-10
                 run_post_merge_verify=pmpv,
+                event_store=None,
             )
 
         assert result == GateClearance.reverified, f'expected a green re-verify, got {result!r}'
@@ -16505,6 +16513,7 @@ class TestReverifyRebasedTree:
                 max_enospc=1,
                 # No keep_worktrees — regression test
                 run_post_merge_verify=pmpv,
+                event_store=None,
             )
 
         assert result == GateClearance.reverified, f'expected a green re-verify, got {result!r}'
@@ -21307,6 +21316,7 @@ class TestMergeShaThreading:
                 max_enospc=1,
                 merge_sha='c' * 40,  # RED: TypeError until step-14 adds this kwarg
                 run_post_merge_verify=pmpv,
+                event_store=None,
             )
 
         assert result == GateClearance.reverified, f'expected a green re-verify, got {result!r}'

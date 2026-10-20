@@ -4009,6 +4009,90 @@
           "current": 6557
         }
       ]
+    },
+    {
+      "task_id": "5064",
+      "reason": "Net-additive observability: the post-rebase re-verify gate records each decision as merge_reverify_gate and forwards event_store into its re-verify; record vocabulary (incl. GateClearance, moved from gates.py) in new merge_lane/reverify_gate_decision.py",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 343,
+          "current": 345
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 3562,
+          "current": 3583
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22301,
+          "current": 22303
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 1615,
+          "current": 1616
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4878,
+          "current": 4883
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57431,
+          "current": 57571
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31645,
+          "current": 31661
+        }
+      ]
+    },
+    {
+      "task_id": "5064",
+      "reason": "Review fixes for 5064: ReverifyGateReason class docstring, and the gate log's overlap-path cap named as MAX_LOGGED_OVERLAP_PATHS beside the record cap (an import line in gates.py)",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 3583,
+          "current": 3584
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py",
+          "baseline": 117,
+          "current": 120
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py",
+          "baseline": 15,
+          "current": 16
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57528,
+          "current": 57532
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31654,
+          "current": 31655
+        }
+      ]
     }
   ]
 }

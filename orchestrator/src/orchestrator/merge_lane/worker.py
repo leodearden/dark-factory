@@ -80,7 +80,6 @@ from orchestrator.merge_lane.drift import (
 from orchestrator.merge_lane.gates import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-    GateClearance,
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
     _check_post_merge_pyright,
@@ -125,6 +124,7 @@ from orchestrator.merge_lane.request_ledger import (
     RequestLedger,
     _alarm_merge_request_stuck,
 )
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.merge_lane.shadow import (
     _alarm_warm_shadow_unparseable,
     _maybe_schedule_shadow_compare,
@@ -6996,6 +6996,7 @@ async def _advance_train(
             max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
             merge_sha=tip.rebased_sha,
             run_post_merge_verify=train_verify,
+            event_store=worker._event_store,
         )
         if isinstance(gate, MergeOutcome):
             return _TrainAdvance(adv, landing_base=candidate_base, reverify_failure=gate)
@@ -21295,6 +21296,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         merge_sha=rebased_sha,
                         keep_worktrees=set(self._owned_merge_worktrees),
                         run_post_merge_verify=_run_post_merge_verify,
+                        event_store=self._event_store,
                     )
                     if isinstance(gate, MergeOutcome):
                         # task 2604: route through the unified terminal
