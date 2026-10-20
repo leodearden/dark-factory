@@ -207,6 +207,18 @@ def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarnin
     return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
 
 
+def _has_branch_base_sha(metadata: Any) -> bool:
+    """True when *metadata* records a non-blank ``branch_base_sha``.
+
+    The orchestrator stamps that key at first dispatch
+    (``orchestrator/src/orchestrator/workflow.py``), so the task already owns a branch.
+    Absent, non-dict or unparseable metadata answers False without emitting a schema warning.
+    """
+    meta, _warnings = _parse_metadata_value(metadata)
+    sha = (meta or {}).get('branch_base_sha')
+    return isinstance(sha, str) and sha.strip() != ''
+
+
 def _warn_metadata_discard(source: str, metadata: Any, warnings: list[SchemaWarning]) -> None:
     """Emit the ``task_metadata.schema_warning`` census line for a whole-metadata discard."""
     reason = '; '.join(w.message for w in warnings) or 'unrecognised shape'
@@ -3366,8 +3378,7 @@ class TaskInterceptor:
         does NOT check heartbeat freshness, so a stale stamp refuses too —
         conservative by design, since refusing only degrades to ``create``.
         A target whose metadata carries a non-blank ``branch_base_sha`` is
-        also refused (``target_has_branch``, task 7199), checked after status
-        and claimant so the existing refusal populations are unchanged.
+        also refused (``target_has_branch``).
         Every abort returns None so the caller degrades to ``create`` instead
         of clobbering a task that has moved on since selection. Eligibility
         refusals are recorded in the combine audit with a ``refused_reason``
@@ -3459,11 +3470,7 @@ class TaskInterceptor:
         target_claimant = target.get('claimant_run_id')
         target_is_claimed = isinstance(target_claimant, str) and target_claimant.strip() != ''
 
-        # ONE read of the target's stored metadata blob, shared by the
-        # branch conjunct of the eligibility chain below and by the gate
-        # guard's verdict and the wording that explains it: all must be
-        # derived from the same bytes, or the log could name a cause the
-        # refusal that actually fired did not have.
+        # Single read shared by the eligibility chain and the gate guard.
         target_metadata = target.get('metadata')
 
         if not is_combine_eligible_status(target_status):
@@ -3486,7 +3493,7 @@ class TaskInterceptor:
                 'still be running',
                 decision.target_id,
             )
-        elif self._has_branch_base_sha(target_metadata):
+        elif _has_branch_base_sha(target_metadata):
             refused_reason = COMBINE_REFUSED_HAS_BRANCH
             logger.warning(
                 'combine-guard: target %s already carries metadata.branch_base_sha '
@@ -3762,18 +3769,6 @@ class TaskInterceptor:
             or meta.get('operational_mode') == 'gate'
             or meta.get('execution_class') == 'operational'
         )
-
-    @staticmethod
-    def _has_branch_base_sha(metadata: Any) -> bool:
-        """True when *metadata* records a non-blank ``branch_base_sha``.
-
-        The orchestrator stamps that key at first dispatch
-        (``orchestrator/src/orchestrator/workflow.py``), so the task already owns a branch.
-        Absent, non-dict or unparseable metadata answers False without emitting a schema warning.
-        """
-        meta, _warnings = _parse_metadata_value(metadata)
-        sha = (meta or {}).get('branch_base_sha')
-        return isinstance(sha, str) and sha.strip() != ''
 
     @staticmethod
     def _inject_routing_override(metadata: Any, reason: str) -> dict:
@@ -7855,8 +7850,7 @@ def _combine_audit_path() -> Path:
 # compute the refusal rate, while the record's own old.status field supplies
 # the per-status breakdown for free. A token per status would make this
 # vocabulary track the status enum and force a consumer update every time a
-# status is added. The third marks a target already dispatched into a branch
-# (task 7199, from task 5493 D4).
+# status is added. The third marks a target already dispatched into a branch.
 COMBINE_REFUSED_NOT_PENDING = 'target_not_pending'
 COMBINE_REFUSED_CLAIMED = 'target_claimed'
 COMBINE_REFUSED_HAS_BRANCH = 'target_has_branch'
