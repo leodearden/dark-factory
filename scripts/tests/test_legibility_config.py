@@ -274,6 +274,68 @@ class TestNoveltySpikeBaseline:
             mod.load_config(_write(tmp_path, text))
 
 
+class TestAdjudication:
+    """``census.adjudication`` — the similarity stage's thresholds, its
+    per-run queue cap and its embedding model (plans/census-incremental-prd.md
+    D3, D4, T1)."""
+
+    def test_defaults_when_census_block_omitted_entirely(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        adjudication = cfg.census.adjudication
+        assert isinstance(adjudication, mod.Adjudication)
+        assert adjudication.attach_min_similarity == 0.90
+        assert adjudication.cluster_min_similarity == 0.85
+        assert adjudication.max_clusters_per_run == 10
+        assert adjudication.embedding_model == 'text-embedding-3-small'
+
+    def test_partial_block_keeps_other_defaults(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {adjudication: {max_clusters_per_run: 3}}\n'
+        adjudication = mod.load_config(_write(tmp_path, text)).census.adjudication
+        assert adjudication.max_clusters_per_run == 3
+        assert adjudication.attach_min_similarity == 0.90
+        assert adjudication.cluster_min_similarity == 0.85
+        assert adjudication.embedding_model == 'text-embedding-3-small'
+
+    def test_full_override_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + textwrap.dedent("""\
+            census:
+              adjudication:
+                attach_min_similarity: 0.95
+                cluster_min_similarity: 0.8
+                max_clusters_per_run: 4
+                embedding_model: text-embedding-3-large
+            """)
+        adjudication = mod.load_config(_write(tmp_path, text)).census.adjudication
+        assert adjudication.attach_min_similarity == 0.95
+        assert adjudication.cluster_min_similarity == 0.8
+        assert adjudication.max_clusters_per_run == 4
+        assert adjudication.embedding_model == 'text-embedding-3-large'
+
+    def test_zero_cap_is_legal(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {adjudication: {max_clusters_per_run: 0}}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.adjudication.max_clusters_per_run == 0
+
+    @pytest.mark.parametrize('bad_value', ['-1', "'10'", '2.5'])
+    def test_negative_or_non_int_cap_raises(self, tmp_path, bad_value):
+        text = MINIMAL_YAML + f'census: {{adjudication: {{max_clusters_per_run: {bad_value}}}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+    @pytest.mark.parametrize('field', ['attach_min_similarity', 'cluster_min_similarity'])
+    @pytest.mark.parametrize('bad_value', ['-0.1', '1.5'])
+    def test_similarity_outside_unit_interval_raises(self, tmp_path, field, bad_value):
+        text = MINIMAL_YAML + f'census: {{adjudication: {{{field}: {bad_value}}}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_block_is_frozen(self):
+        adjudication = mod.Adjudication()
+        with pytest.raises(ValidationError):
+            adjudication.max_clusters_per_run = 99
+        assert adjudication.max_clusters_per_run == 10
+
+
 class TestFullConfigOverridesDefaults:
     """A fully-populated §7.4 YAML round-trips every explicit value."""
 
