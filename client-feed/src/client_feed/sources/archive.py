@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import gzip
+import math
 import os
 import re
 import xml.etree.ElementTree as ET
+import zlib
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -148,23 +151,76 @@ def _legs(summaries: Sequence[_Summary]) -> tuple[VerifyLeg, ...] | NotRecorded:
     )
 
 
+_OUTCOME_TAGS: Final = {
+    'failure': CaseOutcome.FAILED,
+    'error': CaseOutcome.ERRORED,
+    'skipped': CaseOutcome.SKIPPED,
+}
+_RED: Final = frozenset({CaseOutcome.FAILED, CaseOutcome.ERRORED})
+
+
 def _case_id(classname: str, name: str) -> str:
+    """The one spelling of a case id, `classname::name`, shared by the junit and map sides."""
     return f'{classname}::{name}' if classname else name
 
 
-def _read_junit(root: Path, path: Path) -> list[CaseResult]:
-    with gzip.open(path) as report:
-        cases = ET.parse(report).getroot().iter('testcase')
-        return [
-            CaseResult(
-                id=_case_id(case.get('classname', ''), case.get('name', '')),
-                outcome=CaseOutcome.PASSED,
-                duration_ms=None,
-                criterion=None,
-                exception_type=None,
-            )
-            for case in cases
-        ]
+def _seconds(value: str | None) -> float | None:
+    if value is None:
+        return None
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(f'a junit time must be a finite non-negative number, got {value!r}')
+    return seconds
+
+
+def _outcome(testcase: ET.Element) -> tuple[CaseOutcome, str | None]:
+    """The first outcome child decides; a red case's kind is its `type` attribute, else its tag."""
+    for child in testcase:
+        outcome = _OUTCOME_TAGS.get(child.tag)
+        if outcome is not None:
+            return outcome, (child.get('type') or child.tag) if outcome in _RED else None
+    return CaseOutcome.PASSED, None
+
+
+def _case(testcase: ET.Element) -> CaseResult:
+    seconds = _seconds(testcase.get('time'))
+    outcome, exception_type = _outcome(testcase)
+    return CaseResult(
+        id=_case_id(testcase.get('classname', ''), testcase.get('name', '')),
+        outcome=outcome,
+        duration_ms=None if seconds is None else round(seconds * 1000),
+        criterion=None,
+        exception_type=exception_type,
+    )
+
+
+@dataclass(frozen=True)
+class _JunitReport:
+    cases: tuple[CaseResult, ...]
+    suite_seconds: tuple[float, ...]
+
+
+def _parse_junit(report: gzip.GzipFile) -> _JunitReport:
+    """Cases and suite times only: no message attribute and no element text is ever read."""
+    cases: list[CaseResult] = []
+    suite_seconds: list[float] = []
+    for _, element in ET.iterparse(report, events=('end',)):
+        if element.tag == 'testcase':
+            cases.append(_case(element))
+            element.clear()
+        elif element.tag == 'testsuite' and (seconds := _seconds(element.get('time'))) is not None:
+            suite_seconds.append(seconds)
+    return _JunitReport(cases=tuple(cases), suite_seconds=tuple(suite_seconds))
+
+
+def _read_junit(root: Path, path: Path) -> _JunitReport:
+    try:
+        with gzip.open(path) as report:
+            return _parse_junit(report)
+    except (OSError, EOFError, zlib.error) as exc:
+        raise _failure(root, path, ArchiveProblem.UNREADABLE) from exc
+    except (ET.ParseError, ValueError) as exc:
+        raise _failure(root, path, ArchiveProblem.MALFORMED_JUNIT) from exc
 
 
 @dataclass(frozen=True)
@@ -184,12 +240,22 @@ class ArchivedRun:
     tests: ArchivedTests | None
 
 
-def _tests(reports: Sequence[Sequence[CaseResult]], max_cases: int) -> ArchivedTests:
-    cases = tuple(case for report in reports for case in report)
+def _tests(reports: Sequence[_JunitReport], max_cases: int) -> ArchivedTests:
+    """Counts over every case; the listing leads with red cases (report order kept) and is cut to the cap."""
+    cases = [case for report in reports for case in report.cases]
+    tally = Counter(case.outcome for case in cases)
+    listed = tuple(sorted(cases, key=lambda case: case.outcome not in _RED)[:max_cases])
+    seconds = [suite for report in reports for suite in report.suite_seconds]
     return ArchivedTests(
-        counts=CaseCounts(passed=len(cases), failed=0, skipped=0, errored=0, truncated=0),
-        duration_ms=None,
-        cases=cases[:max_cases],
+        counts=CaseCounts(
+            passed=tally[CaseOutcome.PASSED],
+            failed=tally[CaseOutcome.FAILED],
+            skipped=tally[CaseOutcome.SKIPPED],
+            errored=tally[CaseOutcome.ERRORED],
+            truncated=len(cases) - len(listed),
+        ),
+        duration_ms=round(sum(seconds) * 1000) if seconds else None,
+        cases=listed,
     )
 
 
