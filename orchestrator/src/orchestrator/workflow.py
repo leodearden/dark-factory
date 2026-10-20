@@ -13,7 +13,7 @@ import string
 import sys
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -104,7 +104,7 @@ from orchestrator.delivered_checks import (
     gate_mark_done_on_delivered_checks,
 )
 from orchestrator.dry_run_unblock import run_dry_run_unblock
-from orchestrator.escalation_router import router_owns
+from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, exit_kind_for, router_owns
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.exit_contract import (
     ExitStatusWriteFailure,
@@ -495,6 +495,7 @@ class _NoStewardApplicable(_HumanHandoff):
         )
 
 if TYPE_CHECKING:
+    from escalation.disposition import ExitKind
     from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
@@ -3397,10 +3398,16 @@ class TaskWorkflow:
                 disposition=disp,
             )
 
-    def _on_terminal_cleanups(self) -> list[OnTerminalEntry]:
+    def _on_terminal_cleanups(
+        self, drive_outcomes: Sequence[WorkflowOutcome] = (),
+    ) -> list[OnTerminalEntry]:
         """Ordered, kind-aware terminal-cleanup list run by ``CancellationScope``
         on every exit from ``run()`` (normal return, soft-cancel, or
         hard-cancel — ``kind`` is ``None`` for a normal exit).
+
+        ``disposition_info_l0s`` routes the task's info notes once the steward
+        has stopped (:meth:`_disposition_info_l0s`); *drive_outcomes* is the
+        cell ``run()`` fills with ``_drive()``'s outcome, read at exit time.
 
         Replaces ``_drive()``'s old ``finally`` block (W9-θ): the same five
         cleanups, in the same order (``stop_claimant_heartbeat`` first —
@@ -3435,6 +3442,11 @@ class TaskWorkflow:
             if self._steward:
                 await self._steward.stop()
 
+        async def _disposition(kind: Literal['hard', 'soft'] | None) -> None:
+            await self._disposition_info_l0s(
+                exit_kind_for(kind, drive_outcomes[-1] if drive_outcomes else None),
+            )
+
         async def _cleanup_worktree(_kind: Literal['hard', 'soft'] | None) -> None:
             # Cleanup worktree (only if done AND branch is on main — preserve
             # otherwise so an agent's update_task(status='done') bypass
@@ -3461,6 +3473,7 @@ class TaskWorkflow:
         return [
             ('stop_claimant_heartbeat', _stop_heartbeat),
             ('stop_steward', _stop_steward),
+            ('disposition_info_l0s', _disposition),
             ('cleanup_done_worktree', _cleanup_worktree),
             ('release_lane', _release_lane),
             ('cleanup_config_dir', _cleanup_config),
@@ -3513,12 +3526,18 @@ class TaskWorkflow:
         :class:`WorkflowCancelled`, caught at this EXACTLY ONE site.
         """
         cancel_kind: Literal['hard', 'soft'] | None = None
+        drive_outcomes: list[WorkflowOutcome] = []
+
+        async def _drive_recorded() -> WorkflowOutcome:
+            drive_outcomes.append(await self._drive())
+            return drive_outcomes[-1]
+
         scope = CancellationScope(
-            self._cancel_event, self._on_terminal_cleanups(),
+            self._cancel_event, self._on_terminal_cleanups(drive_outcomes),
             cancel_grace_secs=self.config.terminal_cleanup_cancel_grace_secs,
         )
         try:
-            outcome = await scope.supervise(self._drive())
+            outcome = await scope.supervise(_drive_recorded())
         except WorkflowCancelled as wc:
             cancel_kind = wc.kind
             outcome = await self._finalise_cancellation(wc.kind)
@@ -3670,8 +3689,9 @@ class TaskWorkflow:
                 f'Task {self.task_id}: completion memory write failed '
                 f'(non-fatal): {e}'
             )
-        # Wait for steward to finish any pending work (suggestion triage, etc.)
-        await self._ensure_steward_started()
+        # Info leftovers are the exit finalizer's (_disposition_info_l0s), not a steward's.
+        if self._pending_steward_l0s():
+            await self._ensure_steward_started()
         await self._await_steward_completion(skip_if_idle=True)
         return await self._finalise_merged_done()
 
@@ -18317,6 +18337,40 @@ class TaskWorkflow:
             )
             if not router_owns(esc, enabled=self.config.info_l0_router_enabled)
         ]
+
+    async def _disposition_info_l0s(self, exit_kind: ExitKind | None) -> None:
+        """Route every pending info note the router owns at this workflow's exit.
+
+        The exit finalizer of plans/info-l0-disposition-router-prd.md D7: one
+        bounded curator submit per note, no polling (INV-8); a held note is
+        left for the orphan reaper.  Eval mode leaves notes to the eval harness.
+        """
+        queue = self.escalation_queue
+        if (
+            exit_kind is None
+            or not self.config.info_l0_router_enabled
+            or queue is None
+            or self._worktree_external
+        ):
+            return
+        sweep = InfoL0Sweep(
+            self._router_ports(queue), by='workflow-finalizer',
+            max_conversions=self.config.info_l0_router_max_conversions_per_sweep,
+        )
+        for esc in queue.get_by_task(self.task_id, status='pending', level=0):
+            if router_owns(esc, enabled=True):
+                await sweep.route(esc, exit_kind=exit_kind)
+        sweep.close()
+
+    def _router_ports(self, queue: EscalationQueue) -> RouterPorts:
+        """The I/O the info-L0 router may touch from this workflow."""
+        return RouterPorts(
+            queue=queue,
+            event_store=self.event_store,
+            dispatch_tool=self.scheduler.dispatch_tool,
+            project_root=str(self.config.project_root),
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
 
     def _steward_work_outstanding(self) -> bool:
         """Whether there is anything for :meth:`_await_steward_completion` to
