@@ -1372,7 +1372,8 @@ related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
 execution_class, merge_lane, pending_since, pending_since_backfilled,
-claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at
+claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at,
+main_health_signature
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 

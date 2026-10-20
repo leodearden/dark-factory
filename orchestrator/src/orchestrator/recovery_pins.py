@@ -106,9 +106,9 @@ MERGE_REMEDIABLE_ESC_CATEGORIES: frozenset[str] = frozenset({
 })
 
 # Categories whose ask is satisfied BY CONSTRUCTION once the branch is ON MAIN
-# (task 4645).  A `preexisting_main_break` escalation asks for
-# `await_preexisting_main_hotfix`: the branch could not merge because main was
-# already red.  Once the branch IS on main that ask is moot, so the escalation
+# (task 4645).  A `preexisting_main_break` escalation exists because the
+# branch could not merge while main was already red; its ask is a fixed main
+# so the merge can be made.  Once the branch IS on main that ask is moot, so the escalation
 # must not veto the on-main self-heal it requested.  The ask is NOT satisfied
 # for an off-main branch (the merge is still unmade), which is why this is a
 # SECOND set consumed by the ON_MAIN blocked-arm clause alone, and not a

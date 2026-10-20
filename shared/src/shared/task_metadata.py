@@ -1375,6 +1375,10 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # fused-memory's amendment advisory (task 4034).
         'plan_text_fp',
         'plan_authored_at',
+        # The sha-independent main-break signature a fix-main task owns (task 5471):
+        # written by orchestrator/src/orchestrator/main_health_fix_owner.py, which
+        # also reads it back through find_tasks_by_metadata as its dedupe key.
+        'main_health_signature',
     }
 )
 

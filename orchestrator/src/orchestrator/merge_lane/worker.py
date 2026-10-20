@@ -44,7 +44,6 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 from escalation.dedupe import DedupeConfig, content_fingerprint_key, submit_or_dedupe
 from escalation.models import Escalation
 from shared.mcp_post import open_mcp_client, post_mcp_tool_call
-from shared.task_metadata import RetryLedger
 
 from orchestrator.branch_stack import UnstackOutcome
 from orchestrator.critical_gate import critical_filing_gate
@@ -69,6 +68,13 @@ from orchestrator.git_ops import (
 from orchestrator.guard_state import PersistentSet, guard_path
 from orchestrator.log_coalesce import ExponentialLogCoalescer
 from orchestrator.main_health_actions import MainHealthNextAction
+from orchestrator.main_health_fix_owner import (
+    FixSpawnContext,
+    MainBreak,
+    MainFixTaskFiler,
+    build_main_fix_task_arguments,
+    ensure_main_fix_owner,
+)
 from orchestrator.merge_lane.coalesce_unwind import restore_pre_stack_tips
 from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
@@ -525,42 +531,6 @@ def lane_for_task_metadata(metadata: dict | None) -> Literal['normal', 'high']:
     """
     value = (metadata or {}).get('merge_lane', '')
     return _normalize_lane(value or '')  # type: ignore[return-value]
-
-
-_FIX_BRIEF_TITLE_MAX = 100
-"""Maximum length for a compose_fix_main_brief title."""
-_FIX_BRIEF_DETAIL_MAX = 800
-"""Maximum bytes of detail to embed in a compose_fix_main_brief description."""
-
-
-def compose_fix_main_brief(
-    category: str, cause_hint: str, detail: str = '',
-) -> tuple[str, str]:
-    """Build a task title and description for a main-health fix task.
-
-    The title follows the pattern ``'fix main: <cause_hint-or-category>'``,
-    truncated to :data:`_FIX_BRIEF_TITLE_MAX` characters.  The description
-    states that this is an automated main-health fix and includes ``category``,
-    ``cause_hint``, and a bounded slice of ``detail``.
-
-    Pure function — no I/O, no side effects.
-    """
-    # Title: use cause_hint when non-empty; fall back to category
-    label = cause_hint.strip() if cause_hint and cause_hint.strip() else category
-    raw_title = f'fix main: {label}'
-    title = raw_title[:_FIX_BRIEF_TITLE_MAX]
-
-    # Description: automated context header + structured fields + truncated detail
-    detail_snippet = (detail or '').strip()[:_FIX_BRIEF_DETAIL_MAX]
-    description = (
-        f'Automated main-health fix task.\n'
-        f'Category: {category}\n'
-        f'Cause: {cause_hint}\n'
-    )
-    if detail_snippet:
-        description += f'\nDetail:\n{detail_snippet}'
-
-    return title, description
 
 
 MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS: int = 1
@@ -1420,9 +1390,11 @@ def _file_main_health_escalation(
     outcome: MergeOutcome,
     *,
     suggested_action: MainHealthNextAction,
+    detail: str | None = None,
 ) -> str | None:
     """File (or fold) a dedup'd ``preexisting_main_break`` escalation for a
-    confirmed pre-existing main-red *outcome* (task 2564).
+    confirmed pre-existing main-red *outcome* (task 2564).  *detail* defaults
+    to ``outcome.reason``.
 
     Returns the id of the SURVIVING (parent) escalation, or ``None`` when
     *escalation_queue* is None.  A folded submission returns the PARENT's id
@@ -1440,10 +1412,10 @@ def _file_main_health_escalation(
 
     Folds via ``submit_or_dedupe`` using the SAME inf-window
     content-fingerprint :class:`~escalation.dedupe.DedupeConfig`
-    ``workflow.py``'s ``_auto_heal_main_health`` uses (categories=
-    ``('preexisting_main_break',)``), so worker- and workflow-filed L1s for
-    one ``(category, cause_hint, probe_sha)`` signature collapse into one
-    parent, race-free; the task-verify L0 for that break stays separate
+    ``workflow.py::TaskWorkflow._file_main_health_l1`` uses (categories=
+    ``('preexisting_main_break',)``), so every worker- and workflow-filed
+    merge-lane L1 for one ``(category, cause_hint, probe_sha)`` signature
+    collapses into one parent, race-free; the task-verify L0 for that break stays separate
     (dedupe never folds across ladder levels). Falls back to a plain
     ``queue.submit`` when *outcome* carries no fingerprint (the fail-safe
     ``''`` path of :func:`_main_health_fingerprint`).
@@ -1459,7 +1431,7 @@ def _file_main_health_escalation(
         severity='blocking',
         category='preexisting_main_break',
         summary=outcome.reason[:200],
-        detail=outcome.reason,
+        detail=outcome.reason if detail is None else detail,
         suggested_action=suggested_action,
         dedupe_fingerprint=fp,
         level=1,
@@ -9850,6 +9822,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Cross-workflow auto-heal attempt counter; shared via
         # self.merge_worker on TaskWorkflow instances.
         self.auto_heal_registry: MainHealthAutoHealRegistry = MainHealthAutoHealRegistry()
+        # One fix-main task per main-break signature (task 5471); shared with
+        # TaskWorkflow via self.merge_worker so its per-signature lock spans both.
+        self.main_fix_filer: MainFixTaskFiler | None = (
+            MainFixTaskFiler(scheduler) if scheduler is not None else None
+        )
         # Internal tasks created by run()
         self._merger_task: asyncio.Task | None = None
         self._verifier_task: asyncio.Task | None = None
@@ -18452,45 +18429,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
 
     async def _spawn_main_health_fix_task(
-        self,
-        req: MergeRequest,
-        sig: str,
-        esc_id: str,
-        category: str,
-        cause_hint: str,
-        detail: str,
+        self, req: MergeRequest, brk: MainBreak, esc_id: str,
     ) -> None:
-        """Schedule a HIGH-lane fix task for a confirmed main-health break.
+        """Fire-and-forget: submit the HIGH-lane auto-heal fix task for *brk*.
 
-        Worker-side mirror of ``TaskWorkflow._spawn_main_health_fix_task``
-        (workflow.py:6106, task 2564).  Builds a submit_task argument block
-        with:
-
-        - title/description from :func:`compose_fix_main_brief`
-        - ``priority='high'`` and ``metadata.merge_lane='high'`` so the fix
-          merges via the HIGH lane
-        - Correlation keys so the auto-watcher / ``unhalt_lanes_owned_by``
-          can link the fix task back to this escalation: ``spawn_context``,
-          ``main_health_signature``, ``main_health_escalation_id``
-
-        Delegates the actual POST to :meth:`_post_submit_tasks` via
-        ``asyncio.create_task`` (registered in ``self._background_tasks``,
-        drained on shutdown — mirrors :func:`_spawn_merge_verify_dry_run`)
-        so the caller is not blocked.
+        Worker-side mirror of ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._spawn_main_health_fix_task``;
+        the argument block comes from
+        ``orchestrator/src/orchestrator/main_health_fix_owner.py::build_main_fix_task_arguments``.
+        The POST runs in ``self._background_tasks``, drained on shutdown.
         """
-        title, description = compose_fix_main_brief(category, cause_hint, detail)
-        arguments = {
-            'title': title,
-            'description': description,
-            'priority': 'high',
-            'project_root': str(req.config.project_root),
-            'metadata': {
-                'merge_lane': 'high',
-                'spawn_context': 'main_health_auto_heal',
-                'main_health_signature': sig,
-                'main_health_escalation_id': esc_id,
-            },
-        }
+        arguments = build_main_fix_task_arguments(
+            brk,
+            project_root=str(req.config.project_root),
+            spawn_context=FixSpawnContext.AUTO_HEAL,
+            escalation_id=esc_id,
+        )
         try:
             task = asyncio.create_task(
                 self._post_submit_tasks([arguments]),
@@ -18504,22 +18457,44 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 req.task_id, exc,
             )
 
+    async def _escalate_owned_main_break(
+        self,
+        req: MergeRequest,
+        outcome: MergeOutcome,
+        brk: MainBreak,
+        *,
+        otherwise: MainHealthNextAction,
+    ) -> None:
+        """Ensure *brk*'s fix-main task, then file the escalation naming it.
+
+        *otherwise* is the next action when no task could be ensured.
+        """
+        owner = await ensure_main_fix_owner(
+            self.main_fix_filer, brk, project_root=str(req.config.project_root),
+        )
+        _file_main_health_escalation(
+            self._escalation_queue, req, outcome,
+            suggested_action=owner.next_action(otherwise),
+            detail=owner.escalation_detail(outcome.reason),
+        )
+
     async def _auto_heal_main_health_deferred(
         self, outcome: MergeOutcome, req: MergeRequest,
     ) -> None:
         """Worker-side auto-heal for a confirmed deferred main-health break (task 2564).
 
         Mirrors ``TaskWorkflow._auto_heal_main_health`` in full: branch (d)
-        non-mechanical / no escalation_queue, branch (e) attempt-cap, branch
-        (idempotency) lane-already-halted, and the (a) happy path — record
-        the attempt, halt the 'normal' lane, submit/fold the dedup'd
-        halt-owner escalation, register lane-halt ownership, and spawn a
-        HIGH-lane fix task.  Called from the deferred main-health probe
-        (:func:`_run_deferred_main_health_probe`, via the ``auto_heal``
-        callback on :class:`_MainHealthProbeHandles`) once it confirms a
-        still-fresh pre-existing break — this is the ONLY production path
-        that can reach a main-health-red outcome, since the provisional
-        outcome returned to the caller is always task-fault (see
+        non-mechanical / no escalation_queue and branch (e) attempt-cap each
+        ensure a fix-main task (task 5471) and file an escalation naming it;
+        branch (idempotency) lane-already-halted folds into the in-flight
+        auto-heal; the (a) happy path records the attempt, halts the 'normal'
+        lane, submits/folds the dedup'd halt-owner escalation, registers
+        lane-halt ownership, and spawns a HIGH-lane fix task.  Called from the
+        deferred main-health probe (:func:`_run_deferred_main_health_probe`,
+        via the ``auto_heal`` callback on :class:`_MainHealthProbeHandles`)
+        once it confirms a still-fresh pre-existing break — this is the ONLY
+        production path that can reach a main-health-red outcome, since the
+        provisional outcome returned to the caller is always task-fault (see
         :func:`_run_post_merge_verify`'s DEFERRED-mode docstring), so
         ``TaskWorkflow._auto_heal_main_health`` (which keys off
         ``MAIN_HEALTH_RED_REASON_PREFIX``) never fires for it.
@@ -18530,26 +18505,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         primitive directly (``auto_heal_registry``, ``halt_lane``, etc.), so
         that branch collapses into the non-mechanical / no-queue check.
         """
-        # RetryLedger is the SAME signature-keying authority
-        # workflow._compute_merge_outcome_signature delegates to.
-
-        category = outcome.failure_category or ''
-        cause_hint = outcome.failure_cause_hint or ''
+        brk = MainBreak(
+            outcome.failure_category or '', outcome.failure_cause_hint or '', outcome.reason,
+        )
 
         # Branch (d): non-mechanical, or no escalation_queue (cannot register
         # a halt-owner → unhalt_lanes_owned_by can never match → the 'normal'
-        # lane would stay halted permanently → livelock).  Escalate-only, no
-        # halt/spawn.
-        if not is_auto_heal_eligible(category, cause_hint) or self._escalation_queue is None:
-            _file_main_health_escalation(
-                self._escalation_queue, req, outcome,
-                suggested_action=MainHealthNextAction.NO_FIX_OWNER,
+        # lane would stay halted permanently → livelock).  No halt/spawn.
+        if not is_auto_heal_eligible(brk.category, brk.cause_hint) or self._escalation_queue is None:
+            await self._escalate_owned_main_break(
+                req, outcome, brk, otherwise=MainHealthNextAction.NO_FIX_OWNER,
             )
             return
 
-        sig = RetryLedger.compute_merge_outcome_signature(
-            category, cause_hint, outcome.reason,
-        )
+        sig = brk.signature
 
         # Branch (e): attempt cap reached — genuine re-break after a prior
         # heal.  Only fires when the lane is NOT currently halted; an
@@ -18559,9 +18528,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self.auto_heal_registry.attempts(sig) >= MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
             and not self.is_lane_halted('normal')
         ):
-            _file_main_health_escalation(
-                self._escalation_queue, req, outcome,
-                suggested_action=MainHealthNextAction.AUTO_HEAL_EXHAUSTED,
+            await self._escalate_owned_main_break(
+                req, outcome, brk, otherwise=MainHealthNextAction.AUTO_HEAL_EXHAUSTED,
             )
             return
 
@@ -18588,9 +18556,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if esc_id:
             self.set_lane_halt_owner('normal', esc_id)
 
-        await self._spawn_main_health_fix_task(
-            req, sig, esc_id or '', category, cause_hint, outcome.reason,
-        )
+        await self._spawn_main_health_fix_task(req, brk, esc_id or '')
 
     def _clear_contended_lease_streak(self, task_id: str) -> None:
         """Close out a task's contended-lane defer streak (task 3003 amend).
