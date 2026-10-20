@@ -15,14 +15,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _curator_fake import FakeCurator
-from _workflow_helpers import AgentStub, FakeScheduler, _build_workflow_with_escalation
+from _workflow_helpers import (
+    AgentStub,
+    FakeScheduler,
+    _build_workflow_with_escalation,
+    _make_git_ops,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig, TimeoutsConfig, UnblockAutoConfig
 from orchestrator.escalation_router import ROUTER_ID, hold_note, read_hold
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
@@ -66,7 +70,7 @@ def _assignment() -> TaskAssignment:
 def _workflow(tmp_path: Path, *, router_enabled: bool) -> tuple[TaskWorkflow, EscalationQueue]:
     config = _config(tmp_path, router_enabled=router_enabled)
     workflow, _scheduler, queue = _build_workflow_with_escalation(
-        config, GitOps(config.git, config.project_root), _assignment(), AgentStub(), tmp_path,
+        config, _make_git_ops(config.project_root), _assignment(), AgentStub(), tmp_path,
         spawn_merge_worker=False,
     )
     return workflow, queue
