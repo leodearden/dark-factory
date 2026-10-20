@@ -32,6 +32,7 @@ This module builds the CM up from the bottom:
 """
 from __future__ import annotations
 
+import itertools
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -44,6 +45,7 @@ import pytest
 from test_workflow_verify_retry import _make_workflow
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
@@ -301,15 +303,30 @@ class TestMergePhaseReverifyHoldsLease:
     Each spy raises _StopMergePhase to unwind before the downstream merge path.
     """
 
-    async def test_red_tip_reaches_merge_without_verify_or_lease(
-        self, tmp_path: Path,
+    @pytest.mark.parametrize(
+        ('case', 'expect_pre_rebased', 'expect_verifies'),
+        [
+            ('clean_rebase', True, 0),
+            ('rebase_conflict', False, 0),
+            ('main_moved', False, 0),
+            ('rollback_red_verify', False, 1),
+        ],
+    )
+    async def test_red_tip_reaches_merge_with_the_lane_free(
+        self, tmp_path: Path, case: str, expect_pre_rebased: bool,
+        expect_verifies: int,
     ):
-        workflow = _build_task_workflow(tmp_path)
+        """A RED task-scope verdict at the rebased tip never stops the submit,
+        and the lane flock is free when it happens: the merge gate verifies
+        every landing (task 1724). pre_rebased is True only for a clean rebase
+        onto an unmoved main. The default arm never asks the re-verify; the
+        rollback arm asks once and records one post_rebase_verify_fail."""
+        workflow = _build_task_workflow(
+            tmp_path, pre_merge_reverify=(case == 'rollback_red_verify'),
+        )
         assert workflow.worktree is not None  # narrow Path | None for the spy
         lock_path = lane_lock_path(workflow.worktree)
-
-        # A RED task-scope verdict at the rebased tip: reaching merge must not
-        # depend on it, because it must never be asked.
+        event_store = MagicMock()
         verify_mock = AsyncMock(return_value=VerifyResult(
             passed=False, test_output='', lint_output='', type_output='',
             summary='red at the rebased tip', timed_out=False,
@@ -321,7 +338,7 @@ class TestMergePhaseReverifyHoldsLease:
             try:
                 assert fd is not None, (
                     'the task lane flock must be FREE when the merge phase '
-                    'submits — no task_verify_lease is taken by default'
+                    'submits — any task_verify_lease has been released'
                 )
             finally:
                 if fd is not None:
@@ -331,18 +348,30 @@ class TestMergePhaseReverifyHoldsLease:
 
         with pytest.MonkeyPatch.context() as mp:
             _stub_merge_phase_preamble(mp, workflow)
+            mp.setattr(workflow, 'event_store', event_store)
             mp.setattr('orchestrator.workflow.run_scoped_verification', verify_mock)
             mp.setattr(workflow, '_submit_to_merge_queue', _submit_spy)
+            if case == 'rebase_conflict':
+                mp.setattr(
+                    workflow.git_ops, 'rebase_onto_main', AsyncMock(return_value=False),
+                )
+            elif case == 'main_moved':
+                shas = itertools.count()
+                mp.setattr(
+                    workflow.git_ops, 'get_main_sha',
+                    AsyncMock(side_effect=lambda: f'main-{next(shas)}'),
+                )
             with pytest.raises(_StopMergePhase):
                 await workflow._run_merge_phase('task/42')
 
-        assert verify_mock.await_count == 0, (
-            'the default merge phase must not run the task-role re-verify'
-        )
-        assert submitted == {'branch': 'task/42', 'pre_rebased': True}, (
-            'a clean rebase onto an unmoved main must submit pre_rebased=True '
-            'from the rebase outcome alone'
-        )
+        assert verify_mock.await_count == expect_verifies
+        assert submitted == {'branch': 'task/42', 'pre_rebased': expect_pre_rebased}
+        waste_types = [
+            c.kwargs['data']['waste_type']
+            for c in event_store.emit.call_args_list
+            if c.args and c.args[0] == EventType.waste_detected
+        ]
+        assert waste_types == ['post_rebase_verify_fail'] * expect_verifies
 
     async def test_pre_merge_reverify_holds_task_lane_flock(self, tmp_path: Path):
         workflow = _build_task_workflow(tmp_path, pre_merge_reverify=True)
