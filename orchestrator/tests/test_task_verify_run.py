@@ -41,6 +41,7 @@ class TestPrepareTaskVerifyWorktree:
 
 
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+@pytest.mark.asyncio
 async def test_run_task_verify_on_a_fresh_worktree_persists_logs_and_strips_paths(
     tmp_path: Path,
 ) -> None:
