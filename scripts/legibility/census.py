@@ -4593,6 +4593,9 @@ def _run_configured_census(
                 unlanded.roll_back, project_root,
                 project_id=cfg.project_id, label=f"census-{date_str}",
             ),
+            embedder=embeddings.Embedder(
+                embed_fn=embeddings.openai_embed, cache_path=embeddings.cache_path(cfg.project_id),
+            ),
             codebook_dict=codebook_dict,
             config=cfg,
             project_root=str(project_root),
