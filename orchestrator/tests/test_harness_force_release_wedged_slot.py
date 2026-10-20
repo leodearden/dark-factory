@@ -330,3 +330,39 @@ async def test_zombie_unwinding_beside_a_redispatch_leaves_the_redispatch_alone(
     assert [(r.task_id, r.block_reason) for r in rig.reports] == [(TID, 'action_teardown:restart')], (
         "the zombie consumed the successor's cancel cause"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_claimant_clear_that_never_returns_does_not_stall_the_force_release(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch,
+):
+    bound = 0.2
+    monkeypatch.setattr(rig.harness, '_FORCE_RELEASE_CLAIMANT_CLEAR_SECS', bound)
+    stranded = rig.release_event()
+
+    async def _stranded_mcp_call(*_args: object, **_kwargs: object) -> dict:
+        await _ignore_cancels_until(stranded)
+        return {}
+
+    monkeypatch.setattr(rig.scheduler, 'dispatch_tool', _stranded_mcp_call)
+    workflow, _release = rig.wedged_in_cleanup()
+    sem = asyncio.Semaphore(0)
+    assert rig.scheduler.lock_table.try_acquire(TID, ['lib'])
+    loop = asyncio.get_running_loop()
+    try:
+        with _built_workflows(workflow):
+            rig.launch(sem)
+            await rig.wait_active()
+            await rig.scan(HARD_CANCEL_POLLS + FORCE_RELEASE_POLLS - 1)
+            started = loop.time()
+            scan = asyncio.create_task(rig.scan(1))
+            rig.slots.append(scan)
+            await asyncio.wait({scan}, timeout=BARRIER)
+
+            assert scan.done(), 'the force-release waited on the stranded claimant clear'
+            assert loop.time() - started < bound + 2.0
+            assert await _value_is_exactly_one(sem)
+            assert not rig.scheduler.lock_table.is_held(TID)
+            assert len(rig.emitted(EventType.workflow_slot_force_released)) == 1
+    finally:
+        await rig.retire()

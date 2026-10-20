@@ -25,6 +25,7 @@ from escalation.categories import EscalationCategory
 from escalation.classify import is_done_step_commit_orphan
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
+from shared.asyncio_tasks import abandon_task
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -241,6 +242,9 @@ except ImportError:
     HAS_STEWARD = False
 
 logger = logging.getLogger(__name__)
+
+# Force-release claimant clears that outlived their bound, kept referenced until they unwind.
+_UNDRAINED_CLAIMANT_CLEARS: set[asyncio.Task] = set()
 
 # Maximum number of same-signature blocked→pending re-pends allowed before the
 # 4th flip is withheld and a born-at-L2 human escalation is filed.  A module
@@ -14513,8 +14517,7 @@ class Harness:
         stuck = suspended_slot_tasks(slot_task)
         self._force_released_slot_tasks().add(slot_task)
         self._unregister_slot(task_id)
-        with contextlib.suppress(Exception):
-            await self.scheduler.set_task_claimant(task_id, claimant_run_id=None, heartbeat_at=None)
+        await self._clear_claimant_bounded(task_id)
         lease.release(requeued=False)
         blamed = culprit(stuck)
         logger.error(
@@ -14530,6 +14533,37 @@ class Harness:
                 data={'status': status, 'polls': polls, 'modules': modules},
             )
         self._file_slot_wedged_l1(task_id, status, polls, modules, stuck)
+
+    # How long the backstop waits for its claimant clear before releasing anyway.
+    # One set_task_claimant MCP call is bounded at 15s; a stranded one (the
+    # httpcore cancel trap) must not stall the backstop that exists for wedges.
+    _FORCE_RELEASE_CLAIMANT_CLEAR_SECS: float = 20.0
+
+    async def _clear_claimant_bounded(self, task_id: str) -> None:
+        """Clear *task_id*'s claimant, giving up after ``_FORCE_RELEASE_CLAIMANT_CLEAR_SECS``.
+
+        A clear that has not returned by then is cancelled without being
+        awaited and left to unwind; the claimant then self-heals, as any lost
+        clear does (``scheduler.py::Scheduler.set_task_claimant``).
+        """
+        clear = asyncio.create_task(
+            self.scheduler.set_task_claimant(task_id, claimant_run_id=None, heartbeat_at=None),
+            name=f'force-release-claimant-clear-{task_id}',
+        )
+        await asyncio.wait({clear}, timeout=self._FORCE_RELEASE_CLAIMANT_CLEAR_SECS)
+        if clear.done():
+            if not clear.cancelled() and clear.exception() is not None:
+                logger.warning(
+                    'Task %s: claimant clear during force-release failed (non-fatal): %s',
+                    task_id, clear.exception(),
+                )
+            return
+        logger.warning(
+            'Task %s: claimant clear during force-release did not return within '
+            '%.0fs; releasing the slot without it',
+            task_id, self._FORCE_RELEASE_CLAIMANT_CLEAR_SECS,
+        )
+        abandon_task(clear, _UNDRAINED_CLAIMANT_CLEARS)
 
     def _force_released_slot_tasks(self) -> set[asyncio.Task]:
         """Slot tasks force-released and not yet ended, lazily created (``_cancel_causes``'s idiom).
