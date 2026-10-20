@@ -1628,6 +1628,121 @@ def _within_fleet_staleness_head_start() -> bool:
     )
 
 
+_NO_MODULE_REMOVAL_WAIVER = "not waiving the fleet-deploy clock gates"
+
+
+def _git_stdout(args: list[str], purpose: str) -> str | None:
+    """Return the stdout of ``git -C REPO_DIR <args>``, or None after a WARNING if it failed."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", REPO_DIR, *args], capture_output=True, text=True, timeout=5
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"{purpose}: git raised {exc!r}; {_NO_MODULE_REMOVAL_WAIVER}")
+        return None
+    if result.returncode != 0:
+        logger.warning(
+            f"{purpose}: git exited {result.returncode}: {result.stderr.strip()}; "
+            f"{_NO_MODULE_REMOVAL_WAIVER}"
+        )
+        return None
+    return result.stdout
+
+
+def _mainline_commit_at(epoch: float) -> str | None:
+    """Return the first-parent commit HEAD's history stood at as of *epoch*, or None."""
+    stdout = _git_stdout(
+        ["rev-list", "-1", "--first-parent", f"--before=@{int(epoch)}", "HEAD"],
+        "module-removal probe: mainline commit at the last fleet deploy",
+    )
+    if stdout is None:
+        return None
+    commit = stdout.strip()
+    if not commit:
+        logger.warning(
+            "module-removal probe: no mainline commit at or before the last fleet "
+            f"deploy ({int(epoch)}); {_NO_MODULE_REMOVAL_WAIVER}"
+        )
+        return None
+    return commit
+
+
+def _removed_watched_modules(base: str) -> tuple[str, ...]:
+    """Return the MODULE_REMOVAL_WATCHED_PATHS .py files present at *base* and absent at HEAD.
+
+    ``--no-renames`` reports a rename as the deletion of its old path.
+    """
+    stdout = _git_stdout(
+        [
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "--diff-filter=D",
+            base,
+            "HEAD",
+            "--",
+            *MODULE_REMOVAL_WATCHED_PATHS,
+        ],
+        "module-removal probe: watched modules removed since the last fleet deploy",
+    )
+    if stdout is None:
+        return ()
+    return tuple(path for path in stdout.split("\0") if path.endswith(".py"))
+
+
+def _first_removal_epoch(base: str, paths: tuple[str, ...]) -> int | None:
+    """Return when the first mainline commit after *base* removing one of *paths* landed."""
+    stdout = _git_stdout(
+        [
+            "log",
+            "--first-parent",
+            "--no-renames",
+            "--diff-filter=D",
+            "--format=%ct",
+            f"{base}..HEAD",
+            "--",
+            *paths,
+        ],
+        "module-removal probe: landing time of the first removal",
+    )
+    if stdout is None:
+        return None
+    try:
+        return min(int(epoch) for epoch in stdout.split())
+    except ValueError:
+        logger.warning(
+            f"module-removal probe: no landing time for {list(paths)} in {stdout!r}; "
+            f"{_NO_MODULE_REMOVAL_WAIVER}"
+        )
+        return None
+
+
+def _due_module_removals() -> tuple[str, ...]:
+    """Return the removed watched modules that now waive the fleet clock gates, or ().
+
+    Non-empty only when watched .py files present in the tree the fleet was
+    last deployed from are absent at HEAD, and MODULE_REMOVAL_GRACE_SECS has
+    passed since the first mainline commit that removed one of them landed.
+    Fails toward no waiver: an absent deploy clock returns () without running
+    git, and any failed git probe returns () after a WARNING. Rationale:
+    OPERATIONS.md section 8 ("Fleet redeploy & watchdog").
+    """
+    deployed = _read_last_fleet_deploy_epoch()
+    if deployed is None:
+        return ()
+    base = _mainline_commit_at(deployed)
+    if base is None:
+        return ()
+    removed = _removed_watched_modules(base)
+    if not removed:
+        return ()
+    first = _first_removal_epoch(base, removed)
+    if first is None or time.time() - first < MODULE_REMOVAL_GRACE_SECS:
+        return ()
+    return removed
+
+
 def _read_last_fm_deploy_epoch() -> float | None:
     """Return the last verified fm-deploy epoch from FM_DEPLOY_CLOCK_PATH, or None.
 
