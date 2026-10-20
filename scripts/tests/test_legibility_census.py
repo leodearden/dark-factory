@@ -11529,3 +11529,184 @@ def test_a_backlog_candidate_near_only_a_fixed_entry_is_not_attached(tmp_path, s
     assert candidate["disposition"] == "pending"
     assert "attached_by" not in candidate
     assert _run_record(kwargs)["adjudication"]["attached"] == []
+
+
+# Row 12 part 2: the rest of the pending backlog, clustered, ranked and capped,
+# is verified one representative per cluster, and the other members follow it.
+
+_PAIR_A = ("Pair A older shape", "Pair A newer shape")
+_PAIR_A_IDS = ("cand-20260702-1", "cand-20260703-1")
+_PAIR_B = ("Pair B older shape", "Pair B newer shape")
+_PAIR_B_IDS = ("cand-20260704-1", "cand-20260704-2")
+_CLOSE = 0.88
+
+
+def _close_pair(axis: int) -> tuple[list[float], list[float]]:
+    """Two vectors at cosine _CLOSE on axes *axis* and *axis* + 1: one queue
+    cluster, orthogonal to every other text."""
+    first, second = [0.0] * (axis + 2), [0.0] * (axis + 2)
+    first[axis] = 1.0
+    second[axis], second[axis + 1] = _CLOSE, math.sqrt(1 - _CLOSE ** 2)
+    return first, second
+
+
+def _queue_codebook(*, pair_b: bool = False) -> dict:
+    """Twelve pending backlog candidates, none near an entry: pair A (two
+    sessions, newest member _PAIR_A_IDS[1]), optionally pair B, and singletons."""
+    cb = _minimal_v2_codebook()
+    singletons = 8 if pair_b else 10
+    cb["candidates"] = [
+        *(
+            _backlog_candidate(f"cand-20260701-{n}", f"Backlog shape {n}", f"s-backlog-{n}")
+            for n in range(1, singletons + 1)
+        ),
+        _backlog_candidate(_PAIR_A_IDS[0], _PAIR_A[0], "s-pair-a-1", first_seen="2026-07-02"),
+        _backlog_candidate(_PAIR_A_IDS[1], _PAIR_A[1], "s-pair-a-2", first_seen="2026-07-03"),
+    ]
+    if pair_b:
+        cb["candidates"] += [
+            _backlog_candidate(_PAIR_B_IDS[0], _PAIR_B[0], "s-pair-b-1", first_seen="2026-07-04"),
+            _backlog_candidate(_PAIR_B_IDS[1], _PAIR_B[1], "s-pair-b-2", first_seen="2026-07-04"),
+        ]
+    return cb
+
+
+def _queue_verify_fn(*, verified_titles=(), raise_on_queue=False):
+    """Verifies *verified_titles* unremediated at the row-5 anchor and rejects
+    every other title; with *raise_on_queue*, a call offering any backlog
+    cluster hits the headroom cap instead. Records each call in ``.calls``."""
+    calls = []
+
+    def verify_fn(clusters, *, model):
+        calls.append({"clusters": clusters, "model": model})
+        if raise_on_queue and any(cluster["title"] != _L6_NOVEL_TITLE for cluster in clusters):
+            raise mod.CensusHeadroomExhausted(
+                stage="verify", reason="usage limit reached", unverified=len(clusters),
+            )
+        verified = [cluster for cluster in clusters if cluster["title"] in verified_titles]
+        result = _verifying_unremediated_at_the_row5_anchor(verified, model=model)
+        result["rejected"] = [cluster for cluster in clusters if cluster["title"] not in verified_titles]
+        return result
+
+    verify_fn.calls = calls
+    return verify_fn
+
+
+def _queue_kwargs(tmp_path, *, verify_fn, cb=None, batch=None, **overrides):
+    _write_briefing(tmp_path)
+    chosen = {**dict(zip(_PAIR_A, _close_pair(0), strict=True)), **dict(zip(_PAIR_B, _close_pair(3), strict=True))}
+    kwargs, _ = _similarity_kwargs(tmp_path, chosen, codebook_dict=cb or _queue_codebook(), batch=batch)
+    kwargs.update(verify_fn=verify_fn, **overrides)
+    return kwargs
+
+
+def _queue_offers(verify_fn) -> list[list[dict]]:
+    """The clusters of every verify call that offered a backlog cluster."""
+    return [
+        call["clusters"] for call in verify_fn.calls
+        if any(cluster["title"] != _L6_NOVEL_TITLE for cluster in call["clusters"])
+    ]
+
+
+def _novel_batch():
+    return [_hand_digest("novel-verified", "a genuinely new confusion shape")]
+
+
+def test_the_queue_offers_its_ranked_capped_clusters_and_a_verified_representative_carries_its_member(tmp_path):
+    verify_fn = _queue_verify_fn(verified_titles={_PAIR_A[1]})
+    kwargs = _queue_kwargs(tmp_path, verify_fn=verify_fn)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    [offered] = _queue_offers(verify_fn)
+    assert len(offered) == 10
+    pair = offered[0]
+    assert pair["title"] == _PAIR_A[1]
+    assert _PAIR_A[0] not in {cluster["title"] for cluster in offered}
+    assert sorted(sighting["session"] for sighting in pair["sightings"]) == ["s-pair-a-1", "s-pair-a-2"]
+    assert sorted(pair["evidence"]) == ["evidence from s-pair-a-1", "evidence from s-pair-a-2"]
+    assert pair["area"] == "orchestrator"
+
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    entry_id = f"entry-{_PAIR_A_IDS[1]}"
+    representative = _persisted_record(kwargs, _PAIR_A_IDS[1])
+    assert (representative["disposition"], representative["promoted_to"]) == ("promoted", entry_id)
+    member = _persisted_record(kwargs, _PAIR_A_IDS[0])
+    assert (member["disposition"], member["promoted_to"], member["adjudicated_with"]) == (
+        "promoted", entry_id, _PAIR_A_IDS[1],
+    )
+    entry = _persisted_record(kwargs, entry_id)
+    assert entry["finding_key"] == _ROW5_KEY
+    assert {sighting["session"] for sighting in entry["sightings"]} == {"s-pair-a-1", "s-pair-a-2"}
+    assert sum(1 for candidate in persisted["candidates"] if candidate["disposition"] == "rejected") == 9
+    assert _persisted_record(kwargs, "cand-20260701-1")["disposition"] == "pending"
+
+    record = _run_record(kwargs)
+    assert record["withheld"] == []
+    [payload] = kwargs["submit_fn"].calls
+    assert payload["metadata"]["x_finding_key"] == _ROW5_KEY
+    assert record["method"]["cost"]["verify_calls"] == 10
+    assert record["method"]["extra"]["adjudicated"] == 11
+    first = record["adjudication"]["processed"][0]
+    assert (first["representative"], first["outcome"]) == (_PAIR_A_IDS[1], "verified")
+    assert sorted(first["members"]) == sorted(_PAIR_A_IDS)
+
+
+def test_a_rejected_representatives_member_is_rejected_with_it(tmp_path):
+    verify_fn = _queue_verify_fn(verified_titles={_PAIR_A[1]})
+    kwargs = _queue_kwargs(tmp_path, verify_fn=verify_fn, cb=_queue_codebook(pair_b=True))
+
+    assert mod.run_census(**kwargs).status == "done"
+
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    assert _persisted_record(kwargs, _PAIR_B_IDS[1])["disposition"] == "rejected"
+    member = _persisted_record(kwargs, _PAIR_B_IDS[0])
+    assert (member["disposition"], member["adjudicated_with"]) == ("rejected", _PAIR_B_IDS[1])
+    record = _run_record(kwargs)
+    [row] = [row for row in record["adjudication"]["processed"] if row["representative"] == _PAIR_B_IDS[1]]
+    assert row["outcome"] == "rejected"
+    assert record["method"]["extra"]["adjudicated"] == 12
+
+
+def test_the_verify_cap_bounds_the_queue_to_what_the_novel_clusters_leave(tmp_path):
+    verify_fn = _queue_verify_fn(verified_titles={_L6_NOVEL_TITLE})
+    kwargs = _queue_kwargs(tmp_path, verify_fn=verify_fn, batch=_novel_batch(), max_verify_clusters=3)
+
+    assert mod.run_census(**kwargs).status == "done"
+
+    assert _offered_titles(verify_fn)[0] == [_L6_NOVEL_TITLE]
+    [offered] = _queue_offers(verify_fn)
+    assert [cluster["title"] for cluster in offered] == [_PAIR_A[1], "Backlog shape 10"]
+    record = _run_record(kwargs)
+    assert record["method"]["cost"]["verify_calls"] == 3
+    assert record["method"]["extra"]["adjudicated"] == 3
+
+
+def test_a_cap_hit_on_the_queue_call_leaves_the_queue_pending_and_the_run_done(tmp_path):
+    verify_fn = _queue_verify_fn(verified_titles={_L6_NOVEL_TITLE}, raise_on_queue=True)
+    kwargs = _queue_kwargs(tmp_path, verify_fn=verify_fn, batch=_novel_batch())
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert len(_queue_offers(verify_fn)) == 1
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    backlog_ids = {candidate["id"] for candidate in _queue_codebook()["candidates"]}
+    backlog = [candidate for candidate in persisted["candidates"] if candidate["id"] in backlog_ids]
+    assert len(backlog) == 12
+    assert all(c["disposition"] == "pending" and "adjudicated_with" not in c for c in backlog)
+    [novel] = [candidate for candidate in persisted["candidates"] if candidate["title"] == _L6_NOVEL_TITLE]
+    assert novel["disposition"] == "promoted"
+
+    record = _run_record(kwargs)
+    adjudication = record["adjudication"]
+    assert "usage limit reached" in adjudication["inconclusive"]
+    assert {row["outcome"] for row in adjudication["processed"]} == {"inconclusive"}
+    assert record["method"]["extra"]["adjudicated"] == 0
+    assert record["method"]["cost"]["verify_calls"] == 1 + 10
+    section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Adjudication")
+    assert [line for line in section.splitlines() if "inconclusive" in line and "usage limit reached" in line]
