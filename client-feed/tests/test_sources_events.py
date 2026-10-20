@@ -5,6 +5,9 @@ from pathlib import Path
 
 import pytest
 from _stores import RunsDb
+from shared.project_layout import runs_db
+
+from client_feed.contract import Source, VerifyKind
 from client_feed.sources.events import (
     EventBatch,
     LandedCommit,
@@ -16,9 +19,6 @@ from client_feed.sources.events import (
     read_events,
 )
 from client_feed.sources.store import StoreProblem, StoreReadError
-from shared.project_layout import runs_db
-
-from client_feed.contract import Source, VerifyKind
 
 BASE = datetime(2026, 10, 1, 10, 0, tzinfo=UTC)
 SHA_A = 'a' * 40
