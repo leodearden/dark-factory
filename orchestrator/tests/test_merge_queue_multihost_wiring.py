@@ -330,7 +330,7 @@ def _make_git_ops_mock():
     mock.get_main_sha = AsyncMock(return_value='main-sha')
     mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)  # plenty of disk
     mock.cleanup_merge_worktree = AsyncMock()
-    mock.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+    mock.create_ephemeral_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
     return mock
 
 
@@ -343,7 +343,7 @@ def _make_drift_git_ops(tmp_path):
     mock = _make_git_ops_mock()
     throwaway = tmp_path / '_merge-throwaway'
     throwaway.mkdir(exist_ok=True)
-    mock.create_throwaway_verify_worktree = AsyncMock(return_value=throwaway)
+    mock.create_ephemeral_verify_worktree = AsyncMock(return_value=throwaway)
     return mock
 
 
@@ -1190,10 +1190,10 @@ class TestRunDriftCheck:
                 verifier=PRODUCTION_VERIFIER,
             )
 
-        git_ops.create_throwaway_verify_worktree.assert_called_once_with('abc123')
+        git_ops.create_ephemeral_verify_worktree.assert_called_once_with('abc123')
         git_ops.cleanup_merge_worktree.assert_called_once()
 
-        throwaway = git_ops.create_throwaway_verify_worktree.return_value
+        throwaway = git_ops.create_ephemeral_verify_worktree.return_value
         assert run_scoped.await_args is not None, (
             'the local trust anchor never verified anything — the allocator '
             'never built it from the drift check factory'

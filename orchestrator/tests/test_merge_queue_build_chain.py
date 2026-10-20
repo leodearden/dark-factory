@@ -385,7 +385,7 @@ class TestMergeBranchIntoWorktree:
         main_sha = await _rev_parse(git_repo)
 
         before = await _worktree_names(git_ops)
-        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
         pre_head = await _rev_parse(wt)
 
         res = await git_ops.merge_branch_into_worktree(wt, '101')
@@ -411,7 +411,7 @@ class TestMergeBranchIntoWorktree:
             git_repo, 'task/101', 'disjoint.txt', 'edit-101\n',
         )
         main_sha = await _rev_parse(git_repo)
-        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
         pre_head = await _rev_parse(wt)
 
         res = await git_ops.merge_branch_into_worktree(wt, '101')
@@ -426,7 +426,7 @@ class TestMergeBranchIntoWorktree:
         git_ops = _make_git_ops(git_repo)
         await _create_branch_editing(git_repo, 'task/101', 'disjoint.txt', 'edit-101\n')
         main_sha = await _rev_parse(git_repo)
-        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
 
         await git_ops.merge_branch_into_worktree(wt, '101')
 
@@ -441,7 +441,7 @@ class TestMergeBranchIntoWorktree:
         main_sha = await _rev_parse(git_repo)
 
         before = await _worktree_names(git_ops)
-        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
 
         res1 = await git_ops.merge_branch_into_worktree(wt, '101')
         assert res1.success is True
@@ -475,7 +475,7 @@ class TestMergeBranchIntoWorktree:
             git_repo, 'task/102', 'shared.txt', _shared_txt_with(1, 'from-102'),
         )
         main_sha = await _rev_parse(git_repo)
-        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
 
         ok = await git_ops.merge_branch_into_worktree(wt, '101')
         assert ok.success is True
@@ -512,7 +512,7 @@ class TestMergeBranchIntoWorktree:
         )
         await _create_branch_editing(git_repo, 'task/103', 'c.txt', 'edit-103\n')
         main_sha = await _rev_parse(git_repo)
-        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
 
         first = await git_ops.merge_branch_into_worktree(wt, '101')
         conflicted = await git_ops.merge_branch_into_worktree(wt, '102')
@@ -528,7 +528,7 @@ class TestMergeBranchIntoWorktree:
         """A non-conflict merge failure is loud, conflicts=False, HEAD unchanged."""
         git_ops = _make_git_ops(git_repo)
         main_sha = await _rev_parse(git_repo)
-        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
         tip = await _rev_parse(wt)
 
         res = await git_ops.merge_branch_into_worktree(wt, 'does-not-exist-999')
@@ -565,7 +565,7 @@ class TestMergeBranchIntoWorktree:
         await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
         await _create_branch_editing(git_repo, 'task/102', 'b.txt', 'edit-102\n')
         main_sha = await _rev_parse(git_repo)
-        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
 
         first = await git_ops.merge_branch_into_worktree(wt, '101')
         assert first.success is True
@@ -612,7 +612,7 @@ class TestMergeBranchIntoWorktree:
         git_ops = _make_git_ops(git_repo)
         await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
         main_sha = await _rev_parse(git_repo)
-        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
         pre = await _rev_parse(wt)
 
         res = await git_ops.merge_branch_into_worktree(wt, '101')
@@ -1219,7 +1219,7 @@ class TestBuildChainClean:
         main_sha = await _rev_parse(git_repo)
 
         # Mimic frozen_prefix_tip: the newest frozen item's merge commit.
-        seed_wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        seed_wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
         seeded = await git_ops.merge_branch_into_worktree(seed_wt, '100')
         assert seeded.success is True
         head = seeded.merge_commit
@@ -1642,7 +1642,7 @@ class TestBuildChainTruncation:
 
         # Mimic frozen_prefix_tip: head is 100's merge commit, already holding
         # the line-1 edit that 101 rewrites differently.
-        seed_wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        seed_wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
         seeded = await git_ops.merge_branch_into_worktree(seed_wt, '100')
         assert seeded.success is True
         head = seeded.merge_commit
@@ -1688,7 +1688,7 @@ class TestBuildChainTruncation:
         documented remedy (idiom at test_crash_recovery.py:69).
         """
         main_sha = await _rev_parse(git_repo)
-        seed_wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        seed_wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
         seeded = await git_ops.merge_branch_into_worktree(seed_wt, branch)
         assert seeded.success is True
         head = seeded.merge_commit
@@ -1912,7 +1912,7 @@ class TestMergeBranchIntoWorktreeRevParseGuard:
         git_ops = _make_git_ops(git_repo)
         await _create_branch_editing(git_repo, 'task/101', 'disjoint.txt', 'edit-101\n')
         main_sha = await _rev_parse(git_repo)
-        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
         pre_head = await _rev_parse(wt)
 
         state = _fail_rev_parse_head(monkeypatch, after_merge=True)
@@ -1939,7 +1939,7 @@ class TestMergeBranchIntoWorktreeRevParseGuard:
         git_ops = _make_git_ops(git_repo)
         await _create_branch_editing(git_repo, 'task/101', 'disjoint.txt', 'edit-101\n')
         main_sha = await _rev_parse(git_repo)
-        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        wt = await git_ops.create_ephemeral_verify_worktree(main_sha)
         pre_head = await _rev_parse(wt)
 
         state = _fail_rev_parse_head(monkeypatch, after_merge=False)
