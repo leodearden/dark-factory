@@ -242,7 +242,13 @@ parameter, the γ2 auto-chain through `_GenerationChainContext`.
 | `_check_plan_files_touched_in_branch()` | merge_lane/gates.py | Pre-merge Decision-1: every declared plan file must be touched on the branch |
 | `_check_post_merge_equivalence()` | merge_lane/gates.py | Post-merge Decision-2: branch-touched paths must match the advanced main tree |
 | `_rebase_delta_touched_overlap()` | merge_lane/gates.py | Intersection of branch-touched and intervening-rebase-delta files (fail-closed) |
-| `_reverify_rebased_tree()` | merge_lane/gates.py | Disjoint-delta re-verify gate; delegates to `_run_post_merge_verify` when overlapping |
+| `_reverify_rebased_tree()` | merge_lane/gates.py | Disjoint-delta re-verify gate; records each decision as a `merge_reverify_gate` event, and delegates to `_run_post_merge_verify` (forwarding `event_store`) when it fires |
+| `_decide_reverify_gate()` | merge_lane/gates.py | Classifies a rebased tree into a `ReverifyGateDecision` (same tree, disjoint, untrusted disjoint, overlap, unknown overlap) without verifying |
+| `_log_reverify_gate_decision()` | merge_lane/gates.py | One log line per gate decision: INFO for a skip, WARNING for a fire |
+| `GateClearance` | merge_lane/reverify_gate_decision.py | Why a rebased tree cleared the gate: `same_tree`, `disjoint` or `reverified` (task 6647; moved from gates.py by task 5064) |
+| `ReverifyGateReason` | merge_lane/reverify_gate_decision.py | Every way the gate decides; its `_SKIP_CLEARANCE` map is the one home of skip-vs-fire |
+| `ReverifyGateDecision` | merge_lane/reverify_gate_decision.py | The facts one gate decision was made on; `event_data()` is the `merge_reverify_gate` payload |
+| `emit_reverify_gate_decision()` | merge_lane/reverify_gate_decision.py | Writes a decision as a `merge_reverify_gate` event (no-op without a store) |
 | `_check_post_merge_pyright()` | merge_lane/gates.py | Post-merge Decision-3: unscoped package-wide type-check against the advanced main SHA |
 | `_resolve_second_parent()` | merge_lane/gates.py | Second parent (`sha^2`) of a `--no-ff` merge commit, for equivalence-gate tip resolution |
 | `_commit_is_linear()` | merge_lane/gates.py | True iff a commit has ≤1 parent (task-1928 worktree-HEAD-fallback fail-safe gate) |
