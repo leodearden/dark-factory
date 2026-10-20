@@ -188,15 +188,16 @@ class TestMainFixTaskFiler:
     def test_a_half_filed_owner_is_released_by_the_next_break(self) -> None:
         store = FakeTaskStore(commit_fails=True)
         filer = MainFixTaskFiler(store)
-        first = _ensure(store, TEST_BREAK, filer)
-        assert store.tasks[first.task_id]['status'] == 'deferred'
+        first = _ensure(store, TEST_BREAK, filer).task_id
+        assert first is not None
+        assert store.tasks[first]['status'] == 'deferred'
         store.commit_fails = False
 
         second = _ensure(store, TEST_BREAK, filer)
 
-        assert second.task_id == first.task_id
+        assert second.task_id == first
         assert len(store.submits) == 1
-        assert store.tasks[first.task_id]['status'] == 'pending'
+        assert store.tasks[first]['status'] == 'pending'
 
     def test_a_hand_carried_deferral_is_left_alone(self) -> None:
         store = FakeTaskStore()
