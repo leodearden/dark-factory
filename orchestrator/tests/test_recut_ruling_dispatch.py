@@ -321,8 +321,8 @@ async def _run_to_provisioning(tmp_path: Path, metadata: Any) -> tuple[AsyncMock
 
     wf.scheduler.set_task_status = AsyncMock(side_effect=_set_status)
     wf.scheduler.get_status = AsyncMock(side_effect=_get_status)
-    wf._mark_blocked = AsyncMock(side_effect=_mark_blocked)  # type: ignore[method-assign]
-    return create_worktree, await wf.run()
+    with patch.object(wf, '_mark_blocked', AsyncMock(side_effect=_mark_blocked)):
+        return create_worktree, await wf.run()
 
 
 @pytest.mark.asyncio

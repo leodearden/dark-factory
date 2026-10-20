@@ -9499,7 +9499,7 @@ class Harness:
             )
             return
 
-        from escalation.models import Escalation  # noqa: PLC0415
+        from escalation.models import Escalation
 
         esc = Escalation(
             id=self._escalation_queue.make_id(task_id),
