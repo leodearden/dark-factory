@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+from itertools import permutations
 from statistics import mean
 
 ScoreRecord = dict
@@ -160,6 +161,73 @@ def complement(
         comp += len(counted(rec) - inc[k])
         inc_total += len(inc[k])
     return comp, inc_total
+
+
+def _share(count: int, matched: int) -> float | None:
+    return round(count / matched, 4) if matched else None
+
+
+def _complement_row(
+    arm: list[ScoreRecord], incumbent: list[ScoreRecord], blocking_gt_by_diff: dict[str, set[str]],
+) -> dict:
+    comp, matched = complement(arm, incumbent)
+    blocking_comp, blocking_matched = complement(arm, incumbent, restrict_to=blocking_gt_by_diff)
+    return {
+        'complement': comp,
+        'incumbent_matched': matched,
+        'share': _share(comp, matched),
+        'blocking_complement': blocking_comp,
+        'blocking_incumbent_matched': blocking_matched,
+        'blocking_share': _share(blocking_comp, blocking_matched),
+    }
+
+
+def _measured_by_trial(records: list[ScoreRecord]) -> dict[int, list[ScoreRecord]]:
+    grouped: dict[int, list[ScoreRecord]] = defaultdict(list)
+    for rec in records:
+        if _is_measured(rec):
+            grouped[rec['trial']].append(rec)
+    return grouped
+
+
+@dataclass(frozen=True)
+class SelfComplementBand:
+    pairs: list[dict]
+    overall_min: float | None
+    overall_max: float | None
+    blocking_min: float | None
+    blocking_max: float | None
+
+
+def self_complement_band(
+    incumbent: list[ScoreRecord], blocking_gt_by_diff: dict[str, set[str]],
+) -> SelfComplementBand:
+    """The incumbent's run-to-run complement: the noise floor every candidate's must clear.
+
+    Each ordered pair of distinct measured trials (trial i over trial j) is one
+    complement row on the fixtures both trials measured; the bounds span the
+    pairs whose share is defined. ``clears_self_complement_band`` reads it.
+    """
+    by_trial = _measured_by_trial(incumbent)
+    pairs = [
+        {
+            'trial': i,
+            'over_trial': j,
+            **_complement_row(
+                [{**r, 'trial': j} for r in by_trial[i]], by_trial[j], blocking_gt_by_diff,
+            ),
+        }
+        for i, j in permutations(sorted(by_trial), 2)
+    ]
+    overall = [p['share'] for p in pairs if p['share'] is not None]
+    blocking = [p['blocking_share'] for p in pairs if p['blocking_share'] is not None]
+    return SelfComplementBand(
+        pairs=pairs,
+        overall_min=min(overall, default=None),
+        overall_max=max(overall, default=None),
+        blocking_min=min(blocking, default=None),
+        blocking_max=max(blocking, default=None),
+    )
 
 
 def summarize_arm(
