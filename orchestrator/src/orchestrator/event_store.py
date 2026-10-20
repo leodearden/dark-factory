@@ -219,13 +219,9 @@ class EventType(StrEnum):
     # /unblock, /do) submit branches without emitting it -> classifier
     # degrades to INDETERMINATE by design.
     workflow_verify = 'workflow_verify'
-    # One row per review whose aggregation workflow.py::TaskWorkflow._execute_verify_review_loop
-    # decided: its PASS / suggestions-only exit and its blocking-cycle branch (client-feed θ,
-    # plans/client-feed-prd.md §4 decision 16). task_id-keyed, phase 'review'; data is defined
-    # by orchestrator/src/orchestrator/review_outcome.py::review_completed_payload — counts
-    # only, never issue text. cycle = 1 + the blocking review cycles recorded before this
-    # review in the task's lifetime; an amendment re-review stays in the same cycle, and only
-    # the review that closes it is recorded.
+    # Client-feed θ (plans/client-feed-prd.md §4 decision 16). Producer:
+    # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._emit_review_completed; data:
+    # orchestrator/src/orchestrator/review_outcome.py::review_completed_payload.
     review_completed = 'review_completed'
     # Local-vs-remote verdict AGREEMENT.  THREE producers emit this member with
     # deliberately DIFFERENT data shapes — read the producer before the payload:
