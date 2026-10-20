@@ -1797,14 +1797,17 @@ def _sighting_counts_by_title(cb: dict) -> dict[str | None, int]:
 
 def _filing_gate(cluster: dict, sighting_count: int) -> tuple[bool, filing_policy.WithheldCluster | None]:
     """Whether this run files verified *cluster*, seen in *sighting_count*
-    distinct sessions, and the cluster as held back when it does not: a
-    structural one never files and is never held (``disposition.files``,
-    contract §6), a mechanical one files by ``filing_policy.is_fileable``."""
+    distinct sessions and at least in those its own sightings carry, and the
+    cluster as held back when it does not: a structural one never files and
+    is never held (``disposition.files``, contract §6), a mechanical one files
+    by ``filing_policy.is_fileable``."""
+    carried = {sighting.get("session") for sighting in cluster.get("sightings") or [] if sighting.get("session")}
+    seen = max(sighting_count, len(carried))
     mechanical = disposition.files(cluster["verdict"])
-    files = mechanical and filing_policy.is_fileable(cluster, sighting_count=sighting_count)
+    files = mechanical and filing_policy.is_fileable(cluster, sighting_count=seen)
     if not mechanical or files:
         return files, None
-    return False, filing_policy.WithheldCluster(title=cluster.get("title"), sighting_count=sighting_count)
+    return False, filing_policy.WithheldCluster(title=cluster.get("title"), sighting_count=seen)
 
 
 _RELEASABLE_ENTRY_STATUSES = frozenset({"open", "partially"})
@@ -1987,9 +1990,73 @@ def _reverify(
         return disposition.reverifications(
             {}, offered=offered, deferred=deferred, error=f"headroom exhausted: {exc.reason}",
         )
-    reported_probes = result.get("headroom_probes") if isinstance(result, Mapping) else None
-    probe_count[0] += reported_probes if isinstance(reported_probes, int) else 0
+    _count_reported_probes(result, probe_count)
     return disposition.reverifications(result, offered=offered, deferred=deferred)
+
+
+def _count_reported_probes(result, probe_count: list[int]) -> None:
+    """Add the headroom probes a *verify_fn* result reports spending; a result
+    without an int count adds none."""
+    reported = result.get("headroom_probes") if isinstance(result, Mapping) else None
+    probe_count[0] += reported if isinstance(reported, int) else 0
+
+
+def _pending_cluster(cb: dict, queued: similarity.QueuedCluster) -> dict:
+    """The verify cluster of queue cluster *queued*: its representative
+    candidate's, seen in every member's sessions."""
+    candidates = cb.get("candidates") or []
+    representative = _find_by_id(candidates, queued.representative.key, kind="queue representative")
+    members = [representative, *(_find_by_id(candidates, item.key, kind="queue member") for item in queued.others)]
+    by_session: dict[str | None, dict] = {}
+    for member in members:
+        for sighting in member.get("sightings") or []:
+            by_session.setdefault(sighting.get("session"), copy.deepcopy(sighting))
+    sightings = list(by_session.values())
+    first = next(iter(representative.get("sightings") or []), {})
+    return _cluster_record(
+        title=representative["title"],
+        cause=representative.get("cause"),
+        area=representative.get("area"),
+        origin_phase=first.get("origin_phase") or "unknown",
+        manifested_phase=first.get("manifested_phase") or "unknown",
+        evidence=[sighting["evidence_quote"] for sighting in sightings if sighting.get("evidence_quote")],
+        sightings=sightings,
+    )
+
+
+@dataclass(frozen=True)
+class QueueOutcome:
+    """What the one queue verify call decided, or why it was inconclusive."""
+
+    verified: tuple[dict, ...] = ()
+    rejected: tuple[dict, ...] = ()
+    inconclusive: str | None = None
+
+
+def _adjudicate_queue(
+    offered: Sequence[similarity.QueuedCluster],
+    *,
+    cb: dict,
+    verify_fn,
+    model: str,
+    project_root: str,
+    probe_count: list[int],
+) -> QueueOutcome:
+    """Verify each *offered* queue cluster's representative in ONE
+    *verify_fn* call. A cap hit inside it leaves every offered candidate
+    pending and never defers the run: the next run queues them again."""
+    if not offered:
+        return QueueOutcome()
+    try:
+        result = verify_fn([_pending_cluster(cb, queued) for queued in offered], model=model) or {}
+    except CensusHeadroomExhausted as exc:
+        logger.warning("census: headroom exhausted during queue adjudication, so it is inconclusive: %s", exc.reason)
+        return QueueOutcome(inconclusive=f"headroom exhausted: {exc.reason}")
+    _count_reported_probes(result, probe_count)
+    return QueueOutcome(
+        verified=tuple(_verified_with_verdicts(result.get("verified") or [], project_root=project_root)),
+        rejected=tuple(result.get("rejected") or []),
+    )
 
 
 def _with_finding(cluster: dict, area_map: finding_area.AreaMap) -> dict:
@@ -2990,19 +3057,13 @@ def run_census(
     # key -- every fake in the tests, any custom verifier -- contributes 0,
     # and a non-int is ignored rather than crashing a finished census over a
     # cosmetic count.
-    reported_probes = verify_result.get("headroom_probes")
-    probe_count[0] += reported_probes if isinstance(reported_probes, int) else 0
+    _count_reported_probes(verify_result, probe_count)
 
     verified = _verified_with_verdicts(
         verify_result.get("verified") or [], project_root=project_root,
     )
     rejected = verify_result.get("rejected") or []
     fixed_entry_ids = verify_result.get("fixed") or []
-    verify_normalisations = verdict_mod.count_normalisations(
-        cluster["verdict"]
-        for cluster in (*verified, *rejected)
-        if isinstance(cluster.get("verdict"), verdict_mod.Verdict)
-    )
 
     # DETECTOR for a systemic verifier failure. Scoping the subprocess cwd
     # removed one CAUSE of the 2026-08-03 silent mass rejection; it is not a
@@ -3055,6 +3116,28 @@ def run_census(
             )
         except Exception as exc:  # noqa: BLE001 - best-effort; the warning above is the real signal
             logger.warning("census: mass-rejection escalation failed (best-effort): %s", exc)
+
+    # The pending queue's representatives are verified inside what the verify
+    # cap leaves after the novel clusters, and their verdicts take the novel
+    # clusters' one path from here on.
+    remaining = None if max_verify_clusters is None else max(0, max_verify_clusters - len(clusters_to_verify))
+    queue_cap = config.census.adjudication.max_clusters_per_run
+    offered = view.select(queue_cap if remaining is None else min(queue_cap, remaining))
+    queue = _adjudicate_queue(
+        offered,
+        cb=codebook_dict,
+        verify_fn=verify_fn,
+        model=config.models.census_verify,
+        project_root=project_root,
+        probe_count=probe_count,
+    )
+    verified = [*verified, *queue.verified]
+    rejected = [*rejected, *queue.rejected]
+    verify_normalisations = verdict_mod.count_normalisations(
+        cluster["verdict"]
+        for cluster in (*verified, *rejected)
+        if isinstance(cluster.get("verdict"), verdict_mod.Verdict)
+    )
 
     synthesis_md = synthesize_fn(verified, model=config.models.census_synthesis)
     verified = [_with_finding(cluster, area_map) for cluster in verified]
@@ -3210,6 +3293,8 @@ def run_census(
         if cluster.get("finding") is not None:
             refuted.append(census_findings.Adjudication(cand_id, cluster["verdict"], cluster.get("cause")))
 
+    updated_codebook, adjudicated = similarity.adjudicate_members(updated_codebook, offered)
+
     for entry_id in fixed_entry_ids:
         updated_codebook = retire_entry(updated_codebook, entry_id)
 
@@ -3247,7 +3332,7 @@ def run_census(
         cb=updated_codebook,
         verify_fn=verify_fn,
         model=config.models.census_verify,
-        remaining=None if max_verify_clusters is None else max(0, max_verify_clusters - len(clusters_to_verify)),
+        remaining=None if remaining is None else remaining - len(offered),
         probe_count=probe_count,
     )
     updated_codebook, status_changes = disposition.project(
@@ -3315,7 +3400,7 @@ def run_census(
     dispositions_record = disposition.OutcomeReport(
         outcomes, reverified, status_changes, refiled, disposition.entry_dispositions(updated_codebook, standings),
     ).to_record()
-    verify_calls = len(clusters_to_verify) + dispositions_record["reverify"]["offered"]
+    verify_calls = len(clusters_to_verify) + len(offered) + dispositions_record["reverify"]["offered"]
     filed_ticket_ids = [decision.ticket for decision in disposal.decisions if decision.ticket is not None]
     cross_project_tickets = tuple(
         CrossProjectTicket(ticket_id=decision.ticket, project_root=decision.filing.project_root)
@@ -3354,7 +3439,7 @@ def run_census(
     screen_report = prescreen.ScreenReport(
         screen, tuple(surfaced_by_key), tuple(key_attaches), tuple(re_observed), instrument_findings,
     )
-    adjudication_report = similarity.AdjudicationReport(view, attached, (), (), None)
+    adjudication_report = similarity.AdjudicationReport(view, attached, offered, adjudicated, queue.inconclusive)
     method = build_method(
         run_id=run_id,
         as_of_sha=as_of_sha,
