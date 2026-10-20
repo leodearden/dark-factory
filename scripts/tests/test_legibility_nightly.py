@@ -4432,6 +4432,7 @@ class TestRunNightlyRecordsTheCensusObservation:
             nightly.run_nightly(
                 project_id='testproj', target_date=date(2026, 7, 13),
                 now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC), recorder=recorder,
+                pass_kind=nightly.PassKind.MANUAL,
             )
 
         doc = _one_recorded(calls)
