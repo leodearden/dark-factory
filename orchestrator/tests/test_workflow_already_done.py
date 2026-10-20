@@ -9,6 +9,7 @@ unworkable task.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -847,3 +848,93 @@ async def test_rejected_mark_done_blocks_the_row_and_files_an_l1(tmp_path: Path)
     assert _status_writes(f)[-1] == ('50', 'blocked')
     assert len(queue.get_by_task('50', status='pending', level=1)) == 1
     assert outcome_allows_status(outcome, 'blocked')
+
+
+# ---------------------------------------------------------------------------
+# merge_phase forwarding (task 4614): the merge-gate narrowing pass routes the
+# architect's already_done report here with merge_phase=True, and a refusal that
+# dropped the flag would park the row while the caller believes it is retrying.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Refusal:
+    arm: Callable[[Path, pytest.MonkeyPatch], _Fixture]
+    reason_fragment: str
+
+
+def _refusal_malformed_report(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    (f.artifacts.root / 'already_done.json').write_text('{"evidence": "no commit"}\n')
+    return f
+
+
+def _refusal_unreachable_commit(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        commit_on_main=False,
+    )
+    f.artifacts.write_already_done(commit=_AD_COMMIT, evidence='e')
+    return f
+
+
+def _refusal_unattributed_hold(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f.wf.task['metadata'] = {'files': [], 'delivered_checks': []}
+    f.artifacts.write_already_done(commit=_AD_COMMIT, evidence='e')
+    return f
+
+
+def _refusal_delivered_checks_block(
+    tmp_path: Path, mp: pytest.MonkeyPatch,
+) -> _Fixture:
+    f = _arm_already_done_fixture(tmp_path)
+    block = DeliveredChecksBlock(
+        reason='failed', main_sha=_AD_MAIN_SHA, failed_check=_AD_DC_CHECK,
+    )
+    mp.setattr(
+        'orchestrator.workflow.gate_mark_done_on_delivered_checks',
+        AsyncMock(return_value=block),
+    )
+    return f
+
+
+def _refusal_rejected_mark_done(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f.artifacts.write_already_done(commit=_AD_COMMIT, evidence='e')
+    f.wf.scheduler.mark_done = AsyncMock(side_effect=SetTaskStatusRejected(
+        task_id='50', error_code='pre_done_hook_rejected', raw='rc 125',
+    ))
+    return f
+
+
+_REFUSAL_ARMS = {
+    'malformed_report': _Refusal(_refusal_malformed_report, 'malformed'),
+    'unreachable_commit': _Refusal(_refusal_unreachable_commit, 'not reachable'),
+    'unattributed_hold': _Refusal(_refusal_unattributed_hold, 'could not be attributed'),
+    'delivered_checks_block': _Refusal(
+        _refusal_delivered_checks_block, 'delivered_checks are not present',
+    ),
+    'rejected_mark_done': _Refusal(_refusal_rejected_mark_done, 'already_done rejected'),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'refusal', _REFUSAL_ARMS.values(), ids=_REFUSAL_ARMS.keys(),
+)
+async def test_merge_phase_is_forwarded_by_every_refusal_arm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: _Refusal,
+):
+    f = refusal.arm(tmp_path, monkeypatch)
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    monkeypatch.setattr(f.wf, '_mark_blocked', mark_blocked)
+
+    outcome = await f.wf._handle_already_done_report(merge_phase=True)
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    mark_blocked.assert_awaited_once()
+    assert mark_blocked.await_args is not None
+    args, kwargs = mark_blocked.await_args
+    assert refusal.reason_fragment in args[0]
+    assert kwargs['merge_phase'] is True
