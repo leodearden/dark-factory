@@ -1,13 +1,17 @@
 """The publisher policy (plans/client-feed-prd.md §7.6): its data rules, glob semantics, kinds and line counting."""
 
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
+from _git_repo import make_repo
 from pydantic import ValidationError
 
 from client_feed.contract import FileKind
-from client_feed.policy import Policy, matches_any
+from client_feed.policy import Policy, PolicyError, PolicyProblem, load_policy, matches_any
 
 
 @pytest.fixture
@@ -211,3 +215,126 @@ def test_counted_lines_is_the_prd_counting_rule(
     policy = _policy(minimal, max_line_bytes=10)
 
     assert policy.counted_lines(content) == lines
+
+
+@pytest.fixture
+def on_disk(minimal: dict[str, Any]) -> dict[str, Any]:
+    """`minimal` made real: project_root a repository with one commit, out_dir an existing directory."""
+    repo = make_repo(Path(minimal['project_root']))
+    repo.write('src/a.py', 'a = 1\n')
+    repo.commit('one', when=datetime(2026, 1, 1, tzinfo=UTC))
+    Path(minimal['out_dir']).mkdir()
+    return minimal
+
+
+def _config(tmp_path: Path, mapping: dict[str, Any]) -> Path:
+    path = tmp_path / 'policy.yaml'
+    path.write_text(yaml.safe_dump(mapping))
+    return path
+
+
+def _refusal(config: Path) -> PolicyError:
+    with pytest.raises(PolicyError) as caught:
+        load_policy(config)
+    assert caught.value.config == config
+    return caught.value
+
+
+def test_a_valid_config_loads_as_its_policy(tmp_path: Path, on_disk: dict[str, Any]) -> None:
+    assert load_policy(_config(tmp_path, on_disk)) == Policy.model_validate(on_disk)
+
+
+def test_a_missing_config_is_unreadable(tmp_path: Path) -> None:
+    config = tmp_path / 'absent.yaml'
+
+    refusal = _refusal(config)
+
+    assert refusal.problem is PolicyProblem.UNREADABLE
+    assert str(config) in str(refusal)
+
+
+def test_a_config_that_is_not_text_is_unreadable(tmp_path: Path) -> None:
+    config = tmp_path / 'policy.yaml'
+    config.write_bytes(b'project_id: \xff\xfe\n')
+
+    assert _refusal(config).problem is PolicyProblem.UNREADABLE
+
+
+@pytest.mark.parametrize('text', ['visible_globs: [src/**\n', '- a\n- b\n', 'just text\n', ''])
+def test_a_config_that_is_not_a_yaml_mapping_is_invalid(tmp_path: Path, text: str) -> None:
+    config = tmp_path / 'policy.yaml'
+    config.write_text(text)
+
+    assert _refusal(config).problem is PolicyProblem.INVALID
+
+
+def test_a_schema_violation_is_invalid_and_names_the_field(
+    tmp_path: Path, on_disk: dict[str, Any]
+) -> None:
+    del on_disk['visible_globs']
+
+    refusal = _refusal(_config(tmp_path, on_disk))
+
+    assert refusal.problem is PolicyProblem.INVALID
+    assert 'visible_globs' in refusal.detail
+    assert 'visible_globs' in str(refusal)
+
+
+def test_a_root_that_is_no_repository_is_refused(
+    tmp_path: Path, minimal: dict[str, Any]
+) -> None:
+    Path(minimal['project_root']).mkdir()
+    Path(minimal['out_dir']).mkdir()
+
+    refusal = _refusal(_config(tmp_path, minimal))
+
+    assert refusal.problem is PolicyProblem.NOT_A_REPOSITORY_ROOT
+    assert minimal['project_root'] in str(refusal)
+
+
+def test_a_root_inside_a_repository_but_not_its_top_is_refused(
+    tmp_path: Path, on_disk: dict[str, Any]
+) -> None:
+    subdirectory = str(Path(on_disk['project_root']) / 'src')
+
+    refusal = _refusal(_config(tmp_path, {**on_disk, 'project_root': subdirectory}))
+
+    assert refusal.problem is PolicyProblem.NOT_A_REPOSITORY_ROOT
+    assert subdirectory in str(refusal)
+
+
+def test_a_missing_out_dir_is_unusable(tmp_path: Path, on_disk: dict[str, Any]) -> None:
+    Path(on_disk['out_dir']).rmdir()
+
+    refusal = _refusal(_config(tmp_path, on_disk))
+
+    assert refusal.problem is PolicyProblem.OUT_DIR_UNUSABLE
+    assert on_disk['out_dir'] in str(refusal)
+
+
+def test_an_out_dir_that_is_a_file_is_unusable(tmp_path: Path, on_disk: dict[str, Any]) -> None:
+    Path(on_disk['out_dir']).rmdir()
+    Path(on_disk['out_dir']).write_text('not a directory')
+
+    assert _refusal(_config(tmp_path, on_disk)).problem is PolicyProblem.OUT_DIR_UNUSABLE
+
+
+def test_an_out_dir_that_is_a_symlink_to_a_directory_is_unusable(
+    tmp_path: Path, on_disk: dict[str, Any]
+) -> None:
+    real = tmp_path / 'real-out'
+    real.mkdir()
+    Path(on_disk['out_dir']).rmdir()
+    Path(on_disk['out_dir']).symlink_to(real)
+
+    assert _refusal(_config(tmp_path, on_disk)).problem is PolicyProblem.OUT_DIR_UNUSABLE
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root owns every directory it could be refused')
+def test_an_out_dir_owned_by_another_user_is_refused(
+    tmp_path: Path, on_disk: dict[str, Any]
+) -> None:
+    refusal = _refusal(_config(tmp_path, {**on_disk, 'out_dir': '/'}))
+
+    assert refusal.problem is PolicyProblem.OUT_DIR_NOT_OWNED
+    assert 'out_dir / ' in str(refusal)
