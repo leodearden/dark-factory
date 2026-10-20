@@ -18,6 +18,7 @@ test_merge_queue_dry_run_unblock.py, which does the same).
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,13 +34,22 @@ from test_merge_queue_main_health import (
     _make_req,
 )
 
+from orchestrator import flake_recorder
 from orchestrator.event_store import EventStore
+from orchestrator.flake_ledger import (
+    FlakeCallSite,
+    FlakeSuppression,
+    FlakeVerdict,
+    ledger_db_path,
+    read_occurrences,
+)
 from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     OutcomeKind,
     RealMergeItem,
     SpeculativeMergeWorker,
     _build_main_health_outcome,
+    _classify_main_health_red,
     _emit_merge_attempt,
     _main_health_fingerprint,
     _MainHealthProbeHandles,
@@ -1409,3 +1419,87 @@ class TestDeferredProbeOriginHostTelemetry:
             f'A stale-main probe verdict must emit no main_health_red event; '
             f'got {calls}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3788: the classifier's task-mu fork hands a flake it suppressed to a
+# sink both probe sites bind to the flake recorder.
+# ---------------------------------------------------------------------------
+
+_PROBED_MAIN_SHA = 'c3' * 20
+
+
+def _classifier_that_suppresses() -> AsyncMock:
+    """A classifier double that does what the mu fork does on an isolated pass:
+    hand the observation to the sink, then answer task-own."""
+    calls = iter(range(1_000))
+
+    async def classify(*args, flake_sink, **kwargs):
+        await flake_sink(
+            FlakeSuppression(
+                verdict=FlakeVerdict.passes_in_isolation,
+                test_ids=(f'orchestrator/tests/test_x.py::test_{next(calls)}',),
+                observed_at=datetime.now(UTC).isoformat(),
+                call_site=FlakeCallSite.main_probe,
+                runner='local',
+                psi_cpu_some10=None,
+                unconfirmable_reason=None,
+            ),
+            _PROBED_MAIN_SHA,
+        )
+        return False, ''
+
+    return AsyncMock(side_effect=classify)
+
+
+class TestTheMuForkFlakeSinkIsWired:
+    @pytest.fixture(autouse=True)
+    def _fresh_storm_streak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(flake_recorder, '_merge_flake_suppression_streak', 0)
+
+    def test_the_deferred_probe_records_the_suppression_against_the_probed_sha(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        with patch(
+            'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+            new=_classifier_that_suppresses(),
+        ):
+            asyncio.run(_run_deferred_main_health_probe(
+                _make_git_ops(tmp_path), req, TEST_FAILURE_RESULT,
+                escalation_queue=escalation_queue,
+            ))
+
+        [row] = read_occurrences(ledger_db_path(config.project_root))
+        assert (row.call_site, row.merge_sha, row.task_id) == ('main_probe', _PROBED_MAIN_SHA, '99')
+        assert escalation_queue.get_pending() == []
+
+    def test_the_sync_probe_reaches_the_storm_escalation_through_its_queue(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _five_suppressions() -> list[object]:
+            return [
+                await _classify_main_health_red(
+                    _make_git_ops(tmp_path), req, TEST_FAILURE_RESULT, None,
+                    escalation_queue=escalation_queue,
+                )
+                for _ in range(5)
+            ]
+
+        with patch(
+            'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+            new=_classifier_that_suppresses(),
+        ):
+            outcomes = asyncio.run(_five_suppressions())
+
+        assert outcomes == [None] * 5
+        assert len(read_occurrences(ledger_db_path(config.project_root))) == 5
+        [storm] = escalation_queue.get_pending()
+        assert storm.task_id == 'merge-flake-suppression-storm'
