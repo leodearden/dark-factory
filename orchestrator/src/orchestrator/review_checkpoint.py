@@ -8,6 +8,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from shared.cli_invoke import (
@@ -67,12 +68,47 @@ def render_reflection_instructions(*, project_id: str, review_id: str) -> str:
    - Skip anything obvious from the code itself; focus on what a future agent couldn't easily rediscover"""
 
 
+NO_BRIEFING_NOTICE = (
+    'No review briefing is available for this project, so there are no declared '
+    '`known_gaps`, `conventions` or `stability_concerns`. Judge findings from the '
+    'code alone.'
+)
+
+
+class ReviewOutcome(StrEnum):
+    RAN = 'ran'
+    SKIPPED_CAPPED = 'skipped_capped'
+
+
+def _render_briefing_section(briefing: str | None) -> str:
+    if briefing is None:
+        return f"""\
+## Review Briefing
+
+{NO_BRIEFING_NOTICE}
+"""
+    return f"""\
+## Review Briefing
+
+The following is the project's review briefing — it describes purpose, key scenarios,
+conventions, known gaps, and stability concerns. Use it to contextualise your review.
+Respect `known_gaps` — do not flag intentionally deferred work. Enforce `conventions` —
+violations are always bugs. Pay special attention to `stability_concerns`.
+
+```yaml
+{briefing}
+```
+"""
+
+
 @dataclass
 class ReviewReport:
     review_id: str
     mode: str  # 'focused' or 'full'
     changed_modules: list[str]
     phase1: VerifyResult
+    outcome: ReviewOutcome
+    briefing_missing: bool
     findings_count: int = 0
     tasks_created: list[str] = field(default_factory=list)
     escalated_findings: int = 0
@@ -113,9 +149,9 @@ class ReviewCheckpoint:
         self._reports: list[ReviewReport] = []
 
         # Full-review rate-limit state (run-forever idle path).  Kept SEPARATE
-        # from the focused counters above because run_focused() resets
-        # _last_review_at_merge on every focused checkpoint; the full-review
-        # ceiling must not be perturbed by focused cadence.
+        # from the focused counters above because run_focused() advances
+        # _last_review_at_merge on every focused checkpoint that ran; the
+        # full-review ceiling must not be perturbed by focused cadence.
         self._last_full_review_time: float | None = None
         self._last_full_review_at_merge: int = 0
 
@@ -142,9 +178,9 @@ class ReviewCheckpoint:
         """Run a focused review scoped to modules that merged since the last checkpoint."""
         modules = list(self._merged_modules)
         report = await self._run_review('focused', modules)
-        # Reset accumulators
-        self._last_review_at_merge = self._merge_count
-        self._merged_modules.clear()
+        if report.outcome is ReviewOutcome.RAN:
+            self._last_review_at_merge = self._merge_count
+            self._merged_modules.clear()
         self._reports.append(report)
         return report
 
@@ -175,11 +211,12 @@ class ReviewCheckpoint:
     async def run_full(self) -> ReviewReport:
         """Run a full review of the entire project."""
         report = await self._run_review('full', [])
-        self._last_review_at_merge = self._merge_count
-        # Record full-review trackers so should_run_full() re-closes the gate.
-        self._last_full_review_time = time.monotonic()
-        self._last_full_review_at_merge = self._merge_count
-        self._merged_modules.clear()
+        if report.outcome is ReviewOutcome.RAN:
+            self._last_review_at_merge = self._merge_count
+            # Record full-review trackers so should_run_full() re-closes the gate.
+            self._last_full_review_time = time.monotonic()
+            self._last_full_review_at_merge = self._merge_count
+            self._merged_modules.clear()
         self._reports.append(report)
         return report
 
@@ -202,8 +239,8 @@ class ReviewCheckpoint:
 
         phase1, working_tree = await self._run_phase1(review_id)
 
-        # Load review briefing
         briefing_content = self._load_briefing()
+        briefing_missing = briefing_content is None
 
         # Phase 2+3: architectural coherence + triage (Opus agent)
         prompt = self._build_prompt(
@@ -267,20 +304,21 @@ class ReviewCheckpoint:
             # classify_failure(e) table workflow.py/steward.py/
             # dry_run_unblock.py all consult for an AllAccountsCappedException
             # — review_checkpoint keeps its own distinct degraded control
-            # flow (skip review, reset accumulators) unchanged.
+            # flow: skip the review and leave the trigger armed, so the
+            # checkpoint re-fires at the next trigger point.
             disp = classify_failure(e)
             logger.warning(
-                'Review %s: skipped — %s (%d retries in %.1fs)',
+                'Review %s: skipped — %s (%d retries in %.1fs); trigger kept for '
+                'the next checkpoint',
                 review_id, disp.reason_prefix.lower(), e.retries, e.elapsed_secs,
             )
-            # Reset accumulators so next trigger doesn't immediately re-fire
-            self._last_review_at_merge = self._merge_count
-            self._merged_modules.clear()
             return ReviewReport(
                 review_id=review_id,
                 mode=mode,
                 changed_modules=modules,
                 phase1=phase1,
+                outcome=ReviewOutcome.SKIPPED_CAPPED,
+                briefing_missing=briefing_missing,
                 findings_count=0,
                 tasks_created=[],
                 escalated_findings=0,
@@ -362,6 +400,8 @@ class ReviewCheckpoint:
             mode=mode,
             changed_modules=modules,
             phase1=phase1,
+            outcome=ReviewOutcome.RAN,
+            briefing_missing=briefing_missing,
             findings_count=findings_count,
             tasks_created=tasks_created,
             escalated_findings=escalated,
@@ -457,30 +497,31 @@ class ReviewCheckpoint:
         )
         return promoted
 
-    def _load_briefing(self) -> str:
-        """Read the review briefing file, or return a warning if absent."""
+    def _load_briefing(self) -> str | None:
+        """The review briefing's text, or None when there is no usable briefing."""
         briefing_path = self.config.project_root / self.config.review.briefing_path
-        if not briefing_path.exists():
-            logger.warning(
-                'No review briefing at %s — review will rely on code inspection only',
-                briefing_path,
-            )
-            return (
-                'No review briefing found. Proceed with best-effort code inspection. '
-                'Focus on obvious integration issues, stubs, and cross-module consistency.'
-            )
         try:
-            return briefing_path.read_text()
+            content = briefing_path.read_text()
+        except FileNotFoundError:
+            reason = 'absent'
         except OSError as e:
-            logger.warning('Failed to read review briefing: %s', e)
-            return f'Failed to read review briefing: {e}'
+            reason = f'unreadable ({e})'
+        else:
+            if content.strip():
+                return content
+            reason = 'empty'
+        logger.warning(
+            'No usable review briefing at %s: %s — review will rely on code inspection only',
+            briefing_path, reason,
+        )
+        return None
 
     def _build_prompt(
         self,
         mode: str,
         phase1: VerifyResult,
         modules: list[str],
-        briefing_content: str,
+        briefing_content: str | None,
         review_id: str,
         *,
         working_tree: Phase1WorkingTree | None = None,
@@ -566,17 +607,7 @@ do NOT re-run these checks yourself.
 
 {phase1_block}
 
-## Review Briefing
-
-The following is the project's review briefing — it describes purpose, key scenarios,
-conventions, known gaps, and stability concerns. Use it to contextualise your review.
-Respect `known_gaps` — do not flag intentionally deferred work. Enforce `conventions` —
-violations are always bugs. Pay special attention to `stability_concerns`.
-
-```yaml
-{briefing_content}
-```
-
+{_render_briefing_section(briefing_content)}
 ## Your Task
 
 1. **Search project memory** for recent decisions and known issues before starting:
@@ -619,6 +650,8 @@ violations are always bugs. Pay special attention to `stability_concerns`.
         data = {
             'review_id': report.review_id,
             'mode': report.mode,
+            'outcome': report.outcome.value,
+            'briefing_missing': report.briefing_missing,
             'changed_modules': report.changed_modules,
             'phase1_passed': report.phase1.passed,
             'phase1_summary': qualified_phase1_summary(
