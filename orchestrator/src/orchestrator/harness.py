@@ -152,7 +152,7 @@ from orchestrator.recovery_emission import (
     veto_signature,
 )
 from orchestrator.recovery_pins import records_pin_recovery
-from orchestrator.review_checkpoint import ReviewCheckpoint
+from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewOutcome, ReviewReport
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.run_store import RunStore
@@ -1153,9 +1153,53 @@ class HarnessReport:
     paused_for_cap: bool = False
     cap_pause_duration_secs: float = 0.0
     review_checkpoints: int = 0
+    review_checkpoints_skipped: int = 0
     review_findings: int = 0
     review_tasks_created: int = 0
     review_cost_usd: float = 0.0
+
+    @property
+    def reviews_attempted(self) -> int:
+        return self.review_checkpoints + self.review_checkpoints_skipped
+
+    def record_review(self, review: ReviewReport) -> None:
+        if review.outcome is not ReviewOutcome.RAN:
+            self.review_checkpoints_skipped += 1
+            return
+        self.review_checkpoints += 1
+        self.review_findings += review.findings_count
+        self.review_tasks_created += len(review.tasks_created)
+        self.review_cost_usd += review.cost_usd
+
+    def to_dict(self) -> dict:
+        return {
+            'started_at': self.started_at,
+            'completed_at': self.completed_at,
+            'total_tasks': self.total_tasks,
+            'completed': self.completed,
+            'blocked': self.blocked,
+            'escalated': self.escalated,
+            'total_cost_usd': self.total_cost_usd,
+            'paused_for_cap': self.paused_for_cap,
+            'cap_pause_duration_secs': self.cap_pause_duration_secs,
+            'review_checkpoints': self.review_checkpoints,
+            'review_checkpoints_skipped': self.review_checkpoints_skipped,
+            'review_findings': self.review_findings,
+            'review_tasks_created': self.review_tasks_created,
+            'review_cost_usd': self.review_cost_usd,
+            'task_reports': [
+                {
+                    'task_id': r.task_id,
+                    'title': r.title,
+                    'outcome': r.outcome.value,
+                    'cost_usd': r.cost_usd,
+                    'duration_ms': r.duration_ms,
+                    'agent_invocations': r.agent_invocations,
+                    'completed_at': r.completed_at,
+                }
+                for r in self.task_reports
+            ],
+        }
 
     def summary(self) -> str:
         lines = [
@@ -1167,9 +1211,10 @@ class HarnessReport:
         ]
         if self.paused_for_cap:
             lines.append(f'  Cap pause: {self.cap_pause_duration_secs:.0f}s total')
-        if self.review_checkpoints > 0:
+        if self.reviews_attempted > 0:
             lines.append(
-                f'  Review checkpoints: {self.review_checkpoints} '
+                f'  Review checkpoints: {self.review_checkpoints} ran, '
+                f'{self.review_checkpoints_skipped} skipped '
                 f'({self.review_findings} findings, '
                 f'{self.review_tasks_created} tasks, '
                 f'${self.review_cost_usd:.2f})'
@@ -3163,7 +3208,7 @@ class Harness:
             self._checkpoint_stores()
 
             # Save HarnessReport alongside review checkpoint reports
-            if self.report.review_checkpoints > 0:
+            if self.report.reviews_attempted > 0:
                 self._save_harness_report()
 
             if self.usage_gate:
@@ -12059,28 +12104,7 @@ class Harness:
         assert self.review_checkpoint is not None
         logger.info('Running full post-completion review...')
         try:
-            review_report = await self.review_checkpoint.run_full()
-            self.report.review_checkpoints += 1
-            self.report.review_findings += review_report.findings_count
-            self.report.review_tasks_created += len(review_report.tasks_created)
-            self.report.review_cost_usd += review_report.cost_usd
-            if review_report.parse_failed:
-                logger.warning(
-                    'Full review %s: reviewer output was unparseable — review '
-                    'inconclusive (findings_count=%d is not a clean pass)',
-                    review_report.review_id,
-                    review_report.findings_count,
-                )
-            logger.info(
-                'Full review complete: %d findings, %d tasks created',
-                review_report.findings_count,
-                len(review_report.tasks_created),
-            )
-            if _MODULE_TAGGER_ENABLED and review_report.tasks_created:
-                try:
-                    await self._tag_task_modules()
-                except Exception as tag_err:
-                    logger.warning(f'Post-review module tagging failed: {tag_err}')
+            await self._account_review(await self.review_checkpoint.run_full(), 'Full review')
         except Exception as e:
             logger.error(f'Full review failed: {e}')
 
@@ -12110,35 +12134,39 @@ class Harness:
         assert self.review_checkpoint is not None
         logger.info('Starting review checkpoint...')
         try:
-            review_report = await self.review_checkpoint.run_focused()
-            self.report.review_checkpoints += 1
-            self.report.review_findings += review_report.findings_count
-            self.report.review_tasks_created += len(review_report.tasks_created)
-            self.report.review_cost_usd += review_report.cost_usd
-            if review_report.parse_failed:
-                logger.warning(
-                    'Review checkpoint %s: reviewer output was unparseable — '
-                    'review inconclusive (findings_count=%d is not a clean pass)',
-                    review_report.review_id,
-                    review_report.findings_count,
-                )
-            logger.info(
-                'Review checkpoint complete: %d findings, %d tasks created, '
-                'cost=$%.2f',
-                review_report.findings_count,
-                len(review_report.tasks_created),
-                review_report.cost_usd,
+            await self._account_review(
+                await self.review_checkpoint.run_focused(), 'Review checkpoint',
             )
-            # Tag newly created tasks with module metadata (agents may have
-            # included modules, but re-run the batch tagger as a fallback
-            # for any tasks that lack them).
-            if _MODULE_TAGGER_ENABLED and review_report.tasks_created:
-                try:
-                    await self._tag_task_modules()
-                except Exception as tag_err:
-                    logger.warning(f'Post-review module tagging failed: {tag_err}')
         except Exception as e:
             logger.error(f'Review checkpoint failed: {e}')
+
+    async def _account_review(self, review_report: ReviewReport, label: str) -> None:
+        """Tally a finished review, then tag the tasks it created with modules."""
+        self.report.record_review(review_report)
+        if review_report.outcome is not ReviewOutcome.RAN:
+            logger.warning(
+                '%s %s: %s — trigger kept for the next checkpoint',
+                label, review_report.review_id, review_report.outcome.value,
+            )
+            return
+        if review_report.parse_failed:
+            logger.warning(
+                '%s %s: reviewer output was unparseable — review inconclusive '
+                '(findings_count=%d is not a clean pass)',
+                label, review_report.review_id, review_report.findings_count,
+            )
+        logger.info(
+            '%s complete: %d findings, %d tasks created, cost=$%.2f',
+            label, review_report.findings_count, len(review_report.tasks_created),
+            review_report.cost_usd,
+        )
+        # Agents may already have set modules on the tasks they created; the
+        # batch tagger is the fallback for any that lack them.
+        if _MODULE_TAGGER_ENABLED and review_report.tasks_created:
+            try:
+                await self._tag_task_modules()
+            except Exception as tag_err:
+                logger.warning(f'Post-review module tagging failed: {tag_err}')
 
     def _checkpoint_stores(self) -> None:
         """Run WAL TRUNCATE checkpoint on each SQLite store — best-effort.
@@ -12182,36 +12210,8 @@ class Harness:
         ts = self.report.started_at.replace(':', '').replace('-', '')[:15]
         path = reports_dir / f'harness-{ts}.json'
 
-        data = {
-            'started_at': self.report.started_at,
-            'completed_at': self.report.completed_at,
-            'total_tasks': self.report.total_tasks,
-            'completed': self.report.completed,
-            'blocked': self.report.blocked,
-            'escalated': self.report.escalated,
-            'total_cost_usd': self.report.total_cost_usd,
-            'paused_for_cap': self.report.paused_for_cap,
-            'cap_pause_duration_secs': self.report.cap_pause_duration_secs,
-            'review_checkpoints': self.report.review_checkpoints,
-            'review_findings': self.report.review_findings,
-            'review_tasks_created': self.report.review_tasks_created,
-            'review_cost_usd': self.report.review_cost_usd,
-            'task_reports': [
-                {
-                    'task_id': r.task_id,
-                    'title': r.title,
-                    'outcome': r.outcome.value,
-                    'cost_usd': r.cost_usd,
-                    'duration_ms': r.duration_ms,
-                    'agent_invocations': r.agent_invocations,
-                    'completed_at': r.completed_at,
-                }
-                for r in self.report.task_reports
-            ],
-        }
-
         try:
-            path.write_text(json.dumps(data, indent=2))
+            path.write_text(json.dumps(self.report.to_dict(), indent=2))
             logger.info('HarnessReport saved: %s', path)
         except OSError as e:
             logger.warning('Failed to save HarnessReport: %s', e)
