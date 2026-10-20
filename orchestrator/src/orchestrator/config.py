@@ -90,6 +90,8 @@ CPM_D_CAP: int = 32
 AGE_BUDGET: float = 500.0
 AGE_HALF_SECS: float = 259200.0
 CONTINUITY_CREDIT: float = 120.0
+CONTINUITY_PROBE_TTL_SECS: float = 300.0
+CONTINUITY_CREDIT_MAX_AGE_SECS: float = 604800.0
 
 # Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
 # below, keyed by a length-capped repr(value) (safe for unhashable/non-str
@@ -600,7 +602,9 @@ class ScoringConfig(BaseModel):
     critical-path weight (``cpm_budget``), pending age (``age_budget``) and
     work-product continuity (``continuity_credit``).  The scheduler arms this
     formula only on ticks where at least ``new_scoring_min_anchor_coverage``
-    of the candidates carry a usable ``pending_since`` anchor (PRD I-6).
+    of the candidates carry a usable ``pending_since`` anchor (PRD I-6); the
+    two ``continuity_*`` probe leaves pace and age out work-product detection
+    (PRD C3).
 
     Plain BaseModel (no ``validate_assignment``) so ``_set_leaf`` can write a
     multi-leaf retune one leaf at a time — see :class:`MergeDeepConfig`.  The
@@ -633,6 +637,23 @@ class ScoringConfig(BaseModel):
         default=CONTINUITY_CREDIT,
         ge=0,
         description='Flat credit for a task that already carries work product (PRD C2).',
+    )
+    continuity_probe_ttl_secs: float = Field(
+        default=CONTINUITY_PROBE_TTL_SECS,
+        ge=60.0,
+        description=(
+            'Seconds between refreshes of the one git for-each-ref probe that detects '
+            'task-branch work product; the floor bounds git subprocess occupancy '
+            'whatever the tuning (PRD C3).'
+        ),
+    )
+    continuity_credit_max_age_secs: float = Field(
+        default=CONTINUITY_CREDIT_MAX_AGE_SECS,
+        gt=0,
+        description=(
+            "Seconds after a task branch's newest commit at which its continuity "
+            'credit lapses, so stale work product stops paying rent (PRD C3).'
+        ),
     )
     new_scoring_min_anchor_coverage: float = Field(
         default=0.90,

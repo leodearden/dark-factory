@@ -93,7 +93,14 @@ from orchestrator.recovery_emission import (
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.sentinel_l1 import file_sentinel_l1
 from orchestrator.streaks import StreakCounter, StreakRegistry
+from orchestrator.strict_event_reads import task_ids_with_event
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
+from orchestrator.work_product import (
+    BranchWork,
+    WorkProductProbe,
+    WorkProductSnapshot,
+    read_branch_work,
+)
 
 # How long a task's age-anchor record outlives the last write that recorded
 # it (task 5352).  Every age-guard write re-records every anchor in the active
@@ -2250,6 +2257,7 @@ class Scheduler:
         wall_time_source: Callable[[], datetime] | None = None,
         state_snapshot_path: Path | None = None,
         jitter_source: Callable[[float, float], float] | None = None,
+        branch_work_reader: Callable[[], Mapping[str, BranchWork]] | None = None,
     ):
         self.config = config
         # Constructor-injected Harness callback bundle (task 2235).  Omitting
@@ -2399,6 +2407,14 @@ class Scheduler:
         self._merge_phase_at: dict[str, float] = {}
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
+        # The continuity probe's one git child (task 3820, PRD C3); git.* is
+        # restart-only, so binding the branch names at construction is correct.
+        self._branch_work_reader: Callable[[], Mapping[str, BranchWork]] = branch_work_reader or partial(
+            read_branch_work,
+            Path(self._project_root),
+            main_branch=config.git.main_branch,
+            branch_prefix=config.git.branch_prefix,
+        )
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
         self._fallback_warned: set[str] = set()  # task IDs already warned about fallback
         self._requeue_until: dict[str, float] = {}  # task_id -> monotonic deadline
@@ -2503,6 +2519,15 @@ class Scheduler:
         self._fm_read_failure_streak: int = 0
         # The I-6 arming gate and its storm-escape state (task 3819, PRD D12).
         self._anchor_gate = AnchorCoverageGate()
+        # The continuity work-product probe (task 3820, PRD C3).  The lambdas
+        # and the bound method read self at call time, so a hot TTL retune and
+        # the late attribute-injected escalation_queue are both honoured.
+        self.work_product = WorkProductProbe(
+            ttl_secs=lambda: self.config.scoring.continuity_probe_ttl_secs,
+            clock=self._time_source,
+            escalate=lambda l1: file_sentinel_l1(self.escalation_queue, l1),
+            resolve=self._resolve_sentinel_l1,
+        )
         # --- Startup gate (task 2235, W10-α) ---
         # False until finish_startup() is called.  acquire_next() asserts
         # this — a runtime check for the "startup reconcile sweeps run
@@ -5857,15 +5882,6 @@ class Scheduler:
         continuity = cfg.continuity_credit if has_work_product else 0.0
         return float(TIER_BASE[coerce_tier(tier)]) + cpm + age + continuity
 
-    def _has_work_product(self, task: dict) -> bool:
-        """Whether *task* already carries work worth resuming (PRD C3).
-
-        Task γ owns the real predicate.  Until it lands this is False for every
-        task, the fail-safe: no live score gains ``continuity_credit`` before
-        γ's zero-progress gating exists.
-        """
-        return False
-
     def _emit_override_diff_events(
         self,
         prev: dict[str, OverrideRow],
@@ -7909,6 +7925,34 @@ class Scheduler:
             file_sentinel_l1(self.escalation_queue, verdict.escalation)
         return verdict.armed
 
+    def _resolve_sentinel_l1(self, sentinel: str, resolution: str) -> None:
+        """Resolve each open L1 the scheduler filed under *sentinel*, its condition cleared; never raises."""
+        queue = self.escalation_queue
+        if queue is None:
+            return
+        try:
+            for esc in queue.get_by_task(sentinel, status='pending', level=1, agent_role='orchestrator-scheduler'):
+                queue.resolve(esc.id, resolution, resolved_by='orchestrator-scheduler')
+                logger.info('Auto-resolved L1 %s escalation %s', sentinel, esc.id)
+        except Exception:
+            logger.warning('Failed to resolve %s escalation', sentinel, exc_info=True)
+
+    def _load_work_product(self, store: EventStore) -> WorkProductSnapshot:
+        """Git's task branches plus the restart-safe zero-progress gate, on a worker thread (PRD C3).
+
+        The gate is read strictly: an unreadable store fails the refresh, which
+        withdraws all credit, rather than reading as "no task ever stalled".
+        """
+        stalled = task_ids_with_event(store.db_path, EventType.zero_progress_requeue)
+        return WorkProductSnapshot(branches=self._branch_work_reader(), zero_progress=stalled)
+
+    def _poll_work_product(self) -> None:
+        """Start a continuity-probe refresh when one is due; with no event store there is no gate to read."""
+        store = self.event_store
+        if store is None:
+            return
+        self.work_product.poll(partial(self._load_work_product, store))
+
     def _score_candidates(self, ctx: TickContext) -> list[tuple[float, str, dict, str]]:
         """Score every candidate of the tick, best first, as ``(score, task_id, task, tier)``.
 
@@ -7925,6 +7969,8 @@ class Scheduler:
         task_ids = [str(t.get('id', '')) for t in ctx.candidates]
         readings = [read_pending_age(t, now) for t in ctx.candidates]
         armed = self._note_anchor_coverage(task_ids, readings)
+        work, now_ts = self.work_product.snapshot, now.timestamp()
+        max_age = self.config.scoring.continuity_credit_max_age_secs
 
         scored: list[tuple[float, str, dict, str]] = []
         for tid, t, reading in zip(task_ids, ctx.candidates, readings, strict=True):
@@ -7935,7 +7981,7 @@ class Scheduler:
                     pri,
                     age_secs=reading.age_secs,
                     transitive_count=transitive,
-                    has_work_product=self._has_work_product(t),
+                    has_work_product=work.has_work_product(tid, now=now_ts, max_age_secs=max_age),
                 )
             else:
                 score = self._compute_score_legacy(pri, self._compute_age(tid, ctx.max_id), transitive)
@@ -7947,7 +7993,8 @@ class Scheduler:
     async def _phase_select_scored(self, ctx: TickContext) -> object:
         """Score each candidate and dispatch the best available.
 
-        Reads: ``ctx.candidates``, ``ctx.effective_priorities``,
+        First starts a continuity-probe refresh when one is due, never waiting
+        on it.  Reads: ``ctx.candidates``, ``ctx.effective_priorities``,
         ``ctx.max_id``, ``ctx.transitive_counts``, ``ctx.psi_hold``,
         ``ctx.candidate_signals``. Writes: none on ctx (dispatch
         bookkeeping lives on ``self``). ALWAYS terminal — returns
@@ -7958,6 +8005,7 @@ class Scheduler:
         numerically smaller (older) id first, and non-numeric ids after every
         numeric one, in string order.
         """
+        self._poll_work_product()
         scored = self._score_candidates(ctx)
 
         # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
@@ -9533,6 +9581,10 @@ class Scheduler:
         self._started = True
         if self.event_store:
             self._hold_history.seed_from_event_store(self.event_store)
+
+    async def aclose(self) -> None:
+        """Stop the scheduler's background work; call once at shutdown."""
+        await self.work_product.aclose()
 
     # --- Retry cap (per-task REQUEUED counter) ---
 
