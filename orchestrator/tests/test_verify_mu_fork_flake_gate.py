@@ -60,7 +60,7 @@ def _rerun_result(*, passed: bool) -> VerifyResult:
         lint_output='',
         type_output='',
         summary='isolated re-run',
-        category=None if passed else 'test_failure',
+        category='' if passed else 'test_failure',
     )
 
 
