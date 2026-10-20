@@ -498,7 +498,9 @@ prints nothing. That is the same rule as [`merge-queue/SKILL.md`](../merge-queue
   - The genuine not-landed outcome is reserved for the branch tip not being an ancestor of main
     (rc=1 here) **and** no main commit patch-equivalent to any branch commit (`git cherry` prints
     no `-` line: all `+`, or empty output). What to do with it is the call site's own disposition
-    (`unblock` and `merge-queue` keep polling / resubmit; `unblock-low-risk` aborts).
+    (`unblock` and `merge-queue` keep polling / resubmit; `unblock-low-risk` aborts). It never
+    licenses `merge_cancel`: a single-commit branch that landed rebased with context drift prints
+    exactly one `+` line, which is this same output, so `git cherry` alone cannot exclude a landing.
 - **No `last_outcome.merge_sha`** (absent or null, e.g. the rebase+fast-forward no-marker shape)
   is expected to be rare. It routes to **landing-unattributable**: a human derives and stamps it
   (`git cherry` all `-` plus a diff check).

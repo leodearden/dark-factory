@@ -433,14 +433,17 @@ eyeballed listing.
   arm](../_shared/deriving-landed-sha.md#rebased-solo-landing)'s three checks, stamped with that
   arm's `{"kind": "merged", "commit": ..., "note": ...}`. Use the sha and the `note` the ladder
   specifies for that outcome, and proceed with the calling arm's sub-steps a–d above.
-- **A genuine not-landed outcome** — the ladder's three: rc=0's **phantom-branch** exit (nothing
-  on main cites this task); rc=1, only **outside** both the `coalesce-*` arm and the
-  rebased-solo-landing arm, with no request-scoped `done` in hand and a `git cherry main
-  task/<task_id>` that prints no `-` line (all `+`, or empty); a `+` line beside any `-` line is
-  possible context drift, so report it as not confirmed landed *without* `merge_cancel`; and rc=128 with an empty marker search,
-  outside the `coalesce-*` arm and with no request-scoped `done` in hand. On any of these:
+- **A genuine not-landed outcome** — the ladder's phantom-branch and rc=128 exits: rc=0's
+  **phantom-branch** exit (nothing on main cites this task), and rc=128 with an empty marker
+  search, outside the `coalesce-*` arm and with no request-scoped `done` in hand. On either:
   `mcp__escalation__merge_cancel(request_id)` then **ABORT**. Do not resolve, do not retry, do
   not direct-merge.
+- **rc=1 with no request-scoped `done`**, outside the `coalesce-*` and rebased-solo-landing arms,
+  with a `git cherry main task/<task_id>` that prints no `-` line — **ABORT** and report it as
+  *not landed or not confirmed landed*, quoting the `git cherry` output, *without*
+  `merge_cancel`. A single-commit branch that landed rebased with context drift prints exactly
+  one `+` line and is indistinguishable from a branch that never landed, so cherry alone never
+  licenses the cancel. A `+` line beside any `-` line is not confirmed landed either: same exit.
 - **Citation gate un-evaluable** (`git.commit_citation_pattern: ""`) — proves neither verdict, so
   it is **not** a not-landed outcome: **ABORT** and report the gate as un-evaluable, *without*
   calling `merge_cancel`. This skill scopes that call to genuine not-landed outcomes **only**.
