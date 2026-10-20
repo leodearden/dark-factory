@@ -57,13 +57,14 @@ KEEPS ITS PIN and does not self-heal — its exit is a human, or the shared
 resolved, or the orphan-L0 reaper promotes a dead-filer L0 to L1 and a human
 consumes it).
 
-That "does not self-heal" property is a statement about a pin OUTSIDE
-``orchestrator.recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES``, and the
-APPLIER is what makes it
-unconditionally true: a row pinned only by a merge-remediable escalation would
-be picked straight back up by the blocked-arm upgrade clauses on the next
-sweep, so ``Harness._reconcile_one_stranded`` holds those rows at their
-pre-3539 LEAVE instead of converting them (amendment pass, review finding #3).
+That "does not self-heal" property is a statement about a pin OUTSIDE the set
+the blocked arm relaxes on — ``orchestrator.recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES``
+off main, ``ON_MAIN_REMEDIABLE_ESC_CATEGORIES`` on main — and the APPLIER is
+what makes it unconditionally true: a row pinned only by a record the blocked
+arm relaxes on would be picked straight back up by its upgrade clauses on the
+next sweep, so ``Harness._reconcile_one_stranded`` holds those rows at their
+pre-3539 LEAVE instead of converting them, asking :func:`report_blocked_arm_would_move`
+(amendment pass, review finding #3).
 This table cannot express that — it keys on a BOOLEAN ``has_open_escalation``
 and stays pure and config-free — which is exactly why the scoping lives with
 the two sibling sweep-side clauses rather than here. The escalation veto itself is unchanged (no
@@ -898,12 +899,12 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # READ THAT PARENTHESIS AS THE PRECONDITION IT IS, not as a property of
     # every converting row (amendment pass, review finding #3). It holds for a
     # `task_failure` pin — the measured 3717 population — and NOT for a
-    # `stranded_blocked` one, which `only_merge_remediable` accepts, so the
-    # next sweep's blocked-arm clauses would move the converted row again
-    # (MARK_DONE on main, RE_FILE off it). The applier therefore holds
-    # merge-remediable-pinned rows at their pre-3539 LEAVE and only genuinely
-    # at-rest rows reach the conversion; see the scoping clause in
-    # `Harness._reconcile_one_stranded`.
+    # `stranded_blocked` one (or, on main, a `preexisting_main_break` one),
+    # which `only_merge_remediable` accepts, so the next sweep's blocked-arm
+    # clauses would move the converted row again (MARK_DONE on main, RE_FILE
+    # off it). The applier therefore holds such rows at their pre-3539 LEAVE
+    # and only genuinely at-rest rows reach the conversion; the scoping clause
+    # in `Harness._reconcile_one_stranded` asks `report_blocked_arm_would_move`.
     #
     # Every CONVERT row is keyed `TaskStatus.IN_PROGRESS` BY CONSTRUCTION.
     # That single fact does two jobs: a converted (`blocked`) task can never

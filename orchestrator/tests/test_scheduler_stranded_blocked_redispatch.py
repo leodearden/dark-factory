@@ -23,6 +23,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -683,16 +684,16 @@ class TestBlockedRedispatchVetoIsDescribed:
         main.
         """
         scheduler = _emitting_scheduler(tmp_path)
-        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+        scheduler.escalation_queue = cast('Any', _FakeEscalationQueue(
             {'T1': [_esc('esc-1', category='preexisting_main_break')]},
-        )
+        ))
 
         result = await scheduler._phase_redispatch_stranded_blocked(
             _ctx_with_done_dep(_blocked_task('T1')),
         )
 
         assert result is _CONTINUE
-        assert scheduler.set_task_status.await_count == 0  # type: ignore[attr-defined]
+        assert cast('AsyncMock', scheduler.set_task_status).await_count == 0
 
     async def test_veto_emits_exactly_one_recovery_vetoed_row(self, tmp_path: Path):
         scheduler = _emitting_scheduler(tmp_path)

@@ -773,8 +773,11 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
         # Still left blocked for the merge to land — never re-pended.
         _asserted_no_repend(harness, tid)
 
-    @pytest.mark.parametrize('category', ['design_concern', 'preexisting_main_break'])
-    async def test_d2_human_concern_esc_still_vetoes(
+    @pytest.mark.parametrize(
+        'category', ['design_concern', 'preexisting_main_break'],
+        ids=['human-concern', 'preexisting-main-break-off-main'],
+    )
+    async def test_d2_non_remediable_off_main_esc_still_vetoes(
         self, harness: Harness, tmp_path: Path, category: str,
     ) -> None:
         """A design_concern is NOT merge-remediable → LEAVE, unchanged.
@@ -884,7 +887,10 @@ class TestVerifiedGreenVetoRelaxOnMain:
     vetoes, unchanged.
     """
 
-    @pytest.mark.parametrize('category', ['stranded_blocked', 'preexisting_main_break'])
+    @pytest.mark.parametrize(
+        'category', ['stranded_blocked', 'preexisting_main_break'],
+        ids=['stranded-blocked', 'preexisting-main-break-B7'],
+    )
     async def test_case_a_merge_remediable_esc_no_longer_vetoes_mark_done(
         self, harness: Harness, tmp_path: Path, category: str,
     ) -> None:
@@ -907,7 +913,10 @@ class TestVerifiedGreenVetoRelaxOnMain:
         assert prov is not None, 'landed branch must self-heal to done'
         assert prov['kind'] == 'found_on_main'
 
-    @pytest.mark.parametrize('companions', [(), ('preexisting_main_break',)])
+    @pytest.mark.parametrize(
+        'companions', [(), ('preexisting_main_break',)],
+        ids=['alone', 'beside-preexisting-main-break'],
+    )
     async def test_case_b_human_concern_esc_still_vetoes_mark_done(
         self, harness: Harness, tmp_path: Path, companions: tuple[str, ...],
     ) -> None:
