@@ -1058,6 +1058,7 @@ class CancellationScope:
         self._on_terminal = on_terminal
         self._cancel_grace_secs = cancel_grace_secs
         self._outer_cancel_seen = False
+        self._task_name_prefix = 'cancellation-scope'
         self._abandoned: list[str] = []
 
     @property
@@ -1073,7 +1074,12 @@ class CancellationScope:
         always passed to every ``on_terminal`` entry, in order, exactly
         once — via the ``finally`` below, so it runs on every exit path.
         """
+        current = asyncio.current_task()
+        if current is not None:
+            self._task_name_prefix = current.get_name()
         body = asyncio.ensure_future(body_coro)
+        if isinstance(body, asyncio.Task):
+            body.set_name(self._child_task_name('body'))
         waiter = asyncio.create_task(self._cancel_event.wait())
         kind: Literal['hard', 'soft'] | None = None
         try:
@@ -1173,7 +1179,7 @@ class CancellationScope:
         caught: it stops the remaining entries and propagates.
         """
         for name, fn in self._on_terminal:
-            entry = asyncio.create_task(self._run_entry(name, fn, kind))
+            entry = asyncio.create_task(self._run_entry(name, fn, kind), name=self._child_task_name(name))
             if not await self._await_entry(name, entry):
                 continue
             if entry.cancelled():
@@ -1237,6 +1243,11 @@ class CancellationScope:
             self._cancel_grace_secs,
             'ended once cancelled' if drain.result() else 'outlived two bounded cancels',
         )
+
+    def _child_task_name(self, role: str) -> str:
+        """``<supervising task>/<role>``: a wedged slot's report finds its children by this
+        prefix (``orchestrator/src/orchestrator/slot_lease.py::suspended_slot_tasks``)."""
+        return f'{self._task_name_prefix}/{role}'
 
     def _absorb_outer_cancel(self) -> None:
         current = asyncio.current_task()
