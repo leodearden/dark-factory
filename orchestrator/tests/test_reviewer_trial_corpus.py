@@ -11,6 +11,7 @@ from _briefing_helpers import (
 )
 
 from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.review_briefing import ReviewChange, ReviewSubject
 from orchestrator.evals.reviewer_trial.corpus import (
     CorpusDiff,
     CorpusManifest,
@@ -276,9 +277,16 @@ class TestFixtureTaskRecordAsTaskDict:
         self, briefing: BriefingAssembler,
     ) -> None:
         record = _make_context().task
+        subject = ReviewSubject(
+            task=record.as_task_dict(),
+            plan=None,
+            plan_absent_reason='',
+            change=ReviewChange(base_sha='a' * 40, diff='', files=()),
+            conventions=(),
+        )
 
-        prompt = await briefing.build_architect_prompt(
-            record.as_task_dict(), worktree=None, context='',
+        prompt = await briefing.build_context_complete_reviewer_prompt(
+            'reviewer_comprehensive', subject, context='',
         )
 
         assert record.id is not None

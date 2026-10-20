@@ -1275,31 +1275,21 @@ class TestFormatTaskFieldSurface:
 
 @pytest.mark.asyncio
 class TestFormatTaskTestStrategy:
-    """``testStrategy`` reaches every role briefed through ``_format_task`` (task 5369).
+    """``testStrategy`` is briefed to the context-complete reviewer only (task 5369).
 
-    The Taskmaster key is ``testStrategy``; before this task no role saw it.
-    Driven through the architect briefing, one of that formatter's callers.
+    ``review.reviewer_briefing`` is the switch that flips and kills the reviewer
+    change, so no role outside it may change with it. The architect briefing is
+    driven here as one of ``_format_task``'s other callers.
     """
 
-    async def test_a_test_strategy_renders_on_its_own_line(
+    async def test_the_architect_briefing_renders_no_test_strategy(
         self, briefing: BriefingAssembler,
     ):
         task = {'id': '5369', 'title': 'A task', 'testStrategy': 'Drive the seam with a real repo.'}
 
         prompt = await briefing.build_architect_prompt(task, context='CTX')
 
-        assert '**Test strategy:** Drive the seam with a real repo.' in prompt.splitlines()
-
-    @pytest.mark.parametrize('task', [
-        {'id': '5369', 'title': 'A task', 'testStrategy': ''},
-        {'id': '5369', 'title': 'A task'},
-    ])
-    async def test_an_empty_or_absent_test_strategy_renders_nothing(
-        self, briefing: BriefingAssembler, task: dict,
-    ):
-        prompt = await briefing.build_architect_prompt(task, context='CTX')
-
-        assert '**Test strategy:**' not in prompt
+        assert 'Drive the seam with a real repo.' not in prompt
 
 
 @pytest.mark.asyncio

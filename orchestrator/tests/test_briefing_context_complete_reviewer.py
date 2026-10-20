@@ -159,6 +159,25 @@ class TestTaskAndPlan:
         for field in ('title', 'description', 'details', 'testStrategy'):
             assert task[field] in prompt, field
 
+    async def test_the_test_strategy_renders_on_its_own_line(self, briefing: BriefingAssembler):
+        prompt = await _build(briefing, _subject())
+
+        assert f'**Test strategy:** {_task()["testStrategy"]}' in prompt.splitlines()
+
+    @pytest.mark.parametrize('test_strategy', ['', None])
+    async def test_an_empty_or_absent_test_strategy_renders_nothing(
+        self, briefing: BriefingAssembler, test_strategy: str | None,
+    ):
+        task = _task()
+        if test_strategy is None:
+            del task['testStrategy']
+        else:
+            task['testStrategy'] = test_strategy
+
+        prompt = await _build(briefing, _subject(task=task))
+
+        assert '**Test strategy:**' not in prompt
+
     async def test_the_plan_analysis_files_and_decisions_reach_the_reviewer(
         self, briefing: BriefingAssembler,
     ):

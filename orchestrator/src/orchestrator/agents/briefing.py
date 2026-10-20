@@ -1174,7 +1174,7 @@ This task holds locks for the following modules:
             reviewer_type=reviewer_type,
             subject=subject,
             context=context,
-            task_block=self._format_task(subject.task),
+            task_block=self._format_task(subject.task, include_test_strategy=True),
             amendment_suggestions=amendment_suggestions,
         )
 
@@ -1460,7 +1460,10 @@ A prior block-time investigation concluded the following; verify against the cur
 **Investigated at:** {created_at}
 """
 
-    def _format_task(self, task: Mapping[str, Any], *, include_files: bool = True) -> str:
+    def _format_task(
+        self, task: Mapping[str, Any], *,
+        include_files: bool = True, include_test_strategy: bool = False,
+    ) -> str:
         """Format a task dict as readable text.
 
         Args:
@@ -1471,6 +1474,10 @@ A prior block-time investigation concluded the following; verify against the cur
                 ``build_architect_prompt`` to anti-anchor the first plan
                 derivation (C-A1): the architect must derive its own file
                 footprint rather than echoing the queue-time metadata guess.
+            include_test_strategy: When True, the task's ``testStrategy`` is
+                rendered. Only the context-complete reviewer passes it, so
+                ``review.reviewer_briefing`` stays the one switch that turns
+                that briefing change on and off (task 5369).
 
         Appends the task's own ``metadata.delivered_checks`` as a capability-gate
         section via :func:`_format_delivered_checks` (task 5359) — the gate
@@ -1507,7 +1514,7 @@ A prior block-time investigation concluded the following; verify against the cur
             lines.append(f'**Description:** {task["description"]}')
         if task.get('details'):
             lines.append(f'**Details:** {task["details"]}')
-        if task.get('testStrategy'):
+        if include_test_strategy and task.get('testStrategy'):
             lines.append(f'**Test strategy:** {task["testStrategy"]}')
         if include_files and metadata.get('files'):
             lines.append(f'**Files:** {", ".join(metadata["files"])}')
