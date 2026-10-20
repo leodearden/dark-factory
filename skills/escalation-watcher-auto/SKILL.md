@@ -971,6 +971,20 @@ mcp__escalation__promote_to_l2(
 
 Add to digest: `PROMOTED (L2 <id>): workflow_exit_contract — <task_id> — <check> <outcome>-><status>`
 
+#### `workflow_slot_wedged`
+
+**Producer.** `orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot` files ONE L1 per task (deduped on an open L1 of this category), `agent_role="orchestrator"`, `severity="blocking"`, `suggested_action="investigate_wedged_workflow"`. The terminal-status watcher saw the task `done`/`cancelled`, hard-cancelled its workflow, and the workflow still had not ended `terminal_status_force_release_polls` polls later, so the harness released its slot and module locks itself (task 6660). A `workflow_slot_force_released` event goes with it.
+
+**Meaning.** Nothing is jammed any more: the slot and locks are free and the task row was already terminal. What remains is a coroutine somewhere that ignores cancellation, which will wedge the next workflow that reaches it. The `detail` lists the await chain the slot task was suspended in, outermost first; its LAST line is the await that would not return.
+
+**Disposition.** Always promote; never close: the cause is a code defect. Quote the last await-chain line in the evidence, and `search_tasks` for a task already owning that await before promoting.
+
+**Cluster.** Every pending `workflow_slot_wedged` L1 whose last await-chain line names the same `file:function` shares one cause, whichever task it is on.
+
+`root_cause="workflow-slot-wedged:<file>:<function of the last await-chain line>"`; options: `A: file a fix for that await (bound it, e.g. shared/src/shared/asyncio_tasks.py::cancel_bounded)`, `B: an existing task already owns it — link it and keep the record open until it lands`, `C: something else`.
+
+Add to digest: `PROMOTED (L2 <id>): workflow_slot_wedged — <task_id> — <last await-chain line>`
+
 #### `infra_issue`
 
 Infrastructure problem. Do NOT attempt automated fixes.
