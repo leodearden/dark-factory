@@ -2626,6 +2626,102 @@ async def test_commit_planning_of_modules_carrier_is_not_rejected_by_retired_key
 
 
 # ---------------------------------------------------------------------------
+# Simple-task files guard δ — simple_task_files_error at the MCP boundary (task 4524)
+#
+# The unit matrix lives in test_simple_task_files_guard.py. These drive the
+# REAL stack: a complexity='simple' submission with no declared files is
+# rejected on both creation paths and persists nothing, while declaring files
+# (or not declaring simple) is accepted. Paths are UNOWNED by any project
+# prefix so the interceptor's path-scope guard never answers first.
+# ---------------------------------------------------------------------------
+
+
+async def _submit_simple_shaped(server, root, planning_mode, metadata):
+    """Submit the one payload the δ tests share, varying only metadata."""
+    return await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Rename widget helper',
+            'description': 'Rename the widget helper for clarity',
+            'planning_mode': planning_mode,
+            'metadata': metadata,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    'metadata',
+    [{'complexity': 'simple'}, {'complexity': 'simple', 'files': []}, {'complexity': ' Simple '}],
+    ids=['files-absent', 'files-empty', 'non-canonical-spelling'],
+)
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_simple_without_files_returns_simple_task_files_error(
+    planning_mode, encode, metadata, real_task_stack, tmp_path,
+):
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+
+    result = await _submit_simple_shaped(server, root, planning_mode, encode(metadata))
+
+    assert result.get('error_type') == 'SimpleTaskFilesRequired', f'got {result!r}'
+    assert result['required_key'] == 'files'
+    assert result['error']
+    assert result['hint']
+    assert 'ticket' not in result
+    assert 'task_id' not in result
+    assert await interceptor.get_statuses(root) == {}
+
+
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_simple_with_files_succeeds(
+    planning_mode, encode, real_task_stack, tmp_path,
+):
+    """Paired positive: the rejected payload plus ``files`` is accepted, so
+    declaring the files is the whole fix."""
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    metadata = {'complexity': 'simple', 'files': ['widget/src/widget/app.py']}
+
+    result = await _submit_simple_shaped(server, root, planning_mode, encode(metadata))
+
+    assert 'error' not in result, f'got {result!r}'
+    if planning_mode:
+        assert result.get('status') == 'deferred', f'got {result!r}'
+        persisted = (await interceptor.get_task(result['task_id'], root))['metadata']
+        assert persisted['complexity'] == 'simple'
+        assert persisted['files'] == metadata['files']
+    else:
+        assert result['ticket'].startswith('tkt_'), f'got {result!r}'
+
+
+@pytest.mark.parametrize(
+    'metadata', [{'complexity': 'full'}, {}], ids=['full', 'no-complexity'],
+)
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_non_simple_without_files_is_not_rejected_by_simple_task_files_error(
+    planning_mode, encode, metadata, real_task_stack, tmp_path,
+):
+    """A fileless full-path task stays legal: its architect derives scope."""
+    server, _ = real_task_stack
+    root = str(tmp_path)
+
+    result = await _submit_simple_shaped(server, root, planning_mode, encode(metadata))
+
+    assert 'error' not in result, f'got {result!r}'
+    if planning_mode:
+        assert result.get('status') == 'deferred', f'got {result!r}'
+    else:
+        assert result['ticket'].startswith('tkt_'), f'got {result!r}'
+
+
+# ---------------------------------------------------------------------------
 # Lock-charter guard γ — commit_planning wiring tests (step-7 RED / step-8 GREEN)
 # ---------------------------------------------------------------------------
 
