@@ -13,11 +13,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal, Protocol, assert_never
 
 from escalation.categories import EscalationCategory
+from escalation.classify import INFO_L0_MECHANICAL_ROLES
 from escalation.disposition import (
     Addressed,
     ConvertViaCurator,
@@ -29,6 +31,7 @@ from escalation.disposition import (
     PromoteReason,
     PromoteWithHint,
     StatusInfo,
+    route_info_l0,
 )
 from escalation.models import Escalation, normalised_severity
 from escalation.queue import EscalationQueue
@@ -107,7 +110,10 @@ def read_hold(record: Escalation) -> RouterHold | None:
         ticket, filed_at = fields['ticket'], fields['filed_at']
         if not isinstance(ticket, str) or not isinstance(filed_at, str):
             raise ValueError('hold fields are not strings')
-        return RouterHold(ticket, datetime.fromisoformat(filed_at))
+        filed = datetime.fromisoformat(filed_at)
+        if filed.tzinfo is None:
+            raise ValueError('hold filed_at carries no timezone')
+        return RouterHold(ticket, filed)
     except (ValueError, TypeError, KeyError) as exc:
         logger.warning(
             'info-l0-router: %s is stamped by the router but its triage note is not a '
@@ -167,6 +173,9 @@ def status_info_sentinel(class_key: str) -> str:
     return f'__info_l0_status_info_{class_key}__'
 
 
+OVERFLOW_SENTINEL = '__info_l0_conversion_overflow__'
+
+
 class DispatchTool(Protocol):
     """The shape of ``orchestrator/src/orchestrator/scheduler.py::Scheduler.dispatch_tool``."""
 
@@ -195,7 +204,8 @@ CONVERT_PENDING = 'convert-pending'
 PROMOTED = 'promoted'
 DEFERRED = 'defer'
 ROUTER_ERROR = 'router-error'
-SUBMIT_TIMEOUT_SECS = 15.0
+DISPATCH_TIMEOUT_SECS = 15.0
+RESOLVE_WAIT_SECS = 2.0
 
 
 @dataclass(frozen=True)
@@ -210,6 +220,17 @@ class Applied:
     curator_unreachable: bool = False
 
 
+@dataclass(frozen=True)
+class _HoldOutcome:
+    """The curator's answer to a D9 hold, performed like a disposition."""
+
+    hold: RouterHold
+    verdict: TicketVerdict
+
+
+_Action = Disposition | _HoldOutcome
+
+
 async def apply(
     disposition: Disposition, record: Escalation, ports: RouterPorts, context: RouteContext,
 ) -> Applied:
@@ -218,32 +239,38 @@ async def apply(
     The record is re-read first, and nothing is written for one that is no
     longer pending (INV-3).  A failure becomes a ``router_error`` promotion.
     """
+    return await _apply(disposition, record, ports, context)
+
+
+async def _apply(
+    action: _Action, record: Escalation, ports: RouterPorts, context: RouteContext,
+) -> Applied:
     try:
         current = ports.queue.get(record.id)
         if current is None or current.status != 'pending':
             return Applied(record.id, ALREADY_TERMINAL)
-        applied = await _perform(disposition, current, ports, context)
+        applied = await _perform(action, current, ports, context)
     except Exception:
         logger.exception(
             'info-l0-router: applying %r to %s failed (by=%s, exit_kind=%s)',
-            disposition, record.id, context.by, context.exit_kind,
+            action, record.id, context.by, context.exit_kind,
             extra={
-                'escalation_id': record.id, 'disposition': repr(disposition),
+                'escalation_id': record.id, 'disposition': repr(action),
                 'by': context.by, 'exit_kind': str(context.exit_kind),
             },
         )
-        applied = _recover(disposition, record, ports, context)
+        applied = _recover(action, record, ports, context)
     _emit(applied, record, ports, context)
     return applied
 
 
 async def _perform(
-    disposition: Disposition, record: Escalation, ports: RouterPorts, context: RouteContext,
+    action: _Action, record: Escalation, ports: RouterPorts, context: RouteContext,
 ) -> Applied:
-    match disposition:
+    match action:
         case Addressed() | ObservationConsumed():
-            _close(record, disposition.resolution_class, '', ports, context)
-            return Applied(record.id, disposition.resolution_class)
+            _close(record, action.resolution_class, '', ports, context)
+            return Applied(record.id, action.resolution_class)
         case StatusInfo(class_key=class_key):
             note = (
                 f': mechanical {class_key} notice, listed in the aggregate for '
@@ -257,8 +284,10 @@ async def _perform(
             return _promote(record, reason, ports, context)
         case Defer(reason=reason):
             return Applied(record.id, DEFERRED, reason=str(reason))
+        case _HoldOutcome(hold=hold, verdict=verdict):
+            return _finish(record, hold, verdict, ports, context)
         case _:
-            assert_never(disposition)
+            assert_never(action)
 
 
 def _close(
@@ -279,7 +308,7 @@ async def _convert(
     try:
         response = await ports.dispatch_tool(
             'submit_task', _submit_arguments(candidate, ports.project_root),
-            timeout=SUBMIT_TIMEOUT_SECS,
+            timeout=DISPATCH_TIMEOUT_SECS,
         )
     except Exception as exc:
         logger.warning('info-l0-router: submit_task for %s raised', record.id, exc_info=True)
@@ -293,7 +322,7 @@ async def _convert(
             )
             return Applied(record.id, CONVERT_PENDING, ticket=ticket)
         case SubmittedTask(task_id=task_id):
-            return close_converted(record, task_id, None, ports, context)
+            return _close_converted(record, task_id, None, ports, context)
         case SubmitFailed(reason=cause):
             return _promote(record, PromoteReason.TICKET_FAILED, ports, context, cause=cause)
         case unreachable:
@@ -321,13 +350,32 @@ def _suggestion_hash(escalation_id: str) -> str:
     return hashlib.sha256(f'{ROUTER_ID}:{escalation_id}'.encode()).hexdigest()[:16]
 
 
-def close_converted(
+def _close_converted(
     record: Escalation, task_id: str, ticket: str | None, ports: RouterPorts,
     context: RouteContext,
 ) -> Applied:
     via = f' via curator ticket {ticket}' if ticket else ''
     _close(record, CONVERTED_CLASS, f': converted:{task_id}{via}', ports, context)
     return Applied(record.id, CONVERTED_CLASS, ticket=ticket)
+
+
+def _finish(
+    record: Escalation, hold: RouterHold, verdict: TicketVerdict, ports: RouterPorts,
+    context: RouteContext,
+) -> Applied:
+    match verdict:
+        case Converted(task_id=task_id):
+            return _close_converted(record, task_id, hold.ticket, ports, context)
+        case Refused(reason=why):
+            reason = PromoteReason.TICKET_REFUSED
+        case Failed(reason=why):
+            reason = PromoteReason.TICKET_FAILED
+        case Undecided(reason=why):
+            reason = PromoteReason.TICKET_TIMEOUT
+        case _:
+            assert_never(verdict)
+    cause = f'curator ticket {hold.ticket}: {why}'
+    return replace(_promote(record, reason, ports, context, cause=cause), ticket=hold.ticket)
 
 
 def _promote(
@@ -391,14 +439,14 @@ def _fallback_detail(
 
 
 def _recover(
-    disposition: Disposition, record: Escalation, ports: RouterPorts, context: RouteContext,
+    action: _Action, record: Escalation, ports: RouterPorts, context: RouteContext,
 ) -> Applied:
-    if isinstance(disposition, PromoteWithHint):
-        return Applied(record.id, ROUTER_ERROR, reason=str(disposition.reason))
+    if isinstance(action, PromoteWithHint):
+        return Applied(record.id, ROUTER_ERROR, reason=str(action.reason))
     try:
         return _promote(
             record, PromoteReason.ROUTER_ERROR, ports, context,
-            cause=f'applying {disposition!r} failed',
+            cause=f'applying {action!r} failed',
         )
     except Exception:
         logger.exception(
@@ -429,3 +477,146 @@ def _emit(applied: Applied, record: Escalation, ports: RouterPorts, context: Rou
         )
     except Exception:
         logger.warning('info-l0-router: event emit failed for %s', record.id, exc_info=True)
+
+
+class InfoL0Sweep:
+    """One routing pass over info L0s, for one caller.
+
+    The state is the pass's own: the D12 conversion cap, the curator
+    short-circuit (after one unreachable dispatch no further dispatch is
+    made), and the records ``close`` lists in the D8/D12 aggregates.
+    """
+
+    def __init__(self, ports: RouterPorts, *, by: str, max_conversions: int) -> None:
+        self._ports = ports
+        self._by = by
+        self._max_conversions = max_conversions
+        self._conversions = 0
+        self._curator_unreachable = False
+        self._status_info: dict[str, list[Escalation]] = {}
+        self._overflow: list[Escalation] = []
+        self._tally: Counter[str] = Counter()
+
+    async def route(
+        self, record: Escalation, *, exit_kind: ExitKind, task_status: str | None = None,
+    ) -> Applied | None:
+        """Decide and apply *record*'s disposition; None when it is held or no longer pending."""
+        current = self._ports.queue.get(record.id)
+        if current is None or current.status != 'pending' or read_hold(current) is not None:
+            return None
+        try:
+            decided = route_info_l0(
+                current, task_status=task_status, exit_kind=exit_kind,
+                mechanical_roles=INFO_L0_MECHANICAL_ROLES,
+            )
+        except Exception:
+            logger.exception('info-l0-router: deciding %s failed (by=%s)', current.id, self._by)
+            decided = PromoteWithHint(PromoteReason.ROUTER_ERROR)
+        disposition = self._admit(current, decided)
+        applied = await apply(disposition, current, self._ports, RouteContext(self._by, exit_kind))
+        self._note(current, disposition, applied)
+        return applied
+
+    async def finish_hold(
+        self, record: Escalation, hold: RouterHold, *, now: datetime, timeout_secs: float,
+        exit_kind: ExitKind = ExitKind.ORPHAN,
+    ) -> Applied | None:
+        """Close a D9 hold the curator decided, or one past its bound; None while it may still decide."""
+        verdict = await self._ask_curator(hold)
+        if isinstance(verdict, Undecided) and (now - hold.filed_at).total_seconds() < timeout_secs:
+            return None
+        applied = await _apply(
+            _HoldOutcome(hold, verdict), record, self._ports, RouteContext(self._by, exit_kind),
+        )
+        self._tally[applied.disposition_class] += 1
+        return applied
+
+    def close(self) -> None:
+        """File or amend this pass's aggregates and log its tally.  Never raises."""
+        for class_key, records in self._status_info.items():
+            self._file_or_amend(
+                status_info_sentinel(class_key), records,
+                summary=f'{len(records)} {class_key} info notice(s) closed status-info ({self._by})',
+                suggested_action='acknowledge_status_info',
+            )
+        if self._overflow:
+            self._file_or_amend(
+                OVERFLOW_SENTINEL, self._overflow,
+                summary=(
+                    f'{len(self._overflow)} info note(s) over the per-sweep conversion cap of '
+                    f'{self._max_conversions} promoted with {FALLBACK_ACTION} ({self._by})'
+                ),
+                suggested_action=FALLBACK_ACTION,
+            )
+        if self._tally:
+            logger.info('info-l0-router (%s): %s', self._by, dict(self._tally))
+        self._status_info, self._overflow, self._tally = {}, [], Counter()
+
+    def _admit(self, record: Escalation, disposition: Disposition) -> Disposition:
+        if not isinstance(disposition, ConvertViaCurator):
+            return disposition
+        if self._curator_unreachable:
+            return PromoteWithHint(PromoteReason.TICKET_FAILED)
+        if self._conversions >= self._max_conversions:
+            self._overflow.append(record)
+            return PromoteWithHint(PromoteReason.CONVERSION_CAP)
+        self._conversions += 1
+        return disposition
+
+    def _note(self, record: Escalation, disposition: Disposition, applied: Applied) -> None:
+        self._tally[applied.disposition_class] += 1
+        if applied.curator_unreachable:
+            self._curator_unreachable = True
+        if isinstance(disposition, StatusInfo) and applied.disposition_class == StatusInfo.resolution_class:
+            self._status_info.setdefault(disposition.class_key, []).append(record)
+
+    async def _ask_curator(self, hold: RouterHold) -> TicketVerdict:
+        if self._curator_unreachable:
+            return Undecided('the curator was unreachable earlier in this sweep')
+        try:
+            body = await self._ports.dispatch_tool(
+                'resolve_ticket',
+                {
+                    'ticket': hold.ticket, 'project_root': self._ports.project_root,
+                    'timeout_seconds': RESOLVE_WAIT_SECS,
+                },
+                timeout=DISPATCH_TIMEOUT_SECS,
+            )
+        except Exception as exc:
+            logger.warning('info-l0-router: resolve_ticket %s raised', hold.ticket, exc_info=True)
+            self._curator_unreachable = True
+            return Undecided(f'resolve_ticket dispatch raised {type(exc).__name__}')
+        return classify_ticket(body)
+
+    def _file_or_amend(
+        self, sentinel: str, records: list[Escalation], *, summary: str, suggested_action: str,
+    ) -> None:
+        queue = self._ports.queue
+        listing = '\n'.join(f'{r.id} (task {r.task_id})' for r in records)
+        try:
+            open_aggregates = [
+                esc for esc in queue.get_by_task(
+                    sentinel, status='pending', level=1, agent_role=AGGREGATE_ROLE,
+                )
+                if esc.category == AGGREGATE_CATEGORY
+            ]
+            if open_aggregates:
+                queue.amend(
+                    open_aggregates[0].id, agent_role=AGGREGATE_ROLE, summary=summary,
+                    detail=listing,
+                )
+                return
+            queue.submit(Escalation(
+                id=queue.make_id(sentinel),
+                task_id=sentinel,
+                agent_role=AGGREGATE_ROLE,
+                severity='info',
+                category=AGGREGATE_CATEGORY,
+                summary=summary[:200],
+                detail=f'{summary}.  Records:\n{listing}',
+                suggested_action=suggested_action,
+                level=1,
+                filing_claimant_run_id=self._ports.filing_claimant_run_id,
+            ))
+        except Exception:
+            logger.exception('info-l0-router: filing or amending the aggregate for %s failed', sentinel)

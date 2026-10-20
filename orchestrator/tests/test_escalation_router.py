@@ -134,6 +134,7 @@ class TestRouterHold:
         'info-l0-router hold: {"ticket": "tkt_7"}',
         'info-l0-router hold: {"ticket": 7, "filed_at": "2026-10-20T12:30:05+00:00"}',
         'info-l0-router hold: {"ticket": "tkt_7", "filed_at": "yesterday"}',
+        'info-l0-router hold: {"ticket": "tkt_7", "filed_at": "2026-10-20T12:30:05"}',
     ])
     def test_router_stamp_with_a_foreign_note_reads_as_no_hold_and_warns(self, note, caplog):
         record = _record(triaged_by=ROUTER_ID, triage_note=note)
@@ -670,7 +671,7 @@ class TestSweepFinishHold:
         first, first_hold = self._held(queue)
         second, second_hold = self._held(queue)
 
-        async def unreachable(name, arguments, *, timeout=15):
+        async def unreachable(name: str, arguments: dict, *, timeout: float = 15) -> dict:
             curator.calls.append((name, dict(arguments)))
             raise ConnectionError('fused-memory unreachable')
 
