@@ -1458,6 +1458,7 @@ def test_the_golden_inputs_note_is_what_a_project_without_instrument_records_rea
 _NOTHING_ADJUDICATED = similarity.AdjudicationReport(
     view=similarity.View(settings=config_mod.Adjudication(), depth=(0, 0)),
     attached=(),
+    unattached=(),
     offered=(),
     adjudicated=(),
     inconclusive=None,
