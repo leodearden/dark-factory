@@ -11710,3 +11710,63 @@ def test_a_cap_hit_on_the_queue_call_leaves_the_queue_pending_and_the_run_done(t
     assert record["method"]["cost"]["verify_calls"] == 1 + 10
     section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Adjudication")
     assert [line for line in section.splitlines() if "inconclusive" in line and "usage limit reached" in line]
+
+
+# Row 12 part 3: when the embedding endpoint or the vector cache fails, the
+# whole similarity stage is skipped for the run, once, loudly, and nothing else.
+
+def _unreachable_embed(texts, *, model):
+    raise embeddings.EmbeddingFailed("embeddings endpoint answered HTTP 503")
+
+
+def _stage_skipped_kwargs(tmp_path, **overrides):
+    """A pending candidate a working embedder would attach to entry-a, and a
+    mined novel cluster the verifier confirms."""
+    cb = _minimal_v2_codebook()
+    cb["candidates"] = [_backlog_candidate("cand-20260701-1", "Near entry a", "s-backlog")]
+    kwargs, _ = _similarity_kwargs(
+        tmp_path, {_ENTRY_A_TEXT: _ENTRY_AXIS, "Near entry a": _NEAR}, codebook_dict=cb, batch=_novel_batch(),
+    )
+    kwargs.update(verify_fn=_make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE}), **overrides)
+    return kwargs
+
+
+def _assert_the_stage_was_skipped(kwargs, reason: str) -> None:
+    [escalation] = kwargs["escalate_fn"].calls
+    assert (escalation["category"], escalation["severity"]) == ("infra_issue", "info")
+    assert "similarity stage" in escalation["summary"] and reason in escalation["summary"]
+    assert _offered_titles(kwargs["verify_fn"])[0] == [_L6_NOVEL_TITLE]
+
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    assert not [c for c in persisted["candidates"] if (c.get("attached_by") or {}).get("method") == "similarity"]
+    assert not [c for c in persisted["candidates"] if "adjudicated_with" in c]
+    assert _persisted_record(kwargs, "cand-20260701-1")["disposition"] == "pending"
+
+    record = _run_record(kwargs)
+    assert reason in record["adjudication"]["skipped"]
+    assert (record["method"]["extra"]["attached"], record["method"]["extra"]["adjudicated"]) == (0, 0)
+    section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Adjudication")
+    assert [line for line in section.splitlines() if "skipped" in line and reason in line]
+
+
+def test_an_unreachable_embedding_endpoint_skips_the_stage_with_one_escalation(tmp_path):
+    kwargs = _stage_skipped_kwargs(
+        tmp_path,
+        embedder=embeddings.Embedder(embed_fn=_unreachable_embed, cache_path=embeddings.cache_path("dark_factory")),
+    )
+
+    assert mod.run_census(**kwargs).status == "done"
+
+    _assert_the_stage_was_skipped(kwargs, "embeddings endpoint answered HTTP 503")
+
+
+def test_an_unreadable_vector_cache_skips_the_stage_with_one_escalation_naming_it(tmp_path):
+    kwargs = _stage_skipped_kwargs(tmp_path)
+    cache = kwargs["embedder"].cache_path
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_bytes(b"not a sqlite database at all, just bytes" * 64)
+
+    assert mod.run_census(**kwargs).status == "done"
+
+    _assert_the_stage_was_skipped(kwargs, str(cache))
