@@ -64,6 +64,7 @@ from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
+    ItemLifecycleState,
     MergeBounceRegistry,
     MergeOutcome,
     MergeRequest,
@@ -544,6 +545,11 @@ class TestBounceDrivenByTheLane:
                     'the bounced item is decided, yet the lane still reports it as '
                     f'{lane_state(lane, suffix.request_id)!r}'
                 )
+                assert lane._lifecycle.current(suffix.request_id) is ItemLifecycleState.TERMINAL, (
+                    'the bounce resolved the request but left it live in the lifecycle registry: '
+                    f'{lane._lifecycle.current(suffix.request_id)!r}'
+                )
+                assert suffix.request_id not in lane._live_items
             finally:
                 release.set()
 

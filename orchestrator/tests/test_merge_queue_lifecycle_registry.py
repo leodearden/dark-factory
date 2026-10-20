@@ -2610,6 +2610,33 @@ class TestDecidedPredispatchRequestsLeaveTheCensus:
         finally:
             live.result.cancel()
 
+    @pytest.mark.parametrize('how', ['cancel', 'resolve'])
+    @pytest.mark.parametrize('registered_as', ['QUEUED', 'LANE_BUFFERED'])
+    async def test_decided_request_held_only_by_the_registry_is_not_listed(
+        self, git_ops: GitOps, config: OrchestratorConfig, registered_as: str, how: str,
+    ) -> None:
+        """The registry-only ghost: registered as waiting, held by no container.
+
+        The shape a divert that forgot to retire left behind (mr-f887c154):
+        the request is off every lane buffer and queue, so only the lifecycle
+        registry still lists it, as queued, for as long as the process lives.
+        Whatever path produces one, the census must not report it once decided.
+        """
+        from orchestrator.merge_lane.worker import ItemLifecycleState
+
+        lane = make_lane(git_ops, asyncio.Queue())
+        ghost = _make_request('ghost', 'ghost', git_ops.project_root, config)
+        lane._register_item(ghost, initial=ItemLifecycleState[registered_as])
+        assert lane_state(lane, ghost.request_id) == 'queued', 'the control must list it'
+
+        _decide(ghost, how)
+
+        assert lane_state(lane, ghost.request_id) is None, (
+            f'a {how}-decided registry-only request is still listed: '
+            f'{lane_entry(lane, ghost.request_id)!r}'
+        )
+        assert lane.snapshot()['depth'] == 0
+
     async def test_cancelled_request_in_a_halted_lane_buffer_is_not_listed(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
