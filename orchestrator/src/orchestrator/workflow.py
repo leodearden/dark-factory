@@ -10757,7 +10757,10 @@ class TaskWorkflow:
         roster = reviewers_for(briefing)
         subject = None
         if briefing is ReviewBriefing.CONTEXT_COMPLETE:
-            subject = await self._context_complete_review_subject()
+            try:
+                subject = await self._context_complete_review_subject()
+            except Exception as exc:
+                return self._review_inputs_unavailable(roster, exc)
             diff = subject.change.diff
         else:
             base_commit = self.artifacts.read_base_commit()
@@ -10845,6 +10848,28 @@ class TaskWorkflow:
             plan_absent_reason='this task has no plan.json (a simple-task run writes none)',
             conventions_relpath=self.config.review.briefing_path,
         )
+
+    def _review_inputs_unavailable(
+        self, roster: list[AgentRole], exc: Exception,
+    ) -> ReviewAggregation:
+        """An ERROR verdict for every reviewer when the review's inputs cannot be gathered.
+
+        They route through the caller's ``reviewer_errors`` -> ``_mark_blocked``
+        path like any reviewer failure, with the cause in each review's summary.
+        """
+        assert self.artifacts is not None
+        logger.error(
+            'Task %s: review inputs could not be gathered, so no reviewer ran: %s',
+            self.task_id, exc, exc_info=exc,
+        )
+        for role in roster:
+            self.artifacts.write_review(role.name, {
+                'reviewer': role.name,
+                'verdict': 'ERROR',
+                'issues': [],
+                'summary': f'Review inputs could not be gathered: {exc}',
+            })
+        return self.artifacts.aggregate_reviews()
 
     def _salvageable_verdict_payload(
         self, role: AgentRole, envelope: object,

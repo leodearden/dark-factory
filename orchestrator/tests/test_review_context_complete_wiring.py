@@ -138,6 +138,22 @@ class TestContextCompleteDispatch:
             for record in caplog.records
         )
 
+    async def test_a_failed_gather_is_an_error_verdict_naming_the_cause(self, tmp_path: Path):
+        f, spied = _setup(tmp_path, ReviewBriefing.CONTEXT_COMPLETE)
+        f.wf.config.git.main_branch = 'no-such-branch'
+        stored_base = f.artifacts.read_base_commit()
+        assert stored_base
+
+        reviews = await f.wf._review()
+
+        roster = [role.name for role in reviewers_for(ReviewBriefing.CONTEXT_COMPLETE)]
+        assert sorted(reviews.reviewer_errors) == sorted(roster)
+        assert spied.context_complete.await_count == 0
+        assert spied.diff_only.await_count == 0
+        mirror = _mirror(f)
+        assert mirror['verdict'] == 'ERROR'
+        assert stored_base in mirror['summary']
+
     async def test_an_absent_plan_is_stated(self, tmp_path: Path):
         f, spied = _setup(tmp_path, ReviewBriefing.CONTEXT_COMPLETE)
 
