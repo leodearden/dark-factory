@@ -93,8 +93,11 @@ def _unit(vector: Sequence[float]) -> Vector:
     return tuple(x / norm for x in vector)
 
 
-def _dot(a: Vector, b: Vector) -> float:
-    return sum(map(operator.mul, a, b))
+if sys.version_info >= (3, 12):
+    _dot = math.sumprod
+else:
+    def _dot(a: Vector, b: Vector) -> float:
+        return sum(map(operator.mul, a, b))
 
 
 @dataclass(frozen=True)
@@ -130,7 +133,8 @@ class Index:
 
     def clusters(self, items: Sequence[Item], threshold: float) -> tuple[tuple[Item, ...], ...]:
         """Single-link clusters of *items*: two items share a cluster when a
-        chain of pairs at or above *threshold* joins them."""
+        chain of pairs at or above *threshold* joins them. Every pair is
+        compared, so the cost is quadratic in ``len(items)``."""
         parent = list(range(len(items)))
 
         def root(i: int) -> int:
