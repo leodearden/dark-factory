@@ -514,6 +514,23 @@ def test_feed_state_round_trips_with_every_section_filled() -> None:
 
 
 @pytest.mark.parametrize(
+    ('section', 'wrong_key', 'record', 'record_key'),
+    [
+        ('prds', 'plans/other-prd.md', event_dict('prd_upserted', seq=3), 'plans/ledger-prd.md'),
+        ('tasks', 6, event_dict('task_upserted', seq=4), '5'),
+        ('criteria', 'staging', event_dict('criteria_results', seq=9), 'verify'),
+        ('criteria_declared', 'C-2', PAYLOADS['criteria_declared']['criteria'][0], 'C-1'),
+    ],
+)
+def test_feed_state_refuses_a_key_that_names_another_record(
+    section: str, wrong_key: object, record: dict[str, object], record_key: str
+) -> None:
+    expected = f"{section} key '{wrong_key}' holds the record of '{record_key}'"
+    with pytest.raises(ValidationError, match=re.escape(expected)):
+        contract.FeedState.model_validate({**EMPTY_STATE, section: {wrong_key: record}})
+
+
+@pytest.mark.parametrize(
     ('wire_type', 'key'),
     [
         ('task_upserted', 5),

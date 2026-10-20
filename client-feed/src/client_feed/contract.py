@@ -7,6 +7,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from enum import StrEnum
+from itertools import chain
 from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal, Self, TypeAlias, TypeVar, get_args
 
@@ -575,6 +576,19 @@ class FeedState(_Record):
     criteria: dict[RunKind, CriteriaResults]
     criteria_declared: dict[str, Criterion]
     recent: tuple[FeedEvent, ...]
+
+    @model_validator(mode='after')
+    def _keys_name_their_records(self) -> Self:
+        keyed_records = chain(
+            (('prds', key, prd.prd_path) for key, prd in self.prds.items()),
+            (('tasks', key, task.task_id) for key, task in self.tasks.items()),
+            (('criteria', key, run.run_kind) for key, run in self.criteria.items()),
+            (('criteria_declared', key, c.id) for key, c in self.criteria_declared.items()),
+        )
+        for section, key, record_key in keyed_records:
+            if key != record_key:
+                raise ValueError(f"{section} key '{key}' holds the record of '{record_key}'")
+        return self
 
 
 class RevealRequested(_Record):
