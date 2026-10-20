@@ -227,16 +227,22 @@ class TestMainFixTaskFiler:
 # ---------------------------------------------------------------------------
 
 
-def _make_worker(tmp_path: Path, queue: EscalationQueue, store: FakeTaskStore | None):
+def _make_worker(
+    tmp_path: Path, queue: EscalationQueue, store: FakeTaskStore | None,
+    monkeypatch: pytest.MonkeyPatch,
+):
     worker = SpeculativeMergeWorker(
         _make_git_ops(tmp_path), asyncio.Queue(),
         escalation_queue=queue, mcp=MagicMock(), scheduler=store,
     )
-    worker._post_submit_tasks = (store or FakeTaskStore()).post_submit_tasks  # type: ignore[method-assign]
+    monkeypatch.setattr(worker, '_post_submit_tasks', (store or FakeTaskStore()).post_submit_tasks)
     return worker
 
 
-def _make_workflow(tmp_path: Path, worker: SpeculativeMergeWorker, queue: EscalationQueue) -> TaskWorkflow:
+def _make_workflow(
+    tmp_path: Path, worker: SpeculativeMergeWorker, queue: EscalationQueue,
+    monkeypatch: pytest.MonkeyPatch,
+) -> TaskWorkflow:
     config = _make_config(tmp_path)
     worktree = tmp_path / 'task-wt'
     worktree.mkdir(exist_ok=True)
@@ -263,8 +269,8 @@ def _make_workflow(tmp_path: Path, worker: SpeculativeMergeWorker, queue: Escala
     workflow.artifacts = artifacts
     workflow.merge_worker = worker
     workflow.escalation_queue = queue
-    workflow._post_submit_tasks = worker._post_submit_tasks  # type: ignore[method-assign]
-    workflow._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow, '_post_submit_tasks', worker._post_submit_tasks)
+    monkeypatch.setattr(workflow, '_mark_blocked', AsyncMock(return_value=WorkflowOutcome.BLOCKED))
     return workflow
 
 
@@ -291,10 +297,11 @@ MERGE_LANE_CASES = {
 
 def _run_site(
     site: str, case: str, tmp_path: Path, store: FakeTaskStore | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[MainBreak, list[str]]:
     """Drive one classification site; return the break and every next action it filed."""
     queue = EscalationQueue(tmp_path / 'escalations')
-    worker = _make_worker(tmp_path, queue, store)
+    worker = _make_worker(tmp_path, queue, store, monkeypatch)
     verify = MERGE_LANE_CASES.get(case, TEST_FAILURE_RESULT)
     outcome = _build_main_health_outcome(verify, MAIN_SHA)
     brk = _break_of(outcome)
@@ -307,7 +314,7 @@ def _run_site(
             )
             await _settle()
             return []
-        workflow = _make_workflow(tmp_path, worker, queue)
+        workflow = _make_workflow(tmp_path, worker, queue, monkeypatch)
         if site == 'sync_workflow':
             await workflow._auto_heal_main_health(outcome, merge_phase=True)
             await _settle()
@@ -339,11 +346,11 @@ class TestNoOutcomeTerminatesOwnerless:
 
     @pytest.mark.parametrize(('site', 'case'), SITE_CASES)
     def test_every_outcome_has_an_open_fix_task_and_an_owned_escalation(
-        self, tmp_path: Path, site: str, case: str,
+        self, tmp_path: Path, site: str, case: str, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         store = FakeTaskStore()
 
-        brk, actions = _run_site(site, case, tmp_path, store)
+        brk, actions = _run_site(site, case, tmp_path, store, monkeypatch)
 
         assert len(store.open_owners(brk.signature)) == 1, store.tasks
         assert actions, f'{site}/{case} filed no escalation'
@@ -351,20 +358,22 @@ class TestNoOutcomeTerminatesOwnerless:
 
     @pytest.mark.parametrize(('site', 'case'), SITE_CASES)
     def test_without_a_task_store_every_outcome_still_files_an_escalation(
-        self, tmp_path: Path, site: str, case: str,
+        self, tmp_path: Path, site: str, case: str, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        brk, actions = _run_site(site, case, tmp_path, None)
+        brk, actions = _run_site(site, case, tmp_path, None, monkeypatch)
 
         assert actions, f'{site}/{case} ended with neither a task nor an escalation'
         assert all(action in set(MainHealthNextAction) for action in actions), actions
 
 
 class TestOneTaskPerSignature:
-    def test_every_site_meeting_one_break_files_one_task(self, tmp_path: Path) -> None:
+    def test_every_site_meeting_one_break_files_one_task(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         store = FakeTaskStore()
         queue = EscalationQueue(tmp_path / 'escalations')
-        worker = _make_worker(tmp_path, queue, store)
-        workflow = _make_workflow(tmp_path, worker, queue)
+        worker = _make_worker(tmp_path, queue, store, monkeypatch)
+        workflow = _make_workflow(tmp_path, worker, queue, monkeypatch)
         req = _make_req('42', tmp_path / 'task-wt', _make_config(tmp_path))
 
         async def _three_sites() -> None:
@@ -382,10 +391,12 @@ class TestOneTaskPerSignature:
 
         assert len(store.submits) == 1
 
-    def test_a_commit_to_a_red_main_does_not_file_a_second_task(self, tmp_path: Path) -> None:
+    def test_a_commit_to_a_red_main_does_not_file_a_second_task(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         store = FakeTaskStore()
         queue = EscalationQueue(tmp_path / 'escalations')
-        worker = _make_worker(tmp_path, queue, store)
+        worker = _make_worker(tmp_path, queue, store, monkeypatch)
         req = _make_req('42', tmp_path / 'task-wt', _make_config(tmp_path))
         before = _build_main_health_outcome(TEST_FAILURE_RESULT, MAIN_SHA)
         after = _build_main_health_outcome(TEST_FAILURE_RESULT, OTHER_MAIN_SHA)
