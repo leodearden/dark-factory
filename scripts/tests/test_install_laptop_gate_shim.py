@@ -29,15 +29,21 @@ export PATH="/home/leo/.cargo/bin:$PATH"
 export ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS="${{ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS:-600}}"
 _LOG="${{TEST_LOG:?}}"
 echo "=== START $1 shell-pid=$$" >> "$_LOG"
-{exec_line}
+{preamble}{exec_line}
 _rc=$?
 echo "=== EXIT rc=$_rc" >> "$_LOG"
 exit $_rc
 """
 
 
-def wrapper_text(exec_line=OLD_LINE, drop=None):
-    text = WRAPPER_TEMPLATE.format(exec_line=exec_line)
+IGNORES_GATE_BIN = (
+    f'function {REAL_BIN} {{ echo "stub $*"; }}\n'
+    "unset ORCH_GATE_BIN\n"
+)
+
+
+def wrapper_text(exec_line=OLD_LINE, drop=None, preamble=""):
+    text = WRAPPER_TEMPLATE.format(exec_line=exec_line, preamble=preamble)
     if drop:
         text = "".join(ln for ln in text.splitlines(keepends=True) if drop not in ln)
     return text
@@ -169,6 +175,32 @@ def test_unrecognised_exec_line_is_refused_untouched(world):
     assert result.returncode != 0
     assert "not recognised" in result.stderr
     assert world["shim"].read_text() == before
+
+
+def assert_wrapper_is_untouched_and_executable(world, before):
+    assert world["shim"].read_bytes() == before
+    assert os.access(world["shim"], os.X_OK)
+
+
+def test_apply_whose_probe_fails_restores_the_backup_and_exits_nonzero(world):
+    """The wrapper stubs its default binary and unsets ORCH_GATE_BIN, so the
+    edited exec line is ignored: the post-install probe must roll back."""
+    world["shim"].write_text(wrapper_text(preamble=IGNORES_GATE_BIN))
+    before = world["shim"].read_bytes()
+    result = run(world)
+    assert result.returncode != 0
+    assert "wrapper ignores ORCH_GATE_BIN" in result.stderr
+    assert "restored" in result.stderr
+    assert_wrapper_is_untouched_and_executable(world, before)
+
+
+def test_check_fails_on_an_installed_wrapper_that_ignores_gate_bin(world):
+    world["shim"].write_text(wrapper_text(NEW_LINE, preamble=IGNORES_GATE_BIN))
+    before = world["shim"].read_bytes()
+    result = run(world, "--check")
+    assert result.returncode != 0
+    assert "wrapper ignores ORCH_GATE_BIN" in result.stderr
+    assert_wrapper_is_untouched_and_executable(world, before)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")

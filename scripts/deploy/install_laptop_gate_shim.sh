@@ -138,8 +138,9 @@ say "installed; previous wrapper kept at $backup"
 
 # 5. post-check; restore the backup if the installed wrapper misbehaves
 if ! ( probe ); then
-    "${priv[@]}" cp -p -- "$backup" "$dir/.$(basename "$shim").restore.$$"
-    "${priv[@]}" mv -f -- "$dir/.$(basename "$shim").restore.$$" "$shim"
+    restoring="$dir/.$(basename "$shim").restore.$$"
+    { "${priv[@]}" cp -p -- "$backup" "$restoring" && "${priv[@]}" mv -f -- "$restoring" "$shim"; } \
+        || fail "post-install probe failed AND restore failed; backup at $backup"
     fail "post-install probe failed; restored $backup"
 fi
 say "OK: $shim honours ORCH_GATE_BIN"
