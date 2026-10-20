@@ -251,3 +251,44 @@ async def test_branch_scoped_reports_are_discarded_and_the_gate_still_decides(
     assert 'plan_files_not_touched' in _merge_attempt_outcomes(gate.events)
     assert gate.merge_queue.qsize() == 0
     assert read_report(gate.artifacts) is None
+
+
+@pytest.mark.asyncio
+async def test_merge_phase_returns_a_terminal_done_without_running_the_merge_success_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A DONE from the merge attempt on an already-terminal machine is a
+    closed task, not a landed merge: nothing is left to finalise."""
+    gate = _arm_gate(tmp_path, monkeypatch, stage_report=_stage_already_done)
+    wf = gate.wf
+
+    async def close_without_a_merge(branch_name, **_kw):
+        del branch_name
+        wf.machine.transition(WorkflowState.DONE)
+        return WorkflowOutcome.DONE
+    monkeypatch.setattr(wf, '_submit_to_merge_queue', close_without_a_merge)
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_scoped_verification',
+        AsyncMock(return_value=_PASSING_VERIFY_RESULT),
+    )
+    wf.config.max_merge_retries = 1
+    wf.config.max_pre_merge_retries = 1
+    wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
+    finalise_merged_done = AsyncMock(return_value=WorkflowOutcome.DONE)
+    write_completion = AsyncMock()
+    for name, stub in {
+        '_maybe_defer_as_train_member': AsyncMock(return_value=None),
+        '_check_escalations': MagicMock(return_value=[]),
+        '_recover_before_merge': AsyncMock(return_value=None),
+        '_finalise_merged_done': finalise_merged_done,
+        '_write_completion_to_memory': write_completion,
+        '_ensure_steward_started': AsyncMock(),
+        '_await_steward_completion': AsyncMock(),
+    }.items():
+        monkeypatch.setattr(wf, name, stub)
+
+    outcome = await asyncio.wait_for(wf._merge_and_finalise(_TASK_ID), 30)
+
+    assert outcome == WorkflowOutcome.DONE
+    finalise_merged_done.assert_not_awaited()
+    write_completion.assert_not_awaited()
