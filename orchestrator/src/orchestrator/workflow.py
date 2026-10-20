@@ -68,7 +68,7 @@ from shared.transcript_archive import (
     restore_archived_transcript,
 )
 
-from orchestrator import chronic_flake, recut_ruling
+from orchestrator import chronic_flake
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.roles import (
     _ESCALATION_TOOLS,
@@ -127,6 +127,7 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_reported_landing,
 )
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.recut_ruling import ruling_to_enforce
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.routing import (
     PlanShape,
@@ -2561,7 +2562,7 @@ class TaskWorkflow:
                 train=cast(TrainMembership, train_meta) if isinstance(train_meta, dict) else None,
                 # Redundant second enforcement of the harness gate's ruling
                 # (orchestrator/recut_ruling.py), from the same dispatch snapshot.
-                recut_ruling=recut_ruling.ruling_to_enforce(self.task),
+                recut_ruling=ruling_to_enforce(self.task),
             )
             self.worktree = worktree_info.path
             self._reify_debug_port = worktree_info.reify_debug_port
