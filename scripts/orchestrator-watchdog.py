@@ -1122,10 +1122,12 @@ def _unit_active_enter_epoch(unit: str) -> int | None:
         return None
 
 
-def _newest_watched_commit_epoch() -> int | None:
-    """Return the newest committer epoch touching WATCHED_PATHS on HEAD, or None.
+def _newest_watched_commit_epoch(paths: list[str] | None = None) -> int | None:
+    """Return the newest committer epoch touching *paths* on HEAD, or None.
 
-    Runs ``git -C REPO_DIR log -1 --format=%ct HEAD -- <WATCHED_PATHS>``.
+    Runs ``git -C REPO_DIR log -1 --format=%ct HEAD -- <paths>``. *paths*
+    defaults to WATCHED_PATHS, read at call time; staleness_pass passes
+    MODULE_REMOVAL_WATCHED_PATHS only in module-removal waiver mode.
     Committer time approximates landing time (the merge queue rebases
     immediately before merging; direct-to-main commits are committed at
     landing) — file mtimes are rejected as a source since they drift under
@@ -1149,7 +1151,7 @@ def _newest_watched_commit_epoch() -> int | None:
                 "--format=%ct",
                 "HEAD",
                 "--",
-                *WATCHED_PATHS,
+                *(WATCHED_PATHS if paths is None else paths),
             ],
             capture_output=True,
             text=True,
@@ -2634,6 +2636,34 @@ def _delegate_fm_restart() -> None:
         ],
         FM_STALENESS_REDEPLOY_UNIT,
     )
+
+
+def _fleet_clock_hold() -> str | None:
+    """Return the skip line of the fleet clock gate holding staleness_pass, or None.
+
+    The min-interval cap is checked first; the coordinator head start
+    (_within_fleet_staleness_head_start, task 4754) takes its own second clock
+    read only on ticks the cap let through, so each gate keeps its named
+    reader seam. The caller throttles the line to the SKIP_LOG_INTERVAL_SECS
+    bucket; that constant's comment explains why a head start still emits.
+    """
+    if _within_fleet_deploy_min_interval():
+        return (
+            "skip: within fleet-deploy min-interval "
+            f"({ORCH_RESTART_MIN_INTERVAL_SECS}s) since last deploy"
+        )
+    if _within_fleet_staleness_head_start():
+        return (
+            f"skip: holding the {STALENESS_GRACE_SECS}s coordinator head start "
+            "since the fleet-deploy min-interval opened"
+        )
+    return None
+
+
+def _describe_removed_modules(removed: tuple[str, ...], shown: int = 5) -> str:
+    """Render *removed* for the journal: the first *shown* paths, then a count of the rest."""
+    rest = len(removed) - shown
+    return ", ".join(removed[:shown]) + (f" (+{rest} more)" if rest > 0 else "")
 
 
 def staleness_pass() -> None:
