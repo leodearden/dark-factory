@@ -1105,7 +1105,10 @@ verify_env:
 #     the same NON-LOGIN, non-interactive shell RemoteRunner.run_merge_verify
 #     dispatches `orchestrator verify-merge` through, with
 #     verify_runner.py::REMOTE_TOOL_PATH_PRELUDE putting ~/.local/bin on PATH
-#     exactly as RemoteRunner's remote `uv sync` does (task 7097).
+#     exactly as RemoteRunner's remote `uv sync` does (task 7097). Caveat:
+#     leo-laptop's /usr/local/bin/orchestrator wrapper puts ~/.cargo/bin
+#     BEFORE ~/.local/bin, the prelude the reverse; no tool differs between
+#     the two dirs today, so this is latent.
 #   - LOCAL: verify_runner.env_probe_local_run spawns via execve (no shell)
 #     under verify._target_subprocess_env(None) — VIRTUAL_ENV dropped, the venv
 #     bin dir off PATH — which is exactly how every local verify command is

@@ -5230,10 +5230,11 @@ class OrchestratorConfig(BaseSettings):
     # declares rustc/cargo in this list explicitly and a Python project is not
     # false-alarmed by a stray ~/.cargo/bin/rustc on one host.
     #
-    # Deliberately NOT in RELOADABLE_FIELDS (restart-only): the probe list is
-    # only consulted alongside the verify_runners pool, which is itself
-    # restart-only, so a hot-reloaded probe list could not take effect anyway
-    # without the runners it accompanies.
+    # Deliberately NOT in RELOADABLE_FIELDS (restart-only), by choice rather
+    # than necessity: merge_lane/drift.py::_run_drift_check reads it live at
+    # each drift check, so a reload WOULD apply, but the probe set describes
+    # the verify_runners pool (itself restart-only) and is kept changing in
+    # the same restart as the hosts it compares.
     verify_env_probes: list[EnvProbeConfig] = Field(
         default_factory=list,
         description=(
