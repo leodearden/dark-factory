@@ -713,11 +713,13 @@ c. **Correctly declared, and correctly needed no change**: call
    recorded reason is what would falsify the plan — which is why (a)
    is the wrong tool for this case and `drop_plan_file` refuses a blank
    reason.
-d. **The work is already on main**: call
-   `report_task_already_done(commit, evidence)` instead of narrowing.  The
-   orchestrator re-verifies that the commit is on main (and attributes it to
-   this task, and checks any declared delivered_checks) and closes the task;
-   a claim that fails that verification blocks the task instead.
+d. **The WHOLE task is already on main, including every commit this
+   branch carries**: call `report_task_already_done(commit, evidence)`
+   instead of narrowing.  The orchestrator re-verifies that the commit is on
+   main (and attributes it to this task, and checks any declared
+   delivered_checks) and closes the task; a claim that fails that
+   verification blocks the task instead.  If this branch carries any patch
+   not yet on main, the report is discarded and the gate decides.
    `report_unactionable_task` and `report_false_premise` are also honoured
    here, but each files a level-1 escalation carrying your reason.
 

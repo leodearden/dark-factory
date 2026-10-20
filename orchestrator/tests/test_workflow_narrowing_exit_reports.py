@@ -63,6 +63,7 @@ def _arm_gate(
     *,
     stage_report: Callable[[TaskArtifacts], None],
     commit_on_main: bool = True,
+    cherry: tuple[int, str] = (0, '- 1111111\n'),
 ) -> _Gate:
     """A workflow whose gate flags ``a.py`` and whose narrowing agent leaves
     the plan unchanged but stages one exit report via *stage_report*."""
@@ -74,7 +75,9 @@ def _arm_gate(
     monkeypatch.setattr(wf, 'event_store', events)
 
     async def fake_run(cmd, **_kw):
-        del cmd
+        if cmd[:2] == ['git', 'cherry']:
+            rc, out = cherry
+            return rc, out, ''
         return 0, 'branch_head_sha\n', ''
     monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -142,6 +145,33 @@ async def test_validated_already_done_closes_the_task_instead_of_escalating(
     gate.mark_blocked.assert_not_awaited()
     assert 'plan_files_not_touched' not in _merge_attempt_outcomes(gate.events)
     assert gate.check_seq.calls == 1
+    assert gate.merge_queue.qsize() == 0
+    assert gate.artifacts.read_already_done() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'cherry',
+    [(0, '- 1111111\n+ 2222222\n'), (128, '')],
+    ids=['branch_carries_an_unlanded_patch', 'git_cherry_error'],
+)
+async def test_already_done_is_discarded_unless_every_branch_patch_is_on_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cherry: tuple[int, str],
+):
+    """The handler attributes the reported commit by ANY one declared file, so
+    it proves the task's work is on main, not that this branch's delivery is."""
+    gate = _arm_gate(
+        tmp_path, monkeypatch, stage_report=_stage_already_done, cherry=cherry,
+    )
+
+    outcome = await gate.submit()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    gate.mark_done.assert_not_awaited()
+    gate.mark_blocked.assert_awaited_once()
+    args, _kwargs = gate.mark_blocked.await_args
+    assert args[0].startswith(PLAN_FILES_NOT_TOUCHED_REASON_PREFIX)
+    assert 'plan_files_not_touched' in _merge_attempt_outcomes(gate.events)
     assert gate.merge_queue.qsize() == 0
     assert gate.artifacts.read_already_done() is None
 
@@ -276,12 +306,16 @@ async def test_merge_phase_returns_a_terminal_done_without_running_the_merge_suc
     wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
     finalise_merged_done = AsyncMock(return_value=WorkflowOutcome.DONE)
     write_completion = AsyncMock()
+    clear_retry_pending = AsyncMock()
+    clear_phase_entered = AsyncMock()
     for name, stub in {
         '_maybe_defer_as_train_member': AsyncMock(return_value=None),
         '_check_escalations': MagicMock(return_value=[]),
         '_recover_before_merge': AsyncMock(return_value=None),
         '_finalise_merged_done': finalise_merged_done,
         '_write_completion_to_memory': write_completion,
+        '_clear_merge_retry_pending': clear_retry_pending,
+        '_clear_merge_phase_entered': clear_phase_entered,
         '_ensure_steward_started': AsyncMock(),
         '_await_steward_completion': AsyncMock(),
     }.items():
@@ -292,3 +326,6 @@ async def test_merge_phase_returns_a_terminal_done_without_running_the_merge_suc
     assert outcome == WorkflowOutcome.DONE
     finalise_merged_done.assert_not_awaited()
     write_completion.assert_not_awaited()
+    # The liveness stamp and retry obligation must not outlive the closed task.
+    clear_retry_pending.assert_awaited()
+    clear_phase_entered.assert_awaited()

@@ -3997,6 +3997,8 @@ class TaskWorkflow:
                 # Closed without a merge (found on main): nothing to finalise —
                 # same as _recover_before_merge's terminal DONE.
                 if self.machine.is_terminal():
+                    await self._clear_merge_retry_pending()
+                    await self._clear_merge_phase_entered()
                     return merge_outcome
                 break
             if merge_outcome != WorkflowOutcome.REQUEUED:
@@ -11352,6 +11354,13 @@ class TaskWorkflow:
         merge is already under way and the gate decides — so they are logged
         and cleared unread; no report outlives the pass.  ``None`` means the
         gate carries on.
+
+        ``already_done`` is honoured only when every patch this BRANCH carries
+        is already on main: the handler attributes the reported commit to the
+        task by ANY one declared file, which proves the task's work is on main
+        but not that this branch's own delivery is, and a DONE here would
+        drop the branch unmerged.  Anything short of proven (a ``+`` line from
+        ``git cherry``, or a git error) discards the report and the gate decides.
         """
         assert self.artifacts is not None
         for name, read, clear in (
@@ -11362,13 +11371,30 @@ class TaskWorkflow:
         ):
             discarded = read()
             if discarded is not None:
-                logger.warning(
-                    'Task %s: merge-gate narrowing pass wrote %s.json, which '
-                    'is not an exit at the merge gate — discarding: %s',
-                    self.task_id, name, json.dumps(discarded)[:500],
-                )
+                self._warn_discarded_exit_report(name, discarded)
                 clear()
+        unlanded_claim = self.artifacts.read_already_done()
+        if unlanded_claim is not None and not await self._branch_patches_all_on_main():
+            self._warn_discarded_exit_report('already_done', unlanded_claim)
+            self.artifacts.clear_already_done()
         return await self._route_task_verdict_report(merge_phase=merge_phase)
+
+    def _warn_discarded_exit_report(self, name: str, report: dict) -> None:
+        logger.warning(
+            'Task %s: merge-gate narrowing pass wrote %s.json, which is not '
+            'an exit at the merge gate — discarding: %s',
+            self.task_id, name, json.dumps(report)[:500],
+        )
+
+    async def _branch_patches_all_on_main(self) -> bool:
+        """True only when ``git cherry`` proves every branch patch is on main."""
+        rc, out, _ = await _run(
+            ['git', 'cherry', self.git_ops.config.main_branch, 'HEAD'],
+            cwd=self.worktree,
+        )
+        return rc == 0 and not any(
+            line.startswith('+') for line in out.splitlines()
+        )
 
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,

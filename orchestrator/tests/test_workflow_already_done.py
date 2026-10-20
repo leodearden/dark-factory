@@ -9,7 +9,7 @@ unworkable task.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -861,11 +861,30 @@ async def test_rejected_mark_done_blocks_the_row_and_files_an_l1(tmp_path: Path)
 class _Refusal:
     arm: Callable[[Path, pytest.MonkeyPatch], _Fixture]
     reason_fragment: str
+    handle: Callable[[TaskWorkflow], Awaitable[WorkflowOutcome]] = (
+        lambda wf: wf._handle_already_done_report(merge_phase=True)
+    )
 
 
 def _refusal_malformed_report(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
     (f.artifacts.root / 'already_done.json').write_text('{"evidence": "no commit"}\n')
+    return f
+
+
+def _refusal_malformed_unactionable_task(
+    tmp_path: Path, _mp: pytest.MonkeyPatch,
+) -> _Fixture:
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    (f.artifacts.root / 'unactionable_task.json').write_text('{"evidence": "no reason"}\n')
+    return f
+
+
+def _refusal_malformed_false_premise(
+    tmp_path: Path, _mp: pytest.MonkeyPatch,
+) -> _Fixture:
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    (f.artifacts.root / 'false_premise.json').write_text('{"evidence": "no premise"}\n')
     return f
 
 
@@ -916,6 +935,14 @@ _REFUSAL_ARMS = {
         _refusal_delivered_checks_block, 'delivered_checks are not present',
     ),
     'rejected_mark_done': _Refusal(_refusal_rejected_mark_done, 'already_done rejected'),
+    'malformed_unactionable_task': _Refusal(
+        _refusal_malformed_unactionable_task, 'malformed',
+        lambda wf: wf._handle_unactionable_task_report(merge_phase=True),
+    ),
+    'malformed_false_premise': _Refusal(
+        _refusal_malformed_false_premise, 'malformed',
+        lambda wf: wf._handle_false_premise_report(merge_phase=True),
+    ),
 }
 
 
@@ -930,7 +957,7 @@ async def test_merge_phase_is_forwarded_by_every_refusal_arm(
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
     monkeypatch.setattr(f.wf, '_mark_blocked', mark_blocked)
 
-    outcome = await f.wf._handle_already_done_report(merge_phase=True)
+    outcome = await refusal.handle(f.wf)
 
     assert outcome == WorkflowOutcome.BLOCKED
     mark_blocked.assert_awaited_once()
