@@ -174,12 +174,14 @@ from orchestrator.systemd_inspect import (
     inspect_systemd_unit,
 )
 from orchestrator.task_ground_truth import (
+    ON_MAIN_BRANCH_KINDS,
     BranchStateKind,
     ClaimantSource,
     RecoveryAction,
     TaskGroundTruth,
     leave_reason,
     recovery_shape_str,
+    report_blocked_arm_would_move,
     report_pins_blocked_done_flip,
     report_pins_blocked_recovery,
     report_pins_recovery,
@@ -401,6 +403,10 @@ _WATCHER_TIMEOUT_GRACE_SECS: float = 300.0
 # Maximum backoff between unclean watcher exits (seconds).
 _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 
+# Cap-retry bound for one rotation; past it the supervisor's fresh relaunch and
+# crashloop guard own recovery (mirrors steward.py::_MAX_CAP_RETRIES).
+_WATCHER_MAX_CAP_RETRIES: int = 16
+
 # Fixed quiescent gap after a failed background-loop pass (seconds). Shared by
 # the main-tip sweep and no-landings breaker loops. Guarantees neither loop can
 # tight-spin on a pass that fails immediately, even if the configured interval
@@ -581,6 +587,8 @@ _WATCHER_DISALLOWED_TOOLS: list[str] = [
     'Bash(git clean:*)',
     'Bash(git merge:*)',
     'Bash(git rebase:*)',
+    # Unscoped on purpose: removes the tool from the CLI registry, so no skill loads; SKILL.md invokes none.
+    'Skill',
 ]
 
 
@@ -6265,18 +6273,22 @@ class Harness:
         # question and share `report_pins_blocked_recovery` /
         # `records_pin_blocked_recovery`.
         #
-        # The two predicates carry the SAME merge-remediable relaxation and
-        # differ on exactly one input class — a dead-filer L0.  Recovery may
-        # proceed past one: its handoff has no consumer left, and conversion or
-        # a re-file is recoverable.  A DONE-FLIP may not: it is terminal, so
-        # completing a task past an unconsumed handoff is the phantom-done D4
-        # had just closed at the dispatch gate, and PRD D3 / spec §6 demand 3
-        # say so directly ("any non-info open record still vetoes MARK_DONE").
-        # The dead L0 is not stranded forever either — part 4 of this task, the
-        # orphan-L0 reaper, promotes it to L1 and gives it an owner.
+        # The two predicates differ on exactly two input classes.  A dead-filer
+        # L0: recovery may proceed past one — its handoff has no consumer left,
+        # and conversion or a re-file is recoverable — but a DONE-FLIP may not.
+        # It is terminal, so completing a task past an unconsumed handoff is the
+        # phantom-done D4 had just closed at the dispatch gate, and PRD D3 /
+        # spec §6 demand 3 say so directly ("any non-info open record still
+        # vetoes MARK_DONE").  The dead L0 is not stranded forever either — part
+        # 4 of this task, the orphan-L0 reaper, promotes it to L1 and gives it
+        # an owner.  And a `preexisting_main_break` pin (task 4645): this clause
+        # ALONE relaxes the wider `recovery_pins.ON_MAIN_REMEDIABLE_ESC_CATEGORIES`,
+        # because it only fires with the branch ON MAIN, where that escalation's
+        # ask (`await_preexisting_main_hotfix`) is already satisfied.  The
+        # off-main clause below keeps the shared set — there the ask is unmet.
         #
-        # The relaxation itself is unchanged and is why this clause exists at
-        # all (PRD leaf δ): a task whose branch landed while it was still
+        # The relaxation itself is why this clause exists at all (PRD leaf δ):
+        # a task whose branch landed while it was still
         # blocked is usually held by the reaper's OWN stranded_blocked — the
         # record that ASKED for this landing — and letting it veto the
         # self-heal pins the task blocked forever after its work is on main.
@@ -6287,9 +6299,7 @@ class Harness:
             and status == 'blocked'
             and report.live_claimant is None
             and not report_pins_blocked_done_flip(report)
-            and report.branch_state.kind in (
-                BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER,
-            )
+            and report.branch_state.kind in ON_MAIN_BRANCH_KINDS
         ):
             action = RecoveryAction.MARK_DONE_WITH_PROVENANCE
 
@@ -6376,8 +6386,13 @@ class Harness:
         # exist to avoid, arrived at by a route no one reviewed.
         #
         # This clause therefore asks the blocked arm's OWN question — "would
-        # those clauses move this row next sweep?" — by calling the SAME
-        # predicate they call (task 3541).  Before eta it asked with
+        # those clauses move this row next sweep?" — through
+        # `report_blocked_arm_would_move`, which composes the SAME two
+        # predicates the clauses call (task 3541) and so follows them when they
+        # diverge: the ON_MAIN clause relaxes `preexisting_main_break` (task
+        # 4645) while the recovery predicate still pins it, and an in-progress
+        # on-main row pinned only by that record is held here rather than
+        # converted and then auto-done next sweep.  Before eta it asked with
         # `_only_merge_remediable`, which WAS that predicate at the time;
         # keeping the old spelling once the arm moved on would let the two
         # drift, which is precisely how this hazard reopens.
@@ -6400,7 +6415,7 @@ class Harness:
         # holds is not in it.
         if (
             action == RecoveryAction.CONVERT_TO_BLOCKED
-            and not report_pins_blocked_recovery(report)
+            and report_blocked_arm_would_move(report)
         ):
             # Says what the clause ACTUALLY asked.  It used to name the records
             # "merge-remediable", which was exact while the question WAS
@@ -14525,7 +14540,9 @@ class Harness:
         final message.  The supervisor-side timeout is rotation_hours*3600 +
         _WATCHER_TIMEOUT_GRACE_SECS so that a wedged agent that ignores its
         own rotation instructions is force-killed (classified as unclean, feeds
-        the crashloop guard).
+        the crashloop guard).  An exhausted cap-retry bound raises
+        AllAccountsCappedException, which the supervisor treats as an unclean
+        exit.
         """
 
         cfg = self.config
@@ -14639,6 +14656,10 @@ class Harness:
             project_id=cfg.fused_memory.project_id,
             role='escalation-watcher-auto',
             task_id='',
+            # A stateless triage loop over a queue it re-reads every cycle, so a
+            # capped rotation retries fresh.
+            resume_on_cap_hit=False,
+            max_cap_retries=_WATCHER_MAX_CAP_RETRIES,
             prompt=user_prompt,
             system_prompt=system_prompt,
             cwd=cfg.project_root,

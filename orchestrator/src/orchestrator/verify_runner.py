@@ -59,9 +59,13 @@ from typing import (
 )
 
 from orchestrator import flake_ledger, verify
-from orchestrator.config import ModuleConfig, VerifyHostPolicy
+from orchestrator.config import EnvProbeConfig, ModuleConfig, VerifyHostPolicy
 from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_to_json
-from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
+from orchestrator.verify import (
+    VerifyResult,
+    _archive_merge_verify_logs,
+    _target_subprocess_env,
+)
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
     SSH_SERVER_ALIVE_COUNT_MAX,
@@ -117,7 +121,9 @@ __all__ = [
     "fingerprint_from_json",
     "EnvParityVerdict",
     "compare_env_fingerprints",
+    "_ENV_FINGERPRINT_DIMENSIONS",
     "capture_env_fingerprint",
+    "env_probe_local_run",
     "ParityRow",
     "VerdictParityReport",
     "parity_report_to_json",
@@ -128,6 +134,8 @@ __all__ = [
     "DriftVerdict",
     "DriftCheckResult",
     "DriftDetector",
+    # task 4537 additions — host-environment divergence detector
+    "EnvDriftCheckResult",
     # κ additions
     "SccacheStats",
     "parse_sccache_stats",
@@ -896,6 +904,19 @@ _SSH_BASE_OPTS = [
 # git, or a worktree — so the probe is side-effect-free and cheap.
 REMOTE_LIVENESS_CMD = 'orchestrator verify-merge --help'
 
+# Exit status ssh reserves for its OWN errors rather than the remote command's:
+# "ssh exits with the exit status of the remote command or with 255 if an error
+# occurred" (ssh(1), EXIT STATUS).  A sleeping host, a refused connection, a
+# ConnectTimeout and a BatchMode auth failure all land here.
+#
+# Load-bearing for env probing (task 4537): the probe adapter must tell "the
+# host said 127, that tool is not installed there" — a real, reportable
+# difference between the hosts — from "we never reached the host at all", which
+# is Invariant 5's transport failure and no finding about anything.  Reading
+# only rc!=0 conflates them and turns a closed laptop into a full env-skew
+# alarm.  See RemoteRunner.env_probe_run.
+_SSH_TRANSPORT_ERROR_RC = 255
+
 # A plain (non-login) ssh shell gets sshd's default PATH, which omits the uv
 # installer's ~/.local/bin (and its older ~/.cargo/bin).  $HOME expands on the
 # REMOTE side, so this is never passed through shlex.quote.
@@ -930,6 +951,83 @@ async def _default_subprocess_run(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    return (
+        proc.returncode or 0,
+        stdout_b.decode().strip(),
+        stderr_b.decode().strip(),
+    )
+
+
+def _env_probe_local_cwd() -> str | None:
+    """Working directory for a LOCAL env probe: ``$HOME``, or None to inherit.
+
+    An ``ssh <host> '<cmd>'`` probe lands in the remote account's home
+    directory, so pinning the local side there keeps a cwd-SENSITIVE resolver
+    walking the same shape of tree on both hosts — ``npx`` in particular walks
+    up from cwd looking for ``node_modules/.bin``, and the daemon's cwd is the
+    project root.  Defence in depth rather than a live fix: measured
+    2026-08-29, ``npx pyright --version`` returns 1.1.413 from both the main
+    checkout and ``$HOME`` (the checkout's ``node_modules/.bin`` holds only
+    ``codex``).  It closes the gap against a future repo-local
+    ``node_modules/.bin/pyright``.
+
+    Returns None — meaning "inherit the parent's cwd" — when ``$HOME`` is not
+    an existing directory, so a HOME-less daemon degrades to today's behaviour
+    instead of raising FileNotFoundError out of every probe (which
+    ``_probe_run_safe`` would then normalise to a bogus rc=127 on the LOCAL
+    side only, i.e. manufacture exactly the divergence this seam exists to
+    prevent).
+    """
+    home = os.path.expanduser('~')
+    return home if os.path.isdir(home) else None
+
+
+async def env_probe_local_run(
+    argv: list[str],
+    *,
+    cwd: str | Path | None = None,
+) -> tuple[int, str, str]:
+    """LOCAL env-probe seam — :func:`_default_subprocess_run` under the VERIFY env.
+
+    Same contract as ``_default_subprocess_run`` — ``(argv, *, cwd=None) ->
+    (rc, stdout, stderr)`` with both streams decoded and stripped, and a raw
+    OSError for an absent binary (``_probe_run_safe`` normalises that to
+    rc=127, unchanged) — differing only in WHERE it runs: the env comes from
+    ``verify._target_subprocess_env``, and cwd defaults to
+    :func:`_env_probe_local_cwd`.
+
+    WHY, measured rather than asserted.  The orchestrator daemon is started by
+    systemd as ``uv run --frozen --project orchestrator ...``
+    (``scripts/orchestrator-dark-factory.service``), and ``/proc/<pid>/environ``
+    of the live unit carries ``VIRTUAL_ENV=<root>/.venv`` with PATH fronted by
+    ``<root>/.venv/bin``.  ``_default_subprocess_run`` passes no ``env=`` at
+    all, so a probe issued through it inherits that verbatim and a bare
+    ``python3`` resolves ``<root>/.venv/bin/python3`` — Python 3.13.9 on this
+    workstation — while ``/usr/bin/python3`` is 3.12.3.  Every REAL local
+    verify command is spawned through ``_target_subprocess_env`` (see
+    ``verify.py``, which strips ``VIRTUAL_ENV`` and drops the venv ``bin`` from
+    PATH), and the remote half of the fingerprint runs in a non-login ssh
+    shell; both resolve 3.12.3.  Probing under the daemon's own environ
+    therefore measures the DAEMON's activation, not the verify environment the
+    detector exists to compare.
+
+    Why the seam is fixed rather than the offending probe dropped: the
+    resulting 3.13.9-vs-3.12.3 report is a blocking L1, and ``check_env``
+    dedups on ``has_open_l1(_ENV_DRIFT_SENTINEL,
+    category=_ENV_DIVERGENCE_CATEGORY)``.  A false alarm left open therefore
+    SUPPRESSES the genuine env-divergence alarm until a human resolves it —
+    the same masking failure the RunnerUnavailable/INCONCLUSIVE handling
+    exists to prevent, and one that dropping ``python3`` would leave latent
+    for every future probe an operator declares.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd if cwd is not None else _env_probe_local_cwd(),
+        env=_target_subprocess_env(None),
     )
     stdout_b, stderr_b = await proc.communicate()
     return (
@@ -2070,6 +2168,95 @@ class RemoteRunner:
         except Exception:
             return False  # fail-safe: stay PARKED on any transport error
 
+    def env_probe_run(self) -> Callable[..., Awaitable[tuple[int, str, str]]]:
+        """Return a :func:`capture_env_fingerprint`-compatible run adapter.
+
+        The returned async callable has capture's ``(argv, *, cwd=None) ->
+        (rc, stdout, stderr)`` shape, and dispatches each probe as::
+
+            ssh <_SSH_BASE_OPTS> <host> <REMOTE_TOOL_PATH_PRELUDE> <shlex-joined argv>
+
+        so a remote fingerprint can be captured through exactly the same
+        function that captures the local one.  The rc/stdout/stderr triple is
+        returned unchanged.  The prelude (task 7097) puts ``~/.local/bin`` on
+        the non-login shell's PATH, as for RemoteRunner's own remote ``uv
+        sync``; without it a host with uv installed reports rc=127.
+
+        Routed through ``self._run`` (the plain seam shared with health /
+        cancel_verify / probe_clean) rather than ``self._ssh_run``: probes are
+        short read-only commands, not the load-bearing long build that needs
+        the stdin heartbeat.  Using ``self._run`` also means every existing
+        test that injects only ``run`` gets the probe path for free.
+
+        A binary absent on the REMOTE host makes the remote shell exit 127,
+        which capture records as ``'<unavailable rc=127>'`` — the same value
+        the local ENOENT normalisation in :func:`_probe_run_safe` produces, so
+        a tool missing on both hosts compares equal rather than as drift.
+
+        TRANSPORT FAILURE IS RAISED, NOT RECORDED
+        -----------------------------------------
+        ``self._run`` defaults to :func:`_default_subprocess_run`, which
+        RETURNS ``(rc, stdout, stderr)`` for every outcome and never raises —
+        so an unreachable host arrives here as ssh's own rc=255, not as an
+        exception.  Recorded verbatim that would render EVERY probe
+        ``'<unavailable rc=255>'`` against real local versions, i.e. a
+        sleeping laptop would read as total env skew.  This adapter therefore
+        converts ssh-level failure into RunnerUnavailable, which is what
+        ``DriftDetector.check_env`` already catches to return INCONCLUSIVE
+        (Invariant 5: transport failure is not divergence) — the same
+        conversion ``run_merge_verify`` performs for the dispatch itself.
+
+        Each probe is additionally bounded by ``_SSH_PROBE_TIMEOUT_SECS``.
+        ``ConnectTimeout=10`` in ``_SSH_BASE_OPTS`` bounds only the HANDSHAKE;
+        a connection that establishes and then hangs would otherwise hold the
+        merge-verify lease and both host slots indefinitely.  A hang converts
+        to RunnerUnavailable for the same reason rc=255 does — transport
+        failure is not divergence.
+
+        Scoped to ``_SSH_TRANSPORT_ERROR_RC`` and OSError specifically, NOT to
+        rc != 0: a reached host that simply lacks the tool exits 127, and that
+        is a genuine reportable difference between the two hosts — the most
+        likely real finding this detector exists to produce.  Broadening the
+        guard would silently disarm it.
+        """
+        async def _run_probe(
+            argv: list[str],
+            *,
+            cwd: str | Path | None = None,
+        ) -> tuple[int, str, str]:
+            remote_cmd = ' '.join(shlex.quote(a) for a in argv)
+            try:
+                async with asyncio.timeout(_SSH_PROBE_TIMEOUT_SECS):
+                    rc, stdout, stderr = await self._run([
+                        'ssh', *_SSH_BASE_OPTS, self._ssh_host,
+                        f'{REMOTE_TOOL_PATH_PRELUDE} {remote_cmd}',
+                    ])
+            except TimeoutError as exc:
+                # BEFORE the OSError clause: TimeoutError subclasses OSError.
+                # A reached-then-wedged connection is a transport failure, not
+                # a finding about the remote's tooling — recording it as
+                # rc=124 would compare a sentinel against real local versions
+                # and file a false divergence L1 over a slow link.
+                raise RunnerUnavailable(
+                    f'ssh {self._ssh_host} probe {remote_cmd!r} exceeded '
+                    f'{_SSH_PROBE_TIMEOUT_SECS}s'
+                ) from exc
+            except OSError as exc:
+                # Spawning the LOCAL ssh binary failed.  Must not fall through
+                # to _probe_run_safe's OSError→rc=127 normalisation: that rule
+                # exists to make an absent binary compare EQUAL across hosts,
+                # and here it would mark every remote probe unavailable while
+                # the local side reports real versions.
+                raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
+            if rc == _SSH_TRANSPORT_ERROR_RC:
+                raise RunnerUnavailable(
+                    f'ssh {self._ssh_host} exited {rc} probing '
+                    f'{remote_cmd!r}: {stderr}'
+                )
+            return (rc, stdout, stderr)
+
+        return _run_probe
+
     @property
     def dispatch_in_flight(self) -> bool:
         """True while a ``_dispatch`` (ref push + ssh verify) is live.
@@ -2598,23 +2785,107 @@ class EnvParityVerdict:
     drift_dimensions: tuple[str, ...]
 
 
+# Single source of truth for the comparable EnvFingerprint fields, in the
+# canonical order drift_dimensions is reported in.  `dimensions=` selects a
+# SUBSET of these; the order of the reported tuple is always this one, never
+# the caller's argument order.
+_ENV_FINGERPRINT_DIMENSIONS = (
+    "toolchain",
+    "verify_env",
+    "sccache_reachable",
+    "extra_probes",
+)
+
+
+def _resolve_env_dimensions(dimensions: Sequence[str] | None) -> set[str]:
+    """Validate a ``dimensions`` selection and resolve it to a set of fields.
+
+    ``None`` means "all four".  Anything else must name at least one REAL
+    comparable field.  Both rejections exist for the same reason: a detective
+    control that compares nothing is permanently green, which is strictly worse
+    than not having it — it reports parity it never measured.
+
+    Two distinct config errors, two distinct messages:
+
+    * an unknown NAME (``('extra_probez',)``) — a typo that would otherwise
+      select nothing;
+    * an EMPTY selection (``()``) — every name valid, nothing selected, which
+      the unknown-name check alone cannot catch because there is no name to
+      object to.
+
+    Shared by :func:`compare_env_fingerprints` and
+    :meth:`DriftDetector.check_env` so the latter can reject a bad selection
+    BEFORE it spends an ssh round trip per probe on a comparison it could never
+    make.
+    """
+    if dimensions is None:
+        return set(_ENV_FINGERPRINT_DIMENSIONS)
+    selected = set(dimensions)
+    if not selected:
+        raise ValueError(
+            'dimensions must name at least one comparable field; an empty '
+            'selection compares nothing and would report every pair of hosts '
+            f'as faithful.  Legal dimensions are '
+            f'{list(_ENV_FINGERPRINT_DIMENSIONS)!r}; pass None for all of them.'
+        )
+    unknown = sorted(selected - set(_ENV_FINGERPRINT_DIMENSIONS))
+    if unknown:
+        raise ValueError(
+            f"unknown env fingerprint dimension(s): {unknown!r}; "
+            f"legal dimensions are {list(_ENV_FINGERPRINT_DIMENSIONS)!r}"
+        )
+    return selected
+
+
 def compare_env_fingerprints(
     local: EnvFingerprint,
     remote: EnvFingerprint,
+    *,
+    dimensions: Sequence[str] | None = None,
 ) -> EnvParityVerdict:
     """Compare local and remote fingerprints field by field.
 
-    Returns an EnvParityVerdict with is_faithful=True when all fields match,
-    and drift_dimensions listing the names of any fields that differ.
+    Returns an EnvParityVerdict with is_faithful=True when all compared fields
+    match, and drift_dimensions listing the names of any that differ.
+
+    Parameters
+    ----------
+    dimensions:
+        Optional subset of :data:`_ENV_FINGERPRINT_DIMENSIONS` to compare.
+        ``None`` (the default) compares all four — byte-identical to the
+        pre-scoping behaviour, so existing callers are unaffected.  The drift
+        detector passes ``('extra_probes',)``: ``toolchain`` and
+        ``sccache_reachable`` are hardcoded Rust probes that would manufacture
+        false drift on a non-Rust project, and ``verify_env`` is host-specific
+        by design (jobserver FIFO path, RAM-tuned concurrency), so legitimate
+        differences there would false-alarm.  A project that DOES care about
+        the Rust toolchain declares rustc/cargo as explicit operator probes and
+        gets the same signal through ``extra_probes``.
+
+    Raises
+    ------
+    ValueError
+        If ``dimensions`` names a field that is not comparable, OR is an empty
+        sequence.  Silently comparing nothing would turn a config typo into a
+        permanently-green detector, which is the worst possible failure for a
+        detective control — and ``()`` reaches that state without a single
+        misspelled name, so it is rejected as the same class of error rather
+        than treated as "compare nothing, report faithful".  ``None`` (not
+        ``()``) is how a caller asks for every dimension.
     """
+    selected = _resolve_env_dimensions(dimensions)
+
     drifts: list[str] = []
-    if local.toolchain != remote.toolchain:
+    if "toolchain" in selected and local.toolchain != remote.toolchain:
         drifts.append("toolchain")
-    if dict(local.verify_env) != dict(remote.verify_env):
+    if "verify_env" in selected and dict(local.verify_env) != dict(remote.verify_env):
         drifts.append("verify_env")
-    if local.sccache_reachable != remote.sccache_reachable:
+    if (
+        "sccache_reachable" in selected
+        and local.sccache_reachable != remote.sccache_reachable
+    ):
         drifts.append("sccache_reachable")
-    if dict(local.extra_probes) != dict(remote.extra_probes):
+    if "extra_probes" in selected and dict(local.extra_probes) != dict(remote.extra_probes):
         drifts.append("extra_probes")
     return EnvParityVerdict(
         is_faithful=not bool(drifts),
@@ -2627,11 +2898,93 @@ def compare_env_fingerprints(
 # ---------------------------------------------------------------------------
 
 
+# POSIX "command not found" return code.  A remote shell reached over ssh
+# already returns 127 when the requested binary does not exist, whereas
+# ``asyncio.create_subprocess_exec`` (the LOCAL path) raises FileNotFoundError
+# for the same condition.  Normalising the local OSError to this rc is what
+# makes a tool that is absent on BOTH hosts produce an IDENTICAL fingerprint
+# value on each side, so "uniformly unavailable" reads as parity rather than
+# as drift (or, worse, as a crashed local capture).
+_PROBE_NOT_FOUND_RC = 127
+
+# Return code ``timeout(1)`` reports for a command it had to kill.  Same
+# cross-host-agreement logic as _PROBE_NOT_FOUND_RC: a probe that wedges on
+# BOTH hosts records the identical value on each side, so "uniformly slow"
+# reads as parity rather than as drift.
+_PROBE_TIMEOUT_RC = 124
+
+# Wall-clock ceiling on ONE probe, LOCAL side.  check_env runs inside
+# _run_drift_check's `async with git_ops.merge_verify_lease(lane_dir=wt)` block
+# and AFTER allocator.acquire_local()/acquire_remote() have taken both verify
+# host slots, and _maybe_run_drift_check fires the coroutine with
+# asyncio.create_task and applies no timeout of its own — so nothing above this
+# would ever reclaim those resources from a hung probe.  The local seam
+# (env_probe_local_run, and capture's own _default_subprocess_run fallback) is
+# a bare create_subprocess_exec + communicate()
+# with no bound at all, and the committed probe set includes
+# `npx pyright --version`, which on a cold npm cache reaches the npm registry.
+# 30s is generous for a --version query and short against the lease.
+_PROBE_TIMEOUT_SECS = 30.0
+
+# Same ceiling for a probe dispatched over ssh, deliberately SHORTER than
+# _PROBE_TIMEOUT_SECS so the two bounds cannot race: a wedged REMOTE probe must
+# deterministically surface as RunnerUnavailable (-> INCONCLUSIVE) rather than
+# as a recorded '<unavailable rc=124>' compared against a real local version,
+# which would read as env divergence and file a false L1 against a slow link.
+# ssh's own ConnectTimeout=10 in _SSH_BASE_OPTS bounds only the HANDSHAKE; a
+# connection that establishes and then hangs is bounded by this and nothing
+# else.
+_SSH_PROBE_TIMEOUT_SECS = 20.0
+
+
+async def _probe_run_safe(
+    run: Callable[..., Awaitable[tuple[int, str, str]]],
+    argv: list[str],
+    *,
+    timeout: float | None = None,
+) -> tuple[int, str, str]:
+    """Await ``run(argv)`` bounded by *timeout*, normalising failures to an rc.
+
+    An absent binary must degrade to a recorded rc, never propagate: a single
+    missing probe would otherwise abort the whole fingerprint capture.  See
+    ``_PROBE_NOT_FOUND_RC`` for why 127 specifically.
+
+    A HUNG probe is the same hazard with a worse blast radius — it holds the
+    merge-verify lease and both verify host slots for as long as it runs — so
+    it is bounded here and normalised the same way, to ``_PROBE_TIMEOUT_RC``.
+
+    ``timeout=None`` reads the module-level ``_PROBE_TIMEOUT_SECS`` at CALL
+    time rather than binding it as a default-argument value, so the ceiling
+    stays monkeypatchable (tests cannot afford to wait 30s to observe it).
+
+    EXCEPT-CLAUSE ORDER IS LOAD-BEARING: ``TimeoutError`` is a subclass of
+    ``OSError`` in Python 3, so an ``except OSError`` placed first would
+    swallow the timeout and misreport a wedged probe as a missing binary.
+
+    Cancelling the inner await can orphan an already-spawned child (the seam is
+    injected, so there is no handle to kill here).  Accepted deliberately: the
+    point is to stop HOLDING the lease, and the probes are short read-only
+    ``--version`` queries, not builds.
+    """
+    bound = _PROBE_TIMEOUT_SECS if timeout is None else timeout
+    try:
+        async with asyncio.timeout(bound):
+            return await run(argv)
+    except TimeoutError:
+        return (
+            _PROBE_TIMEOUT_RC, '',
+            f'probe {argv!r} exceeded {bound}s and was abandoned',
+        )
+    except OSError as exc:
+        return (_PROBE_NOT_FOUND_RC, '', str(exc))
+
+
 async def capture_env_fingerprint(
     run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
     *,
     verify_env: Mapping[str, str] | None = None,
     extra_probe_specs: Sequence[tuple[str, list[str]]] = (),
+    include_toolchain: bool = True,
 ) -> EnvFingerprint:
     """Probe a host's verify environment and return a frozen EnvFingerprint.
 
@@ -2649,22 +3002,49 @@ async def capture_env_fingerprint(
         Each argv is issued through ``run``; trimmed stdout is stored under
         ``key``.  When a probe exits non-zero the value is
         ``'<unavailable rc=N>'``.
+    include_toolchain:
+        Whether to issue the three HARDCODED Rust probes (``rustc --version``,
+        ``cargo --version``, ``sccache --show-stats``).  ``True`` (the default)
+        preserves every existing caller byte for byte.  ``False`` skips them
+        and yields ``toolchain=''`` / ``sccache_reachable=False``, which is
+        correct only when the caller will not COMPARE those fields — see
+        :meth:`DriftDetector.check_env`, which derives this from its
+        ``dimensions``.  The saving is not cosmetic: on the remote side each
+        probe is a separate ssh invocation (``_SSH_BASE_OPTS`` sets up no
+        ControlMaster), so skipping three of them turns a 4-probe check from
+        seven full TCP+auth handshakes into four, serially, over a possibly-WAN
+        link — plus three fewer local subprocess spawns.
+
+    Absent binaries
+    ---------------
+    Every probe site is routed through :func:`_probe_run_safe`, which catches
+    OSError (the FileNotFoundError ``create_subprocess_exec`` raises for a
+    binary that does not exist) and normalises it to rc=127 — the same rc an
+    ssh remote shell reports for "command not found".  Consequences: a
+    rust-less host yields ``toolchain == ''`` and still returns a fingerprint
+    rather than raising; an absent sccache yields ``sccache_reachable=False``;
+    a genuinely-absent extra probe renders ``'<unavailable rc=127>'`` on BOTH
+    the local and the remote side, so it compares equal instead of
+    manufacturing drift.
     """
     _run = run if run is not None else _default_subprocess_run
 
-    # Toolchain: rustc --version + cargo --version
-    _, rustc_out, _ = await _run(['rustc', '--version'])
-    _, cargo_out, _ = await _run(['cargo', '--version'])
-    toolchain = (rustc_out.strip() + '\n' + cargo_out.strip()).strip()
+    toolchain = ''
+    sccache_reachable = False
+    if include_toolchain:
+        # Toolchain: rustc --version + cargo --version
+        _, rustc_out, _ = await _probe_run_safe(_run, ['rustc', '--version'])
+        _, cargo_out, _ = await _probe_run_safe(_run, ['cargo', '--version'])
+        toolchain = (rustc_out.strip() + '\n' + cargo_out.strip()).strip()
 
-    # sccache reachability
-    sccache_rc, _, _ = await _run(['sccache', '--show-stats'])
-    sccache_reachable = (sccache_rc == 0)
+        # sccache reachability
+        sccache_rc, _, _ = await _probe_run_safe(_run, ['sccache', '--show-stats'])
+        sccache_reachable = (sccache_rc == 0)
 
     # Extra probes
     extra_probes: dict[str, str] = {}
     for key, argv in extra_probe_specs:
-        probe_rc, probe_out, _ = await _run(argv)
+        probe_rc, probe_out, _ = await _probe_run_safe(_run, list(argv))
         if probe_rc == 0:
             extra_probes[key] = probe_out.strip()
         else:
@@ -2843,6 +3223,27 @@ async def run_verdict_parity(
 # Sentinel task_id used for dedup'd drift escalation (mirrors harness '__scheduler__').
 _DRIFT_SENTINEL = '__drift__'
 
+# Sentinel task_id for the dedup'd ENV-drift escalation (task 4537).
+# DELIBERATELY DISTINCT from _DRIFT_SENTINEL above, and not a category
+# refinement of it.  The verdict path's dedup calls
+# ``has_open_l1(_DRIFT_SENTINEL)`` with NO category argument, and
+# EscalationQueue.has_open_l1 counts ANY pending L1 on that task_id when
+# category is None (escalation/src/escalation/queue.py::EscalationQueue.
+# has_open_l1).  Sharing one sentinel would therefore make an open env-drift
+# escalation silently suppress a genuine VERDICT-divergence escalation — the
+# alarm that stops unverified code landing on main — and vice versa.  Two
+# sentinels make the two dedup namespaces disjoint by construction rather
+# than by both filers remembering to pass a category.
+_ENV_DRIFT_SENTINEL = '__env_drift__'
+
+# Escalation category for env divergence.  A named constant rather than two
+# string literals because the dedup pre-check and the filed Escalation MUST
+# spell it identically.  It must also be registered in
+# escalation/src/escalation/categories.py::EscalationCategory: has_open_l1 and
+# submit both refuse an unregistered category, and check_env_safely would
+# swallow that refusal, so the detector would never file.
+_ENV_DIVERGENCE_CATEGORY = 'verify_env_divergence'
+
 
 class DriftVerdict(StrEnum):
     """Outcome of a single DriftDetector.check() call."""
@@ -2885,6 +3286,40 @@ class DriftCheckResult:
     remote_category: str = ''
     escalated: bool = False
     quarantined: bool = False
+
+
+@dataclass(frozen=True)
+class EnvDriftCheckResult:
+    """Result of one DriftDetector.check_env() call (task 4537, Lever C).
+
+    Sibling of DriftCheckResult, and deliberately a SEPARATE type: the two
+    checks answer different questions (do the hosts AGREE? vs are the hosts
+    the SAME?) and, crucially, have different remedies.  DriftCheckResult
+    carries a `quarantined` flag; this one does not, because env divergence
+    never benches a host — see check_env's fail-safe note.
+
+    Fields
+    ------
+    verdict:          AGREE / DIVERGE / INCONCLUSIVE.
+    is_faithful:      True when every compared dimension matched.  ALSO True
+                      when the verdict is INCONCLUSIVE, i.e. when the check
+                      could not be taken: a caller gating an alarm on
+                      ``not is_faithful`` must not fire because a host was
+                      unreachable.  Read ``verdict`` to tell "the hosts match"
+                      from "we do not know".
+    drift_dimensions: EnvFingerprint field names that differed (empty when
+                      faithful or inconclusive).
+    local_probes:     The local host's extra_probes mapping ({} when unprobed).
+    remote_probes:    The remote host's extra_probes mapping ({} when unprobed).
+    escalated:        True when a NEW env-divergence escalation was submitted
+                      (False when deduped against an already-open L1).
+    """
+    verdict: DriftVerdict
+    is_faithful: bool
+    drift_dimensions: tuple[str, ...] = ()
+    local_probes: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    remote_probes: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    escalated: bool = False
 
 
 class DriftDetector:
@@ -3050,6 +3485,305 @@ class DriftDetector:
             escalated=escalated,
             quarantined=True,
         )
+
+    async def check_env(
+        self,
+        probe_specs: Sequence[tuple[str, list[str]]],
+        *,
+        local_run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
+        dimensions: Sequence[str] = ('extra_probes',),
+    ) -> EnvDriftCheckResult:
+        """Compare the local and remote hosts' ENVIRONMENTS, not their verdicts.
+
+        ``check()`` above asks whether the two hosts reached the same verdict
+        for one SHA.  Two hosts running different tool versions answer that
+        question identically on almost every commit — and diverge exactly on
+        the one that matters.  This asks the prior question: are they running
+        the same tools at all?
+
+        Captures an EnvFingerprint on each host through the SAME
+        :func:`capture_env_fingerprint` (local via *local_run* /
+        :func:`env_probe_local_run`, remote via ``remote.env_probe_run()``),
+        then compares them under :func:`compare_env_fingerprints` scoped to
+        *dimensions*.
+
+        THE PROBE SEAM IS THE VERIFY SEAM, on both sides: the remote probes go
+        through the same non-login ssh shell a remote verify runs in, and the
+        local ones through the same ``verify._target_subprocess_env`` scrub a
+        local verify command is spawned under.  A fingerprint captured under
+        anything else measures the wrong environment and reports divergence
+        that no verify run would ever experience.
+
+        Parameters
+        ----------
+        probe_specs:
+            ``(key, argv)`` pairs from ``config.verify_env_probes``.  Empty
+            (the shipped default) means the detector is off.
+        local_run:
+            Injected local run seam.  None uses :func:`env_probe_local_run` —
+            the VERIFY seam (``verify._target_subprocess_env``, cwd ``$HOME``),
+            deliberately not ``capture_env_fingerprint``'s own
+            ``_default_subprocess_run`` default, which would inherit the
+            daemon's ``uv run`` venv activation and report the daemon's
+            interpreter instead of the host's.
+        dimensions:
+            Compared EnvFingerprint fields.  Defaults to ``('extra_probes',)``
+            — only what the operator explicitly declared.  toolchain and
+            sccache_reachable are hardcoded RUST probes that would manufacture
+            drift on a Python project, and verify_env is host-specific by
+            design (jobserver FIFO path, RAM-tuned concurrency).
+
+        Side-effects
+        ------------
+        AGREE → emit ``verify_env_parity_ok`` (None-safe).
+        DIVERGE → emit ``verify_env_divergence`` + one deduped L1 escalation.
+        INCONCLUSIVE → nothing at all: no event, no escalation, no probe.
+        INCONCLUSIVE covers every reason the check could not be TAKEN — no
+        probes declared, no local runner, no eligible remote (including one
+        the verdict path just quarantined), a remote that is not a
+        RemoteRunner, or a transport failure (an UNREACHABLE host, which ssh
+        reports as rc=255 and ``RemoteRunner.env_probe_run`` converts into
+        RunnerUnavailable) — never a finding about the hosts.  Alarming on any
+        of those would train operators to ignore the alarm, and here it would
+        do worse than that: the L1 dedups on
+        ``(_ENV_DRIFT_SENTINEL, _ENV_DIVERGENCE_CATEGORY)``, so one false
+        alarm filed against a sleeping laptop suppresses the genuine one until
+        a human resolves it.
+
+        Raises
+        ------
+        ValueError
+            If *dimensions* names an unknown field or is empty.  Deliberately
+            NOT folded into INCONCLUSIVE: those are host conditions, this is a
+            caller/config error, and an empty selection would otherwise report
+            every pair of hosts as faithful.  :meth:`check_env_safely` catches
+            it and logs at WARNING, so the mistake is visible rather than a
+            permanently-green detector.
+
+        FAIL-SAFE, NOT FAIL-CLOSED
+        --------------------------
+        This method NEVER calls ``self._pool.quarantine``, unlike ``check()``.
+        A verdict split can land unverified code on main, so benching the
+        remote is proportionate there.  A probe-version skew is a loud
+        operator signal, and auto-benching a verify host over a cosmetic
+        difference would cost more than the divergence it reports.  Whether
+        env drift should ever quarantine is an operator policy decision, not
+        one for this detector to make silently.
+        """
+        # Validate the SELECTION before anything else, including before the
+        # no-probes guard.  An unknown or empty `dimensions` is a caller error,
+        # not a host condition, and the two must not be conflated: returning
+        # INCONCLUSIVE for it would hide the mistake behind the same quiet
+        # degradation that a sleeping laptop produces, and comparing an empty
+        # selection would emit a verify_env_parity_ok affirming a parity that
+        # was never measured.  Resolved here rather than left to
+        # compare_env_fingerprints so the rejection costs no ssh round trips.
+        selected_dimensions = _resolve_env_dimensions(dimensions)
+
+        inconclusive = EnvDriftCheckResult(
+            verdict=DriftVerdict.INCONCLUSIVE, is_faithful=True
+        )
+
+        # Guard order is load-bearing: the no-probes case is checked FIRST so
+        # the shipped default (verify_env_probes: []) costs nothing and touches
+        # neither host — "off" must mean off, not "probed and compared nothing".
+        if not probe_specs:
+            return inconclusive
+
+        local = self._pool.local_runner
+        remote = self._pool.eligible_remote()
+        if local is None or remote is None:
+            # Lever C not configured, or the verdict path already quarantined
+            # the remote.  Mirrors check()'s same-shaped guard.
+            return inconclusive
+
+        # Duck-typed rather than a Protocol method: env_probe_run is a
+        # RemoteRunner affordance, and widening the VerifyRunner Protocol for
+        # it would force every stand-in and test double to grow an ssh probe
+        # seam it has no use for.
+        probe_run = getattr(remote, 'env_probe_run', None)
+        if probe_run is None:
+            return inconclusive
+
+        # REMOTE FIRST, deliberately.  The remote capture is the one that can
+        # fail — it is an ssh round trip to a host that may be asleep — while
+        # the local capture spawns a real subprocess per probe (plus the three
+        # hardcoded Rust ones) through capture's default seam.  Probing the
+        # local host first spends all of that building a fingerprint that is
+        # then discarded the moment the remote turns out to be unreachable,
+        # which on the production path is EVERY drift check taken while the
+        # laptop is closed.  Ordering it this way also keeps a caller that
+        # supplies an unusable remote off the local machine entirely.
+        # Do not PROBE what will not be COMPARED.  The three hardcoded Rust
+        # probes are skipped unless `dimensions` actually reads them, which on
+        # the production path (('extra_probes',)) it never does — the same
+        # reasoning that scopes the comparison in the first place.  Derived
+        # from the selection rather than hardcoded off so a caller that DOES
+        # ask for toolchain/sccache_reachable still gets a real answer instead
+        # of a silent ''/False that would compare equal on every pair of hosts.
+        include_toolchain = bool(
+            {'toolchain', 'sccache_reachable'} & selected_dimensions
+        )
+        try:
+            remote_fp = await capture_env_fingerprint(
+                probe_run(),
+                extra_probe_specs=probe_specs,
+                include_toolchain=include_toolchain,
+            )
+            local_fp = await capture_env_fingerprint(
+                # NOT capture's own default (_default_subprocess_run): that is
+                # a bare create_subprocess_exec with no env=, so it would probe
+                # under the orchestrator daemon's venv activation rather than
+                # under the verify environment.  See env_probe_local_run.
+                local_run if local_run is not None else env_probe_local_run,
+                extra_probe_specs=probe_specs,
+                include_toolchain=include_toolchain,
+            )
+        except RunnerUnavailable:
+            # Invariant 5: transport failure is not divergence.  A closed or
+            # flaky laptop must never raise a false env-skew alarm — the same
+            # reasoning check() applies to a failed verify dispatch.
+            #
+            # This arm is REACHED on the production seam, not decorative:
+            # RemoteRunner.env_probe_run converts ssh's rc=255 (and an ssh
+            # spawn failure) into RunnerUnavailable precisely so an unreachable
+            # host lands here instead of comparing '<unavailable rc=255>'
+            # against real local versions and alarming on every declared tool.
+            return inconclusive
+
+        parity = compare_env_fingerprints(local_fp, remote_fp, dimensions=dimensions)
+
+        if parity.is_faithful:
+            if self._event_store is not None:
+                from orchestrator.event_store import EventType
+                self._event_store.emit(
+                    EventType.verify_env_parity_ok,
+                    task_id=self._task_id,
+                    data={
+                        'local_runner': local.name,
+                        'remote_runner': remote.name,
+                        'probe_keys': sorted(local_fp.extra_probes),
+                        'dimensions': list(dimensions),
+                    },
+                )
+            return EnvDriftCheckResult(
+                verdict=DriftVerdict.AGREE,
+                is_faithful=True,
+                local_probes=dict(local_fp.extra_probes),
+                remote_probes=dict(remote_fp.extra_probes),
+            )
+
+        # Diverge — name the offending probes, emit, and file ONE deduped L1.
+        # Only the keys that actually differ are reported: a run where pyright
+        # agrees and uv skews must point at uv, not at "extra_probes changed".
+        diverging_probes = {
+            key: {
+                'local': local_fp.extra_probes.get(key, ''),
+                'remote': remote_fp.extra_probes.get(key, ''),
+            }
+            for key in sorted(set(local_fp.extra_probes) | set(remote_fp.extra_probes))
+            if local_fp.extra_probes.get(key) != remote_fp.extra_probes.get(key)
+        }
+
+        if self._event_store is not None:
+            from orchestrator.event_store import EventType
+            self._event_store.emit(
+                EventType.verify_env_divergence,
+                task_id=self._task_id,
+                data={
+                    'local_runner': local.name,
+                    'remote_runner': remote.name,
+                    'drift_dimensions': list(parity.drift_dimensions),
+                    'diverging_probes': diverging_probes,
+                },
+            )
+
+        escalated = False
+        if self._escalation_queue is not None and not self._escalation_queue.has_open_l1(
+            _ENV_DRIFT_SENTINEL, category=_ENV_DIVERGENCE_CATEGORY
+        ):
+            from escalation.models import Escalation
+            # diverging_probes is empty whenever a caller scopes `dimensions`
+            # at something with no per-probe detail (toolchain, verify_env,
+            # sccache_reachable).  The production path never does, but this is
+            # a public parameter, and an L1 whose one-line summary trails off
+            # after the colon tells an operator nothing.  Degrade to naming
+            # the dimensions and pointing at the event payload instead.
+            offenders = ', '.join(diverging_probes) or (
+                'no per-probe detail for this dimension — read the '
+                'verify_env_divergence event'
+            )
+            skew = ', '.join(
+                f'{key}: local={vals["local"]!r} remote={vals["remote"]!r}'
+                for key, vals in diverging_probes.items()
+            ) or 'none (the divergence is outside extra_probes)'
+            esc = Escalation(
+                id=self._escalation_queue.make_id(_ENV_DRIFT_SENTINEL),
+                task_id=_ENV_DRIFT_SENTINEL,
+                agent_role='orchestrator-env-drift-detector',
+                severity='blocking',
+                level=1,
+                category=_ENV_DIVERGENCE_CATEGORY,
+                summary=(
+                    f'Host env divergence in {"/".join(parity.drift_dimensions)}: '
+                    f'{offenders}'
+                ),
+                detail=(
+                    f'local_runner={local.name!r} remote_runner={remote.name!r} '
+                    f'drift_dimensions={list(parity.drift_dimensions)!r}. '
+                    f'Diverging probes — {skew}. '
+                    f'The two hosts are not running the same tools, so their verify '
+                    f'verdicts are not interchangeable: they will agree on almost '
+                    f'every commit and diverge on the one where the version matters. '
+                    f'The remote has NOT been quarantined (env drift is a detective '
+                    f'control, not a gate).'
+                ),
+                suggested_action=(
+                    'Pin the diverging tool to one version across both hosts (or '
+                    'install the matching version on the lagging host), then re-run '
+                    'the drift check to confirm parity is restored.'
+                ),
+            )
+            self._escalation_queue.submit(esc)
+            escalated = True
+
+        # NO self._pool.quarantine call here — see this method's docstring.
+        # check() quarantines because a verdict split can land unverified code
+        # on main; a probe-version skew does not, and benching a verify host
+        # over a cosmetic difference would cost more than the finding.
+        return EnvDriftCheckResult(
+            verdict=DriftVerdict.DIVERGE,
+            is_faithful=False,
+            drift_dimensions=parity.drift_dimensions,
+            local_probes=dict(local_fp.extra_probes),
+            remote_probes=dict(remote_fp.extra_probes),
+            escalated=escalated,
+        )
+
+    async def check_env_safely(self, probes: Sequence[EnvProbeConfig]) -> None:
+        """:meth:`check_env` over ``config.verify_env_probes``, for the land-hook drift path.
+
+        Call it BEFORE :meth:`check`: ``check`` quarantines the remote on
+        verdict divergence, after which there is no eligible remote and the
+        env check could only ever report INCONCLUSIVE.
+
+        Never raises.  The verdict check that follows is the load-bearing
+        alarm, and this is a newer detective in front of it, so any failure
+        here — an ssh probe hanging up, a malformed argv, a bug in
+        ``check_env``, its ValueError for a bad selection — is logged at
+        WARNING with the traceback and swallowed rather than allowed to skip
+        ``check``.
+        """
+        import logging
+
+        try:
+            await self.check_env([(probe.key, list(probe.argv)) for probe in probes])
+        except Exception:
+            logging.getLogger(__name__).warning(
+                'Env drift check failed for task %s; ignoring (detective control)',
+                self._task_id,
+                exc_info=True,
+            )
 
 
 def render_parity_report(report: VerdictParityReport) -> str:

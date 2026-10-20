@@ -2688,3 +2688,86 @@ class TestConvertScopingClauseTracksTheBlockedArm:
         assert await _reconcile_stranded(
             enforce_harness, _TID, 'in-progress', mid_run=False,
         ) != _CONVERTED
+
+
+#: Task 4645: the escalation whose ask an ON-MAIN landing satisfies.  Pinned to
+#: the literal on purpose — this suite asserts the category's behaviour, and the
+#: set it belongs to is pinned in `test_recovery_pins.py`.
+PREEXISTING_MAIN_BREAK_PIN = EscalationRef(
+    id='esc-4645-pmb', level=1, category='preexisting_main_break', severity='blocking',
+)
+
+
+@pytest.mark.asyncio
+class TestConvertScopingClauseFollowsTheOnMainRelaxation:
+    """The ON_MAIN clause relaxes one more category than the recovery predicate.
+
+    The scoping clause asks "would the blocked arm move this row next sweep?",
+    so it must follow BOTH clauses: an in-progress on-main row pinned only by a
+    `preexisting_main_break` record would otherwise convert and then be marked
+    done by the ON_MAIN clause one sweep later (task 4645).
+    """
+
+    @pytest.mark.parametrize(
+        'kind', [BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER],
+    )
+    async def test_an_on_main_preexisting_main_break_pin_is_held_not_converted(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        from orchestrator.event_store import EventType
+
+        _bind(enforce_harness, _pinned_in_progress(
+            kind, refs=[PREEXISTING_MAIN_BREAK_PIN],
+        ))
+
+        result = await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        )
+
+        assert result is None
+        assert enforce_harness.scheduler.set_task_status.await_count == 0
+        rows = _recovery_rows(enforce_harness)
+        assert len(rows) == 1, rows
+        assert rows[0]['event_type'] == EventType.recovery_vetoed.value
+        assert rows[0]['data'].get('reason') == 'escalation_pinned'
+
+    @pytest.mark.parametrize(
+        'kind', [BranchStateKind.EXISTS_OFF_MAIN, BranchStateKind.GONE_NO_MARKER],
+    )
+    async def test_an_off_main_preexisting_main_break_pin_still_converts(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        """Off main the ask is unmet and the recovery predicate still pins it,
+        so `blocked` is genuinely at rest — the relaxation is ON_MAIN only."""
+        _bind(enforce_harness, _pinned_in_progress(
+            kind, refs=[PREEXISTING_MAIN_BREAK_PIN],
+        ))
+
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+
+    async def test_an_on_main_task_failure_pin_still_converts(
+        self, enforce_harness,
+    ) -> None:
+        """Control: a human-concern pin is in neither set, on main or off."""
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN, refs=[PIN_REFS[1]],
+        ))
+
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+
+    async def test_a_preexisting_main_break_beside_a_human_concern_still_converts(
+        self, enforce_harness,
+    ) -> None:
+        """B8 through this clause: `all(...)` keeps the human concern pinning."""
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN,
+            refs=[PREEXISTING_MAIN_BREAK_PIN, PIN_REFS[2]],
+        ))
+
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED

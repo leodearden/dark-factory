@@ -1077,6 +1077,128 @@ verify_env:
   # arms the override for the one context (the verify host) already known-good.
   DF_REQUIRE_SANDBOX_TESTS: "1"
 
+# Lever C HOST-ENVIRONMENT divergence probes (task 4537).
+#
+# The drift check (verify_drift_check_every_n_lands) compares the two hosts'
+# VERDICTS. Two hosts on different tool versions agree on almost every commit
+# and diverge on exactly the one where the version matters, so a verdict-only
+# detective is blind to the skew right up until it costs a bad land. These
+# probes compare the TOOLS themselves at the same cadence: each argv is run on
+# both hosts, the trimmed stdout is compared, and a difference emits
+# verify_env_divergence naming the probe and BOTH values plus one deduped L1.
+#
+# DETECTIVE, NOT A GATE. Env divergence NEVER quarantines the remote and never
+# blocks a land (DriftDetector.check_env). Benching a verify host over a
+# cosmetic probe difference would cost more than the finding; if this should
+# ever gate, that is a deliberate operator decision, not a silent one.
+#
+# LIVE ON THIS PROJECT. This file enables the `laptop` verify runner with
+# verify_drift_check_every_n_lands: 10, so these probes run on both hosts at the
+# first drift check after the deploy that carries them, and every 10 lands after
+# that. The first check is expected to report the real tool skew measured below
+# as ONE deduped L1 — designed behaviour, not a defect. RESTART-ONLY
+# (deliberately absent from RELOADABLE_FIELDS): the probe list is only
+# consulted alongside the verify_runners pool, which is itself restart-only.
+#
+# THE PROBE SEAM IS THE VERIFY SEAM, ON BOTH SIDES.
+#   - REMOTE: RemoteRunner.env_probe_run issues `ssh <host> <prelude> <cmd>` —
+#     the same NON-LOGIN, non-interactive shell RemoteRunner.run_merge_verify
+#     dispatches `orchestrator verify-merge` through, with
+#     verify_runner.py::REMOTE_TOOL_PATH_PRELUDE putting ~/.local/bin on PATH
+#     exactly as RemoteRunner's remote `uv sync` does (task 7097). Caveat:
+#     leo-laptop's /usr/local/bin/orchestrator wrapper puts ~/.cargo/bin
+#     BEFORE ~/.local/bin, the prelude the reverse; no tool differs between
+#     the two dirs today, so this is latent.
+#   - LOCAL: verify_runner.env_probe_local_run spawns via execve (no shell)
+#     under verify._target_subprocess_env(None) — VIRTUAL_ENV dropped, the venv
+#     bin dir off PATH — which is exactly how every local verify command is
+#     spawned, and with cwd pinned to $HOME to match where an ssh probe lands.
+# So a PATH difference between the hosts is a real finding about the verify
+# environment, not a probe artifact. That is not hypothetical: see uv below.
+#
+# The cwd=$HOME pin is DEFENCE IN DEPTH, not a live fix: `npx` walks up from
+# cwd looking for node_modules/.bin, the daemon's cwd is the project root, and
+# that root DOES have a node_modules/ — but it holds only `codex`, and
+# (measured 2026-08-28) `npx pyright --version` returned 1.1.413 from both the
+# root and $HOME. The pin closes the gap against a future repo-local
+# node_modules/.bin/pyright, which would otherwise read as laptop drift.
+#
+# WHY THE LOCAL SEAM IS SPELLED OUT. capture_env_fingerprint's own default
+# (_default_subprocess_run) is a bare create_subprocess_exec with NO env=, so a
+# probe issued through it inherits the ORCHESTRATOR DAEMON's environment. That
+# daemon is started by systemd as `uv run --frozen --project orchestrator ...`
+# (scripts/orchestrator-dark-factory.service), i.e. with VIRTUAL_ENV=<root>/.venv
+# and PATH fronted by <root>/.venv/bin. MEASURED 2026-08-29, same host, same
+# process, the two seams side by side:
+#     _default_subprocess_run  ->  python3  Python 3.13.9   (<root>/.venv/bin/python3)
+#     env_probe_local_run      ->  python3  Python 3.12.3   (/usr/bin/python3)
+# The daemon's own venv activation is therefore worth a whole minor version on
+# the python3 probe. Captured that way, python3 would have reported a false
+# 3.13.9-vs-3.12.3 divergence on the first live check — and since check_env
+# dedups on has_open_l1(_ENV_DRIFT_SENTINEL, category='verify_env_divergence'),
+# that false blocking L1 would then stay open and SUPPRESS the genuine
+# env-divergence alarm. The seam is what makes the table below mean what it
+# says; do not "simplify" the local capture back onto capture's default.
+#
+# MEASURED (workstation via env_probe_local_run — execve, no shell, scrubbed
+# env, cwd=$HOME; leo-laptop via `ssh leo-laptop <cmd>` — the remote capture
+# seam). uv / node / python3 re-measured 2026-08-29 under that exact seam and
+# unchanged; pyright and the whole leo-laptop column carry their 2026-08-28
+# measurement forward (see the note under the table):
+#
+#   probe    workstation                            leo-laptop
+#   -------  -------------------------------------  ----------------------------
+#   pyright  pyright 1.1.413                        pyright 1.1.413
+#   uv       uv 0.11.6 (x86_64-unknown-linux-gnu)   NOT ON PATH (rc=127)
+#   node     v22.23.2                               v22.22.3
+#   python3  Python 3.12.3                          Python 3.12.3
+#
+# Predicated on the seam above: under the daemon's raw environ python3 would
+# be a THIRD (spurious) diverging probe. pyright's workstation cell was NOT
+# re-measured on 2026-08-29 — `npx pyright --version` exited 1 with empty
+# stdout from the re-measuring session, which ran inside an AGENT SANDBOX.
+# That is a known sandbox artifact, not a host condition: agents/write_set.py::
+# compute_write_set grants ~/.cache/uv and ~/.claude/fleet but has no ~/.npm
+# row, so npm cannot write _cacache/_logs and aborts with EACCES before it
+# ever execs pyright (task 3162 owns the fix; the `sudo chown -R` the npm
+# error text suggests is a confirmed no-op — the tree is already leo:leo).
+# The unsandboxed daemon that runs the real probe is unaffected. The table's
+# rc=127 for uv predates the remote prelude (task 7097): it was a PATH-scope
+# artefact of the bare non-login shell, not a missing install (`ssh leo-laptop
+# bash -lc "uv --version"` finds uv 0.10.6). Under the seam above, the first
+# live drift check is expected to report TWO genuine diverging probes:
+#   - uv: 0.11.6 on the workstation vs 0.10.6 on the laptop.
+#   - node: a genuine patch-level skew.
+# pyright is EQUAL today only by coincidence: type_check_command chains bare
+# `npx pyright` with no package.json, so each host resolves whatever its npx
+# cache happens to hold and they can part company on any day. That is precisely
+# why it is probed. python3 matches on both and is probed as a tripwire for a
+# future skew.
+#
+# NO RUST PROBE, DELIBERATELY. Only the probes declared here are compared —
+# EnvFingerprint's hardcoded rustc/cargo/sccache dimensions are skipped (see
+# verify_runner.compare_env_fingerprints' `dimensions` parameter). dark_factory
+# is a Python project, and this workstation carries a stray
+# ~/.cargo/bin/rustc that leo-laptop need not; comparing it would manufacture
+# drift on a toolchain nothing here builds with. A Rust project declares
+# rustc/cargo in this list explicitly instead.
+#
+# EXECUTABLE HALF: orchestrator/tests/test_config.py::
+# TestCommittedEnvProbesDeployed pins these keys and the npx spelling. Its
+# _EXPECTED_PROBE_KEYS must move in the SAME COMMIT as any change below.
+#
+# Keep every probe short, read-only and fast: they run on BOTH hosts on every
+# drift check.
+verify_env_probes:
+  - key: pyright
+    argv: ["npx", "pyright", "--version"]
+  - key: uv
+    argv: ["uv", "--version"]
+  - key: node
+    argv: ["node", "--version"]
+  - key: python3
+    argv: ["python3", "--version"]
+
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
 fused_memory:
@@ -1491,20 +1613,19 @@ verify_host_policy: prefer_remote
 verify_drift_check_every_n_lands: 10
 verify_cross_check_remote_green: false
 
-# Pre-merge rebase-and-reverify: run it ONCE and never repeat it (Leo, 2026-09-06).
-# workflow.py's merge phase rebases the task branch onto main and runs a full
-# task-role scoped verify (admission-gated, 3 slots on this box) BEFORE submitting
-# to the merge queue; the stock loop repeats that whole cycle up to
-# max_pre_merge_retries times whenever main moved during the verify. MEASURED
-# 2026-09-06: "main moved during pre-merge rebase, retrying" fired 29 times in one
-# day on this host, each retry a 40-90 min verify under load, and task 5050 sat ~15h
-# in that step. With 1 the loop runs one rebase+verify; if main moved meanwhile the
-# task submits anyway with pre_rebased=False and the merge queue's own rebase +
-# post-merge verify (which happens regardless) is the one that lands it. This
-# knob is NOT in RELOADABLE_FIELDS — it takes effect at the next orchestrator
-# restart. Follow-up lever (policy PRD, task 5098): whether the pre-merge verify
-# should run at all when the queue re-verifies on landing.
+# Pre-merge rebase: the merge phase only REBASES (Leo, 2026-10-09, task 6580).
+# workflow.py's merge phase rebases the task branch onto main and submits it to the
+# merge queue; it no longer runs a task-role scoped verify first, because the merge
+# queue's own gate verifies every landing (task 1724) and that verdict had no
+# reader. This closes the "should the pre-merge verify run at all" sub-question
+# task 5098 held. max_pre_merge_retries bounds the rebase retry when main moved
+# during the rebase; with 1 a moved main submits with pre_rebased=False and the
+# queue's rebase lands it. This knob is NOT in RELOADABLE_FIELDS — it takes
+# effect at the next orchestrator restart.
 max_pre_merge_retries: 1
+# Rollback switch only (green tier, mcp__escalation__reload_config): true restores
+# the advisory post-rebase task-role re-verify on the next merge attempt.
+pre_merge_reverify: false
 
 # Config-driven off-hot-path offline lane — dark-factory qdrant-integration
 # instance (plans/integration-test-lane-prd.md, task beta). Restores the
@@ -1623,3 +1744,11 @@ unblock_auto:
 # scheduled fleet redeploy. workflow_exit_contract_enforce stays False until task
 # 3113 lands and a fresh soak shows zero would-violates.
 convert_to_blocked_enforce: true
+
+psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2026-09-08)
+  mem_some_avg10: 15.0
+  mem_full_avg10: 3.0
+  io_some_avg10: 40.0
+  runqueue_ratio: 4.0     # provisional (D9); the calibration gate re-derives it
+  min_inflight_floor: 3
+  # cpu_some_avg10 and own_cpu_some_avg10 deliberately absent: off (D1, D2)

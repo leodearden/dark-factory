@@ -3765,6 +3765,82 @@ class TaskWorkflow:
         await self._clear_merge_retry_pending()
         return await self._merge_and_finalise(branch_name)
 
+    async def _rebase_before_enqueue(self) -> bool:
+        """Phase 1 of the merge phase: rebase onto main before enqueueing.
+
+        Returns True when the rebased tip sits on the current main (the
+        ``pre_rebased`` flag). The merge gate verifies every landing
+        regardless (task 1724), so the task-role re-verify here runs only
+        when the ``pre_merge_reverify`` rollback switch is on (task 6580).
+        """
+        assert self.worktree is not None
+        for _attempt in range(self.config.max_pre_merge_retries):
+            main_before = await self.git_ops.get_main_sha()
+            if not await self.git_ops.rebase_onto_main(self.worktree):
+                return False  # true conflict — queue will detect it
+            if (
+                self.config.pre_merge_reverify
+                and not await self._post_rebase_reverify_passed()
+            ):
+                return False
+            if main_before == await self.git_ops.get_main_sha():
+                self.metrics.pre_merge_rebase_ok += 1
+                return True
+            self.metrics.pre_merge_rebase_attempts += 1
+            logger.info(
+                f'Task {self.task_id}: main moved during pre-merge '
+                f'rebase, retrying'
+            )
+        return False
+
+    async def _post_rebase_reverify_passed(self) -> bool:
+        """Rollback-only (``pre_merge_reverify``) task-role re-verify of the rebased tip."""
+        assert self.worktree is not None
+        # Warm-lane consumer-hold (task 3027): same per-lane
+        # <lane_dir>.lock hold as the implement-phase verify — this
+        # post-rebase re-verify also builds/runs test binaries on the
+        # task's warm lane, so it equally races reify's warm-lane-gc.sh
+        # reclaim; the flock is the cross-process guard that script
+        # honors. Fails open on contention.
+        async with self.git_ops.task_verify_lease(self.worktree):
+            verify = await run_scoped_verification(
+                self.worktree, self.config, self._module_configs,
+                task_files=self._task_files,
+                # role='task' is explicit for γ's explicit-is-correct
+                # invariant (mirrors merge_queue.py role='merge').
+                # 'task' is already the default so this is documentary.
+                # This site's task_verify_lease wrap has its OWN
+                # held-flock call-site spy: test_task_verify_lease.py::
+                # TestMergePhaseReverifyHoldsLease drives _run_merge_phase
+                # to here and asserts the lane flock is HELD during the
+                # re-verify (the implement-phase site is covered
+                # separately by TestTaskLaneVerifyHoldsLease).
+                role='task',
+                task_id=self.task_id,
+                event_store=self.event_store,
+            )
+        if not verify.passed:
+            if verify.timed_out:
+                logger.warning(
+                    f'Task {self.task_id}: post-rebase verification '
+                    f'timed out; merge queue will retry'
+                )
+            else:
+                logger.warning(
+                    f'Task {self.task_id}: post-rebase verification '
+                    f'failed: {verify.summary}'
+                )
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.waste_detected,
+                        task_id=self.task_id, phase='merge',
+                        data={
+                            'waste_type': 'post_rebase_verify_fail',
+                            'summary': verify.summary[:200],
+                        },
+                    )
+        return verify.passed
+
     async def _run_merge_phase(self, branch_name: str) -> WorkflowOutcome | None:
         """Execute the MERGE phase. Returns None to fall through to SUCCESS."""
         assert self.worktree is not None  # guaranteed by _setup_worktree_and_artifacts
@@ -3857,10 +3933,11 @@ class TaskWorkflow:
         for _merge_attempt in range(self.config.max_merge_retries):
             # task 2753: stamp the pre-enqueue MERGE-phase grace on the
             # Scheduler at the TOP of the retry loop — this is the precise
-            # pre-enqueue window (Phase-1 rebase + scoped re-verify + Phase-2
-            # submit, before register_and_enqueue_merge_request emits
-            # merge_queued). Re-stamps on each REQUEUED retry (each re-runs a
-            # vulnerable pre-merge verify). The orchestrator self-redeploy
+            # pre-enqueue window (Phase-1 rebase, and the rollback-only
+            # re-verify `pre_merge_reverify`, + Phase-2 submit, before
+            # register_and_enqueue_merge_request emits merge_queued). Re-stamps
+            # on each REQUEUED retry (each re-runs a vulnerable pre-enqueue
+            # window). The orchestrator self-redeploy
             # coordinator reads this so a polite/force-fire restart does not
             # cancel the workflow before it reaches the durable merge journal.
             # Cleared at the durable-enqueue boundary in _submit_to_merge_queue
@@ -3869,7 +3946,8 @@ class TaskWorkflow:
             # task 2991 (review-fix R2-B): refresh the DURABLE liveness stamp
             # alongside the in-memory one above, for the same reason. Each
             # REQUEUED retry re-runs a full vulnerable pre-enqueue window
-            # (Phase-1 rebase + scoped re-verify, minutes, zero LLM calls)
+            # (Phase-1 rebase, and the rollback-only re-verify
+            # `pre_merge_reverify`; zero LLM calls)
             # AFTER _submit_to_merge_queue discharged the stamp at the enqueue
             # boundary. Without this re-stamp that window has neither a durable
             # merge_phase_liveness nor a fresh routing.latest, so the task
@@ -3885,68 +3963,9 @@ class TaskWorkflow:
             # window", which an `if _merge_attempt > 0` would make dependent on
             # loop-index reasoning.
             await self._stamp_merge_phase_entered()
-            # Phase 1: pre-merge rebase (no lock, no queue slot)
-            # Rebase the task branch onto current main and re-verify
-            # so the queued merge phase is fast/trivial.
-            pre_rebased = False
-            for _attempt in range(self.config.max_pre_merge_retries):
-                main_before = await self.git_ops.get_main_sha()
-                if not await self.git_ops.rebase_onto_main(self.worktree):
-                    break  # true conflict — queue will detect it
-                # Warm-lane consumer-hold (task 3027): same per-lane
-                # <lane_dir>.lock hold as the implement-phase verify — this
-                # post-rebase re-verify also builds/runs test binaries on the
-                # task's warm lane, so it equally races reify's warm-lane-gc.sh
-                # reclaim; the flock is the cross-process guard that script
-                # honors. Fails open on contention.
-                async with self.git_ops.task_verify_lease(self.worktree):
-                    verify = await run_scoped_verification(
-                        self.worktree, self.config, self._module_configs,
-                        task_files=self._task_files,
-                        # role='task' is explicit for γ's explicit-is-correct
-                        # invariant (mirrors merge_queue.py role='merge').
-                        # 'task' is already the default so this is documentary.
-                        # This site's task_verify_lease wrap has its OWN
-                        # held-flock call-site spy: test_task_verify_lease.py::
-                        # TestMergePhaseReverifyHoldsLease drives _run_merge_phase
-                        # to here and asserts the lane flock is HELD during the
-                        # re-verify (the implement-phase site is covered
-                        # separately by TestTaskLaneVerifyHoldsLease).
-                        role='task',
-                        task_id=self.task_id,
-                        event_store=self.event_store,
-                    )
-                if not verify.passed:
-                    if verify.timed_out:
-                        logger.warning(
-                            f'Task {self.task_id}: post-rebase verification '
-                            f'timed out; merge queue will retry'
-                        )
-                    else:
-                        logger.warning(
-                            f'Task {self.task_id}: post-rebase verification '
-                            f'failed: {verify.summary}'
-                        )
-                        if self.event_store:
-                            self.event_store.emit(
-                                EventType.waste_detected,
-                                task_id=self.task_id, phase='merge',
-                                data={
-                                    'waste_type': 'post_rebase_verify_fail',
-                                    'summary': verify.summary[:200],
-                                },
-                            )
-                    break
-                main_after = await self.git_ops.get_main_sha()
-                if main_before == main_after:
-                    pre_rebased = True
-                    self.metrics.pre_merge_rebase_ok += 1
-                    break
-                self.metrics.pre_merge_rebase_attempts += 1
-                logger.info(
-                    f'Task {self.task_id}: main moved during pre-merge '
-                    f'rebase, retrying'
-                )
+            # Phase 1: pre-merge rebase (no lock, no queue slot); see
+            # _rebase_before_enqueue.
+            pre_rebased = await self._rebase_before_enqueue()
 
             # Phase 2: submit to merge queue (replaces _merge_lock)
             self._last_merge_block_reason = None

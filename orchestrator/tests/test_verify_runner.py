@@ -3,8 +3,10 @@
 import asyncio
 import dataclasses
 import json
+import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -3952,6 +3954,320 @@ class TestCaptureEnvFingerprint:
 
 
 # ---------------------------------------------------------------------------
+# task 4537 step-1: capture_env_fingerprint degrades on an ABSENT binary
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCaptureEnvFingerprintMissingBinary:
+    """An absent probe binary must degrade to rc=127, not raise OSError.
+
+    ``asyncio.create_subprocess_exec`` raises ``FileNotFoundError`` when the
+    binary does not exist, whereas an ssh remote shell returns rc=127 for the
+    same condition.  Normalising the local side to 127 is what makes a tool
+    that is absent on BOTH hosts compare EQUAL instead of exploding locally
+    and reporting ``<unavailable rc=127>`` remotely.
+    """
+
+    def _make_run(self, *, missing=(), responses=None):
+        """Async run callable that raises FileNotFoundError for `missing` argv[0]."""
+        queue = list(responses or [])
+        issued = []
+        missing_set = set(missing)
+
+        async def fake_run(argv, *, cwd=None):
+            issued.append(argv)
+            if argv[0] in missing_set:
+                raise FileNotFoundError(
+                    2, 'No such file or directory', argv[0],
+                )
+            if queue:
+                return queue.pop(0)
+            return (0, '', '')
+
+        run: Any = fake_run
+        run.issued = issued
+        return run
+
+    async def test_absent_extra_probe_records_rc_127(self):
+        """An absent EXTRA probe binary yields '<unavailable rc=127>', not OSError."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        run = self._make_run(
+            missing=['nosuchtool'],
+            responses=[
+                (0, 'rustc 1.80.0\n', ''),
+                (0, 'cargo 1.80.0\n', ''),
+                (0, 'stats\n', ''),
+            ],
+        )
+        fp = await capture_env_fingerprint(
+            run, extra_probe_specs=[('nosuchtool', ['nosuchtool', '--version'])],
+        )
+        assert fp.extra_probes['nosuchtool'] == '<unavailable rc=127>'
+
+    async def test_absent_rustc_and_cargo_yield_empty_toolchain(self):
+        """A rust-less host still produces an EnvFingerprint, with toolchain ''."""
+        from orchestrator.verify_runner import EnvFingerprint, capture_env_fingerprint
+        run = self._make_run(
+            missing=['rustc', 'cargo'],
+            responses=[(0, 'stats\n', '')],
+        )
+        fp = await capture_env_fingerprint(run)
+        assert isinstance(fp, EnvFingerprint)
+        assert fp.toolchain == ''
+
+    async def test_absent_sccache_not_reachable(self):
+        """An absent sccache binary yields sccache_reachable False, not OSError."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        run = self._make_run(
+            missing=['sccache'],
+            responses=[
+                (0, 'rustc 1.80.0\n', ''),
+                (0, 'cargo 1.80.0\n', ''),
+            ],
+        )
+        fp = await capture_env_fingerprint(run)
+        assert fp.sccache_reachable is False
+
+    async def test_uniformly_absent_on_both_hosts_compares_equal(self):
+        """Two rust-less hosts both missing the same probe compare FAITHFUL.
+
+        This is the property the detector depends on: a tool absent on both
+        sides is not drift.
+        """
+        from orchestrator.verify_runner import (
+            capture_env_fingerprint,
+            compare_env_fingerprints,
+        )
+        probes = [('pyright', ['npx', 'pyright', '--version'])]
+        missing = ['rustc', 'cargo', 'sccache', 'npx']
+
+        local_fp = await capture_env_fingerprint(
+            self._make_run(missing=missing), extra_probe_specs=probes,
+        )
+        remote_fp = await capture_env_fingerprint(
+            self._make_run(missing=missing), extra_probe_specs=probes,
+        )
+
+        verdict = compare_env_fingerprints(local_fp, remote_fp)
+        assert verdict.is_faithful is True
+        assert verdict.drift_dimensions == ()
+
+
+@pytest.mark.asyncio
+class TestCaptureEnvFingerprintIncludeToolchain:
+    """The three hardcoded Rust probes are skippable when nothing compares them.
+
+    On the remote side each probe is a SEPARATE ssh invocation (_SSH_BASE_OPTS
+    sets up no ControlMaster/ControlPersist), so issuing rustc/cargo/sccache
+    for a comparison scoped to extra_probes costs three extra TCP+auth
+    handshakes per host, serially, over a possibly-WAN link.
+    """
+
+    def _make_run(self):
+        issued = []
+
+        async def fake_run(argv, *, cwd=None):
+            issued.append(list(argv))
+            return (0, f'{argv[0]} 1.0.0\n', '')
+
+        run: Any = fake_run
+        run.issued = issued
+        return run
+
+    async def test_default_still_issues_the_toolchain_probes(self):
+        """Byte-identical for every existing caller — run_verdict_parity included."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        run = self._make_run()
+        await capture_env_fingerprint(run, extra_probe_specs=[('uv', ['uv', '--version'])])
+        assert run.issued == [
+            ['rustc', '--version'],
+            ['cargo', '--version'],
+            ['sccache', '--show-stats'],
+            ['uv', '--version'],
+        ]
+
+    async def test_opt_out_issues_only_the_declared_probes(self):
+        from orchestrator.verify_runner import capture_env_fingerprint
+        run = self._make_run()
+        await capture_env_fingerprint(
+            run,
+            extra_probe_specs=[('uv', ['uv', '--version'])],
+            include_toolchain=False,
+        )
+        assert run.issued == [['uv', '--version']]
+
+    async def test_opt_out_yields_empty_toolchain_and_unreachable_sccache(self):
+        """The skipped fields report their not-measured values, not stale ones."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fp = await capture_env_fingerprint(self._make_run(), include_toolchain=False)
+        assert fp.toolchain == ''
+        assert fp.sccache_reachable is False
+
+    async def test_opt_out_preserves_the_extra_probe_values(self):
+        from orchestrator.verify_runner import capture_env_fingerprint
+        fp = await capture_env_fingerprint(
+            self._make_run(),
+            extra_probe_specs=[('uv', ['uv', '--version'])],
+            include_toolchain=False,
+        )
+        assert fp.extra_probes == {'uv': 'uv 1.0.0'}
+
+
+@pytest.mark.asyncio
+class TestCheckEnvSkipsUnreadToolchainProbes:
+    """check_env derives include_toolchain from its `dimensions`, not a hardcode."""
+
+    async def test_default_scope_probes_only_the_declared_tools(self):
+        """The production path: 2 declared probes -> 2 commands per host, not 5."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, remote_fake = _make_env_drift_pool()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+
+        expected = [list(argv) for _, argv in _ENV_PROBE_SPECS]
+        assert local_run.issued == expected
+        assert remote_fake.env_probe_run().issued == expected
+
+    async def test_a_toolchain_scope_still_probes_rustc(self):
+        """Derived, not hardcoded off: asking for toolchain must MEASURE it.
+
+        Hardcoding include_toolchain=False would silently make every host
+        report toolchain='' and compare faithful — a false green for the one
+        caller that explicitly asked about the Rust toolchain.
+        """
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, local_run, _ = _make_env_drift_pool(
+            local_output={**_MATCHING_PROBE_OUTPUT, 'rustc --version': 'rustc 1.96.0\n'},
+            remote_output=_MATCHING_PROBE_OUTPUT,
+        )
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        result = await detector.check_env(
+            _ENV_PROBE_SPECS, local_run=local_run, dimensions=('toolchain',),
+        )
+        assert ['rustc', '--version'] in local_run.issued
+        assert result.verdict == DriftVerdict.DIVERGE
+
+    async def test_sccache_scope_still_probes_sccache(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = _make_env_drift_pool()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        await detector.check_env(
+            _ENV_PROBE_SPECS, local_run=local_run, dimensions=('sccache_reachable',),
+        )
+        assert ['sccache', '--show-stats'] in local_run.issued
+
+
+@pytest.mark.asyncio
+class TestCaptureEnvFingerprintProbeTimeout:
+    """A HUNG probe must not hold the merge-verify lease and both host slots.
+
+    check_env runs inside _run_drift_check's merge_verify_lease block, after
+    both allocator slots are taken, and _maybe_run_drift_check fires it with
+    asyncio.create_task and no timeout of its own — so nothing above would ever
+    reclaim those resources.  The local seam is a bare create_subprocess_exec +
+    communicate(), and the committed probe set includes `npx pyright
+    --version`, which on a cold npm cache reaches the npm registry.
+    """
+
+    def _hanging_run(self, *, hangs=()):
+        """Run callable that never returns for argv[0] in `hangs`."""
+        issued = []
+        hang_set = set(hangs)
+
+        async def fake_run(argv, *, cwd=None):
+            issued.append(list(argv))
+            if argv[0] in hang_set:
+                await asyncio.sleep(60)
+            return (0, f'{argv[0]} 1.0.0\n', '')
+
+        run: Any = fake_run
+        run.issued = issued
+        return run
+
+    async def test_hung_extra_probe_records_rc_124(self, monkeypatch):
+        """A wedged probe degrades to a recorded sentinel, not an unbounded await."""
+        from orchestrator import verify_runner as vr
+        monkeypatch.setattr(vr, '_PROBE_TIMEOUT_SECS', 0.05)
+        fp = await vr.capture_env_fingerprint(
+            self._hanging_run(hangs=['npx']),
+            extra_probe_specs=[('pyright', ['npx', 'pyright', '--version'])],
+        )
+        assert fp.extra_probes['pyright'] == '<unavailable rc=124>'
+
+    async def test_hung_probe_does_not_block_the_remaining_probes(self, monkeypatch):
+        """One wedged probe must not abandon the rest of the capture."""
+        from orchestrator import verify_runner as vr
+        monkeypatch.setattr(vr, '_PROBE_TIMEOUT_SECS', 0.05)
+        fp = await vr.capture_env_fingerprint(
+            self._hanging_run(hangs=['npx']),
+            extra_probe_specs=[
+                ('pyright', ['npx', 'pyright', '--version']),
+                ('uv', ['uv', '--version']),
+            ],
+        )
+        assert fp.extra_probes['pyright'] == '<unavailable rc=124>'
+        assert fp.extra_probes['uv'] == 'uv 1.0.0'
+
+    async def test_capture_returns_promptly_under_a_hung_probe(self, monkeypatch):
+        """The whole point: the lease is released rather than parked forever."""
+        from orchestrator import verify_runner as vr
+        monkeypatch.setattr(vr, '_PROBE_TIMEOUT_SECS', 0.05)
+        started = time.monotonic()
+        await vr.capture_env_fingerprint(
+            self._hanging_run(hangs=['npx', 'rustc', 'cargo', 'sccache']),
+            extra_probe_specs=[('pyright', ['npx', 'pyright', '--version'])],
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed < 5.0, (
+            f'capture took {elapsed:.1f}s under a hung probe — the bound did '
+            f'not apply, and in production this would hold the merge-verify '
+            f'lease and both verify host slots for that whole time'
+        )
+
+    async def test_hung_toolchain_probe_does_not_raise(self, monkeypatch):
+        """The bound covers the hardcoded probes too, not just the extra ones."""
+        from orchestrator import verify_runner as vr
+        monkeypatch.setattr(vr, '_PROBE_TIMEOUT_SECS', 0.05)
+        fp = await vr.capture_env_fingerprint(
+            self._hanging_run(hangs=['rustc', 'sccache']),
+        )
+        assert fp.toolchain == 'cargo 1.0.0'
+        assert fp.sccache_reachable is False
+
+    async def test_uniformly_hung_probe_compares_equal(self, monkeypatch):
+        """A probe wedged on BOTH hosts is not drift — same rule as an absent one."""
+        from orchestrator import verify_runner as vr
+        monkeypatch.setattr(vr, '_PROBE_TIMEOUT_SECS', 0.05)
+        probes = [('pyright', ['npx', 'pyright', '--version'])]
+        local_fp = await vr.capture_env_fingerprint(
+            self._hanging_run(hangs=['npx']), extra_probe_specs=probes,
+        )
+        remote_fp = await vr.capture_env_fingerprint(
+            self._hanging_run(hangs=['npx']), extra_probe_specs=probes,
+        )
+        verdict = vr.compare_env_fingerprints(
+            local_fp, remote_fp, dimensions=('extra_probes',),
+        )
+        assert verdict.is_faithful is True
+
+    async def test_timeout_is_not_misreported_as_a_missing_binary(self, monkeypatch):
+        """TimeoutError subclasses OSError — the except order must not swallow it.
+
+        A hung probe and an absent one are different operator findings ("the
+        tool is slow/unreachable" vs "the tool is not installed"), so they must
+        not collapse onto the same rc.
+        """
+        from orchestrator import verify_runner as vr
+        monkeypatch.setattr(vr, '_PROBE_TIMEOUT_SECS', 0.05)
+        fp = await vr.capture_env_fingerprint(
+            self._hanging_run(hangs=['npx']),
+            extra_probe_specs=[('pyright', ['npx', 'pyright', '--version'])],
+        )
+        assert fp.extra_probes['pyright'] != '<unavailable rc=127>'
+
+
+# ---------------------------------------------------------------------------
 # ε step-5: compare_env_fingerprints → EnvParityVerdict
 # ---------------------------------------------------------------------------
 
@@ -4027,6 +4343,96 @@ class TestCompareEnvFingerprints:
         assert 'verify_env' not in verdict.drift_dimensions
         assert 'sccache_reachable' not in verdict.drift_dimensions
         assert 'extra_probes' not in verdict.drift_dimensions
+
+    # -- task 4537 step-3: scoping the comparison to chosen dimensions -------
+
+    def test_scoped_to_extra_probes_ignores_toolchain_and_sccache(self):
+        """dimensions=('extra_probes',) is FAITHFUL despite toolchain/sccache skew.
+
+        The non-Rust-project property: this workstation has a stray
+        /home/leo/.cargo/bin/rustc that a rust-less laptop does not, and that
+        must not manufacture drift for a Python project.
+        """
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(toolchain='rustc 1.96.0\ncargo 1.96.0', sccache_reachable=True)
+        remote = self._fp(toolchain='', sccache_reachable=False)
+        verdict = compare_env_fingerprints(local, remote, dimensions=('extra_probes',))
+        assert verdict.is_faithful is True
+        assert verdict.drift_dimensions == ()
+
+    def test_same_pair_unscoped_still_reports_both_dimensions(self):
+        """Omitting dimensions compares all four — unchanged for every caller."""
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(toolchain='rustc 1.96.0\ncargo 1.96.0', sccache_reachable=True)
+        remote = self._fp(toolchain='', sccache_reachable=False)
+        verdict = compare_env_fingerprints(local, remote)
+        assert verdict.is_faithful is False
+        assert 'toolchain' in verdict.drift_dimensions
+        assert 'sccache_reachable' in verdict.drift_dimensions
+
+    def test_scoped_still_detects_extra_probe_drift(self):
+        """Scoping does not blind the detector to the dimension it DOES watch."""
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(
+            toolchain='rustc 1.96.0', extra_probes={'pyright': '1.1.400'},
+        )
+        remote = self._fp(
+            toolchain='', extra_probes={'pyright': '1.1.377'},
+        )
+        verdict = compare_env_fingerprints(local, remote, dimensions=('extra_probes',))
+        assert verdict.is_faithful is False
+        assert verdict.drift_dimensions == ('extra_probes',)
+
+    def test_unknown_dimension_raises_value_error(self):
+        """An unknown dimension name is a config error, not a silent no-op."""
+        from orchestrator.verify_runner import compare_env_fingerprints
+        fp = self._fp()
+        with pytest.raises(ValueError) as excinfo:
+            compare_env_fingerprints(fp, fp, dimensions=('extra_probez',))
+        assert 'extra_probez' in str(excinfo.value)
+
+    def test_empty_dimensions_raises_value_error(self):
+        """`dimensions=()` is the SAME class of error as a misspelled name.
+
+        Without this guard an empty selection compares nothing and returns
+        is_faithful=True — a permanently-green detective control that affirms a
+        parity it never measured.  Two fingerprints differing in EVERY field
+        are used so a pass here could only mean "compared nothing".
+        """
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(
+            toolchain='rustc 1.96.0',
+            verify_env={'A': '1'},
+            sccache_reachable=True,
+            extra_probes={'pyright': '1.1.400'},
+        )
+        remote = self._fp(
+            toolchain='',
+            verify_env={'A': '2'},
+            sccache_reachable=False,
+            extra_probes={'pyright': '1.1.377'},
+        )
+        with pytest.raises(ValueError) as excinfo:
+            compare_env_fingerprints(local, remote, dimensions=())
+        assert 'at least one' in str(excinfo.value)
+
+    def test_none_is_still_how_a_caller_asks_for_every_dimension(self):
+        """Rejecting () must not make the all-dimensions default unreachable."""
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(toolchain='a')
+        remote = self._fp(toolchain='b')
+        verdict = compare_env_fingerprints(local, remote, dimensions=None)
+        assert verdict.drift_dimensions == ('toolchain',)
+
+    def test_scoped_multi_dimension_preserves_canonical_order(self):
+        """drift_dimensions keeps the canonical field order, not the caller's."""
+        from orchestrator.verify_runner import compare_env_fingerprints
+        local = self._fp(toolchain='a', extra_probes={'k': 'v1'})
+        remote = self._fp(toolchain='b', extra_probes={'k': 'v2'})
+        verdict = compare_env_fingerprints(
+            local, remote, dimensions=('extra_probes', 'toolchain'),
+        )
+        assert verdict.drift_dimensions == ('toolchain', 'extra_probes')
 
 
 # ---------------------------------------------------------------------------
@@ -5193,6 +5599,1044 @@ class TestDriftDetectorCadence:
 
 
 # ---------------------------------------------------------------------------
+# task 4537 step-9/11/13: DriftDetector.check_env — host-environment divergence
+# ---------------------------------------------------------------------------
+
+_ENV_PROBE_SPECS = [
+    ('pyright', ['npx', 'pyright', '--version']),
+    ('uv', ['uv', '--version']),
+]
+
+
+def _make_probe_run(outputs, *, raises=None):
+    """Return an async (argv, *, cwd=None) run callable driven by a cmdline→stdout map.
+
+    Keys are the space-joined argv (so ['npx','pyright','--version'] resolves
+    against 'npx pyright --version'); an unmapped command returns rc=127, the
+    same 'command not found' rc capture_env_fingerprint normalises ENOENT to.
+    rustc/cargo/sccache raise FileNotFoundError, standing in for a host that
+    has no Rust toolchain at all.
+    """
+    issued = []
+
+    async def run(argv, *, cwd=None):
+        issued.append(list(argv))
+        if raises is not None:
+            raise raises
+        head = argv[0]
+        joined = ' '.join(argv)
+        for probe_argv, stdout in outputs.items():
+            if joined == probe_argv:
+                return (0, stdout, '')
+        if head in ('rustc', 'cargo', 'sccache'):
+            raise FileNotFoundError(2, 'No such file or directory', head)
+        return (127, '', f'{head}: command not found')
+
+    recording: Any = run
+    recording.issued = issued
+    return recording
+
+
+_MATCHING_PROBE_OUTPUT = {
+    'npx pyright --version': 'pyright 1.1.377\n',
+    'uv --version': 'uv 0.11.6\n',
+}
+
+
+def _make_env_drift_pool(*, local_output=None, remote_output=None, remote_raises=None):
+    """Pool with a local runner + a remote exposing env_probe_run()."""
+    from orchestrator.verify_runner import VerifyRunnerPool
+
+    local_fake = MagicMock(spec=VerifyRunner)
+    local_fake.name = 'local'
+    local_fake.is_local = True
+    local_fake.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+
+    remote_run = _make_probe_run(
+        remote_output if remote_output is not None else _MATCHING_PROBE_OUTPUT,
+        raises=remote_raises,
+    )
+
+    class _FakeRemote:
+        name: str = 'laptop'
+        is_local: ClassVar[bool] = False
+
+        def __init__(self):
+            self.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+
+        async def health(self) -> bool:
+            # Present to satisfy the VerifyRunner Protocol (pyright over tests/
+            # is clause 2 of the merge-verify type gate).  Never consulted on
+            # the check_env path — HostAllocator.acquire_remote does not probe
+            # health, and check_env only calls env_probe_run.
+            return True
+
+        def env_probe_run(self):
+            return remote_run
+
+    remote_fake = _FakeRemote()
+
+    local_run = _make_probe_run(
+        local_output if local_output is not None else _MATCHING_PROBE_OUTPUT
+    )
+    pool = VerifyRunnerPool([local_fake, remote_fake])
+    return pool, local_run, remote_fake
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorCheckEnvFaithful:
+    """check_env(): identical probe output on both hosts → AGREE + parity event."""
+
+    async def test_matching_probes_return_agree_and_faithful(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, local_run, _ = _make_env_drift_pool()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=MagicMock())
+        result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert result.verdict == DriftVerdict.AGREE
+        assert result.is_faithful is True
+        assert result.drift_dimensions == ()
+
+    async def test_matching_probes_emit_exactly_one_parity_event(self):
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = _make_env_drift_pool()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, task_id='t')
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert event_store.emit.call_count == 1
+        assert event_store.emit.call_args[0][0] == EventType.verify_env_parity_ok
+
+    async def test_parity_event_carries_runner_names_and_probe_keys(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = _make_env_drift_pool()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        data = event_store.emit.call_args[1]['data']
+        assert data['local_runner'] == 'local'
+        assert data['remote_runner'] == 'laptop'
+        assert sorted(data['probe_keys']) == ['pyright', 'uv']
+        assert tuple(data['dimensions']) == ('extra_probes',)
+
+    async def test_matching_probes_emit_no_divergence_event(self):
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = _make_env_drift_pool()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        emitted = [c[0][0] for c in event_store.emit.call_args_list]
+        assert EventType.verify_env_divergence not in emitted
+
+    async def test_matching_probes_submit_no_escalation(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = _make_env_drift_pool()
+        escalation_queue = MagicMock()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        escalation_queue.submit.assert_not_called()
+
+    async def test_matching_probes_do_not_quarantine_remote(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = _make_env_drift_pool()
+        detector = DriftDetector(pool)
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert pool.is_quarantined('laptop') is False
+        assert pool.eligible_remote() is not None
+
+    async def test_rust_toolchain_absent_on_both_hosts_is_not_drift(self):
+        """Neither fake host has rustc/cargo/sccache; that must read as parity."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, local_run, _ = _make_env_drift_pool()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=MagicMock())
+        result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert result.verdict == DriftVerdict.AGREE
+
+
+# ---------------------------------------------------------------------------
+# task 4537 step-11: DriftDetector.check_env — DIVERGENCE arm
+# ---------------------------------------------------------------------------
+
+# Same probe set, but the remote reports the uv version measured on leo-laptop
+# on 2026-08-20 (0.10.6) against the workstation's 0.11.6.  pyright matches, so
+# a detector that merely noticed "some probe output differs" without naming the
+# offender would still be useless to an operator.
+_PERTURBED_PROBE_OUTPUT = {
+    'npx pyright --version': 'pyright 1.1.377\n',
+    'uv --version': 'uv 0.10.6\n',
+}
+
+
+class _FakeEscQueue:
+    """EscalationQueue stand-in with FAITHFUL has_open_l1 semantics.
+
+    Mirrors escalation.queue::EscalationQueue.has_open_l1's
+    ``(task_id, *, category=None)`` filter exactly: category=None counts ANY
+    pending L1 on that task_id, a category counts only matching ones.  That
+    fidelity is what makes the namespace-isolation test below a real
+    behavioural assertion rather than a tautology over a MagicMock.
+    """
+
+    def __init__(self):
+        self.submitted = []
+        self._seq = 0
+
+    def make_id(self, task_id):
+        self._seq += 1
+        return f'esc-{task_id}-{self._seq}'
+
+    def submit(self, esc):
+        self.submitted.append(esc)
+
+    def has_open_l1(self, task_id, *, category=None):
+        return any(
+            e.task_id == task_id
+            and e.level == 1
+            and e.status == 'pending'
+            and (category is None or e.category == category)
+            for e in self.submitted
+        )
+
+
+def _diverging_events(event_store, event_type):
+    """Every emit() call of *event_type*, as a list of its data payloads."""
+    return [
+        c[1]['data']
+        for c in event_store.emit.call_args_list
+        if c[0][0] == event_type
+    ]
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorCheckEnvDivergence:
+    """check_env(): one perturbed probe → DIVERGE + named event + one deduped L1."""
+
+    def _diverged(self):
+        return _make_env_drift_pool(remote_output=_PERTURBED_PROBE_OUTPUT)
+
+    async def test_perturbed_probe_returns_diverge(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, local_run, _ = self._diverged()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert result.verdict == DriftVerdict.DIVERGE
+        assert result.is_faithful is False
+        assert result.drift_dimensions == ('extra_probes',)
+
+    async def test_divergence_event_emitted_exactly_once(self):
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = self._diverged()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=_FakeEscQueue())
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert len(_diverging_events(event_store, EventType.verify_env_divergence)) == 1
+        assert _diverging_events(event_store, EventType.verify_env_parity_ok) == []
+
+    async def test_divergence_event_names_the_dimension_probe_and_both_values(self):
+        """The whole point: the event must be readable without re-probing."""
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = self._diverged()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=_FakeEscQueue())
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        data = _diverging_events(event_store, EventType.verify_env_divergence)[0]
+        assert tuple(data['drift_dimensions']) == ('extra_probes',)
+        assert data['local_runner'] == 'local'
+        assert data['remote_runner'] == 'laptop'
+        assert data['diverging_probes'] == {
+            'uv': {'local': 'uv 0.11.6', 'remote': 'uv 0.10.6'}
+        }
+
+    async def test_matching_probe_is_not_listed_as_diverging(self):
+        """pyright agrees; only uv skews.  Naming both would be noise."""
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = self._diverged()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=_FakeEscQueue())
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        data = _diverging_events(event_store, EventType.verify_env_divergence)[0]
+        assert 'pyright' not in data['diverging_probes']
+
+    async def test_divergence_submits_exactly_one_escalation(self):
+        from orchestrator.verify_runner import _ENV_DRIFT_SENTINEL, DriftDetector
+        pool, local_run, _ = self._diverged()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=queue)
+        result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert len(queue.submitted) == 1
+        esc = queue.submitted[0]
+        assert esc.task_id == _ENV_DRIFT_SENTINEL
+        assert esc.level == 1
+        assert esc.category == 'verify_env_divergence'
+        assert esc.severity == 'blocking'
+        assert result.escalated is True
+
+    async def test_escalation_text_names_dimension_probe_and_both_values(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = self._diverged()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=queue)
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        esc = queue.submitted[0]
+        assert 'uv' in esc.summary
+        blob = esc.summary + esc.detail
+        assert 'extra_probes' in blob
+        assert 'uv 0.11.6' in blob
+        assert 'uv 0.10.6' in blob
+
+    async def test_second_check_dedups_to_one_escalation(self):
+        """Two consecutive diverging checks file ONE escalation, not two."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = self._diverged()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=queue)
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        second = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert len(queue.submitted) == 1
+        assert second.escalated is False
+
+    async def test_dedup_still_emits_the_divergence_event(self):
+        """Dedup suppresses the ESCALATION, never the telemetry."""
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, local_run, _ = self._diverged()
+        event_store = MagicMock()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        second = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert len(_diverging_events(event_store, EventType.verify_env_divergence)) == 2
+        assert second.verdict == DriftVerdict.DIVERGE
+
+    async def test_divergence_does_not_quarantine_the_remote(self):
+        """FAIL-SAFE, not fail-closed: env drift alarms, it never benches a host.
+
+        Asserted as an explicit negative because auto-benching a verify host
+        over a cosmetic probe difference is the failure mode this design
+        deliberately refuses.
+        """
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = self._diverged()
+        pool.quarantine = MagicMock(side_effect=AssertionError('check_env must not quarantine'))
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert pool.is_quarantined('laptop') is False
+        assert pool.eligible_remote() is not None
+
+    async def test_open_verdict_drift_l1_does_not_suppress_the_env_escalation(self):
+        """Namespace isolation, direction 1.
+
+        The verdict path dedups on has_open_l1('__drift__') with NO category
+        filter, so a shared sentinel would let either alarm silence the other.
+        """
+        from escalation.models import Escalation
+
+        from orchestrator.verify_runner import _DRIFT_SENTINEL, DriftDetector
+        pool, local_run, _ = self._diverged()
+        queue = _FakeEscQueue()
+        queue.submitted.append(Escalation(
+            id='esc-drift-pre', task_id=_DRIFT_SENTINEL, agent_role='orchestrator-drift-detector',
+            severity='blocking', category='verify_drift_divergence', summary='pre-existing verdict drift',
+            level=1,
+        ))
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=queue)
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert len(queue.submitted) == 2
+
+    async def test_open_env_drift_l1_does_not_suppress_the_verdict_escalation(self):
+        """Namespace isolation, direction 2 — the regression that matters most.
+
+        An open env-drift L1 must not silence a genuine verdict divergence,
+        which is the alarm that stops unverified code landing on main.
+        """
+        from escalation.models import Escalation
+
+        from orchestrator.verify_runner import _DRIFT_SENTINEL, _ENV_DRIFT_SENTINEL, DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(), remote_result=_make_pass_result()
+        )
+        queue = _FakeEscQueue()
+        queue.submitted.append(Escalation(
+            id='esc-env-pre', task_id=_ENV_DRIFT_SENTINEL, agent_role='orchestrator-env-drift-detector',
+            severity='blocking', category='verify_env_divergence', summary='pre-existing env drift',
+            level=1,
+        ))
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=queue)
+        await detector.check('sha1', _make_spec())
+        assert [e.task_id for e in queue.submitted] == [_ENV_DRIFT_SENTINEL, _DRIFT_SENTINEL]
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorCheckEnvNonProbeDimension:
+    """A non-default `dimensions` must still produce a LEGIBLE escalation.
+
+    The production path only ever compares ('extra_probes',), but dimensions is
+    a public parameter.  Scoped to a dimension with no per-probe detail, the
+    diverging-probe map is empty — and an escalation summary that trails off
+    after the colon tells an operator nothing about a blocking L1.
+    """
+
+    def _toolchain_skewed_pool(self):
+        # Only the LOCAL host has rustc, so toolchain differs while every
+        # declared probe agrees.
+        return _make_env_drift_pool(
+            local_output={**_MATCHING_PROBE_OUTPUT, 'rustc --version': 'rustc 1.96.0\n'},
+            remote_output=_MATCHING_PROBE_OUTPUT,
+        )
+
+    async def test_toolchain_only_scope_diverges(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, local_run, _ = self._toolchain_skewed_pool()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        result = await detector.check_env(
+            _ENV_PROBE_SPECS, local_run=local_run, dimensions=('toolchain',),
+        )
+        assert result.verdict == DriftVerdict.DIVERGE
+        assert result.drift_dimensions == ('toolchain',)
+
+    async def test_escalation_text_stays_legible_without_probe_detail(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = self._toolchain_skewed_pool()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=queue)
+        await detector.check_env(
+            _ENV_PROBE_SPECS, local_run=local_run, dimensions=('toolchain',),
+        )
+        esc = queue.submitted[0]
+        assert 'toolchain' in esc.summary
+        # No dangling "in toolchain: " with nothing after it.
+        assert not esc.summary.rstrip().endswith(':')
+        assert esc.summary.split(':', 1)[1].strip()
+        assert 'toolchain' in esc.detail
+
+    async def test_default_scope_is_unaffected_by_the_fallback(self):
+        """The extra_probes path still names the probe, not the fallback text."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = _make_env_drift_pool(remote_output=_PERTURBED_PROBE_OUTPUT)
+        queue = _FakeEscQueue()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=queue)
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert queue.submitted[0].summary.endswith('uv')
+
+
+@pytest.mark.asyncio
+class TestEnvProbeSshTimeout:
+    """A remote probe that hangs after connecting must read as UNREACHABLE.
+
+    ssh's ConnectTimeout=10 (_SSH_BASE_OPTS) bounds only the HANDSHAKE.  A
+    connection that establishes and then wedges — a loaded laptop, a stalled
+    npx fetching from the npm registry — is bounded by nothing else, and would
+    hold the merge-verify lease and both verify host slots for as long as it
+    runs.
+    """
+
+    def _hanging_runner(self):
+        async def fake_run(argv, *, cwd=None):
+            await asyncio.sleep(60)
+            return (0, '', '')
+
+        return RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+        )
+
+    async def test_hung_ssh_probe_raises_runner_unavailable(self, monkeypatch):
+        """Transport failure, NOT a recorded rc: a wedged link is not a finding."""
+        from orchestrator import verify_runner as vr
+        monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 0.05)
+        adapter = self._hanging_runner().env_probe_run()
+        with pytest.raises(vr.RunnerUnavailable) as excinfo:
+            await adapter(['uv', '--version'])
+        assert 'laptop.local' in str(excinfo.value)
+
+    async def test_hung_remote_probe_is_inconclusive_not_divergence(self, monkeypatch):
+        """END TO END: a wedged remote must not file a false env-divergence L1.
+
+        This is the discriminating arm.  Had the ssh hang been normalised to a
+        recorded rc=124 like the local side, every declared probe would compare
+        a sentinel against a real local version — total apparent env skew — and
+        the resulting L1 would dedup on (_ENV_DRIFT_SENTINEL, category) and
+        suppress the genuine alarm until a human resolved it.
+        """
+        from orchestrator import verify_runner as vr
+        monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 0.05)
+
+        remote_runner = self._hanging_runner()
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+        local_run = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+
+        pool = vr.VerifyRunnerPool([local_fake, remote_runner])
+        event_store = MagicMock()
+        queue = _FakeEscQueue()
+        detector = vr.DriftDetector(
+            pool, event_store=event_store, escalation_queue=queue,
+        )
+        result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+
+        assert result.verdict == vr.DriftVerdict.INCONCLUSIVE
+        event_store.emit.assert_not_called()
+        assert queue.submitted == []
+
+    async def test_hung_remote_probe_leaves_the_local_host_untouched(self, monkeypatch):
+        """check_env captures the remote FIRST, so a wedged link costs nothing local."""
+        from orchestrator import verify_runner as vr
+        monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 0.05)
+
+        remote_runner = self._hanging_runner()
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+        local_run = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+
+        pool = vr.VerifyRunnerPool([local_fake, remote_runner])
+        detector = vr.DriftDetector(
+            pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue(),
+        )
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert local_run.issued == []
+
+    async def test_check_env_returns_promptly_under_a_hung_remote(self, monkeypatch):
+        """The lease and both host slots are released, not parked."""
+        from orchestrator import verify_runner as vr
+        monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 0.05)
+
+        remote_runner = self._hanging_runner()
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+
+        pool = vr.VerifyRunnerPool([local_fake, remote_runner])
+        detector = vr.DriftDetector(pool, event_store=MagicMock())
+        started = time.monotonic()
+        await detector.check_env(
+            _ENV_PROBE_SPECS, local_run=_make_probe_run(_MATCHING_PROBE_OUTPUT),
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed < 5.0, (
+            f'check_env took {elapsed:.1f}s against a wedged remote — in '
+            f'production that is the merge-verify lease and both verify host '
+            f'slots held for the same duration'
+        )
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorCheckEnvBadDimensions:
+    """A bad `dimensions` selection must be LOUD, never a quiet false green.
+
+    `dimensions` is a public parameter of check_env.  An empty selection would
+    take the faithful branch and emit a verify_env_parity_ok event affirming
+    that two hosts match — without having compared a single field.  That is
+    worse than no detector at all, so it raises instead.
+    """
+
+    async def test_empty_dimensions_raises_instead_of_reporting_parity(self):
+        from orchestrator.verify_runner import DriftDetector
+        # Hosts that genuinely DIVERGE, so a "faithful" answer could only come
+        # from having compared nothing.
+        pool, local_run, _ = _make_env_drift_pool(remote_output=_PERTURBED_PROBE_OUTPUT)
+        event_store = MagicMock()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
+
+        with pytest.raises(ValueError):
+            await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run, dimensions=())
+
+        event_store.emit.assert_not_called()
+        assert queue.submitted == []
+
+    async def test_unknown_dimension_raises_at_check_env_level(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, _ = _make_env_drift_pool()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        with pytest.raises(ValueError) as excinfo:
+            await detector.check_env(
+                _ENV_PROBE_SPECS, local_run=local_run, dimensions=('extra_probez',),
+            )
+        assert 'extra_probez' in str(excinfo.value)
+
+    async def test_bad_dimensions_rejected_before_any_host_is_probed(self):
+        """The rejection costs no ssh round trips — validated before capture."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, remote_fake = _make_env_drift_pool()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        with pytest.raises(ValueError):
+            await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run, dimensions=())
+        assert local_run.issued == []
+        assert remote_fake.env_probe_run().issued == []
+
+
+# ---------------------------------------------------------------------------
+# task 4537 step-13: DriftDetector.check_env — INCONCLUSIVE guards
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorCheckEnvInconclusive:
+    """check_env(): infrastructure conditions degrade quietly — never an alarm.
+
+    Every case here is a reason the check could not be TAKEN.  Reporting any of
+    them as divergence would train operators to ignore the alarm, which is the
+    only thing that makes a detective control worthless.
+    """
+
+    async def test_no_probes_configured_is_inconclusive(self):
+        """The shipped default (verify_env_probes: []) leaves the detector off."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, local_run, _ = _make_env_drift_pool()
+        event_store = MagicMock()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
+        result = await detector.check_env([], local_run=local_run)
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.drift_dimensions == ()
+        event_store.emit.assert_not_called()
+        assert queue.submitted == []
+
+    async def test_no_probes_configured_touches_no_host(self):
+        """Off must mean OFF: not one probe is issued on either host."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_run, remote_fake = _make_env_drift_pool()
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        await detector.check_env([], local_run=local_run)
+        assert local_run.issued == []
+        assert remote_fake.env_probe_run().issued == []
+
+    async def test_no_eligible_remote_is_inconclusive(self):
+        """Lever C off, or the remote already quarantined by the verdict path."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, VerifyRunnerPool
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+        pool = VerifyRunnerPool([local_fake])
+        event_store = MagicMock()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
+        result = await detector.check_env(_ENV_PROBE_SPECS)
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+        event_store.emit.assert_not_called()
+        assert queue.submitted == []
+
+    async def test_remote_quarantined_by_verdict_path_is_inconclusive(self):
+        """Concrete form of the above: check() benched the remote first."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, local_run, _ = _make_env_drift_pool()
+        pool.quarantine('laptop')
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+
+    async def test_no_local_runner_is_inconclusive(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, VerifyRunnerPool
+        _, _, remote_fake = _make_env_drift_pool()
+        pool = VerifyRunnerPool([remote_fake])
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        result = await detector.check_env(_ENV_PROBE_SPECS)
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+
+    async def test_remote_without_env_probe_run_is_inconclusive(self):
+        """A non-RemoteRunner stand-in: duck-typed, so VerifyRunner stays unwidened.
+
+        env_probe_run is NOT on the VerifyRunner Protocol, so any pool member
+        that is not a RemoteRunner legitimately lacks it.  That must degrade,
+        not raise out of a detective control.
+        """
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, VerifyRunnerPool
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+        bare_remote = MagicMock(spec=VerifyRunner)
+        bare_remote.name = 'laptop'
+        bare_remote.is_local = False
+        assert not hasattr(bare_remote, 'env_probe_run')
+        pool = VerifyRunnerPool([local_fake, bare_remote])
+        event_store = MagicMock()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
+        result = await detector.check_env(_ENV_PROBE_SPECS)
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+        event_store.emit.assert_not_called()
+        assert queue.submitted == []
+
+    async def test_remote_transport_failure_is_inconclusive_not_divergence(self):
+        """Invariant 5: a closed laptop is not a version skew."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, RunnerUnavailable
+        pool, local_run, _ = _make_env_drift_pool(
+            remote_raises=RunnerUnavailable('laptop unreachable')
+        )
+        event_store = MagicMock()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
+        result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+        event_store.emit.assert_not_called()
+        assert queue.submitted == []
+
+    async def test_local_transport_failure_is_inconclusive(self):
+        """Symmetric with the remote arm."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, RunnerUnavailable
+        pool, _, _ = _make_env_drift_pool()
+        local_run = _make_probe_run({}, raises=RunnerUnavailable('local seam down'))
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+
+    async def test_inconclusive_does_not_quarantine(self):
+        from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
+        pool, local_run, _ = _make_env_drift_pool(
+            remote_raises=RunnerUnavailable('laptop unreachable')
+        )
+        detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert pool.is_quarantined('laptop') is False
+
+
+# ---------------------------------------------------------------------------
+# task 4537: an UNREACHABLE remote is not divergence — through the REAL seam
+# ---------------------------------------------------------------------------
+
+# Exit status ssh reserves for its own errors ("or 255 if an error occurred",
+# ssh(1) EXIT STATUS).  A sleeping laptop, a refused connection and a
+# ConnectTimeout all land here.
+_SSH_UNREACHABLE_RC = 255
+
+
+def _make_ssh_seam(rc_by_probe=None, *, default=None):
+    """Return a `self._run` stand-in shaped EXACTLY like _default_subprocess_run.
+
+    That is the point of this helper: the production local seam RETURNS
+    ``(rc, stdout, stderr)`` for every outcome including transport failure and
+    raises nothing, so a test double that raises cannot reach the code path a
+    down host actually takes.  Keys of *rc_by_probe* are matched against the
+    probe command the ssh argv carries after REMOTE_TOOL_PATH_PRELUDE.
+    """
+    from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
+    if default is None:
+        default = (
+            _SSH_UNREACHABLE_RC,
+            '',
+            'ssh: connect to host laptop.local port 22: No route to host',
+        )
+    issued = []
+
+    async def run(argv, *, cwd=None):
+        issued.append(list(argv))
+        remote_cmd = argv[-1].removeprefix(f'{REMOTE_TOOL_PATH_PRELUDE} ')
+        if rc_by_probe is not None and remote_cmd in rc_by_probe:
+            return rc_by_probe[remote_cmd]
+        return default
+
+    recording: Any = run
+    recording.issued = issued
+    return recording
+
+
+def _make_real_remote_pool(ssh_run):
+    """Pool of (local stand-in, REAL RemoteRunner) driven by *ssh_run*.
+
+    A real RemoteRunner — not a fake with an env_probe_run attribute — because
+    the defect this class pins lives in the adapter RemoteRunner.env_probe_run
+    returns, between ``self._run`` and capture_env_fingerprint.
+    """
+    from orchestrator.verify_runner import RemoteRunner, VerifyRunnerPool
+
+    local_fake = MagicMock(spec=VerifyRunner)
+    local_fake.name = 'local'
+    local_fake.is_local = True
+    remote = RemoteRunner(
+        name='laptop',
+        ssh_host='laptop.local',
+        git_remote='origin',
+        cwd='/repo',
+        run=ssh_run,
+    )
+    return VerifyRunnerPool([local_fake, remote]), remote
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorCheckEnvUnreachableRemote:
+    """Invariant 5 against the seam production actually has.
+
+    ``TestDriftDetectorCheckEnvInconclusive`` covers a probe seam that RAISES
+    RunnerUnavailable — a condition the production path cannot produce.
+    ``RemoteRunner.env_probe_run`` dispatches through ``self._run``, which
+    defaults to ``_default_subprocess_run``; that RETURNS ``(rc, out, err)``
+    and never raises, and ssh reports an unreachable host as rc=255.  Left
+    unhandled, every probe renders ``'<unavailable rc=255>'`` on the remote
+    side and a real version locally, i.e. a sleeping laptop reads as total
+    env skew: a blocking L1 naming every tool, which then DEDUPS AWAY the
+    genuine env-divergence alarm until a human resolves it.
+
+    These tests therefore drive a real RemoteRunner over the returning-rc
+    shape, which is the only way to exercise the guard against the input the
+    closed-laptop case supplies.
+    """
+
+    def _detector(self, ssh_run):
+        from orchestrator.verify_runner import DriftDetector
+        pool, _ = _make_real_remote_pool(ssh_run)
+        event_store = MagicMock()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
+        return detector, pool, event_store, queue
+
+    async def test_unreachable_remote_is_inconclusive_not_divergence(self):
+        """rc=255 on every probe is a transport failure, not a version skew."""
+        from orchestrator.verify_runner import DriftVerdict
+        detector, _, _, _ = self._detector(_make_ssh_seam())
+        local_run = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+        result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert result.verdict == DriftVerdict.INCONCLUSIVE, (
+            f'a host that ssh could not reach was reported as {result.verdict} '
+            f'with drift_dimensions={result.drift_dimensions!r} — a closed '
+            f'laptop must never raise an env-skew alarm'
+        )
+        assert result.is_faithful is True
+        assert result.drift_dimensions == ()
+
+    async def test_unreachable_remote_emits_no_divergence_event(self):
+        detector, _, event_store, _ = self._detector(_make_ssh_seam())
+        local_run = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        event_store.emit.assert_not_called()
+
+    async def test_unreachable_remote_files_no_escalation(self):
+        """The blocking-L1 half: the bogus alarm would suppress the real one.
+
+        Both escalations dedup on ``(_ENV_DRIFT_SENTINEL,
+        category='verify_env_divergence')``, so ONE false L1 filed while the
+        laptop is asleep silences the detector for the finding it exists to
+        produce.
+        """
+        detector, _, _, queue = self._detector(_make_ssh_seam())
+        local_run = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert queue.submitted == [], (
+            f'unreachable host filed {len(queue.submitted)} escalation(s): '
+            f'{[e.summary for e in queue.submitted]}'
+        )
+
+    async def test_unreachable_remote_issues_no_local_probe(self):
+        """A host we cannot probe must cost ZERO local subprocesses.
+
+        The remote is fingerprinted FIRST precisely so an unreachable host is
+        discovered before seven binaries are spawned on the dispatcher — on
+        the production path that is every drift check taken while the laptop
+        is asleep, and in the test suite it is what keeps a drift test that
+        never meant to probe anything off the real machine.
+        """
+        detector, _, _, _ = self._detector(_make_ssh_seam())
+        local_run = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+        await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert local_run.issued == [], (
+            f'local host was probed {len(local_run.issued)} times for a '
+            f'comparison that could never be made: {local_run.issued!r}'
+        )
+
+    async def test_ssh_spawn_failure_is_inconclusive(self):
+        """OSError from spawning ssh itself is transport, not a missing tool.
+
+        ``_probe_run_safe`` normalises OSError to rc=127 so an ABSENT LOCAL
+        BINARY compares equal against an absent remote one.  Applied to the
+        ssh adapter that normalisation is wrong in the same direction as
+        rc=255: it would render every remote probe '<unavailable rc=127>'
+        against real local versions.
+        """
+        from orchestrator.verify_runner import DriftVerdict
+
+        async def ssh_missing(argv, *, cwd=None):
+            raise FileNotFoundError(2, 'No such file or directory', 'ssh')
+
+        detector, _, _, queue = self._detector(ssh_missing)
+        local_run = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+        result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert queue.submitted == []
+
+    async def test_remote_binary_absent_is_still_real_divergence(self):
+        """The guard must not over-broaden to 'any non-zero rc is transport'.
+
+        A REACHED host that simply lacks the tool exits 127 through the remote
+        shell.  That is a genuine, reportable difference between the two
+        hosts, and swallowing it would disarm the detector for the most likely
+        real finding (a tool installed on one side only).
+        """
+        from orchestrator.verify_runner import DriftVerdict
+        ssh_run = _make_ssh_seam({
+            'npx pyright --version': (127, '', 'npx: command not found'),
+            'uv --version': (0, 'uv 0.11.6\n', ''),
+            'rustc --version': (127, '', 'rustc: command not found'),
+            'cargo --version': (127, '', 'cargo: command not found'),
+            'sccache --show-stats': (127, '', 'sccache: command not found'),
+        })
+        detector, _, _, queue = self._detector(ssh_run)
+        local_run = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+        result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+        assert result.verdict == DriftVerdict.DIVERGE
+        assert result.drift_dimensions == ('extra_probes',)
+        assert result.remote_probes['pyright'] == '<unavailable rc=127>'
+        assert result.remote_probes['uv'] == 'uv 0.11.6'
+        assert len(queue.submitted) == 1
+        assert 'pyright' in queue.submitted[0].summary
+        assert 'uv' not in queue.submitted[0].summary
+
+
+# ---------------------------------------------------------------------------
+# task 4537 step-21: the LOCAL probe seam must BE the verify seam
+# ---------------------------------------------------------------------------
+
+
+def _make_exec_recorder(*, rc=0, stdout=b'  Python 3.12.3\n', stderr=b'  npm notice \n'):
+    """Stand-in for ``asyncio.create_subprocess_exec`` recording every call.
+
+    Returns ``(fake_exec, calls)`` where each entry of *calls* is
+    ``{'argv': [...], 'kwargs': {...}}``.  Hermetic by construction: nothing is
+    ever spawned, so these tests never touch the machine's real PATH, its real
+    toolchain, or the network (`npx pyright --version` reaches the npm registry
+    on a cold cache).
+    """
+    calls: list[dict[str, Any]] = []
+
+    async def fake_exec(*argv, **kwargs):
+        calls.append({'argv': list(argv), 'kwargs': kwargs})
+        proc = MagicMock()
+        proc.returncode = rc
+        proc.communicate = AsyncMock(return_value=(stdout, stderr))
+        return proc
+
+    return fake_exec, calls
+
+
+@pytest.mark.asyncio
+class TestEnvProbeLocalSeamMatchesVerifySeam:
+    """The LOCAL probe must be spawned under the env every VERIFY command gets.
+
+    Reviewer finding (blocking): ``check_env`` passed ``local_run=None``
+    straight through to ``capture_env_fingerprint``, whose fallback
+    ``_default_subprocess_run`` is a bare ``create_subprocess_exec`` with NO
+    ``env=`` — so the local half inherited the orchestrator daemon's own
+    environ verbatim.  That daemon is started by systemd as ``uv run --frozen
+    --project orchestrator ...``
+    (scripts/orchestrator-dark-factory.service), and ``/proc/<pid>/environ`` of
+    the live unit carries ``VIRTUAL_ENV=<root>/.venv`` with PATH fronted by
+    ``<root>/.venv/bin``.  Under that PATH ``python3`` resolves to
+    ``.venv/bin/python3`` (3.13.9) while the remote's non-login ssh shell — and
+    every real local verify command, spawned through
+    ``verify._target_subprocess_env`` — resolves ``/usr/bin/python3`` (3.12.3).
+
+    The committed ``python3`` probe would therefore have reported a false
+    3.13.9-vs-3.12.3 divergence on the first live check, and by ``check_env``'s
+    own ``has_open_l1(_ENV_DRIFT_SENTINEL, category=...)`` dedup that false
+    blocking L1 would stay open and SUPPRESS the genuine env-divergence alarm —
+    exactly the masking failure the INCONCLUSIVE handling exists to prevent.
+
+    Every test here monkeypatches; none spawns.
+    """
+
+    def _activate_fake_venv(self, monkeypatch, tmp_path):
+        """Synthesise the daemon's own activation, hermetically.
+
+        VIRTUAL_ENV plus a PATH fronted by its bin dir is precisely the shape
+        ``uv run`` leaves in the orchestrator process.  HOME is pinned to
+        *tmp_path* so the cwd assertions below name a directory this test
+        controls rather than the runner's real home.
+        """
+        monkeypatch.setenv('VIRTUAL_ENV', '/tmp/fakevenv')
+        monkeypatch.setenv('PATH', '/tmp/fakevenv/bin:/usr/bin:/bin')
+        monkeypatch.setenv('HOME', str(tmp_path))
+
+    async def _spawn_once(self, monkeypatch, tmp_path, **kwargs):
+        """Await the seam once and return the single recorded exec call."""
+        from orchestrator import verify_runner as vr
+        self._activate_fake_venv(monkeypatch, tmp_path)
+        fake_exec, calls = _make_exec_recorder()
+        monkeypatch.setattr(vr.asyncio, 'create_subprocess_exec', fake_exec)
+        result = await vr.env_probe_local_run(['python3', '--version'], **kwargs)
+        assert len(calls) == 1
+        return calls[0], result
+
+    async def test_seam_drops_the_daemons_virtual_env(self, monkeypatch, tmp_path):
+        """VIRTUAL_ENV must not reach the probe — it is what makes uv/python skew."""
+        call, _ = await self._spawn_once(monkeypatch, tmp_path)
+        env = call['kwargs'].get('env')
+        assert env is not None, (
+            'the local probe seam spawned with no env= at all, so it inherited '
+            "the daemon's own venv activation verbatim"
+        )
+        assert 'VIRTUAL_ENV' not in env, (
+            f"VIRTUAL_ENV={env['VIRTUAL_ENV']!r} leaked into the probe env"
+        )
+
+    async def test_seam_strips_the_venv_bin_from_path(self, monkeypatch, tmp_path):
+        """The measured defect: .venv/bin first on PATH resolves python3 3.13.9."""
+        call, _ = await self._spawn_once(monkeypatch, tmp_path)
+        env = call['kwargs'].get('env') or {}
+        assert env.get('PATH') == '/usr/bin:/bin', (
+            f"probe PATH was {env.get('PATH')!r} — the venv bin dir is still on "
+            'it, so a bare `python3`/`uv` resolves the orchestrator venv rather '
+            'than the host toolchain the remote will report'
+        )
+
+    async def test_seam_defaults_cwd_to_home(self, monkeypatch, tmp_path):
+        """Match where `ssh <host> <cmd>` lands, so npx walks the same tree."""
+        call, _ = await self._spawn_once(monkeypatch, tmp_path)
+        assert call['kwargs'].get('cwd') == os.path.expanduser('~') == str(tmp_path)
+
+    async def test_explicit_cwd_overrides_the_home_default(self, monkeypatch, tmp_path):
+        """The seam keeps _default_subprocess_run's cwd= contract."""
+        elsewhere = tmp_path / 'elsewhere'
+        elsewhere.mkdir()
+        call, _ = await self._spawn_once(monkeypatch, tmp_path, cwd=str(elsewhere))
+        assert call['kwargs'].get('cwd') == str(elsewhere)
+
+    async def test_seam_returns_rc_and_stripped_streams(self, monkeypatch, tmp_path):
+        """Satisfies capture_env_fingerprint's run contract exactly like the default."""
+        _, result = await self._spawn_once(monkeypatch, tmp_path)
+        assert result == (0, 'Python 3.12.3', 'npm notice')
+
+    async def test_check_env_drives_local_capture_through_the_scrubbed_seam(
+        self, monkeypatch
+    ):
+        """ROUTING: with local_run omitted, check_env must use the scrubbed seam.
+
+        The seam existing is not enough — the production call site
+        (merge_drift._run_drift_check) is the ONLY caller that relies on the
+        ``local_run=None`` default, so a seam the default does not reach fixes
+        nothing.
+        """
+        from orchestrator import verify_runner as vr
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+
+        scrubbed = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+        unscrubbed = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+        monkeypatch.setattr(vr, 'env_probe_local_run', scrubbed)
+        monkeypatch.setattr(vr, '_default_subprocess_run', unscrubbed)
+
+        pool, _, _ = _make_env_drift_pool()
+        detector = DriftDetector(
+            pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue()
+        )
+        result = await detector.check_env(_ENV_PROBE_SPECS)
+
+        assert result.verdict == DriftVerdict.AGREE
+        assert ['npx', 'pyright', '--version'] in scrubbed.issued, (
+            f'the local probes never reached the scrubbed seam; it saw '
+            f'{scrubbed.issued!r}'
+        )
+        assert unscrubbed.issued == [], (
+            f'check_env fell back to _default_subprocess_run — the unscoped '
+            f"seam that inherits the daemon's venv — for {unscrubbed.issued!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # ι step-13: public-surface __all__ — ι additions present and importable
 # ---------------------------------------------------------------------------
 
@@ -5863,6 +7307,109 @@ class TestRemoteRunnerCancelVerify:
         )
         result = await runner.probe_clean()
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# task 4537 step-7: RemoteRunner.env_probe_run() — the ssh capture adapter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerEnvProbeRun:
+    """env_probe_run() returns a capture_env_fingerprint-compatible adapter
+    that dispatches each probe argv over ssh through the plain self._run seam,
+    behind REMOTE_TOOL_PATH_PRELUDE (task 7097) so the non-login ssh shell
+    finds ~/.local/bin tools the way RemoteRunner's own `uv sync` does."""
+
+    def _make_runner(self, *, responses=None):
+        calls = []
+        queue = list(responses or [])
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if queue:
+                return queue.pop(0)
+            return (0, 'ok\n', '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+        )
+        return runner, calls
+
+    async def test_issues_exact_ssh_argv_with_shared_base_opts(self):
+        """The adapter reuses _SSH_BASE_OPTS verbatim rather than re-spelling flags."""
+        from orchestrator.verify_runner import _SSH_BASE_OPTS, REMOTE_TOOL_PATH_PRELUDE
+
+        runner, calls = self._make_runner()
+        adapter = runner.env_probe_run()
+        await adapter(['uv', '--version'])
+
+        assert calls == [[
+            'ssh', *_SSH_BASE_OPTS, 'laptop.local',
+            f'{REMOTE_TOOL_PATH_PRELUDE} uv --version',
+        ]]
+
+    async def test_remote_command_leads_with_the_unquoted_path_prelude(self):
+        """Task 7097: a non-login ssh shell lacks ~/.local/bin, so a bare
+        `uv --version` exits 127 on a host where uv IS installed — a false
+        divergence that, deduped, would suppress the real skew alarm. The
+        prelude goes first and unquoted ($HOME must expand remotely); the
+        probe argv follows, still shlex-quoted."""
+        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
+
+        runner, calls = self._make_runner()
+        adapter = runner.env_probe_run()
+        await adapter(['sh', '-c', 'echo a b'])
+
+        remote_cmd = calls[0][-1]
+        assert remote_cmd.startswith(f'{REMOTE_TOOL_PATH_PRELUDE} ')
+        assert '$HOME/.local/bin' in remote_cmd
+        assert remote_cmd.removeprefix(f'{REMOTE_TOOL_PATH_PRELUDE} ') == "sh -c 'echo a b'"
+
+    async def test_returns_run_result_tuple_unchanged(self):
+        """(rc, stdout, stderr) passes through — satisfies capture's run contract."""
+        runner, _ = self._make_runner(responses=[(0, 'uv 0.10.6\n', 'warn')])
+        adapter = runner.env_probe_run()
+        assert await adapter(['uv', '--version']) == (0, 'uv 0.10.6\n', 'warn')
+
+    async def test_argv_elements_are_shlex_quoted(self):
+        """An argv element needing quoting is quoted into the remote command string."""
+        runner, calls = self._make_runner()
+        adapter = runner.env_probe_run()
+        await adapter(['sh', '-c', 'echo a b'])
+
+        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
+
+        remote_cmd = calls[0][-1]
+        assert remote_cmd == f"{REMOTE_TOOL_PATH_PRELUDE} sh -c 'echo a b'"
+
+    async def test_capture_env_fingerprint_drives_probes_over_ssh(self):
+        """End-to-end: capture_env_fingerprint(adapter) populates extra_probes."""
+        from orchestrator.verify_runner import capture_env_fingerprint
+
+        runner, calls = self._make_runner(responses=[
+            (127, '', 'rustc: command not found'),   # rustc
+            (127, '', 'cargo: command not found'),   # cargo
+            (127, '', 'sccache: command not found'), # sccache
+            (0, '1.1.377\n', ''),                    # pyright probe
+            (0, 'uv 0.10.6\n', ''),                  # uv probe
+        ])
+        adapter = runner.env_probe_run()
+        fp = await capture_env_fingerprint(adapter, extra_probe_specs=[
+            ('pyright', ['npx', 'pyright', '--version']),
+            ('uv', ['uv', '--version']),
+        ])
+
+        assert dict(fp.extra_probes) == {'pyright': '1.1.377', 'uv': 'uv 0.10.6'}
+        # every probe went over ssh to the configured host
+        assert all(c[0] == 'ssh' and 'laptop.local' in c for c in calls)
+        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
+        assert calls[-2][-1] == f'{REMOTE_TOOL_PATH_PRELUDE} npx pyright --version'
+        assert calls[-1][-1] == f'{REMOTE_TOOL_PATH_PRELUDE} uv --version'
 
 
 # ---------------------------------------------------------------------------
