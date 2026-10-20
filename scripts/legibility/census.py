@@ -1526,7 +1526,7 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
         # flagless run the mere PRESENCE of a ## Verification section is
         # itself the anomaly -- a stronger signal than one more always-present
         # line an operator learns to skim past. Same voice as the `suspect`
-        # string at the detector in run_census, deliberately.
+        # string in _detect_mass_rejection, deliberately.
         verification.append(
             f"- **ALL {mass_rejection.offered} verified-candidate cluster(s) were "
             "REJECTED and none survived.** Suspect a SYSTEMIC verifier failure "
@@ -2018,6 +2018,44 @@ def _escalate_skipped_similarity(reason: str, *, project_id: str, escalate_fn) -
         )
     except Exception as exc:
         logger.warning("census: similarity-skip escalation failed (best-effort): %s", exc)
+
+
+def _detect_mass_rejection(offered: int, verified: int, *, clusters: str, escalate_fn) -> MassRejection | None:
+    """The anomaly record when *offered* clusters went to one verify call and
+    none was verified, logged and escalated; None otherwise. *clusters* names
+    what was offered.
+
+    The default verifier fails CLOSED per cluster, so any systemic failure
+    (model unreachable mid-run, a permission denial, persistently unparseable
+    verdicts) presents as an ordinary all-rejected run: the signature of the
+    2026-08-03 sandbox incident, where the verify subprocess was rooted outside
+    the censused tree. An all-rejected run is legitimately possible, so this
+    never fails or defers a run whose mining is paid for, and the escalation is
+    best-effort because it sits between that spend and the output writes. The
+    returned record is the durable trace: the committed report renders it."""
+    if not offered or verified:
+        return None
+    suspect = (
+        f"census: ALL {offered} {clusters} cluster(s) were "
+        "REJECTED and none survived -- suspect a systemic verifier failure "
+        "(model unreachable, tool access denied, or unparseable verdicts) rather "
+        "than genuinely unfounded claims. This is the observable signature of the "
+        "2026-08-03 sandbox incident, where the verify subprocess was rooted "
+        "outside the censused tree and every read was permission-denied. Check "
+        "the per-cluster 'verify failed' warnings above; a run with real findings "
+        "is being reported as an empty census if this is systemic."
+    )
+    logger.warning("%s", suspect)
+    try:
+        escalate_fn(
+            category="infra_issue",
+            severity="info",
+            summary=f"legibility census: all {offered} {clusters} cluster(s) rejected -- possible systemic verifier failure",
+            detail=suspect,
+        )
+    except Exception as exc:
+        logger.warning("census: mass-rejection escalation failed (best-effort): %s", exc)
+    return MassRejection(offered=offered)
 
 
 @dataclass(frozen=True)
@@ -2534,7 +2572,7 @@ def _defer(
     directly -- a defer that keeps going and persists something is the
     exact failure this whole guard exists to prevent.
 
-    The escalation is best-effort, matching the mass-rejection site below:
+    The escalation is best-effort, matching ``_detect_mass_rejection``:
     a raising ``escalate_fn`` must never be what turns a clean abort into
     a crash, and the warning above it is the real signal either way.
     """
@@ -3010,14 +3048,22 @@ def run_census(
                 max_verify_clusters, deferred_count, len(novel_clusters),
             )
 
+    # The pending queue's representatives are verified inside what the verify
+    # cap leaves after the novel clusters, and their verdicts take the novel
+    # clusters' one path from here on.
+    remaining = None if max_verify_clusters is None else max(0, max_verify_clusters - len(clusters_to_verify))
+    queue_cap = config.census.adjudication.max_clusters_per_run
+    offered = view.select(queue_cap if remaining is None else min(queue_cap, remaining))
+
     # Stage-boundary gate. Mining is long and expensive, so a cap that was
     # absent at preflight can easily have arrived by now -- and the stage it
     # guards is the one where an unnoticed cap goes SILENT rather than loud:
     # the default verifier fails closed per cluster, so every cap-poisoned
     # verify call would land as an ordinary rejection and the run would exit 0
-    # looking unremarkable. Guarded by `if clusters_to_verify` so a run with
-    # nothing to verify spends no probe on a stage it is about to skip.
-    if clusters_to_verify:
+    # looking unremarkable. It guards the queue's verify call as much as the
+    # novel clusters', so a run with neither spends no probe on a stage it is
+    # about to skip.
+    if clusters_to_verify or offered:
         stage_headroom = _stage_headroom_gate(
             invoke, model=config.models.trickle, stage="verify", probe_count=probe_count,
         )
@@ -3066,64 +3112,10 @@ def run_census(
     rejected = verify_result.get("rejected") or []
     fixed_entry_ids = verify_result.get("fixed") or []
 
-    # DETECTOR for a systemic verifier failure. Scoping the subprocess cwd
-    # removed one CAUSE of the 2026-08-03 silent mass rejection; it is not a
-    # detector for the class. _build_default_verify_fn fails CLOSED per
-    # cluster -- correctly, an unverifiable claim must reject rather than
-    # crash -- so ANY systemic failure (model unreachable mid-run, a
-    # different permission denial, a persistent parse failure) still
-    # presents as an ordinary all-rejected run, and the report below states
-    # zero verified clusters in the same voice it would use for a genuinely
-    # unremarkable census. "clusters were offered and NONE survived" is the
-    # observable signature of that incident, so say it out loud.
-    #
-    # Not an error and not a defer: an all-rejected run is legitimately
-    # possible, so this must not fail a census whose mining is already
-    # paid for. The escalate_fn call is wrapped because, unlike the
-    # defer-path escalation above (which returns immediately afterwards),
-    # this one sits between the mining spend and the output writes -- a
-    # raising escalate_fn must not be what discards the run's results.
-    #
-    # The signature also lands in the COMMITTED REPORT, via `mass_rejection`
-    # below. Before that it did not: the log line and the info escalation
-    # were the only trace, both ephemeral, while the dated markdown -- the
-    # artifact an operator actually reads weeks later -- rendered
-    # byte-identically to a clean census whenever no verify cap was set. The
-    # escalation stays best-effort for the reason above; the report line is
-    # the durable one.
-    mass_rejection = None
-    if clusters_to_verify and not verified:
-        mass_rejection = MassRejection(offered=len(clusters_to_verify))
-        suspect = (
-            f"census: ALL {len(clusters_to_verify)} verified-candidate cluster(s) were "
-            "REJECTED and none survived -- suspect a systemic verifier failure "
-            "(model unreachable, tool access denied, or unparseable verdicts) rather "
-            "than genuinely unfounded claims. This is the observable signature of the "
-            "2026-08-03 sandbox incident, where the verify subprocess was rooted "
-            "outside the censused tree and every read was permission-denied. Check "
-            "the per-cluster 'verify failed' warnings above; a run with real findings "
-            "is being reported as an empty census if this is systemic."
-        )
-        logger.warning("%s", suspect)
-        try:
-            escalate_fn(
-                category="infra_issue",
-                severity="info",
-                summary=(
-                    f"legibility census: all {len(clusters_to_verify)} cluster(s) rejected "
-                    "-- possible systemic verifier failure"
-                ),
-                detail=suspect,
-            )
-        except Exception as exc:  # noqa: BLE001 - best-effort; the warning above is the real signal
-            logger.warning("census: mass-rejection escalation failed (best-effort): %s", exc)
+    mass_rejection = _detect_mass_rejection(
+        len(clusters_to_verify), len(verified), clusters="verified-candidate", escalate_fn=escalate_fn,
+    )
 
-    # The pending queue's representatives are verified inside what the verify
-    # cap leaves after the novel clusters, and their verdicts take the novel
-    # clusters' one path from here on.
-    remaining = None if max_verify_clusters is None else max(0, max_verify_clusters - len(clusters_to_verify))
-    queue_cap = config.census.adjudication.max_clusters_per_run
-    offered = view.select(queue_cap if remaining is None else min(queue_cap, remaining))
     queue = _adjudicate_queue(
         offered,
         cb=codebook_dict,
@@ -3131,6 +3123,9 @@ def run_census(
         model=config.models.census_verify,
         project_root=project_root,
         probe_count=probe_count,
+    )
+    queue_mass_rejection = None if queue.inconclusive is not None else _detect_mass_rejection(
+        len(offered), len(queue.verified), clusters="pending-queue", escalate_fn=escalate_fn,
     )
     verified = [*verified, *queue.verified]
     rejected = [*rejected, *queue.rejected]
@@ -3448,7 +3443,7 @@ def run_census(
         screen, tuple(surfaced_by_key), tuple(key_attaches), tuple(re_observed), instrument_findings,
     )
     adjudication_report = similarity.AdjudicationReport(
-        view, attached, unattached, offered, adjudicated, queue.inconclusive,
+        view, attached, unattached, offered, adjudicated, queue.inconclusive, queue_mass_rejection is not None,
     )
     method = build_method(
         run_id=run_id,

@@ -1462,6 +1462,7 @@ _NOTHING_ADJUDICATED = similarity.AdjudicationReport(
     offered=(),
     adjudicated=(),
     inconclusive=None,
+    mass_rejected=False,
 ).to_record()
 """The ``adjudication`` record of a run whose similarity stage ran over an
 empty queue."""
@@ -11767,6 +11768,50 @@ def test_a_cap_hit_on_the_queue_call_leaves_the_queue_pending_and_the_run_done(t
     assert record["method"]["cost"]["verify_calls"] == 1 + 10
     section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Adjudication")
     assert [line for line in section.splitlines() if "inconclusive" in line and "usage limit reached" in line]
+    assert adjudication["mass_rejection"] is None
+
+
+def test_a_queue_with_no_novel_cluster_is_gated_on_headroom_before_its_verify_call(tmp_path):
+    verify_fn = _queue_verify_fn()
+    kwargs = _queue_kwargs(tmp_path, verify_fn=verify_fn, invoke=_make_fake_invoke(_capped_after_preflight_invoke()))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert (outcome.status, outcome.deferred_stage) == ("deferred", "verify")
+    assert verify_fn.calls == []
+    assert not kwargs["report_path"].exists()
+    assert not kwargs["codebook_path"].exists()
+    assert not kwargs["census_state_path"].exists()
+    [escalation] = kwargs["escalate_fn"].calls
+    assert "verify" in escalation["summary"]
+
+
+def test_a_queue_whose_every_representative_is_rejected_is_flagged_and_escalated(tmp_path, caplog):
+    kwargs = _queue_kwargs(tmp_path, verify_fn=_queue_verify_fn())
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert "systemic" in " ".join(record.message.lower() for record in caplog.records)
+    [escalation] = kwargs["escalate_fn"].calls
+    assert (escalation["category"], escalation["severity"]) == ("infra_issue", "info")
+    assert "queue" in escalation["summary"] and "rejected" in escalation["summary"]
+    record = _run_record(kwargs)
+    assert record["mass_rejection"] is None
+    assert record["adjudication"]["mass_rejection"] == {"offered": 10}
+    section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Adjudication")
+    [notice] = [line for line in section.splitlines() if "ALL 10" in line]
+    assert "REJECTED" in notice and "systemic" in notice.lower()
+
+
+def test_a_queue_with_a_verified_representative_is_not_flagged(tmp_path):
+    kwargs = _queue_kwargs(tmp_path, verify_fn=_queue_verify_fn(verified_titles={_PAIR_A[1]}))
+
+    assert mod.run_census(**kwargs).status == "done"
+
+    assert _run_record(kwargs)["adjudication"]["mass_rejection"] is None
+    assert kwargs["escalate_fn"].calls == []
 
 
 # Row 12 part 3: when the embedding endpoint or the vector cache fails, the

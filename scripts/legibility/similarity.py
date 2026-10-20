@@ -410,8 +410,9 @@ _CHANGED = frozenset({Outcome.VERIFIED, Outcome.REJECTED})
 @dataclass(frozen=True)
 class AdjudicationReport:
     """What this run's similarity stage did: the View it built, the attaches
-    applied, the queue clusters offered to verify and how each resolved, and
-    why the queue call was inconclusive when it was."""
+    applied, the queue clusters offered to verify and how each resolved, why
+    the queue call was inconclusive when it was, and whether the verifier
+    rejected every cluster offered, the signature of a systemic failure."""
 
     view: View
     attached: tuple[AppliedAttach, ...]
@@ -419,6 +420,7 @@ class AdjudicationReport:
     offered: tuple[QueuedCluster, ...]
     adjudicated: tuple[Adjudicated, ...]
     inconclusive: str | None
+    mass_rejected: bool
 
     def _outcome(self, queued: QueuedCluster) -> Outcome:
         if self.inconclusive is not None:
@@ -474,6 +476,7 @@ class AdjudicationReport:
                 for item in self.unattached
             ],
             "inconclusive": self.inconclusive,
+            "mass_rejection": {"offered": len(self.offered)} if self.mass_rejected else None,
         }
 
 
@@ -489,6 +492,15 @@ def _unattached_line(item: Mapping[str, Any]) -> str:
     return (
         f"- not attached, no pending candidate after the merge: {report_text.quoted_title(item['title'])} "
         f"(similarity {item['score']:.4f} → {item['entry_id']}); not verified this run"
+    )
+
+
+def _mass_rejection_line(mass_rejection: Mapping[str, Any]) -> str:
+    return (
+        f"- **ALL {mass_rejection['offered']} queue cluster(s) were REJECTED and none survived**, "
+        "and every member was rejected with its representative. Suspect a SYSTEMIC verifier failure "
+        "(model unreachable, tool access denied, or unparseable verdicts) rather than unfounded claims; "
+        "check the run's per-cluster 'verify failed' warnings."
     )
 
 
@@ -521,6 +533,7 @@ def report_lines(record: Mapping[str, Any]) -> list[str]:
     depth, processed = record["queue_depth"], record["processed"]
     return [
         *header,
+        *([_mass_rejection_line(record["mass_rejection"])] if record["mass_rejection"] else []),
         f"- queue depth: {depth['candidates']} pending candidate(s) in {depth['clusters']} cluster(s)",
         f"- processed this run: {len(processed)} cluster(s), "
         f"{sum(len(item['members']) for item in processed)} candidate(s)",

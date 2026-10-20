@@ -617,7 +617,7 @@ class TestAdjudicationReport:
             ],
         )
 
-    def _report(self, tmp_path, *, inconclusive=None, merged_novel=True):
+    def _report(self, tmp_path, *, inconclusive=None, merged_novel=True, mass_rejected=False):
         cb = self._cb()
         view, _ = _view(tmp_path, cb, [_novel('Novel near', cause=None, session='s-novel')], vectors=self._VECTORS)
         merged = copy.deepcopy(cb)
@@ -629,7 +629,10 @@ class TestAdjudicationReport:
         if inconclusive is None:
             _by_id(merged, offered[0].representative.key)['disposition'] = 'rejected'
         merged, adjudicated = similarity.adjudicate_members(merged, offered)
-        return similarity.AdjudicationReport(view, attached, unattached, offered, adjudicated, inconclusive), view
+        report = similarity.AdjudicationReport(
+            view, attached, unattached, offered, adjudicated, inconclusive, mass_rejected,
+        )
+        return report, view
 
     def test_the_record_is_json_safe_and_complete(self, tmp_path):
         report, view = self._report(tmp_path)
@@ -658,6 +661,7 @@ class TestAdjudicationReport:
         assert all(isinstance(row['score'], float) for row in record['attached'])
         assert record['unattached'] == []
         assert record['inconclusive'] is None
+        assert record['mass_rejection'] is None
 
     def test_a_screened_cluster_the_merge_left_no_candidate_is_reported_unattached(self, tmp_path):
         report, view = self._report(tmp_path, merged_novel=False)
@@ -673,6 +677,17 @@ class TestAdjudicationReport:
         assert 'entry-a' in line
         assert f'{score:.4f}' in line
         assert 'no pending candidate' in line
+
+    def test_a_mass_rejected_queue_is_recorded_and_stated_first(self, tmp_path):
+        report, _ = self._report(tmp_path, mass_rejected=True)
+
+        record = report.to_record()
+
+        assert record['mass_rejection'] == {'offered': 1}
+        lines = similarity.report_lines(record)
+        [notice] = [line for line in lines if 'ALL 1 ' in line]
+        assert 'REJECTED' in notice and 'systemic' in notice.lower()
+        assert lines.index(notice) < next(index for index, line in enumerate(lines) if 'queue depth' in line)
 
     def test_counts_are_attaches_and_candidates_the_queue_adjudicated(self, tmp_path):
         report, _ = self._report(tmp_path)
@@ -709,7 +724,7 @@ class TestAdjudicationReport:
 
     def test_a_skipped_record_says_why_and_that_nothing_happened(self):
         view = similarity.View.skipped_by('embeddings endpoint answered HTTP 503', 1, _SETTINGS)
-        record = similarity.AdjudicationReport(view, (), (), (), (), None).to_record()
+        record = similarity.AdjudicationReport(view, (), (), (), (), None, False).to_record()
 
         assert record['skipped'] == 'embeddings endpoint answered HTTP 503'
         assert record['queue_depth'] is None
