@@ -1212,7 +1212,7 @@
     "orchestrator/tests/test_workflow_train_worktree.py": {"patch_targets": [], "private_reads": 6},
     "orchestrator/tests/test_workflow_truthful_commit_stamp.py": {"patch_targets": [], "private_reads": 29},
     "orchestrator/tests/test_workflow_truthful_exits.py": {"patch_targets": [], "private_reads": 23},
-    "orchestrator/tests/test_workflow_verify_retry.py": {"patch_targets": [], "private_reads": 11},
+    "orchestrator/tests/test_workflow_verify_retry.py": {"patch_targets": [], "private_reads": 8},
     "orchestrator/tests/test_workflow_warm_lane_requeue.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_workflow_worktree_missing.py": {"patch_targets": [], "private_reads": 3},
     "orchestrator/tests/test_worktree_namespace_c2.py": {"patch_targets": [], "private_reads": 0}

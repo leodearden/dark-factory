@@ -120,6 +120,11 @@ def _make_workflow(
     return workflow, artifacts
 
 
+async def _run_verify_loop(workflow: TaskWorkflow) -> WorkflowOutcome:
+    """The single call site through which these tests drive the verify/debug loop."""
+    return await workflow._verify_debugfix_loop()
+
+
 def _opaque_timeout_result() -> VerifyResult:
     return VerifyResult(
         passed=False,
@@ -171,7 +176,7 @@ class TestOpaqueTimeoutFastFail:
             'orchestrator.workflow.run_scoped_verification', verify_mock,
         )
 
-        outcome = await workflow._verify_debugfix_loop()
+        outcome = await _run_verify_loop(workflow)
         assert outcome == WorkflowOutcome.BLOCKED
         # Verify was called exactly max_opaque_timeout_attempts (2) times;
         # third call MUST NOT happen.
@@ -200,7 +205,7 @@ class TestOpaqueTimeoutFastFail:
             'orchestrator.workflow.run_scoped_verification', verify_mock,
         )
 
-        outcome = await workflow._verify_debugfix_loop()
+        outcome = await _run_verify_loop(workflow)
         assert outcome == WorkflowOutcome.BLOCKED
         # Real test failures retry up to max_verify_attempts.
         assert verify_mock.await_count == config.max_verify_attempts, (
@@ -238,7 +243,7 @@ class TestOpaqueTimeoutFastFail:
             'orchestrator.workflow.run_scoped_verification', verify_mock,
         )
 
-        outcome = await workflow._verify_debugfix_loop()
+        outcome = await _run_verify_loop(workflow)
         # We expect a full max_verify_attempts (5) loop because the
         # plan's simple guard checks attempt-count + opaque category +
         # opaque regex.  After the first opaque attempt verify_attempt=1
@@ -285,7 +290,7 @@ class TestPerTaskVerifyRole:
             'orchestrator.workflow.run_scoped_verification', verify_mock,
         )
 
-        outcome = await workflow._verify_debugfix_loop()
+        outcome = await _run_verify_loop(workflow)
 
         assert outcome == WorkflowOutcome.DONE, f'expected DONE, got {outcome}'
         assert verify_mock.await_count == 1, (
@@ -341,7 +346,7 @@ class TestDebuggerReceivesAttemptContext:
             'orchestrator.workflow.run_scoped_verification', AsyncMock(side_effect=results),
         )
 
-        outcome = await workflow._verify_debugfix_loop()
+        outcome = await _run_verify_loop(workflow)
         contexts = [call.kwargs['attempt_context'] for call in debugger_prompt.await_args_list]
         return outcome, contexts
 
