@@ -889,6 +889,83 @@ def test_this_guard_module_is_itself_a_guard_family_member() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _scanner_offence(name, source) -- the per-scanner verdict the family
+# invariant applies to each detected scanner, pinned synthetically because the
+# real tree is green by construction and cannot demonstrate any offence.
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_scanner(mark_lines: str) -> str:
+    """A whole-tree scanner module whose module-level marks are *mark_lines*."""
+    return (
+        'import ast\n'
+        'import pytest\n'
+        'from pathlib import Path\n'
+        'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
+        f'{mark_lines}'
+        '\n'
+        '_TESTS_DIR = Path(__file__).parent\n'
+        '\n'
+        'def test_some_new_invariant() -> None:\n'
+        "    for py_file in sorted(_TESTS_DIR.rglob('*.py')):\n"
+        "        ast.parse(py_file.read_text(encoding='utf-8'))\n"
+    )
+
+
+def test_offence_is_none_for_the_house_spelling() -> None:
+    source = _synthetic_scanner('pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n')
+    assert _scanner_offence('test_new.py', source) is None
+
+
+def test_offence_names_a_missing_module_level_timeout() -> None:
+    offence = _scanner_offence('test_new.py', _synthetic_scanner(''))
+    assert offence is not None
+    assert offence.startswith('test_new.py: ')
+    assert 'no module-level pytestmark timeout' in offence
+
+
+def test_offence_names_a_ceiling_below_the_family_ceiling() -> None:
+    offence = _scanner_offence(
+        'test_new.py', _synthetic_scanner('pytestmark = pytest.mark.timeout(30)\n'),
+    )
+    assert offence is not None
+    assert 'pins 30s' in offence
+    assert 'below the' in offence and 'family ceiling' in offence
+
+
+@pytest.mark.parametrize(
+    'mark_line',
+    [
+        pytest.param('pytestmark = pytest.mark.timeout(1500)\n', id='literal-above-the-ceiling'),
+        pytest.param(
+            'from somewhere import SOME_OTHER_TIMEOUT\n'
+            'pytestmark = pytest.mark.timeout(SOME_OTHER_TIMEOUT)\n',
+            id='unresolvable-constant',
+        ),
+    ],
+)
+def test_offence_names_a_mark_outside_the_guard_family(mark_line: str) -> None:
+    """Passing the name and value halves is not enough: task-role verify runs
+    only the family ``is_whole_tree_guard_module`` admits, so a scanner spelled
+    any other way would stop running before the merge gate."""
+    offence = _scanner_offence('test_new.py', _synthetic_scanner(mark_line))
+    assert offence is not None
+    assert 'WHOLE_TREE_SCAN_TEST_TIMEOUT' in offence
+    assert 'guard family' in offence
+
+
+def test_a_synthetic_new_scanner_marked_by_a_literal_is_not_a_family_member() -> None:
+    """END TO END on the third half: detected, named, AT the ceiling by value --
+    and still an offender, proving the membership half is not dead code."""
+    synthetic_source = _synthetic_scanner('pytestmark = pytest.mark.timeout(1500)\n')
+    assert _scans_whole_tree_py(synthetic_source) is True
+    assert 'timeout' in module_level_marker_names(synthetic_source)
+    ceiling = _module_level_timeout_ceiling(synthetic_source)
+    assert ceiling is not None and ceiling >= WHOLE_TREE_SCAN_TEST_TIMEOUT
+    assert _scanner_offence('test_new.py', synthetic_source) is not None
+
+
+# ---------------------------------------------------------------------------
 # The family invariant: the actual ratchet.
 #
 # Allowlist-free and TOTAL -- every whole-tree scanner under this directory
