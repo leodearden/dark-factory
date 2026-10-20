@@ -33,7 +33,6 @@ from orchestrator.agents.review_briefing import (
 REVIEWER = 'reviewer_comprehensive'
 BASE_SHA = '0123456789abcdef0123456789abcdef01234567'
 AMENDMENT_HEADING = '# Amendment Re-Review Scope'
-SCOPE_HEADING = '# Scope Check'
 CONVENTIONS_HEADING = '# Project Conventions'
 
 
@@ -234,7 +233,7 @@ class TestInlineDiff:
 
 
 @pytest.mark.asyncio
-class TestConventionsScopeAndAction:
+class TestConventionsAndAction:
     async def test_each_convention_rule_and_why_appear(self, briefing: BriefingAssembler):
         conventions = (
             ReviewConvention('Cite cross-file refs as path::symbol', 'Line pins drift.'),
@@ -252,11 +251,6 @@ class TestConventionsScopeAndAction:
         prompt = await _build(briefing, _subject(conventions=()))
 
         assert CONVENTIONS_HEADING not in prompt
-
-    async def test_the_scope_check_is_a_suggestion(self, briefing: BriefingAssembler):
-        prompt = await _build(briefing, _subject(plan=_plan()))
-
-        assert 'suggestion' in _section(prompt, SCOPE_HEADING)
 
     async def test_the_verdict_call_names_the_reviewer(self, briefing: BriefingAssembler):
         prompt = await _build(briefing, _subject())
