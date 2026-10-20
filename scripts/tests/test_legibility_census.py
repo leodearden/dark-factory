@@ -6290,6 +6290,19 @@ def test_main_passes_no_since_for_a_legacy_state(tmp_path, monkeypatch):
     assert call["report_path"] == tmp_path / "plans" / "confusion-census-2026-10-06.md"
 
 
+def test_main_passes_the_openai_embedder_and_the_hosts_vector_cache(tmp_path, monkeypatch):
+    _write_legibility_yaml(tmp_path)
+    _commit_all(tmp_path)
+
+    call = _main_with_fake_census(tmp_path, monkeypatch)
+
+    embedder = call["embedder"]
+    assert isinstance(embedder, embeddings.Embedder)
+    assert embedder.embed_fn is embeddings.openai_embed
+    assert embedder.cache_path == embeddings.cache_path("dark_factory")
+    assert embedder.cache_path.is_relative_to(tmp_path / "legibility-state")
+
+
 def test_main_names_the_dry_run_payloads_after_the_allocated_basename(tmp_path, monkeypatch):
     _write_legibility_yaml(tmp_path)
     (tmp_path / "plans").mkdir()
