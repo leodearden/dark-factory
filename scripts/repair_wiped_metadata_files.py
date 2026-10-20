@@ -197,8 +197,10 @@ def plan_files_rejection_reason(candidate: WipeCandidate) -> str | None:
 # The write payload.
 # ---------------------------------------------------------------------------
 
-# This task's id, stamped into every backfill so a later reader can attribute
-# the write without consulting the event log.
+# The DEFAULT attribution: the task that built this tool and ran its first
+# pass. Stamped into every backfill so a later reader can attribute the write
+# without consulting the event log; a later pass names its own task with
+# --task-id.
 REPAIR_TASK_ID = "3329"
 
 # WHY x_-PREFIXED, and not the bare `files_backfill_provenance` the task
@@ -218,7 +220,12 @@ REPAIR_TASK_ID = "3329"
 PROVENANCE_KEY = "x_files_backfill_provenance"
 
 
-def build_repair_payload(candidate: WipeCandidate, *, now_iso: str) -> dict:
+def build_repair_payload(
+    candidate: WipeCandidate,
+    *,
+    now_iso: str,
+    repair_task_id: str = REPAIR_TASK_ID,
+) -> dict:
     """Build the metadata patch that restores *candidate*'s wiped file scope.
 
     A MINIMAL ADDITIVE PATCH: exactly two keys, both of which this write is
@@ -250,7 +257,7 @@ def build_repair_payload(candidate: WipeCandidate, *, now_iso: str) -> dict:
     return {
         "files": list(writable_plan_files(candidate)),
         PROVENANCE_KEY: {
-            "task": REPAIR_TASK_ID,
+            "task": repair_task_id,
             "src": candidate.plan_files_source,
             "sig": candidate.wipe_signature,
             "fidelity": candidate.plan_files_fidelity,
@@ -507,6 +514,7 @@ async def repair_one(
     candidate: WipeCandidate,
     *,
     now_iso: str,
+    repair_task_id: str = REPAIR_TASK_ID,
 ) -> RepairOutcome:
     """Write ONE candidate's recovered scope back, and never raise.
 
@@ -530,7 +538,9 @@ async def repair_one(
     strand the remaining 23: the failure is captured, attributed and reported,
     and drives a non-zero exit at the end.
     """
-    payload = build_repair_payload(candidate, now_iso=now_iso)
+    payload = build_repair_payload(
+        candidate, now_iso=now_iso, repair_task_id=repair_task_id
+    )
     try:
         result = await client.call_tool(
             "update_task",
@@ -634,6 +644,7 @@ async def repair_project(
     *,
     apply: bool,
     now_iso: str,
+    repair_task_id: str = REPAIR_TASK_ID,
 ) -> RepairResult:
     """Audit *project_root* fresh, then repair what is safe to repair.
 
@@ -888,7 +899,15 @@ async def repair_project(
             )
             continue
 
-        outcomes.append(await repair_one(client, project_root, candidate, now_iso=now_iso))
+        outcomes.append(
+            await repair_one(
+                client,
+                project_root,
+                candidate,
+                now_iso=now_iso,
+                repair_task_id=repair_task_id,
+            )
+        )
 
     return RepairResult(
         project_root=project_root,
@@ -1042,8 +1061,17 @@ DEFAULT_SERVER = "http://127.0.0.1:8002"
 # Inheriting the migrate script's 'migrate-metadata' would file every one of
 # these repair writes in the journal and the event stream under an unrelated,
 # long-finished migration — making the backfill unattributable exactly when
-# someone is trying to work out who touched a historical record.
-CLIENT_NAME = "repair-wiped-metadata-files-3329"
+# someone is trying to work out who touched a historical record. CLIENT_NAME is
+# the DEFAULT, named for REPAIR_TASK_ID; a later pass names its own task with
+# --task-id.
+CLIENT_NAME_PREFIX = "repair-wiped-metadata-files"
+
+
+def client_name_for(repair_task_id: str) -> str:
+    return f"{CLIENT_NAME_PREFIX}-{repair_task_id}"
+
+
+CLIENT_NAME = client_name_for(REPAIR_TASK_ID)
 
 # Exit codes, named rather than spelled inline so the epilog, main()'s
 # docstring and the returns can never drift into disagreeing about what a
@@ -1087,7 +1115,7 @@ def _transport_error_types() -> tuple[type[BaseException], ...]:
     return (httpx.HTTPError, OSError, RuntimeError)
 
 
-def _make_client(server_url: str):
+def _make_client(server_url: str, *, repair_task_id: str = REPAIR_TASK_ID):
     """Construct the MCP client. Imported LAZILY, on the apply path only.
 
     ``migrate_metadata_modules_to_files`` imports httpx at module scope, so
@@ -1112,7 +1140,7 @@ def _make_client(server_url: str):
         Guarded in tests/scripts/test_repair_wiped_metadata_files.py.
         """
 
-        _client_name = CLIENT_NAME
+        _client_name = client_name_for(repair_task_id)
 
     return RepairFusedMemoryClient(server_url)
 
@@ -1150,6 +1178,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Actually write. Without this the run is inert: no MCP client is "
             "constructed and no task is touched."
+        ),
+    )
+    parser.add_argument(
+        "--task-id", dest="repair_task_id", default=REPAIR_TASK_ID,
+        help=(
+            "The task this run writes on behalf of, stamped into "
+            f"{PROVENANCE_KEY}.task and the MCP clientInfo.name. Defaults to "
+            f"{REPAIR_TASK_ID}, the task that built this tool and ran its first "
+            "pass."
         ),
     )
     parser.add_argument(
@@ -1196,7 +1233,13 @@ async def main_async(args: argparse.Namespace) -> int:
     async def _repair_root(root: str, client: _ToolClient | None) -> None:
         try:
             results.append(
-                await repair_project(client, root, apply=args.apply, now_iso=now_iso)
+                await repair_project(
+                    client,
+                    root,
+                    apply=args.apply,
+                    now_iso=now_iso,
+                    repair_task_id=args.repair_task_id,
+                )
             )
         except UNREADABLE_STORE_ERRORS as exc:
             # Same wording as the audit's warning, deliberately: one phrasing
@@ -1215,7 +1258,9 @@ async def main_async(args: argparse.Namespace) -> int:
         transport_errors = _transport_error_types()
         async with contextlib.AsyncExitStack() as stack:
             try:
-                client = await stack.enter_async_context(_make_client(args.server_url))
+                client = await stack.enter_async_context(
+                    _make_client(args.server_url, repair_task_id=args.repair_task_id)
+                )
             except transport_errors as exc:
                 # A down server is a NAMED outcome, not a traceback. The catch
                 # is scoped to the handshake alone — a transport failure

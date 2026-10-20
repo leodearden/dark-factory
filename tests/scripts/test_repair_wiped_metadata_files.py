@@ -1800,7 +1800,7 @@ def test_main_async_reports_a_mid_batch_transport_death_as_exit_live_read_failed
     root = _wiped_project(tmp_path)
     monkeypatch.setattr(
         "repair_wiped_metadata_files._make_client",
-        lambda server_url: _client_context(
+        lambda server_url, **_kwargs: _client_context(
             _FakeClient(raises=_ConnectError("Connection refused"))
         ),
     )
@@ -1824,7 +1824,7 @@ def test_main_async_returns_exit_ok_when_the_only_outcome_is_skip_missing(
     root = _wiped_project(tmp_path)
     monkeypatch.setattr(
         "repair_wiped_metadata_files._make_client",
-        lambda server_url: _client_context(
+        lambda server_url, **_kwargs: _client_context(
             _FakeClient(
                 returns={
                     "error": "No tasks found for ID(s): 2464",
@@ -1878,7 +1878,7 @@ def test_exit_write_failed_outranks_exit_live_read_failed(tmp_path, monkeypatch)
     )
     monkeypatch.setattr(
         "repair_wiped_metadata_files._make_client",
-        lambda server_url: _client_context(client),
+        lambda server_url, **_kwargs: _client_context(client),
     )
     args = _build_parser().parse_args(
         ["--project-root", str(root_a), "--project-root", str(root_b), "--apply"]
