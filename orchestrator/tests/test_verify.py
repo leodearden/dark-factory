@@ -12175,6 +12175,35 @@ class TestRunVerificationThreadsEachLegsOwnDuration:
         assert result.category != 'infra_kill'
         assert SIGNAL_KILL_SUMMARY_MARKER not in result.summary
 
+    @pytest.mark.asyncio
+    async def test_a_lint_failure_beside_a_green_test_leg_records_the_test_leg_as_passed(
+        self, tmp_path: Path,
+    ):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__lint_cmd__':
+                return 1, 'x.py:1:1: F401 unused import\n', False
+            return 0, '19639 passed in 2351s\n' if cmd == '__test_cmd__' else '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert result.test_leg_failed is False
+        assert '19639 passed' in result.test_output
+        assert '## Test Output' not in result.failure_report()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_test_leg_is_recorded_as_failed(self, tmp_path: Path):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__test_cmd__':
+                return 1, '....\n19638 passed, 1 error in 2351s\n', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert result.test_leg_failed is True
+        assert '## Test Output' in result.failure_report()
+
 
 # ---------------------------------------------------------------------------
 # Version pin survival through verify's scoping pipeline (task 3931)

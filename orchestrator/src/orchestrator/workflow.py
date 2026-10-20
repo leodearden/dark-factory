@@ -69,6 +69,7 @@ from shared.transcript_archive import (
 )
 
 from orchestrator import chronic_flake
+from orchestrator.agents.briefing import PriorAttemptCause, VerifyAttemptContext
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.roles import (
     _ESCALATION_TOOLS,
@@ -579,6 +580,7 @@ class _BriefingLike(Protocol):
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = ...,
         task_id: str | None = ...,
+        *, attempt_context: VerifyAttemptContext | None = ...,
     ) -> str: ...
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = ...,
@@ -10311,6 +10313,7 @@ class TaskWorkflow:
         """Run verification, invoke debugger on failures."""
         assert self.worktree is not None and self.artifacts is not None
         verify_attempt = 0
+        prior_causes: list[PriorAttemptCause] = []
 
         while True:
             # Fix 3: rebase onto main BEFORE each verify (including the first).
@@ -10449,11 +10452,24 @@ class TaskWorkflow:
             # Invoke debugger
             self.plan = self.artifacts.read_plan()
             failure_report = result.failure_report()
+            attempt_context = VerifyAttemptContext(
+                attempt=verify_attempt,
+                max_attempts=self.config.max_verify_attempts,
+                prior_causes=tuple(prior_causes),
+            )
 
-            async def build_prompt(failure_report: str = failure_report) -> str:
+            async def build_prompt(
+                failure_report: str = failure_report,
+                attempt_context: VerifyAttemptContext = attempt_context,
+            ) -> str:
                 return await self.briefing.build_debugger_prompt(
                     failure_report, self._live_plan(), task_id=self.task_id,
+                    attempt_context=attempt_context,
                 )
+
+            prior_causes.append(PriorAttemptCause(
+                category=result.category, cause=result.cause_hint or result.summary,
+            ))
 
             pre_head = await self._get_head_commit()
             debug_result = await self._invoke(DEBUGGER, build_prompt, self.worktree)

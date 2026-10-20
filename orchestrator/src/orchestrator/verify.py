@@ -1418,16 +1418,18 @@ _WEAK_FAILURE_MARKER_RE = re.compile(
 )
 
 # Union of strong+weak, plus a trailing bare "FAILED" substring alternative —
-# used by failure_report() as the emit-gate for the ## Test Failures section
-# (broadened from the legacy `'FAILED' in test_output` substring check to
-# "any failure marker present, OR that legacy substring itself"). The
+# used by failure_report() to pick the test section's HEADING: a match is
+# headed ## Test Failures, no match is the labelled ## Test Output. It no
+# longer decides whether the section appears; any non-empty test output does
+# (task 5357). (Broadened from the legacy `'FAILED' in test_output` substring
+# check to "any failure marker present, OR that legacy substring itself".) The
 # trailing `FAILED` alternative is what makes this a *genuine* superset: a
 # structurally-anchored marker alone is NOT one, since e.g. a cargo summary
 # line like "test result: FAILED. 3 passed; 1 failed" has no line-start/
 # line-end FAILED (see _PYTEST_FAILED_LINE_RE / _TRAILING_FAILED_RE) and no
 # strong/weak marker at all, yet still contains the old substring — without
-# this alternative such output would silently stop emitting the section.
-# Note this union is the emit *gate* only; _failure_anchored_excerpt anchors
+# this alternative such output would be headed as marker-less.
+# Note this union is the heading *selector* only; _failure_anchored_excerpt anchors
 # windows using _STRONG_FAILURE_MARKER_RE/_WEAK_FAILURE_MARKER_RE directly
 # (not this pattern), so a gate-only match like the cargo line above falls
 # back to _failure_anchored_excerpt's tail slice — identical to pre-anchoring
@@ -1512,6 +1514,42 @@ def _failure_anchored_excerpt(output: str, *, cap: int = 3000, window: int = 10)
 
     # Still over cap (or no strong windows survived) — hard tail-truncate.
     return excerpt[-cap:]
+
+
+_NO_FAILURE_MARKER_NOTE = (
+    'No failure marker matched in this output; the block above is its raw '
+    'tail, unfiltered.'
+)
+
+
+def _render_output_section(
+    heading: str, output: str, *, cap: int, note: str | None = None,
+    logs_listed: bool = False,
+) -> str:
+    """Render one leg's captured output as a failure-report section.
+
+    Serves failure_report's invariant that a non-empty leg output is never
+    silently dropped: every leg goes through this one renderer, which excerpts
+    with :func:`_failure_anchored_excerpt` and labels what it shows, including
+    when the excerpt is shorter than the output. Shape contract: the fence
+    sits directly under the heading and every annotation follows the closing
+    fence, because
+    ``orchestrator/src/orchestrator/b3_gate.py::_strip_captured_output`` strips
+    only a fence opened directly under a heading listed in
+    ``_FAILURE_REPORT_CAPTURED_HEADINGS``, which must name every heading this
+    helper renders.
+    """
+    excerpt = _failure_anchored_excerpt(output, cap=cap)
+    annotations = [note] if note else []
+    if len(excerpt) < len(output):
+        truncation = f'Excerpt: {len(excerpt):,} of {len(output):,} characters shown.'
+        if logs_listed:
+            truncation += ' Full output: the log files listed under Verify Logs.'
+        annotations.append(truncation)
+    section = f'{heading}\n\n```\n{excerpt}\n```'
+    if annotations:
+        section += '\n\n' + '\n'.join(annotations)
+    return section
 
 
 # _ARCHIVE_DENY_LIST, _CATEGORY_PRIORITY, and PREEXISTING_BREAK_SKIP_CATEGORIES
@@ -4495,6 +4533,14 @@ class VerifyResult:
     # UNSCOPED_TYPECHECK_* sentinel results, and any hand-constructed result.
     # `[]` = "no failing legs" (a pass), which is likewise not a licence.
     failing_leg_categories: list[str] | None = None
+    # Task 5357: True iff the TEST leg ran and exited non-zero. `lint_output` and
+    # `type_output` are blanked on a passing leg at construction but
+    # `test_output` is not (chronic_flake reads it on passes), so
+    # `failure_report` needs this to tell a failed test leg's raw tail from a
+    # green run's. False is the default for results that never recorded it
+    # (hand-built, `_trivial_pass`, an older remote's wire payload), which keeps
+    # their report as before: a marker-less test output is not shown.
+    test_leg_failed: bool = False
     # Task 2823: True IFF this result came from _trivial_pass — a config-only
     # (no .py/.rs) merge that short-circuited verification WITHOUT running any
     # suite. The merge worker's pass path keys on this to refuse advancing main
@@ -4628,13 +4674,31 @@ class VerifyResult:
                 for p in self.archive_log_paths:
                     log_lines.append(f'- {p}')
             sections.append('\n'.join(log_lines))
-        if self.test_output and _FAILURE_MARKER_RE.search(self.test_output):
-            excerpt = _failure_anchored_excerpt(self.test_output, cap=3000)
-            sections.append(f'## Test Failures\n\n```\n{excerpt}\n```')
-        if self.lint_output and self.lint_output.strip():
-            sections.append(f'## Lint Issues\n\n```\n{self.lint_output[-2000:]}\n```')
-        if self.type_output and 'error' in self.type_output.lower():
-            sections.append(f'## Type Errors\n\n```\n{self.type_output[-2000:]}\n```')
+        logs_listed = bool(self.worktree_log_paths or self.archive_log_paths)
+        if self.test_output.strip():
+            if _FAILURE_MARKER_RE.search(self.test_output):
+                sections.append(_render_output_section(
+                    '## Test Failures', self.test_output, cap=3000,
+                    logs_listed=logs_listed,
+                ))
+            elif self.test_leg_failed:
+                sections.append(_render_output_section(
+                    '## Test Output', self.test_output, cap=3000,
+                    note=_NO_FAILURE_MARKER_NOTE, logs_listed=logs_listed,
+                ))
+        if self.lint_output.strip():
+            sections.append(_render_output_section(
+                '## Lint Issues', self.lint_output, cap=2000, logs_listed=logs_listed,
+            ))
+        if 'error' in self.type_output.lower():
+            sections.append(_render_output_section(
+                '## Type Errors', self.type_output, cap=2000, logs_listed=logs_listed,
+            ))
+        elif self.type_output.strip():
+            sections.append(_render_output_section(
+                '## Type Check Output', self.type_output, cap=2000,
+                note=_NO_FAILURE_MARKER_NOTE, logs_listed=logs_listed,
+            ))
         return '\n\n'.join(sections) if sections else self.summary
 
 
@@ -7776,6 +7840,7 @@ async def run_verification(
         test_output=attempt.test.output,
         lint_output=attempt.lint.output if attempt.lint.rc != 0 else '',
         type_output=attempt.type.output if attempt.type.rc != 0 else '',
+        test_leg_failed=attempt.test.rc != 0,
         summary=summary,
         timed_out=timed_out,
         cause_hint=cause_hint,
@@ -7968,6 +8033,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        test_leg_failed=any(r.test_leg_failed for r in results),
         admission_legs=tuple(leg for r in results for leg in (r.admission_legs or ())) or None,
     )
 
