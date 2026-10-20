@@ -1379,6 +1379,21 @@ def derive_verify_plan(
     return VerifyPlan(runs=tuple(_derive_fallback_runs(existing_files, config, worktree_reader)))
 
 
+def executed_module_prefixes(plan: VerifyPlan) -> frozenset[str]:
+    """The module prefixes *plan* executes: none for a TRIVIAL plan, and never a
+    module whose only run is the cmd-None 'no files under prefix' SKIPPED (the rule
+    ``verify.py::_executed_module_configs_from_plan`` applies)."""
+    if len(plan.runs) == 1 and plan.runs[0].scope_kind is ScopeKind.TRIVIAL:
+        return frozenset()
+    runs_by_prefix: dict[str, list[PlannedRun]] = {}
+    for run in plan.runs:
+        runs_by_prefix.setdefault(run.module_prefix, []).append(run)
+    return frozenset(
+        prefix for prefix, runs in runs_by_prefix.items()
+        if not (len(runs) == 1 and runs[0].cmd is None and runs[0].scope_kind is ScopeKind.SKIPPED)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reverse-dependency test widening (task 2607)
 # ---------------------------------------------------------------------------
