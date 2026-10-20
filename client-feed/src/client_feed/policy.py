@@ -3,14 +3,27 @@
 from __future__ import annotations
 
 import functools
+import os
 import re
+import stat
 from collections.abc import Mapping, Sequence
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Final, Self
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictInt, model_validator
+import yaml
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    ValidationError,
+    model_validator,
+)
 
 from client_feed.contract import FileKind, NonNegativeInt, ProjectId, RepoPath
+from client_feed.sources.git import GitError, repository_toplevel
 
 DEFAULT_TEST_GLOBS: Final = ('**/tests/**', '**/test_*.py', '**/*_test.py', '**/conftest.py')
 DEFAULT_DOCS_GLOBS: Final = ('**/*.md', 'docs/**')
@@ -164,3 +177,110 @@ class Policy(BaseModel):
         return sum(
             -(-len(line) // self.max_line_bytes) for line in content.split(b'\n') if line.strip()
         )
+
+
+class PolicyProblem(StrEnum):
+    UNREADABLE = 'unreadable'
+    INVALID = 'invalid'
+    NOT_A_REPOSITORY_ROOT = 'not_a_repository_root'
+    OUT_DIR_UNUSABLE = 'out_dir_unusable'
+    OUT_DIR_NOT_OWNED = 'out_dir_not_owned'
+
+
+class PolicyError(Exception):
+    """A policy file the publisher refuses to start on."""
+
+    def __init__(self, *, config: Path, problem: PolicyProblem, detail: str) -> None:
+        self.config = config
+        self.problem = problem
+        self.detail = detail
+        super().__init__(f'policy {config} refused ({problem}): {detail}')
+
+
+def _first_error(exc: ValidationError) -> str:
+    errors = exc.errors()
+    first = errors[0]
+    location = '.'.join(str(part) for part in first['loc']) or '<policy>'
+    more = f' (and {len(errors) - 1} more)' if len(errors) > 1 else ''
+    return f'{location}: {first["msg"]}{more}'
+
+
+def _read_mapping(config: Path) -> Mapping[str, Any]:
+    try:
+        text = config.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PolicyError(config=config, problem=PolicyProblem.UNREADABLE, detail=str(exc)) from exc
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise PolicyError(
+            config=config, problem=PolicyProblem.INVALID, detail=f'not YAML: {exc}'
+        ) from exc
+    if not isinstance(data, dict):
+        raise PolicyError(
+            config=config,
+            problem=PolicyProblem.INVALID,
+            detail=f'expected a mapping, got {type(data).__name__}',
+        )
+    return data
+
+
+def _validated(config: Path, data: Mapping[str, Any]) -> Policy:
+    try:
+        return Policy.model_validate(data)
+    except ValidationError as exc:
+        raise PolicyError(
+            config=config, problem=PolicyProblem.INVALID, detail=_first_error(exc)
+        ) from exc
+
+
+def _require_repository_root(config: Path, policy: Policy) -> None:
+    """The root must BE a work tree's top: from a subdirectory, every git call would act on the parent repository."""
+    root = policy.project_root
+    try:
+        toplevel = repository_toplevel(root)
+    except GitError as exc:
+        raise PolicyError(
+            config=config,
+            problem=PolicyProblem.NOT_A_REPOSITORY_ROOT,
+            detail=f'project_root {root} could not be checked: {exc}',
+        ) from exc
+    if toplevel is None or toplevel != root.resolve():
+        where = 'is in no git work tree' if toplevel is None else f'is inside the work tree {toplevel}'
+        raise PolicyError(
+            config=config,
+            problem=PolicyProblem.NOT_A_REPOSITORY_ROOT,
+            detail=f'project_root {root} {where}, not at its top',
+        )
+
+
+def _require_owned_out_dir(config: Path, policy: Policy) -> None:
+    out_dir = policy.out_dir
+    try:
+        status = os.lstat(out_dir)
+    except OSError as exc:
+        raise PolicyError(
+            config=config,
+            problem=PolicyProblem.OUT_DIR_UNUSABLE,
+            detail=f'out_dir {out_dir} cannot be inspected: {exc.strerror}',
+        ) from exc
+    if not stat.S_ISDIR(status.st_mode):
+        raise PolicyError(
+            config=config,
+            problem=PolicyProblem.OUT_DIR_UNUSABLE,
+            detail=f'out_dir {out_dir} is not a directory (a symlink is refused)',
+        )
+    if status.st_uid != os.geteuid():
+        raise PolicyError(
+            config=config,
+            problem=PolicyProblem.OUT_DIR_NOT_OWNED,
+            detail=f'out_dir {out_dir} is owned by uid {status.st_uid}, not the running uid {os.geteuid()}',
+        )
+
+
+def load_policy(config: Path) -> Policy:
+    """The policy in `config`, or a PolicyError naming why the publisher must not start on it."""
+    policy = _validated(config, _read_mapping(config))
+    _require_repository_root(config, policy)
+    _require_owned_out_dir(config, policy)
+    return policy
