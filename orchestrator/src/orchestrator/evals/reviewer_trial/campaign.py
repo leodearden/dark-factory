@@ -34,6 +34,9 @@ from statistics import mean
 ScoreRecord = dict
 """``asdict(ScoringResult)`` plus ``trial: int``; ``unmeasured`` may be set."""
 
+MIN_DECISION_TRIALS = 3
+"""Every pre-registered decision rule needs at least this many paired trials."""
+
 
 @dataclass
 class ArmMetrics:
@@ -54,12 +57,21 @@ class ArmMetrics:
     paired_vs_incumbent: list[dict] = field(default_factory=list)
     complement_count: int = 0
     incumbent_matched: int = 0
-    complement_share: float = 0.0
+    complement_share: float | None = None
     blocking_complement_count: int = 0
     blocking_incumbent_matched: int = 0
-    blocking_complement_share: float = 0.0
+    blocking_complement_share: float | None = None
     unmeasured: int = 0
     unmeasured_cost_usd: float = 0.0
+
+
+@dataclass(frozen=True)
+class SelfComplementBand:
+    pairs: tuple[dict, ...]
+    overall_min: float | None
+    overall_max: float | None
+    blocking_min: float | None
+    blocking_max: float | None
 
 
 @dataclass
@@ -198,15 +210,6 @@ def _measured_by_trial(records: list[ScoreRecord]) -> dict[int, list[ScoreRecord
     return grouped
 
 
-@dataclass(frozen=True)
-class SelfComplementBand:
-    pairs: list[dict]
-    overall_min: float | None
-    overall_max: float | None
-    blocking_min: float | None
-    blocking_max: float | None
-
-
 def self_complement_band(
     incumbent: list[ScoreRecord], blocking_gt_by_diff: dict[str, set[str]],
 ) -> SelfComplementBand:
@@ -217,7 +220,7 @@ def self_complement_band(
     pairs whose share is defined. ``clears_self_complement_band`` reads it.
     """
     by_trial = _measured_by_trial(incumbent)
-    pairs = [
+    pairs = tuple(
         {
             'trial': i,
             'over_trial': j,
@@ -226,7 +229,7 @@ def self_complement_band(
             ),
         }
         for i, j in permutations(sorted(by_trial), 2)
-    ]
+    )
     overall = [p['share'] for p in pairs if p['share'] is not None]
     blocking = [p['blocking_share'] for p in pairs if p['blocking_share'] is not None]
     return SelfComplementBand(
@@ -251,7 +254,7 @@ def complement_by_trial(
 
 
 def clears_self_complement_band(
-    per_trial: list[dict], band: SelfComplementBand, min_trials: int = 3,
+    per_trial: list[dict], band: SelfComplementBand, min_trials: int = MIN_DECISION_TRIALS,
 ) -> bool:
     """Pre-registered D7 complement rule: in each of at least *min_trials* trials the
     candidate's blocking complement share is strictly above the incumbent's own
@@ -303,24 +306,21 @@ def summarize_arm(
     if incumbent is not None and incumbent is not records:
         measured_incumbent = [r for r in incumbent if _is_measured(r)]
         metrics.paired_vs_incumbent = paired_comparison(measured, measured_incumbent)
-        metrics.complement_count, metrics.incumbent_matched = complement(measured, measured_incumbent)
-        if metrics.incumbent_matched:
-            metrics.complement_share = round(metrics.complement_count / metrics.incumbent_matched, 4)
-        metrics.blocking_complement_count, metrics.blocking_incumbent_matched = complement(
-            measured, measured_incumbent, restrict_to=blocking_gt_by_diff,
-        )
-        if metrics.blocking_incumbent_matched:
-            metrics.blocking_complement_share = round(
-                metrics.blocking_complement_count / metrics.blocking_incumbent_matched, 4,
-            )
+        pooled = _complement_row(measured, measured_incumbent, blocking_gt_by_diff)
+        metrics.complement_count = pooled['complement']
+        metrics.incumbent_matched = pooled['incumbent_matched']
+        metrics.complement_share = pooled['share']
+        metrics.blocking_complement_count = pooled['blocking_complement']
+        metrics.blocking_incumbent_matched = pooled['blocking_incumbent_matched']
+        metrics.blocking_complement_share = pooled['blocking_share']
     return metrics
 
 
 def strict_improvement(arm: ArmMetrics, incumbent: ArmMetrics) -> bool:
-    """Pre-registered adoption rule: the arm's mean F1 beats the incumbent's
-    in every trial, paired on the same fixtures, and there are at least three."""
+    """Pre-registered adoption rule: the arm's mean F1 beats the incumbent's in every
+    trial, paired on the same fixtures, and there are at least ``MIN_DECISION_TRIALS``."""
     pairs = list(zip(arm.f1_by_trial, incumbent.f1_by_trial, strict=False))
-    return len(pairs) >= 3 and all(a > b for a, b in pairs)
+    return len(pairs) >= MIN_DECISION_TRIALS and all(a > b for a, b in pairs)
 
 
 def non_inferiority_deltas(arm: list[ScoreRecord], incumbent: list[ScoreRecord]) -> list[dict]:
@@ -350,7 +350,7 @@ def _mean_delta(pairs: list[tuple[ScoreRecord, ScoreRecord]], metric: str) -> fl
 
 
 def non_inferior(
-    arm: list[ScoreRecord], incumbent: list[ScoreRecord], min_trials: int = 3,
+    arm: list[ScoreRecord], incumbent: list[ScoreRecord], min_trials: int = MIN_DECISION_TRIALS,
 ) -> bool:
     """Pre-registered D2 adoption rule: in each of at least *min_trials* trials, paired on
     the cells both sides measured, the arm's mean blocking recall is not below the
@@ -430,7 +430,8 @@ def _complement_rule_lines(decisions: CampaignDecisions) -> list[str]:
         ) or 'no shared measured cells'
         lines.append(
             f'- `{name}` blocking complement above the incumbent self-complement maximum '
-            f'({ceiling}) in every trial (at least 3): **{"PASS" if ok else "FAIL"}** ({per_trial})'
+            f'({ceiling}) in every trial (at least {MIN_DECISION_TRIALS}): '
+            f'**{"PASS" if ok else "FAIL"}** ({per_trial})'
         )
     return lines
 
@@ -442,8 +443,8 @@ def format_markdown(arms: list[ArmMetrics], decisions: CampaignDecisions) -> str
     ]
     for a in arms:
         comp = '—' if a.name == decisions.incumbent else (
-            f'{a.complement_count} ({a.complement_share:.1%}) / '
-            f'{a.blocking_complement_count} ({a.blocking_complement_share:.1%})'
+            f'{a.complement_count} ({_fmt(a.complement_share, ".1%")}) / '
+            f'{a.blocking_complement_count} ({_fmt(a.blocking_complement_share, ".1%")})'
         )
         lines.append(
             f'| {a.name} | {a.trials} | {a.reviews} | {a.unmeasured} | {_fmt(a.mean_f1, ".3f")} | '

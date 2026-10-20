@@ -252,26 +252,26 @@ class TestSelfComplementBand:
     def test_fewer_than_two_measured_trials_is_no_band(self, incumbent: list[dict]) -> None:
         band = campaign.self_complement_band(incumbent, BLOCKING_GT)
 
-        assert band.pairs == []
+        assert band.pairs == ()
         assert (band.overall_min, band.overall_max, band.blocking_min, band.blocking_max) == (
             None, None, None, None,
         )
 
 
 def _trial_row(trial: int, blocking_share: float | None, share: float = 0.5) -> dict:
-    """A per-trial complement row out of 100 incumbent matches (none blocking when undefined)."""
-    blocking_matched = 0 if blocking_share is None else 100
+    """A per-trial complement row out of 100 incumbent matches; an undefined blocking share is 0/0."""
     return {
         'trial': trial,
         'complement': round(share * 100), 'incumbent_matched': 100, 'share': share,
-        'blocking_complement': round((blocking_share or 0.03) * 100),
-        'blocking_incumbent_matched': blocking_matched, 'blocking_share': blocking_share,
+        'blocking_complement': 0 if blocking_share is None else round(blocking_share * 100),
+        'blocking_incumbent_matched': 0 if blocking_share is None else 100,
+        'blocking_share': blocking_share,
     }
 
 
 def _band(blocking_max: float | None) -> campaign.SelfComplementBand:
     return campaign.SelfComplementBand(
-        pairs=[], overall_min=0.107, overall_max=0.333,
+        pairs=(), overall_min=0.107, overall_max=0.333,
         blocking_min=None if blocking_max is None else 0.11, blocking_max=blocking_max,
     )
 
@@ -361,7 +361,8 @@ def test_complement_pass_is_decided_against_the_incumbents_self_complement_band(
     assert decisions.self_complement.blocking_max == pytest.approx(1 / 4)
     assert [r['blocking_share'] for r in decisions.complement_by_trial['clears']] == [0.75, 0.4, 0.75]
     assert [r['blocking_share'] for r in decisions.complement_by_trial['noisy']] == [0.5, 0.2, 0.5]
-    assert next(a for a in arms if a.name == 'noisy').complement_share > 0.10
+    noisy_share = next(a for a in arms if a.name == 'noisy').complement_share
+    assert noisy_share is not None and noisy_share > 0.10
     assert decisions.complement_pass == {'noisy': False, 'clears': True}
 
     md = campaign.format_markdown(arms, decisions)
@@ -372,6 +373,7 @@ def test_complement_pass_is_decided_against_the_incumbents_self_complement_band(
     clears_line = next(line for line in lines if line.startswith('- `clears` blocking complement'))
     noisy_line = next(line for line in lines if line.startswith('- `noisy` blocking complement'))
     assert '**PASS**' in clears_line
+    assert f'in every trial (at least {campaign.MIN_DECISION_TRIALS})' in clears_line
     assert '**FAIL**' in noisy_line and 't2 20.0% (1/5)' in noisy_line
     assert not any(line.startswith('- `inc` blocking complement') for line in lines)
     assert 'of incumbent recall' not in md
@@ -394,6 +396,24 @@ def test_an_incumbent_with_one_measured_trial_has_no_band_and_every_candidate_fa
     assert 'fewer than two measured trials' in band_line
     arm_line = next(line for line in lines if line.startswith('- `arm` blocking complement'))
     assert '**FAIL**' in arm_line and 't1 n/a (2/0)' in arm_line
+
+
+def test_an_undefined_pooled_share_is_none_and_reads_n_a_in_the_table_as_in_the_decision_line() -> None:
+    inc = [_rec('inc', 'd1', 1, [('gx', 'blocking')], [], 0.5)]
+    arm = [_rec('arm', 'd1', 1, [('g1', 'blocking'), ('g2', 'blocking')], [], 0.5)]
+
+    arms, decisions = campaign.summarize_campaign(inc + arm, 'inc', BLOCKING_GT)
+
+    by = {a.name: a for a in arms}
+    assert (by['arm'].blocking_complement_count, by['arm'].blocking_incumbent_matched) == (2, 0)
+    assert by['arm'].blocking_complement_share is None
+    assert by['arm'].complement_share == pytest.approx(2.0)
+    assert (by['inc'].complement_share, by['inc'].blocking_complement_share) == (None, None)
+    arm_row = next(
+        line for line in campaign.format_markdown(arms, decisions).splitlines()
+        if line.startswith('| arm |')
+    )
+    assert '| 2 (200.0%) / 2 (n/a) |' in arm_row
 
 
 def _scored(variant: str, diff: str, trial: int, *, br: float, f1: float) -> dict:
