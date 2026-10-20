@@ -8203,6 +8203,23 @@ def _worktree_reader(
     return _read
 
 
+def _worktree_pkg_test_lister(worktree: Path) -> Callable[[str], list[str]]:
+    """Build a ``verify_plan`` ``list_pkg_tests`` seam bound to *worktree*.
+
+    Maps a module prefix to the collectable ``.py`` files under
+    ``worktree/<pkg>/tests`` as worktree-relative POSIX paths. Consumed by the
+    reverse-dependency widening and by ``derive_verify_plan``'s task-role
+    whole-tree guard-family enumeration.
+    """
+    def _list(pkg: str) -> list[str]:
+        tests_dir = worktree / pkg / 'tests'
+        if not tests_dir.is_dir():
+            return []
+        rel_paths = (p.relative_to(worktree).as_posix() for p in tests_dir.rglob('*.py'))
+        return [p for p in rel_paths if verify_plan._is_collectable_test_file(p)]
+    return _list
+
+
 # Maps a PlannedRun's reason-string tool prefix to the ModuleConfig attribute
 # it renders into. Used by _executed_module_configs_from_plan to recover
 # which of test_command/lint_command/type_check_command a PlannedRun belongs
@@ -8535,11 +8552,12 @@ def _reverse_dependency_module_configs(
     scoping branch), not something this helper can close on its own.
 
     Thin impure wrapper around the pure
-    :func:`verify_plan.reverse_dependent_test_targets`: builds a
-    ``list_pkg_tests`` closure (rglobs ``worktree/<pkg>/tests`` for ``.py``
-    files, mapped to worktree-relative POSIX paths, filtered to genuinely
-    pytest-collectable files via ``verify_plan._is_collectable_test_file`` —
-    mirrors how ``derive_verify_plan`` selects collectable tests) and a
+    :func:`verify_plan.reverse_dependent_test_targets`: builds its
+    ``list_pkg_tests`` seam via :func:`_worktree_pkg_test_lister` (rglobs
+    ``worktree/<pkg>/tests`` for ``.py`` files, mapped to worktree-relative
+    POSIX paths, filtered to genuinely pytest-collectable files via
+    ``verify_plan._is_collectable_test_file`` — mirrors how
+    ``derive_verify_plan`` selects collectable tests) and a
     ``read_content`` reader via :func:`_worktree_reader` (threaded with the
     caller's *content_cache*, so a file already read elsewhere this attempt
     is not read from disk twice).
@@ -8570,17 +8588,11 @@ def _reverse_dependency_module_configs(
     survives via ``replace`` so the widened run uses the dependent's normal
     per-module overrides.
     """
-    def _list_pkg_tests(pkg: str) -> list[str]:
-        tests_dir = worktree / pkg / 'tests'
-        if not tests_dir.is_dir():
-            return []
-        rel_paths = (p.relative_to(worktree).as_posix() for p in tests_dir.rglob('*.py'))
-        return [p for p in rel_paths if verify_plan._is_collectable_test_file(p)]
-
     read_content = _worktree_reader(worktree, cache=content_cache)
 
     triggered = verify_plan.reverse_dependent_test_targets(
-        changed_files, verify_plan._REVERSE_TEST_DEPENDENTS, _list_pkg_tests, read_content,
+        changed_files, verify_plan._REVERSE_TEST_DEPENDENTS,
+        _worktree_pkg_test_lister(worktree), read_content,
     )
 
     widened: list[ModuleConfig] = []
@@ -8942,6 +8954,7 @@ async def _run_scoped_verification_body(
                 plan = verify_plan.derive_verify_plan(
                     existing_files, module_configs, config,
                     _worktree_reader(worktree, cache=_content_cache), role=role,
+                    list_pkg_tests=_worktree_pkg_test_lister(worktree),
                 )
                 scoped = _executed_module_configs_from_plan(module_configs, plan)
                 scoped_prefixes = {mc.prefix for mc in scoped}
