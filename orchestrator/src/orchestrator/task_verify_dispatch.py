@@ -8,6 +8,7 @@ downward only: this module must never import ``orchestrator.merge_lane`` or
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -395,7 +396,17 @@ class TaskVerifyDispatcher:
     async def _end_lease(
         self, lease: HostLease, remote: asyncio.Future[VerifyResult] | None,
     ) -> None:
-        await self._pool.release(lease)
+        """Release *lease*; a remote verify still in flight (only on cancellation) is
+        cancelled on its host first, while its dispatch is live (PRD §4.8)."""
+        if remote is None or remote.done():
+            await self._pool.release(lease)
+            return
+        try:
+            await asyncio.shield(self._pool.cancel_and_release(lease))
+        finally:
+            remote.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await remote
 
     async def _scope_of(self, call: _VerifyCall) -> _TaskScope:
         tip = await run_git(['git', 'rev-parse', 'HEAD'], cwd=call.worktree)
