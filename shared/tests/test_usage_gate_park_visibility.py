@@ -50,6 +50,7 @@ import pytest
 from _usage_gate_test_helpers import make_gate
 
 from shared import usage_gate as usage_gate_mod
+from shared.invocation_outcome import AuthFailed, CapHit
 
 LOGGER_NAME = 'shared.usage_gate'
 
@@ -422,6 +423,32 @@ class TestAllCappedParkIsVisible:
             'wrong trains readers to ignore it: '
             f'{[p for _, p in _park_records(caplog)]!r}'
         )
+
+    async def test_the_heartbeat_names_which_accounts_are_capped_and_which_auth_failed(
+        self, caplog, fast_heartbeat
+    ) -> None:
+        """A capped account waits on a reset; an auth-failed one never reopens
+        without an operator. Counted together they read the same."""
+        gate = make_gate(['a', 'b'], auth_reprobe_enabled=False)
+        try:
+            async with gate.invoke_slot() as slot:
+                slot.report(CapHit(
+                    resets_at=datetime.now(UTC) + timedelta(hours=5), reason='test cap',
+                ))
+            async with gate.invoke_slot() as slot:
+                slot.report(AuthFailed(status=401))
+            assert gate.is_paused, 'fixture must actually be parked'
+            fast_heartbeat(0.02)
+
+            await _park_for(gate, 0.1)
+        finally:
+            await gate.shutdown()
+
+        records = _park_records(caplog)
+        assert records, 'no heartbeat emitted — cannot assert what it names'
+        _, payload = records[0]
+        assert payload.get('capped_accounts') == ['a'], payload
+        assert payload.get('auth_failed_accounts') == ['b'], payload
 
     async def test_the_heartbeat_survives_a_non_serialisable_reset_time(
         self, caplog, fast_heartbeat, monkeypatch
