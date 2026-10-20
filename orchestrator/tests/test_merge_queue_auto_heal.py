@@ -1253,7 +1253,7 @@ class TestAutoHealHaltOwnerSurvivesOwnBlock:
         async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
             request.result.set_result(outcome)
 
-        with patch('orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue):
+        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
             asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
             )
