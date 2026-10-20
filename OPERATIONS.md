@@ -1161,16 +1161,20 @@ A remote verify host leaves the pool in one of three classes, shown per host
 as `quarantine_class` in the `get_merge_queue()` snapshot (with `kind`,
 `sticky` and `identity`):
 
-- **`ru`**: unreachable (`ssh true` fails; a streak of `RunnerUnavailable`
-  or a long outage). Re-probed by `ssh <host> true`; a pass re-admits it.
+- **`ru`**: unreachable (`kind` `transport`): the ssh client itself failed
+  (rc 255), or a push could not connect to the host or lost it mid-push (a
+  laptop going to sleep). Re-probed by `ssh <host> true`; a pass re-admits it.
 - **`skew`**: reached, but it could not run this dispatcher's gate, or a
   verify there produced no usable verdict (`kind` is `gate`, `unparseable`,
-  `no_verdict` or `wire_shape`). Re-probed by the full `ensure-gate`
+  `no_verdict` or `wire_shape`); a push the host refused, or any non-zero
+  exit of a command it ran, is `gate`. Re-probed by the full `ensure-gate`
   (publish the deployed commit, build or reuse the gate checkout, identity
   handshake); a pass re-admits it. A `wire_shape` bench carries both gate
   identities (`code_sha` and wire fingerprint, local and remote) in
   `identity`. Its L1 is category `verify_host_skew`, sentinel
-  `__verify_host_skew__<host>@<sha>`, and is resolved on re-admission.
+  `__verify_host_skew__<host>` (the deployed commit is in its detail), and is
+  resolved on re-admission; a restarted orchestrator resolves the one its
+  predecessor left open.
 - **`divergence`**: held after a local/remote verdict divergence. It has no
   stored reason today and is cleared only by an operator.
 
@@ -1185,7 +1189,8 @@ The operator clear is the escalation MCP tool
 (use it once the cause is fixed), resolves the open unreachability and skew
 L1s, and returns `{host, cleared, quarantine_class, was_sticky}`. A PARKED
 slot is still freed only after a clean probe shows no stale verify running
-there. The per-commit sticky count survives a clear; a restart resets it.
+there. Like a restart, a clear resets the host's per-commit sticky count, so
+its next skew bench is a first one again.
 
 **When an L1 names the shim** ("the orchestrator shim on the verify host does
 not honour ORCH_GATE_BIN"): the host's `/usr/local/bin/orchestrator` wrapper

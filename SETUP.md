@@ -872,8 +872,9 @@ Four operator-facing facts:
 - **The gate builder runs `uv sync --all-packages`; it does not run
   `npm ci`.** A commit that bumps `package-lock.json` still needs the Node-installed tools provisioned on the host ("Provisioning
   the remote host" above). Gate directories are built on first use of a
-  commit (about a second warm, a minute cold), are never written after they
-  are marked ready, and are reaped when idle for 7 days (trash after 1 day)
+  commit (about a second warm, a minute cold), are marked ready only once
+  their own binary answers the handshake for their commit, are never written
+  after that, and are reaped when idle for 7 days (leftover trash after 1 day)
   by a detached sweep launched at most hourly per orchestrator process (never against a benched host) that touches only a root carrying the
   `.dark-factory-gate-root` marker. The dispatcher emits `runner_stale` then
   `runner_synced` (kind `gate_checkout`) when it had to build one.
