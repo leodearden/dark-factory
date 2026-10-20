@@ -2489,7 +2489,8 @@ def _assert_scoped_targets_invariant(plan, files: list[str], label: str) -> None
        SKIPPED/TRIVIAL never ran.
     2. **No invented paths** — the record is always a subset of the diff it
        was derived from, so it can never drift into naming a file the plan
-       never saw.
+       never saw. (These sweeps pass no ``list_pkg_tests``; with one, the
+       task-role floor also records the guard-family modules it enumerated.)
     3. **D3 stays intact** — the key serialises JSON-natively and the whole
        plan dict survives a JSON round-trip unchanged, which is what actually
        reaches ``VerifyResult.plan``.

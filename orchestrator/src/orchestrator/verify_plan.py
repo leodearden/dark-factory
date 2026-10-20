@@ -885,8 +885,8 @@ def _derive_module_runs(
     #      -> FULL_SUITE, the task-3494 arm. It sits BELOW arms 1-3 so those
     #      never reach it (arm 3 runs the same probe over its own selection),
     #      and it is a sub-branch of arm 4 rather than a peer because it fires
-    #      only on the selection arm 4 would otherwise emit. See the MARKER DESELECTION
-    #      paragraph in this function's docstring.
+    #      only on the selection arm 4 would otherwise emit. See the MARKER
+    #      DESELECTION paragraph in this function's docstring.
     #   4b. collectable tests     -> FILE_SCOPED to them
     #   5. otherwise             -> an explicit reasoned SKIPPED (the task-1852
     #      "not silent" requirement: never a dropped command)
