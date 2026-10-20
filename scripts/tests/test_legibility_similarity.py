@@ -5,6 +5,7 @@ run builds, its codebook transforms, its report section and its queue CLI
 from __future__ import annotations
 
 import copy
+import json
 import math
 
 import pytest
@@ -582,3 +583,107 @@ class TestAdjudicateMembers:
 
         with pytest.raises(ValueError, match='cand-20260801-1.*pending'):
             similarity.adjudicate_members(verified, offered)
+
+
+class TestAdjudicationReport:
+    _VECTORS = {
+        'Entry A': _angle(0), 'Near': _angle(10), 'Novel near': _angle(15),
+        'Older member': _angle(90), 'Representative': _angle(95), 'Alone': _angle(180),
+    }
+
+    def _cb(self) -> dict:
+        return _codebook(
+            entries=[_entry('entry-a', 'Entry A')],
+            candidates=[
+                _candidate('cand-20260801-1', 'Near', cause=None, sessions=('s-1',)),
+                _candidate('cand-20260801-2', 'Older member', cause=None, sessions=('s-2',)),
+                _candidate('cand-20260805-1', 'Representative', cause=None, first_seen='2026-08-05',
+                           sessions=('s-3',)),
+                _candidate('cand-20260801-3', 'Alone', cause=None, sessions=('s-4',)),
+            ],
+        )
+
+    def _report(self, tmp_path, *, inconclusive=None):
+        cb = self._cb()
+        view, _ = _view(tmp_path, cb, [_novel('Novel near', cause=None, session='s-novel')], vectors=self._VECTORS)
+        merged = copy.deepcopy(cb)
+        merged['candidates'].append(_candidate('cand-20261020-1', 'Novel near', cause=None,
+                                               first_seen='2026-10-20', sessions=('s-novel',)))
+        merged, attached = similarity.attach(merged, view, run_id=_RUN)
+        offered = view.select(1)
+        if inconclusive is None:
+            _by_id(merged, offered[0].representative.key)['disposition'] = 'rejected'
+        merged, adjudicated = similarity.adjudicate_members(merged, offered)
+        return similarity.AdjudicationReport(view, attached, offered, adjudicated, inconclusive), view
+
+    def test_the_record_is_json_safe_and_complete(self, tmp_path):
+        report, view = self._report(tmp_path)
+
+        record = report.to_record()
+
+        assert json.loads(json.dumps(record)) == record
+        assert record['model'] == 'text-embedding-3-small'
+        assert record['thresholds'] == {'attach_min_similarity': 0.90, 'cluster_min_similarity': 0.85}
+        assert record['max_clusters_per_run'] == 10
+        assert record['skipped'] is None
+        assert record['embedding'] == {
+            'requests': view.requests, 'embedded': view.embedded, 'cached': view.cached, 'pruned': view.pruned,
+        }
+        assert record['queue_depth'] == {'candidates': 3, 'clusters': 2}
+        assert record['processed'] == [{
+            'representative': 'cand-20260805-1',
+            'title': 'Representative',
+            'members': ['cand-20260801-2', 'cand-20260805-1'],
+            'sessions': 2,
+            'outcome': 'rejected',
+        }]
+        assert [
+            (row['candidate_id'], row['title'], row['entry_id'], row['novel']) for row in record['attached']
+        ] == [('cand-20260801-1', 'Near', 'entry-a', False), ('cand-20261020-1', 'Novel near', 'entry-a', True)]
+        assert all(isinstance(row['score'], float) for row in record['attached'])
+        assert record['inconclusive'] is None
+
+    def test_counts_are_attaches_and_candidates_the_queue_adjudicated(self, tmp_path):
+        report, _ = self._report(tmp_path)
+
+        assert report.counts() == {'attached': 2, 'adjudicated': 2}
+
+    def test_an_inconclusive_queue_adjudicates_nothing(self, tmp_path):
+        report, _ = self._report(tmp_path, inconclusive='headroom exhausted: cap banner')
+
+        record = report.to_record()
+
+        assert record['inconclusive'] == 'headroom exhausted: cap banner'
+        assert [row['outcome'] for row in record['processed']] == ['inconclusive']
+        assert report.counts() == {'attached': 2, 'adjudicated': 0}
+        assert any('headroom exhausted: cap banner' in line for line in similarity.report_lines(record))
+
+    def test_report_lines_state_the_run_and_audit_every_attach(self, tmp_path):
+        report, _ = self._report(tmp_path)
+        record = report.to_record()
+
+        lines = similarity.report_lines(record)
+
+        assert lines[:3] == ['', '## Adjudication', '']
+        text = '\n'.join(lines)
+        assert 'text-embedding-3-small' in text
+        assert '0.9' in text and '0.85' in text
+        assert any('3' in line and '2' in line and 'queue depth' in line for line in lines)
+        assert any('processed' in line and '1 cluster' in line and '2 candidate' in line for line in lines)
+        for row in record['attached']:
+            [audit] = [line for line in lines if row['candidate_id'] in line and 'similarity' in line]
+            assert '"' + row['title'] + '"' in audit
+            assert row['entry_id'] in audit
+            assert f"{row['score']:.4f}" in audit
+
+    def test_a_skipped_record_says_why_and_that_nothing_happened(self):
+        view = similarity.View.skipped_by('embeddings endpoint answered HTTP 503', 1, _SETTINGS)
+        record = similarity.AdjudicationReport(view, (), (), (), None).to_record()
+
+        assert record['skipped'] == 'embeddings endpoint answered HTTP 503'
+        assert record['queue_depth'] is None
+        assert record['embedding']['requests'] == 1
+        lines = similarity.report_lines(record)
+        [skipped] = [line for line in lines if 'HTTP 503' in line]
+        assert 'no similarity attach' in skipped
+        assert 'no queue adjudication' in skipped
