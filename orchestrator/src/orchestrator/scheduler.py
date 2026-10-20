@@ -842,6 +842,7 @@ class McpSessionLike(Protocol):
         self,
         name: str,
         arguments: dict,
+        *,
         timeout: float = ...,
     ) -> dict: ...
 
