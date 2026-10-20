@@ -20,13 +20,15 @@ UNSPECIFIED = 'unspecified'
 
 def review_completed_payload(cycle: int, reviews: ReviewAggregation) -> dict[str, object]:
     issues = (*reviews.blocking_issues, *reviews.suggestions)
+    kind_readings = [issue_kind_of(issue) for issue in issues]
     return {
         'cycle': cycle,
         'has_blocking_issues': reviews.has_blocking_issues,
         'blocking_count': len(reviews.blocking_issues),
         'suggestion_count': len(reviews.suggestions),
         'by_category': _tally(_category_of(issue) for issue in issues),
-        'by_kind': _tally(_kind_of(issue) for issue in issues),
+        'by_kind': _tally(reading.kind.value for reading in kind_readings),
+        'kind_flagged': sum(reading.flagged for reading in kind_readings),
         'reviewer_count': len(reviews.reviews),
         'reviewer_errors': len(reviews.reviewer_errors),
     }
@@ -39,8 +41,3 @@ def _tally(keys: Iterable[str]) -> dict[str, int]:
 def _category_of(issue: dict) -> str:
     category = issue.get('category')
     return category if isinstance(category, str) and category else UNSPECIFIED
-
-
-def _kind_of(issue: dict) -> str:
-    reading = issue_kind_of(issue)
-    return UNSPECIFIED if reading.flagged else reading.kind.value

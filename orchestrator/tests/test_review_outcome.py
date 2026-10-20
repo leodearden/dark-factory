@@ -55,7 +55,8 @@ def test_payload_is_exactly_the_counts_of_the_aggregation():
         'blocking_count': 1,
         'suggestion_count': 2,
         'by_category': {'category-b1': 1, 'category-s1': 1, 'category-s2': 1},
-        'by_kind': {UNSPECIFIED: 3},
+        'by_kind': {'defect': 3},
+        'kind_flagged': 3,
         'reviewer_count': 2,
         'reviewer_errors': 0,
     }
@@ -74,12 +75,13 @@ def test_clean_pass_has_zero_counts_and_empty_tallies():
         'suggestion_count': 0,
         'by_category': {},
         'by_kind': {},
+        'kind_flagged': 0,
         'reviewer_count': 0,
         'reviewer_errors': 0,
     }
 
 
-def test_by_kind_counts_recognised_kinds_and_folds_the_rest_into_unspecified():
+def test_by_kind_keeps_the_accessors_defect_reading_and_counts_flagged_kinds():
     reviews = _aggregation(
         [_issue('a', 'blocking', kind='defect')],
         [
@@ -92,7 +94,8 @@ def test_by_kind_counts_recognised_kinds_and_folds_the_rest_into_unspecified():
 
     payload = _stored_payload(1, reviews)
 
-    assert payload['by_kind'] == {'defect': 1, 'docs': 2, UNSPECIFIED: 2}
+    assert payload['by_kind'] == {'defect': 3, 'docs': 2}
+    assert payload['kind_flagged'] == 2
     assert list(payload['by_kind']) == sorted(payload['by_kind'])
 
 
