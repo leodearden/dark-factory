@@ -59,6 +59,11 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
+
+# A flat sibling in scripts/, found because a directly executed script puts its
+# own directory at sys.path[0]; never run this file via `python -m` or `-I`.
+from _watched_module_removals import removals_since
 
 # (port, systemd unit name) pairs to watch.  Port values match each
 # orchestrator's configured escalation.port (guarded by the drift test in
@@ -205,6 +210,19 @@ try:
     ORCH_RESTART_MIN_INTERVAL_SECS = int(os.environ["ORCH_RESTART_MIN_INTERVAL_SECS"])
 except (KeyError, ValueError):
     ORCH_RESTART_MIN_INTERVAL_SECS = 259200
+
+# Watched trees whose .py removal arms a ModuleNotFoundError in every running
+# orchestrator; shared/src/ is added because the fleet imports shared.
+MODULE_REMOVAL_WATCHED_PATHS = [*WATCHED_PATHS, "shared/src/"]
+
+# Bounds how long a removal of one of those modules may wait, after it first
+# lands on main, before the staleness backstop redeploys the fleet ahead of
+# the clock gates above (task 7198; rationale in OPERATIONS.md section 8).
+# Same env-with-default idiom as STALENESS_GRACE_SECS.
+try:
+    MODULE_REMOVAL_GRACE_SECS = int(os.environ["ORCH_MODULE_REMOVAL_GRACE_SECS"])
+except (KeyError, ValueError):
+    MODULE_REMOVAL_GRACE_SECS = 600
 
 # Provenance recorded in every clock this script stamps (task 4823). These
 # MIRROR df_pytest_isolation.py::CLOCK_PROVENANCE_SOURCE_KEY /
@@ -1109,10 +1127,12 @@ def _unit_active_enter_epoch(unit: str) -> int | None:
         return None
 
 
-def _newest_watched_commit_epoch() -> int | None:
-    """Return the newest committer epoch touching WATCHED_PATHS on HEAD, or None.
+def _newest_watched_commit_epoch(paths: list[str] | None = None) -> int | None:
+    """Return the newest committer epoch touching *paths* on HEAD, or None.
 
-    Runs ``git -C REPO_DIR log -1 --format=%ct HEAD -- <WATCHED_PATHS>``.
+    Runs ``git -C REPO_DIR log -1 --format=%ct HEAD -- <paths>``. *paths*
+    defaults to WATCHED_PATHS, read at call time; _module_removal_staleness_mode
+    passes MODULE_REMOVAL_WATCHED_PATHS.
     Committer time approximates landing time (the merge queue rebases
     immediately before merging; direct-to-main commits are committed at
     landing) — file mtimes are rejected as a source since they drift under
@@ -1136,7 +1156,7 @@ def _newest_watched_commit_epoch() -> int | None:
                 "--format=%ct",
                 "HEAD",
                 "--",
-                *WATCHED_PATHS,
+                *(WATCHED_PATHS if paths is None else paths),
             ],
             capture_output=True,
             text=True,
@@ -1613,6 +1633,66 @@ def _within_fleet_staleness_head_start() -> bool:
         ORCH_RESTART_MIN_INTERVAL_SECS + STALENESS_GRACE_SECS,
         _read_last_fleet_deploy_epoch,
     )
+
+
+class _BucketedWarnings:
+    """A ``logger`` whose warnings reach the journal only in the skip-line emit slot.
+
+    The module-removal probe runs on every tick a fleet clock gate holds, which
+    is most ticks of the whole min-interval, so an unthrottled persistent git
+    failure would journal a WARNING every 60s for days. Same bucket as the
+    skip lines: see SKIP_LOG_INTERVAL_SECS.
+    """
+
+    def warning(self, msg: str) -> None:
+        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+            logger.warning(msg)
+
+
+_bucketed_logger = _BucketedWarnings()
+
+
+def _oldest_enabled_unit_start() -> int | None:
+    """Return the earliest start epoch among the units staleness_pass can flag, or None.
+
+    Those are the running, enabled orchestrator units with a determinable
+    start epoch. A unit whose probe raises is left out, which can only move
+    the result later.
+    """
+    starts: list[int] = []
+    for unit in _enumerate_running_units():
+        try:
+            if is_unit_enabled(unit) and (start := _unit_start_epoch(unit)) is not None:
+                starts.append(start)
+        except Exception as exc:
+            _bucketed_logger.warning(
+                f"module-removal anchor: start probe for {unit} raised {exc!r}; leaving it out"
+            )
+    return min(starts, default=None)
+
+
+def _due_module_removals() -> tuple[str, ...]:
+    """Return the removed watched modules that now waive the fleet clock gates, or ().
+
+    Non-empty only when watched .py files on the mainline when the oldest
+    flaggable unit started (_oldest_enabled_unit_start) are absent at HEAD,
+    and MODULE_REMOVAL_GRACE_SECS has passed since the first mainline commit
+    that removed one of them landed. Anchored on that unit, not on the
+    fleet-deploy clock: the clock is stamped when a sweep finishes, so a
+    removal landing mid-sweep predates it while the units restarted before
+    the removal still run its callers. Fails toward no waiver: no such unit
+    returns () without running git, and a failed probe returns () after a
+    bucketed WARNING. Rationale: OPERATIONS.md section 8.
+    """
+    oldest_start = _oldest_enabled_unit_start()
+    if oldest_start is None:
+        return ()
+    removals = removals_since(
+        REPO_DIR, oldest_start, MODULE_REMOVAL_WATCHED_PATHS, _bucketed_logger
+    )
+    if removals is None or time.time() - removals.first_landed < MODULE_REMOVAL_GRACE_SECS:
+        return ()
+    return removals.paths
 
 
 def _read_last_fm_deploy_epoch() -> float | None:
@@ -2508,6 +2588,101 @@ def _delegate_fm_restart() -> None:
     )
 
 
+def _fleet_clock_hold() -> str | None:
+    """Return the skip line of the fleet clock gate holding staleness_pass, or None.
+
+    The min-interval cap is checked first; the coordinator head start
+    (_within_fleet_staleness_head_start, task 4754) takes its own second clock
+    read only on ticks the cap let through, so each gate keeps its named
+    reader seam. The caller throttles the line to the SKIP_LOG_INTERVAL_SECS
+    bucket; that constant's comment explains why a head start still emits.
+    """
+    if _within_fleet_deploy_min_interval():
+        return (
+            "skip: within fleet-deploy min-interval "
+            f"({ORCH_RESTART_MIN_INTERVAL_SECS}s) since last deploy"
+        )
+    if _within_fleet_staleness_head_start():
+        return (
+            f"skip: holding the {STALENESS_GRACE_SECS}s coordinator head start "
+            "since the fleet-deploy min-interval opened"
+        )
+    return None
+
+
+def _describe_removed_modules(removed: tuple[str, ...], shown: int = 5) -> str:
+    """Render *removed* for the journal: the first *shown* paths, then a count of the rest."""
+    rest = len(removed) - shown
+    return ", ".join(removed[:shown]) + (f" (+{rest} more)" if rest > 0 else "")
+
+
+@dataclass(frozen=True)
+class _StalenessMode:
+    """How one staleness_pass tick proceeds once the fleet clock gates let it through.
+
+    newest_commit_epoch reads the commit units are measured against;
+    honours_commit_grace says whether that commit's STALENESS_GRACE_SECS
+    still applies; waives_held_cap is asked when the min-interval cap is
+    found held just before delegating, and True lets the delegation cross it.
+    """
+
+    newest_commit_epoch: Callable[[], int | None]
+    honours_commit_grace: bool
+    waives_held_cap: Callable[[], bool]
+    delegation_line: str
+
+
+def _routine_staleness_mode() -> _StalenessMode:
+    return _StalenessMode(
+        newest_commit_epoch=_newest_watched_commit_epoch,
+        honours_commit_grace=True,
+        waives_held_cap=lambda: False,
+        delegation_line=(
+            "delegating fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain"
+        ),
+    )
+
+
+def _module_removal_staleness_mode(removed: tuple[str, ...]) -> _StalenessMode:
+    """The mode for a tick a clock gate holds but a due module removal waives (task 7198).
+
+    Units are measured against MODULE_REMOVAL_WATCHED_PATHS, the commit grace
+    is waived, and a cap found held just before delegating is crossed only
+    while a fresh probe still finds the removal due: a sweep that restarted
+    the units mid-pass has already covered it.
+    """
+    return _StalenessMode(
+        newest_commit_epoch=lambda: _newest_watched_commit_epoch(MODULE_REMOVAL_WATCHED_PATHS),
+        honours_commit_grace=False,
+        waives_held_cap=lambda: bool(_due_module_removals()),
+        delegation_line=(
+            "delegating fleet-wide module-removal redeploy to "
+            "restart-all-orchestrators.sh --drain ahead of the fleet-deploy "
+            "clock gates; removed since the oldest running unit started: "
+            f"{_describe_removed_modules(removed)}"
+        ),
+    )
+
+
+def _staleness_mode() -> _StalenessMode | None:
+    """Return how this tick proceeds past the fleet clock gates, or None while they hold it.
+
+    The module-removal probe runs only on a tick a gate holds. A held tick
+    with nothing due logs the holding gate's skip line, throttled to the
+    SKIP_LOG_INTERVAL_SECS bucket on wall-clock time (not
+    elapsed-since-deploy): the gate CHECK still runs every tick.
+    """
+    hold = _fleet_clock_hold()
+    if hold is None:
+        return _routine_staleness_mode()
+    removed = _due_module_removals()
+    if removed:
+        return _module_removal_staleness_mode(removed)
+    if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+        log(hold)
+    return None
+
+
 def staleness_pass() -> None:
     """Restart any running orchestrator unit stale w.r.t. the newest watched commit.
 
@@ -2580,6 +2755,12 @@ def staleness_pass() -> None:
     site for the measured width of the window and why the second read is not
     rate-limited.
 
+    Module-removal waiver (task 7198): on a tick where a clock gate holds, a
+    watched .py module removed since the oldest flaggable unit started waives
+    both clock gates and the commit grace, never the lease. _staleness_mode
+    resolves which mode the tick runs in; see _module_removal_staleness_mode,
+    _due_module_removals and OPERATIONS.md section 8.
+
     Delegation (task 2396): once ANY eligible unit is found stale, the
     per-unit loop below no longer restarts it directly — instead the whole
     fleet-wide restart is delegated ONCE, after the loop, to
@@ -2591,31 +2772,8 @@ def staleness_pass() -> None:
     because a unit mid-restart is indistinguishable from a wedged one to a
     port probe. Every other unit, and every other tick, is unchanged.
     """
-    if _within_fleet_deploy_min_interval():
-        # Bucket on wall-clock time (not elapsed-since-deploy) — see
-        # SKIP_LOG_INTERVAL_SECS above.
-        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
-            log(
-                "skip: within fleet-deploy min-interval "
-                f"({ORCH_RESTART_MIN_INTERVAL_SECS}s) since last deploy"
-            )
-        return
-
-    # This gate takes a SECOND small-JSON clock read, on exactly those ticks
-    # where the min-interval gate above has already expired and let the tick
-    # through (a blocked tick returns above and never reaches here). That
-    # second read is deliberate: each gate keeps its own named reader seam
-    # rather than threading one epoch through both (task 4754).
-    if _within_fleet_staleness_head_start():
-        # Same bucket idiom as the gate above: the gate CHECK still runs every
-        # tick, only the log EMISSION is throttled. This window is exactly one
-        # bucket period long — see SKIP_LOG_INTERVAL_SECS for why that still
-        # emits (twice, measured), and what would break it.
-        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
-            log(
-                f"skip: holding the {STALENESS_GRACE_SECS}s coordinator head start "
-                "since the fleet-deploy min-interval opened"
-            )
+    mode = _staleness_mode()
+    if mode is None:
         return
 
     lease = _live_fleet_lease()
@@ -2631,10 +2789,10 @@ def staleness_pass() -> None:
             )
         return
 
-    commit_epoch = _newest_watched_commit_epoch()
+    commit_epoch = mode.newest_commit_epoch()
     if commit_epoch is None:
         return  # undeterminable — fall safe, no restarts this tick
-    if time.time() - commit_epoch < STALENESS_GRACE_SECS:
+    if mode.honours_commit_grace and time.time() - commit_epoch < STALENESS_GRACE_SECS:
         # RETAINED second anchor (task 4754 decision 1): the head start is
         # the LATER of "since the min-interval window opened" (gate above) and
         # "since the newest watched commit". Gates on the newest commit's age
@@ -2686,7 +2844,7 @@ def staleness_pass() -> None:
         # reached only when a stale unit was genuinely found, so it is rare
         # and highly actionable — and a race we declined to take is exactly
         # the evidence an operator needs to explain a missing redeploy.
-        if _within_fleet_deploy_min_interval():
+        if _within_fleet_deploy_min_interval() and not mode.waives_held_cap():
             log(
                 "skip: the fleet-deploy clock was stamped while this pass was "
                 "probing units; another tier got there first"
@@ -2699,7 +2857,7 @@ def staleness_pass() -> None:
                 f"units (lease {_describe_lease(lease)})"
             )
             return
-        log("delegating fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain")
+        log(mode.delegation_line)
         _delegate_fleet_restart()
 
 
