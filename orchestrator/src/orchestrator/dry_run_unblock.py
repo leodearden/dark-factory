@@ -252,15 +252,12 @@ def _task_context(task: dict[str, Any] | None) -> _TaskContext:
     return _TaskContext('\n'.join(lines), False)
 
 
-# Read-only tools the dry-run agent is allowed to use.
-# Bash(pytest:*) and Bash(cargo:*) are intentionally omitted: both can
-# write .pyc/__pycache__/target/ files or fetch from the network, which
-# contradicts the read-only safety contract advertised in SKILL.md.
-# The agent can read existing test output from .task/iterations.jsonl instead.
-# Explicit read-only git subcommands instead of a wildcard — Bash(git:*) would
-# permit mutating subcommands (commit, push, reset, checkout, restore, clean)
-# which contradict the read-only contract for this autonomous, no-human-
-# checkpoint invocation where the threat profile is higher than interactive use.
+# The investigation's enforced envelope: it runs under --permission-mode
+# dontAsk, so the CLI denies, without a prompt, any tool call no allow rule
+# admits. Every entry is therefore a grant, and each must be read-only.
+# Bash(pytest:*) and Bash(cargo:*) are omitted: both write build artefacts or
+# fetch from the network. Git is granted per read-only subcommand, never as a
+# wildcard and never `git branch`, which creates and deletes refs.
 _ALLOWED_TOOLS: list[str] = [
     'Read',
     'Glob',
@@ -270,19 +267,18 @@ _ALLOWED_TOOLS: list[str] = [
     'Bash(git status:*)',
     'Bash(git show:*)',
     'Bash(git rev-parse:*)',
-    'Bash(git branch:*)',
     'Bash(git ls-files:*)',
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
 ]
 
-# Mutating tools explicitly blocked.
-# Defence-in-depth: list the most dangerous git mutations alongside the
-# write-capable MCP tools so the allowlist and denylist are consistent.
+# Defence-in-depth against allow rules the CLI merges from ambient settings
+# files: a deny rule beats an allow rule wherever it came from.
 _DISALLOWED_TOOLS: list[str] = [
     'Edit',
     'Write',
+    'NotebookEdit',
     'Bash(git commit:*)',
     'Bash(git push:*)',
     'Bash(git reset:*)',
@@ -513,6 +509,7 @@ async def run_dry_run_unblock(
                 model=decision.model,
                 max_turns=decision.max_turns,
                 max_budget_usd=decision.budget_usd,
+                permission_mode='dontAsk',
                 allowed_tools=_ALLOWED_TOOLS,
                 disallowed_tools=_DISALLOWED_TOOLS,
                 mcp_config=mcp_config,
