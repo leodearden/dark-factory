@@ -59,6 +59,7 @@ from collections.abc import (
     Collection,
     Iterable,
     Mapping,
+    Sequence,
 )
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -154,6 +155,18 @@ PushResult = Literal['pushed', 'noop', 'rejected', 'error']
 # Return type for recover_red_main — distinguishes a successful CAS move
 # from an atomic abort (another writer beat us to the ref).
 RecoverResult = Literal['rewound', 'cas_failed', 'error']
+
+
+# How GitOps._find_replay matched a replayed commit: the exact patch-id tier,
+# or the unique exact-subject fallback.
+ReplayMatch = Literal['patch-id', 'subject']
+
+
+class RebasedCitation(TypedDict):
+    """GitOps.resolve_rebased_citation's answer: the commit on main a cited SHA landed as."""
+    landed: str
+    subject: str
+    method: ReplayMatch
 
 
 # Return type for remove_merge_worktree_guarded — the C1 lease-enforced
@@ -11875,35 +11888,8 @@ class GitOps:
         replayed commit so :meth:`TaskWorkflow._reconcile_done_step_commits`
         can re-point the plan step to it instead of escalating.
 
-        Two tiers, tried in order:
-
-        1. **patch-id** (exact): compute *target_sha*'s patch-id
-           (``git log -p -1 --no-color`` piped to ``git patch-id --stable``)
-           and look it up in a ``{patch-id: sha}`` map built the same way over
-           ``base_sha..HEAD``. ``git patch-id --stable`` hashes the normalized
-           diff hunks, so a clean replay reproduces byte-identical hunks and an
-           identical patch-id — the canonical, whitespace/line-number-robust
-           equivalence the ``git cherry`` dedup in
-           :meth:`rebase_preserving_task_commits` also relies on. Using the
-           identical diff-emitting command (``git log -p``) for both the single
-           target and the range guarantees both sides are normalized by the
-           same code path. The ``<patch-id> <sha>`` line the range form emits
-           maps the shared patch-id to the REPLAYED (HEAD-side) sha, which is
-           exactly the remap target. If TWO commits in ``base_sha..HEAD`` share
-           a patch-id (a diff reverted then re-applied, or genuinely identical
-           hunks), that patch-id is ambiguous — we cannot tell which sha the
-           orphan replayed onto — so it is skipped rather than resolved to an
-           arbitrary one of them, the same 'never guess' posture tier 2 applies
-           to an ambiguous subject.
-        2. **unique exact-subject** (fallback): when the patch-id lookup
-           misses — e.g. a rebase that resolved a conflict altered the diff
-           but preserved the commit message — recover the replayed sha only if
-           EXACTLY ONE commit in ``base_sha..HEAD`` shares *target_sha*'s
-           subject (the ``%H\\x1f%s`` idiom from :meth:`get_commit_subjects`,
-           ``\\x1f``-split because subjects may contain colons/punctuation). An
-           ambiguous subject (two or more matches) or no match returns
-           ``None`` — the method fails toward the caller's escalation, never
-           toward a wrong re-point.
+        The search over ``base_sha..HEAD`` is :meth:`_find_replay`'s two
+        tiers (patch-id, then unique exact subject), unnarrowed.
 
         Fully fail-safe: any git error, an unresolvable/GC'd *target_sha*, or
         empty patch-id output yields ``None``, letting the caller fall through
@@ -11914,75 +11900,8 @@ class GitOps:
         posture as :meth:`get_commit_subjects` / :meth:`get_commit_changed_files`.
         """
         try:
-            # Tier 1: patch-id equivalence. Compute the orphaned target's
-            # patch-id from its own diff.
-            rc, target_diff, _ = await _run(
-                ['git', 'log', '-p', '-1', '--no-color', target_sha], cwd=worktree,
-            )
-            if rc != 0 or not target_diff.strip():
-                return None
-            _, target_pid_out, _ = await _run(
-                ['git', 'patch-id', '--stable'], cwd=worktree, input_text=target_diff,
-            )
-            target_pid = target_pid_out.split()[0] if target_pid_out.strip() else None
-
-            # Build the {patch-id: sha} map over base..HEAD (the live branch).
-            rc, range_diff, _ = await _run(
-                ['git', 'log', '-p', '--no-color', f'{base_sha}..HEAD'], cwd=worktree,
-            )
-            if rc == 0 and range_diff.strip():
-                _, range_pid_out, _ = await _run(
-                    ['git', 'patch-id', '--stable'], cwd=worktree, input_text=range_diff,
-                )
-                pid_to_sha: dict[str, str] = {}
-                ambiguous_pids: set[str] = set()
-                for line in range_pid_out.splitlines():
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        pid = parts[0]
-                        if pid in pid_to_sha:
-                            # Two commits in base..HEAD share a patch-id (a
-                            # diff reverted then re-applied, or genuinely
-                            # identical hunks). We cannot know which one the
-                            # orphaned step replayed onto, so mark the patch-id
-                            # ambiguous and fall through — the same 'never
-                            # guess' posture tier 2 applies to an ambiguous
-                            # subject, rather than silently keeping whichever
-                            # colliding sha the dict happens to retain.
-                            ambiguous_pids.add(pid)
-                        pid_to_sha[pid] = parts[1]
-                if (
-                    target_pid
-                    and target_pid in pid_to_sha
-                    and target_pid not in ambiguous_pids
-                ):
-                    return pid_to_sha[target_pid]
-
-            # Tier 2: unique exact-subject fallback. Only fires when the
-            # patch-id lookup missed; recovers the replayed sha only when
-            # exactly ONE commit in base..HEAD shares the target's subject, so
-            # we never mis-point a step whose subject two replayed commits
-            # happen to share (e.g. a generic "feat: GREEN — implementation").
-            rc, target_subject, _ = await _run(
-                ['git', 'log', '-1', '--format=%s', target_sha], cwd=worktree,
-            )
-            if rc != 0 or not target_subject.strip():
-                return None
-            rc, subj_out, _ = await _run(
-                ['git', 'log', '--format=%H\x1f%s', f'{base_sha}..HEAD'], cwd=worktree,
-            )
-            if rc != 0 or not subj_out.strip():
-                return None
-            subject_matches: list[str] = []
-            for line in subj_out.splitlines():
-                if not line.strip():
-                    continue
-                sha, _, subject = line.partition('\x1f')
-                if subject == target_subject:
-                    subject_matches.append(sha)
-            if len(subject_matches) == 1:
-                return subject_matches[0]
-            return None
+            match = await self._find_replay(worktree, target_sha, f'{base_sha}..HEAD')
+            return match[0] if match is not None else None
         except Exception:
             # Fully fail-safe: any git error / unresolvable target yields None so
             # the caller falls through to its existing escalation path. Log at
@@ -11991,6 +11910,190 @@ class GitOps:
                 'find_equivalent_commit failed for target_sha=%s base_sha=%s '
                 'in %s; returning None (caller will fall through to escalation)',
                 target_sha, base_sha, worktree, exc_info=True,
+            )
+            return None
+
+    async def _find_replay(
+        self,
+        cwd: Path,
+        target_sha: str,
+        rev_range: str,
+        *,
+        paths: Sequence[str] | None = None,
+    ) -> tuple[str, ReplayMatch] | None:
+        """The commit in *rev_range* that *target_sha* was replayed onto, and how it matched.
+
+        Two tiers, tried in order:
+
+        1. **patch-id** (exact): compute *target_sha*'s patch-id
+           (``git log -p -1 --no-color`` piped to ``git patch-id --stable``)
+           and look it up in a ``{patch-id: sha}`` map built the same way over
+           *rev_range*. ``git patch-id --stable`` hashes the normalized
+           diff hunks, so a clean replay reproduces byte-identical hunks and an
+           identical patch-id — the canonical, whitespace/line-number-robust
+           equivalence the ``git cherry`` dedup in
+           :meth:`rebase_preserving_task_commits` also relies on. Using the
+           identical diff-emitting command (``git log -p``) for both the single
+           target and the range guarantees both sides are normalized by the
+           same code path. The ``<patch-id> <sha>`` line the range form emits
+           maps the shared patch-id to the REPLAYED (range-side) sha, which is
+           exactly the remap target. If TWO commits in *rev_range* share
+           a patch-id (a diff reverted then re-applied, or genuinely identical
+           hunks), that patch-id is ambiguous — we cannot tell which sha the
+           orphan replayed onto — so it is skipped rather than resolved to an
+           arbitrary one of them, the same 'never guess' posture tier 2 applies
+           to an ambiguous subject.
+        2. **unique exact-subject** (fallback): when the patch-id lookup
+           misses — e.g. a rebase that resolved a conflict altered the diff
+           but preserved the commit message — recover the replayed sha only if
+           EXACTLY ONE commit in *rev_range* shares *target_sha*'s
+           subject (the ``%H\\x1f%s`` idiom from :meth:`get_commit_subjects`,
+           ``\\x1f``-split because subjects may contain colons/punctuation). An
+           ambiguous subject (two or more matches) or no match returns
+           ``None`` — the method fails toward the caller, never toward a wrong
+           match.
+
+        *paths*, when given, narrows tier 1's candidates to commits touching
+        those paths (``--full-diff`` keeps each candidate's whole patch so its
+        patch-id stays comparable; ``--full-history`` stops history
+        simplification pruning a merged side's commit; ``--no-merges`` drops
+        merges, which emit no diff anyway). The narrowing is exact: a patch-id
+        twin, or any commit colliding with it, touches exactly the target's
+        paths. An EMPTY *paths* means no tier-1 candidates, never an
+        unrestricted scan. Tier 2 always scans the whole range.
+
+        No exception handling: each caller owns its fail-safe posture.
+        """
+        # Tier 1: patch-id equivalence. Compute the target's patch-id from its
+        # own diff.
+        rc, target_diff, _ = await _run(
+            ['git', 'log', '-p', '-1', '--no-color', target_sha], cwd=cwd,
+        )
+        if rc != 0 or not target_diff.strip():
+            return None
+        _, target_pid_out, _ = await _run(
+            ['git', 'patch-id', '--stable'], cwd=cwd, input_text=target_diff,
+        )
+        target_pid = target_pid_out.split()[0] if target_pid_out.strip() else None
+
+        twins = await self._unambiguous_patch_ids(cwd, rev_range, paths)
+        if target_pid and target_pid in twins:
+            return twins[target_pid], 'patch-id'
+
+        # Tier 2: unique exact-subject fallback. Only fires when the patch-id
+        # lookup missed; recovers the replayed sha only when exactly ONE commit
+        # in rev_range shares the target's subject, so we never mis-point at a
+        # commit whose subject two replayed commits happen to share (e.g. a
+        # generic "feat: GREEN — implementation").
+        rc, target_subject, _ = await _run(
+            ['git', 'log', '-1', '--format=%s', target_sha], cwd=cwd,
+        )
+        if rc != 0 or not target_subject.strip():
+            return None
+        rc, subj_out, _ = await _run(
+            ['git', 'log', '--format=%H\x1f%s', rev_range], cwd=cwd,
+        )
+        if rc != 0 or not subj_out.strip():
+            return None
+        subject_matches: list[str] = []
+        for line in subj_out.splitlines():
+            if not line.strip():
+                continue
+            sha, _, subject = line.partition('\x1f')
+            if subject == target_subject:
+                subject_matches.append(sha)
+        if len(subject_matches) == 1:
+            return subject_matches[0], 'subject'
+        return None
+
+    async def _unambiguous_patch_ids(
+        self, cwd: Path, rev_range: str, paths: Sequence[str] | None,
+    ) -> dict[str, str]:
+        """``{patch-id: sha}`` over *rev_range* (narrowed to *paths* when given),
+        omitting every patch-id two commits share."""
+        if paths is None:
+            range_log = ['git', 'log', '-p', '--no-color', rev_range]
+        elif paths:
+            range_log = [
+                'git', 'log', '-p', '--no-color', '--full-diff', '--full-history',
+                '--no-merges', rev_range, '--', *paths,
+            ]
+        else:
+            return {}
+        rc, range_diff, _ = await _run(range_log, cwd=cwd)
+        if rc != 0 or not range_diff.strip():
+            return {}
+        _, range_pid_out, _ = await _run(
+            ['git', 'patch-id', '--stable'], cwd=cwd, input_text=range_diff,
+        )
+        pid_to_sha: dict[str, str] = {}
+        ambiguous_pids: set[str] = set()
+        for line in range_pid_out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                pid = parts[0]
+                if pid in pid_to_sha:
+                    # Two commits in rev_range share a patch-id (a diff
+                    # reverted then re-applied, or genuinely identical hunks).
+                    # We cannot know which one the target replayed onto, so the
+                    # patch-id is ambiguous and dropped — the same 'never
+                    # guess' posture tier 2 applies to an ambiguous subject.
+                    ambiguous_pids.add(pid)
+                pid_to_sha[pid] = parts[1]
+        return {pid: sha for pid, sha in pid_to_sha.items() if pid not in ambiguous_pids}
+
+    async def resolve_rebased_citation(self, sha: str) -> RebasedCitation | None:
+        """The commit on main that a cited, since-rebased *sha* landed as, or None.
+
+        For a SHA quoted by an archived record (an escalation's detail, an
+        evidence line) after its branch was rebased and landed: the fork point
+        is ``merge-base(main, sha)`` and the search is :meth:`_find_replay`'s
+        two tiers over ``<fork point>..main``, patch-id first, then a unique
+        exact subject, never a guess on an ambiguous one. Tier 1 is narrowed
+        to commits touching *sha*'s own paths, which is exact because a
+        patch-id twin touches exactly those paths, and keeps the scan to
+        seconds over a month of main.
+
+        *sha* may be abbreviated. None when it is not a commit, is already an
+        ancestor of main (it needs no resolution, and searching ``sha..main``
+        could pair it with a LATER same-subject commit), or has no twin.
+
+        Read-only: runs git queries at ``project_root`` and never rewrites a
+        ref, a record or anything else. Fail-safe like
+        :meth:`find_equivalent_commit`: any error is logged at WARNING and
+        yields None.
+        """
+        main = self.config.main_branch
+        try:
+            rc, out, _ = await _run(
+                ['git', 'rev-parse', '--verify', '--quiet', f'{sha}^{{commit}}'],
+                cwd=self.project_root,
+            )
+            cited = out.strip()
+            if rc != 0 or not cited:
+                return None
+            if await self.is_ancestor_checked(cited, main) is not False:
+                return None
+            base = await self.merge_base_with_main(cited)
+            if base is None:
+                return None
+            paths = await self.get_commit_changed_files(cited)
+            match = await self._find_replay(
+                self.project_root, cited, f'{base}..{main}', paths=paths,
+            )
+            if match is None:
+                return None
+            landed, method = match
+            rc, subject, _ = await _run(
+                ['git', 'log', '-1', '--format=%s', landed], cwd=self.project_root,
+            )
+            if rc != 0:
+                return None
+            return RebasedCitation(landed=landed, subject=subject.strip(), method=method)
+        except Exception:
+            logger.warning(
+                'resolve_rebased_citation failed for sha=%s; returning None',
+                sha, exc_info=True,
             )
             return None
 
