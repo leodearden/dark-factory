@@ -80,11 +80,11 @@ def _make_runner_cfg(
 
 
 class TestBuildRemoteRunners:
-    """Tests for _build_remote_runners(config, cwd, *, quarantine=None) -> list[RemoteRunner]."""
+    """Tests for build_remote_runners(config, cwd, *, quarantine=None) -> list[RemoteRunner]."""
 
     def _call(self, config, cwd='/repo', *, quarantine=None):
-        from orchestrator.merge_lane.worker import _build_remote_runners
-        return _build_remote_runners(config, cwd, quarantine=quarantine)
+        from orchestrator.verify_hosts import build_remote_runners
+        return build_remote_runners(config, cwd, quarantine=quarantine)
 
     def test_empty_verify_runners_returns_empty_list(self):
         """config.verify_runners=[] → returns []."""
@@ -193,7 +193,7 @@ class TestBuildRemoteRunners:
 
 
 class TestBuildRemoteRunnersDfCheckout:
-    """Each RemoteRunner built by _build_remote_runners receives the INV-2 paths.
+    """Each RemoteRunner built by build_remote_runners receives the INV-2 paths.
 
     - df_remote_checkout == its VerifyRunnerConfig.df_checkout_path (per-runner,
       opt-in; None keeps auto-sync OFF / byte-identical).
@@ -206,8 +206,8 @@ class TestBuildRemoteRunnersDfCheckout:
     """
 
     def _call(self, config, cwd='/repo', *, quarantine=None):
-        from orchestrator.merge_lane.worker import _build_remote_runners
-        return _build_remote_runners(config, cwd, quarantine=quarantine)
+        from orchestrator.verify_hosts import build_remote_runners
+        return build_remote_runners(config, cwd, quarantine=quarantine)
 
     def test_df_remote_checkout_threaded_from_config(self):
         """Each runner's _df_remote_checkout == its cfg.df_checkout_path."""
