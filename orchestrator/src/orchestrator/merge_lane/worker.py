@@ -9930,7 +9930,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # graph over the unfrozen suffix, debounce signature, cached main SHA,
         # per-branch bounce counter) now live on a SuffixConflictTracker
         # (orchestrator.suffix_graph), owned here as self._suffix_tracker.
-        # git_ops/lane_buffers/frozen_prefix/frozen_prefix_tip are ALL injected
+        # git_ops/lane_buffers/frozen_prefix/frozen_prefix_tip/retire_item are ALL injected
         # as narrow callables that RE-READ the live attribute on `self` on
         # every call (not `self` itself, and not a value/bound-method
         # snapshot captured once here) so the tracker is unit-testable
@@ -9953,6 +9953,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             lane_buffers=lambda: self._lane_buffers,
             frozen_prefix=lambda: self.frozen_prefix(),
             frozen_prefix_tip=lambda main_sha: self.frozen_prefix_tip(main_sha),
+            retire_item=lambda rid: self._retire_item(rid),
         )
         # Resume signal: set by every unhalt method so a blocked merger
         # (waiting with no pickable item) wakes up to re-check lanes.
@@ -13670,6 +13671,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ))
         return found
 
+    def _decided_predispatch_ids(self, arrivals: Sequence[MergeRequest]) -> frozenset[str]:
+        """Ids of the requests waiting for the merger whose outcome is already decided.
+
+        A waiter's cancel, or a resolution on another path, can decide a request
+        long before the merger dequeues and drops it; :meth:`snapshot` never
+        lists such a request. Registry QUEUED/LANE_BUFFERED ids are resolved
+        through :func:`_request_of`, because a requeued item's live object need
+        not be a bare MergeRequest. *arrivals* are the requests still in the
+        external queue, which the registry has not seen yet.
+        """
+        registered = {
+            rid for rid, state in self._lifecycle.non_terminal_items().items()
+            if state in _REQUEUED_STATES and _request_of(self._live_items[rid]).result.done()
+        }
+        buffered = [req for lane in MERGE_LANES for req in self._lane_buffers[lane]]
+        return frozenset(registered | {
+            req.request_id for req in (*buffered, *arrivals) if req.result.done()
+        })
+
     def snapshot(self) -> dict:
         """Return a synchronous read-only snapshot of the merge worker pipeline state.
 
@@ -13744,6 +13764,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             its verify resolves them.
         State values: queued, merging, awaiting_host, awaiting_verify,
           dispatching, verifying, passthrough, gate_reverify, finalizing.
+          A request still waiting for the merger whose outcome is already
+          decided (its future resolved or cancelled) is never listed.
           (task 2435 kappa-b: 'remerging' collapsed into 'merging' now that
           both the initial dequeue-time merge and the dispatch-time
           chain-invalidation remerge are registry-sourced MERGING entries;
@@ -13826,11 +13848,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             for _lane in MERGE_LANES
             for _lb_req in self._lane_buffers[_lane]
         }
-        _container_ids |= {
-            _q_req.request_id
+        _arrivals: list[MergeRequest] = [
+            _q_req
             for _q_req in self._queue._queue  # type: ignore[attr-defined]
             if _q_req is not None
-        }
+        ]
+        _container_ids |= {_q_req.request_id for _q_req in _arrivals}
+        _decided = self._decided_predispatch_ids(_arrivals)
 
         # 0. Finalize-head window: derived from _live_items — the single
         # InflightEntry whose request_id is absent from the _inflight deque
@@ -13838,7 +13862,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Prepended at position 0 so it remains head-of-line — it is the
         # submission-order head. Replaces the deleted _finalizing_head field
         # (merge-queue-reliability PRD scope-4 kappa-b / task 2435).
-        _excluded_ids: set[str] = set(_container_ids)
+        _excluded_ids: set[str] = _container_ids | _decided
         _fh_entry = self._finalizing_head_entry(_inflight_ids)
         if _fh_entry is not None:
             entries.append(_infl_entry(_fh_entry, 0))
@@ -13944,18 +13968,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # 4. Queued (waiting for the merger; the incident blind spot)
         # Items may be in the external _queue OR already drained into _lane_buffers.
         # Enumerate _lane_buffers first (priority-ordered; items here are already
-        # waiting), then _queue for any not-yet-drained arrivals.
-        # Same CPython internal-deque access as _queue above — read-only, no lock.
-        for lane in MERGE_LANES:
-            for req in list(self._lane_buffers[lane]):
-                entries.append(_entry(
-                    req, 'queued', worktree_path=None,
-                    position=len(entries), lane=lane,
-                ))
-        for req in list(self._queue._queue):  # type: ignore[attr-defined]
-            if req is None:
-                continue
-            entries.append(_entry(req, 'queued', worktree_path=None, position=len(entries)))
+        # waiting), then _queue for any not-yet-drained arrivals, which carry
+        # their own lane.
+        _waiting = [
+            (lane, req)
+            for lane, req in (
+                *((_ln, _r) for _ln in MERGE_LANES for _r in self._lane_buffers[_ln]),
+                *((None, _r) for _r in _arrivals),
+            )
+            if req.request_id not in _decided
+        ]
+        for lane, req in _waiting:
+            entries.append(_entry(
+                req, 'queued', worktree_path=None,
+                position=len(entries), lane=lane,
+            ))
 
         entries, _duplicate_rids = _first_copy_per_request(entries)
         self._duplicate_render_log.report(_duplicate_rids)
