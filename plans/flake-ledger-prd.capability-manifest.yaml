@@ -139,10 +139,11 @@ tasks:
   title: 'Gate the task-μ fork: discriminate before verify_failure_is_preexisting_on_main
     returns wholly-preexisting'
   capabilities:
-  - name: mu-fork-early-return-site
-    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:6472
-      `if failing_result.failing_test_ids is not None:` → :6479 `return wholly, (main_sha
-      if wholly else '')`. Both line anchors RE-RESOLVED exact on 2026-08-06
+  - name: mu-fork-flake-gate-helper
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/verify.py::verify_failure_is_preexisting_on_main's
+      task-μ fork (`failing_result.failing_test_ids is not None`) returns its wholly-preexisting
+      verdict through orchestrator/src/orchestrator/verify.py::_wholly_preexisting_after_flake_gate,
+      which re-runs the named failures in isolation on main before that verdict stands
     verdict: PASS
     delivered_check:
       kind: grep
@@ -153,9 +154,10 @@ tasks:
   - name: mu-fork-flake-gate-tests
     binding: 'amended 2026-10-20 (task 3788 carry): the original mu-fork-early-return-site
       check grepped the ''main_probe'' call_site literal, which already had 1 hit on main
-      (a docstring at verify.py::_main_probe_failure_is_isolated_flake), so it was vacuous.
-      The two checks now bound to delta are the gate helper symbol above (0 hits before
-      3788) and this test file (absent before 3788), which pins B4/B5 and the main-pinned tree'
+      (a docstring at orchestrator/src/orchestrator/verify.py::_main_probe_failure_is_isolated_flake),
+      so it was vacuous. The two checks now bound to delta are the gate helper symbol above
+      (0 hits before 3788) and this test file (absent before 3788), which pins B4/B5 and
+      the main-pinned tree'
     verdict: PASS
     delivered_check:
       kind: path
