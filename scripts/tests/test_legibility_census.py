@@ -44,6 +44,7 @@ from legibility import (
     prescreen,
     session_ledger,
     session_runner,
+    similarity,
     task_store,
     trickle_state,
     unlanded,
@@ -1377,6 +1378,7 @@ def test_render_report_carries_each_piece_in_its_own_section():
         mod.SECTION_METHOD,
         mod.SECTION_SATURATION,
         mod.SECTION_SCREENED,
+        mod.SECTION_ADJUDICATION,
         mod.SECTION_MATRIX,
         mod.SECTION_SYNTHESIS,
         mod.SECTION_FINDINGS,
@@ -1450,6 +1452,17 @@ def test_the_golden_inputs_note_is_what_a_project_without_instrument_records_rea
     assert prescreen.load_instrument_findings(tmp_path, "dark_factory").note == _NO_INSTRUMENT_RECORDS_NOTE
 
 
+_NOTHING_ADJUDICATED = similarity.AdjudicationReport(
+    view=similarity.View(settings=config_mod.Adjudication(), depth=(0, 0)),
+    attached=(),
+    offered=(),
+    adjudicated=(),
+    inconclusive=None,
+).to_record()
+"""The ``adjudication`` record of a run whose similarity stage ran over an
+empty queue."""
+
+
 _SAMPLE_METHOD: dict[str, Any] = {
     "run_id": "census-dark_factory-20260714",
     "as_of_sha": "a" * 40,
@@ -1475,6 +1488,8 @@ _SAMPLE_METHOD: dict[str, Any] = {
     "extra": {
         "inputs_consumed_note": _NO_INSTRUMENT_RECORDS_NOTE,
         "screened": _NOTHING_SCREENED.counts(),
+        "attached": 0,
+        "adjudicated": 0,
         "ledger_created_this_run": False,
         "ledger_state": "ok",
         "ledger_pruned": 0,
@@ -1527,6 +1542,8 @@ extra:
     session: 0
     key: 0
     cross_instrument: 0
+  attached: 0
+  adjudicated: 0
   ledger_created_this_run: false
   ledger_state: ok
   ledger_pruned: 0
@@ -1545,6 +1562,13 @@ extra:
 - per rule: title 0, session 0, key 0, cross_instrument 0
 - inputs consumed: none
 - inputs note: /review: no record matching review/reports/review-dark_factory-<YYYYMMDD>[-<n>].json; /hotspot-survey: no record matching plans/bug-hotspot-survey-<YYYY-MM-DD>[-<n>]-full-findings.json; /review-all: no record matching plans/review-all-dark_factory-<YYYYMMDD>[-<n>].json
+
+## Adjudication
+
+- model text-embedding-3-small; attach at cosine >= 0.9, cluster at >= 0.85; at most 10 queue cluster(s) per run
+- embeddings: 0 request(s), 0 embedded, 0 cached, 0 pruned
+- queue depth: 0 pending candidate(s) in 0 cluster(s)
+- processed this run: 0 cluster(s), 0 candidate(s)
 
 ## Origin x Manifestation Matrix
 
@@ -1593,7 +1617,11 @@ that record is what distinguishes it from a leak.
 
 Moved by task 6405 (census PRD leaf L6): ``## Screened`` renders on every
 run, flagless included (check_census_report.SECTIONS requires it), and the
-Method block gains ``extra.screened`` and the real inputs note."""
+Method block gains ``extra.screened`` and the real inputs note.
+
+Moved by task 6406 (census PRD leaf L7): ## Adjudication renders on every run
+(check_census_report.SECTIONS requires it), and the Method block gains
+``extra.attached`` and ``extra.adjudicated``."""
 
 
 def _capped_mining_result(*, stop_reason, max_batches, batches=2):
@@ -1786,6 +1814,7 @@ def _render_kwargs(**overrides) -> dict[str, Any]:
         dispositions=_EMPTY_DISPOSITIONS,
         cost_note="cost",
         screened=_NOTHING_SCREENED.to_record(),
+        adjudication=_NOTHING_ADJUDICATED,
     )
     kwargs.update(overrides)
     return kwargs
@@ -2361,6 +2390,8 @@ def _method(**overrides):
         screened=_NOTHING_SCREENED.counts(),
         inputs_consumed=(),
         inputs_consumed_note=_NO_INSTRUMENT_RECORDS_NOTE,
+        embedding_calls=0,
+        adjudication={"attached": 0, "adjudicated": 0},
     )
     kwargs.update(overrides)
     return mod.build_method(**kwargs)
@@ -2450,6 +2481,36 @@ def test_the_census_record_carries_the_screen_report_and_renders_it():
     assert check_census_report.check_record_method(record, _ORACLE_REPORT) == []
 
 
+def test_build_census_record_requires_the_adjudication_report():
+    kwargs = _render_kwargs()
+    del kwargs["adjudication"]
+    with pytest.raises(TypeError, match="adjudication"):
+        mod.build_census_record(**kwargs)
+
+
+def test_the_census_record_carries_the_adjudication_report_and_renders_it_after_screened():
+    record = json.loads(json.dumps(_census_record()))
+
+    assert record["adjudication"] == _NOTHING_ADJUDICATED
+    keys = [section.key for section in mod.census_report_sections(record)]
+    assert keys.index(mod.SECTION_ADJUDICATION) == keys.index(mod.SECTION_SCREENED) + 1
+    assert mod.SECTION_ADJUDICATION == "adjudication"
+    lines = _section(mod.census_report_sections(record), mod.SECTION_ADJUDICATION).lines
+    assert lines == tuple(similarity.report_lines(record["adjudication"]))
+    assert "Adjudication" in check_census_report.level2_titles(mod.render_report(record))
+
+
+def test_build_method_counts_embedding_calls_attaches_and_adjudications():
+    method = _method(embedding_calls=3, adjudication={"attached": 2, "adjudicated": 5})
+
+    assert method["cost"]["embedding_calls"] == 3
+    assert method["extra"]["attached"] == 2
+    assert method["extra"]["adjudicated"] == 5
+    record = json.loads(json.dumps(_census_record(method=method)))
+    assert check_census_report.check_record_method(record, _ORACLE_REPORT) == []
+    assert check_census_report.check_rendered_method(mod.render_report(record), _ORACLE_REPORT) == []
+
+
 def test_build_method_evidence_comes_from_the_selection(tmp_path):
     selection = _selection(
         tmp_path, session_ledger.LedgerState.OK,
@@ -2516,6 +2577,7 @@ def test_census_report_sections_flagless_key_set_and_order():
         mod.SECTION_METHOD,
         mod.SECTION_SATURATION,
         mod.SECTION_SCREENED,
+        mod.SECTION_ADJUDICATION,
         mod.SECTION_MATRIX,
         mod.SECTION_SYNTHESIS,
         mod.SECTION_FINDINGS,
@@ -2637,6 +2699,7 @@ def test_render_report_flagless_output_is_byte_identical_golden():
         dispositions=_EMPTY_DISPOSITIONS,
         cost_note="cost",
         screened=_NOTHING_SCREENED.to_record(),
+        adjudication=_NOTHING_ADJUDICATED,
     ))
     assert report == _GOLDEN_FLAGLESS_REPORT
 
