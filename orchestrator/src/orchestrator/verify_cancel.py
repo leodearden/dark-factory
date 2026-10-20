@@ -1,8 +1,8 @@
-"""Host-side cancellation contract for ``orchestrator verify-merge``.
+"""Host-side cancellation contract for ``orchestrator verify-merge`` and ``verify-task``.
 
 Overview
 --------
-When ``orchestrator verify-merge --request-id X`` starts, it:
+When ``orchestrator verify-merge --request-id X`` (or ``verify-task``) starts, it:
 
 1. Calls :func:`start_own_process_group` to join a new session/process group
    (``os.setsid``), isolating itself from the SSH session that launched it.
@@ -30,6 +30,11 @@ fixes this:
 
 :func:`cancel_request` is its pgid-file caller: it roots the walk, and aims
 the backstop, at the recorded pgid.
+
+The subcommand also records its verify worktree beside the pgid file
+(:func:`write_worktree_path`).  A cancel SIGKILLs the tree and so skips the
+subcommand's own ``finally``; the record is what lets :func:`cancel_request`
+reap that worktree instead (PRD plans/remote-task-leg-verify-prd.md §4.2).
 
 pgid-file directory
 -------------------
@@ -128,8 +133,8 @@ def pgid_file(worktree_base: Path, request_id: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def write_pgid_file(path: Path, pgid: int) -> None:
-    """Atomically write *pgid* to *path*, creating parent directories first.
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Atomically write *text* to *path*, creating parent directories first.
 
     Uses a sibling tmp file + ``os.replace`` for atomicity so a concurrent
     reader never sees a partial write.  The temp name is derived additively
@@ -140,14 +145,44 @@ def write_pgid_file(path: Path, pgid: int) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / (path.name + '.tmp')
-    tmp.write_text(str(pgid))
+    tmp.write_text(text)
     os.replace(tmp, path)
+
+
+def write_pgid_file(path: Path, pgid: int) -> None:
+    """Atomically write *pgid* to *path*, creating parent directories first."""
+    _atomic_write_text(path, str(pgid))
 
 
 def remove_pgid_file(path: Path) -> None:
     """Remove *path* if it exists; silently a no-op when absent (idempotent)."""
     with contextlib.suppress(FileNotFoundError):
         path.unlink()
+
+
+def worktree_path_file(pgid_path: Path) -> Path:
+    """Return the worktree record kept beside the pgid file at *pgid_path*."""
+    return pgid_path.parent / (pgid_path.name + '.worktree')
+
+
+def write_worktree_path(pgid_path: Path, worktree: Path) -> None:
+    """Atomically record *worktree* as the verify worktree of *pgid_path*'s run."""
+    _atomic_write_text(worktree_path_file(pgid_path), str(worktree))
+
+
+def read_worktree_path(pgid_path: Path) -> Path | None:
+    """Return the recorded worktree, or None when the record is absent or empty."""
+    try:
+        raw = worktree_path_file(pgid_path).read_text().strip()
+    except FileNotFoundError:
+        return None
+    return Path(raw) if raw else None
+
+
+def remove_worktree_path(pgid_path: Path) -> None:
+    """Remove the worktree record; a no-op when absent (idempotent)."""
+    with contextlib.suppress(FileNotFoundError):
+        worktree_path_file(pgid_path).unlink()
 
 
 # ---------------------------------------------------------------------------
