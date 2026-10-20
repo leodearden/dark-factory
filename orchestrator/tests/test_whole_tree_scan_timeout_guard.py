@@ -414,6 +414,30 @@ def _module_level_timeout_ceiling(source: str) -> float | None:
     return min(resolved) if resolved else None
 
 
+def _scanner_offence(name: str, source: str) -> str | None:
+    """Why the whole-tree scanner *name* (content *source*) breaks the family invariant, else None.
+
+    The three halves in order: a module-level timeout NAME, a resolvable VALUE
+    not below the family ceiling (an unresolvable one is no opinion), and
+    MEMBERSHIP of the family task-role verify enumerates.
+    """
+    if 'timeout' not in module_level_marker_names(source):
+        return f'{name}: no module-level pytestmark timeout'
+    ceiling = _module_level_timeout_ceiling(source)
+    if ceiling is not None and ceiling < WHOLE_TREE_SCAN_TEST_TIMEOUT:
+        return (
+            f'{name}: module-level timeout pins {ceiling:g}s, below '
+            f'the {WHOLE_TREE_SCAN_TEST_TIMEOUT}s family ceiling'
+        )
+    if not is_whole_tree_guard_module(source):
+        return (
+            f'{name}: module-level timeout is not spelled '
+            'pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT), so verify_plan\'s '
+            'task-role guard family will not run it'
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # _scans_whole_tree_py(source) -- inline-fixture unit tests.
 #
@@ -977,9 +1001,9 @@ def test_a_synthetic_new_scanner_marked_by_a_literal_is_not_a_family_member() ->
 
 def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
     """Every whole-tree ``*.py`` scanner here needs a MODULE-LEVEL timeout mark
-    AT the family ceiling.
+    AT the family ceiling, spelled via ``WHOLE_TREE_SCAN_TEST_TIMEOUT``.
 
-    TWO HALVES, because either alone is insufficient. The NAME half
+    THREE HALVES, applied per scanner by :func:`_scanner_offence`. The NAME half
     (:func:`module_level_marker_names`) catches a scanner with no mark; the
     VALUE half (:func:`_module_level_timeout_ceiling`) catches one marked
     ``pytest.mark.timeout(30)``, which carries the name yet sits BELOW even the
@@ -987,6 +1011,12 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
     exact cliff this module exists to clear. Only a value the grammar can
     actually resolve can offend: an unresolvable expression is skipped, keeping
     the guard a floor rather than a proof.
+
+    The MEMBERSHIP half exists because task 7253 (the gate-5702 ruling) narrowed
+    the task-role verify floor to the touched tests plus this family, enumerated
+    by :func:`orchestrator.pytest_markers.is_whole_tree_guard_module`. A scanner
+    outside the family -- marked by a literal, or by another constant -- would
+    silently stop running before the merge gate, so membership is not fail-soft.
 
     Why module-level rather than "a timeout mark somewhere in the file": only a
     module-level ``pytestmark`` is a statically sound LOWER BOUND on every
@@ -1040,19 +1070,9 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
         if not _scans_whole_tree_py(source):
             continue
         scanners.append(py_file)
-        if 'timeout' not in module_level_marker_names(source):
-            offenders.append(f'{py_file.name}: no module-level pytestmark timeout')
-            continue
-        # NAME present, but at what value? A mark of `timeout(30)` satisfies the
-        # check above while sitting BELOW even the global ini default -- see
-        # _module_level_timeout_ceiling. None means unresolvable, which is NOT
-        # an offence (fail-soft; the guard stays a floor).
-        ceiling = _module_level_timeout_ceiling(source)
-        if ceiling is not None and ceiling < WHOLE_TREE_SCAN_TEST_TIMEOUT:
-            offenders.append(
-                f'{py_file.name}: module-level timeout pins {ceiling:g}s, below '
-                f'the {WHOLE_TREE_SCAN_TEST_TIMEOUT}s family ceiling'
-            )
+        offence = _scanner_offence(py_file.name, source)
+        if offence is not None:
+            offenders.append(offence)
 
     assert examined >= _MIN_EXPECTED_TEST_FILES, (
         f'only {examined} .py files examined under {_TESTS_DIR} (expected at '
@@ -1074,7 +1094,8 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
         raise AssertionError(
             f'{len(offenders)} whole-tree AST-scanning test module(s) under '
             f'{_TESTS_DIR.name}/ lack a module-level timeout mark AT THE FAMILY '
-            'CEILING (either no mark at all, or one pinned lower). Add\n\n'
+            'CEILING (no mark at all, one pinned lower, or one not spelled via '
+            'WHOLE_TREE_SCAN_TEST_TIMEOUT). Add\n\n'
             '    from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
             '    pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n\n'
             'at module level in each. These modules rglob() every *.py in the '
@@ -1090,6 +1111,7 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
             'Use WHOLE_TREE_SCAN_TEST_TIMEOUT rather than a hand-picked number: '
             'a smaller literal carries the marker NAME while leaving the test at '
             'or under the cliff, which is why the value is checked and not just '
-            'the name.'
+            'the name. Any other spelling, even a larger literal, also leaves the '
+            'module out of the guard family task-role verify runs.'
             f'\n\nOffending scanners:\n  {offender_list}'
         )
