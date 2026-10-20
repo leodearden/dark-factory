@@ -1155,6 +1155,51 @@ held for as long as its request is live. The two-pass count starts only once
 the request resolves without landing (blocked, cancelled, or superseded into
 a train that derailed). Re-read the task after any non-landed outcome.
 
+### Reading a verify-host bench (`quarantine_class`, task 6565)
+
+A remote verify host leaves the pool in one of three classes, shown per host
+as `quarantine_class` in the `get_merge_queue()` snapshot (with `kind`,
+`sticky` and `identity`):
+
+- **`ru`**: unreachable (`ssh true` fails; a streak of `RunnerUnavailable`
+  or a long outage). Re-probed by `ssh <host> true`; a pass re-admits it.
+- **`skew`**: reached, but it could not run this dispatcher's gate, or a
+  verify there produced no usable verdict (`kind` is `gate`, `unparseable`,
+  `no_verdict` or `wire_shape`). Re-probed by the full `ensure-gate`
+  (publish the deployed commit, build or reuse the gate checkout, identity
+  handshake); a pass re-admits it. A `wire_shape` bench carries both gate
+  identities (`code_sha` and wire fingerprint, local and remote) in
+  `identity`. Its L1 is category `verify_host_skew`, sentinel
+  `__verify_host_skew__<host>@<sha>`, and is resolved on re-admission.
+- **`divergence`**: held after a local/remote verdict divergence. It has no
+  stored reason today and is cleared only by an operator.
+
+A skew bench is **sticky** once a host benches a second time on the same
+deployed commit after a passing probe: it is then never re-probed or
+re-admitted automatically, and files its L1 at once. It returns at the next
+orchestrator restart, or via the operator clear. A transport failure never
+makes a bench sticky and never downgrades a skew bench.
+
+The operator clear is the escalation MCP tool
+`clear_verify_host_quarantine(host)`. It frees the host without probing it
+(use it once the cause is fixed), resolves the open unreachability and skew
+L1s, and returns `{host, cleared, quarantine_class, was_sticky}`. A PARKED
+slot is still freed only after a clean probe shows no stale verify running
+there. The per-commit sticky count survives a clear; a restart resets it.
+
+**When an L1 names the shim** ("the orchestrator shim on the verify host does
+not honour ORCH_GATE_BIN"): the host's `/usr/local/bin/orchestrator` wrapper
+runs the shared tree instead of the gate. Run
+`scripts/deploy/install_laptop_gate_shim.sh` (add `--check` to only verify),
+then clear the bench. Other skew reasons name the failing step (uv, disk, the
+gate root, the remote config): fix it on the host and let the reprobe re-admit
+it.
+
+`scripts/orchestrator-watchdog.py --report` shows a `CODE-SHA` column per
+unit: the commit each unit's verify wire path was imported from, read from
+its fleet heartbeat. Units at different commits build different gate
+directories; they never share or overwrite one.
+
 ---
 
 ## 6. Config reload vs restart
