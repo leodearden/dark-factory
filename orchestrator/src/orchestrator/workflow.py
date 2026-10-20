@@ -104,6 +104,7 @@ from orchestrator.delivered_checks import (
     gate_mark_done_on_delivered_checks,
 )
 from orchestrator.dry_run_unblock import run_dry_run_unblock
+from orchestrator.escalation_router import router_owns
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.exit_contract import (
     ExitStatusWriteFailure,
@@ -15181,7 +15182,7 @@ class TaskWorkflow:
                 # invariant fix A establishes on the producer side.  Leaving
                 # them pending would re-strand the NEXT ESCALATED entry on
                 # the same records for another full window.
-                for esc in pending_l0:
+                for esc in self._pending_steward_l0s():
                     self.escalation_queue.resolve(
                         esc.id,
                         'Auto-dismissed: steward did not resolve within the '
@@ -17008,9 +17009,7 @@ class TaskWorkflow:
             # Defensive cleanup: L0 should already be cleared by
             # _wait_for_resolution, but dismiss any stragglers (race
             # between the L0-empty check and the L1 check).
-            remaining_l0 = self.escalation_queue.get_by_task(
-                self.task_id, status='pending', level=0,
-            )
+            remaining_l0 = self._pending_steward_l0s()
             if remaining_l0:
                 logger.warning(
                     'Task %s: %d L0 escalation(s) still pending at '
@@ -17256,9 +17255,7 @@ class TaskWorkflow:
                     #     esc-3576-234), and steward._dismiss_capped_l0
                     #     dismisses only the single record it was handed.
                     if self.escalation_queue:
-                        orphan_l0 = self.escalation_queue.get_by_task(
-                            self.task_id, status='pending', level=0,
-                        )
+                        orphan_l0 = self._pending_steward_l0s()
                         for esc in orphan_l0:
                             # WARNING, not INFO, and per-record rather than a
                             # count: a swallowed filing must be traceable to
@@ -17348,9 +17345,7 @@ class TaskWorkflow:
         # skip_escalation path above.  Guarded on escalation_queue because the
         # fall-through is also reached when no queue is wired.
         if self.escalation_queue:
-            orphan_l0 = self.escalation_queue.get_by_task(
-                self.task_id, status='pending', level=0,
-            )
+            orphan_l0 = self._pending_steward_l0s()
             for esc in orphan_l0:
                 self.escalation_queue.resolve(
                     esc.id,
@@ -18307,6 +18302,22 @@ class TaskWorkflow:
             return True
         return isinstance(outcome, StewardInterrupted) and outcome.wip_commits_present
 
+    def _pending_steward_l0s(self) -> list[Escalation]:
+        """The task's pending level-0 records whose exit consumer is a steward.
+
+        An info note the info-L0 router owns is left out: the router routes it
+        when the workflow exits (plans/info-l0-disposition-router-prd.md D10),
+        so a steward-side sweep never dismisses it unread.
+        """
+        if self.escalation_queue is None:
+            return []
+        return [
+            esc for esc in self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=0,
+            )
+            if not router_owns(esc, enabled=self.config.info_l0_router_enabled)
+        ]
+
     def _steward_work_outstanding(self) -> bool:
         """Whether there is anything for :meth:`_await_steward_completion` to
         wait ON — its ``skip_if_idle`` gate, used by the post-merge success
@@ -18628,9 +18639,7 @@ class TaskWorkflow:
                     # fall-through's dismissal loop — otherwise it strands
                     # for the orphan-L0 reaper to later promote into a
                     # duplicate L1.
-                    orphan_l0 = self.escalation_queue.get_by_task(
-                        self.task_id, status='pending', level=0,
-                    )
+                    orphan_l0 = self._pending_steward_l0s()
                     for esc in orphan_l0:
                         self.escalation_queue.resolve(
                             esc.id,
