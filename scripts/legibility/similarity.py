@@ -6,6 +6,7 @@ entry, and clusters the rest of the pending backlog into a ranked, capped
 adjudication queue."""
 from __future__ import annotations
 
+import copy
 import enum
 import math
 import operator
@@ -20,7 +21,7 @@ from typing import Any
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import codebook, config, embeddings, prescreen
+from legibility import census_findings, codebook, config, embeddings, prescreen
 
 Vector = tuple[float, ...]
 
@@ -42,7 +43,8 @@ class Kind(enum.StrEnum):
 @dataclass(frozen=True)
 class Item:
     """One indexed record. ``record_id`` is None for this run's novel
-    clusters, which are not yet in the codebook."""
+    clusters, which are not yet in the codebook; ``key`` is the record id
+    for every other item."""
 
     kind: Kind
     record_id: str | None
@@ -277,3 +279,115 @@ def build_view(
         cached=embedded.cached,
         pruned=embedded.pruned,
     )
+
+
+# ---------------------------------------------------------------------------
+# The codebook transforms: similarity attaches, and queue members following
+# their representative
+# ---------------------------------------------------------------------------
+
+class Outcome(enum.StrEnum):
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+    UNRESOLVED = "unresolved"
+    INCONCLUSIVE = "inconclusive"
+
+
+def similarity_attached_by(score: float, run_id: str) -> dict[str, Any]:
+    return {"method": "similarity", "score": score, "run_id": run_id}
+
+
+@dataclass(frozen=True)
+class AppliedAttach:
+    """A pending candidate joined onto an entry by similarity; *novel* when
+    it is this run's screened novel cluster."""
+
+    candidate_id: str
+    title: str
+    entry_id: str
+    score: float
+    novel: bool
+
+
+def _pending_titled(cb: Mapping[str, Any], title: str) -> str:
+    for candidate in cb.get("candidates") or []:
+        if candidate.get("title") == title and candidate.get("disposition") == "pending":
+            return candidate["id"]
+    raise ValueError(f"similarity attach: screened cluster {title!r} has no pending candidate")
+
+
+def attach(cb: dict, view: View, *, run_id: str) -> tuple[dict, tuple[AppliedAttach, ...]]:
+    """A new codebook in which every attach of *view* joins its entry: a
+    backlog candidate by its id, a screened novel cluster by the pending
+    candidate this run's merge gave its title."""
+    result = cb
+    applied: list[AppliedAttach] = []
+    for found, novel in (*((found, False) for found in view.attaches), *((found, True) for found in view.screened)):
+        candidate_id = _pending_titled(result, found.item.title) if novel else found.item.key
+        attached_by = similarity_attached_by(found.score, run_id)
+        result = prescreen.join_entry(
+            result, candidate_id, found.entry_id,
+            candidate_fields={"attached_by": attached_by}, sighting_fields={"attached_by": attached_by},
+        )
+        applied.append(AppliedAttach(candidate_id, found.item.title, found.entry_id, found.score, novel))
+    return result, tuple(applied)
+
+
+@dataclass(frozen=True)
+class Adjudicated:
+    """How one offered queue cluster resolved, and the members that followed
+    its representative."""
+
+    representative: str
+    outcome: Outcome
+    members: tuple[str, ...]
+
+
+def _candidate(cb: Mapping[str, Any], candidate_id: str) -> dict:
+    for candidate in cb.get("candidates") or []:
+        if candidate.get("id") == candidate_id:
+            return candidate
+    raise ValueError(f"similarity adjudication: no candidate {candidate_id!r}")
+
+
+def _rejected_with(cb: dict, member_id: str, representative: Mapping[str, Any]) -> dict:
+    result = copy.deepcopy(cb)
+    member = _candidate(result, member_id)
+    if member.get("disposition") != "pending":
+        raise ValueError(
+            f"similarity adjudication: member {member_id!r} is {member.get('disposition')!r}, not pending",
+        )
+    identity = census_findings.FindingIdentity.from_record(representative)
+    if identity is not None:
+        member.update(census_findings.stamped(member, identity))
+    member.update(disposition="rejected", adjudicated_with=representative["id"])
+    codebook.assert_no_deletion(cb, result)
+    return result
+
+
+def adjudicate_members(
+    cb: dict, offered: Sequence[QueuedCluster],
+) -> tuple[dict, tuple[Adjudicated, ...]]:
+    """A new codebook in which each *offered* cluster's other members follow
+    the disposition its representative now has: onto its entry when it was
+    promoted, rejected with it when it was rejected, untouched while it is
+    still pending."""
+    result = cb
+    outcomes: list[Adjudicated] = []
+    for queued in offered:
+        representative = _candidate(result, queued.representative.key)
+        others = tuple(member.key for member in queued.others)
+        if representative.get("disposition") == "promoted":
+            for member_id in others:
+                result = prescreen.join_entry(
+                    result, member_id, representative["promoted_to"],
+                    candidate_fields={"adjudicated_with": representative["id"]}, sighting_fields={},
+                )
+            outcomes.append(Adjudicated(representative["id"], Outcome.VERIFIED, others))
+        elif representative.get("disposition") == "rejected":
+            for member_id in others:
+                result = _rejected_with(result, member_id, representative)
+            outcomes.append(Adjudicated(representative["id"], Outcome.REJECTED, others))
+        else:
+            outcomes.append(Adjudicated(representative["id"], Outcome.UNRESOLVED, ()))
+    return result, tuple(outcomes)

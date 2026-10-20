@@ -523,7 +523,7 @@ class TestAdjudicateMembers:
         offered = self._offered(cb)
         verified = self._promoted(cb)
 
-        result, adjudicated = similarity.adjudicate_members(verified, offered, run_id=_RUN)
+        result, adjudicated = similarity.adjudicate_members(verified, offered)
 
         [outcome] = adjudicated
         assert outcome.representative == 'cand-20260805-1'
@@ -552,7 +552,7 @@ class TestAdjudicateMembers:
         if identity is not None:
             representative.update(identity.to_fields())
 
-        result, adjudicated = similarity.adjudicate_members(rejected, offered, run_id=_RUN)
+        result, adjudicated = similarity.adjudicate_members(rejected, offered)
 
         assert [(item.outcome, item.members) for item in adjudicated] == [
             (similarity.Outcome.REJECTED, ('cand-20260801-1',)),
@@ -567,7 +567,7 @@ class TestAdjudicateMembers:
     def test_a_still_pending_representative_leaves_its_members_untouched(self):
         cb = self._pending()
 
-        result, adjudicated = similarity.adjudicate_members(cb, self._offered(cb), run_id=_RUN)
+        result, adjudicated = similarity.adjudicate_members(cb, self._offered(cb))
 
         assert result == cb
         assert [(item.outcome, item.members) for item in adjudicated] == [
@@ -581,4 +581,4 @@ class TestAdjudicateMembers:
         _by_id(verified, 'cand-20260801-1')['disposition'] = 'rejected'
 
         with pytest.raises(ValueError, match='cand-20260801-1.*pending'):
-            similarity.adjudicate_members(verified, offered, run_id=_RUN)
+            similarity.adjudicate_members(verified, offered)
