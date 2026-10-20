@@ -10699,12 +10699,20 @@ class TestCreateWorktreeRequeueAndRecycledId:
         await git_ops.cleanup_worktree(lane, 'A')
         assert plan_file.exists(), 'prereq: plan.json must still exist after cleanup'
 
+        # Seed the lane→task routing key so the disk backstop MATCHES and the
+        # identity guard this test exists to prove is genuinely reached.
+        meta_root = TaskArtifacts.meta_root_for(lane.parent, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            '{"task_id": "A", "title": "Old Task"}'
+        )
+
         # NEW task with recycled id 'A' but DIFFERENT title — should NOT inherit plan
         info2 = await git_ops.create_worktree('A', expected_title='New Task')
         assert info2.path == lane  # same pool lane
 
-        # TODAY: disk backstop reuses (task_id 'A' == 'A') → plan.json inherited → FAIL
-        # AFTER step-26: identity mismatch ('Old Task' != 'New Task') → fresh reset → plan gone
+        # Without the guard: disk backstop reuses (task_id 'A' == 'A') → plan inherited
+        # With it: identity mismatch ('Old Task' != 'New Task') → fresh reset → plan gone
         assert not plan_file.exists(), (
             'Recycled-id task MUST NOT inherit the prior task\'s plan.json '
             '(identity guard should route to fresh reset)'
@@ -12181,7 +12189,7 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
         task/D must be RETAINED by α (not deleted as 0-beyond-main).
 
         Sequence:
-        1. Acquire lane on 'D', write .task/plan.json, commit WIP commit
+        1. Acquire lane on 'D', seed the meta root's metadata.json, commit WIP
         2. Advance main
         3. release_warm_lane('D') → detach + retain task/D (WIP > 0) + FREE
         4. acquire_warm_lane('D', main_HEAD) → disk-backstop route (route 2)
@@ -12198,15 +12206,16 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
 
         git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
 
-        # Step 1: Acquire lane on 'D', write plan.json, commit WIP
+        # Step 1: Acquire lane on 'D', seed metadata.json, commit WIP
         info = await git_ops.acquire_warm_lane('D', start_ref)
         assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
         lane = info.path
 
-        # Write .task/plan.json with task_id='D' (forces disk-backstop route on re-acquire)
-        task_dir = lane / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text(_json.dumps({'task_id': 'D'}))
+        # metadata.json with task_id='D' is the lane→task routing key that
+        # forces the disk-backstop route on re-acquire.
+        meta_root = TaskArtifacts.meta_root_for(lane.parent, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(_json.dumps({'task_id': 'D'}))
 
         # Commit WIP so task/D has commits beyond main
         (lane / 'wip_d.txt').write_text('work for task D\n')
@@ -12224,7 +12233,7 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
         # Step 3: release_warm_lane → detach + retain + FREE
         await git_ops.release_warm_lane(lane, 'D')
 
-        # Verify: detached, task/D retained, plan.json intact
+        # Verify: detached, task/D retained, metadata.json intact
         _, abbrev_raw, _ = await _run(
             ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
         )
@@ -12235,12 +12244,13 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
             ['git', 'rev-parse', '--verify', 'task/D'], cwd=git_repo,
         )
         assert rc_verify == 0, 'task/D must be RETAINED after first release (α)'
-        assert (task_dir / 'plan.json').exists(), (
-            'plan.json must survive release_warm_lane (used by disk-backstop re-acquire)'
+        assert (meta_root / 'metadata.json').exists(), (
+            'metadata.json must survive release_warm_lane '
+            '(it is the disk-backstop re-acquire routing key)'
         )
 
         # Step 4: re-acquire via disk-backstop route
-        # (pool sees lane as FREE+registered with plan.json task_id=='D' → route 2)
+        # (pool sees lane as FREE+registered, metadata.json task_id=='D' → route 2)
         info2 = await git_ops.acquire_warm_lane('D', main_head)
 
         # Step 5: assertions on re-acquire result

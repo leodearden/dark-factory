@@ -288,6 +288,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         WorktreeConflictError,
         WorktreeMissing,
     )
+    from orchestrator.recut_ruling import RecutRulingUnreadable, RecutRulingViolation
     from orchestrator.verify import VerifyInfraError
 
     _disposition_table_cache = {
@@ -565,6 +566,25 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Branch reset: rebase wiped committed task work',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Re-cut rulings (task 3154): a human ruled "re-cut fresh off main",
+        # so a refused or unreadable ruling goes back to a human, never to a
+        # quiet default block.
+        RecutRulingViolation: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Re-cut ruling refused provisioning',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        RecutRulingUnreadable: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Re-cut ruling unreadable',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── BD-2 completeness rows: exported by the 4 covered modules, but
