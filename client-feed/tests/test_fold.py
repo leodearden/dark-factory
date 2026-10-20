@@ -10,6 +10,7 @@ import pytest
 from client_feed.contract import (
     EVENT_MODELS,
     FEED_VERSION,
+    CriteriaDeclared,
     EventHeader,
     FeedError,
     FeedLine,
@@ -219,6 +220,23 @@ def criteria(seq: int, run_kind: str = 'verify') -> FeedLine:
     )
 
 
+def declared(seq: int, *criteria: tuple[str, str]) -> FeedLine:
+    return line(
+        'criteria_declared',
+        seq,
+        criteria=[
+            {
+                'id': cid,
+                'prd': 'plans/a-prd.md',
+                'capability': 'Ledger',
+                'statement': statement,
+                'kind': 'success',
+            }
+            for cid, statement in criteria
+        ],
+    )
+
+
 def unknown(seq: int) -> FeedLine:
     return line('future_minor_event', seq, feed_version='1.1', payload={'n': seq})
 
@@ -258,6 +276,8 @@ def mixed_feed() -> list[FeedLine]:
         merge(30),
         branches(31, ahead=2),
         tree(32, OTHER_SHA),
+        declared(33, ('C-2', 'Two'), ('C-1', 'Old')),
+        declared(34, ('C-1', 'New'), ('C-3', 'Three')),
     ]
 
 
@@ -278,6 +298,7 @@ def empty_state(project_id: str = 'p') -> FeedState:
         tree=None,
         revealed=(),
         criteria={},
+        criteria_declared={},
         recent=(),
     )
 
@@ -421,6 +442,18 @@ def test_criteria_keep_the_latest_result_per_run_kind() -> None:
     assert state.criteria == {'verify': last_verify, 'staging': staging}
 
 
+def test_declared_criteria_are_keyed_by_id_and_the_last_declaration_wins() -> None:
+    first = declared(1, ('C-2', 'Two'), ('C-1', 'Old'))
+    last = declared(3, ('C-3', 'Three'), ('C-1', 'New'))
+    assert isinstance(last, CriteriaDeclared)
+    state = fold([first, refused(2), last], project_id='p')
+    assert list(state.criteria_declared) == ['C-1', 'C-3']
+    assert state.criteria_declared['C-1'].statement == 'New'
+    assert state.criteria_declared == {criterion.id: criterion for criterion in last.criteria}
+    cleared = fold([first, refused(2), last, declared(4)], project_id='p')
+    assert cleared.criteria_declared == {}
+
+
 def test_snapshots_keep_the_latest() -> None:
     last_factory, last_branches, last_tree = factory_state(4, 'paused'), branches(5, 3), tree(6)
     feed = [factory_state(1), branches(2), tree(3, OTHER_SHA), last_factory, last_branches, last_tree]
@@ -437,7 +470,14 @@ def test_recent_holds_timeline_events_only() -> None:
         criteria(8),
         criteria(9),
     ]
-    snapshots = [heartbeat(1), factory_state(4), branches(7), tree(10), unknown(11)]
+    snapshots = [
+        heartbeat(1),
+        factory_state(4),
+        branches(7),
+        tree(10),
+        unknown(11),
+        declared(12, ('C-1', 'One')),
+    ]
     feed = sorted(timeline + snapshots, key=lambda ln: ln.seq)
     assert fold(feed, project_id='p').recent == tuple(timeline)
 

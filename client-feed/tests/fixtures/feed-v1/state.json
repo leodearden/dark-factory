@@ -1,8 +1,8 @@
 {
   "project_id": "demo-client",
   "feed_version": "1.0",
-  "watermark_seq": 26,
-  "as_of": "2026-10-14T09:26:00Z",
+  "watermark_seq": 27,
+  "as_of": "2026-10-14T09:27:00Z",
   "head": "3f2a9c1e7b4d5a60812c9e0f4b7a1d2c3e5f6a7b",
   "engagement_version": 2,
   "degraded": [
@@ -243,6 +243,29 @@
           "tests": []
         }
       ]
+    }
+  },
+  "criteria_declared": {
+    "C-1": {
+      "id": "C-1",
+      "prd": "plans/ledger-prd.md",
+      "capability": "Ledger",
+      "statement": "Every entry shows the running balance after it.",
+      "kind": "success"
+    },
+    "C-2": {
+      "id": "C-2",
+      "prd": "plans/ledger-prd.md",
+      "capability": "Ledger",
+      "statement": "A balance is never rounded before the last entry.",
+      "kind": "failure"
+    },
+    "C-3": {
+      "id": "C-3",
+      "prd": "plans/reports-prd.md",
+      "capability": "Monthly reports",
+      "statement": "A monthly statement lists every account's closing balance.",
+      "kind": "success"
     }
   },
   "recent": [
