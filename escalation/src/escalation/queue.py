@@ -3026,6 +3026,7 @@ class EscalationQueue:
         *,
         strand_age_secs: float | None = None,
         now: datetime | None = None,
+        keep: Callable[[Escalation], bool] | None = None,
     ) -> int:
         """Dismiss all pending L0 escalations with the given resolution message.
 
@@ -3055,6 +3056,12 @@ class EscalationQueue:
         loop, mirroring ``Harness._reap_orphan_l0_escalations``, so every
         record in one sweep is aged against the same instant.
 
+        ``keep``: an optional predicate over each pending level-0 record; a
+        record it returns True for is neither dismissed nor counted.  The
+        startup amnesty passes it so the info-L0 router's held or unrouted
+        notes survive for the orphan reaper
+        (plans/info-l0-disposition-router-prd.md boundary #16).
+
         Returns the number of escalations where resolve() returned non-None.
         In the common single-writer case this equals the number actually dismissed.
         In a concurrent-write race (another process resolves an escalation between
@@ -3071,7 +3078,7 @@ class EscalationQueue:
         now = now or datetime.now(UTC)
         count = 0
         strands = 0
-        for esc in (e for e in pending if e.level == 0):
+        for esc in (e for e in pending if e.level == 0 and not (keep and keep(e))):
             try:
                 # fallback=datetime.max: an unparseable timestamp sorts as
                 # NEWEST, never as infinitely stale (the dedupe.py sentinel
