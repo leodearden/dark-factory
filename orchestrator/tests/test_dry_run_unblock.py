@@ -3092,3 +3092,92 @@ class TestSkillPromptExplainsEveryTaskBlockState:
             f'the user prompt carries {unexplained} but the unblock-auto '
             f'system prompt never explains them'
         )
+
+
+_MUTATING_GIT_SUBCOMMANDS = frozenset({
+    'branch', 'tag', 'checkout', 'switch', 'reset', 'commit', 'merge',
+    'rebase', 'stash', 'worktree', 'push', 'pull', 'fetch', 'clean',
+    'restore', 'add', 'rm', 'mv', 'apply', 'am', 'cherry-pick', 'revert',
+    'update-ref', 'config',
+})
+
+
+def _rendered_argv(kwargs: dict) -> list[str]:
+    """The CLI argv the captured investigation call becomes.
+
+    A call that passes no ``permission_mode`` gets ``invoke_agent``'s own
+    default, read off its signature, so the argv is the one the CLI receives.
+    """
+    import inspect
+
+    from shared.cli_invoke import build_claude_argv
+
+    from orchestrator.agents.invoke import invoke_agent
+
+    default_mode = inspect.signature(invoke_agent).parameters['permission_mode'].default
+    argv, temp_files = build_claude_argv(
+        model=kwargs['model'],
+        max_budget_usd=kwargs['max_budget_usd'],
+        system_prompt=kwargs['system_prompt'],
+        max_turns=kwargs['max_turns'],
+        permission_mode=kwargs.get('permission_mode', default_mode),
+        allowed_tools=kwargs['allowed_tools'],
+        disallowed_tools=kwargs['disallowed_tools'],
+        mcp_config=None,
+        output_schema=kwargs['output_schema'],
+        effort=kwargs['effort'],
+        resume_session_id=None,
+        session_id=kwargs['session_id'],
+    )
+    for path in temp_files:
+        Path(path).unlink(missing_ok=True)
+    return argv
+
+
+def _flag_values(argv: list[str], flag: str) -> list[str]:
+    """Every token after *flag* up to the next ``--`` flag."""
+    start = argv.index(flag) + 1
+    values = []
+    for token in argv[start:]:
+        if token.startswith('--'):
+            break
+        values.append(token)
+    return values
+
+
+class TestInvestigationPermissionEnvelope:
+    """The dry run's read-only promise must be enforced by the CLI, not advised.
+
+    Under the inherited ``bypassPermissions`` the allowlist binds nothing and
+    only deny rules hold, so ``git -C <wt> commit`` slipped past
+    ``Bash(git commit:*)`` and ``NotebookEdit`` was never denied at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_investigation_runs_under_dont_ask_not_bypass(self, tmp_path):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        assert kwargs.get('permission_mode') == 'dontAsk', kwargs.get('permission_mode')
+        argv = _rendered_argv(kwargs)
+        assert argv[argv.index('--permission-mode') + 1] == 'dontAsk', argv
+
+    @pytest.mark.asyncio
+    async def test_every_builtin_file_writing_tool_is_denied(self, tmp_path):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        denied = set(_flag_values(_rendered_argv(kwargs), '--disallowed-tools'))
+        missing = sorted({'Edit', 'Write', 'NotebookEdit'} - denied)
+        assert not missing, f'file-writing tools not denied: {missing}'
+
+    @pytest.mark.asyncio
+    async def test_no_git_subcommand_the_envelope_allows_can_mutate(self, tmp_path):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        allowed_subs = {
+            match.group(1)
+            for entry in kwargs['allowed_tools']
+            if (match := re.fullmatch(r'Bash\(git (\S+):\*\)', entry))
+        }
+        assert allowed_subs, kwargs['allowed_tools']
+        mutating = sorted(allowed_subs & _MUTATING_GIT_SUBCOMMANDS)
+        assert not mutating, f'the envelope grants mutation-capable git subcommands: {mutating}'
