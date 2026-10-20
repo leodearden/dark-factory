@@ -5,6 +5,7 @@ Each payload is built inside SQLite from its model's field names, so the `data` 
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -12,12 +13,19 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, Self
+from typing import Any, Final, Self, TypeVar
 
-from pydantic import BaseModel, ConfigDict, StrictBool, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    JsonValue,
+    StrictBool,
+    ValidationError,
+    model_validator,
+)
 from shared.project_layout import runs_db
 
-from client_feed.contract import CommitSha, NonNegativeInt, Source, VerifyKind
+from client_feed.contract import CommitSha, NonNegativeInt, SchedulerState, Source, VerifyKind
 from client_feed.sources.store import read_only
 
 
@@ -235,28 +243,43 @@ def _placeholders(count: int) -> str:
     return ', '.join('?' * count)
 
 
-def _stream_query() -> tuple[str, tuple[str, ...]]:
-    """The stream SELECT and its leading CASE parameters; `?` for the cursor, the types and the limit follow."""
-    with_payload = [(kind, spec.payload) for kind, spec in _STREAM.items() if spec.payload]
+@dataclass(frozen=True)
+class _Query:
+    sql: str
+    params: tuple[Any, ...]
+
+
+_Payloads = Mapping[StoreEventType, type[_Payload] | None]
+
+
+def _rows_of_types(columns: str, payloads: _Payloads, *, after_id: int = 0, limit: int = -1) -> _Query:
+    """`columns` plus each row's payload (NULL for a type without a model), in id order; -1 is no limit."""
+    with_payload = [(kind, model) for kind, model in payloads.items() if model is not None]
     cases = ' '.join(f'WHEN ? THEN {_payload_sql(model)}' for _, model in with_payload)
-    sql = (
-        f'SELECT id, timestamp, event_type, task_id, phase, CASE event_type {cases} END'
-        f' FROM events WHERE id > ? AND event_type IN ({_placeholders(len(_STREAM))})'
-        ' ORDER BY id LIMIT ?'
+    payload = f'CASE event_type {cases} END' if with_payload else 'NULL'
+    return _Query(
+        f'SELECT {columns}, {payload} FROM events'
+        f' WHERE id > ? AND event_type IN ({_placeholders(len(payloads))}) ORDER BY id LIMIT ?',
+        (*(kind.value for kind, _ in with_payload), after_id, *(kind.value for kind in payloads), limit),
     )
-    return sql, tuple(kind.value for kind, _ in with_payload)
 
 
-_STREAM_SQL, _STREAM_CASE_TYPES = _stream_query()
+_ModelT = TypeVar('_ModelT', bound=_Payload)
 
 
-def _validated(model: type[_Payload], payload: str | None) -> _Payload | None:
+def _validated(model: type[_ModelT], payload: str | None) -> _ModelT | None:
     if payload is None:
         return None
     try:
         return model.model_validate_json(payload)
     except ValidationError:
         return None
+
+
+def _read(root: Path, *queries: _Query) -> tuple[list[tuple[Any, ...]], ...]:
+    """Every query's rows, all read from one snapshot of runs.db."""
+    with read_only(root, runs_db(root), source=Source.EVENTS) as conn:
+        return tuple(conn.execute(query.sql, query.params).fetchall() for query in queries)
 
 
 def _projected(raw: tuple[Any, ...]) -> StreamEvent | SkippedRow | None:
@@ -274,17 +297,21 @@ def _projected(raw: tuple[Any, ...]) -> StreamEvent | SkippedRow | None:
     return spec.read(_Row(event_id=event_id, at=at, task_id=_task_id(task_id), phase=phase), parsed)
 
 
-def _read(root: Path, sql: str, params: tuple[Any, ...]) -> list[tuple[Any, ...]]:
-    with read_only(root, runs_db(root), source=Source.EVENTS) as conn:
-        return conn.execute(sql, params).fetchall()
+_STREAM_PAYLOADS: Final[_Payloads] = MappingProxyType(
+    {kind: spec.payload for kind, spec in _STREAM.items()}
+)
 
 
 def read_events(root: Path, *, after_id: int, limit: int) -> EventBatch:
     """Up to `limit` rows of the mapped types after `after_id`, projected in id order."""
     if limit < 1:
         raise ValueError(f'limit must be at least 1, got {limit}')
-    rows = _read(
-        root, _STREAM_SQL, (*_STREAM_CASE_TYPES, after_id, *(kind.value for kind in _STREAM), limit)
+    (rows,) = _read(
+        root,
+        _rows_of_types(
+            'id, timestamp, event_type, task_id, phase', _STREAM_PAYLOADS,
+            after_id=after_id, limit=limit,
+        ),
     )
     projected = [_projected(row) for row in rows]
     return EventBatch(
@@ -294,3 +321,138 @@ def read_events(root: Path, *, after_id: int, limit: int) -> EventBatch:
         has_more=len(rows) == limit,
     )
 
+
+@dataclass(frozen=True)
+class FactoryStatus:
+    """Whether the scheduler runs and how long runs.db has been quiet; named as contract.FactoryState's fields."""
+
+    scheduler: SchedulerState
+    since: datetime | None
+    last_event_at: datetime | None
+    idle_seconds: int | None
+
+
+class _PauseRestored(_Payload):
+    reasserted: StrictBool | None
+
+
+_SCHEDULER_PAYLOADS: Final[_Payloads] = MappingProxyType({
+    StoreEventType.SCHEDULER_PAUSED: None,
+    StoreEventType.SCHEDULER_RESUMED: None,
+    StoreEventType.SCHEDULER_PAUSE_RESTORED: _PauseRestored,
+})
+
+_NEWEST_TIMESTAMP: Final = _Query('SELECT timestamp FROM events ORDER BY id DESC LIMIT 1', ())
+
+
+def _scheduler_after(kind: StoreEventType, payload: str | None) -> SchedulerState:
+    """A restored pause ends only when the restart recorded that it declined to reassert it."""
+    if kind is StoreEventType.SCHEDULER_RESUMED:
+        return SchedulerState.RUNNING
+    if kind is StoreEventType.SCHEDULER_PAUSE_RESTORED:
+        restored = _validated(_PauseRestored, payload)
+        if restored is not None and restored.reasserted is False:
+            return SchedulerState.RUNNING
+    return SchedulerState.PAUSED
+
+
+def _scheduler_since(rows: list[tuple[Any, ...]]) -> tuple[SchedulerState, datetime | None]:
+    scheduler, since = SchedulerState.RUNNING, None
+    for event_type, timestamp, payload in rows:
+        after = _scheduler_after(StoreEventType(event_type), payload)
+        if after is not scheduler:
+            scheduler, since = after, _instant(timestamp)
+    return scheduler, since
+
+
+def read_factory_status(root: Path, *, now: datetime) -> FactoryStatus:
+    """The scheduler state folded from every pause and resume, and the quiet time since the newest row."""
+    if now.utcoffset() is None:
+        raise ValueError(f'now must be timezone-aware, got {now.isoformat()}')
+    changes, newest = _read(
+        root, _rows_of_types('event_type, timestamp', _SCHEDULER_PAYLOADS), _NEWEST_TIMESTAMP
+    )
+    scheduler, since = _scheduler_since(changes)
+    last_event_at = _instant(newest[0][0]) if newest else None
+    idle_seconds = (
+        None
+        if last_event_at is None
+        else max(0, math.floor((now - last_event_at).total_seconds()))
+    )
+    return FactoryStatus(
+        scheduler=scheduler, since=since, last_event_at=last_event_at, idle_seconds=idle_seconds
+    )
+
+
+@dataclass(frozen=True)
+class OpenEscalation:
+    escalation_id: str
+    level: int | None
+
+
+@dataclass(frozen=True)
+class OpenEscalations:
+    """Every escalation runs.db records as created and not yet resolved, by task."""
+
+    by_task: Mapping[int, tuple[OpenEscalation, ...]]
+
+    def levels(self, task_id: int) -> tuple[int | None, ...]:
+        """The recorded level of each of the task's open escalations, None where none is recorded."""
+        return tuple(escalation.level for escalation in self.by_task.get(task_id, ()))
+
+
+class _EscalationCreated(_Payload):
+    escalation_id: str | None
+    level: JsonValue
+
+
+class _EscalationResolved(_Payload):
+    escalation_id: str | None
+    escalation_ids: tuple[str, ...] | None
+
+
+_ESCALATION_PAYLOADS: Final[_Payloads] = MappingProxyType({
+    StoreEventType.ESCALATION_CREATED: _EscalationCreated,
+    StoreEventType.ESCALATION_RESOLVED: _EscalationResolved,
+})
+
+
+def _recorded_level(value: JsonValue) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+_Opened = dict[str, tuple[int, OpenEscalation]]
+
+
+def _closed_ids(resolved: _EscalationResolved, task_id: int | None, opened: _Opened) -> tuple[str, ...]:
+    """By id, else by the listed ids, else every open escalation of the resolving task."""
+    if resolved.escalation_id is not None:
+        return (resolved.escalation_id,)
+    if resolved.escalation_ids is not None:
+        return resolved.escalation_ids
+    return tuple(key for key, (owner, _) in opened.items() if task_id is not None and owner == task_id)
+
+
+def _apply_escalation(opened: _Opened, event_type: str, task_id: int | None, payload: str | None) -> None:
+    if event_type == StoreEventType.ESCALATION_CREATED:
+        created = _validated(_EscalationCreated, payload)
+        if created is not None and created.escalation_id is not None and task_id is not None:
+            level = _recorded_level(created.level)
+            opened[created.escalation_id] = (task_id, OpenEscalation(created.escalation_id, level))
+        return
+    resolved = _validated(_EscalationResolved, payload)
+    if resolved is not None:
+        for escalation_id in _closed_ids(resolved, task_id, opened):
+            opened.pop(escalation_id, None)
+
+
+def read_open_escalations(root: Path) -> OpenEscalations:
+    """The open escalations left by replaying every created and resolved row in id order."""
+    (rows,) = _read(root, _rows_of_types('event_type, task_id', _ESCALATION_PAYLOADS))
+    opened: _Opened = {}
+    for event_type, task_id, payload in rows:
+        _apply_escalation(opened, event_type, _task_id(task_id), payload)
+    by_task: dict[int, tuple[OpenEscalation, ...]] = {}
+    for owner, escalation in opened.values():
+        by_task[owner] = (*by_task.get(owner, ()), escalation)
+    return OpenEscalations(by_task=MappingProxyType(by_task))
