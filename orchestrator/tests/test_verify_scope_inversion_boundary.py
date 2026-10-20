@@ -1307,8 +1307,9 @@ class TestRow9FallbackNarrowingNeverWholeRepoChain:
 # ALSO touched a production file would fork by role, which is not the shape
 # this row exercises.) modB's touched file is a plain SOURCE file with no
 # collectable test alongside it, which DOES fork by role: FULL_SUITE at
-# role='task' (the R3 owning-module pytest floor) vs SKIPPED at role='merge'
-# (R4 — the legacy shape).
+# role='task' (modB carries no whole-tree guard family, so the task-3294
+# floor takes its full-suite fallback leg — gate 5702, task 7253) vs SKIPPED
+# at role='merge' (R4 — the legacy shape).
 ROW10_MODA_TEST_PATH: str = 'moda/tests/test_thing.py'
 ROW10_MODA_TEST_CONTENT: str = 'def test_thing():\n    pass\n'
 ROW10_MODB_SOURCE_PATH: str = 'modb/helpers.py'
@@ -1376,7 +1377,8 @@ class TestRow10PlanAuthorityBothRoles:
     ``plan.runs`` — A1 — at BOTH role='task' and role='merge'. A mixed diff
     (a touched TEST file under modA, role-independent; a touched SOURCE-only
     file under modB, which forks by role — FULL_SUITE pytest at role='task'
-    (R3), SKIPPED at role='merge' (R4, breadth='scoped')) exercises both a
+    (R3's floor, via its no-guard-family fallback leg), SKIPPED at
+    role='merge' (R4, breadth='scoped')) exercises both a
     role-independent and a role-forking module in one plan.
     """
 
