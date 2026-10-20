@@ -80,7 +80,6 @@ from orchestrator.merge_lane.drift import (
 from orchestrator.merge_lane.gates import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-    GateClearance,
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
     _check_post_merge_pyright,
@@ -125,6 +124,7 @@ from orchestrator.merge_lane.request_ledger import (
     RequestLedger,
     _alarm_merge_request_stuck,
 )
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.merge_lane.shadow import (
     _alarm_warm_shadow_unparseable,
     _maybe_schedule_shadow_compare,

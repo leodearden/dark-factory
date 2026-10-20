@@ -66,10 +66,10 @@ from orchestrator.git_ops import (
 )
 from orchestrator.merge_lane.gates import (
     DropGuardResult,
-    GateClearance,
     _check_plan_files_touched_in_branch,
 )
 from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.merge_lane.types import DiskGuardOutcome, QueuedBranch
 from orchestrator.merge_lane.worker import (
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,

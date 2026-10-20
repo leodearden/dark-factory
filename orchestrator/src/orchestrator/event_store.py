@@ -195,6 +195,12 @@ class EventType(StrEnum):
     # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::
     # NoProgressAbort.event_data.
     merge_verify_progress_abort = 'merge_verify_progress_abort'
+    # One decision of the post-rebase re-verify gate, skip and fire alike,
+    # written before any re-verify runs. task_id-keyed, phase='merge'; data is
+    # defined by orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py::
+    # ReverifyGateDecision.event_data. A fire's verdict is the merge_verify row
+    # with the same task_id and merge_sha.
+    merge_reverify_gate = 'merge_reverify_gate'
     # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
     # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from
     # merge_verify, which is the merge worker's POST-rebase verify (branch

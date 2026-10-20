@@ -25,13 +25,13 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
-from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S, GitOps, _run
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.merge_lane.types import (
     MergeOutcome,
     MergeRequest,
@@ -3316,17 +3316,6 @@ def _disjoint_skip_blockers(
         )
 
     return blockers
-
-
-class GateClearance(StrEnum):
-    """Why a rebased tree cleared :func:`_reverify_rebased_tree` (task 6647)."""
-
-    same_tree = 'same_tree'
-    """The rebased tree is byte-identical to the tree whose verify passed."""
-    disjoint = 'disjoint'
-    """Footprint-disjoint from trusted drift; see :func:`_disjoint_skip_blockers`."""
-    reverified = 'reverified'
-    """A full re-verify of the rebased tree passed."""
 
 
 async def _same_tree(git_ops: GitOps, a: str, b: str) -> bool:
