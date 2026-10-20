@@ -68,6 +68,7 @@ from orchestrator.background_service import (
     LifecycleRegistry,
     ManagedService,
 )
+from orchestrator.chain_telemetry import ChainTelemetry
 from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
 from orchestrator.config import (
     OrchestratorConfig,
@@ -18558,6 +18559,16 @@ class Harness:
                 else digest_mod.ModelRoleRollup()
             )
 
+            # (8c) Deep merge-ahead chain telemetry (task 3188, PRD ε).  The
+            # reader is fail-open itself; the guard covers only a missing EventStore.
+            chain_telemetry = (
+                digest_mod.chain_telemetry_in_window(
+                    events_db_path, window_start, window_end
+                )
+                if events_db_path is not None
+                else ChainTelemetry()
+            )
+
             # (9) Parked-task counts via public Scheduler properties (task 1327).
             parked_live = self.scheduler.parked_live_count
             parked_window_churn = self.scheduler.parked_window_churn_count
@@ -18620,6 +18631,7 @@ class Harness:
                 submissions_in_step=submissions_in_step,
                 lifecycle_events_in_step=diff,
                 pause_visibility=pause_visibility,
+                chain_telemetry=chain_telemetry,
             )
 
             digest_mod.write_digest_entry(digest_dir, inputs)

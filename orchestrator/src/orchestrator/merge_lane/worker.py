@@ -5996,8 +5996,9 @@ async def classify_and_merge(
         # NOTE: _emit_speculative str-converts every data value (see its
         # `{k: str(v) ...}` coercion below), so depth lands here as a str
         # (e.g. "2") — unlike the merge_verify event's depth (dispatch, in
-        # verify_runner.py), which is a native int. analyze_speculation_depth's
-        # compute_per_depth() coerces both defensively, but a future consumer
+        # verify_runner.py), which is a native int. chain_telemetry.py::
+        # _is_legacy_deep_label and analyze_speculation_depth.py::
+        # is_legacy_deep_label coerce both, but a future consumer
         # that aggregates depth across both event types should not assume a
         # single type.
         worker._emit_speculative(
@@ -6340,9 +6341,10 @@ async def build_chain(
     # (`CHAIN_FAULT_REASONS`: an item's `merge_error` — missing ref, hook
     # rejection — and the lane's `lane_base_mismatch`) as opposed to the
     # benign caps (conflict / already_merged / train_request) escalate to
-    # WARNING, because ε's telemetry reader does not exist yet — a silent
-    # fault here is exactly the shape the no-silent-fail-soft design invariant
-    # exists to prevent.
+    # WARNING, because no event carries the truncation reason (ε's reader keys
+    # on `chain_items`/`passed`); a fault here is otherwise visible only in
+    # this line — a silent fault is exactly the shape the no-silent-fail-soft
+    # design invariant exists to prevent.
     #
     # `elapsed_ms` is on the line for the reason in the Caller-cost note of the
     # docstring: the blocking cost of a round is otherwise invisible from the
@@ -9069,11 +9071,9 @@ class ProbePlacement:
     was already built and healthy at this dispatch's decision time", NOT
     "this specific verify exercised d cumulative layers of diff" -- the two
     coincide only when the dispatched item happens to itself be the depth-d
-    tip. Treat probe-sourced buckets in ``analyze_speculation_depth.py`` as
-    a depth-availability proxy, not literal per-item cumulative-diff
-    coverage, until a follow-up phase redirects dispatch itself onto the
-    deep tip (which would also realize the throughput lever described in
-    this task's plan -- landing d+1 items per passing probe).
+    tip. Chain readers key on ``chain_items``, so a probe-era ``depth``
+    label is counted as a legacy row, never bucketed
+    (orchestrator/src/orchestrator/chain_telemetry.py::_is_legacy_deep_label).
 
     Attributes:
         depth: The probed cumulative stack depth (a member of
@@ -21967,7 +21967,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # the verify still exercises only `item`'s own (typically shallower)
             # merge_wt. See ProbePlacement's docstring for the resulting
             # label-vs-verified-content caveat this implies for consumers of
-            # analyze_speculation_depth.py's per-depth P(pass|depth) curve.
+            # the legacy `depth` label.
             placement = self._probe_verify_placement(item)
             depth = placement.depth if placement is not None else self._verify_frontier_depth()
             probe_base = placement.base if placement is not None else None

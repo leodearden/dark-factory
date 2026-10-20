@@ -154,7 +154,13 @@ class EventType(StrEnum):
     #                verified (see ProbePlacement's known-limitation note), so
     #                probe-era `depth` values are excluded from calibration.
     #                `chain_items` is derived from the tree that actually ran
-    #                and carries no such caveat.
+    #                and carries no such caveat.  PRD OQ#4 (task 3188 ε):
+    #                `depth` keeps being emitted alongside `chain_items` for
+    #                one release and task 4767 retires it; where both are
+    #                present `chain_items` is authoritative, and a `depth`-only
+    #                row is counted by
+    #                orchestrator/src/orchestrator/chain_telemetry.py::_is_legacy_deep_label,
+    #                never bucketed.
     # PLUS its always-present-but-NULLABLE companion (task 3185 amend,
     # reviewer_comprehensive performance):
     #   chain_build_ms  int | None.  Wall-clock milliseconds the deep chain
