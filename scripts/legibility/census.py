@@ -2833,9 +2833,10 @@ def run_census(
 
     *max_verify_clusters* bounds the per-cluster verification spend
     (``--max-verify-clusters``) to the first N novel clusters the pre-screen
-    leaves, in mining order. Selection is a plain ``[:N]`` slice of ``_novel_clusters``'s
-    own first-occurrence-wins ordering -- deterministic given the run,
-    with no invented "most important first" heuristic (any such ranking
+    leaves, in mining order; the similarity queue and then the re-verifies
+    take only what the novel clusters leave of it. Selection is a plain
+    ``[:N]`` slice of ``_novel_clusters``'s own first-occurrence-wins
+    ordering -- deterministic given the run, with no invented "most important first" heuristic (any such ranking
     would need a signal the census does not have pre-verification). The
     deferred remainder is NOT dropped: the codebook merge below consumes
     every mining record (``prescreen.routed_records``), not the verified clusters, so a
@@ -3418,11 +3419,11 @@ def run_census(
         )
 
     # verify is ONE call PER CLUSTER (_build_default_verify_fn), not one call
-    # total -- and the per-cluster count, novel clusters plus re-verifies, is
-    # precisely what an operator using --max-verify-clusters reads this line
-    # to check. headroom-probe is the run's REAL probe spend: this function's
-    # preflight and stage gate PLUS whatever the verifier reported spending on
-    # its own in-verify detectors.
+    # total -- and the per-cluster count, novel clusters plus queue clusters
+    # plus re-verifies, is precisely what an operator using
+    # --max-verify-clusters reads this line to check. headroom-probe is the
+    # run's REAL probe spend: this function's preflight and stage gate PLUS
+    # whatever the verifier reported spending on its own in-verify detectors.
     cost_note = (
         f"invoke calls: {config.models.census_miner} miner="
         f"{sum(s.total for s in mining_result.batch_stats)}, "
