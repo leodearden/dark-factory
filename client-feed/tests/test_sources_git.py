@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from _git_repo import Repo, make_repo
+
 from client_feed.sources.git import (
     EntryKind,
     GitError,
