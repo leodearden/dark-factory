@@ -698,12 +698,19 @@ through the **B3 low-risk gate** instead of spawning an interactive
   verify suite, and merges through the queue — aborting cleanly (leaving
   the escalation pending) on any doubt: non-low risk, a stale proposal,
   scope creep, a rebase conflict, a verify failure, or any merge-queue
-  outcome other than `done`.
+  outcome other than `done`. A merge the worker has already picked up is
+  never cancelled at the sub-agent's 20-minute polling ceiling: the
+  sub-agent hands its `request_id` back to the watcher, which resumes
+  polling it to terminal in a fresh background sub-agent. Only an entry
+  still queued at the ceiling is cancelled.
 - Anything else (drift, an aborted low-risk attempt, a capped budget) is
   left pending, written to the project's `afk-digest.md`, and recorded as
-  a decision for the next human return-triage pass.
+  a decision for the next human return-triage pass. A handed-off merge
+  still live after the resume backstop is left pending the same way, with
+  a decision record, and is never cancelled.
 - `unblock-low-risk` never touches main directly, never skips verification,
-  and never retries — one clean attempt or a pending escalation.
+  and never retries — one clean attempt or a pending escalation. A resume
+  is not a retry: it never resubmits or re-charges.
 
 ### `/recon-escalation-watcher` for the reconciliation queue
 
