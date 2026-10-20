@@ -19,8 +19,10 @@ from __future__ import annotations
 import contextlib
 import copy
 import functools
+import itertools
 import json
 import logging
+import math
 import re
 import subprocess
 from datetime import UTC, datetime, time, timedelta
@@ -38,6 +40,7 @@ from legibility import (
     codebook,
     coder,
     disposition,
+    embeddings,
     filing_policy,
     finding_area,
     invariants,
@@ -2708,6 +2711,54 @@ def test_render_report_flagless_output_is_byte_identical_golden():
 # step-17: RED — run_census() DEFER path (headroom banner)
 # ---------------------------------------------------------------------------
 
+_FRESH_AXES = itertools.count(16)
+"""One-hot axes no test chooses: a test's own vectors use axes below 16."""
+
+
+def _padded(vectors: list[list[float]]) -> list[list[float]]:
+    """*vectors* padded with zeros to one length, as one embeddings response is."""
+    width = max(len(vector) for vector in vectors)
+    return [vector + [0.0] * (width - len(vector)) for vector in vectors]
+
+
+def _fresh_axis() -> list[float]:
+    return [*[0.0] * next(_FRESH_AXES), 1.0]
+
+
+def _nothing_similar_embed(texts, *, model):
+    """An embed_fn under which no two texts are ever similar, even across
+    runs sharing one vector cache: each text it is handed gets a fresh axis."""
+    return _padded([_fresh_axis() for _ in texts])
+
+
+def _keyed_embed(chosen: dict[str, list[float]]):
+    """An embed_fn giving each text in *chosen* the vector the test chose and
+    every other text a fresh axis; records each call's texts in ``.calls``."""
+    calls: list[list[str]] = []
+
+    def embed(texts, *, model):
+        calls.append(list(texts))
+        return _padded([list(chosen[text]) if text in chosen else _fresh_axis() for text in texts])
+
+    embed.calls = calls
+    return embed
+
+
+def _census_config(tmp_path, *, project_id="dark_factory", **adjudication) -> config_mod.LegibilityConfig:
+    """The run_census test config. Its similarity queue verifies no cluster
+    unless a test passes ``max_clusters_per_run``, so suites not about L7 see
+    no attach and no queue verify call."""
+    return config_mod.LegibilityConfig(
+        project_id=project_id,
+        project_root=str(tmp_path),
+        escalation_port=8103,
+        cwd_prefixes=[str(tmp_path)],
+        census=config_mod.Census(
+            adjudication=config_mod.Adjudication(**{"max_clusters_per_run": 0, **adjudication}),
+        ),
+    )
+
+
 def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
     # The return annotation is load-bearing for the type gate, not decoration.
     # This dict is deliberately heterogeneous — injected callables, a
@@ -2729,12 +2780,12 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
         commit=_poison("commit"),
         roll_back=_poison("roll_back"),
         codebook_dict=_minimal_v2_codebook(),
-        config=config_mod.LegibilityConfig(
-            project_id="dark_factory",
-            project_root=str(tmp_path),
-            escalation_port=8103,
-            cwd_prefixes=[str(tmp_path)],
+        # Nothing is ever similar and the queue cap is 0, so a suite not about
+        # the similarity stage (census PRD L7) sees no attach and no queue verify.
+        embedder=embeddings.Embedder(
+            embed_fn=_nothing_similar_embed, cache_path=tmp_path / "embeddings.sqlite",
         ),
+        config=_census_config(tmp_path),
         project_root=str(tmp_path),
         project_id="dark_factory",
         codebook_path=tmp_path / "confusion-codebook.yaml",
@@ -8901,12 +8952,7 @@ def _hosted_kwargs(tmp_path, *, remediation=None, **overrides):
         synthesize_fn=_make_fake_synthesize_fn(),
         escalate_fn=_make_fake_escalate_fn(),
         commit=_make_fake_commit(),
-        config=config_mod.LegibilityConfig(
-            project_id="hosted_project",
-            project_root=str(tmp_path),
-            escalation_port=8103,
-            cwd_prefixes=[str(tmp_path)],
-        ),
+        config=_census_config(tmp_path, project_id="hosted_project"),
         project_id="hosted_project",
         **overrides,
     )
@@ -11357,3 +11403,127 @@ def test_a_codebook_entry_at_the_location_wins_over_the_external_finding(tmp_pat
     persisted = codebook.load(kwargs["codebook_path"])
     standing = next(e for e in persisted["entries"] if e["id"] == _STANDING_ENTRY_ID)
     assert standing["finding_key"] == _ROW5_KEY
+
+
+# ---------------------------------------------------------------------------
+# task 6406: the similarity stage (census PRD L7, §4.8 row 12)
+# ---------------------------------------------------------------------------
+
+_ENTRY_A_TEXT = "Some confusion cluster"
+_NOVEL_TEXT = (
+    "Silent no-op subagent contract — Agents were given contracts their runtime could not honor."
+)
+_NEAR = [0.99, math.sqrt(1 - 0.99 ** 2), 0.0]
+_ENTRY_AXIS = [1.0, 0.0, 0.0]
+
+
+def _backlog_candidate(cand_id: str, title: str, session: str, *, first_seen: str = "2026-07-01") -> dict:
+    return {
+        "id": cand_id,
+        "title": title,
+        "cause": None,
+        "area": "orchestrator",
+        "first_seen": first_seen,
+        "disposition": "pending",
+        "sightings": [{
+            "date": first_seen,
+            "project": "dark_factory",
+            "session": session,
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+            "evidence_quote": f"evidence from {session}",
+        }],
+    }
+
+
+def _similarity_kwargs(tmp_path, chosen, *, codebook_dict=None, batch=None, **adjudication):
+    embed = _keyed_embed(chosen)
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[batch or [_hand_digest("dup-1", "nothing new here")]],
+        verify_fn=_poison("verify_fn"),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+        codebook_dict=codebook_dict or _minimal_v2_codebook(),
+        embedder=embeddings.Embedder(embed_fn=embed, cache_path=tmp_path / "embeddings.sqlite"),
+        config=_census_config(tmp_path, **{"max_clusters_per_run": 10, **adjudication}),
+    )
+    return kwargs, embed
+
+
+def _persisted_record(kwargs, record_id: str) -> dict:
+    persisted = codebook.load(kwargs["codebook_path"])
+    return next(r for r in (*persisted["entries"], *persisted["candidates"]) if r["id"] == record_id)
+
+
+def test_a_backlog_candidate_near_an_open_entry_is_attached_by_similarity(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["candidates"] = [_backlog_candidate("cand-20260701-1", "Near entry a", "s-backlog")]
+    kwargs, embed = _similarity_kwargs(
+        tmp_path, {_ENTRY_A_TEXT: _ENTRY_AXIS, "Near entry a": _NEAR}, codebook_dict=cb,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    candidate = _persisted_record(kwargs, "cand-20260701-1")
+    attached_by = {"method": "similarity", "score": 0.99, "run_id": kwargs["run_id"]}
+    assert candidate["disposition"] == "promoted"
+    assert candidate["promoted_to"] == "entry-a"
+    assert candidate["attached_by"] == attached_by
+    entry = _persisted_record(kwargs, "entry-a")
+    [sighting] = [s for s in entry["sightings"] if s["session"] == "s-backlog"]
+    assert sighting["attached_by"] == attached_by
+
+    record = _run_record(kwargs)
+    assert [(row["candidate_id"], row["entry_id"], row["score"]) for row in record["adjudication"]["attached"]] == [
+        ("cand-20260701-1", "entry-a", 0.99),
+    ]
+    assert record["method"]["extra"]["attached"] == 1
+    assert record["method"]["cost"]["embedding_calls"] == len(embed.calls) == 1
+    adjudication = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Adjudication")
+    [audit] = [line for line in adjudication.splitlines() if "cand-20260701-1" in line]
+    assert "0.9900" in audit and "entry-a" in audit and '"Near entry a"' in audit
+
+
+def test_a_novel_cluster_near_an_entry_is_screened_and_its_candidate_attached(tmp_path):
+    kwargs, _ = _similarity_kwargs(
+        tmp_path, {_ENTRY_A_TEXT: _ENTRY_AXIS, _NOVEL_TEXT: _NEAR},
+        batch=[_hand_digest("novel-verified", "a genuinely new confusion shape")],
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    [candidate] = [c for c in persisted["candidates"] if c["title"] == "Silent no-op subagent contract"]
+    assert candidate["disposition"] == "promoted"
+    assert candidate["promoted_to"] == "entry-a"
+    assert candidate["attached_by"]["method"] == "similarity"
+    entry = _persisted_record(kwargs, "entry-a")
+    assert "novel-verified" in {s["session"] for s in entry["sightings"]}
+    assert kwargs["run_id"] in entry["last_seen_runs"]
+    [row] = _run_record(kwargs)["adjudication"]["attached"]
+    assert (row["candidate_id"], row["novel"]) == (candidate["id"], True)
+
+
+@pytest.mark.parametrize("status", ["fixed", "retired"])
+def test_a_backlog_candidate_near_only_a_fixed_entry_is_not_attached(tmp_path, status):
+    cb = _minimal_v2_codebook()
+    cb["entries"][0]["status"] = status
+    cb["candidates"] = [_backlog_candidate("cand-20260701-1", "Near entry a", "s-backlog")]
+    kwargs, _ = _similarity_kwargs(
+        tmp_path, {_ENTRY_A_TEXT: _ENTRY_AXIS, "Near entry a": _NEAR}, codebook_dict=cb,
+        max_clusters_per_run=0,
+    )
+
+    assert mod.run_census(**kwargs).status == "done"
+
+    candidate = _persisted_record(kwargs, "cand-20260701-1")
+    assert candidate["disposition"] == "pending"
+    assert "attached_by" not in candidate
+    assert _run_record(kwargs)["adjudication"]["attached"] == []
