@@ -22,6 +22,7 @@ auth-failed through the gate's public slot API, never by writing its state.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -43,11 +44,11 @@ def _cap() -> CapHit:
 _AUTH = AuthFailed(status=401)
 
 
-async def _gate_reporting(names, *outcomes: InvocationOutcome, scope=None):
+async def _gate_reporting(names, *outcomes: InvocationOutcome, scope=None, **cfg):
     """A gate over *names* with each outcome reported, in order, by the slot
     each next invocation in *scope* would get: the first outcome lands on the
     first admissible account, the next on the one after it, and so on."""
-    gate = make_gate(list(names))
+    gate = make_gate(list(names), **cfg)
     for outcome in outcomes:
         async with gate.invoke_slot(scope=scope) as slot:
             slot.report(outcome)
@@ -60,8 +61,8 @@ async def gates():
     auth failure starts a background re-probe)."""
     built = []
 
-    async def _build(names, *outcomes, scope=None):
-        gate = await _gate_reporting(names, *outcomes, scope=scope)
+    async def _build(names, *outcomes, scope=None, **cfg):
+        gate = await _gate_reporting(names, *outcomes, scope=scope, **cfg)
         built.append(gate)
         return gate
 
@@ -171,3 +172,72 @@ async def test_pool_frozen_names_the_count_and_which_accounts_are_capped_or_auth
     for name in ('max-x', 'max-y', 'max-z'):
         assert name in message
     assert 'capped' in message and 'auth-failed' in message
+
+
+async def _raises_pool_frozen_after(awaitable) -> tuple[PoolFrozen, float]:
+    """Await *awaitable* within the suite bound; return its PoolFrozen and how
+    long it took to raise."""
+    started = time.monotonic()
+    with pytest.raises(PoolFrozen) as excinfo:
+        await asyncio.wait_for(awaitable, _BOUND_SECS)
+    return excinfo.value, time.monotonic() - started
+
+
+async def test_a_bounded_park_on_a_frozen_fleet_raises_pool_frozen_once_spent(gates):
+    gate = await gates(('a', 'b'), _cap(), _cap())
+
+    frozen, elapsed = await _raises_pool_frozen_after(gate.before_invoke(max_wait_secs=0.2))
+
+    assert elapsed >= 0.15, f'raised after {elapsed:.3f}s: it refused to park instead of parking'
+    assert frozen.capped_account_names == ('a', 'b')
+
+
+async def test_a_bounded_park_on_an_exhausted_scope_raises_with_the_scope(gates):
+    gate = await gates(('a', 'b'), _cap(), _cap(), scope=SCOPE)
+    assert not gate.is_paused, 'fixture must leave the fleet open, or this is the fleet park'
+
+    frozen, elapsed = await _raises_pool_frozen_after(
+        gate.before_invoke(scope=SCOPE, max_wait_secs=0.2),
+    )
+
+    assert elapsed >= 0.15, f'raised after {elapsed:.3f}s: it refused to park instead of parking'
+    assert frozen.scope == SCOPE
+
+
+async def test_a_zero_allowance_refuses_to_park(gates):
+    gate = await gates(('a', 'b'), _cap(), _cap())
+
+    await _raises_pool_frozen_after(gate.before_invoke(max_wait_secs=0.0))
+
+
+async def test_invoke_slot_forwards_the_allowance(gates):
+    gate = await gates(('a', 'b', 'c'), _cap(), _AUTH, _cap())
+
+    async def _enter_slot():
+        async with gate.invoke_slot(max_wait_secs=0.2):
+            pytest.fail('a frozen pool must not yield a slot')
+
+    refused, _ = await _raises_pool_frozen_after(_enter_slot())
+    after, _ = await _raises_pool_frozen_after(gate.before_invoke(park=False))
+
+    for frozen in (refused, after):
+        assert frozen.capped_account_names == ('a', 'c')
+        assert frozen.auth_failed_account_names == ('b',)
+
+
+async def test_a_bounded_park_still_serves_an_account_that_reopens_in_time(gates):
+    """The account reopens through the gate's real reset path: its resume
+    probe (stubbed to succeed by ``make_gate``) fires at its reset time."""
+    soon = CapHit(resets_at=datetime.now(UTC) + timedelta(seconds=0.5), reason='test cap')
+    gate = await gates(('a', 'b'), _cap(), soon, wait_for_reset=True)
+    assert gate.is_paused, 'fixture must start frozen, or nothing parks'
+    allowance = 2.0
+
+    started = time.monotonic()
+    lease = await asyncio.wait_for(
+        gate.before_invoke(max_wait_secs=allowance), _BOUND_SECS + allowance,
+    )
+    elapsed = time.monotonic() - started
+
+    assert lease is not None and lease.name == 'b', lease
+    assert elapsed < allowance, f'served after {elapsed:.3f}s, not within the {allowance}s bound'

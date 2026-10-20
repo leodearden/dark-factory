@@ -497,6 +497,36 @@ class TestAnAbandonedParkIsNotInherited:
             'earlier, unrelated park happened to last'
         )
 
+    async def test_a_park_that_ends_at_its_deadline_does_not_poison_the_next_one(
+        self, caplog, fast_heartbeat
+    ) -> None:
+        """A bounded park ends by raising, which no lease-serving clear reaches."""
+        interval = fast_heartbeat(0.05)
+        gate = _all_capped_gate()
+
+        with pytest.raises(usage_gate_mod.PoolFrozen):
+            await asyncio.wait_for(
+                gate.before_invoke(max_wait_secs=interval * 2.4), _PARK_VALVE_SECS,
+            )
+        assert _park_records(caplog), (
+            'the bounded park logged nothing, so this test cannot show that its '
+            'clock was or was not inherited'
+        )
+
+        caplog.clear()
+        await _park_for(gate, interval * 1.5)
+
+        records = _park_records(caplog)
+        assert records, (
+            'the next park emitted no heartbeat: the park that ended at its '
+            "deadline left `_park_last_logged_at` set and throttled it"
+        )
+        first_elapsed = records[0][1]['elapsed_s']
+        assert first_elapsed < interval, (
+            f'the next park opened at elapsed_s={first_elapsed!r}, inherited from '
+            'a park that had already ended at its deadline'
+        )
+
     async def test_a_cancelled_sibling_does_not_reset_a_live_park(
         self, caplog, fast_heartbeat, stall_the_loop
     ) -> None:
