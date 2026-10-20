@@ -386,6 +386,40 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        with sub-steps a–d, and only a genuine not-landed outcome calls
        `mcp__escalation__merge_cancel(request_id)` before the **ABORT**.
 
+### Resuming a handed-off merge (resume mode)
+
+The escalation-watcher launches this skill in **resume mode** after a prior run returned
+`handed_off` (step 8's deadline disposition). Resume mode finishes that run's merge; it is not a
+second attempt.
+
+- **Inputs:** `task_id`, `escalation_id`, `project_root`, `worktree`, `request_id`. If any is
+  missing, ABORT without `merge_cancel`.
+- **Skip** preconditions 0–6 and Procedure steps 1–7. **Never** call `merge_request`,
+  `b3_gate check`, `record-launch` or `charge`: the fix is already committed, gated and charged,
+  and the entry is already submitted. Re-charging would spend a second cap slot, and resubmitting
+  would race a live entry (the watcher's "Tracking in-flight merges").
+- **The one re-check:** `mcp__escalation__get_escalation(escalation_id)` must still be `pending`.
+  If it is not, someone has taken the item: return `aborted` without `merge_cancel` and without
+  touching the task. The merge carries on, and whoever resolved the escalation owns it.
+- **Poll:** enter step 8's poll loop at its first `merge_status(request_id)` call (no submit), with
+  the resume parameters: `deadline = now() + 3 h`, cadence clamp [60 s, 300 s]. Past pickup there
+  is nothing left to cancel, and the remaining wait is a verify of about 50–60 min
+  (`plans/verify-admission-task-slots-gate.md`, M2); 3 h covers a verify plus a gate re-verify
+  with margin, at a cadence that keeps this sub-agent's context small. A wait over 120 s still
+  uses the foreground form of
+  [Waiting between polls](../merge-queue/SKILL.md#waiting-between-polls), with an explicit Bash
+  `timeout` above the wait.
+- **At the resume deadline** step 8's deadline disposition applies unchanged: still `queued` →
+  `merge_cancel` and ABORT; picked up → `handed_off` again. The watcher does not launch a second
+  resume (its "Completion handling").
+- **Otherwise run step 9 exactly as written**, including [this skill's
+  dispositions](#ladder-dispositions) on the ladder's verdicts. A polled `done` follows sub-step
+  a's **Polled** bullet: recover the sha with the task-scoped merge-marker ladder
+  ([Deriving the landed sha](#deriving-the-landed-sha)), stamp `kind` `"merged"` (or
+  `"found_on_main"`, as that bullet allows), then run sub-steps b–d. The superseded and
+  `coalesce-*` arms keep polling to this run's polling deadline.
+- Return per "Return value".
+
 ### Rebase recovery preflight
 
 `git rebase --abort` is the way out of a conflicted rebase, and it has two measured failure modes
