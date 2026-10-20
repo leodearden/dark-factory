@@ -174,12 +174,14 @@ from orchestrator.systemd_inspect import (
     inspect_systemd_unit,
 )
 from orchestrator.task_ground_truth import (
+    ON_MAIN_BRANCH_KINDS,
     BranchStateKind,
     ClaimantSource,
     RecoveryAction,
     TaskGroundTruth,
     leave_reason,
     recovery_shape_str,
+    report_blocked_arm_would_move,
     report_pins_blocked_done_flip,
     report_pins_blocked_recovery,
     report_pins_recovery,
@@ -6298,9 +6300,7 @@ class Harness:
             and status == 'blocked'
             and report.live_claimant is None
             and not report_pins_blocked_done_flip(report)
-            and report.branch_state.kind in (
-                BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER,
-            )
+            and report.branch_state.kind in ON_MAIN_BRANCH_KINDS
         ):
             action = RecoveryAction.MARK_DONE_WITH_PROVENANCE
 
@@ -6387,8 +6387,13 @@ class Harness:
         # exist to avoid, arrived at by a route no one reviewed.
         #
         # This clause therefore asks the blocked arm's OWN question — "would
-        # those clauses move this row next sweep?" — by calling the SAME
-        # predicate they call (task 3541).  Before eta it asked with
+        # those clauses move this row next sweep?" — through
+        # `report_blocked_arm_would_move`, which composes the SAME two
+        # predicates the clauses call (task 3541) and so follows them when they
+        # diverge: the ON_MAIN clause relaxes `preexisting_main_break` (task
+        # 4645) while the recovery predicate still pins it, and an in-progress
+        # on-main row pinned only by that record is held here rather than
+        # converted and then auto-done next sweep.  Before eta it asked with
         # `_only_merge_remediable`, which WAS that predicate at the time;
         # keeping the old spelling once the arm moved on would let the two
         # drift, which is precisely how this hazard reopens.
@@ -6411,7 +6416,7 @@ class Harness:
         # holds is not in it.
         if (
             action == RecoveryAction.CONVERT_TO_BLOCKED
-            and not report_pins_blocked_recovery(report)
+            and report_blocked_arm_would_move(report)
         ):
             # Says what the clause ACTUALLY asked.  It used to name the records
             # "merge-remediable", which was exact while the question WAS
