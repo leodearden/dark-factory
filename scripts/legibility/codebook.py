@@ -1107,6 +1107,65 @@ def validate_coding_record(record: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Reading records: their sessions, fixed entries, the pending candidate of a
+# title, and an entry through the candidate promoted to it
+# ---------------------------------------------------------------------------
+
+def sessions_of(record: Mapping[str, Any]) -> list[str]:
+    """The session of each of *record*'s sightings, in order, repeats kept."""
+    return [
+        sighting["session"]
+        for sighting in record.get("sightings") or []
+        if isinstance(sighting, Mapping) and isinstance(sighting.get("session"), str)
+    ]
+
+
+FIXED_STATUSES = frozenset({"fixed", "retired"})
+"""Entry statuses a re-observation contradicts: fixed by a task, or retired
+because the census verifier reported it fixed. Nothing attaches to such an
+entry; a cluster re-observing one is surfaced (plans/census-incremental-prd.md
+L5, consumers)."""
+
+
+def is_fixed(entry: Mapping[str, Any]) -> bool:
+    return entry.get("status") in FIXED_STATUSES
+
+
+def pending_titled(codebook: Mapping[str, Any], title: str | None) -> str | None:
+    """The id of the first ``pending`` candidate titled exactly *title*: the
+    key :func:`apply_coding_records` groups new candidates by, so a cluster
+    built from a raw coding record resolves to the candidate the merge gave it.
+
+    None is a normal outcome, not an impossibility: when every candidate of
+    the title is already adjudicated, the merge declines to fabricate a pending
+    twin (task 4144) and routes the recurrence to the standing record. A
+    caller surfaces a None rather than skipping it in silence."""
+    for candidate in codebook.get("candidates") or []:
+        if candidate.get("title") == title and candidate.get("disposition") == "pending":
+            return candidate.get("id")
+    return None
+
+
+def promoted_from(codebook: Mapping[str, Any], entry_id: str) -> dict | None:
+    """The candidate promoted to entry *entry_id* as its own entry: linked by
+    ``promoted_to`` and neither attached nor adjudicated onto it."""
+    for candidate in codebook.get("candidates") or []:
+        if (
+            candidate.get("promoted_to") == entry_id
+            and "attached_by" not in candidate
+            and "adjudicated_with" not in candidate
+        ):
+            return candidate
+    return None
+
+
+def entry_field(codebook: Mapping[str, Any], entry: Mapping[str, Any], field: str) -> str | None:
+    """*entry*'s *field* (``cause`` or ``area``): its own when a correction has
+    written it, else that of the candidate it was promoted from."""
+    return entry.get(field) or (promoted_from(codebook, entry["id"]) or {}).get(field)
+
+
+# ---------------------------------------------------------------------------
 # load / dump — deterministic canonical YAML I/O
 # ---------------------------------------------------------------------------
 

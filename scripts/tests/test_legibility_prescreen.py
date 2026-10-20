@@ -139,6 +139,8 @@ def test_a_novel_title_from_an_unseen_session_stays_to_verify_in_order():
     assert screen.to_verify[1] is second
     assert screen.screened == ()
     assert screen.surfaced == ()
+    assert screen.uncatalogued == screen.to_verify
+    assert all(got is want for got, want in zip(screen.uncatalogued, screen.to_verify, strict=True))
 
 
 @pytest.mark.parametrize(
@@ -156,6 +158,18 @@ def test_a_title_matching_a_fixed_entry_is_surfaced_and_verified(title, fixed_en
     assert screen.surfaced == (
         prescreen.Surfaced(rule=prescreen.Rule.TITLE, title=title, fixed_entry_ids=(fixed_entry_id,)),
     )
+    assert screen.uncatalogued == ()
+
+
+def test_only_clusters_no_catalogued_record_matches_are_uncatalogued():
+    novel = _cluster("Brand new shape")
+    surfaced = _cluster("FIXED shape", session="sess-other")
+
+    screen = _screen(novel, surfaced)
+
+    assert screen.to_verify == (novel, surfaced)
+    assert screen.uncatalogued == (novel,)
+    assert screen.uncatalogued[0] is novel
 
 
 def test_a_title_matching_a_retired_entry_is_surfaced_as_fixed():

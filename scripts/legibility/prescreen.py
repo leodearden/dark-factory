@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from legibility import census_findings, codebook, finding_area, verdict
+from legibility import census_findings, codebook, entry_join, finding_area, report_text, verdict
 
 
 class Rule(enum.StrEnum):
@@ -32,17 +32,6 @@ def normalised_title(title: str) -> str:
 
 def _attached_by(rule: Rule, run_id: str) -> dict[str, str]:
     return {"method": rule.value, "run_id": run_id}
-
-
-_FIXED_STATUSES = frozenset({"fixed", "retired"})
-"""Entry statuses a re-observation contradicts: fixed by a task (L5), or
-retired because the verifier reported it fixed (``census.py::retire_entry``).
-No rule attaches to such an entry; a cluster re-observing one is surfaced
-(plans/census-incremental-prd.md L5, consumers)."""
-
-
-def _is_fixed(entry: Mapping[str, Any]) -> bool:
-    return entry.get("status") in _FIXED_STATUSES
 
 
 @dataclass(frozen=True)
@@ -75,14 +64,6 @@ def _preferred(records: Sequence[CataloguedTitle], title: str) -> CataloguedTitl
     return next((record for record in records if record.title == title), records[0])
 
 
-def _sessions_of(record: Mapping[str, Any]) -> list[str]:
-    return [
-        sighting["session"]
-        for sighting in record.get("sightings") or []
-        if isinstance(sighting, Mapping) and isinstance(sighting.get("session"), str)
-    ]
-
-
 @dataclass(frozen=True)
 class Catalogue:
     """The codebook as the pre-screen reads it before this run's merge: every
@@ -96,7 +77,7 @@ class Catalogue:
     def of(cls, cb: Mapping[str, Any]) -> Catalogue:
         entries = [entry for entry in cb.get("entries") or [] if isinstance(entry, Mapping)]
         candidates = [candidate for candidate in cb.get("candidates") or [] if isinstance(candidate, Mapping)]
-        fixed = {entry.get("id") for entry in entries if _is_fixed(entry)}
+        fixed = {entry.get("id") for entry in entries if codebook.is_fixed(entry)}
 
         def fixed_entry_of(record: Mapping[str, Any], *, is_entry: bool) -> str | None:
             if is_entry:
@@ -116,7 +97,7 @@ class Catalogue:
 
         sessions: dict[str, list[str]] = {}
         for record in (*candidates, *entries):
-            for session in dict.fromkeys(_sessions_of(record)):
+            for session in dict.fromkeys(codebook.sessions_of(record)):
                 sessions.setdefault(session, []).append(record["id"])
         return cls(
             candidate_titles=index(candidates, is_entry=False),
@@ -180,6 +161,13 @@ class Screen:
     screened: tuple[Screened, ...]
     surfaced: tuple[Surfaced, ...]
 
+    @property
+    def uncatalogued(self) -> tuple[dict, ...]:
+        """The clusters to verify that no catalogued record matches by title or
+        session; a surfaced cluster re-observes a fixed entry and is not among them."""
+        surfaced = {item.title for item in self.surfaced}
+        return tuple(cluster for cluster in self.to_verify if cluster["title"] not in surfaced)
+
 
 def screen(clusters: Sequence[dict], catalogue: Catalogue) -> Screen:
     """Split novel *clusters* into those still to verify, in order, and those
@@ -189,7 +177,7 @@ def screen(clusters: Sequence[dict], catalogue: Catalogue) -> Screen:
     surfaced: list[Surfaced] = []
     for cluster in clusters:
         title = cluster["title"]
-        sessions = _sessions_of(cluster)
+        sessions = codebook.sessions_of(cluster)
         session = sessions[0] if sessions else None
         if (attach := catalogue.attachable(title)) is not None:
             screened.append(Screened(Rule.TITLE, title, session, attach.matched))
@@ -255,7 +243,7 @@ def _joinable(
 ) -> tuple[dict, census_findings.FindingIdentity] | None:
     """The first entry at *identity*'s location that is not fixed: the one a
     verdict there joins."""
-    return next(((entry, standing) for entry, standing in _entries_at(cb, identity) if not _is_fixed(entry)), None)
+    return next(((entry, standing) for entry, standing in _entries_at(cb, identity) if not codebook.is_fixed(entry)), None)
 
 
 @dataclass(frozen=True)
@@ -286,37 +274,23 @@ def _record_by_id(records: Iterable[dict], record_id: str, *, kind: str) -> dict
 def attach_by_key(
     cb: dict, candidate_id: str, entry_id: str, found: verdict.Verdict, *, run_id: str,
 ) -> tuple[dict, KeyAttach]:
-    """A new codebook in which pending *candidate_id* is promoted onto entry
-    *entry_id* instead of to an entry of its own, and the attach it made.
-
-    The candidate takes the entry's standing identity; each of its sightings
-    from a session the entry does not carry is appended to the entry, marked
-    with the attach and the verifier's tags."""
-    result = copy.deepcopy(cb)
-    candidate = _record_by_id(result.get("candidates") or [], candidate_id, kind="candidate")
-    target = _record_by_id(result.get("entries") or [], entry_id, kind="entry")
+    """A new codebook in which pending *candidate_id* joins keyed entry
+    *entry_id* (``entry_join.py::join_entry``), and the attach it made. The
+    sightings it appends carry the attach and the verifier's tags."""
+    target = _record_by_id(cb.get("entries") or [], entry_id, kind="entry")
     identity = census_findings.FindingIdentity.from_record(target)
     if identity is None:
         raise ValueError(f"attach_by_key: entry {entry_id!r} carries no finding identity")
     attached_by = _attached_by(Rule.KEY, run_id)
-
-    candidate.update(census_findings.stamped(candidate, identity))
-    candidate.update(disposition="promoted", promoted_to=target["id"], attached_by=attached_by)
-    sightings = target.setdefault("sightings", [])
-    carried = set(_sessions_of(target))
-    for sighting in candidate.get("sightings") or []:
-        if sighting.get("session") in carried:
-            continue
-        carried.add(sighting.get("session"))
-        sightings.append({
-            **copy.deepcopy(sighting), "attached_by": dict(attached_by), "verifier_tags": list(found.tags),
-        })
-
-    codebook.assert_no_deletion(cb, result)
+    result = entry_join.join_entry(
+        cb, candidate_id, entry_id,
+        candidate_fields={"attached_by": attached_by},
+        sighting_fields={"attached_by": attached_by, "verifier_tags": list(found.tags)},
+    )
     return result, KeyAttach(
-        title=candidate.get("title") or "",
+        title=_record_by_id(result["candidates"], candidate_id, kind="candidate").get("title") or "",
         candidate_id=candidate_id,
-        entry_id=target["id"],
+        entry_id=entry_id,
         identity=identity,
         verifier_tags=found.tags,
     )
@@ -546,7 +520,7 @@ def place(
     if joinable is not None:
         entry, standing = joinable
         return Placement(standing, entry["id"], None, None)
-    fixed_entry_ids = tuple(entry["id"] for entry, _ in _entries_at(cb, identity) if _is_fixed(entry))
+    fixed_entry_ids = tuple(entry["id"] for entry, _ in _entries_at(cb, identity) if codebook.is_fixed(entry))
     adoption = inputs.match(identity)
     return Placement(
         identity=identity if adoption is None else adoption.identity,
@@ -624,12 +598,8 @@ class ScreenReport:
         }
 
 
-def _title(title: str) -> str:
-    return '"' + " ".join(title.split()) + '"'
-
-
 def _attached_line(item: Mapping[str, Any]) -> str:
-    line = f"- attached by key: {_title(item['title'])} ({item['candidate_id']}) → {item['entry_id']} under {item['key']}"
+    line = f"- attached by key: {report_text.quoted_title(item['title'])} ({item['candidate_id']}) → {item['entry_id']} under {item['key']}"
     if item["tag_disagreement"] is None:
         return line
     standing, offered = item["tag_disagreement"]
@@ -650,17 +620,17 @@ def report_lines(record: Mapping[str, Any]) -> list[str]:
         f"- inputs consumed: {consumed}",
         *([f"- inputs note: {inputs['note']}"] if inputs["note"] else []),
         *(
-            f"- screened by {item['rule']}: {_title(item['title'])} → {', '.join(item['matched'])}"
+            f"- screened by {item['rule']}: {report_text.quoted_title(item['title'])} → {', '.join(item['matched'])}"
             for item in record["screened"]
         ),
         *(
             f"- surfaced by {item['rule']}, verified (re-observes fixed {', '.join(item['fixed_entry_ids'])}): "
-            f"{_title(item['title'])}"
+            f"{report_text.quoted_title(item['title'])}"
             for item in record["surfaced"]
         ),
         *(_attached_line(item) for item in record["attached"]),
         *(
-            f"- re-observed from {item['run_id']} by {item['matched_by']}: {_title(item['title'])} → "
+            f"- re-observed from {item['run_id']} by {item['matched_by']}: {report_text.quoted_title(item['title'])} → "
             f"{item['entry_id']} under {item['key']}"
             for item in record["re_observed"]
         ),
