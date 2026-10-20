@@ -17,7 +17,7 @@ import pytest
 from _fm_helpers import load_script_module
 
 if TYPE_CHECKING:
-    from write_triage_stats import StratumUnit
+    from ..scripts.write_triage_stats import StratumUnit
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'write_triage_stats.py'
 
