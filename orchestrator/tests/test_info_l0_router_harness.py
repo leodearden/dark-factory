@@ -281,3 +281,62 @@ class TestReaperRoutesInfoOrphans:
         assert l1.suggested_action == 'manual_intervention'
         assert esc.summary in l1.summary
         assert _curator(harness).calls == []
+
+
+def _write_legacy(harness: Harness, task_id: str, *, level: int, category: str) -> Escalation:
+    """A record filed before its category was retired: on disk, never through submit."""
+    queue = _queue(harness)
+    esc = Escalation(
+        id=queue.make_id(task_id), task_id=task_id, agent_role='implementer',
+        severity='blocking', category=category, summary=f'legacy L{level}', detail='legacy detail',
+        level=level, timestamp=(datetime.now(UTC) - timedelta(seconds=AGED_SECS)).isoformat(),
+    )
+    (queue.queue_dir / f'{esc.id}.json').write_text(esc.to_json())
+    return esc
+
+
+@pytest.mark.asyncio
+class TestBlockingDedupIsCategoryScoped:
+    """The unblock-4917 amendment: an open L1 covers a blocking orphan only
+    when it is about the same category, and it is told what it absorbed."""
+
+    async def test_an_l1_of_another_category_does_not_cover_a_blocking_orphan(self, harness: Harness):
+        _submit_aged(harness, '42', severity='blocking', level=1, category='task_failure', seconds_ago=5.0)
+        orphan = _submit_aged(harness, '42', severity='blocking', category='infra_issue')
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        (l1,) = _l1s(harness, agent_role='harness-orphan-reaper')
+        assert (l1.suggested_action, l1.category) == ('manual_intervention', 'infra_issue')
+        assert orphan.summary in l1.summary
+        assert 'Auto-promoted to level 1' in (_current(harness, orphan.id).resolution or '')
+
+    async def test_a_same_category_l1_covers_the_orphan_and_records_it(self, harness: Harness):
+        covering = _submit_aged(
+            harness, '42', severity='blocking', level=1, category='infra_issue', seconds_ago=5.0,
+        )
+        orphan = _submit_aged(
+            harness, '42', severity='blocking', category='infra_issue', summary='disk quota hit',
+        )
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        dismissed = _current(harness, orphan.id)
+        assert (dismissed.status, dismissed.resolved_by) == ('dismissed', 'harness-orphan-reaper')
+        assert 'open L1 already covers' in (dismissed.resolution or '')
+        assert _l1s(harness, agent_role='harness-orphan-reaper') == []
+        (amendment,) = _current(harness, covering.id).amendments
+        assert amendment['agent_role'] == 'harness-orphan-reaper'
+        carried = amendment['summary'] + amendment['detail']
+        assert orphan.id in carried and 'disk quota hit' in carried
+
+    async def test_a_legacy_category_does_not_abort_the_sweep(self, harness: Harness):
+        _write_legacy(harness, '7', level=1, category='retired_category')
+        legacy = _write_legacy(harness, '7', level=0, category='retired_category')
+        later = _submit_aged(harness, '8', severity='blocking')
+
+        await harness._reap_orphan_l0_escalations()
+
+        assert _current(harness, legacy.id).status == 'dismissed'
+        assert _current(harness, later.id).status == 'dismissed'
+        assert [l1.task_id for l1 in _l1s(harness, agent_role='harness-orphan-reaper')] == ['8']
