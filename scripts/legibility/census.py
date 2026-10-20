@@ -2040,7 +2040,7 @@ def _escalate_skipped_similarity(reason: str, *, project_id: str, escalate_fn) -
             summary=f"legibility census ({project_id}): similarity stage skipped -- {reason}",
             detail=detail,
         )
-    except Exception as exc:  # noqa: BLE001 - best-effort; the warning above is the real signal
+    except Exception as exc:
         logger.warning("census: similarity-skip escalation failed (best-effort): %s", exc)
 
 
