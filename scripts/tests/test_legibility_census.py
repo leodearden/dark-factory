@@ -972,7 +972,7 @@ def test_build_task_payloads_priority_defaults_to_the_default_severity():
 # (codebook.py::_apply_coding_record), so verification must operate on the
 # same set of resolvable titles -- a second cluster for an already-seen title
 # can never resolve to a second
-# "pending" candidate id in _find_pending_candidate_id, wasting a Sonnet
+# "pending" candidate id in codebook.pending_titled, wasting a Sonnet
 # verify call and diverging the matrix from the codebook
 # (reviewer_comprehensive finding #3).
 # ---------------------------------------------------------------------------
@@ -3498,7 +3498,7 @@ def test_run_census_skips_a_deletion_shaped_mining_record_and_lands_the_rest(
 # task 5279 W2: a REJECT verdict that resolves to no pending candidate must
 # name itself.
 #
-# Post-4144 `_find_pending_candidate_id` returning None is a NORMAL outcome:
+# Post-4144 `codebook.pending_titled` returning None is a NORMAL outcome:
 # when a re-mined title's only same-title candidate is already adjudicated,
 # `codebook.apply_coding_records` deliberately declines to fabricate a pending
 # twin (codebook.py:429-455 -- fabricating one is how rejected
@@ -8367,7 +8367,7 @@ def test_run_census_report_stays_silent_when_a_cluster_verifies(tmp_path):
 
 # ---------------------------------------------------------------------------
 # task 4879 step-13: RED — W-D. `run_census`'s promote loop does
-# `cand_id = _find_pending_candidate_id(...)` / `if cand_id is None: continue`
+# `cand_id = codebook.pending_titled(...)` / `if cand_id is None: continue`
 # — dropping a verify verdict the census PAID FOR with no log and no counter.
 # Post-4144 that None is a NORMAL outcome, not a defensive impossibility: for
 # a re-mined title whose only same-title candidate is already adjudicated,

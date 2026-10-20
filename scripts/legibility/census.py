@@ -1080,7 +1080,7 @@ class VerifyCoverage:
     remainder is DEFERRED, not dropped: those clusters still merge into
     the codebook as ``pending`` candidates via the untouched
     ``codebook.apply_coding_records`` path (which consumes raw mining
-    records, not verified clusters), so ``_find_pending_candidate_id`` can
+    records, not verified clusters), so ``codebook.py::pending_titled`` can
     still find them.
 
     That pickup is CONDITIONAL, not automatic, and the report says so: the
@@ -1713,7 +1713,7 @@ def _novel_clusters(records: list[dict]) -> list[dict]:
       new candidate sharing a title into the SAME pending codebook
       candidate, so a second cluster for that title would spend a
       redundant verify_fn call on a candidate id that can never be found
-      "pending" a second time (``_find_pending_candidate_id`` would return
+      "pending" a second time (``codebook.py::pending_titled`` would return
       None for it, silently dropping its promote/reject)."""
     seen_titles: set[str] = set()
     clusters = []
@@ -1749,34 +1749,10 @@ def _novel_clusters(records: list[dict]) -> list[dict]:
     return clusters
 
 
-def _find_pending_candidate_id(cb: dict, title: str | None) -> str | None:
-    """Locate a still-``pending`` candidate in *cb* by *title* -- the same
-    key ``codebook.apply_coding_records`` groups new candidates by, so a
-    verified/rejected cluster (built pre-merge from a raw mining record) can
-    be resolved to the REAL candidate id the merge just assigned it.
-
-    ``None`` is a NORMAL outcome, not a defensive impossibility. When a
-    re-mined title's only same-title candidate is already adjudicated,
-    ``codebook.apply_coding_records`` deliberately declines to fabricate a
-    pending twin (task 4144 -- fabricating one is how rejected
-    ``cand-20260722-28`` came back as pending ``cand-20260724-2`` in the
-    live codebook) and routes the recurrence sighting to the standing
-    record instead. The prior verdict standing is the CORRECT result; what
-    was wrong was skipping the cluster in silence. Callers are therefore
-    required to SURFACE a ``None`` -- see BOTH of ``run_census``'s
-    adjudication loops (verified and rejected) and
-    ``_find_adjudicated_candidate``, which names which verdict is
-    standing."""
-    for candidate in cb.get("candidates") or []:
-        if candidate.get("title") == title and candidate.get("disposition") == "pending":
-            return candidate.get("id")
-    return None
-
-
 def _sighting_counts_by_title(cb: dict) -> dict[str | None, int]:
     """How many DISTINCT sessions have sighted each title, across every entry
     and candidate carrying it -- the same title key
-    ``_find_pending_candidate_id`` resolves by. A promoted entry holds a copy
+    ``codebook.py::pending_titled`` resolves by. A promoted entry holds a copy
     of its candidate's sightings, hence the dedup by session.
 
     Every record counts, whatever its disposition or status, including a
@@ -2095,7 +2071,7 @@ def _with_finding(cluster: dict, area_map: finding_area.AreaMap) -> dict:
 def _find_adjudicated_candidate(cb: dict, title: str | None) -> dict | None:
     """Locate the standing already-adjudicated (non-``pending``) candidate
     in *cb* for *title* -- the one whose verdict explains why
-    ``_find_pending_candidate_id`` found nothing.
+    ``codebook.py::pending_titled`` found nothing.
 
     Mirrors ``codebook.apply_coding_records``'s own TWO-STEP precedence for
     exactly this situation (its ``elif same_title:`` branch, reached when
@@ -2861,7 +2837,7 @@ def run_census(
     deferred remainder is NOT dropped: the codebook merge below consumes
     every mining record (``prescreen.routed_records``), not the verified clusters, so a
     deferred cluster still lands as a ``pending`` candidate that
-    ``_find_pending_candidate_id`` can resolve later. That later pickup is
+    ``codebook.py::pending_titled`` can resolve later. That later pickup is
     CONDITIONAL (see ``VerifyCoverage``): its sessions are ledgered as coded,
     so a deferred cluster is re-adjudicated only if the same confusion
     RECURS. What a deferred cluster
@@ -3216,11 +3192,11 @@ def run_census(
     re_observed: list[prescreen.ReObserved] = []
 
     for cluster in verified:
-        cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
+        cand_id = codebook.pending_titled(updated_codebook, cluster.get("title"))
         if cand_id is None:
             # A verify verdict this run PAID FOR that resolves to no pending
             # candidate. Post-4144 this is a normal outcome, not an anomaly
-            # (see _find_pending_candidate_id); skipping it is still correct,
+            # (see codebook.py::pending_titled); skipping it is still correct,
             # announcing it is what was missing. The silence costs MORE here
             # than on the reject side below: a confusion pattern this run
             # CONFIRMED enters no codebook entry, and every later census codes
@@ -3303,7 +3279,7 @@ def run_census(
         )
 
     for cluster in rejected:
-        cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
+        cand_id = codebook.pending_titled(updated_codebook, cluster.get("title"))
         if cand_id is None:
             # A reject verdict this run PAID FOR that resolves to no pending
             # candidate. Post-4144 this is a normal outcome, not an anomaly:

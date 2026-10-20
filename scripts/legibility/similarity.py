@@ -22,7 +22,7 @@ from typing import Any
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import census_findings, codebook, config, embeddings, prescreen
+from legibility import census_findings, codebook, config, embeddings, entry_join, report_text
 
 Vector = tuple[float, ...]
 
@@ -65,7 +65,7 @@ def _item(kind: Kind, record: Mapping[str, Any], cause: str | None, *, record_id
         record_id=record_id,
         title=record["title"],
         text=record_text(record["title"], cause),
-        sessions=tuple(dict.fromkeys(prescreen.sessions_of(record))),
+        sessions=tuple(dict.fromkeys(codebook.sessions_of(record))),
         first_seen=record.get("first_seen"),
     )
 
@@ -77,7 +77,7 @@ def items_of(cb: Mapping[str, Any], novel_clusters: Iterable[Mapping[str, Any]] 
         *(
             _item(Kind.ENTRY, entry, codebook.entry_field(cb, entry, "cause"), record_id=entry["id"])
             for entry in cb.get("entries") or []
-            if not prescreen.is_fixed(entry)
+            if not codebook.is_fixed(entry)
         ),
         *(
             _item(Kind.PENDING, candidate, candidate.get("cause"), record_id=candidate["id"])
@@ -314,13 +314,6 @@ class AppliedAttach:
     novel: bool
 
 
-def _pending_titled(cb: Mapping[str, Any], title: str) -> str | None:
-    for candidate in cb.get("candidates") or []:
-        if candidate.get("title") == title and candidate.get("disposition") == "pending":
-            return candidate["id"]
-    return None
-
-
 def attach(
     cb: dict, view: View, *, run_id: str,
 ) -> tuple[dict, tuple[AppliedAttach, ...], tuple[Attach, ...]]:
@@ -334,12 +327,12 @@ def attach(
     applied: list[AppliedAttach] = []
     unattached: list[Attach] = []
     for found, novel in (*((found, False) for found in view.attaches), *((found, True) for found in view.screened)):
-        candidate_id = _pending_titled(result, found.item.title) if novel else found.item.key
+        candidate_id = codebook.pending_titled(result, found.item.title) if novel else found.item.key
         if candidate_id is None:
             unattached.append(found)
             continue
         attached_by = similarity_attached_by(found.score, run_id)
-        result = prescreen.join_entry(
+        result = entry_join.join_entry(
             result, candidate_id, found.entry_id,
             candidate_fields={"attached_by": attached_by}, sighting_fields={"attached_by": attached_by},
         )
@@ -393,7 +386,7 @@ def adjudicate_members(
         others = tuple(member.key for member in queued.others)
         if representative.get("disposition") == "promoted":
             for member_id in others:
-                result = prescreen.join_entry(
+                result = entry_join.join_entry(
                     result, member_id, representative["promoted_to"],
                     candidate_fields={"adjudicated_with": representative["id"]}, sighting_fields={},
                 )
@@ -487,21 +480,21 @@ class AdjudicationReport:
 def _attached_line(item: Mapping[str, Any]) -> str:
     novel = ", this run's novel cluster" if item["novel"] else ""
     return (
-        f"- attached by similarity {item['score']:.4f}: {prescreen.quoted_title(item['title'])} "
+        f"- attached by similarity {item['score']:.4f}: {report_text.quoted_title(item['title'])} "
         f"({item['candidate_id']}{novel}) → {item['entry_id']}"
     )
 
 
 def _unattached_line(item: Mapping[str, Any]) -> str:
     return (
-        f"- not attached, no pending candidate after the merge: {prescreen.quoted_title(item['title'])} "
+        f"- not attached, no pending candidate after the merge: {report_text.quoted_title(item['title'])} "
         f"(similarity {item['score']:.4f} → {item['entry_id']}); not verified this run"
     )
 
 
 def _processed_line(item: Mapping[str, Any]) -> str:
     return (
-        f"- {item['outcome']}: {prescreen.quoted_title(item['title'])} ({item['representative']}) for "
+        f"- {item['outcome']}: {report_text.quoted_title(item['title'])} ({item['representative']}) for "
         f"{len(item['members'])} candidate(s) across {item['sessions']} session(s)"
     )
 
@@ -544,7 +537,7 @@ def report_lines(record: Mapping[str, Any]) -> list[str]:
 
 def _cluster_line(queued: QueuedCluster) -> str:
     return (
-        f"- {queued.representative.key}: {prescreen.quoted_title(queued.representative.title)}, "
+        f"- {queued.representative.key}: {report_text.quoted_title(queued.representative.title)}, "
         f"{len(queued.members)} member(s) across {queued.sessions} session(s)"
     )
 
