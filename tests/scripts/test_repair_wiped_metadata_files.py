@@ -356,6 +356,14 @@ def test_build_repair_payload_provenance_carries_this_tasks_id_and_the_audit_fie
     assert provenance["at"] == _NOW
 
 
+def test_build_repair_payload_provenance_names_the_task_the_run_is_performed_for():
+    """A later pass stamps ITS OWN task, so a reader following ``task`` lands on
+    the record that actually describes this write, not on the first pass's."""
+    payload = build_repair_payload(_candidate(7), now_iso=_NOW, repair_task_id="3427")
+
+    assert payload[PROVENANCE_KEY]["task"] == "3427"
+
+
 def test_build_repair_payload_never_carries_done_provenance():
     """(c) DoneProvenanceWriteAuthorityError floor: update_task rejects any
     metadata write carrying done_provenance (set_task_status is its only
@@ -2099,6 +2107,60 @@ def test_repair_handshake_is_the_parents_with_only_the_name_substituted():
         return copied
 
     assert _name_normalised(repair_posts) == _name_normalised(parent_posts)
+
+
+# ---------------------------------------------------------------------------
+# A later pass is attributable to ITS OWN task: --task-id reaches both the
+# provenance stamp and the clientInfo.name fused-memory derives agent_id from.
+# ---------------------------------------------------------------------------
+
+
+def test_make_client_names_the_task_the_run_is_performed_for():
+    client = _make_client("http://127.0.0.1:9", repair_task_id="3427")
+
+    assert client._client_name == "repair-wiped-metadata-files-3427"
+    posts = _record_handshake(client)
+    assert posts[0]["params"]["clientInfo"]["name"] == "repair-wiped-metadata-files-3427"
+
+
+def test_make_client_defaults_to_the_first_pass_name():
+    assert _make_client("http://127.0.0.1:9")._client_name == CLIENT_NAME
+
+
+def test_task_id_flag_defaults_to_the_first_pass_and_accepts_a_later_task():
+    parser = _build_parser()
+
+    assert parser.parse_args(["--project-root", "x"]).repair_task_id == REPAIR_TASK_ID
+    assert (
+        parser.parse_args(["--project-root", "x", "--task-id", "3427"]).repair_task_id
+        == "3427"
+    )
+
+
+def test_main_async_attributes_an_applied_write_to_the_task_id_flag(
+    tmp_path, monkeypatch
+):
+    root = _wiped_project(tmp_path)
+    client = _ScriptedClient(
+        [{"status": "done", "metadata": {"files": []}}, {"success": True}]
+    )
+    client_task_ids: list[str] = []
+
+    def _fake_make_client(server_url, *, repair_task_id):
+        client_task_ids.append(repair_task_id)
+        return _client_context(client)
+
+    monkeypatch.setattr("repair_wiped_metadata_files._make_client", _fake_make_client)
+    args = _build_parser().parse_args(
+        ["--project-root", str(root), "--task-id", "3427", "--apply"]
+    )
+
+    exit_code = asyncio.run(main_async(args))
+
+    assert exit_code == EXIT_OK
+    assert client_task_ids == ["3427"]
+    [(_name, arguments)] = [call for call in client.calls if call[0] == "update_task"]
+    assert json.loads(arguments["metadata"])[PROVENANCE_KEY]["task"] == "3427"
 
 
 def test_main_project_root_is_repeatable(tmp_path):
