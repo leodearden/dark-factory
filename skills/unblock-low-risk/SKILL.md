@@ -1,6 +1,6 @@
 ---
 name: unblock-low-risk
-description: "Autonomous, NON-INTERACTIVE unblock of a single blocked task — but ONLY when the orchestrator's at-block-time dry-run investigation labelled the fix `risk_label == 'low'`. This is the unattended counterpart to /unblock, built for AFK windows: the L2 escalation-watcher launches it as a sub-agent (no terminal) for `task_failure`/`review_issues` escalations whose latest `metadata.dry_run_proposals[-1]` is low-risk and fresh. It re-derives the fix from the proposal prose, applies it scoped to `files_referenced`, runs the project verify suite, and merges via the orchestrator merge queue — aborting cleanly (leaving the escalation pending for a human) on ANY doubt: non-low risk, stale proposal, scope creep, rebase conflict, verify failure, or a merge-queue result other than done. A merge the worker has already picked up and is still verifying at the polling ceiling is handed back to the watcher (outcome handed_off), never cancelled. It NEVER touches main directly, never --no-verify, never retries. NOT for: medium / human-review-required proposals, interactive unblocking (use /unblock), any task without a low-risk dry-run proposal, or post-merge-red-main fix-forward tasks (block reason starts with 'Post-merge unscoped type-check failed' — b3_gate.check_proposal hard-ABORTs this entire class regardless of risk_label; see task 1680)."
+description: "Autonomous, NON-INTERACTIVE unblock of a single blocked task — but ONLY when the orchestrator's at-block-time dry-run investigation labelled the fix `risk_label == 'low'`. This is the unattended counterpart to /unblock, built for AFK windows: the L2 escalation-watcher launches it as a sub-agent (no terminal) for `task_failure`/`review_issues` escalations whose latest `metadata.dry_run_proposals[-1]` is low-risk and fresh. It re-derives the fix from the proposal prose, applies it scoped to `files_referenced`, runs the project verify suite, and merges via the orchestrator merge queue — aborting cleanly (leaving the escalation pending for a human) on ANY doubt: non-low risk, stale proposal, scope creep, rebase conflict, verify failure, or a merge-queue result other than done. A merge the worker has already picked up and is still live at the polling ceiling is handed back to the watcher (outcome handed_off), never cancelled. It NEVER touches main directly, never --no-verify, never retries. NOT for: medium / human-review-required proposals, interactive unblocking (use /unblock), any task without a low-risk dry-run proposal, or post-merge-red-main fix-forward tasks (block reason starts with 'Post-merge unscoped type-check failed' — b3_gate.check_proposal hard-ABORTs this entire class regardless of risk_label; see task 1680)."
 ---
 
 # Unblock — Low-Risk (autonomous, non-interactive)
@@ -239,7 +239,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
          if state == queued:      # never picked up by the merge worker — cancel-before-pickup
              mcp__escalation__merge_cancel(request_id)
              ABORT
-         else:                    # picked up: a verify is running — NEVER cancel
+         else:                    # picked up by the merge worker (merging or verifying) — NEVER cancel
              HAND OFF             # return outcome "handed_off" with request_id (see Return value)
      ```
 
@@ -248,10 +248,12 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      deadline the entry's state decides:
      - **Still `queued`** — no worker has started it, so cancelling costs nothing: call
        `merge_cancel(request_id)` and ABORT, leaving the escalation pending for a human.
-     - **Any other live state** (`verifying`, `gate`, `finalizing`, or any live state added
-       later) — the merge worker picked it up and a verify is running. **Never `merge_cancel`
-       it**: on a pending waiter `escalation/src/escalation/server.py::merge_cancel` retires the
-       entry and reaps its in-flight worktree, discarding a verify that may be green. A merge
+     - **Any other live state** (`verifying`, `gate`, `finalizing`, or any state later added to
+       `LIVE_STATES`) — the entry was picked up by the merge worker (merging or verifying).
+       `verifying` also covers an entry waiting for a verify slot, so it proves pickup, not a
+       running verify. **Never `merge_cancel` it**: on a pending waiter
+       `escalation/src/escalation/server.py::merge_cancel` retires the entry and reaps its
+       in-flight worktree, discarding the merge's progress and any verify that may be green. A merge
        verify runs about 50–60 min (`plans/verify-admission-task-slots-gate.md`, M2), so a
        picked-up entry at 20 minutes is the normal case, not a doubt signal. Instead **HAND
        OFF**: leave the task status and the escalation untouched, call no `merge_cancel`, and
@@ -401,7 +403,8 @@ second attempt.
   would race a live entry (the watcher's "Tracking in-flight merges").
 - **The one re-check:** `mcp__escalation__get_escalation(escalation_id)` must still be `pending`.
   If it is not, someone has taken the item: return `aborted` without `merge_cancel` and without
-  touching the task. The merge carries on, and whoever resolved the escalation owns it.
+  touching the task, with a `reason` that says the escalation is no longer pending and names its
+  status. The merge carries on, and whoever resolved the escalation owns it.
 - **Poll:** enter step 8's poll loop at its first `merge_status(request_id)` call (no submit), with
   the resume parameters: `deadline = now() + 3 h`, cadence clamp [60 s, 300 s]. Past pickup there
   is nothing left to cancel, and the remaining wait is a verify of about 50–60 min
@@ -584,19 +587,20 @@ on any doubt applies identically to this mode — nothing here loosens that.
 ## Aborting
 
 On any ABORT:
-- **Cancel a live durable-intent entry only where the ABORTing arm calls for it.** After a
-  successful `merge_request` submission (a `request_id` was returned — which excludes the
-  `already_merged` fast-path), call `mcp__escalation__merge_cancel(request_id)` FIRST, before
-  anything else, on exactly these arms: still `queued` at step 8's polling deadline; step 9's
-  `conflict` | `blocked` | `abandoned` | `failed` | `unknown_branch` arm; and the ladder's
-  genuine not-landed outcome. **Never** call it on an arm that says *without `merge_cancel`*,
-  nor on `superseded`, nor on an entry whose last observed state is live and past `queued` — at
-  step 8's deadline that is a hand-off, not an abort, and resume mode's
-  escalation-no-longer-pending exit leaves the merge running. Where it is called, it prevents an
-  orphaned durable-intent entry (PRD D2 — submitted merges now outlive the MCP call and
-  session) from accumulating. `merge_cancel` never raises and is a safe no-op if the entry
-  already finalized (it returns `cancelled: false` with the terminal state). A coalesced or
-  `attached` `request_id` may resolve to `state: "unknown"` — treat the cancel as best-effort.
+- **Cancel a live durable-intent entry only on the arms listed here.** This is the one list of
+  `merge_cancel` call sites in this skill: an arm not listed never calls it. After a successful
+  `merge_request` submission (a `request_id` was returned — which excludes the `already_merged`
+  fast-path), call `mcp__escalation__merge_cancel(request_id)` FIRST, before anything else, on:
+  - an entry still `queued` at step 8's polling deadline;
+  - step 9's `conflict` | `blocked` | `abandoned` | `failed` | `unknown_branch` arm;
+  - the ladder's genuine not-landed outcome ([this skill's dispositions](#ladder-dispositions)).
+
+  Every other ABORT leaves the entry alone, and step 8's hand-off of a picked-up entry is not an
+  ABORT at all. Where the call is made, it prevents an orphaned durable-intent entry (PRD D2 —
+  submitted merges now outlive the MCP call and session) from accumulating. `merge_cancel` never
+  raises and is a safe no-op if the entry already finalized (it returns `cancelled: false` with
+  the terminal state). A coalesced or `attached` `request_id` may resolve to `state: "unknown"` —
+  treat the cancel as best-effort.
 - **Do NOT change the task status.** `release_workflow` parks an `in-progress` task to `blocked`
   (including when there was no active slot at all) — that is the safe, sweep-immune state, so
   leave it there. If it returned `parked: null` the task was not at `in-progress`: leave it
@@ -644,12 +648,7 @@ Return ONLY this JSON object (no prose):
 - Merge ONLY through `merge_request` with explicit `wait_secs=100`; completion is awaited ONLY via
   `merge_status` polling (15 s→60 s backoff using `eta_seconds`; resume mode: 60 s→300 s); never
   a direct `git merge`; never `--no-verify`.
-- **Cancel on abort, where the arm says so:** an ABORT after a successful submission calls
-  `merge_cancel(request_id)` first only on the arms "Aborting" names; never on a *without
-  `merge_cancel`* arm or `superseded`.
-- **Never cancel a picked-up merge:** a live entry past `queued` at the polling deadline is
-  handed off (`outcome: handed_off`), never cancelled; only a still-`queued` entry may be
-  cancelled.
+- **`merge_cancel` only on the arms "Aborting" lists** — that section is the single list.
 - One attempt. No retry loops. ABORT on the first sign of doubt. Resume mode is not a retry: it
   never resubmits or re-charges.
 - After `set_task_status`, restore metadata via `update_task(append=true)`.
