@@ -1266,7 +1266,8 @@ class Decided:
 
 
 ChainTruncationReason: TypeAlias = Literal[
-    'conflict', 'train_request', 'already_merged', 'merge_error', 'lane_base_mismatch',
+    'conflict', 'train_request', 'stacked_on_unlanded_base', 'already_merged',
+    'merge_error', 'lane_base_mismatch',
 ]
 CHAIN_FAULT_REASONS: frozenset[ChainTruncationReason] = frozenset(
     {'merge_error', 'lane_base_mismatch'},
@@ -1281,7 +1282,7 @@ class ChainResult:
     Returned by :func:`orchestrator.merge_lane.worker.build_chain`, which
     sequentially merges queued items in submission order onto the frozen
     head's merge commit inside ONE scratch worktree, truncating at the first
-    textual conflict.  Sibling of the ``classify_and_merge`` sum type
+    item refused or not merging cleanly.  Sibling of the ``classify_and_merge`` sum type
     (:class:`MergedOk` / :class:`Decided`) — same family, one level up: those
     describe a single item's merge, this describes a whole speculative chain.
 
@@ -1301,6 +1302,9 @@ class ChainResult:
     * ``truncated_reason`` — ``'conflict'`` (genuine textual conflict — an
       expected, benign chain outcome), ``'train_request'`` (a
       :class:`GroupMergeRequest`, which ``_do_train_merge`` owns),
+      ``'stacked_on_unlanded_base'`` (the item's branch carries a recorded
+      stack base that never landed on main — benign: it takes the sequential
+      path, where ``classify_and_merge`` un-stacks it first),
       ``'already_merged'`` (the item's work is ALREADY in the base, so
       ``git merge --no-ff`` was a no-op — benign: it caps the chain but
       signals no fault, and the item's real verdict is rendered by the
@@ -1311,10 +1315,10 @@ class ChainResult:
       a lane-provisioning fault, distinct from ``'merge_error'``, which is
       an ITEM's merge failing).  **Only ``'merge_error'`` and
       ``'lane_base_mismatch'`` denote genuine faults**
-      (``CHAIN_FAULT_REASONS``) — conflict /
-      train_request / already_merged are benign caps and are deliberately
-      NOT collapsed into them, so ε's deep-fail reader is not inflated with
-      non-faults.
+      (``CHAIN_FAULT_REASONS``) — conflict / train_request /
+      stacked_on_unlanded_base / already_merged are benign caps and are
+      deliberately NOT collapsed into them, so a reader of truncation reasons
+      is not inflated with non-faults.
     * ``lane`` / ``lane_warm`` — the ONE scratch worktree holding ``tip``.
     * ``build_ms`` — wall-clock milliseconds the build cost, stamped by γ's
       caller (``_deep_chain_placement``) rather than by ``build_chain``

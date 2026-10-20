@@ -10240,6 +10240,24 @@ class GitOps:
                 detail=str(exc),
             )
 
+    async def unlanded_stack_base(self, full_branch: str) -> str | None:
+        """The recorded stack base of *full_branch* when it is not on main, else None.
+
+        A read-only check: it neither rewrites the branch nor clears the
+        record, so a caller that must stay pure
+        (orchestrator/src/orchestrator/merge_lane/worker.py::build_chain) can
+        refuse a stacked branch instead of un-stacking it.  It is the
+        conservative half of :meth:`unstack_from_unlanded_base`'s test: a git
+        error counts as unlanded, and a stale record (the branch was already
+        rebased off its base) still answers the base, so a stale record costs
+        chain depth, never correctness.
+        """
+        base = await self._stack_ledger().base_of(full_branch)
+        if base is None:
+            return None
+        landed = await self.is_ancestor_checked(base, self.config.main_branch)
+        return None if landed is True else base
+
     async def restore_pre_stack_tip(self, tip: PreStackTip) -> TipRestore:
         """Put a stacked member's branch back on the tip it had before stacking.
 

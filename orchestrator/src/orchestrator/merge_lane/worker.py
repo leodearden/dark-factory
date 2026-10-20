@@ -6147,7 +6147,8 @@ async def build_chain(
 
     Merges up to ``min(len(queue_snapshot), cap, target_depth)`` items, in
     submission order, sequentially into ONE scratch worktree, truncating at
-    the first item that does not merge cleanly.  Mirrors the free-function
+    the first item that is refused (a train, or a branch stacked on an
+    unlanded base) or does not merge cleanly.  Mirrors the free-function
     convention of :func:`classify_and_merge` (collaborators injected rather
     than reached for).
 
@@ -6286,14 +6287,12 @@ async def build_chain(
             # merge_liveness._acquire_warm_verify_worktree's Raises section.
             # Truncation is recorded in the returned ChainResult and nowhere
             # else.
-            if isinstance(req, GroupMergeRequest):
-                # A train carries `tip_branch` + `member_task_ids` + member
-                # callbacks and is landed by `_do_train_merge`; chaining it
-                # as a plain item would land a train without its member
-                # bookkeeping.  Truncate rather than skip past it — see the
-                # contiguous-prefix note below.
+            refusal = await _link_refusal(git_ops, req)
+            if refusal is not None:
+                # Truncate rather than skip past it — see the contiguous-prefix
+                # note below.
                 truncated_at = req.task_id
-                truncated_reason = 'train_request'
+                truncated_reason = refusal
                 break
             # bare_id so merge_branch_into_worktree's resolve_queued_branch_ref /
             # branch_prefix handling matches the sequential path exactly.
@@ -6316,8 +6315,8 @@ async def build_chain(
                 # bucket.  An already-landed item is BENIGN — its work is
                 # already in the base and it takes its normal sequential path,
                 # where `_is_genuinely_merged` renders the real verdict — so
-                # reporting it as a fault would inflate ε's deep-fail reader
-                # with non-faults and hide the real ones.
+                # reporting it as a fault would inflate a reader of truncation
+                # reasons with non-faults and hide the real ones.
                 if res.already_up_to_date:
                     truncated_reason = 'already_merged'
                 elif res.conflicts:
@@ -6340,7 +6339,8 @@ async def build_chain(
     # previously the only one that left no trace at all.  The fault reasons
     # (`CHAIN_FAULT_REASONS`: an item's `merge_error` — missing ref, hook
     # rejection — and the lane's `lane_base_mismatch`) as opposed to the
-    # benign caps (conflict / already_merged / train_request) escalate to
+    # benign caps (conflict / already_merged / train_request /
+    # stacked_on_unlanded_base) escalate to
     # WARNING, because no event carries the truncation reason (ε's reader keys
     # on `chain_items`/`passed`); a fault here is otherwise visible only in
     # this line — a silent fault is exactly the shape the no-silent-fail-soft
@@ -6377,6 +6377,29 @@ async def _lane_head(lane: Path) -> str | None:
     """The commit *lane* has checked out, or ``None`` when it cannot be read."""
     rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
     return out.strip() if rc == 0 else None
+
+
+async def _link_refusal(
+    git_ops: GitOps, req: MergeRequest,
+) -> ChainTruncationReason | None:
+    """Why :func:`build_chain` may not chain *req* before any merge is tried, or None.
+
+    A train (:class:`GroupMergeRequest`) carries ``tip_branch`` +
+    ``member_task_ids`` + member callbacks and is landed by
+    ``_do_train_merge``; chaining it as a plain item would land a train
+    without its member bookkeeping.  It is checked first because a train
+    tip's recorded stack base is a co-member, not a foreign base.
+
+    A branch stacked on a base that never landed would land the base's
+    commits under the link's name, and un-stacking it here would rewrite a
+    queued branch from inside a pure builder, so it is refused and left to
+    ``classify_and_merge`` on the sequential path, which un-stacks it.
+    """
+    if isinstance(req, GroupMergeRequest):
+        return 'train_request'
+    if await git_ops.unlanded_stack_base(req.branch.full_name) is not None:
+        return 'stacked_on_unlanded_base'
+    return None
 
 
 async def _journal_landed_then_advance(
