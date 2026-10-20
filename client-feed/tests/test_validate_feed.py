@@ -28,6 +28,7 @@ from client_feed.contract import (
     FeedState,
     FileRevealed,
     Heartbeat,
+    RunKind,
     WaitingOn,
     parse_feed_line,
     split_jsonl,
@@ -108,7 +109,7 @@ def test_the_committed_state_holds_the_facts_the_feed_was_written_to_show() -> N
         'C-2': 'failure',
         'C-3': 'success',
     }
-    assert set(state.criteria_declared) == {r.id for r in state.criteria['verify'].results}
+    assert set(state.criteria_declared) == {r.id for r in state.criteria[RunKind.VERIFY].results}
 
 
 def test_the_fixture_validates(capsys: pytest.CaptureFixture[str]) -> None:
