@@ -268,10 +268,17 @@ def test_last_changes_date_each_path_by_its_newest_first_parent_commit(repo: Rep
     repo.write('c.txt', 'c\n')
     repo.commit('c on the branch', when=T2)
     repo.checkout('main')
+    repo.write('d.txt', 'd\n')
+    repo.commit('d on main while the branch is open', when=T2)
     head = repo.merge_no_ff('task/7', 'Merge task/7 into main', when=T3)
 
-    assert last_changes(repo.root, head, since=None) == {'a.txt': T0, 'b.txt': T1, 'c.txt': T3}
-    assert last_changes(repo.root, head, since=second) == {'c.txt': T3}
+    assert last_changes(repo.root, head, since=None) == {
+        'a.txt': T0,
+        'b.txt': T1,
+        'c.txt': T3,
+        'd.txt': T2,
+    }
+    assert last_changes(repo.root, head, since=second) == {'c.txt': T3, 'd.txt': T2}
     assert last_changes(repo.root, head, since=head) == {}
 
 

@@ -6,18 +6,25 @@ import contextlib
 import os
 import re
 import subprocess
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import IO, Final
+
+from client_feed.contract import Branch
 
 MAIN_BRANCH: Final = 'main'
 TASK_BRANCH_PREFIX: Final = 'task/'
 GIT_TIMEOUT_SECS: Final = 300
 
-_MAIN_REF: Final = f'refs/heads/{MAIN_BRANCH}'
+_BRANCH_REFS: Final = 'refs/heads/'
+_MAIN_REF: Final = f'{_BRANCH_REFS}{MAIN_BRANCH}'
 _OBJECT_SHA: Final = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
+_DECIMAL: Final = re.compile(r'[0-9]+')
+_COMMIT_MARK: Final = b'\x01'
+_FIRST_PARENT_DIFF: Final = '--diff-merges=first-parent'
 
 # Mirrors df_pytest_isolation.py::_GIT_REDIRECT_ENV: the variables that make git act on a
 # repository or config other than the one at cwd.
@@ -221,3 +228,118 @@ def blob_reader(root: Path) -> Iterator[Callable[[str], bytes]]:
         _abandon(process)
         raise
     _finish(process)
+
+
+def _task_id(branch: str) -> int | None:
+    suffix = branch.removeprefix(TASK_BRANCH_PREFIX)
+    if _DECIMAL.fullmatch(suffix) is None or int(suffix) < 1:
+        return None
+    return int(suffix)
+
+
+def _branch(record: bytes) -> Branch:
+    refname, unix, ahead_behind = record.decode().split('\0')
+    name = refname.removeprefix(_BRANCH_REFS)
+    return Branch(
+        name=name,
+        task_id=_task_id(name),
+        ahead=int(ahead_behind.split()[0]),
+        last_commit_at=datetime.fromtimestamp(int(unix), UTC),
+    )
+
+
+def task_branches(root: Path) -> tuple[Branch, ...]:
+    """Every refs/heads/task/* branch, by name, with its count of commits main does not have."""
+    output = _run(
+        root,
+        'for-each-ref',
+        f'--format=%(refname)%00%(committerdate:unix)%00%(ahead-behind:{_MAIN_REF})',
+        f'{_BRANCH_REFS}{TASK_BRANCH_PREFIX}',
+    ).stdout
+    branches = (_branch(record) for record in output.split(b'\n') if record)
+    return tuple(sorted(branches, key=lambda branch: branch.name))
+
+
+@dataclass(frozen=True)
+class MergeStats:
+    """What a commit landed on main: its diff against its first parent."""
+
+    files_changed: int
+    insertions: int
+    deletions: int
+
+
+def _numstat_lines(count: bytes) -> int:
+    return 0 if count == b'-' else int(count)
+
+
+def merge_stats(root: Path, commit: str) -> MergeStats:
+    """The commit's numstat against its first parent; a rename is one file and a binary file counts no lines."""
+    output = _run(
+        root,
+        'diff-tree', '-r', '-z', '--numstat', '-M', '--root', _FIRST_PARENT_DIFF, '--no-commit-id',
+        _require_sha(commit),
+    ).stdout
+    tokens = output.split(b'\0')
+    files = insertions = deletions = 0
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if not token:
+            continue
+        added, deleted, path = token.split(b'\t', 2)
+        if not path:
+            index += 2
+        files += 1
+        insertions += _numstat_lines(added)
+        deletions += _numstat_lines(deleted)
+    return MergeStats(files_changed=files, insertions=insertions, deletions=deletions)
+
+
+def generated_paths(root: Path, commit: str, paths: Sequence[str]) -> frozenset[str]:
+    """The paths that `commit`'s own attributes mark linguist-generated."""
+    source = _require_sha(commit)
+    if not paths:
+        return frozenset()
+    output = _run(
+        root,
+        'check-attr', '--source', source, '-z', '--stdin', 'linguist-generated',
+        input_bytes=b''.join(os.fsencode(path) + b'\0' for path in paths),
+    ).stdout
+    fields = output.split(b'\0')
+    triples = zip(fields[0::3], fields[1::3], fields[2::3], strict=False)
+    return frozenset(os.fsdecode(path) for path, _, value in triples if value in (b'set', b'true'))
+
+
+def is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
+    """Whether `ancestor` is reachable from `descendant`; an unknown commit is no ancestor."""
+    completed = _run(
+        root,
+        'merge-base', '--is-ancestor', _require_sha(ancestor), _require_sha(descendant),
+        ok_returncodes=(0, 1, 128),
+    )
+    return completed.returncode == 0
+
+
+def _commit_changes(record: bytes) -> tuple[datetime, list[str]]:
+    header, _, names = record.partition(b'\0')
+    paths = names.removeprefix(b'\n').split(b'\0')
+    return datetime.fromtimestamp(int(header), UTC), [os.fsdecode(path) for path in paths if path]
+
+
+def last_changes(root: Path, head: str, *, since: str | None) -> dict[str, datetime]:
+    """For each path changed on `head`'s first-parent chain (after `since`), its newest change's committer time."""
+    revisions = _require_sha(head) if since is None else f'{_require_sha(since)}..{head}'
+    output = _run(
+        root,
+        'log', '--first-parent', _FIRST_PARENT_DIFF, '--no-renames', '--format=%x01%ct',
+        '--name-only', '-z',
+        revisions, '--',
+    ).stdout
+    changed: dict[str, datetime] = {}
+    for record in output.split(_COMMIT_MARK)[1:]:
+        when, paths = _commit_changes(record)
+        for path in paths:
+            changed.setdefault(path, when)
+    return changed
