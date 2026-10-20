@@ -103,14 +103,14 @@ class _Harness:
             raise EphemeralWorktreeError('worktree add failed on every attempt')
         yield self.probe_worktree
 
-    async def _main_baseline(self, config, module_configs, git_ops, main_sha, **kwargs):
+    async def main_baseline(self, config, module_configs, git_ops, main_sha, **kwargs):
         return self.baseline
 
-    async def _run_verification(self, worktree, config, module_config=None, **kwargs):
+    async def run_verification(self, worktree, config, module_config=None, **kwargs):
         self.rerun_trees.append(worktree)
         return _rerun_result(passed=self.rerun_passes)
 
-    async def _legacy_probe(self, *args, **kwargs):
+    async def legacy_probe(self, *args, **kwargs):
         raise AssertionError('the signature-comparison probe must not run on the mu fork')
 
     async def sink(self, observation: FlakeSuppression, main_sha: str) -> None:
@@ -127,9 +127,9 @@ class _Harness:
 def harness(tmp_path: Path):
     h = _Harness(tmp_path)
     with (
-        patch.object(verify_module, 'main_baseline_failing_ids', side_effect=h._main_baseline),
-        patch.object(verify_module, 'run_verification', side_effect=h._run_verification),
-        patch.object(verify_module, 'run_scoped_verification', side_effect=h._legacy_probe),
+        patch.object(verify_module, 'main_baseline_failing_ids', side_effect=h.main_baseline),
+        patch.object(verify_module, 'run_verification', side_effect=h.run_verification),
+        patch.object(verify_module, 'run_scoped_verification', side_effect=h.legacy_probe),
     ):
         yield h
 
