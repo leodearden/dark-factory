@@ -1981,23 +1981,31 @@ class TestFrozenPoolInvestigationIsBounded:
     gate until a reset, out of reach of ``_DRY_RUN_CAP_WAIT_SANITY_SECS``."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(('freezing_outcome', 'named', 'unnamed'), [
+        pytest.param('cap', 'capped: only', 'auth-failed: only', id='capped'),
+        pytest.param('auth', 'auth-failed: only', 'all accounts capped', id='auth_failed'),
+    ])
     async def test_a_pool_frozen_at_spawn_writes_infra_failure_within_the_bound(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, freezing_outcome, named, unnamed,
     ):
         from datetime import UTC, datetime, timedelta
 
         from _orch_helpers import build_usage_gate
         from shared.config_models import AccountConfig
-        from shared.invocation_outcome import CapHit
+        from shared.invocation_outcome import AuthFailed, CapHit
 
         from orchestrator import dry_run_unblock
         from orchestrator.dry_run_unblock import run_dry_run_unblock
 
+        outcome = {
+            'cap': CapHit(resets_at=datetime.now(UTC) + timedelta(hours=5), reason='test cap'),
+            'auth': AuthFailed(status=401),
+        }[freezing_outcome]
         gate = build_usage_gate(
             [AccountConfig(name='only', oauth_token_env='TEST_TOKEN_ONLY')], ['tok-only'],
         )
         async with gate.invoke_slot() as slot:
-            slot.report(CapHit(resets_at=datetime.now(UTC) + timedelta(hours=5), reason='test cap'))
+            slot.report(outcome)
         assert gate.is_paused, 'fixture must freeze the pool before the investigation starts'
         monkeypatch.setattr(dry_run_unblock, '_DRY_RUN_CAP_WAIT_SANITY_SECS', 0.2)
         scheduler = MagicMock()
@@ -2027,7 +2035,8 @@ class TestFrozenPoolInvestigationIsBounded:
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['status'] == 'infra_failure', entry
         assert entry['risk_label'] == 'human-review-required', entry
-        assert 'capped' in entry['proposal_text'].lower(), entry
+        assert named in entry['proposal_text'], entry
+        assert unnamed not in entry['proposal_text'].lower(), entry
 
 
 class TestCapHitRetriesFresh:

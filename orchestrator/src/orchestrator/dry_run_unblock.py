@@ -554,8 +554,8 @@ async def run_dry_run_unblock(
             # the entry's proposal_text/block_class.
             disp = classify_failure(cap_exc)
             logger.warning(
-                'dry_run_unblock: %s for task %s: %s',
-                disp.reason_prefix.lower(), task_id, cap_exc,
+                'dry_run_unblock: %s for task %s (%.1fs elapsed)',
+                _cap_wedge(cap_exc, disp), task_id, cap_exc.elapsed_secs,
             )
             entry = _cap_exhausted_entry(reason=reason, exc=cap_exc, disp=disp)
             # This entry's block_class reflects THIS cap-hit, not the
@@ -940,21 +940,32 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
     }
 
 
+def _cap_wedge(exc: AllAccountsCappedException, disp: BlockDisposition) -> str:
+    """What spent the investigation's cap patience, for its log and its entry.
+
+    A deadline spent parked names the gate's frozen-pool snapshot instead of
+    *disp*'s cap phrase: a pool frozen on rejected credentials is not a cap.
+    """
+    if exc.pool_frozen is None:
+        return f'{disp.reason_prefix.lower()} after {exc.retries} retries'
+    return f'cap-wait bound spent parked ({exc.pool_frozen})'
+
+
 def _cap_exhausted_entry(
     *, reason: str, exc: AllAccountsCappedException, disp: BlockDisposition,
 ) -> dict[str, Any]:
     """Build the retryable infra_failure entry for a cap-exhausted investigation.
 
-    AllAccountsCappedException means invoke_with_cap_retry exceeded the
-    ``_DRY_RUN_CAP_WAIT_SANITY_SECS`` bound (all accounts capped) — no
-    AgentResult was ever produced, so this reuses the None-safe
-    ``_failure_diagnostics(None)`` shape rather than the AgentResult-derived
-    one, matching the task-2020 infra_failure entry shape.
+    AllAccountsCappedException means invoke_with_cap_retry spent the
+    ``_DRY_RUN_CAP_WAIT_SANITY_SECS`` bound, retrying caps or parked on a
+    frozen pool — no AgentResult was ever produced, so this reuses the
+    None-safe ``_failure_diagnostics(None)`` shape rather than the
+    AgentResult-derived one, matching the task-2020 infra_failure entry shape.
 
     *disp* (BD-1) is ``classify_failure(exc)`` — the SAME disposition-table
     lookup workflow.py/steward.py/review_checkpoint.py all consult for an
     ``AllAccountsCappedException``, single-sourcing ``proposal_text``'s
-    leading phrase (the caller separately rebinds the outer ``block_class``
+    cap phrase (the caller separately rebinds the outer ``block_class``
     from ``disp.block_class`` too — see ``run_dry_run_unblock``'s except
     clause).
     """
@@ -963,8 +974,7 @@ def _cap_exhausted_entry(
         'status': 'infra_failure',
         'proposal_text': (
             f'Infra wedge (retryable, not a human-review conclusion): '
-            f'{disp.reason_prefix.lower()} after {exc.retries} retries '
-            f'({exc.elapsed_secs:.1f}s elapsed)'
+            f'{_cap_wedge(exc, disp)} ({exc.elapsed_secs:.1f}s elapsed)'
         ),
         'risk_label': _HUMAN_REVIEW_REQUIRED,
         'files_referenced': [],

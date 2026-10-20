@@ -291,6 +291,35 @@ async def test_cap_wait_sanity_secs_bounds_the_park_of_a_pool_frozen_at_call_sta
     ), [(rec.name, rec.getMessage()) for rec in caplog.records]
 
 
+async def test_a_park_spent_on_an_all_auth_failed_pool_does_not_report_a_cap(gates):
+    """Rejected credentials never reopen at a reset, so the exception a parking
+    caller gets carries the gate's snapshot and does not call the freeze a cap."""
+    gate = await gates(('a', 'b'), _AUTH, _AUTH)
+    invoke_fn = _RecordingInvoke()
+
+    with pytest.raises(AllAccountsCappedException) as excinfo:
+        await asyncio.wait_for(
+            _invoke_parking(gate, invoke_fn, cap_wait_sanity_secs=0.2), _BOUND_SECS,
+        )
+
+    frozen = excinfo.value.pool_frozen
+    assert isinstance(frozen, PoolFrozen), frozen
+    assert frozen is excinfo.value.__cause__, (frozen, excinfo.value.__cause__)
+    assert frozen.capped_account_names == ()
+    assert frozen.auth_failed_account_names == ('a', 'b')
+    message = str(excinfo.value)
+    assert 'all accounts capped' not in message, message
+    assert 'auth-failed' in message and 'a, b' in message, message
+
+
+async def test_a_cap_spent_in_the_retry_loop_carries_no_pool_snapshot():
+    """Only a park the gate refused to end has a ``PoolFrozen`` to report."""
+    exc = AllAccountsCappedException(retries=3, elapsed_secs=1.0, label='lbl')
+
+    assert exc.pool_frozen is None
+    assert 'all accounts capped' in str(exc)
+
+
 async def test_without_a_sanity_bound_the_park_is_still_unbounded(gates):
     gate = await gates(('a', 'b'), _cap(), _cap())
     invoke_fn = _RecordingInvoke()

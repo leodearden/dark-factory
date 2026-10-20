@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - exercised only when aiohttp absent
 if TYPE_CHECKING:
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
-    from shared.usage_gate import UsageGate
+    from shared.usage_gate import PoolFrozen, UsageGate
     from shared.vllm_bridge import VllmBridge
 else:
     # Re-expose the runtime binding under the public name so callers (and test
@@ -226,7 +226,8 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 # the cap-retry branch (_check_cap_wait, after an invocation returned a cap)
 # and the gate's own park when no account is admissible (the time left on the
 # deadline, forwarded as before_invoke's max_wait_secs).  A park that outlives
-# it raises AllAccountsCappedException chained from the gate's PoolFrozen.
+# it raises AllAccountsCappedException chained from the gate's PoolFrozen and
+# carrying it as pool_frozen, so an all-AUTH_FAILED freeze is not read as a cap.
 # park_on_frozen_pool=False (the curator, the legibility runner) still refuses
 # to park at all and gets PoolFrozen unconverted.  The bound lives in the
 # wrapper and the gate because a wait in before_invoke is definitionally a cap
@@ -369,14 +370,28 @@ class AllAccountsCappedException(Exception):
     - ``retries``: number of consecutive cap hits before giving up
     - ``elapsed_secs``: wall-clock seconds elapsed since the call started
     - ``label``: caller label from invoke_with_cap_retry (e.g. "Task 7 [impl]")
+    - ``pool_frozen``: the gate's ``PoolFrozen`` when the deadline was spent
+      parked, else ``None``.  It says which accounts were capped and which
+      AUTH_FAILED, and the message is built from it, because a pool frozen on
+      rejected credentials is not a cap and will not clear at a reset.
     """
 
-    def __init__(self, retries: int, elapsed_secs: float, label: str) -> None:
+    def __init__(
+        self,
+        retries: int,
+        elapsed_secs: float,
+        label: str,
+        *,
+        pool_frozen: PoolFrozen | None = None,
+    ) -> None:
         self.retries = retries
         self.elapsed_secs = elapsed_secs
         self.label = label
+        self.pool_frozen = pool_frozen
+        spent = f'after {retries} retries ({elapsed_secs:.1f}s elapsed)'
         super().__init__(
-            f'{label}: all accounts capped after {retries} retries ({elapsed_secs:.1f}s elapsed)'
+            f'{label}: all accounts capped {spent}' if pool_frozen is None
+            else f'{label}: cap-wait deadline spent parked {spent} — {pool_frozen}'
         )
 
 
@@ -2388,8 +2403,9 @@ async def invoke_with_cap_retry(
     admissible (every one capped or AUTH_FAILED, or a scoped model exhausted
     everywhere).  ``True`` (the default) parks within *cap_wait_sanity_secs*;
     a park that spends it raises ``AllAccountsCappedException`` chained
-    ``from`` the gate's ``usage_gate.PoolFrozen``, which keeps the snapshot
-    of which accounts were capped and which auth-failed.  ``False`` refuses
+    ``from`` the gate's ``usage_gate.PoolFrozen`` and carrying it as
+    ``pool_frozen``: the snapshot of which accounts were capped and which
+    auth-failed.  ``False`` refuses
     to park and lets ``PoolFrozen`` propagate unconverted, for a caller that
     must defer rather than wait and must tell a cap from rejected
     credentials, which will not clear at a reset (task 6042).
@@ -2520,16 +2536,21 @@ async def invoke_with_cap_retry(
     cap_wait_deadline = None if cap_wait_sanity_secs is None else retry_start + cap_wait_sanity_secs
     last_cap_wait_log_at: float | None = None
 
-    def _cap_patience_spent(why: str, hits: int, elapsed: float) -> AllAccountsCappedException:
+    def _cap_patience_spent(
+        why: str, hits: int, elapsed: float, *, pool_frozen: PoolFrozen | None = None,
+    ) -> AllAccountsCappedException:
         """Log why this call's cap patience ran out; return the exception saying so."""
         logger.error(f'{label}: {why}')
-        return AllAccountsCappedException(retries=hits, elapsed_secs=elapsed, label=label)
+        return AllAccountsCappedException(
+            retries=hits, elapsed_secs=elapsed, label=label, pool_frozen=pool_frozen,
+        )
 
     def _check_cap_wait(now: float, elapsed: float, cooldown: float, hits: int) -> None:
         """Guard and throttled log for cap-wait iterations.
 
-        Raises AllAccountsCappedException when the 14-day sanity bound is exceeded,
-        or when the count-based max_cap_retries bound is reached.
+        Raises AllAccountsCappedException once cap_wait_sanity_secs, measured
+        from call start, is spent, or when the count-based max_cap_retries
+        bound is reached.
         Emits a structured 'cap_wait' JSON log at most once per _CAP_WAIT_LOG_INTERVAL_SECS.
         Closes over: cap_wait_sanity_secs, max_cap_retries, label, num_accounts,
         usage_gate, last_cap_wait_log_at (nonlocal write).
@@ -2684,7 +2705,7 @@ async def invoke_with_cap_retry(
                     raise _cap_patience_spent(
                         f'cap-wait sanity bound ({cap_wait_sanity_secs}s) spent parked '
                         f'after {elapsed:.1f}s: {frozen}',
-                        consecutive_cap_hits, elapsed,
+                        consecutive_cap_hits, elapsed, pool_frozen=frozen,
                     ) from frozen
                 # Consulted inside the acquired slot, after any cooldown or
                 # park, and before attribution and credentials: a declined
