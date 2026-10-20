@@ -114,6 +114,7 @@ class EscalationCategory(StrEnum):
     VERIFY_WORKTREE_CONTENTION = 'verify_worktree_contention'
     WIP_CONFLICT = 'wip_conflict'
     WORKFLOW_EXIT_CONTRACT = 'workflow_exit_contract'
+    WORKFLOW_SLOT_WEDGED = 'workflow_slot_wedged'
     WRITE_CLASSIFIER_FALLBACK_STORM = 'write_classifier_fallback_storm'
     WRITE_TRIAGE_FAIL_OPEN_STORM = 'write_triage_fail_open_storm'
 
