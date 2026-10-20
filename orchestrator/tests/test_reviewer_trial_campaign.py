@@ -39,6 +39,17 @@ def test_complement_is_what_the_arm_caught_and_the_incumbent_missed_on_the_same_
     assert campaign.complement(arm, incumbent) == (1, 3)
 
 
+def test_complement_restricted_to_blocking_truth_counts_only_those_ids_on_both_sides() -> None:
+    inc = [_rec('inc', 'd1', 1, [('g1', 'blocking'), ('gx', 'blocking')], [], 0.5),
+           _rec('inc', 'd2', 1, [('g3', 'blocking')], [], 0.5)]
+    arm = [_rec('arm', 'd1', 1, [('g1', 'blocking'), ('g2', 'blocking'), ('gy', 'blocking')], [], 0.5),
+           _rec('arm', 'd2', 1, [('g3', 'blocking'), ('gz', 'blocking')], [], 0.5)]
+
+    assert campaign.complement(arm, inc) == (3, 3)
+    assert campaign.complement(arm, inc, restrict_to=BLOCKING_GT) == (1, 2)
+    assert campaign.complement(arm, inc, restrict_to={'d1': {'g1', 'g2'}}) == (1, 1)
+
+
 def test_strict_improvement_needs_three_trials_all_strictly_better() -> None:
     inc = [_rec('inc', 'd1', t, [], [], 0.5) for t in (1, 2, 3)]
     better = [_rec('arm', 'd1', t, [], [], 0.6) for t in (1, 2, 3)]
