@@ -453,6 +453,7 @@ review:
   full_review_on_complete: true
   briefing_path: "review/briefing.yaml"
   reports_dir: "data/review-checkpoints"
+  reviewer_briefing: "diff-only"
 
 # Scheduler fairness — anti-starvation for broad-footprint tasks.
 #

@@ -60,6 +60,8 @@ class CampaignDecisions:
     strict_f1_improvement: dict[str, bool]
     complement_pass: dict[str, bool]
     complement_threshold: float
+    non_inferiority: dict[str, bool]
+    non_inferiority_by_trial: dict[str, list[dict]]
 
 
 def _is_measured(rec: ScoreRecord) -> bool:
@@ -204,6 +206,44 @@ def strict_improvement(arm: ArmMetrics, incumbent: ArmMetrics) -> bool:
     return len(pairs) >= 3 and all(a > b for a, b in pairs)
 
 
+def non_inferiority_deltas(arm: list[ScoreRecord], incumbent: list[ScoreRecord]) -> list[dict]:
+    """Per trial, *arm*'s mean blocking recall and F1 minus *incumbent*'s.
+
+    Both means run over the same cells: the ``(trial, diff_id)`` keys both
+    sides measured. A fixture one side skipped, or a matcher cell one side
+    could not measure, drops out of the pair rather than reading as a zero.
+    """
+    measured_incumbent = {_key(r): r for r in incumbent if _is_measured(r)}
+    pairs_by_trial: dict[int, list[tuple[ScoreRecord, ScoreRecord]]] = defaultdict(list)
+    for rec in arm:
+        if _is_measured(rec) and _key(rec) in measured_incumbent:
+            pairs_by_trial[rec['trial']].append((rec, measured_incumbent[_key(rec)]))
+    return [
+        {
+            'trial': trial,
+            'blocking_recall_delta': _mean_delta(pairs, 'blocking_recall'),
+            'f1_delta': _mean_delta(pairs, 'f1'),
+        }
+        for trial, pairs in sorted(pairs_by_trial.items())
+    ]
+
+
+def _mean_delta(pairs: list[tuple[ScoreRecord, ScoreRecord]], metric: str) -> float:
+    return round(mean(a[metric] for a, _ in pairs) - mean(i[metric] for _, i in pairs), 4)
+
+
+def non_inferior(
+    arm: list[ScoreRecord], incumbent: list[ScoreRecord], min_trials: int = 3,
+) -> bool:
+    """Pre-registered D2 adoption rule: in each of at least *min_trials* trials, paired on
+    the cells both sides measured, the arm's mean blocking recall is not below the
+    incumbent's and its mean F1 is not worse. Ties pass; nothing shared fails."""
+    deltas = non_inferiority_deltas(arm, incumbent)
+    return len(deltas) >= min_trials and all(
+        d['blocking_recall_delta'] >= 0 and d['f1_delta'] >= 0 for d in deltas
+    )
+
+
 def summarize_campaign(
     records: list[ScoreRecord],
     incumbent_name: str,
@@ -221,11 +261,19 @@ def summarize_campaign(
         summarize_arm(name, recs, blocking_gt_by_diff, incumbent_records)
         for name, recs in by_arm.items() if name != incumbent_name
     )
+    candidates = {name: recs for name, recs in by_arm.items() if name != incumbent_name}
     decisions = CampaignDecisions(
         incumbent=incumbent_name,
         strict_f1_improvement={a.name: strict_improvement(a, arms[0]) for a in arms[1:]},
         complement_pass={a.name: a.complement_share >= complement_threshold for a in arms[1:]},
         complement_threshold=complement_threshold,
+        non_inferiority={
+            name: non_inferior(recs, incumbent_records) for name, recs in candidates.items()
+        },
+        non_inferiority_by_trial={
+            name: non_inferiority_deltas(recs, incumbent_records)
+            for name, recs in candidates.items()
+        },
     )
     return arms, decisions
 
@@ -265,6 +313,15 @@ def format_markdown(arms: list[ArmMetrics], decisions: CampaignDecisions) -> str
         lines.append(
             f'- `{name}` complement ≥ {decisions.complement_threshold:.0%} of incumbent recall: '
             f'**{"PASS" if ok else "FAIL"}** ({share:.1%})'
+        )
+    for name, ok in decisions.non_inferiority.items():
+        deltas = '; '.join(
+            f"t{d['trial']} BR{d['blocking_recall_delta']:+.3f} F1{d['f1_delta']:+.3f}"
+            for d in decisions.non_inferiority_by_trial[name]
+        ) or 'no shared measured cells'
+        lines.append(
+            f'- `{name}` non-inferior (blocking recall not below and F1 not worse in every '
+            f'trial, paired, measured cells only): **{"PASS" if ok else "FAIL"}** ({deltas})'
         )
     return '\n'.join(lines)
 

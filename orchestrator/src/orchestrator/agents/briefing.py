@@ -4,18 +4,29 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from shared.briefing_queries import BriefingScope
 from shared.task_text_fingerprint import TaskTextDrift
 
 from orchestrator.agents.memory_recall import MemoryRecall
+from orchestrator.agents.review_briefing import (
+    ReviewSubject,
+    amendment_scope_section,
+    render_context_complete_review,
+    review_action_section,
+)
 from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
 
 logger = logging.getLogger(__name__)
+
+DIFF_ONLY_DIFF_CAP_CHARS = 50_000
+"""Where the incumbent reviewer briefing cuts its diff; ``diff_cap_chars=0`` lifts the cut."""
 
 COMMIT_BULLET_LIMIT = 40
 """Max commit bullets rendered in one briefing section (task 3033 amendment).
@@ -1174,6 +1185,7 @@ This task holds locks for the following modules:
         self, reviewer_type: str, diff: str, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
         task: dict | None = None,
+        diff_cap_chars: int = DIFF_ONLY_DIFF_CAP_CHARS,
     ) -> str:
         """Build prompt for a reviewer agent.
 
@@ -1192,14 +1204,20 @@ This task holds locks for the following modules:
         the returned prompt is byte-identical to the non-amendment path.  The
         advisory section is best-effort — the deterministic
         ``partition_suggestions_by_delta`` filter is the enforceable guarantee.
+
+        *diff_cap_chars* is where the diff is cut; ``0`` inlines it whole.
+        Production callers leave the default.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(task), 'reviewer')
 
-        # Truncate very large diffs to avoid blowing the context
-        if len(diff) > 50000:
-            diff = diff[:50000] + '\n\n... [diff truncated] ...'
+        if diff_cap_chars and len(diff) > diff_cap_chars:
+            diff = diff[:diff_cap_chars] + '\n\n... [diff truncated] ...'
 
+        action = review_action_section(
+            reviewer_type,
+            'Review the diff according to your specialization. Explore the codebase as needed for context.',
+        )
         prompt = f"""\
 {context}
 
@@ -1209,34 +1227,31 @@ This task holds locks for the following modules:
 {diff}
 ```
 
-# Action
-
-1. Review the diff according to your specialization. Explore the codebase as needed for context.
-2. Call `submit_review_verdict(reviewer="{reviewer_type}", verdict=..., issues=..., summary=...)` with your findings.
-
-Your verdict is read from the `submit_review_verdict` tool call, not from your prose output — you MUST call it before finishing.
-"""
+{action}"""
 
         if amendment_suggestions:
-            listed = '\n'.join(
-                f"- {s.get('location') or '(no location)'} — "
-                f"{s.get('description') or ''}"
-                for s in amendment_suggestions
-            )
-            prompt += f"""
-# Amendment Re-Review Scope
-
-This diff was just amended to address the prior review's in-scope suggestions,
-listed below. Do NOT hunt for fresh, unrelated nits across the full diff:
-first confirm the listed prior suggestions were addressed, then report ONLY
-new findings introduced within the amendment delta — the lines this amendment
-actually changed. Blocking regressions anywhere in the diff remain in scope.
-
-Prior suggestions the amendment was asked to address:
-{listed}
-"""
+            prompt += '\n' + amendment_scope_section(amendment_suggestions)
 
         return prompt
+
+    async def build_context_complete_reviewer_prompt(
+        self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
+    ) -> str:
+        """Build the context-complete (D2) reviewer prompt for *subject*.
+
+        Memory is scoped to the task exactly as :meth:`build_reviewer_prompt`
+        scopes it; the rendering lives in ``agents/review_briefing.py``.
+        """
+        if context is None:
+            context = await self._get_memory_context(BriefingScope.from_task(subject.task), 'reviewer')
+        return render_context_complete_review(
+            reviewer_type=reviewer_type,
+            subject=subject,
+            context=context,
+            task_block=self._format_task(subject.task, include_test_strategy=True),
+            amendment_suggestions=amendment_suggestions,
+        )
 
     async def build_completion_judge_prompt(
         self,
@@ -1520,7 +1535,10 @@ A prior block-time investigation concluded the following; verify against the cur
 **Investigated at:** {created_at}
 """
 
-    def _format_task(self, task: dict, *, include_files: bool = True) -> str:
+    def _format_task(
+        self, task: Mapping[str, Any], *,
+        include_files: bool = True, include_test_strategy: bool = False,
+    ) -> str:
         """Format a task dict as readable text.
 
         Args:
@@ -1531,6 +1549,10 @@ A prior block-time investigation concluded the following; verify against the cur
                 ``build_architect_prompt`` to anti-anchor the first plan
                 derivation (C-A1): the architect must derive its own file
                 footprint rather than echoing the queue-time metadata guess.
+            include_test_strategy: When True, the task's ``testStrategy`` is
+                rendered. Only the context-complete reviewer passes it, so
+                ``review.reviewer_briefing`` stays the one switch that turns
+                that briefing change on and off (task 5369).
 
         Appends the task's own ``metadata.delivered_checks`` as a capability-gate
         section via :func:`_format_delivered_checks` (task 5359) — the gate
@@ -1567,12 +1589,14 @@ A prior block-time investigation concluded the following; verify against the cur
             lines.append(f'**Description:** {task["description"]}')
         if task.get('details'):
             lines.append(f'**Details:** {task["details"]}')
+        if include_test_strategy and task.get('testStrategy'):
+            lines.append(f'**Test strategy:** {task["testStrategy"]}')
         if include_files and metadata.get('files'):
             lines.append(f'**Files:** {", ".join(metadata["files"])}')
         deps = task.get('dependencies', [])
         if deps:
             dep_ids = [str(d.get('id', d)) if isinstance(d, dict) else str(d) for d in deps]
             lines.append(f'**Dependencies:** {", ".join(dep_ids)}')
-        body = '\n'.join(lines) if lines else json.dumps(task, indent=2)
+        body = '\n'.join(lines) if lines else json.dumps(dict(task), indent=2)
         checks_block = _format_delivered_checks(metadata.get('delivered_checks'))
         return f'{body}\n\n{checks_block}' if checks_block else body
