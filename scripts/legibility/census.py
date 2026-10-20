@@ -3000,13 +3000,15 @@ def run_census(
     # The pre-screen (plans/census-incremental-prd.md L6): a cluster already
     # catalogued by title, or from a session already sighted, costs no verify
     # call, and the merge attaches each title-screened sighting through its
-    # existing routing. The cap, the stage gate and verify see what is left.
+    # existing routing. The cap, the stage gate and verify see what is left;
+    # a surfaced cluster is verified, never similarity-screened
+    # (prescreen.py::Screen.uncatalogued).
     catalogue = prescreen.Catalogue.of(codebook_dict)
     screen = prescreen.screen(_novel_clusters(mining_result.records), catalogue)
     routed_records = prescreen.routed_records(mining_result.records, catalogue, run_id=run_id)
     session_screened = sum(1 for item in screen.screened if item.rule is prescreen.Rule.SESSION)
     view = similarity.build_view(
-        codebook_dict, screen.to_verify, embedder=embedder, settings=config.census.adjudication,
+        codebook_dict, screen.uncatalogued, embedder=embedder, settings=config.census.adjudication,
     )
     if view.skipped is not None:
         _escalate_skipped_similarity(view.skipped, project_id=project_id, escalate_fn=escalate_fn)
