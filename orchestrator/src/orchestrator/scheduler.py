@@ -50,6 +50,7 @@ from orchestrator.config import (
     TIER_BASE,
     TIER_WIDTH,
     OrchestratorConfig,
+    PsiAdmissionConfig,
     coerce_tier,
 )
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
@@ -945,6 +946,23 @@ class BlastRadiusResult:
             )
 
 
+@dataclass(frozen=True)
+class PsiHold:
+    """One tick's dispatch-admission hold, fixed when ``_phase_psi_gate`` decided it.
+
+    ``metric`` is the tripping arm's config field (D10 rank) and ``floor`` the
+    ``min_inflight_floor`` that ``in_flight`` met. Both come from the config the
+    gate read, so a hot reload that lands later in the tick (``apply_reload``
+    mutates ``config.psi_admission`` in place) cannot change what the
+    ``dispatch_deferred`` event reports.
+    """
+
+    metric: str
+    sample: PsiSample
+    in_flight: int
+    floor: int
+
+
 @dataclass
 class TickContext:
     """Per-tick mutable state threaded through ``acquire_next``'s phase list.
@@ -960,8 +978,8 @@ class TickContext:
     Deliberately a MUTABLE dataclass, not frozen: phases mutate shared
     per-tick state in place exactly as the pre-decomposition inline locals
     did (``status_map`` backfilled, ``candidates`` filtered, ``external_cache``
-    / ``psi_*`` written across phases). Co-located here (not a new module)
-    to avoid a circular import — it references ``OverrideRow``, ``PsiSample``,
+    / ``psi_hold`` written across phases). Co-located here (not a new module)
+    to avoid a circular import — it references ``OverrideRow``, ``PsiHold``,
     and ``TaskAssignment``, all already defined/imported in this module.
 
     ``terminal_dep_records`` (task 2692, δ/ε follow-up): holds fetched
@@ -995,9 +1013,7 @@ class TickContext:
     candidate_signals: dict[str, str | None] = field(default_factory=dict)
     gated_ids: set[str] = field(default_factory=set)
     stale_ids: set[str] = field(default_factory=set)
-    psi_sample: PsiSample | None = None
-    psi_hold: bool = False
-    psi_in_flight: int = 0
+    psi_hold: PsiHold | None = None
     dispatch_deferred_emitted: bool = False
 
 
@@ -2158,6 +2174,28 @@ def _park_records(parks_by_owner: Mapping[str, Mapping[str, Any]]) -> dict[str, 
     return {owner: ParkRecord.model_validate(rec) for owner, rec in parks_by_owner.items()}
 
 
+def _psi_degradations(sample: PsiSample, cfg: PsiAdmissionConfig) -> dict[str, str]:
+    """Map each degraded load component whose loss disables a LIVE gate arm
+    to the operator-facing description of that loss.
+
+    Host PSI always counts: an unreadable host sample makes every arm inert
+    this tick (DA-D6 fail-open). The runqueue and own-cgroup components count
+    only while their arm is on, because a degraded component behind an off arm
+    costs the gate nothing (PRD plans/load-throttle-harmonisation-prd.md D2).
+    """
+    degraded: dict[str, str] = {}
+    if not sample.read_ok:
+        degraded['host_psi'] = (
+            'host PSI /proc/pressure: failing open, heavy dispatch is NOT throttled'
+        )
+    if cfg.runqueue_ratio is not None and not sample.runqueue_read_ok:
+        degraded['runqueue'] = '/proc/stat runqueue: runqueue_ratio arm inert'
+    if cfg.own_cpu_some_avg10 is not None and not sample.own_read_ok:
+        own_cgroup = sample.own_cgroup or '(unresolved)'
+        degraded['own_cgroup'] = f'own cgroup {own_cgroup}: own_cpu_some_avg10 arm inert'
+    return degraded
+
+
 class Scheduler:
     """Selects next eligible task and manages module locks."""
 
@@ -2688,18 +2726,21 @@ class Scheduler:
         self._landed_outbox_gate: Callable[[str], Any] | None = None
         # Injected PSI reader for the dispatch-admission gate (task 2328,
         # DA3 of PRD docs/prds/dispatch-admission-load-cap.md).  Defaults to
-        # the real /proc/pressure reader; tests reassign
-        # ``scheduler._read_psi_sample = lambda: PsiSample(...)`` — mirrors
-        # the ``_landed_outbox_gate`` seam above (instance attr, no new
-        # constructor kwarg).  Signature: () -> PsiSample.
-        self._read_psi_sample: Callable[[], PsiSample] = read_psi_sample
+        # the real reader with this project's id bound here, so the
+        # own-cgroup reading resolves df-<project_id>.slice (task 3590); tests
+        # reassign ``scheduler._read_psi_sample = lambda: PsiSample(...)`` —
+        # mirrors the ``_landed_outbox_gate`` seam above (instance attr, no
+        # new constructor kwarg).  Signature: () -> PsiSample.
+        self._read_psi_sample: Callable[[], PsiSample] = partial(
+            read_psi_sample, project_id=config.fused_memory.project_id
+        )
         # Rate-limit timestamps (monotonic, via self._time_source) for the
-        # dispatch-admission gate's two WARNING streams — deliberately
+        # dispatch-admission gate's WARNING streams — deliberately
         # separate so "PSI unreadable" (fail-open, DA-D6) and "deferring
         # heavy dispatch" (throttle, DA-D2) cannot rate-limit each other into
-        # silence.
+        # silence, and kept per degraded component for the same reason.
         self._last_dispatch_deferred_log: float = 0.0
-        self._last_psi_read_fail_log: float = 0.0
+        self._psi_degradation_logged_at: dict[str, float] = {}
         # Injected async hook installed by the Harness — the already-landed
         # pre-dispatch gate (task 2313), architecturally parallel to
         # _landed_outbox_gate above but sourced from live git state (ancestry
@@ -7508,41 +7549,57 @@ class Scheduler:
         """Dispatch-admission gate (task 2328, DA3 of PRD
         docs/prds/dispatch-admission-load-cap.md).
 
-        Reads: none on ctx. Writes: ``ctx.psi_sample``, ``ctx.psi_hold``,
-        ``ctx.psi_in_flight``. Computed ONCE per tick, before both the
-        pinned and scored dispatch loops, so a single hold decision
-        governs both (DA-D5 parity) and ``len(self._dispatched)`` is read
-        before this tick's own dispatch can mutate it (stable floor
-        comparison). Runs after the empty-candidate short-circuit so an
-        idle tick never pays for a PSI read. Always continues.
+        Reads: none on ctx. Writes: ``ctx.psi_hold``. Computed ONCE per
+        tick, before both the pinned and scored dispatch loops, so a single
+        hold decision governs both (DA-D5 parity) and ``len(self._dispatched)``
+        is read before this tick's own dispatch can mutate it (stable floor
+        comparison). Runs after the empty-candidate short-circuit so an idle
+        tick never pays for a PSI read. Always continues.
+
+        A degraded load component never holds: ``saturated()`` treats its
+        arm as inert (every arm, when host PSI is unreadable — DA-D6). The
+        loud operator signal is ``_warn_psi_degradations``.
         """
         cfg_psi = self.config.psi_admission
-        psi_sample: PsiSample | None = None
-        psi_hold = False
-        psi_in_flight = 0
+        hold: PsiHold | None = None
         if cfg_psi.enabled:
             psi_sample = self._read_psi_sample()
-            if not psi_sample.read_ok:
-                # Fail-open (DA-D6): saturated() is False whenever read_ok is
-                # False, so psi_hold stays False and dispatch proceeds
-                # normally — this WARNING is only the loud operator signal.
-                _now = self._time_source()
-                if _now - self._last_psi_read_fail_log >= _DISPATCH_DEFERRED_LOG_SECS:
-                    logger.warning(
-                        'Dispatch-admission gate: PSI sample unreadable — '
-                        'failing open (heavy dispatch is NOT throttled this tick)'
-                    )
-                    self._last_psi_read_fail_log = _now
-            psi_in_flight = len(self._dispatched)
-            psi_hold = (
-                psi_sample.saturated(cfg_psi) and psi_in_flight >= cfg_psi.min_inflight_floor
-            )
-        ctx.psi_sample = psi_sample
-        ctx.psi_hold = psi_hold
-        ctx.psi_in_flight = psi_in_flight
+            self._warn_psi_degradations(_psi_degradations(psi_sample, cfg_psi))
+            in_flight = len(self._dispatched)
+            if psi_sample.saturated(cfg_psi) and in_flight >= cfg_psi.min_inflight_floor:
+                hold = PsiHold(
+                    metric=psi_sample.tripping_metric(cfg_psi),
+                    sample=psi_sample,
+                    in_flight=in_flight,
+                    floor=cfg_psi.min_inflight_floor,
+                )
+        ctx.psi_hold = hold
         return _CONTINUE
 
-    def _note_heavy_deferral(self, ctx: TickContext, deferred_task_id: str) -> None:
+    def _warn_psi_degradations(self, degraded: Mapping[str, str]) -> None:
+        """WARN once, naming every degraded component, when any of them is
+        due — not reported within the rate-limit window.
+
+        Each component keeps its own window: one that newly degrades (host PSI
+        failing while the runqueue arm is already inert) is reported at once,
+        and one that flaps is reported at most once per window.
+        """
+        now = self._time_source()
+        logged_at = self._psi_degradation_logged_at
+        if not any(
+            now - logged_at.get(component, -math.inf) >= _DISPATCH_DEFERRED_LOG_SECS
+            for component in degraded
+        ):
+            return
+        logger.warning(
+            'Dispatch-admission gate: load component unreadable — %s',
+            '; '.join(degraded.values()),
+        )
+        logged_at.update(dict.fromkeys(degraded, now))
+
+    def _note_heavy_deferral(
+        self, ctx: TickContext, hold: PsiHold, deferred_task_id: str
+    ) -> None:
         """Emit dispatch_deferred + a rate-limited WARNING for the FIRST
         heavy candidate skipped this tick.
 
@@ -7555,42 +7612,26 @@ class Scheduler:
         if ctx.dispatch_deferred_emitted:
             return
         ctx.dispatch_deferred_emitted = True
-        cfg_psi = self.config.psi_admission
-        # invariant: only reachable when ctx.psi_hold is True, which is only
-        # ever set True inside `if cfg_psi.enabled:` after ctx.psi_sample is
-        # assigned — so ctx.psi_sample is never None here.
-        assert ctx.psi_sample is not None
-        psi_sample = ctx.psi_sample
-        # DA-D1 ranked order: cpu > mem_some > mem_full > io.
-        if psi_sample.cpu_some10 >= cfg_psi.cpu_some_avg10:
-            metric, value = 'cpu_some_avg10', psi_sample.cpu_some10
-        elif psi_sample.mem_some10 >= cfg_psi.mem_some_avg10:
-            metric, value = 'mem_some_avg10', psi_sample.mem_some10
-        elif psi_sample.mem_full10 >= cfg_psi.mem_full_avg10:
-            metric, value = 'mem_full_avg10', psi_sample.mem_full10
-        else:
-            metric, value = 'io_some_avg10', psi_sample.io_some10
         if self.event_store:
             self.event_store.emit(
                 EventType.dispatch_deferred,
                 task_id=deferred_task_id,
                 data={
-                    'metric': metric,
-                    'value': value,
-                    'in_flight': ctx.psi_in_flight,
-                    'floor': cfg_psi.min_inflight_floor,
+                    'metric': hold.metric,
+                    'in_flight': hold.in_flight,
+                    'floor': hold.floor,
+                    'sample': asdict(hold.sample),
                 },
             )
         _now = self._time_source()
         if _now - self._last_dispatch_deferred_log >= _DISPATCH_DEFERRED_LOG_SECS:
             logger.warning(
                 'Dispatch-admission gate: deferring heavy task %s — '
-                'PSI %s=%.1f (in_flight=%d, floor=%d)',
+                'PSI %s tripped (in_flight=%d, floor=%d)',
                 deferred_task_id,
-                metric,
-                value,
-                ctx.psi_in_flight,
-                cfg_psi.min_inflight_floor,
+                hold.metric,
+                hold.in_flight,
+                hold.floor,
             )
             self._last_dispatch_deferred_log = _now
 
@@ -7640,7 +7681,7 @@ class Scheduler:
                 # remain exempt.  ctx.psi_hold and _note_heavy_deferral are
                 # the SAME once-per-tick decision/helper the scored loop
                 # uses below, so both loops share one hold and one event.
-                self._note_heavy_deferral(ctx, pin.task_id)
+                self._note_heavy_deferral(ctx, ctx.psi_hold, pin.task_id)
                 continue
             modules = self._get_modules(pin.task)
             if self.lock_table.try_acquire(pin.task_id, modules):
@@ -7953,7 +7994,7 @@ class Scheduler:
                     # deterministic candidates are exempt (DA-D4) and lower-
                     # ranked exempt/light candidates behind it still get a turn
                     # (per-candidate `continue`, not a top-level `return None`).
-                    self._note_heavy_deferral(ctx, task_id)
+                    self._note_heavy_deferral(ctx, ctx.psi_hold, task_id)
                     continue
                 modules = self._get_modules(task)
                 acquired = self.lock_table.try_acquire(task_id, modules)
