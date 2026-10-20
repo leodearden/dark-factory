@@ -21,13 +21,13 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from shared.usage_gate import UsageGate
-from test_reviewer_trial_checkout import _CHANGE_AT_BASE, _git, _Source
+from test_reviewer_trial_checkout import _CHANGE_AT_BASE, _commit, _git, _Source
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.agents.roles import build_reviewer_role
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import OrchestratorConfig, ReviewConfig
+from orchestrator.config import OrchestratorConfig, project_review_config
 from orchestrator.evals.reviewer_trial.checkout import (
     FixtureEnrichmentMissing,
     fixture_checkout,
@@ -694,7 +694,7 @@ class TestPanelBriefsLikeProduction:
                 task=diff.context.task.as_task_dict(),
                 plan=diff.context.plan,
                 plan_absent_reason=diff.context.plan_reason or '',
-                conventions_relpath=ReviewConfig().briefing_path,
+                conventions_relpath=project_review_config(source.root).briefing_path,
             )
         expected = await BriefingAssembler(OrchestratorConfig()).build_context_complete_reviewer_prompt(
             'reviewer_r1', subject, context='',
@@ -710,6 +710,35 @@ class TestPanelBriefsLikeProduction:
         assert call['system_prompt'] == build_reviewer_role(
             spec.name, spec.specialization, ReviewBriefing.CONTEXT_COMPLETE,
         ).system_prompt
+
+    @pytest.mark.asyncio
+    async def test_a_d2_arm_reads_conventions_where_the_fixture_project_configures_them(
+        self, source: _Source,
+    ) -> None:
+        _git(source.root, 'checkout', '-q', '-b', 'conventions', source.base)
+        base = _commit(source.root, {
+            'review/briefing.yaml': _conventions_yaml('DEFAULT-PATH RULE'),
+            'docs/review-conventions.yaml': _conventions_yaml('PROJECT-PATH RULE'),
+        }, 'conventions at two paths')
+        (source.root / 'dark-factory-orchestrator.yaml').write_text(
+            'review:\n  briefing_path: docs/review-conventions.yaml\n',
+        )
+        variant = with_briefing(_one_reviewer(), ReviewBriefing.CONTEXT_COMPLETE)
+        seen: list[dict] = []
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_capturing_invoke(seen),
+        ):
+            await run_panel(variant, _enriched(source, base_sha=base), stagger_secs=0)
+
+        [call] = seen
+        assert 'PROJECT-PATH RULE' in call['prompt']
+        assert 'DEFAULT-PATH RULE' not in call['prompt']
+
+
+def _conventions_yaml(rule: str) -> str:
+    return f'conventions:\n  - rule: {rule}\n    why: the project says so\n'
 
 
 class TestTrialFixtureReadiness:

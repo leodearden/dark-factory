@@ -31,7 +31,7 @@ from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.agents.roles import AgentRole
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import OrchestratorConfig, ReviewConfig
+from orchestrator.config import OrchestratorConfig, project_review_config
 from orchestrator.evals.reviewer_trial.checkout import (
     FixtureCheckout,
     FixtureEnrichmentMissing,
@@ -137,12 +137,21 @@ async def _panel_prompts(
 
 
 async def _review_subject(diff: CorpusDiff, checkout: FixtureCheckout) -> ReviewSubject:
-    """What production would gather for *diff*'s change, read from its scratch clone."""
+    """What production would gather for *diff*'s change, read from its scratch clone.
+
+    The conventions file is the one *diff*'s own project configures.
+    """
     if diff.context is None:
         raise FixtureEnrichmentMissing([diff.diff_id])
     if checkout.change_base is None:
         raise FixtureNotMaterialisable(
             diff.diff_id, checkout.unapplied_reason or 'its change is not committed in the clone',
+        )
+    conventions_relpath = project_review_config(diff.cwd or DEFAULT_FIXTURE_CWD).briefing_path
+    if not (checkout.root / conventions_relpath).is_file():
+        logger.info(
+            'Fixture %s: no conventions at %s in its tree; its d2 panel is briefed without them',
+            diff.diff_id, conventions_relpath,
         )
     return await gather_review_subject(
         checkout.root,
@@ -150,7 +159,7 @@ async def _review_subject(diff: CorpusDiff, checkout: FixtureCheckout) -> Review
         task=diff.context.task.as_task_dict(),
         plan=diff.context.plan,
         plan_absent_reason=diff.context.plan_reason or _NO_PLAN_REASON,
-        conventions_relpath=ReviewConfig().briefing_path,
+        conventions_relpath=conventions_relpath,
     )
 
 

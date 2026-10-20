@@ -6153,6 +6153,22 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     return config
 
 
+PROJECT_CONFIG_FILENAME = 'dark-factory-orchestrator.yaml'
+"""The canonical name of a project's orchestrator config, at its project root."""
+
+
+def project_review_config(project_root: Path) -> ReviewConfig:
+    """The ``review`` block the orchestrator of the project at *project_root* runs with.
+
+    Layered the way OrchestratorConfig layers its YAML source (defaults.yaml,
+    then the project's own file, then ``${VAR}`` expansion), but without
+    setting ``ORCH_CONFIG_PATH``, so one process can read another project's
+    setting. A project with no config file gets the shipped defaults.
+    """
+    layered = YamlSettingsSource(OrchestratorConfig, project_root / PROJECT_CONFIG_FILENAME)()
+    return ReviewConfig.model_validate(layered.get('review') or {})
+
+
 # ---------------------------------------------------------------------------
 # Config hot-reload (plans/config-hot-reload-prd.md, task alpha): RELOADABLE_FIELDS
 # ---------------------------------------------------------------------------

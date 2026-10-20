@@ -37,6 +37,7 @@ from orchestrator.config import (
     default_price_table,
     diff_config,
     load_config,
+    project_review_config,
 )
 
 
@@ -4600,3 +4601,26 @@ class TestReviewerBriefingConfig:
 
     def test_the_leaf_is_green_tier_reloadable(self):
         assert 'review.reviewer_briefing' in RELOADABLE_FIELDS
+
+
+class TestProjectReviewConfig:
+    """``project_review_config`` reads another project's ``review`` block as its orchestrator would (task 5369)."""
+
+    def test_a_projects_override_is_layered_over_the_shipped_defaults(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'some-other-project.yaml'))
+        (tmp_path / 'dark-factory-orchestrator.yaml').write_text(
+            'review:\n  briefing_path: docs/review-conventions.yaml\n',
+        )
+
+        review = project_review_config(tmp_path)
+
+        assert review.briefing_path == 'docs/review-conventions.yaml'
+        assert review.reports_dir == _load_package_defaults()['review']['reports_dir']
+        assert os.environ['ORCH_CONFIG_PATH'] == str(tmp_path / 'some-other-project.yaml')
+
+    def test_a_project_without_a_config_file_gets_the_shipped_defaults(self, tmp_path: Path):
+        review = project_review_config(tmp_path)
+
+        assert review.briefing_path == _load_package_defaults()['review']['briefing_path']
