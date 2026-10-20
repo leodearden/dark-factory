@@ -6272,18 +6272,22 @@ class Harness:
         # question and share `report_pins_blocked_recovery` /
         # `records_pin_blocked_recovery`.
         #
-        # The two predicates carry the SAME merge-remediable relaxation and
-        # differ on exactly one input class — a dead-filer L0.  Recovery may
-        # proceed past one: its handoff has no consumer left, and conversion or
-        # a re-file is recoverable.  A DONE-FLIP may not: it is terminal, so
-        # completing a task past an unconsumed handoff is the phantom-done D4
-        # had just closed at the dispatch gate, and PRD D3 / spec §6 demand 3
-        # say so directly ("any non-info open record still vetoes MARK_DONE").
-        # The dead L0 is not stranded forever either — part 4 of this task, the
-        # orphan-L0 reaper, promotes it to L1 and gives it an owner.
+        # The two predicates differ on exactly two input classes.  A dead-filer
+        # L0: recovery may proceed past one — its handoff has no consumer left,
+        # and conversion or a re-file is recoverable — but a DONE-FLIP may not.
+        # It is terminal, so completing a task past an unconsumed handoff is the
+        # phantom-done D4 had just closed at the dispatch gate, and PRD D3 /
+        # spec §6 demand 3 say so directly ("any non-info open record still
+        # vetoes MARK_DONE").  The dead L0 is not stranded forever either — part
+        # 4 of this task, the orphan-L0 reaper, promotes it to L1 and gives it
+        # an owner.  And a `preexisting_main_break` pin (task 4645): this clause
+        # ALONE relaxes the wider `recovery_pins.ON_MAIN_REMEDIABLE_ESC_CATEGORIES`,
+        # because it only fires with the branch ON MAIN, where that escalation's
+        # ask (`await_preexisting_main_hotfix`) is already satisfied.  The
+        # off-main clause below keeps the shared set — there the ask is unmet.
         #
-        # The relaxation itself is unchanged and is why this clause exists at
-        # all (PRD leaf δ): a task whose branch landed while it was still
+        # The relaxation itself is why this clause exists at all (PRD leaf δ):
+        # a task whose branch landed while it was still
         # blocked is usually held by the reaper's OWN stranded_blocked — the
         # record that ASKED for this landing — and letting it veto the
         # self-heal pins the task blocked forever after its work is on main.

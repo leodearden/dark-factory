@@ -1179,8 +1179,9 @@ def report_pins_blocked_recovery(report: TruthReport) -> bool:
 def report_pins_blocked_done_flip(report: TruthReport) -> bool:
     """Do *report*'s open records forbid flipping a BLOCKED task to done?
 
-    :func:`report_pins_blocked_recovery`'s deliberately-more-conservative twin;
-    they differ on exactly one input class.  See
+    :func:`report_pins_blocked_recovery`'s twin; they differ on exactly two
+    input classes (a dead-filer L0, and a ``preexisting_main_break``-only pin,
+    which only the done-flip relaxes).  See
     :func:`orchestrator.recovery_pins.records_pin_blocked_done_flip`.
     """
     return records_pin_blocked_done_flip(
