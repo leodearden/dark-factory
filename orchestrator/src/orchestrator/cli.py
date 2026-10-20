@@ -44,6 +44,7 @@ from orchestrator.verify_cancel import (
 
 if TYPE_CHECKING:
     from orchestrator.git_ops import GitOps
+    from orchestrator.task_verify_spec import TaskVerifySpec
     from orchestrator.verify import VerifyResult
     from orchestrator.verify_runner import MergeVerifySpec
 
@@ -1037,6 +1038,56 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         parse_spec=spec_from_json,
         body=functools.partial(_verify_merge_body, sha),
         preflight=_merge_lane_gate,
+    )
+
+
+def _task_spec_for_sha(sha: str, spec_json: str) -> 'TaskVerifySpec':
+    """Parse ``--spec``, refusing a spec whose tip_sha is not ``--sha`` (INV-3, receiving end)."""
+    from orchestrator.task_verify_spec import task_spec_from_json
+
+    spec = task_spec_from_json(spec_json)
+    if spec.tip_sha != sha:
+        raise ValueError(f'spec tip_sha {spec.tip_sha} is not --sha {sha}')
+    return spec
+
+
+async def _verify_task_body(
+    sha: str, ctx: _RemoteVerifyContext, spec: 'TaskVerifySpec',
+) -> 'VerifyResult':
+    """verify-task's body: a fresh ephemeral worktree at *sha*, then the task-role verify."""
+    from orchestrator.task_verify_run import run_task_verify_on_worktree
+
+    wt = await ctx.git_ops.create_ephemeral_verify_worktree(sha)
+    async with _verify_worktree_lifetime(ctx, wt):
+        return await run_task_verify_on_worktree(wt, ctx.config, spec)
+
+
+@main.command('verify-task')
+@click.option('--sha', required=True, help='Task tip SHA to verify (must be present in the local repo)')
+@click.option('--spec', 'spec_json', required=True,
+              help='TaskVerifySpec as a JSON string (from RemoteRunner.run_task_verify)')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project — sets project_root and '
+                   'fused_memory.project_id.')
+@click.option('--request-id', default=None,
+              help='Optional cancellation key: joins a new process group and records the '
+                   'pgid and worktree under <worktree_base>/.merge_verify_pgids/ for '
+                   '``orchestrator cancel-verify --request-id X``.')
+def verify_task(sha: str, spec_json: str, config_path: Path | None, request_id: str | None):
+    """Run a task-role verify of --sha on a fresh ephemeral worktree; print one VerifyResult JSON.
+
+    Exit 0 on any verdict; exit 1 on a config, spec or infrastructure error, or
+    when the stdin watchdog fires.  The worktree is recorded beside the pgid
+    file so ``cancel-verify`` reaps it.  Always ephemeral: no lane flock, no
+    unscoped typecheck, no flake suppression.  PRD:
+    plans/remote-task-leg-verify-prd.md §5.3.
+    """
+    _run_remote_verify(
+        config_path, spec_json, request_id,
+        parse_spec=functools.partial(_task_spec_for_sha, sha),
+        body=functools.partial(_verify_task_body, sha),
     )
 
 

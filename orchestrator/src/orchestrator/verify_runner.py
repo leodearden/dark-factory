@@ -1246,7 +1246,7 @@ def resolve_local_df_checkout(start: Path | None = None) -> Path | None:
 
 
 RemoteVerifySubcommand = Literal['verify-merge', 'verify-task']
-# The single home of the remote verify process pattern; β's verify_cancel reuses it.
+# The single home of the remote verify process pattern.
 REMOTE_VERIFY_PROCESS_PATTERN: str = '|'.join(get_args(RemoteVerifySubcommand))
 
 
