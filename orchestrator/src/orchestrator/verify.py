@@ -9374,6 +9374,96 @@ async def _run_scoped_verification_body(
         _maybe_prune_archive(archive_root)
 
 
+#: Receives the task-mu fork's ``passes_in_isolation`` observation and the main
+#: SHA it was re-run on. The merge lane binds it to the flake recorder
+#: (``merge_lane/worker.py::_main_probe_flake_sink``); this module never imports
+#: the recorder, so the discriminator stays pure.
+FlakeObservationSink = Callable[[FlakeSuppression, str], Awaitable[None]]
+
+
+def _mu_fork_confirmed_red_key(main_sha: str, branch_ids: frozenset[str]) -> tuple[str, str, str]:
+    digest = hashlib.sha1('\n'.join(sorted(branch_ids)).encode()).hexdigest()
+    return main_sha, 'mu_fork_confirmed_red', digest
+
+
+async def _wholly_preexisting_after_flake_gate(
+    failing_result: VerifyResult,
+    branch_ids: frozenset[str],
+    config: 'OrchestratorConfig',
+    module_configs: 'list[ModuleConfig]',
+    git_ops: object,
+    main_sha: str,
+    flake_sink: FlakeObservationSink | None,
+) -> tuple[bool, str]:
+    """The task-mu fork's verdict once every one of *branch_ids* is red in main's baseline.
+
+    ``(True, main_sha)`` stands unless the named failures, re-run in isolation
+    on main, all PASS: a load flake can starve the same test in the branch's
+    gate and in main's one-shot baseline probe, so matching id sets alone can
+    declare a green main broken. On ``passes_in_isolation`` the answer is
+    ``(False, '')`` and *flake_sink* receives the observation.
+
+    The re-run happens in a worktree pinned at *main_sha*, never the task's
+    worktree the caller passes: the verdict is a claim about main, and the
+    merge worktree that produced *failing_result* is already gone by the time
+    the merge lane classifies (``merge_lane/worker.py::_classify_main_health_red``).
+    A task tree is older main plus the branch, so a break that main gained
+    after the branch's base would pass there and be wrongly suppressed.
+
+    One-way ratchet: every other outcome keeps ``(True, main_sha)`` — no
+    recoverable node-id (checked before any worktree is made), a worktree that
+    could not be made, ``unconfirmable``, or an isolated pass that examined
+    fewer tests than the junit report names. A confirmed red is cached per
+    (main SHA, id set) so sibling merges against a genuinely red main pay one
+    re-run; a pass or an unconfirmable answer is a statement about host load
+    and is never cached. A raising *flake_sink* is logged and changes nothing.
+    """
+    if not _extract_failing_test_ids(failing_result.test_output):
+        return True, main_sha
+    cache_key = _mu_fork_confirmed_red_key(main_sha, branch_ids)
+    cached = _PROBE_CACHE.get(cache_key)
+    if cached is not None and time.monotonic() - cached[0] < _PROBE_CACHE_TTL:
+        return True, main_sha
+    rerun_modules = verify_plan.effective_merge_module_configs(config, module_configs)
+    observation = await _on_main_probe_worktree(
+        git_ops, main_sha,
+        lambda probe_worktree: confirm_isolated_rerun_verdict(
+            probe_worktree, config, rerun_modules, failing_result,
+            call_site=FlakeCallSite.main_probe,
+        ),
+    )
+    if observation is None:
+        return True, main_sha
+    if observation.verdict is FlakeVerdict.fails_in_isolation:
+        _PROBE_CACHE[cache_key] = (time.monotonic(), True)
+        return True, main_sha
+    if observation.verdict is not FlakeVerdict.passes_in_isolation:
+        return True, main_sha
+    examined = frozenset(observation.test_ids)
+    if len(examined) < len(branch_ids):
+        logger.info(
+            'verify_failure_is_preexisting_on_main: isolated re-run on main %.8s '
+            'passed but examined %d test(s) of the %d the junit report names; '
+            'keeping the preexisting verdict', main_sha, len(examined), len(branch_ids),
+        )
+        return True, main_sha
+    logger.warning(
+        'verify_failure_is_preexisting_on_main: %s passed on isolated re-run on '
+        'main %.8s; downgrading the wholly-preexisting baseline verdict to task-own '
+        '(main is not red for these tests)', sorted(examined), main_sha,
+    )
+    if flake_sink is not None:
+        try:
+            await flake_sink(observation, main_sha)
+        except Exception:
+            logger.warning(
+                'verify_failure_is_preexisting_on_main: recording the mu-fork flake '
+                'observation failed (main_sha=%.8s); the verdict is unaffected',
+                main_sha, exc_info=True,
+            )
+    return False, ''
+
+
 async def verify_failure_is_preexisting_on_main(
     worktree: Path,
     config: 'OrchestratorConfig',
@@ -9381,6 +9471,8 @@ async def verify_failure_is_preexisting_on_main(
     task_files: 'list[str] | None',
     failing_result: VerifyResult,
     git_ops: object,
+    *,
+    flake_sink: FlakeObservationSink | None = None,
 ) -> tuple[bool, str]:
     """Detect whether *failing_result* is inherited from the current main HEAD.
 
@@ -9437,6 +9529,9 @@ async def verify_failure_is_preexisting_on_main(
             See the 2026-07-29 reify-allowlist incident, whose shape was a
             guard that skipped on one side of a comparison and looked
             pass-shaped on the other.
+          - CONFIRM GATE (task 3788): every branch-failing id is red in
+            main's baseline, but each named failure passed on an isolated
+            re-run on main (``_wholly_preexisting_after_flake_gate``).
           - CONFIRM GATE (task 3597): the signature matched, but
             ``_main_probe_failure_is_isolated_flake`` positively confirmed
             every named failing test passes in isolation on the main
@@ -9446,12 +9541,13 @@ async def verify_failure_is_preexisting_on_main(
             genuine lint/type break, the one-way-ratchet guarantee, and
             why the downgrade is deliberately not cached).
 
-    CONFIRM GATE (task 3597): a signature match alone is not trusted
-    blindly — see ``_main_probe_failure_is_isolated_flake``'s docstring for
-    the full contract.  This gate is scoped to the signature-comparison
-    path only — the task-μ baseline-diff fork above
-    (``failing_result.failing_test_ids is not None``) returns before this
-    point and is untouched.
+    CONFIRM GATES: neither decision path trusts a match blindly.  The
+    signature-comparison path re-runs through
+    ``_main_probe_failure_is_isolated_flake`` (task 3597); the task-μ
+    baseline-diff fork (``failing_result.failing_test_ids is not None``)
+    re-runs through ``_wholly_preexisting_after_flake_gate`` (task 3788),
+    which hands a ``passes_in_isolation`` observation to *flake_sink*.  Both
+    re-run on main, and both are documented on those functions.
 
     A process-wide TTL cache (keyed by (main_sha, category, normalised cause_hint))
     avoids redundant probes from the same or sibling tasks against an unchanged main.
@@ -9523,7 +9619,10 @@ async def verify_failure_is_preexisting_on_main(
             if baseline is not None:
                 branch_ids = frozenset(failing_result.failing_test_ids)
                 if is_wholly_preexisting(branch_ids, baseline):
-                    return True, main_sha
+                    return await _wholly_preexisting_after_flake_gate(
+                        failing_result, branch_ids, config, module_configs,
+                        git_ops, main_sha, flake_sink,
+                    )
                 # Task 3226: a SKIP is not a PASS.  An attributable id (main
                 # ran it green) blames the branch; a diff made up entirely of
                 # ids main skipped proves nothing and defers to the signature
