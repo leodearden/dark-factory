@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import shlex
 import subprocess
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ from _git_fixtures import RepoSeed, seed_repo
 
 from orchestrator import task_verify_dispatch
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.task_verify_dispatch import (
     CrossCheck,
@@ -30,9 +32,10 @@ from orchestrator.task_verify_dispatch import (
     TaskVerifyPolicy,
     eligible,
 )
+from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_from_json
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_hosts import HostPool
-from orchestrator.verify_runner import HostAllocator, RemoteRunner
+from orchestrator.verify_runner import HostAllocator, RemoteRunner, result_to_json
 
 _SIDECAR_KEYS = {
     'decision', 'runner', 'reason', 'tip_sha', 'base_sha',
@@ -533,3 +536,153 @@ class TestLocalRoutes:
         decision = h.dispatcher.decision_for('7', 1)
         assert decision is not None
         assert decision.reason == 'merge_demand'
+
+
+
+# ---------------------------------------------------------------------------
+# The remote leg, through a real RemoteRunner
+# ---------------------------------------------------------------------------
+
+
+def _answers(result: VerifyResult) -> VerifyAnswer:
+    async def answer(argv: list[str]) -> Answer:
+        return 0, result_to_json(result), ''
+    return answer
+
+
+def _exits(rc: int) -> VerifyAnswer:
+    async def answer(argv: list[str]) -> Answer:
+        return rc, '', 'ssh: connect to host laptop.local port 22: No route to host'
+    return answer
+
+
+def _raises(exc: Exception) -> VerifyAnswer:
+    async def answer(argv: list[str]) -> Answer:
+        raise exc
+    return answer
+
+
+def _sent_spec(transport: _Transport) -> TaskVerifySpec:
+    remote_cmd = transport.argvs[transport.log.index('verify_task')][-1]
+    words = shlex.split(remote_cmd)
+    return task_spec_from_json(words[words.index('--spec') + 1])
+
+
+class _Events:
+    """A recording event store: every emit, in order."""
+
+    def __init__(self) -> None:
+        self.emitted: list[tuple[Any, str | None, dict[str, Any]]] = []
+
+    def emit(self, event_type: Any, *, task_id: str | None = None, data: Any = None, **_: Any) -> None:
+        self.emitted.append((event_type, task_id, data or {}))
+
+
+def _assert_slot_free(h: _Harness) -> None:
+    assert h.allocator.is_busy('laptop') is False
+    assert h.pool.holders() == {}
+
+
+@pytest.mark.asyncio
+class TestRemoteLeg:
+    async def test_a_remote_green_is_returned_and_archived(self, tmp_path: Path) -> None:
+        transport = _Transport(verify=_answers(_result(True, summary='remote verdict')))
+        h = _harness(tmp_path, _ORCH_ONLY, transport=transport)
+
+        result = await h.call()
+
+        assert result.passed is True
+        assert result.summary == 'remote verdict'
+        assert h.local.calls == []
+        task_dir = h.archive_root / '7'
+        [pass_summary] = list(task_dir.glob('attempt-1.remote-laptop.pass-summary-*.json'))
+        [sidecar_path] = list(task_dir.glob('attempt-1.dispatch-*.json'))
+        assert result.archive_log_paths == [str(pass_summary)]
+        assert sorted(task_dir.iterdir()) == sorted([pass_summary, sidecar_path])
+        sidecar = json.loads(sidecar_path.read_text())
+        assert sidecar['decision'] == 'remote'
+        assert sidecar['runner'] == 'laptop'
+        assert sidecar['reason'] == 'remote'
+        assert (sidecar['tip_sha'], sidecar['base_sha']) == (h.tip, h.base)
+        assert sidecar['remote_wall_secs'] is not None
+        assert sidecar['lease_held_secs'] is not None
+        _assert_slot_free(h)
+        assert h.hooks.recovered == ['laptop']
+        spec = _sent_spec(transport)
+        assert spec.task_files == (_A_PY,)
+        assert spec.attempt_id == 1
+        assert spec.tip_sha == h.tip
+
+    async def test_a_dirty_tree_runs_locally_before_any_push(self, tmp_path: Path) -> None:
+        transport = _Transport(verify=_answers(_result(True)))
+        h = _harness(tmp_path, _ORCH_ONLY, transport=transport)
+        (h.repo / 'scratch.txt').write_text('untracked\n')
+
+        result = await h.call()
+
+        assert result is h.local.result
+        assert h.local.calls == [h.expected_call()]
+        assert h.only_sidecar()['reason'] == 'dirty_tree'
+        assert 'push' not in h.transport.log
+        _assert_slot_free(h)
+
+    async def test_a_stale_runner_that_cannot_sync_runs_locally(self, tmp_path: Path) -> None:
+        df_local = tmp_path / 'df-local'
+        df_local.mkdir()
+        transport = _Transport(
+            verify=_answers(_result(True)), local_df_head='a' * 40, remote_df_head='b' * 40,
+            upstream_rc=1, pull_rc=1,
+        )
+        h = _harness(
+            tmp_path, _ORCH_ONLY, transport=transport,
+            runner_kwargs={'df_remote_checkout': '/remote/df', 'df_local_checkout': df_local},
+        )
+        events = _Events()
+
+        result = await h.call(event_store=events)
+
+        assert result is h.local.result
+        assert h.local.calls == [h.expected_call(event_store=events)]
+        assert h.only_sidecar()['reason'] == 'sync_stale'
+        assert h.hooks.unavailable == [('laptop', 'sync_stale')]
+        assert h.allocator.is_quarantined('laptop') is False
+        assert [e[0] for e in events.emitted] == [EventType.runner_stale]
+        assert 'verify_task' not in h.transport.log
+        _assert_slot_free(h)
+
+    async def test_an_unreachable_runner_runs_locally(self, tmp_path: Path) -> None:
+        h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_exits(255)))
+
+        result = await h.call()
+
+        assert result is h.local.result
+        assert h.local.calls == [h.expected_call()]
+        assert h.only_sidecar()['reason'] == 'runner_unavailable'
+        assert h.hooks.unavailable == [('laptop', 'transport')]
+        assert h.hooks.recovered == []
+        _assert_slot_free(h)
+
+    async def test_an_infra_transient_remote_red_reruns_locally_in_the_same_call(
+        self, tmp_path: Path,
+    ) -> None:
+        remote_red = _result(False, category='env_transient', summary='uv cache locked')
+        h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(remote_red)))
+
+        result = await h.call()
+
+        assert result is h.local.result
+        assert h.local.calls == [h.expected_call()]
+        assert h.only_sidecar()['reason'] == 'infra_transient'
+        _assert_slot_free(h)
+
+    async def test_an_unexpected_transport_error_is_a_dispatcher_error(self, tmp_path: Path) -> None:
+        h = _harness(
+            tmp_path, _ORCH_ONLY, transport=_Transport(verify=_raises(RuntimeError('boom'))),
+        )
+
+        with pytest.raises(RuntimeError, match='boom'):
+            await h.call()
+
+        assert h.local.calls == []
+        assert h.only_sidecar()['reason'] == 'dispatcher_error'
+        _assert_slot_free(h)
