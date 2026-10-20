@@ -180,6 +180,13 @@ class Screen:
     screened: tuple[Screened, ...]
     surfaced: tuple[Surfaced, ...]
 
+    @property
+    def uncatalogued(self) -> tuple[dict, ...]:
+        """The clusters to verify that no catalogued record matches by title or
+        session; a surfaced cluster re-observes a fixed entry and is not among them."""
+        surfaced = {item.title for item in self.surfaced}
+        return tuple(cluster for cluster in self.to_verify if cluster["title"] not in surfaced)
+
 
 def screen(clusters: Sequence[dict], catalogue: Catalogue) -> Screen:
     """Split novel *clusters* into those still to verify, in order, and those
