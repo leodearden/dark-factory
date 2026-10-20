@@ -13160,9 +13160,16 @@ class Harness:
         L0 with a parked workflow can never age out there.  The origin strand
         esc-5189-7 sat pending 20h58m for exactly that reason — a workflow WAS
         attending it — and then this sweep closed it as ordinary restart noise.
+
+        Info notes the info-L0 router owns are routed first, never dismissed
+        unread (plans/info-l0-disposition-router-prd.md boundary #16): a held
+        or still-unrouted one survives the sweep for the orphan reaper, and
+        none is counted as a strand.
         """
         if self._escalation_queue is None:
             return
+
+        await self._route_info_l0s_across_restart(self._escalation_queue)
 
         threshold = self.config.orphan_l0_timeout_secs
         strands = self._snapshot_stale_l0_strands(threshold)
@@ -13171,7 +13178,7 @@ class Harness:
             'Auto-dismissed: orchestrator restarted — stale from prior run'
         )
         count = self._escalation_queue.dismiss_all_pending(
-            resolution, strand_age_secs=threshold
+            resolution, strand_age_secs=threshold, keep=self._router_eligible,
         )
         if count:
             logger.info(
@@ -13185,6 +13192,34 @@ class Harness:
             self._report_stale_l0_strands(strands)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(f'Failed to report stale L0 strand telemetry: {e}')
+
+    async def _route_info_l0s_across_restart(self, queue: EscalationQueue) -> None:
+        """One startup-amnesty router pass: finish held notes, route the rest.
+
+        A router failure never aborts startup; the notes it left pending are
+        kept by the sweep for the orphan reaper.
+        """
+        try:
+            sweep = InfoL0Sweep(
+                self._router_ports(queue), by='startup-amnesty',
+                max_conversions=self.config.info_l0_router_max_conversions_per_sweep,
+            )
+            now = datetime.now(UTC)
+            for esc in queue.get_pending():
+                if not self._router_eligible(esc):
+                    continue
+                hold = read_hold(esc)
+                if hold is None:
+                    await sweep.route(esc, exit_kind=ExitKind.RESTART)
+                else:
+                    await sweep.finish_hold(
+                        esc, hold, now=now,
+                        timeout_secs=self.config.info_l0_router_ticket_timeout_secs,
+                        exit_kind=ExitKind.RESTART,
+                    )
+            sweep.close()
+        except Exception:
+            logger.exception('info-l0-router: the startup amnesty pass failed')
 
     def _snapshot_stale_l0_strands(self, threshold_secs: float) -> list[dict[str, Any]]:
         """Per-record detail for the L0s about to be swept as strands.
@@ -13211,7 +13246,7 @@ class Harness:
         try:
             now = datetime.now(UTC)
             for esc in self._escalation_queue.get_pending():
-                if esc.level != 0:
+                if esc.level != 0 or self._router_eligible(esc):
                     continue
                 # fallback=datetime.max — same sentinel direction as the queue
                 # side, so an unparseable timestamp is never mistaken for a
