@@ -81,6 +81,7 @@ from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
 from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
+from escalation.sha_citations import resolve_cited_shas
 from escalation.store_identity import StoreIdentity
 from escalation.tool_description_block import AppendToEveryToolDescription
 
@@ -4986,6 +4987,37 @@ def create_server(
                 'error': 'escalation server running standalone — no harness wired',
             }
         return await harness.reload_config()
+
+    # --- Cited-SHA resolution (task 5751) ---
+
+    @mcp.tool()
+    async def resolve_escalation_shas(escalation_id: str) -> dict[str, Any]:
+        """Resolve the commit SHAs an escalation cites to the commits they landed as on main.
+
+        Scans the record's ``summary``, ``detail`` and each ``evidence``
+        entry's ``observation`` for 7-40 hex SHA tokens and maps each one a
+        rebase orphaned to its landed twin on main (patch-id first, then a
+        unique exact subject; never a guess).  Returns ``{escalation_id,
+        resolved_shas: [{cited, landed, subject, method}]}``, in cited order.
+        A token absent from ``resolved_shas`` is already on main, is not a
+        commit, or has no twin.
+
+        Read-only: the record is never rewritten, and ``get_escalation`` /
+        ``get_task_escalations`` are unchanged — they still show the SHAs as
+        filed.  An unknown id returns ``{error}`` naming it; a standalone
+        server (no harness wired) returns ``{'error': 'no git authority
+        wired'}``.
+        """
+        git_ops = getattr(harness, 'git_ops', None)
+        if git_ops is None:
+            return {'error': 'no git authority wired'}
+        esc = await asyncio.to_thread(queue.get, escalation_id)
+        if esc is None:
+            return {'error': f'Escalation {escalation_id} not found'}
+        return {
+            'escalation_id': esc.id,
+            'resolved_shas': await resolve_cited_shas(esc, git_ops),
+        }
 
     # --- Interactive warm-worktree tools (PRD β / task 2011) ---
 
