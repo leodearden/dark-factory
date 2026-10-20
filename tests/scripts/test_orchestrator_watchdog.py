@@ -71,7 +71,7 @@ def _load_watchdog() -> types.ModuleType:
 def _neutralize_fleet_clock_gates(
     wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Stub ALL THREE of staleness_pass's fleet coordination gates to "not blocking".
+    """Stub ALL FOUR of staleness_pass's fleet coordination gates to "not blocking".
 
     For the many staleness_pass tests that are about something else entirely
     (enumeration, per-unit probes, delegation, exception isolation) and just
@@ -86,13 +86,15 @@ def _neutralize_fleet_clock_gates(
     is a hollow pass or a machine-state-dependent flake rather than a hard
     error) nothing flags it. Each gate added to the pass has so far meant
     another sweep across every such test — task 2396 added the min-interval
-    stub, task 4754 the head-start stub, task 4755 the in-flight lease stub —
-    so the list lives in ONE place and the next gate is a one-line edit here.
+    stub, task 4754 the head-start stub, task 4755 the in-flight lease stub,
+    task 7198 the module-removal waiver stub — so the list lives in ONE place
+    and the next gate is a one-line edit here.
 
-    Scoped to staleness_pass's OWN gate prefix, which is what "all three" means
+    Scoped to staleness_pass's OWN gate prefix, which is what "all four" means
     here: _count_head_start_skip_lines and _head_start_skip_line_emitted_at
     hold the head-start gate OPEN, so the pass returns before ever reaching the
-    lease read and neither needs this helper's third line.
+    lease read and neither needs this helper's third line (they stub the
+    waiver themselves, since a held gate is exactly when it is probed).
 
     Deliberately NOT used by the acceptance tests that must exercise the real
     file reads — test_staleness_head_start_anchored_on_fleet_min_interval_
@@ -114,6 +116,9 @@ def _neutralize_fleet_clock_gates(
     # once again immediately before delegating, to close the read-then-act
     # window), so an unstubbed test reads live machine state twice.
     monkeypatch.setattr(wdog, "_live_fleet_lease", lambda: None)
+    # task 7198: the module-removal waiver reads the same live clock and runs
+    # git against the hardcoded REPO_DIR, on any tick where a clock gate holds.
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
 
 
 def _neutralize_fm_clock_gates(
@@ -2791,6 +2796,7 @@ def test_staleness_pass_skips_when_within_fleet_deploy_min_interval(
     log_messages: list[str] = []
 
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     monkeypatch.setattr(wdog.time, "time", lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0)
     monkeypatch.setattr(
         wdog,
@@ -2833,6 +2839,7 @@ def test_staleness_pass_suppresses_skip_log_outside_log_bucket(
     log_messages: list[str] = []
 
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     # Halfway into the bucket — well outside the logging slot near its start.
     monkeypatch.setattr(
         wdog.time,
@@ -2879,6 +2886,7 @@ def test_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket(
 
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     # Halfway into the bucket — well outside the logging slot near its start.
     monkeypatch.setattr(
         wdog.time,
@@ -2937,6 +2945,7 @@ def _count_head_start_skip_lines(
     tier = "fm" if pass_fn_name.startswith("fused_memory") else "fleet"
     monkeypatch.setattr(wdog, f"_within_{tier}_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, f"_within_{tier}_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
 
     now = {"t": window_start + tick_phase}
@@ -2959,6 +2968,7 @@ def _head_start_skip_line_emitted_at(
     log_messages: list[str] = []
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
     monkeypatch.setattr(wdog.time, "time", lambda: when)
     wdog.staleness_pass()
@@ -3161,6 +3171,7 @@ def test_staleness_head_start_anchored_on_fleet_min_interval_expiry_real_clock_f
             json.dumps({"ts": now - age_secs, "iso": "2026-08-26T00:00:00+00:00"})
         )
         monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+        monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
 
         recorded_calls: list[list[str]] = []
         log_messages: list[str] = []
@@ -4314,6 +4325,7 @@ def test_boundary1_staleness_inside_window_real_clock_file(
     clock_file = tmp_path / "clock.json"
     clock_file.write_text(json.dumps({"ts": clock_ts, "iso": "2026-07-16T00:00:00+00:00"}))
     monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
 
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace, if ever reached
     unit = "orchestrator-know-live.service"

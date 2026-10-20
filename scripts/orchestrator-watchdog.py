@@ -2738,6 +2738,12 @@ def staleness_pass() -> None:
     site for the measured width of the window and why the second read is not
     rate-limited.
 
+    Module-removal waiver (task 7198): on a tick where a clock gate holds, a
+    watched .py module removed since the last fleet deploy waives both clock
+    gates and the commit grace, never the lease, and anchors staleness on
+    MODULE_REMOVAL_WATCHED_PATHS. See _due_module_removals and OPERATIONS.md
+    section 8.
+
     Delegation (task 2396): once ANY eligible unit is found stale, the
     per-unit loop below no longer restarts it directly — instead the whole
     fleet-wide restart is delegated ONCE, after the loop, to
@@ -2749,32 +2755,16 @@ def staleness_pass() -> None:
     because a unit mid-restart is indistinguishable from a wedged one to a
     port probe. Every other unit, and every other tick, is unchanged.
     """
-    if _within_fleet_deploy_min_interval():
-        # Bucket on wall-clock time (not elapsed-since-deploy) — see
-        # SKIP_LOG_INTERVAL_SECS above.
-        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
-            log(
-                "skip: within fleet-deploy min-interval "
-                f"({ORCH_RESTART_MIN_INTERVAL_SECS}s) since last deploy"
-            )
-        return
-
-    # This gate takes a SECOND small-JSON clock read, on exactly those ticks
-    # where the min-interval gate above has already expired and let the tick
-    # through (a blocked tick returns above and never reaches here). That
-    # second read is deliberate: each gate keeps its own named reader seam
-    # rather than threading one epoch through both (task 4754).
-    if _within_fleet_staleness_head_start():
-        # Same bucket idiom as the gate above: the gate CHECK still runs every
-        # tick, only the log EMISSION is throttled. This window is exactly one
-        # bucket period long — see SKIP_LOG_INTERVAL_SECS for why that still
-        # emits (twice, measured), and what would break it.
-        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
-            log(
-                f"skip: holding the {STALENESS_GRACE_SECS}s coordinator head start "
-                "since the fleet-deploy min-interval opened"
-            )
-        return
+    removed: tuple[str, ...] = ()
+    hold = _fleet_clock_hold()
+    if hold is not None:
+        removed = _due_module_removals()
+        if not removed:
+            # Bucket on wall-clock time (not elapsed-since-deploy) — the gate
+            # CHECK still runs every tick, only the log EMISSION is throttled.
+            if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+                log(hold)
+            return
 
     lease = _live_fleet_lease()
     if lease is not None:
@@ -2789,10 +2779,14 @@ def staleness_pass() -> None:
             )
         return
 
-    commit_epoch = _newest_watched_commit_epoch()
+    commit_epoch = (
+        _newest_watched_commit_epoch(MODULE_REMOVAL_WATCHED_PATHS)
+        if removed
+        else _newest_watched_commit_epoch()
+    )
     if commit_epoch is None:
         return  # undeterminable — fall safe, no restarts this tick
-    if time.time() - commit_epoch < STALENESS_GRACE_SECS:
+    if not removed and time.time() - commit_epoch < STALENESS_GRACE_SECS:
         # RETAINED second anchor (task 4754 decision 1): the head start is
         # the LATER of "since the min-interval window opened" (gate above) and
         # "since the newest watched commit". Gates on the newest commit's age
@@ -2844,7 +2838,12 @@ def staleness_pass() -> None:
         # reached only when a stale unit was genuinely found, so it is rare
         # and highly actionable — and a race we declined to take is exactly
         # the evidence an operator needs to explain a missing redeploy.
-        if _within_fleet_deploy_min_interval():
+        # In waiver mode a held cap is still crossed only while a fresh probe
+        # finds the removal post-deploy: a sweep that stamped the clock
+        # mid-pass already covered it.
+        if _within_fleet_deploy_min_interval() and not (
+            removed and _due_module_removals()
+        ):
             log(
                 "skip: the fleet-deploy clock was stamped while this pass was "
                 "probing units; another tier got there first"
@@ -2857,7 +2856,15 @@ def staleness_pass() -> None:
                 f"units (lease {_describe_lease(lease)})"
             )
             return
-        log("delegating fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain")
+        if removed:
+            log(
+                "delegating fleet-wide module-removal redeploy to "
+                "restart-all-orchestrators.sh --drain ahead of the fleet-deploy "
+                "clock gates; removed since the last fleet deploy: "
+                f"{_describe_removed_modules(removed)}"
+            )
+        else:
+            log("delegating fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain")
         _delegate_fleet_restart()
 
 
