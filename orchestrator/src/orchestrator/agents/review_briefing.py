@@ -7,10 +7,12 @@ reviewer trial all import it downward without a cycle.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 
 
 class ReviewBriefing(StrEnum):
@@ -56,13 +58,27 @@ class ReviewConvention:
 
 @dataclass(frozen=True)
 class ReviewSubject:
-    """Everything the context-complete reviewer is briefed with, besides memory."""
+    """Everything the context-complete reviewer is briefed with, besides memory.
+
+    ``task`` and ``plan`` are read-only deep copies taken at construction, so
+    every reviewer briefed from one subject sees the records as they were then,
+    whatever the caller does to its own copies afterwards.
+    """
 
     task: Mapping[str, object]
     plan: Mapping[str, object] | None
     plan_absent_reason: str
     change: ReviewChange
     conventions: tuple[ReviewConvention, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'task', _snapshot(self.task))
+        if self.plan is not None:
+            object.__setattr__(self, 'plan', _snapshot(self.plan))
+
+
+def _snapshot(record: Mapping[str, object]) -> Mapping[str, object]:
+    return MappingProxyType(copy.deepcopy(dict(record)))
 
 
 _PLAN_FIELDS = ('title', 'analysis', 'files', 'design_decisions', 'prerequisites', 'steps')

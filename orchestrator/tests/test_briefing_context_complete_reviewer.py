@@ -120,6 +120,36 @@ def _line_naming(prompt: str, path: str) -> str:
 
 
 @pytest.mark.asyncio
+class TestSubjectSnapshot:
+    """A subject briefs every reviewer from the records as they were when it was built."""
+
+    async def test_mutating_the_callers_records_after_construction_changes_no_briefing(
+        self, briefing: BriefingAssembler,
+    ):
+        task, plan = _task(), _plan()
+        subject = _subject(task=task, plan=plan)
+        task['title'] = 'MUTATED TITLE'
+        task['metadata']['files'].append('MUTATED_FILE.py')
+        plan['analysis'] = 'MUTATED ANALYSIS'
+        plan['files'].append('MUTATED_PLAN_FILE.py')
+
+        prompt = await _build(briefing, subject)
+
+        assert _task()['title'] in prompt
+        assert _plan()['analysis'] in prompt
+        assert 'MUTATED' not in prompt
+
+    async def test_the_subjects_records_are_read_only(self) -> None:
+        subject = _subject(plan=_plan())
+
+        with pytest.raises(TypeError):
+            subject.task['title'] = 'x'  # type: ignore[index]
+        assert subject.plan is not None
+        with pytest.raises(TypeError):
+            subject.plan['analysis'] = 'x'  # type: ignore[index]
+
+
+@pytest.mark.asyncio
 class TestTaskAndPlan:
     async def test_every_briefed_task_field_reaches_the_reviewer(self, briefing: BriefingAssembler):
         task = _task()

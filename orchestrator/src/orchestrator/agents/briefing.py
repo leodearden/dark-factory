@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from shared.briefing_queries import BriefingScope
 from shared.task_text_fingerprint import TaskTextDrift
@@ -1166,14 +1168,13 @@ This task holds locks for the following modules:
         Memory is scoped to the task exactly as :meth:`build_reviewer_prompt`
         scopes it; the rendering lives in ``agents/review_briefing.py``.
         """
-        task = dict(subject.task)
         if context is None:
-            context = await self._get_memory_context(BriefingScope.from_task(task), 'reviewer')
+            context = await self._get_memory_context(BriefingScope.from_task(subject.task), 'reviewer')
         return render_context_complete_review(
             reviewer_type=reviewer_type,
             subject=subject,
             context=context,
-            task_block=self._format_task(task),
+            task_block=self._format_task(subject.task),
             amendment_suggestions=amendment_suggestions,
         )
 
@@ -1459,7 +1460,7 @@ A prior block-time investigation concluded the following; verify against the cur
 **Investigated at:** {created_at}
 """
 
-    def _format_task(self, task: dict, *, include_files: bool = True) -> str:
+    def _format_task(self, task: Mapping[str, Any], *, include_files: bool = True) -> str:
         """Format a task dict as readable text.
 
         Args:
@@ -1514,6 +1515,6 @@ A prior block-time investigation concluded the following; verify against the cur
         if deps:
             dep_ids = [str(d.get('id', d)) if isinstance(d, dict) else str(d) for d in deps]
             lines.append(f'**Dependencies:** {", ".join(dep_ids)}')
-        body = '\n'.join(lines) if lines else json.dumps(task, indent=2)
+        body = '\n'.join(lines) if lines else json.dumps(dict(task), indent=2)
         checks_block = _format_delivered_checks(metadata.get('delivered_checks'))
         return f'{body}\n\n{checks_block}' if checks_block else body
