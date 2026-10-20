@@ -1623,3 +1623,11 @@ unblock_auto:
 # scheduled fleet redeploy. workflow_exit_contract_enforce stays False until task
 # 3113 lands and a fresh soak shows zero would-violates.
 convert_to_blocked_enforce: true
+
+psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2026-09-08)
+  mem_some_avg10: 15.0
+  mem_full_avg10: 3.0
+  io_some_avg10: 40.0
+  runqueue_ratio: 4.0     # provisional (D9); the calibration gate re-derives it
+  min_inflight_floor: 3
+  # cpu_some_avg10 and own_cpu_some_avg10 deliberately absent: off (D1, D2)
