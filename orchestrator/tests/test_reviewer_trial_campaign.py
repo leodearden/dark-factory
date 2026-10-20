@@ -256,6 +256,86 @@ class TestSelfComplementBand:
         )
 
 
+def _trial_row(trial: int, blocking_share: float | None, share: float = 0.5) -> dict:
+    """A per-trial complement row out of 100 incumbent matches (none blocking when undefined)."""
+    blocking_matched = 0 if blocking_share is None else 100
+    return {
+        'trial': trial,
+        'complement': round(share * 100), 'incumbent_matched': 100, 'share': share,
+        'blocking_complement': round((blocking_share or 0.03) * 100),
+        'blocking_incumbent_matched': blocking_matched, 'blocking_share': blocking_share,
+    }
+
+
+def _band(blocking_max: float | None) -> campaign.SelfComplementBand:
+    return campaign.SelfComplementBand(
+        pairs=[], overall_min=0.107, overall_max=0.333,
+        blocking_min=None if blocking_max is None else 0.11, blocking_max=blocking_max,
+    )
+
+
+class TestComplementClearsTheBand:
+    """D7's complement rule: the candidate's blocking complement beats the incumbent's own, every trial."""
+
+    def test_complement_by_trial_pairs_each_trial_with_the_same_incumbent_trial_on_measured_cells(self) -> None:
+        inc = [
+            _rec('inc', 'd1', 3, [('g1', 'blocking')], [], 0.5),
+            _rec('inc', 'd1', 1, [('g1', 'blocking')], [], 0.5),
+            _rec('inc', 'd1', 2, [('g1', 'blocking'), ('g2', 'blocking')], [], 0.5),
+            _rec('inc', 'd2', 1, [('g3', 'blocking')], [], 0.5),
+            _unmeasured_rec('inc', 'd2', 2),
+            _rec('inc', 'd2', 3, [('g3', 'blocking')], [], 0.5),
+        ]
+        arm = [
+            _rec('arm', 'd1', 3, [('g1', 'blocking'), ('g2', 'blocking')], [], 0.5),
+            _rec('arm', 'd1', 1, [('g1', 'blocking'), ('g2', 'blocking'), ('gx', 'blocking')], [], 0.5),
+            _rec('arm', 'd1', 2, [('g1', 'blocking'), ('g2', 'blocking')], [], 0.5),
+            _rec('arm', 'd1', 4, [('g1', 'blocking'), ('g2', 'blocking')], [], 0.5),
+            _unmeasured_rec('arm', 'd2', 1),
+            _rec('arm', 'd2', 2, [('g3', 'blocking')], [], 0.5),
+            _rec('arm', 'd2', 3, [('g3', 'blocking')], [], 0.5),
+        ]
+
+        rows = campaign.complement_by_trial(arm, inc, BLOCKING_GT)
+
+        assert rows == [
+            {'trial': 1, 'complement': 2, 'incumbent_matched': 1, 'share': 2.0,
+             'blocking_complement': 1, 'blocking_incumbent_matched': 1, 'blocking_share': 1.0},
+            {'trial': 2, 'complement': 0, 'incumbent_matched': 2, 'share': 0.0,
+             'blocking_complement': 0, 'blocking_incumbent_matched': 2, 'blocking_share': 0.0},
+            {'trial': 3, 'complement': 1, 'incumbent_matched': 2, 'share': 0.5,
+             'blocking_complement': 1, 'blocking_incumbent_matched': 2, 'blocking_share': 0.5},
+        ]
+
+    def test_passes_when_three_trials_each_beat_the_bands_blocking_maximum(self) -> None:
+        rows = [_trial_row(1, 0.3), _trial_row(2, 0.25), _trial_row(3, 0.21)]
+
+        assert campaign.clears_self_complement_band(rows, _band(0.2)) is True
+
+    @pytest.mark.parametrize(
+        ('rows', 'blocking_max'),
+        [
+            pytest.param([_trial_row(1, 0.3), _trial_row(2, 0.2), _trial_row(3, 0.3)], 0.2, id='one-at-the-max'),
+            pytest.param([_trial_row(1, 0.3), _trial_row(2, 0.1), _trial_row(3, 0.3)], 0.2, id='one-below'),
+            pytest.param([_trial_row(1, 0.3), _trial_row(2, None), _trial_row(3, 0.3)], 0.2, id='undefined-share'),
+            pytest.param([_trial_row(t, 0.9) for t in (1, 2, 3)], None, id='no-band'),
+            pytest.param(
+                [_trial_row(t, 0.15, share=0.5) for t in (1, 2, 3)], 0.2,
+                id='high-overall-share-but-blocking-inside-the-band',
+            ),
+            pytest.param([], 0.2, id='no-trials'),
+        ],
+    )
+    def test_fails_closed(self, rows: list[dict], blocking_max: float | None) -> None:
+        assert campaign.clears_self_complement_band(rows, _band(blocking_max)) is False
+
+    def test_fewer_than_three_trials_fails_unless_the_floor_is_lowered(self) -> None:
+        rows = [_trial_row(1, 0.3), _trial_row(2, 0.3)]
+
+        assert campaign.clears_self_complement_band(rows, _band(0.2)) is False
+        assert campaign.clears_self_complement_band(rows, _band(0.2), min_trials=2) is True
+
+
 def _scored(variant: str, diff: str, trial: int, *, br: float, f1: float) -> dict:
     """A measured score record whose blocking recall and F1 differ."""
     return _rec(variant, diff, trial, [], [], f1) | {'blocking_recall': br}
