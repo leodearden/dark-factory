@@ -167,6 +167,95 @@ def test_markdown_names_each_arms_unmeasured_count() -> None:
     assert '| unmeasured |' in md.splitlines()[0]
 
 
+def _pair(band: campaign.SelfComplementBand, trial: int, over_trial: int) -> dict:
+    return next(p for p in band.pairs if (p['trial'], p['over_trial']) == (trial, over_trial))
+
+
+class TestSelfComplementBand:
+    """The incumbent's run-to-run complement: every ordered pair of its own trials."""
+
+    def test_every_ordered_pair_of_trials_is_a_row_and_the_bounds_span_the_defined_shares(self) -> None:
+        inc = [
+            _rec('inc', 'd1', 1, [('g1', 'blocking')], [], 0.5),
+            _rec('inc', 'd1', 2, [('g1', 'blocking'), ('g2', 'blocking')], [], 0.5),
+            _rec('inc', 'd1', 3, [('g1', 'blocking'), ('gx', 'blocking')], [], 0.5),
+        ]
+        overall = {(1, 2): 0.0, (1, 3): 0.0, (2, 1): 1.0, (2, 3): 0.5, (3, 1): 1.0, (3, 2): 0.5}
+        blocking = {(1, 2): 0.0, (1, 3): 0.0, (2, 1): 1.0, (2, 3): 1.0, (3, 1): 0.0, (3, 2): 0.0}
+
+        band = campaign.self_complement_band(inc, BLOCKING_GT)
+
+        assert {(p['trial'], p['over_trial']) for p in band.pairs} == set(overall)
+        assert len(band.pairs) == 6
+        assert _pair(band, 2, 1) == {
+            'trial': 2, 'over_trial': 1,
+            'complement': 1, 'incumbent_matched': 1, 'share': 1.0,
+            'blocking_complement': 1, 'blocking_incumbent_matched': 1, 'blocking_share': 1.0,
+        }
+        assert (_pair(band, 1, 2)['complement'], _pair(band, 1, 2)['share']) == (0, 0.0)
+        assert (_pair(band, 3, 1)['share'], _pair(band, 3, 1)['blocking_share']) == (1.0, 0.0)
+        for key, share in overall.items():
+            assert _pair(band, *key)['share'] == share, key
+        for key, share in blocking.items():
+            assert _pair(band, *key)['blocking_share'] == share, key
+        assert (band.overall_min, band.overall_max) == (min(overall.values()), max(overall.values()))
+        assert (band.blocking_min, band.blocking_max) == (min(blocking.values()), max(blocking.values()))
+
+    def test_a_fixture_unmeasured_in_one_trial_drops_out_of_every_pair_touching_that_trial(self) -> None:
+        inc = [
+            *(_rec('inc', 'd1', t, [('g1', 'blocking')], [], 0.5) for t in (1, 2, 3)),
+            _rec('inc', 'd2', 1, [('g3', 'blocking')], [], 0.5),
+            _unmeasured_rec('inc', 'd2', 2),
+            _rec('inc', 'd2', 3, [('g3', 'blocking')], [], 0.5),
+        ]
+
+        band = campaign.self_complement_band(inc, BLOCKING_GT)
+
+        for key in ((1, 2), (2, 1), (2, 3), (3, 2)):
+            row = _pair(band, *key)
+            assert (row['complement'], row['incumbent_matched']) == (0, 1), key
+            assert (row['blocking_complement'], row['blocking_incumbent_matched']) == (0, 1), key
+        for key in ((1, 3), (3, 1)):
+            assert _pair(band, *key)['incumbent_matched'] == 2, key
+        assert band.overall_max == 0.0
+        assert band.blocking_max == 0.0
+
+    def test_a_pair_over_a_trial_with_no_blocking_match_has_no_blocking_share(self) -> None:
+        inc = [
+            _rec('inc', 'd1', 1, [('gx', 'blocking')], [], 0.5),
+            _rec('inc', 'd1', 2, [('g1', 'blocking'), ('gx', 'blocking')], [], 0.5),
+        ]
+
+        band = campaign.self_complement_band(inc, BLOCKING_GT)
+
+        undefined = _pair(band, 2, 1)
+        assert (undefined['blocking_complement'], undefined['blocking_incumbent_matched']) == (1, 0)
+        assert undefined['blocking_share'] is None
+        assert undefined['share'] == 1.0
+        assert _pair(band, 1, 2)['blocking_share'] == 0.0
+        assert (band.blocking_min, band.blocking_max) == (0.0, 0.0)
+        assert (band.overall_min, band.overall_max) == (0.0, 1.0)
+
+    @pytest.mark.parametrize(
+        'incumbent',
+        [
+            pytest.param([_rec('inc', 'd1', 1, [('g1', 'blocking')], [], 0.5)], id='one-trial'),
+            pytest.param(
+                [_rec('inc', 'd1', 1, [('g1', 'blocking')], [], 0.5), _unmeasured_rec('inc', 'd1', 2)],
+                id='second-trial-unmeasured',
+            ),
+            pytest.param([], id='no-records'),
+        ],
+    )
+    def test_fewer_than_two_measured_trials_is_no_band(self, incumbent: list[dict]) -> None:
+        band = campaign.self_complement_band(incumbent, BLOCKING_GT)
+
+        assert band.pairs == []
+        assert (band.overall_min, band.overall_max, band.blocking_min, band.blocking_max) == (
+            None, None, None, None,
+        )
+
+
 def _scored(variant: str, diff: str, trial: int, *, br: float, f1: float) -> dict:
     """A measured score record whose blocking recall and F1 differ."""
     return _rec(variant, diff, trial, [], [], f1) | {'blocking_recall': br}
