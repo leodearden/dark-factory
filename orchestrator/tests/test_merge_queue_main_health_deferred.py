@@ -1503,3 +1503,33 @@ class TestTheMuForkFlakeSinkIsWired:
         assert len(read_occurrences(ledger_db_path(config.project_root))) == 5
         [storm] = escalation_queue.get_pending()
         assert storm.task_id == 'merge-flake-suppression-storm'
+
+    def test_the_post_merge_verify_threads_its_queue_to_the_sync_probe(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _five_red_merges() -> None:
+            for _ in range(5):
+                await _run_post_merge_verify(
+                    _make_git_ops(tmp_path), req, merge_wt,
+                    timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+                    escalation_queue=escalation_queue,
+                    verifier=FakeVerifier(default=VerifyScript(result=TEST_FAILURE_RESULT)),
+                )
+
+        with patch(
+            'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+            new=_classifier_that_suppresses(),
+        ):
+            asyncio.run(_five_red_merges())
+
+        rows = read_occurrences(ledger_db_path(config.project_root))
+        assert sum(row.call_site == 'main_probe' for row in rows) == 5
+        assert [e.task_id for e in escalation_queue.get_pending()] == [
+            'merge-flake-suppression-storm',
+        ]
