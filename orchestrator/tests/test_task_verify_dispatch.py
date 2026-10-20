@@ -8,6 +8,7 @@ and a real RemoteRunner whose public transport seams (``run=``, ``ssh_run=``,
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -686,3 +687,68 @@ class TestRemoteLeg:
         assert h.local.calls == []
         assert h.only_sidecar()['reason'] == 'dispatcher_error'
         _assert_slot_free(h)
+
+
+
+# ---------------------------------------------------------------------------
+# Cancellation while the remote verify is in flight
+# ---------------------------------------------------------------------------
+
+
+def _hangs(started: asyncio.Event) -> VerifyAnswer:
+    async def answer(argv: list[str]) -> Answer:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError('a never-set event was set')
+    return answer
+
+
+def _pending_tasks() -> set[asyncio.Task[Any]]:
+    current = asyncio.current_task()
+    return {t for t in asyncio.all_tasks() if t is not current and not t.done()}
+
+
+async def _cancel_mid_verify(h: _Harness, started: asyncio.Event) -> None:
+    before = _pending_tasks()
+    call = asyncio.create_task(h.call())
+    await asyncio.wait_for(started.wait(), timeout=30)
+
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+    assert _pending_tasks() == before
+
+
+@pytest.mark.asyncio
+class TestCancellation:
+    async def test_cancel_verify_is_issued_while_the_dispatch_is_in_flight(
+        self, tmp_path: Path,
+    ) -> None:
+        started = asyncio.Event()
+        h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_hangs(started)))
+
+        await _cancel_mid_verify(h, started)
+
+        log = h.transport.log
+        assert 'cancel_verify' in log
+        assert log.index('verify_task') < log.index('cancel_verify') < log.index('delete_ref')
+        cancel_argv = h.transport.argvs[log.index('cancel_verify')]
+        assert 'orchestrator cancel-verify --request-id req1' in cancel_argv[-1]
+        _assert_slot_free(h)
+        assert h.sidecars() == []
+        assert h.dispatcher.decision_for('7', 1) is None
+        assert h.local.calls == []
+
+    async def test_a_failed_cancel_parks_the_host_for_the_next_call(self, tmp_path: Path) -> None:
+        started = asyncio.Event()
+        transport = _Transport(verify=_hangs(started), cancel_rc=1, pgrep_rc=0)
+        h = _harness(tmp_path, _ORCH_ONLY, transport=transport)
+
+        await _cancel_mid_verify(h, started)
+
+        assert h.allocator.is_parked('laptop') is True
+        assert h.pool.holders() == {}
+        result = await h.call(attempt_id=2)
+        assert result is h.local.result
+        assert h.only_sidecar(attempt_id=2)['reason'] == 'host_parked'
