@@ -647,12 +647,12 @@ class ScreenReport:
         }
 
 
-def _title(title: str) -> str:
+def quoted_title(title: str) -> str:
     return '"' + " ".join(title.split()) + '"'
 
 
 def _attached_line(item: Mapping[str, Any]) -> str:
-    line = f"- attached by key: {_title(item['title'])} ({item['candidate_id']}) → {item['entry_id']} under {item['key']}"
+    line = f"- attached by key: {quoted_title(item['title'])} ({item['candidate_id']}) → {item['entry_id']} under {item['key']}"
     if item["tag_disagreement"] is None:
         return line
     standing, offered = item["tag_disagreement"]
@@ -673,17 +673,17 @@ def report_lines(record: Mapping[str, Any]) -> list[str]:
         f"- inputs consumed: {consumed}",
         *([f"- inputs note: {inputs['note']}"] if inputs["note"] else []),
         *(
-            f"- screened by {item['rule']}: {_title(item['title'])} → {', '.join(item['matched'])}"
+            f"- screened by {item['rule']}: {quoted_title(item['title'])} → {', '.join(item['matched'])}"
             for item in record["screened"]
         ),
         *(
             f"- surfaced by {item['rule']}, verified (re-observes fixed {', '.join(item['fixed_entry_ids'])}): "
-            f"{_title(item['title'])}"
+            f"{quoted_title(item['title'])}"
             for item in record["surfaced"]
         ),
         *(_attached_line(item) for item in record["attached"]),
         *(
-            f"- re-observed from {item['run_id']} by {item['matched_by']}: {_title(item['title'])} → "
+            f"- re-observed from {item['run_id']} by {item['matched_by']}: {quoted_title(item['title'])} → "
             f"{item['entry_id']} under {item['key']}"
             for item in record["re_observed"]
         ),

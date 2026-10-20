@@ -391,3 +391,121 @@ def adjudicate_members(
         else:
             outcomes.append(Adjudicated(representative["id"], Outcome.UNRESOLVED, ()))
     return result, tuple(outcomes)
+
+
+# ---------------------------------------------------------------------------
+# The run's ## Adjudication section
+# ---------------------------------------------------------------------------
+
+_CHANGED = frozenset({Outcome.VERIFIED, Outcome.REJECTED})
+
+
+@dataclass(frozen=True)
+class AdjudicationReport:
+    """What this run's similarity stage did: the View it built, the attaches
+    applied, the queue clusters offered to verify and how each resolved, and
+    why the queue call was inconclusive when it was."""
+
+    view: View
+    attached: tuple[AppliedAttach, ...]
+    offered: tuple[QueuedCluster, ...]
+    adjudicated: tuple[Adjudicated, ...]
+    inconclusive: str | None
+
+    def _outcome(self, queued: QueuedCluster) -> Outcome:
+        if self.inconclusive is not None:
+            return Outcome.INCONCLUSIVE
+        return next(
+            (item.outcome for item in self.adjudicated if item.representative == queued.representative.key),
+            Outcome.UNRESOLVED,
+        )
+
+    def counts(self) -> dict[str, int]:
+        changed = [queued for queued in self.offered if self._outcome(queued) in _CHANGED]
+        return {
+            "attached": len(self.attached),
+            "adjudicated": sum(len(queued.members) for queued in changed),
+        }
+
+    def to_record(self) -> dict[str, Any]:
+        view = self.view
+        return {
+            "model": view.model,
+            "thresholds": {
+                "attach_min_similarity": view.settings.attach_min_similarity,
+                "cluster_min_similarity": view.settings.cluster_min_similarity,
+            },
+            "max_clusters_per_run": view.settings.max_clusters_per_run,
+            "skipped": view.skipped,
+            "embedding": {
+                "requests": view.requests, "embedded": view.embedded, "cached": view.cached, "pruned": view.pruned,
+            },
+            "queue_depth": None if view.depth is None else {"candidates": view.depth[0], "clusters": view.depth[1]},
+            "processed": [
+                {
+                    "representative": queued.representative.key,
+                    "title": queued.representative.title,
+                    "members": [member.key for member in queued.members],
+                    "sessions": queued.sessions,
+                    "outcome": self._outcome(queued).value,
+                }
+                for queued in self.offered
+            ],
+            "attached": [
+                {
+                    "candidate_id": item.candidate_id,
+                    "title": item.title,
+                    "entry_id": item.entry_id,
+                    "score": float(item.score),
+                    "novel": item.novel,
+                }
+                for item in self.attached
+            ],
+            "inconclusive": self.inconclusive,
+        }
+
+
+def _attached_line(item: Mapping[str, Any]) -> str:
+    novel = ", this run's novel cluster" if item["novel"] else ""
+    return (
+        f"- attached by similarity {item['score']:.4f}: {prescreen.quoted_title(item['title'])} "
+        f"({item['candidate_id']}{novel}) → {item['entry_id']}"
+    )
+
+
+def _processed_line(item: Mapping[str, Any]) -> str:
+    return (
+        f"- {item['outcome']}: {prescreen.quoted_title(item['title'])} ({item['representative']}) for "
+        f"{len(item['members'])} candidate(s) across {item['sessions']} session(s)"
+    )
+
+
+def report_lines(record: Mapping[str, Any]) -> list[str]:
+    """The report's ``## Adjudication`` section, rendered from the run
+    record's ``adjudication`` value (:meth:`AdjudicationReport.to_record`)."""
+    thresholds, embedding = record["thresholds"], record["embedding"]
+    header = [
+        "",
+        "## Adjudication",
+        "",
+        f"- model {record['model']}; attach at cosine >= {thresholds['attach_min_similarity']}, "
+        f"cluster at >= {thresholds['cluster_min_similarity']}; at most "
+        f"{record['max_clusters_per_run']} queue cluster(s) per run",
+        f"- embeddings: {embedding['requests']} request(s), {embedding['embedded']} embedded, "
+        f"{embedding['cached']} cached, {embedding['pruned']} pruned",
+    ]
+    if record["skipped"] is not None:
+        return [
+            *header,
+            f"- skipped: {record['skipped']}; no similarity attach and no queue adjudication happened this run",
+        ]
+    depth, processed = record["queue_depth"], record["processed"]
+    return [
+        *header,
+        f"- queue depth: {depth['candidates']} pending candidate(s) in {depth['clusters']} cluster(s)",
+        f"- processed this run: {len(processed)} cluster(s), "
+        f"{sum(len(item['members']) for item in processed)} candidate(s)",
+        *([f"- queue inconclusive: {record['inconclusive']}"] if record["inconclusive"] else []),
+        *(_processed_line(item) for item in processed),
+        *(_attached_line(item) for item in record["attached"]),
+    ]
