@@ -484,6 +484,30 @@ class TestDefaults:
         with pytest.raises(ValidationError):
             OrchestratorConfig(terminal_status_hard_cancel_polls=0)
 
+    def test_wedged_slot_backstop_defaults_leave_room_for_the_bounded_cleanup(
+        self, monkeypatch, tmp_path,
+    ):
+        """Task 6660: one abandoned cleanup entry takes at most 3 grace windows
+        (its grace plus cancel_bounded's two), so the force-release backstop,
+        counted in watcher polls past the hard-cancel, must wait longer."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.terminal_cleanup_cancel_grace_secs == 120.0
+        assert config.terminal_status_force_release_polls == 15
+        assert (
+            config.terminal_status_force_release_polls * config.terminal_status_poll_interval_secs
+            > 3 * config.terminal_cleanup_cancel_grace_secs
+        )
+
+    def test_terminal_cleanup_cancel_grace_secs_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(terminal_cleanup_cancel_grace_secs=0)
+
+    def test_terminal_status_force_release_polls_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(terminal_status_force_release_polls=0)
+
     def test_run_forever_idle_defaults(self, monkeypatch, tmp_path):
         """Run-forever idle + full-review rate-limit fields carry their defaults.
 
