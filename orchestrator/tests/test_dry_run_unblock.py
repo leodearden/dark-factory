@@ -3181,3 +3181,55 @@ class TestInvestigationPermissionEnvelope:
         assert allowed_subs, kwargs['allowed_tools']
         mutating = sorted(allowed_subs & _MUTATING_GIT_SUBCOMMANDS)
         assert not mutating, f'the envelope grants mutation-capable git subcommands: {mutating}'
+
+
+_FENCE = re.compile(r'^```(\w*)\n(.*?)^```', re.MULTILINE | re.DOTALL)
+_INLINE_SPAN = re.compile(r'`([^`\n]+)`')
+_SHELL_COMPOSITION = re.compile(r'\$\(|`|&&|\|\||[;|]')
+
+
+def _instructed_commands(skill: str) -> list[str]:
+    """Every shell command *skill* tells the investigator to run."""
+    commands = [
+        line.strip()
+        for lang, body in _FENCE.findall(skill) if lang == 'bash'
+        for line in body.splitlines()
+        if line.strip() and not line.strip().startswith('#')
+    ]
+    prose = _FENCE.sub('', skill)
+    commands += [span for span in _INLINE_SPAN.findall(prose) if span.startswith('git ')]
+    return commands
+
+
+def _admitted(command: str, allowed_tools: list[str]) -> bool:
+    """Whether a ``Bash(<prefix>:*)`` rule admits *command* as one simple command.
+
+    A prefix rule never admits a composed command as a whole, so substitution
+    and operators leave it unadmitted.
+    """
+    if _SHELL_COMPOSITION.search(command):
+        return False
+    prefixes = [
+        match.group(1)
+        for entry in allowed_tools
+        if (match := re.fullmatch(r'Bash\((.+):\*\)', entry))
+    ]
+    return any(command == p or command.startswith(f'{p} ') for p in prefixes)
+
+
+class TestSkillCommandsFitTheEnvelope:
+    """Under dontAsk a skill command outside the allowlist is denied without a
+    prompt, which silently degrades the investigation rather than failing it."""
+
+    @pytest.mark.asyncio
+    async def test_every_git_command_the_skill_instructs_is_admitted_by_the_envelope(
+        self, tmp_path,
+    ):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        commands = _instructed_commands(kwargs['system_prompt'])
+        assert commands, 'no instructed command extracted from the unblock-auto skill'
+        unadmitted = [c for c in commands if not _admitted(c, kwargs['allowed_tools'])]
+        assert not unadmitted, (
+            f'the unblock-auto skill instructs commands its envelope denies: {unadmitted}'
+        )
