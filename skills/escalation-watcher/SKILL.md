@@ -277,6 +277,16 @@ After `lease-claim` returns `acquired` or `proceed`, and before the first brief:
    does not mention: is it new since, or missed? Pins and HOLDs go into the sitting as `standing`
    records with their release predicates (see "Investigate before you `record`"). Traps stay in
    mind for the session and carry into your own handover while they still hold.
+
+   A **handed-off B3 merge** in the In flight section (`{task_id, escalation_id, request_id,
+   worktree}`) has no live owner: any resume-mode run polling it ended with the predecessor. If
+   `get_escalation(escalation_id)` still shows the escalation `pending`, launch
+   `unblock-low-risk` in resume mode for it once, exactly as the `handed_off` bullet of B3
+   "Completion handling" does, and track the `task_id` as in flight from then on. This launch
+   replaces a resume the stop cut off; it is not a second resume. Do not run `b3_gate check` or
+   `record-launch` first: `check` reports `already_attempted` for this task, and skipping on that
+   verdict would leave a live merge unwatched. If the escalation is no longer pending, whoever
+   took it owns the merge: launch nothing, and never `merge_cancel` it.
 4. Open the first brief, posted unprompted at launch (see "When it runs"), with the reconciliation:
    what carried forward, what the handover missed, and each correction where live state refutes
    it.
@@ -303,11 +313,10 @@ Four steps, in this order:
    Note every background sub-agent, spawned session and merge request still in flight; they go
    into the handover's in-flight section. A B3 `unblock-low-risk` sub-agent cut off by the stop is
    not relaunched by a successor: its `record-launch` marker makes `check` report
-   `already_attempted`. A handed-off B3 merge whose resume has not yet returned is different: its
-   `{task_id, escalation_id, request_id}` goes into the In flight section whether or not a
-   resume-mode run was still polling at the stop. A successor reconciling the handover (step 3 of
-   "Reading the predecessor's handover at launch") launches resume mode for it once, if the
-   escalation is still pending; resume mode does not pass through `check`.
+   `already_attempted`. A handed-off B3 merge whose resume has not yet returned is different:
+   record its `{task_id, escalation_id, request_id, worktree}` in the In flight section, whether
+   or not a resume-mode run was still polling at the stop. Step 3 of "Reading the predecessor's
+   handover at launch" says what the successor does with it.
 2. **Write the handover** (see "The handover file (`l2-handover.md`)"). It goes before the release,
    so a successor that claims the freed lease finds it complete.
 3. **Release the lease** with the `lease-release` verb under "Heartbeat + release" in "Claiming the
@@ -1327,12 +1336,16 @@ launch by `task_id` / background-task-id):
   mode; it waits for the human. If the abort reason indicates drift/staleness and the one-shot has
   not been used this cycle, route through the drift path once. Also file a DecisionRecord via
   `write-decision` carrying the abort reason as `--text` (see "Filing Parked Decisions to the
-  Cockpit Registry" below).
+  Cockpit Registry" below). A **resume-mode** `aborted` (see `handed_off` below) differs in two
+  ways. It never takes the drift path: the re-gate ends in `record-launch`, which can only report
+  `already_attempted` for this task. And when its reason is that the escalation is no longer
+  pending, write only the digest line and file no DecisionRecord: whoever took the escalation
+  owns it, and the merge carries on.
 - `outcome == "handed_off"`: neither a failure nor an abort. The merge `request_id` it returns
-  was picked up by the merge worker and is still verifying; the sub-agent did not cancel it, did
-  not change the task status, and left the escalation pending. **Never `merge_cancel` it**, and
-  never submit another merge for that `task_id`: it is an in-flight merge, so record its
-  `{task_id, escalation_id, request_id}` per "Tracking in-flight merges". Launch
+  was picked up by the merge worker and is still live (merging or verifying); the sub-agent did
+  not cancel it, did not change the task status, and left the escalation pending. **Never
+  `merge_cancel` it**, and never submit another merge for that `task_id`: it is an in-flight
+  merge, so record its `{task_id, escalation_id, request_id}` per "Tracking in-flight merges". Launch
   `unblock-low-risk` again as a NON-INTERACTIVE background sub-agent in **resume mode**, exactly
   as B3 is launched above (`Agent` tool, general-purpose, `run_in_background: true`), pointing it
   at the "Resuming a handed-off merge (resume mode)" subsection of
@@ -1343,8 +1356,8 @@ launch by `task_id` / background-task-id):
   launch:** if a resume-mode run itself returns `handed_off` (its 3 h backstop expired with the
   merge still live), do not resume again — leave the escalation pending, write the digest line,
   and file a DecisionRecord via `write-decision` whose `--text` names the `request_id` and its
-  last state. Still never cancel. A resume-mode `merged` or `aborted` is handled by the bullets
-  above.
+  last state. Still never cancel. A resume-mode `merged` is handled by the `merged` bullet, and a
+  resume-mode `aborted` by the `aborted` bullet, including its resume-mode exceptions.
 
 The sub-agent re-checks the gate defensively and refuses anything not unambiguously low-risk; treat
 its abort as authoritative.
@@ -1373,8 +1386,9 @@ mode; AFK shift 3 manages it):
 demoted to a generated history view: `data/return-brief.md`, the 05:30 return brief, is the
 primary pull-on-return surface that supersedes it, and it reads the cockpit decision queue (C5b),
 fed by `write-decision` (see "Filing Parked Decisions to the Cockpit Registry" above), for any of
-the above that left a decision open (i.e. every outcome except "Merged" and a first "Handed off",
-whose resume is still running).
+the above that left a decision open (i.e. every outcome except "Merged", a first "Handed off",
+whose resume is still running, and a resume-mode "Aborted" on an escalation someone else already
+took).
 
 **When a line is derived from a triage ack.** If a digest line above, or a `write-decision --text`
 registry entry (see "Filing Parked Decisions to the Cockpit Registry" above), draws on an existing
