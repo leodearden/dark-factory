@@ -874,7 +874,7 @@ Four operator-facing facts:
   the remote host" above). Gate directories are built on first use of a
   commit (about a second warm, a minute cold), are never written after they
   are marked ready, and are reaped when idle for 7 days (trash after 1 day)
-  by an hourly detached sweep that touches only a root carrying the
+  by a detached sweep launched at most hourly per orchestrator process (never against a benched host) that touches only a root carrying the
   `.dark-factory-gate-root` marker. The dispatcher emits `runner_stale` then
   `runner_synced` (kind `gate_checkout`) when it had to build one.
 
