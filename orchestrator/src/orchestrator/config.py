@@ -3903,6 +3903,15 @@ class OrchestratorConfig(BaseSettings):
     # restarting the fleet is not a kill switch (the argument already written
     # for ``config_key_census.*`` and ``merge_deep.chain_cap``).
     merge_disjoint_skip_requires_verified_drift: bool = Field(default=True)
+    # The project's merge gate verdict is a function of the tree alone: no
+    # leg reads git history (ancestry of HEAD, a merge-base, a log).  Only
+    # then may ``merge_lane/gates.py::_reverify_rebased_tree`` skip the
+    # re-verify of a rebased tree byte-identical to the one that just passed
+    # (task 6647).  False (the default) re-verifies it.  GREEN TIER for the
+    # reason given for ``merge_disjoint_skip_requires_verified_drift``
+    # above: read fresh off ``req.config`` at each gate evaluation, and it
+    # only ever decides whether one more verify runs before an advance.
+    merge_gate_history_pure: bool = Field(default=False)
     # Fix (b), task 2822 — per-land cross-check of a REMOTE merge-verify green.
     # When True (default), after a remote two-host verify returns a real-suite
     # PASS that would DECIDE a land, the merge worker re-runs the LOCAL
@@ -6391,6 +6400,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # merge's breadth, and is read fresh off req.config at each gate
         # evaluation.  A safety kill switch behind a restart is not one.
         'merge_disjoint_skip_requires_verified_drift',
+        # Same-tree gate skip precondition (task 6647) — green-tier for the
+        # reason given directly above.
+        'merge_gate_history_pure',
         # Task-text amendment gate on the Lever-B skip (task 4031) — read off
         # self.config at each revalidation decision and never captured, so a
         # flip affects only the next decision.

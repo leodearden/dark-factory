@@ -77,6 +77,7 @@ from orchestrator.merge_lane.drift import (
 from orchestrator.merge_lane.gates import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+    GateClearance,
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
     _check_post_merge_pyright,
@@ -6776,12 +6777,14 @@ def _emit_train_attempt(
     *,
     started_monotonic: float,
     attempt: int | None = None,
+    gate_clearance: GateClearance | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` for *req*'s train, tagged with its train id and members."""
     _emit_merge_attempt(
         event_store, req.task_id, outcome,
         attempt=attempt, duration_ms=_elapsed_ms(started_monotonic),
         train_id=req.train_id, member_task_ids=req.member_task_ids,
+        gate_clearance=gate_clearance,
     )
 
 
@@ -6941,6 +6944,7 @@ async def _advance_train(
         tip = _rebased_tip(adv, req.task_id)
         gate = await _reverify_rebased_tree(
             git_ops, req, merge_wt,
+            verified_merge_sha=candidate,
             rebased_from=candidate_base,
             rebased_onto=tip.rebased_onto,
             timeouts=worker._post_merge_verify_timeouts,
@@ -6950,18 +6954,18 @@ async def _advance_train(
             merge_sha=tip.rebased_sha,
             run_post_merge_verify=train_verify,
         )
-        if gate is not None:
+        if isinstance(gate, MergeOutcome):
             return _TrainAdvance(adv, landing_base=candidate_base, reverify_failure=gate)
         candidate = tip.rebased_sha
         candidate_base = expected_main = tip.rebased_onto
         logger.info(
-            'Train %s: rebased tip %s cleared the re-verify gate; advancing '
+            'Train %s: rebased tip %s cleared the re-verify gate (%s); advancing '
             '(retry %d/%d)',
-            req.train_id, candidate[:8], retries, worker.MAX_CAS_RETRIES,
+            req.train_id, candidate[:8], gate, retries, worker.MAX_CAS_RETRIES,
         )
         _emit_train_attempt(
             worker._event_store, req, OutcomeKind.gate_retry,
-            attempt=retries, started_monotonic=started_monotonic,
+            attempt=retries, started_monotonic=started_monotonic, gate_clearance=gate,
         )
 
 
@@ -11228,6 +11232,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # optional probe is treated as clean.
                     _is_parked = getattr(self._host_allocator, 'is_parked', None)
                     _was_parked = bool(_is_parked(name)) if _is_parked is not None else False
+                    _park_epoch = getattr(self._host_allocator, 'park_epoch', None)
+                    _probed_epoch = _park_epoch(name) if _park_epoch is not None else None
                     if _was_parked:
                         _probe_clean = getattr(runner, 'probe_clean', None)
                         if _probe_clean is None:
@@ -11269,10 +11275,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             continue
 
                     _readmit = getattr(self._host_allocator, 'readmit', None)
-                    if _readmit is not None:
-                        _readmit(name)
-                    else:
+                    if _readmit is None:
                         self._host_allocator.clear_quarantine(name)
+                    elif not _readmit(name, expect_epoch=_probed_epoch):
+                        continue
                     self._record_runner_recovered(name)
                     _clear_verify_host_unreachable(
                         self._escalation_queue,
@@ -14675,11 +14681,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """Periodically probe quarantined remote hosts and clear on recovery.
 
         Runs independently of the merger/verifier loops so it fires even when
-        those are idle.  Wakes every ``_reprobe_interval_s`` seconds and delegates
-        to the clock-injectable :meth:`_reprobe_quarantined_hosts`.
+        those are idle.  Wakes every ``_reprobe_interval_s`` seconds and runs two
+        sweeps: the tracker-driven :meth:`_reprobe_quarantined_hosts` first, then
+        :meth:`_reprobe_untracked_parked_slots`, the backstop for PARKED hosts
+        with no tracker entry.
 
-        Any unexpected exception is logged and swallowed (same pattern as
-        _heartbeat_loop) so a probe bug can never crash the worker.
+        Each sweep is fault-isolated: an unexpected exception is logged and
+        swallowed (same pattern as _heartbeat_loop), so a probe bug can neither
+        crash the worker nor disable the other sweep.
         """
         while self._running:
             await self._clock.sleep(self._reprobe_interval_s)
@@ -14687,6 +14696,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 await self._reprobe_quarantined_hosts(self._clock.now())
             except Exception:
                 logger.exception('reprobe_quarantined_hosts: unexpected error in loop')
+            try:
+                await self._reprobe_untracked_parked_slots()
+            except Exception:
+                logger.exception('reprobe_untracked_parked_slots: unexpected error in loop')
+
+    async def _reprobe_untracked_parked_slots(self) -> None:
+        """Free PARKED hosts the tracker sweep cannot see; tracked ones stay its job."""
+        if not isinstance(self._host_allocator, HostAllocator):
+            return
+        await self._host_allocator.reprobe_parked_slots(
+            exclude=frozenset(self._runner_unavailable),
+        )
 
     # ── supervisor (task 1857) ───────────────────────────────────────────
 
@@ -17898,8 +17919,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``cancel_verify()`` returns rc != 0 and all ``max_attempts``
         ``probe_clean()`` polls fail, so
         :meth:`~orchestrator.verify_runner.HostAllocator.cancel_and_release`
-        leaves the slot **PARKED** and non-acquirable (verify_runner.py:3202,
-        3211).  That is the correct fail-closed state — the cancel RPC failed,
+        leaves the slot **PARKED** and non-acquirable.  That is the correct
+        fail-closed state — the cancel RPC failed,
         so a stale verify process may still be running there — but it writes
         **only** ``_slots``: the host is NOT added to ``_quarantine``, so
         ``quarantined_remote_runners()`` never yields it and
@@ -17920,7 +17941,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         PARKED, not ``not ok``, is the discriminator: the cancel-fail path
         returns False *regardless* of the probe outcome, so a host whose probe
         came back clean (slot FREE, perfectly healthy) would otherwise be
-        quarantined on a false positive.
+        quarantined on a false positive.  Detection runs in a ``finally``, so a
+        CancelledError during the multi-second probe loop, where the slot is
+        already PARKED, still records the strand and then propagates unchanged.
 
         The PARKED read is gated on ``isinstance(..., HostAllocator)`` — the
         house pattern task 3275 established at :meth:`_host_states_block`,
@@ -17937,29 +17960,40 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if lease is None or self._host_allocator is None:
             return True
 
-        ok = await self._host_allocator.cancel_and_release(lease)
-
-        if not ok and not getattr(lease, 'is_local', False):
-            try:
-                _parked = (
-                    isinstance(self._host_allocator, HostAllocator)
-                    and self._host_allocator.is_parked(lease.name)
-                )
-                if _parked:
-                    self._quarantine_unreachable_host(
-                        lease.name,
-                        f'verify cancel/probe failed against {lease.name!r} — '
-                        'host slot PARKED (presumed unreachable)',
-                        self._clock.now(),
-                    )
-            except Exception:
-                logger.warning(
-                    f'strand check after cancel_and_release({lease.name!r}) '
-                    'failed; host may be PARKED without a tracker entry',
-                    exc_info=True,
-                )
-
+        ok = False
+        try:
+            ok = await self._host_allocator.cancel_and_release(lease)
+        finally:
+            if not ok:
+                self._record_parked_strand(lease)
         return ok
+
+    def _record_parked_strand(self, lease: Any) -> None:
+        """Quarantine and track *lease*'s remote host if its slot was left PARKED.
+
+        Synchronous on purpose: it runs in :meth:`_cancel_and_release_tracked`'s
+        ``finally``, possibly while a CancelledError is unwinding.
+        """
+        if getattr(lease, 'is_local', False):
+            return
+        try:
+            _parked = (
+                isinstance(self._host_allocator, HostAllocator)
+                and self._host_allocator.is_parked(lease.name)
+            )
+            if _parked:
+                self._quarantine_unreachable_host(
+                    lease.name,
+                    f'verify cancel/probe failed against {lease.name!r} — '
+                    'host slot PARKED (presumed unreachable)',
+                    self._clock.now(),
+                )
+        except Exception:
+            logger.warning(
+                f'strand check after cancel_and_release({lease.name!r}) '
+                'failed; host may be PARKED without a tracker entry',
+                exc_info=True,
+            )
 
     async def _teardown_verify_task(
         self,
@@ -20387,6 +20421,49 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             landed, len(chain.links), head_sha[:8],
         )
 
+    async def _finalize_landed_by_successor(
+        self,
+        item: RealMergeItem,
+        merge_wt: Path,
+        *,
+        spec_warm: bool,
+        landed_sha: str,
+        main_sha: str,
+    ) -> None:
+        """Finalize *item* as landed by its own verified commit, which a later landing carried onto main.
+
+        Task 7196 (the "already on main" slice of 6155).  Re-verifying here
+        would gate main's own tree.  Main was moved by another item, so the
+        landing-side work that belongs to the item that moved it (the chain
+        walk, shadow compare, drift check, warm-base refresh, the landed hook)
+        is not repeated, and the main-tip cache stays at *main_sha*, never
+        regressing to *landed_sha*.
+        """
+        req = item.request
+        logger.info(
+            'Task %s: verified merge commit %s is already on main %s; '
+            'finalizing as landed without a re-verify',
+            req.task_id, landed_sha[:8], main_sha[:8],
+        )
+        self._gate_retries.pop(req.task_id, None)
+        await self._release_or_cleanup(merge_wt, spec_warm=spec_warm)
+        outcome = await _finalize_advanced_merge(
+            self._git_ops, req, self._event_store,
+            merge_commit_fallback=landed_sha,
+            base_sha=item.base_sha,
+            started_monotonic=item.started_monotonic,
+            cas_retries=self._cas_retries,
+            timeouts=self._post_merge_verify_timeouts,
+            enospc_retries=self._post_merge_verify_enospc_retries,
+            log_label=' (already on main)',
+            merged_branch_tip=item.merged_branch_tip,
+            advanced_sha=landed_sha,
+        )
+        self._resolve_or_drop_abandoned(req, outcome)
+        if outcome.status == 'done':
+            self._note_merge_landing(req.request_id)
+            self._last_known_main_sha = main_sha
+
     async def _finalize_inflight(self, entry: InflightEntry) -> bool:
         """Run the CAS advance_main + post-advance work for one in-flight item.
 
@@ -21145,12 +21222,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     return True
 
                 if result == 'rebased_pending_reverify':
+                    rebased_sha, rebased_from, rebased_onto = _rebased_tip(adv_outcome, req.task_id)
+                    if await self._git_ops.is_ancestor_checked(current_sha, rebased_onto) is True:
+                        await self._finalize_landed_by_successor(
+                            item, merge_wt, spec_warm=_vr_spec_warm,
+                            landed_sha=current_sha, main_sha=rebased_onto,
+                        )
+                        advanced = True
+                        return True
                     # ι=1894: count this as a merge retry — main advanced under the
                     # request, so a fresh re-verify is required.  Both cas_failed and
                     # rebased_pending_reverify are included in retries_per_landing (see
                     # _note_merge_retry docstring for the rationale).
                     self._note_merge_retry()
-                    rebased_sha, rebased_from, rebased_onto = _rebased_tip(adv_outcome, req.task_id)
 
                     self._note_transition(
                         req.request_id, ItemLifecycleState.FINALIZING,
@@ -21158,6 +21242,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     )
                     gate = await _reverify_rebased_tree(
                         self._git_ops, req, merge_wt,
+                        verified_merge_sha=current_sha,
                         rebased_from=rebased_from,
                         rebased_onto=rebased_onto,
                         timeouts=self._post_merge_verify_timeouts,
@@ -21168,7 +21253,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         keep_worktrees=set(self._owned_merge_worktrees),
                         run_post_merge_verify=_run_post_merge_verify,
                     )
-                    if gate is not None:
+                    if isinstance(gate, MergeOutcome):
                         # task 2604: route through the unified terminal
                         # chokepoint so _retire_item fires (mirrors the three
                         # converted sites and the FAIL/skip branch). A raw
@@ -21231,15 +21316,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         item, base_sha=rebased_onto, remerge_recovery=False,
                     )
                     logger.info(
-                        'Task %s: gate cleared (disjoint or green re-verify); '
+                        'Task %s: gate cleared (%s); '
                         'advancing with rebased SHA %s (gate attempt %d/%d)',
-                        req.task_id, rebased_sha[:8],
+                        req.task_id, gate, rebased_sha[:8],
                         gate_total, self.MAX_CAS_RETRIES,
                     )
                     _emit_merge_attempt(
                         self._event_store, req.task_id, OutcomeKind.gate_retry,
                         attempt=gate_total,
                         duration_ms=_elapsed_ms(item.started_monotonic),
+                        gate_clearance=gate,
                     )
                     self._note_transition(
                         req.request_id, ItemLifecycleState.GATE_REVERIFY,

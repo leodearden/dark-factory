@@ -1206,6 +1206,15 @@ takes no arguments: it always re-reads that process's own
   switch, it only ever ADDS one verify before an advance, and it cannot
   split an in-flight merge's breadth. Contrast its **restart-only**
   neighbour `merge_verify_breadth`, which does change breadth mid-merge.
+- `merge_gate_history_pure` (task 6647; default `false`). Declares that every
+  leg of the project's merge gate judges the tree alone, reading no git
+  history. Only then does `merge_lane/gates.py::_reverify_rebased_tree` skip
+  the re-verify of a rebased tree byte-identical to the tree that just passed
+  (`gate_clearance: same_tree` on the `gate_retry` row). Dark-factory ships it
+  `false`: several of its legs read HEAD's history (named in
+  `dark-factory-orchestrator.yaml` beside the key). Green-tier for the same
+  reason as the bullet above: read per gate evaluation, and it only decides
+  whether one more verify runs.
 - `merge_deep.chain_cap` (the deep merge-ahead chain cap — see
   [§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap);
   `0` is the shipped default and the feature's kill switch). Green-tier on
