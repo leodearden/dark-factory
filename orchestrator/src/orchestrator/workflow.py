@@ -3483,12 +3483,17 @@ class TaskWorkflow:
         :class:`WorkflowCancelled`, caught at this EXACTLY ONE site.
         """
         cancel_kind: Literal['hard', 'soft'] | None = None
-        scope = CancellationScope(self._cancel_event, self._on_terminal_cleanups())
+        scope = CancellationScope(
+            self._cancel_event, self._on_terminal_cleanups(),
+            cancel_grace_secs=self.config.terminal_cleanup_cancel_grace_secs,
+        )
         try:
             outcome = await scope.supervise(self._drive())
         except WorkflowCancelled as wc:
             cancel_kind = wc.kind
             outcome = await self._finalise_cancellation(wc.kind)
+        finally:
+            self._record_abandoned_cleanup(scope.abandoned_entries)
         report = (
             self._terminal_report
             if (
@@ -3517,6 +3522,29 @@ class TaskWorkflow:
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
         return report
+
+    def _record_abandoned_cleanup(self, entries: tuple[str, ...]) -> None:
+        """Make a bounded-but-wedged terminal cleanup loud (task 6660, INV-11).
+
+        An event and an ERROR, no escalation: the scope did return, so the
+        slot and its module locks are released as usual.  A slot that never
+        returns is the harness's to report: ``workflow_slot_wedged``, from
+        ``orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot``.
+        """
+        if not entries:
+            return
+        logger.error(
+            'Task %s: terminal cleanup abandoned %s after a hard-cancel; the '
+            'slot is released, but whatever those entries own may be left behind',
+            self.task_id, list(entries),
+        )
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.workflow_cleanup_abandoned,
+                task_id=self.task_id,
+                phase=self.machine.state.value,
+                data={'entries': list(entries)},
+            )
 
     async def _exit_status_facts(
         self, cancel_kind: Literal['hard', 'soft'] | None,
