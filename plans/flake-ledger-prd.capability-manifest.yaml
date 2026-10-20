@@ -146,9 +146,21 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: '[''"]main_probe[''"]'
+      pattern: _wholly_preexisting_after_flake_gate
       paths:
       - orchestrator/src/orchestrator/
+      expect: present
+  - name: mu-fork-flake-gate-tests
+    binding: 'amended 2026-10-20 (task 3788 carry): the original mu-fork-early-return-site
+      check grepped the ''main_probe'' call_site literal, which already had 1 hit on main
+      (a docstring at verify.py::_main_probe_failure_is_isolated_flake), so it was vacuous.
+      The two checks now bound to delta are the gate helper symbol above (0 hits before
+      3788) and this test file (absent before 3788), which pins B4/B5 and the main-pinned tree'
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/tests/test_verify_mu_fork_flake_gate.py
       expect: present
   - name: gate-is-live-but-structurally-unreachable
     binding: 'capability→producer (wired) + measured floor — _main_probe_failure_is_isolated_flake
