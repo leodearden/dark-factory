@@ -11,10 +11,13 @@ import math
 import random
 import types
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 import pytest
 from _fm_helpers import load_script_module
+
+if TYPE_CHECKING:
+    from write_triage_stats import StratumUnit
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'write_triage_stats.py'
 
@@ -24,7 +27,7 @@ def _mod() -> types.ModuleType:
     return load_script_module(SCRIPT_PATH, mod_name='write_triage_stats')
 
 
-def _unit(stratum: str, numerator: float, denominator: float = 1.0) -> Any:
+def _unit(stratum: str, numerator: float, denominator: float = 1.0) -> StratumUnit:
     return _mod().StratumUnit(stratum=stratum, numerator=numerator, denominator=denominator)
 
 
@@ -104,7 +107,7 @@ class TestStratifiedBootstrap95:
         + [('b', 1)] * 5 + [('b', 0)] * 15
     )
 
-    def _units(self) -> list[Any]:
+    def _units(self) -> list[StratumUnit]:
         return [_unit(stratum, num) for stratum, num in self._UNITS]
 
     def test_the_same_seed_gives_the_same_interval(self) -> None:
