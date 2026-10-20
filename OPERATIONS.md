@@ -1701,6 +1701,19 @@ restart:
   shared 8-hour clock. Since task 5371 it passes `--drain` too (it is still
   disabled by config until task 5020).
 
+**Module-removal fast path (task 7198).** A watched commit that deletes or
+renames a `.py` module under `orchestrator/src`, `escalation/src` or
+`shared/src` arms a `ModuleNotFoundError` in every running orchestrator that
+imports it lazily (the 2026-10-17 `merge_disposition` incident, task 7098).
+Once `ORCH_MODULE_REMOVAL_GRACE_SECS` (default 600s) has passed since the
+first such commit landed on main after the last verified fleet deploy, the
+staleness backstop waives its min-interval, head start and commit grace and
+delegates the same `restart-all-orchestrators.sh --drain` sweep, which stamps
+the clock as usual. A held fleet lease still blocks it, and a failed git
+probe logs a WARNING and waives nothing. Journal signature: `delegating
+fleet-wide module-removal redeploy`. Code:
+`scripts/orchestrator-watchdog.py::_due_module_removals`.
+
 Both staleness and the coordinator invoke the same
 `restart-all-orchestrators.sh` chokepoint, so **clock-stamping** is defined
 once: the script is the sole on-disk writer of the shared clock, and only on
