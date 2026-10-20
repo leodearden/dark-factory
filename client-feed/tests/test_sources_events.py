@@ -7,9 +7,10 @@ import pytest
 from _stores import RunsDb
 from shared.project_layout import runs_db
 
-from client_feed.contract import Source, VerifyKind
+from client_feed.contract import SchedulerState, Source, VerifyKind
 from client_feed.sources.events import (
     EventBatch,
+    FactoryStatus,
     LandedCommit,
     PhaseChange,
     SkippedRow,
@@ -17,6 +18,8 @@ from client_feed.sources.events import (
     StoreEventType,
     VerifyVerdict,
     read_events,
+    read_factory_status,
+    read_open_escalations,
 )
 from client_feed.sources.store import StoreProblem, StoreReadError
 
@@ -349,3 +352,178 @@ class TestStoreFailures:
         read_all(root)
 
         assert runs.path.read_bytes() == before
+
+
+class TestFactoryStatus:
+    def test_an_empty_store_is_running_with_nothing_recorded(self, root: Path, runs: RunsDb) -> None:
+        assert read_factory_status(root, now=at(0)) == FactoryStatus(
+            scheduler=SchedulerState.RUNNING, since=None, last_event_at=None, idle_seconds=None
+        )
+
+    def test_a_pause_with_nothing_after_it_is_paused_and_idle(
+        self, root: Path, runs: RunsDb
+    ) -> None:
+        runs.emit('scheduler_paused', at=at(0), data={'reason': 'SECRET-REASON'})
+
+        status = read_factory_status(root, now=at(180))
+
+        assert status == FactoryStatus(
+            scheduler=SchedulerState.PAUSED, since=at(0), last_event_at=at(0), idle_seconds=10800
+        )
+        assert 'SECRET-' not in repr(status)
+
+    def test_a_resume_ends_the_pause(self, root: Path, runs: RunsDb) -> None:
+        runs.emit('scheduler_paused', at=at(0))
+        runs.emit('scheduler_resumed', at=at(5))
+
+        status = read_factory_status(root, now=at(10))
+
+        assert (status.scheduler, status.since) == (SchedulerState.RUNNING, at(5))
+
+    def test_a_restart_that_declines_to_reassert_ends_the_pause(
+        self, root: Path, runs: RunsDb
+    ) -> None:
+        runs.emit('scheduler_paused', at=at(0))
+        runs.emit('scheduler_pause_restored', at=at(5), data={'reasserted': False})
+
+        status = read_factory_status(root, now=at(10))
+
+        assert (status.scheduler, status.since) == (SchedulerState.RUNNING, at(5))
+
+    @pytest.mark.parametrize('data', [{'reasserted': True}, {'reason': 'ewa_trip'}])
+    def test_a_restored_pause_that_is_not_declined_stays_paused(
+        self, root: Path, runs: RunsDb, data: dict
+    ) -> None:
+        runs.emit('scheduler_paused', at=at(0))
+        runs.emit('scheduler_pause_restored', at=at(5), data=data)
+
+        status = read_factory_status(root, now=at(10))
+
+        assert (status.scheduler, status.since) == (SchedulerState.PAUSED, at(0))
+
+    def test_a_second_pause_keeps_the_first_since(self, root: Path, runs: RunsDb) -> None:
+        runs.emit('scheduler_paused', at=at(0))
+        runs.emit('scheduler_paused', at=at(5))
+
+        status = read_factory_status(root, now=at(10))
+
+        assert (status.scheduler, status.since) == (SchedulerState.PAUSED, at(0))
+
+    def test_the_newest_row_of_any_type_is_the_last_event(self, root: Path, runs: RunsDb) -> None:
+        runs.emit('scheduler_paused', at=at(0))
+        runs.emit('cost_update', at=at(60), data={'cost_usd': 1.0})
+
+        status = read_factory_status(root, now=at(180))
+
+        assert (status.last_event_at, status.idle_seconds) == (at(60), 7200)
+
+    def test_a_clock_behind_the_last_event_is_not_idle(self, root: Path, runs: RunsDb) -> None:
+        runs.emit('cost_update', at=at(10))
+
+        assert read_factory_status(root, now=at(0)).idle_seconds == 0
+
+    def test_a_naive_clock_is_refused(self, root: Path, runs: RunsDb) -> None:
+        with pytest.raises(ValueError):
+            read_factory_status(root, now=datetime(2026, 10, 1, 10, 0))
+
+    def test_a_missing_store_is_refused(self, root: Path) -> None:
+        with pytest.raises(StoreReadError) as caught:
+            read_factory_status(root, now=at(0))
+
+        assert caught.value.problem is StoreProblem.MISSING
+
+
+def escalation(escalation_id: str | None = None, **extra: object) -> dict:
+    data: dict = {'category': 'task_failure', 'summary': 'SECRET-SUMMARY /home/leo/x', **extra}
+    if escalation_id is not None:
+        data['escalation_id'] = escalation_id
+    return data
+
+
+class TestOpenEscalations:
+    def test_a_created_escalation_is_open_at_its_level(self, root: Path, runs: RunsDb) -> None:
+        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1', level=2))
+
+        assert read_open_escalations(root).levels(9) == (2,)
+
+    def test_a_resolution_by_id_closes_it(self, root: Path, runs: RunsDb) -> None:
+        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1', level=2))
+        runs.emit('escalation_resolved', at=at(1), task_id='9', data={'escalation_id': 'esc-9-1'})
+
+        assert read_open_escalations(root).levels(9) == ()
+
+    def test_a_resolution_by_ids_closes_only_the_listed(self, root: Path, runs: RunsDb) -> None:
+        for number in (1, 2, 3):
+            runs.emit(
+                'escalation_created', at=at(number), task_id='9',
+                data=escalation(f'esc-9-{number}', level=number),
+            )
+        runs.emit(
+            'escalation_resolved', at=at(5), task_id='9',
+            data={'outcome': 'steward_wait_timeout', 'escalation_ids': ['esc-9-1', 'esc-9-3']},
+        )
+
+        assert read_open_escalations(root).levels(9) == (2,)
+
+    def test_an_outcome_only_resolution_closes_its_task_only(
+        self, root: Path, runs: RunsDb
+    ) -> None:
+        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1', level=1))
+        runs.emit('escalation_created', at=at(1), task_id='9', data=escalation('esc-9-2', level=2))
+        runs.emit('escalation_created', at=at(2), task_id='10', data=escalation('esc-10-1', level=1))
+        runs.emit('escalation_resolved', at=at(3), task_id='9', data={'outcome': 'requeued'})
+
+        escalations = read_open_escalations(root)
+
+        assert (escalations.levels(9), escalations.levels(10)) == ((), (1,))
+
+    @pytest.mark.parametrize(
+        ('task_id', 'data'),
+        [
+            ('9', escalation(None, level=1)),
+            ('_mainprobe-1', escalation('esc-x-1', level=1)),
+            ('9', 'not json'),
+        ],
+    )
+    def test_a_created_row_without_an_id_or_task_opens_nothing(
+        self, root: Path, runs: RunsDb, task_id: str, data: dict | str
+    ) -> None:
+        runs.emit('escalation_created', at=at(0), task_id=task_id, data=data)
+
+        assert read_open_escalations(root).by_task == {}
+
+    @pytest.mark.parametrize('level', ['2', True, 1.0, None])
+    def test_a_level_that_is_not_an_integer_reads_as_unrecorded(
+        self, root: Path, runs: RunsDb, level: object
+    ) -> None:
+        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1', level=level))
+
+        assert read_open_escalations(root).levels(9) == (None,)
+
+    def test_an_absent_level_reads_as_unrecorded(self, root: Path, runs: RunsDb) -> None:
+        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1'))
+
+        assert read_open_escalations(root).levels(9) == (None,)
+
+    def test_resolving_an_unknown_id_changes_nothing(self, root: Path, runs: RunsDb) -> None:
+        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1', level=1))
+        runs.emit('escalation_resolved', at=at(1), task_id='9', data={'escalation_id': 'esc-9-7'})
+
+        assert read_open_escalations(root).levels(9) == (1,)
+
+    def test_a_task_with_no_escalation_has_no_levels(self, root: Path, runs: RunsDb) -> None:
+        assert read_open_escalations(root).levels(9) == ()
+
+    def test_no_escalation_text_reaches_the_result(self, root: Path, runs: RunsDb) -> None:
+        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1', level=2))
+
+        escalations = read_open_escalations(root)
+
+        assert 'SECRET-' not in repr(escalations)
+        assert '/home/' not in repr(escalations)
+
+    def test_a_missing_store_is_refused(self, root: Path) -> None:
+        with pytest.raises(StoreReadError) as caught:
+            read_open_escalations(root)
+
+        assert (caught.value.source, caught.value.problem) == (Source.EVENTS, StoreProblem.MISSING)
