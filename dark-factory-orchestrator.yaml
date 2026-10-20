@@ -69,6 +69,25 @@ max_concurrent_tasks: 24
 # orchestrator/tests/test_operational_config_binding.py.
 lock_depth: 12
 
+# HUB-FILE LOCK WIDTH (limit 2 on exactly two files; Leo 2026-10-19). A BOUNDED
+# EXPERIMENT, not a standing setting; max_per_module stays 1 everywhere else.
+# Why: workflow.py and harness.py are the two most contended lock keys, and this
+# is the only lever that lets two orchestrator tasks hold one hub file at once.
+# Correctness rests on BRE (acquire-before-edit) + full-workspace merge-verify,
+# as for lock_depth above; the price is paid at rebase/merge time.
+# The experiment, its 14d baseline and the REVERT CLAUSE live in task
+# 7202: a deterministic always_escalates human gate that fires 7 days
+# after the deploy task closes and re-measures. Read it there before changing or
+# keeping this key.
+# Keys are depth-lock_depth paths (4 components, inside lock_depth 12), so they
+# match exactly what ModuleLockTable._limit_for looks up; a deeper key never would.
+# RED TIER: module_overrides is not in RELOADABLE_FIELDS and _limit_for memoises
+# per process, so this takes effect at the next orchestrator restart (the
+# explicit deploy task filed with this carrier), not on reload_config.
+module_overrides:
+  orchestrator/src/orchestrator/workflow.py: 2
+  orchestrator/src/orchestrator/harness.py: 2
+
 # Verification commands (dark-factory multi-subproject layout)
 # test_command fans out per-subproject so each runs in its own venv with its
 # own pyproject.toml (per-test timeout, -n auto, -m 'not integration', …).
