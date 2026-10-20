@@ -282,6 +282,21 @@ def test_an_engagement_projection_parses(delivered_commit: str | None) -> None:
 
 
 @pytest.mark.parametrize(
+    'stage', ['scoping', 'discovery_invoiced', 'defect_window', 'a_stage_this_factory_never_heard_of']
+)
+def test_the_engagement_stage_is_an_open_string(stage: str) -> None:
+    parsed = parse_engagement(json.dumps({**ENGAGEMENT, 'stage': stage}))
+    assert type(parsed.stage) is str
+    assert parsed.stage == stage
+
+
+def test_an_empty_engagement_stage_is_a_violation() -> None:
+    with pytest.raises(ContractViolation) as caught:
+        parse_engagement(json.dumps({**ENGAGEMENT, 'stage': ''}))
+    assert 'stage' in caught.value.detail
+
+
+@pytest.mark.parametrize(
     'text',
     [
         json.dumps({key: value for key, value in ENGAGEMENT.items() if key != 'engagement_version'}),
