@@ -51,7 +51,7 @@ from shared.transcript_archive import (
 )
 
 from orchestrator import digest as digest_mod
-from orchestrator import recovery_pins
+from orchestrator import recovery_pins, recut_ruling
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -174,12 +174,14 @@ from orchestrator.systemd_inspect import (
     inspect_systemd_unit,
 )
 from orchestrator.task_ground_truth import (
+    ON_MAIN_BRANCH_KINDS,
     BranchStateKind,
     ClaimantSource,
     RecoveryAction,
     TaskGroundTruth,
     leave_reason,
     recovery_shape_str,
+    report_blocked_arm_would_move,
     report_pins_blocked_done_flip,
     report_pins_blocked_recovery,
     report_pins_recovery,
@@ -401,6 +403,10 @@ _WATCHER_TIMEOUT_GRACE_SECS: float = 300.0
 # Maximum backoff between unclean watcher exits (seconds).
 _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 
+# Cap-retry bound for one rotation; past it the supervisor's fresh relaunch and
+# crashloop guard own recovery (mirrors steward.py::_MAX_CAP_RETRIES).
+_WATCHER_MAX_CAP_RETRIES: int = 16
+
 # Fixed quiescent gap after a failed background-loop pass (seconds). Shared by
 # the main-tip sweep and no-landings breaker loops. Guarantees neither loop can
 # tight-spin on a pass that fails immediately, even if the configured interval
@@ -581,6 +587,8 @@ _WATCHER_DISALLOWED_TOOLS: list[str] = [
     'Bash(git clean:*)',
     'Bash(git merge:*)',
     'Bash(git rebase:*)',
+    # Unscoped on purpose: removes the tool from the CLI registry, so no skill loads; SKILL.md invokes none.
+    'Skill',
 ]
 
 
@@ -3464,9 +3472,8 @@ class Harness:
         name`` (the new ``.task-meta`` sibling location, W11 beta), falling
         back to the legacy ``entry / '.task' / name`` when the new path is
         absent.  Mirrors ``TaskArtifacts._read_path``'s new-then-old
-        contract and ``GitOps._find_lane_by_plan_task_id``'s plan.json scan,
-        for the ``_recover_crashed_tasks`` reads that don't go through a
-        ``TaskArtifacts`` instance.
+        contract, for the ``_recover_crashed_tasks`` reads that don't go
+        through a ``TaskArtifacts`` instance.
         """
         new_path = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, entry.name) / name
         if new_path.exists():
@@ -6266,18 +6273,22 @@ class Harness:
         # question and share `report_pins_blocked_recovery` /
         # `records_pin_blocked_recovery`.
         #
-        # The two predicates carry the SAME merge-remediable relaxation and
-        # differ on exactly one input class — a dead-filer L0.  Recovery may
-        # proceed past one: its handoff has no consumer left, and conversion or
-        # a re-file is recoverable.  A DONE-FLIP may not: it is terminal, so
-        # completing a task past an unconsumed handoff is the phantom-done D4
-        # had just closed at the dispatch gate, and PRD D3 / spec §6 demand 3
-        # say so directly ("any non-info open record still vetoes MARK_DONE").
-        # The dead L0 is not stranded forever either — part 4 of this task, the
-        # orphan-L0 reaper, promotes it to L1 and gives it an owner.
+        # The two predicates differ on exactly two input classes.  A dead-filer
+        # L0: recovery may proceed past one — its handoff has no consumer left,
+        # and conversion or a re-file is recoverable — but a DONE-FLIP may not.
+        # It is terminal, so completing a task past an unconsumed handoff is the
+        # phantom-done D4 had just closed at the dispatch gate, and PRD D3 /
+        # spec §6 demand 3 say so directly ("any non-info open record still
+        # vetoes MARK_DONE").  The dead L0 is not stranded forever either — part
+        # 4 of this task, the orphan-L0 reaper, promotes it to L1 and gives it
+        # an owner.  And a `preexisting_main_break` pin (task 4645): this clause
+        # ALONE relaxes the wider `recovery_pins.ON_MAIN_REMEDIABLE_ESC_CATEGORIES`,
+        # because it only fires with the branch ON MAIN, where that escalation's
+        # ask (`await_preexisting_main_hotfix`) is already satisfied.  The
+        # off-main clause below keeps the shared set — there the ask is unmet.
         #
-        # The relaxation itself is unchanged and is why this clause exists at
-        # all (PRD leaf δ): a task whose branch landed while it was still
+        # The relaxation itself is why this clause exists at all (PRD leaf δ):
+        # a task whose branch landed while it was still
         # blocked is usually held by the reaper's OWN stranded_blocked — the
         # record that ASKED for this landing — and letting it veto the
         # self-heal pins the task blocked forever after its work is on main.
@@ -6288,9 +6299,7 @@ class Harness:
             and status == 'blocked'
             and report.live_claimant is None
             and not report_pins_blocked_done_flip(report)
-            and report.branch_state.kind in (
-                BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER,
-            )
+            and report.branch_state.kind in ON_MAIN_BRANCH_KINDS
         ):
             action = RecoveryAction.MARK_DONE_WITH_PROVENANCE
 
@@ -6377,8 +6386,13 @@ class Harness:
         # exist to avoid, arrived at by a route no one reviewed.
         #
         # This clause therefore asks the blocked arm's OWN question — "would
-        # those clauses move this row next sweep?" — by calling the SAME
-        # predicate they call (task 3541).  Before eta it asked with
+        # those clauses move this row next sweep?" — through
+        # `report_blocked_arm_would_move`, which composes the SAME two
+        # predicates the clauses call (task 3541) and so follows them when they
+        # diverge: the ON_MAIN clause relaxes `preexisting_main_break` (task
+        # 4645) while the recovery predicate still pins it, and an in-progress
+        # on-main row pinned only by that record is held here rather than
+        # converted and then auto-done next sweep.  Before eta it asked with
         # `_only_merge_remediable`, which WAS that predicate at the time;
         # keeping the old spelling once the arm moved on would let the two
         # drift, which is precisely how this hazard reopens.
@@ -6401,7 +6415,7 @@ class Harness:
         # holds is not in it.
         if (
             action == RecoveryAction.CONVERT_TO_BLOCKED
-            and not report_pins_blocked_recovery(report)
+            and report_blocked_arm_would_move(report)
         ):
             # Says what the clause ACTUALLY asked.  It used to name the records
             # "merge-remediable", which was exact while the question WAS
@@ -9420,6 +9434,103 @@ class Harness:
             task_id,
         )
 
+    async def _run_recut_ruling_gate(self, assignment) -> recut_ruling.RecutGateResult:
+        """Execute or refuse a task's re-cut ruling before dispatch (task 3154).
+
+        Fails closed: an exception is a refusal. A refusal blocks the task and
+        files one design_concern L1.
+        """
+        task_id = assignment.task_id
+        try:
+            result = await recut_ruling.enforce_recut_ruling(
+                assignment.task,
+                ops=self.git_ops,
+                persist=functools.partial(self.scheduler.update_task, task_id),
+                now=datetime.now(UTC),
+            )
+        except Exception as exc:
+            logger.warning(
+                'recut_ruling: gate raised for task %s: %s', task_id, exc, exc_info=True,
+            )
+            result = recut_ruling.RecutGateResult(
+                recut_ruling.GateVerdict.REFUSED, reason=f'the re-cut gate raised: {exc}',
+            )
+        logger.info(
+            'recut_ruling: task %s verdict=%s reason=%r',
+            task_id, result.verdict.value, result.reason,
+        )
+        if result.executed:
+            self._log_recut_executed(task_id, result)
+        elif result.refused:
+            ruling_id = result.ruling.ruling_id if result.ruling else 'unreadable'
+            await self._block_and_file_dispatch_gate_l1(
+                task_id,
+                category='design_concern',
+                summary=f'RECUT_RULING_REFUSED: task {task_id} ruling {ruling_id} cannot be honoured',
+                detail=(
+                    f'{result.reason}\n'
+                    'Remedy: if metadata.recut_ruling is malformed, correct it to '
+                    '{"ruling_id": <str>, "ruled_at": <ISO-8601>}; otherwise resolve the '
+                    'cause above and unblock the task. A re-dispatch is safe: nothing '
+                    'fresh is cut until the execution record is durable.'
+                ),
+            )
+        return result
+
+    @staticmethod
+    def _log_recut_executed(task_id: str, result: recut_ruling.RecutGateResult) -> None:
+        parked = result.parked
+        logger.warning(
+            'RECUT: task %s ruling %s executed — parked %s @ %s; dispatching fresh off main',
+            task_id,
+            result.ruling.ruling_id if result.ruling else '?',
+            parked.parked_branch if parked and parked.parked_branch else 'nothing',
+            parked.parked_tip if parked and parked.parked_tip else '-',
+        )
+
+    async def _block_and_file_dispatch_gate_l1(
+        self, task_id: str, *, category: str, summary: str, detail: str,
+    ) -> None:
+        """Block *task_id* and file one category-scoped L1 for a dispatch gate."""
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+        except Exception:
+            logger.warning(
+                'Dispatch-gate block for task %s — set_task_status raised; '
+                'will still attempt to file escalation',
+                task_id, exc_info=True,
+            )
+        if not self._escalation_queue:
+            logger.warning(
+                'Dispatch-gate block for task %s — no escalation queue, skipping L1 file',
+                task_id,
+            )
+            return
+        if self._escalation_queue.has_open_l1(task_id, category=category):
+            logger.warning(
+                'Dispatch-gate block for task %s — open %s L1 already exists, '
+                'suppressing duplicate',
+                task_id, category,
+            )
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-scheduler',
+            severity='blocking',
+            category=category,
+            summary=summary[:200],
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
+        self._escalation_queue.submit(esc)
+        logger.warning('Filed L1 %s escalation %s for task %s', category, esc.id, task_id)
+
     async def _run_cross_repo_gate(self, assignment) -> bool:
         """Run the dispatch-time cross-repo admission gate (task 3121).
 
@@ -10017,6 +10128,22 @@ class Harness:
             )
             # Drop any preserved-worktree marker once the slot picks the task up.
             self._preserved_worktrees.discard(assignment.task_id)
+
+            # ── Re-cut ruling gate (task 3154) ───────────────────────────────
+            # Runs before the session-resume guard so a pre-ruling plan or
+            # session is never resumed. See orchestrator/recut_ruling.py.
+            if recut_ruling.carries_recut_ruling(assignment.task):
+                recut = await self._run_recut_ruling_gate(assignment)
+                if recut.refused:
+                    arm_requeue_cooldown = True
+                    return TaskReport(
+                        task_id=assignment.task_id,
+                        title=assignment.task.get('title', ''),
+                        outcome=WorkflowOutcome.BLOCKED,
+                        block_reason='recut_ruling_refused',
+                    )
+                if recut.executed:
+                    recovered_plan = recovered_session = recovered_config_dir = None
 
             # ── γ session-resume eligibility guard (task 2774) ────────────────
             # A recovered session is injected as --resume below ONLY when it is
@@ -14413,7 +14540,9 @@ class Harness:
         final message.  The supervisor-side timeout is rotation_hours*3600 +
         _WATCHER_TIMEOUT_GRACE_SECS so that a wedged agent that ignores its
         own rotation instructions is force-killed (classified as unclean, feeds
-        the crashloop guard).
+        the crashloop guard).  An exhausted cap-retry bound raises
+        AllAccountsCappedException, which the supervisor treats as an unclean
+        exit.
         """
 
         cfg = self.config
@@ -14527,6 +14656,10 @@ class Harness:
             project_id=cfg.fused_memory.project_id,
             role='escalation-watcher-auto',
             task_id='',
+            # A stateless triage loop over a queue it re-reads every cycle, so a
+            # capped rotation retries fresh.
+            resume_on_cap_hit=False,
+            max_cap_retries=_WATCHER_MAX_CAP_RETRIES,
             prompt=user_prompt,
             system_prompt=system_prompt,
             cwd=cfg.project_root,

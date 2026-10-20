@@ -38,6 +38,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import logging
 import os
 import shlex
 import time
@@ -84,6 +85,8 @@ from orchestrator.verify_spec_shared import (
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
     from orchestrator.event_store import EventStore
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "UnscopedTypecheckSpec",
@@ -4043,6 +4046,9 @@ _SLOT_FREE = 'FREE'
 _SLOT_BUSY = 'BUSY'
 _SLOT_PARKED = 'PARKED'   # cancel-fail path: held + non-acquirable, pending pgrep probe
 
+# Which writer freed a PARKED slot — carried on the un-PARK log line.
+UnparkSource = Literal['inline_probe', 'reprobe_sweep', 'readmit', 'release', 'unpark']
+
 # Wire vocabulary for the slot constants above (task 3275).  Derived from the
 # constants rather than re-spelled so the two can never drift apart.  Consumers
 # of HostAllocator.host_states() see ONLY these lowercase strings, never the
@@ -4109,9 +4115,13 @@ class HostAllocator:
     BUSY   : slot is held by an in-flight verify
     PARKED : cancel-fail path — held + non-acquirable, pending pgrep probe
 
-    PARKED is distinct from the shared _runner_quarantine set (which is permanent
-    until worker restart).  PARKED is transient — cleared when probe_clean() →
-    True or when max_attempts is exhausted (in which case the slot stays PARKED).
+    PARKED is distinct from the shared quarantine set.  The inline probe in
+    :meth:`cancel_and_release` frees the slot once ``probe_clean()`` reports
+    clean; if that probe gives up, the slot stays PARKED until a later clean
+    probe frees it (:meth:`reprobe_parked_slots`, :meth:`unpark`,
+    :meth:`readmit`) — no restart.  Each PARK is an episode with its own
+    :meth:`park_epoch`, so a PARKED→FREE write that crosses an await frees
+    only the episode it probed.
 
     Shared quarantine
     -----------------
@@ -4140,6 +4150,7 @@ class HostAllocator:
             self._slots[r.name] = _SLOT_FREE
         # Shared quarantine — by-reference so mutations are visible to the caller
         self._quarantine: set[str] = quarantine if quarantine is not None else set()
+        self._park_epoch: dict[str, int] = {}
 
     @property
     def host_names(self) -> list[str]:
@@ -4203,9 +4214,10 @@ class HostAllocator:
 
     async def release(self, lease: HostLease) -> None:
         """Release a held slot back to FREE.  Idempotent."""
-        current = self._slots.get(lease.name)
-        if current in (_SLOT_BUSY, _SLOT_PARKED):
+        if self._slots.get(lease.name) == _SLOT_BUSY:
             self._slots[lease.name] = _SLOT_FREE
+        else:
+            self._unpark(lease.name, expect_epoch=None, source='release')
 
     async def quarantine_and_release(self, lease: HostLease) -> None:
         """Add a remote host to the shared quarantine set and free its slot.
@@ -4235,7 +4247,7 @@ class HostAllocator:
         """
         self._quarantine.discard(name)
 
-    def readmit(self, name: str) -> None:
+    def readmit(self, name: str, *, expect_epoch: int | None = None) -> bool:
         """Fully re-engage host *name* in the pool: un-quarantine AND un-PARK.
 
         This is the auto-reprobe re-engagement primitive (task 1795 recovery,
@@ -4261,12 +4273,25 @@ class HostAllocator:
         ``health()`` AND ``probe_clean()`` — so that freeing the slot cannot
         double-dispatch onto a host still churning on a previous merge.
 
+        *expect_epoch* is the :meth:`park_epoch` the caller read before its
+        probe.  When the slot's park episode has changed since (freed and
+        re-PARKed across the probe's await), the probe vouched for an older
+        episode: nothing is changed and False is returned, so the host stays
+        quarantined and PARKED for the next sweep.
+
         Idempotent: a repeat call on an already-FREE, unquarantined host is a
-        safe no-op.
+        safe no-op.  Returns True when the host was re-admitted.
         """
+        if expect_epoch is not None and self.park_epoch(name) != expect_epoch:
+            logger.info(
+                'HostAllocator: host %r not re-admitted — its park episode changed '
+                'since the probe (expected epoch %d, now %s)',
+                name, expect_epoch, self.park_epoch(name),
+            )
+            return False
+        self._unpark(name, expect_epoch=expect_epoch, source='readmit')
         self._quarantine.discard(name)
-        if self._slots.get(name) == _SLOT_PARKED:
-            self._slots[name] = _SLOT_FREE
+        return True
 
     def is_quarantined(self, name: str) -> bool:
         """Return True if host *name* is currently quarantined.
@@ -4364,6 +4389,58 @@ class HostAllocator:
         """
         return self._slots.get(name) == _SLOT_PARKED
 
+    def park_epoch(self, name: str) -> int | None:
+        """The current park episode of host *name*, or None unless its slot is PARKED."""
+        if self._slots.get(name) != _SLOT_PARKED:
+            return None
+        return self._park_epoch[name]
+
+    def unpark(self, name: str, *, expect_epoch: int | None = None) -> bool:
+        """Free host *name*'s PARKED slot without a restart; never touches the quarantine.
+
+        Caller obligation: probe the host clean first, since PARK means a stale
+        verify may still be running there.  Pass the :meth:`park_epoch` read
+        before that probe as *expect_epoch* so a newer PARK is never freed.
+
+        Returns True only when this call transitioned the slot PARKED→FREE.
+        """
+        return self._unpark(name, expect_epoch=expect_epoch, source='unpark')
+
+    def _park(self, name: str, cancel_rc: int) -> int:
+        """The single PARK writer; returns the slot's park episode.
+
+        A genuine transition opens a new episode and logs the lost capacity.
+        Re-parking an already-PARKED slot (a cancel retry) stays in the current
+        episode, silently, so the log never over-counts.
+        """
+        if self._slots.get(name) != _SLOT_PARKED:
+            self._park_epoch[name] = self._park_epoch.get(name, 0) + 1
+            self._slots[name] = _SLOT_PARKED
+            logger.warning(
+                'HostAllocator: host %r slot PARKED (cancel rc=%s, park epoch %d) — '
+                'verify capacity lost until a probe finds it clean',
+                name, cancel_rc, self._park_epoch[name],
+            )
+        return self._park_epoch[name]
+
+    def _unpark(
+        self, name: str, *, expect_epoch: int | None, source: UnparkSource,
+    ) -> bool:
+        """The single PARKED→FREE writer, refusing when *expect_epoch* is stale."""
+        epoch = self.park_epoch(name)
+        if epoch is None:
+            return False
+        if expect_epoch is not None and expect_epoch != epoch:
+            logger.info(
+                'HostAllocator: host %r stays PARKED — its park episode changed '
+                '(expected epoch %d, now %d)',
+                name, expect_epoch, epoch,
+            )
+            return False
+        self._slots[name] = _SLOT_FREE
+        logger.info('HostAllocator: host %r slot un-PARKED (source=%s)', name, source)
+        return True
+
     def remote_runner(self, name: str) -> Any | None:
         """Return the runner object declared for remote host *name*, else None.
 
@@ -4417,8 +4494,9 @@ class HostAllocator:
             rc != 0  → PARK the slot (held + non-acquirable) and poll
                        lease.runner.probe_clean() until clean or max_attempts
                        exhausted.  Un-park + free the slot when probe returns
-                       True.  Return False on the cancel-fail path regardless
-                       of probe outcome.
+                       True, unless another writer has meanwhile freed or
+                       re-parked it.  Return False on the cancel-fail path
+                       regardless of probe outcome.
 
         Parameters
         ----------
@@ -4440,19 +4518,15 @@ class HostAllocator:
         recovery retry (re-cancel + re-probe). A ``None`` lease is also a
         no-op returning True (defensive guard for already-cleared callers).
 
-        Known limitation (ABA): the guard keys on current slot STATE
-        (FREE/BUSY/PARKED), not on lease identity — ``HostLease`` is a frozen
-        dataclass with no generation/epoch token. If a lease's slot is
-        released (FREE) and then re-acquired (BUSY) by a *different*
-        in-flight verify before a stale ``cancel_and_release(old_lease)``
-        call arrives, the guard sees BUSY, falls through, and would cancel
-        the NEW occupant's verify instead of no-op'ing. This is pre-existing
-        (not introduced by this guard) and out of scope here: callers must
-        never invoke ``cancel_and_release`` with a lease after that lease's
-        slot may have already been released and re-acquired elsewhere.
-        Closing it fully would require tagging ``HostLease`` and the slot map
-        with a monotonically increasing generation counter and refusing to
-        cancel on a generation mismatch.
+        Known limitation (ABA): every PARKED→FREE write that crosses an await
+        is guarded by the park epoch, so the probe loop never frees a slot that
+        another writer freed, re-acquired or re-parked while it was probing.
+        What remains needs lease identity, which ``HostLease`` does not carry:
+        a stale ``cancel_and_release(old_lease)`` or ``release(old_lease)``
+        arriving after the slot was freed and re-acquired BUSY by a *different*
+        verify sees BUSY and acts on the new occupant.  Callers must never
+        present a lease whose slot may already have been released and
+        re-acquired elsewhere.
 
         Note: wired into production by tasks 1757 & 1762.  Called in
         ``stop()`` (shutdown drain of ``_inflight`` in-flight entries), in
@@ -4473,10 +4547,8 @@ class HostAllocator:
         if self._slots.get(lease.name) == _SLOT_FREE:
             # Already released — nothing to cancel. Short-circuit before any
             # RPC so a double-release cannot re-issue cancel_verify() and
-            # PARK a healthy slot. This checks slot STATE only, not lease
-            # identity, so it does not cover the ABA case (slot re-acquired
-            # by a different lease between two calls) — see the docstring's
-            # "Known limitation (ABA)" note.
+            # PARK a healthy slot. This keys on slot state, not lease
+            # identity — see the docstring's "Known limitation (ABA)" note.
             return True
 
         if lease.is_local:
@@ -4488,15 +4560,52 @@ class HostAllocator:
             await self.release(lease)
             return True
 
-        # Cancel failed: PARK the slot and poll until the host is clean
-        self._slots[lease.name] = _SLOT_PARKED
+        # Cancel failed: PARK the slot and poll until the host is clean,
+        # for as long as this park episode is still the current one.
+        episode = self._park(lease.name, rc)
         for attempt in range(max_attempts):
-            clean = await lease.runner.probe_clean()
-            if clean:
-                self._slots[lease.name] = _SLOT_FREE
+            if self.park_epoch(lease.name) != episode:
+                return False
+            if await lease.runner.probe_clean():
+                self._unpark(lease.name, expect_epoch=episode, source='inline_probe')
                 return False
             if attempt < max_attempts - 1:
                 await sleep(1.0)
 
         # max_attempts exhausted — slot remains PARKED (non-acquirable)
         return False
+
+    async def reprobe_parked_slots(
+        self, *, exclude: frozenset[str] = frozenset(),
+    ) -> list[str]:
+        """Free every PARKED remote that now probes clean; return the names freed.
+
+        The recovery for a PARK whose inline probe gave up, whoever parked it.
+        *exclude* names hosts the caller recovers itself (the merge worker's
+        unavailability tracker), so each host keeps one recovery owner.  The
+        park epoch read before each probe guards the await window: an episode
+        freed or re-parked meanwhile is left alone.  Never touches the
+        quarantine.
+        """
+        freed: list[str] = []
+        for name, runner in list(self._remote_runners.items()):
+            epoch = self.park_epoch(name)
+            if epoch is None or name in exclude:
+                continue
+            if await self._reprobe_one_parked(name, runner, epoch):
+                freed.append(name)
+        return freed
+
+    async def _reprobe_one_parked(self, name: str, runner: Any, epoch: int) -> bool:
+        try:
+            clean = await runner.probe_clean()
+        except Exception:
+            logger.warning(
+                'HostAllocator: reprobe of PARKED host %r failed; it stays PARKED',
+                name, exc_info=True,
+            )
+            return False
+        if not clean:
+            logger.debug('HostAllocator: PARKED host %r still not clean', name)
+            return False
+        return self._unpark(name, expect_epoch=epoch, source='reprobe_sweep')

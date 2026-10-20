@@ -479,6 +479,7 @@ class FakeBriefing:
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
+        *, attempt_context=None,
     ) -> str:
         return f'Fix: {failures[:100]}'
 

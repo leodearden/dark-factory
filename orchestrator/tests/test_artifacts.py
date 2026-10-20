@@ -1854,6 +1854,58 @@ class TestMetaRootDerivation:
         )
 
 
+class TestReadLaneTaskId:
+    """`read_lane_task_id` resolves lane -> task off `metadata.json` ONLY, and
+    a missing, undecodable, corrupt or malformed file is a miss, never a raise.
+    """
+
+    @pytest.fixture
+    def meta_root(self, tmp_path: Path) -> Path:
+        root = tmp_path / '.task-meta' / '_lane-0'
+        root.mkdir(parents=True)
+        return root
+
+    def test_returns_task_id_from_metadata_json(self, meta_root: Path):
+        (meta_root / 'metadata.json').write_text(json.dumps({
+            'task_id': '5069',
+            'title': 'T',
+            'created_at': '2026-09-02T00:00:00+00:00',
+        }))
+        assert TaskArtifacts.read_lane_task_id(meta_root) == '5069'
+
+    def test_missing_meta_root_returns_none(self, tmp_path: Path):
+        meta_root = tmp_path / '.task-meta' / '_lane-0'
+        assert not meta_root.exists()
+        assert TaskArtifacts.read_lane_task_id(meta_root) is None
+
+    def test_missing_metadata_json_returns_none(self, meta_root: Path):
+        assert TaskArtifacts.read_lane_task_id(meta_root) is None
+
+    @pytest.mark.parametrize('payload', [
+        b'{not json',
+        b'\xff\xfe{"task_id": "5069"}',
+        b'["a", "b"]',
+        b'{"title": "T"}',
+        b'{"task_id": ""}',
+        b'{"task_id": {"nested": 1}}',
+        b'{"task_id": true}',
+    ], ids=[
+        'corrupt-json', 'non-utf8', 'non-dict', 'no-task-id', 'empty-task-id',
+        'dict-task-id', 'bool-task-id',
+    ])
+    def test_unusable_metadata_returns_none(self, meta_root: Path, payload: bytes):
+        (meta_root / 'metadata.json').write_bytes(payload)
+        assert TaskArtifacts.read_lane_task_id(meta_root) is None
+
+    def test_integer_task_id_is_coerced_to_str(self, meta_root: Path):
+        (meta_root / 'metadata.json').write_text(json.dumps({'task_id': 5069}))
+        assert TaskArtifacts.read_lane_task_id(meta_root) == '5069'
+
+    def test_plan_json_is_not_consulted(self, meta_root: Path):
+        (meta_root / 'plan.json').write_text(json.dumps({'task_id': '5069'}))
+        assert TaskArtifacts.read_lane_task_id(meta_root) is None
+
+
 class TestMetaRootConstructor:
     """`meta_root` is an OPTIONAL 2nd constructor arg. Supplying it activates
     the `.task-meta` relocation; writes must land there and NEVER under the

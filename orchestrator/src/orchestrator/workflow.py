@@ -69,6 +69,7 @@ from shared.transcript_archive import (
 )
 
 from orchestrator import chronic_flake
+from orchestrator.agents.briefing import PriorAttemptCause, VerifyAttemptContext
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.agents.roles import (
@@ -128,6 +129,7 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_reported_landing,
 )
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.recut_ruling import ruling_to_enforce
 from orchestrator.review_inputs import gather_review_subject, review_fork_point
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.routing import (
@@ -581,6 +583,7 @@ class _BriefingLike(Protocol):
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = ...,
         task_id: str | None = ...,
+        *, attempt_context: VerifyAttemptContext | None = ...,
     ) -> str: ...
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = ...,
@@ -2565,6 +2568,9 @@ class TaskWorkflow:
                     else None
                 ),
                 train=cast(TrainMembership, train_meta) if isinstance(train_meta, dict) else None,
+                # Redundant second enforcement of the harness gate's ruling
+                # (orchestrator/recut_ruling.py), from the same dispatch snapshot.
+                recut_ruling=ruling_to_enforce(self.task),
             )
             self.worktree = worktree_info.path
             self._reify_debug_port = worktree_info.reify_debug_port
@@ -3994,6 +4000,12 @@ class TaskWorkflow:
                 merge_phase=True,
             )
             if merge_outcome == WorkflowOutcome.DONE:
+                # Closed without a merge (found on main): nothing to finalise —
+                # same as _recover_before_merge's terminal DONE.
+                if self.machine.is_terminal():
+                    await self._clear_merge_retry_pending()
+                    await self._clear_merge_phase_entered()
+                    return merge_outcome
                 break
             if merge_outcome != WorkflowOutcome.REQUEUED:
                 # BLOCKED / ESCALATED — exit slot. A soft-cancel inside
@@ -5271,12 +5283,11 @@ class TaskWorkflow:
             # work is on the BRANCH, not main — but more decisive than a
             # re-looping blocking_dependency); blocking_dependency may re-loop
             # the architect.
-            if self.artifacts.read_unactionable_task() is not None:
-                return await self._handle_unactionable_task_report()
-            if self.artifacts.read_false_premise() is not None:
-                return await self._handle_false_premise_report()
-            if self.artifacts.read_already_done() is not None:
-                return await self._handle_already_done_report()
+            verdict = await self._route_task_verdict_report()
+            if verdict is not None:
+                return verdict
+            # ready_to_merge / blocking_dependency are branch-scoped, so they
+            # sit outside the task-verdict router.
             if self.artifacts.read_ready_to_merge() is not None:
                 return await self._handle_ready_to_merge_report()
             # Fix B: the architect may have written a blocking_dependency
@@ -5721,12 +5732,11 @@ class TaskWorkflow:
 
         # Architect-style escape hatches — same artifacts so the existing
         # handlers work unchanged.
-        if self.artifacts.read_unactionable_task() is not None:
-            return await self._handle_unactionable_task_report()
-        if self.artifacts.read_false_premise() is not None:
-            return await self._handle_false_premise_report()
-        if self.artifacts.read_already_done() is not None:
-            return await self._handle_already_done_report()
+        verdict = await self._route_task_verdict_report()
+        if verdict is not None:
+            return verdict
+        # ready_to_merge / blocking_dependency are branch-scoped, so they sit
+        # outside the task-verdict router.
         if self.artifacts.read_ready_to_merge() is not None:
             return await self._handle_ready_to_merge_report()
         if self.artifacts.read_blocking_dependency() is not None:
@@ -7037,7 +7047,37 @@ class TaskWorkflow:
         await self.scheduler.set_task_status(self.task_id, 'pending')
         return WorkflowOutcome.REQUEUED
 
-    async def _handle_already_done_report(self) -> WorkflowOutcome:
+    async def _route_task_verdict_report(
+        self, *, merge_phase: bool = False,
+    ) -> WorkflowOutcome | None:
+        """Dispatch the architect's task-verdict exit artifact, if one exists.
+
+        The three verdicts about the TASK itself, in decisiveness order:
+        ``unactionable_task`` and ``false_premise`` (straight to a level-1
+        escalation, bypassing the steward), then ``already_done`` (a clean
+        DONE).  Returns ``None`` when none is present.  The branch-scoped
+        exits (``ready_to_merge``, ``blocking_dependency``) are deliberately
+        not routed here.  *merge_phase* is forwarded to every handler so a
+        refusal parks the row the way the in-slot merge retry expects.
+        """
+        assert self.artifacts is not None
+        if self.artifacts.read_unactionable_task() is not None:
+            return await self._handle_unactionable_task_report(
+                merge_phase=merge_phase,
+            )
+        if self.artifacts.read_false_premise() is not None:
+            return await self._handle_false_premise_report(
+                merge_phase=merge_phase,
+            )
+        if self.artifacts.read_already_done() is not None:
+            return await self._handle_already_done_report(
+                merge_phase=merge_phase,
+            )
+        return None
+
+    async def _handle_already_done_report(
+        self, *, merge_phase: bool = False,
+    ) -> WorkflowOutcome:
         """Process a ``.task/already_done.json`` report from the architect.
 
         Caller has already verified the artifact exists.
@@ -7091,6 +7131,7 @@ class TaskWorkflow:
                 'Architect wrote malformed already_done.json '
                 '(missing commit)',
                 detail=json.dumps(report, indent=2)[:2000],
+                merge_phase=merge_phase,
             )
 
         main_sha = await self.git_ops.get_main_sha()
@@ -7103,6 +7144,7 @@ class TaskWorkflow:
                     f'commit: {commit}\nmain_sha: {main_sha}\n'
                     f'evidence: {evidence}'
                 )[:2000],
+                merge_phase=merge_phase,
             )
 
         metadata = self.task.get('metadata') or {}
@@ -7116,7 +7158,7 @@ class TaskWorkflow:
         )
         if not verdict.accepted or verdict.evidence_sha is None:
             return await self._hold_unattributed_already_done(
-                branch, verdict, commit, evidence,
+                branch, verdict, commit, evidence, merge_phase=merge_phase,
             )
 
         block = await self._delivered_checks_block(
@@ -7133,6 +7175,7 @@ class TaskWorkflow:
                     f'failed_check: {block.failed_check}\n'
                     f'evidence: {evidence}'
                 )[:2000],
+                merge_phase=merge_phase,
             )
 
         logger.info(
@@ -7162,12 +7205,14 @@ class TaskWorkflow:
             return await self._mark_blocked(
                 f'Architect already_done rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
+                merge_phase=merge_phase,
             )
         self._enter_phase(WorkflowState.DONE)
         return WorkflowOutcome.DONE
 
     async def _hold_unattributed_already_done(
         self, branch: str, verdict: LandingVerdict, commit: str, evidence: str,
+        *, merge_phase: bool = False,
     ) -> WorkflowOutcome:
         """Hold an uncorroborated already_done report BLOCKED behind one L1.
 
@@ -7201,6 +7246,7 @@ class TaskWorkflow:
                 f'evidence: {evidence}'
             )[:2000],
             skip_escalation=held,
+            merge_phase=merge_phase,
         )
 
     async def _handle_ready_to_merge_report(self) -> WorkflowOutcome:
@@ -7849,7 +7895,9 @@ class TaskWorkflow:
             self.task_id, esc.id, status,
         )
 
-    async def _handle_unactionable_task_report(self) -> WorkflowOutcome:
+    async def _handle_unactionable_task_report(
+        self, *, merge_phase: bool = False,
+    ) -> WorkflowOutcome:
         """Process a ``.task/unactionable_task.json`` report from the architect.
 
         Caller has already verified the artifact exists.
@@ -7882,15 +7930,19 @@ class TaskWorkflow:
                 '(missing reason)',
                 detail=json.dumps(report, indent=2)[:2000],
                 escalate_to_human=True,
+                merge_phase=merge_phase,
             )
 
         return await self._mark_blocked(
             f'Architect reported task unactionable: {reason}',
             detail=f'reason: {reason}\nevidence: {evidence}'[:2000],
             escalate_to_human=True,
+            merge_phase=merge_phase,
         )
 
-    async def _handle_false_premise_report(self) -> WorkflowOutcome:
+    async def _handle_false_premise_report(
+        self, *, merge_phase: bool = False,
+    ) -> WorkflowOutcome:
         """Process a ``.task/false_premise.json`` report from the architect.
 
         Caller has already verified the artifact exists.
@@ -7925,6 +7977,7 @@ class TaskWorkflow:
                 detail=json.dumps(report, indent=2)[:2000],
                 escalate_to_human=True,
                 category='design_concern',
+                merge_phase=merge_phase,
             )
         else:
             result = await self._mark_blocked(
@@ -7936,6 +7989,7 @@ class TaskWorkflow:
                 )[:2000],
                 escalate_to_human=True,
                 category='design_concern',
+                merge_phase=merge_phase,
             )
         # Clear only after the L1 escalation has been successfully submitted —
         # if _mark_blocked raises, the artifact survives for the next retry.
@@ -10319,6 +10373,7 @@ class TaskWorkflow:
         """Run verification, invoke debugger on failures."""
         assert self.worktree is not None and self.artifacts is not None
         verify_attempt = 0
+        prior_causes: list[PriorAttemptCause] = []
 
         while True:
             # Fix 3: rebase onto main BEFORE each verify (including the first).
@@ -10457,11 +10512,24 @@ class TaskWorkflow:
             # Invoke debugger
             self.plan = self.artifacts.read_plan()
             failure_report = result.failure_report()
+            attempt_context = VerifyAttemptContext(
+                attempt=verify_attempt,
+                max_attempts=self.config.max_verify_attempts,
+                prior_causes=tuple(prior_causes),
+            )
 
-            async def build_prompt(failure_report: str = failure_report) -> str:
+            async def build_prompt(
+                failure_report: str = failure_report,
+                attempt_context: VerifyAttemptContext = attempt_context,
+            ) -> str:
                 return await self.briefing.build_debugger_prompt(
                     failure_report, self._live_plan(), task_id=self.task_id,
+                    attempt_context=attempt_context,
                 )
+
+            prior_causes.append(PriorAttemptCause(
+                category=result.category, cause=result.cause_hint or result.summary,
+            ))
 
             pre_head = await self._get_head_commit()
             debug_result = await self._invoke(DEBUGGER, build_prompt, self.worktree)
@@ -11342,6 +11410,63 @@ class TaskWorkflow:
         # to the gate's re-check below.
         return True
 
+    async def _consume_narrowing_exit_report(
+        self, *, merge_phase: bool,
+    ) -> WorkflowOutcome | None:
+        """Honour the exit report the merge-gate narrowing agent left, if any.
+
+        The narrowing pass runs the architect, which holds every ``report_*``
+        exit tool, so it may answer with an exit artifact instead of a
+        narrowed plan.  The three verdicts on the TASK (``already_done``,
+        ``unactionable_task``, ``false_premise``) are routed to their plan-phase
+        handlers, which carry their own validation, and a ``DONE`` /
+        ``BLOCKED`` outcome ends the submit.  The branch-scoped exits
+        (``ready_to_merge``, ``blocking_dependency``) mean nothing here — the
+        merge is already under way and the gate decides — so they are logged
+        and cleared unread; no report outlives the pass.  ``None`` means the
+        gate carries on.
+
+        ``already_done`` is honoured only when every patch this BRANCH carries
+        is already on main: the handler attributes the reported commit to the
+        task by ANY one declared file, which proves the task's work is on main
+        but not that this branch's own delivery is, and a DONE here would
+        drop the branch unmerged.  Anything short of proven (a ``+`` line from
+        ``git cherry``, or a git error) discards the report and the gate decides.
+        """
+        assert self.artifacts is not None
+        for name, read, clear in (
+            ('ready_to_merge', self.artifacts.read_ready_to_merge,
+             self.artifacts.clear_ready_to_merge),
+            ('blocking_dependency', self.artifacts.read_blocking_dependency,
+             self.artifacts.clear_blocking_dependency),
+        ):
+            discarded = read()
+            if discarded is not None:
+                self._warn_discarded_exit_report(name, discarded)
+                clear()
+        unlanded_claim = self.artifacts.read_already_done()
+        if unlanded_claim is not None and not await self._branch_patches_all_on_main():
+            self._warn_discarded_exit_report('already_done', unlanded_claim)
+            self.artifacts.clear_already_done()
+        return await self._route_task_verdict_report(merge_phase=merge_phase)
+
+    def _warn_discarded_exit_report(self, name: str, report: dict) -> None:
+        logger.warning(
+            'Task %s: merge-gate narrowing pass wrote %s.json, which is not '
+            'an exit at the merge gate — discarding: %s',
+            self.task_id, name, json.dumps(report)[:500],
+        )
+
+    async def _branch_patches_all_on_main(self) -> bool:
+        """True only when ``git cherry`` proves every branch patch is on main."""
+        rc, out, _ = await _run(
+            ['git', 'cherry', self.git_ops.config.main_branch, 'HEAD'],
+            cwd=self.worktree,
+        )
+        return rc == 0 and not any(
+            line.startswith('+') for line in out.splitlines()
+        )
+
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,
         *, merge_phase: bool = False,
@@ -11447,11 +11572,19 @@ class TaskWorkflow:
                     # that was going to escalate anyway, and the architect is
                     # never asked to adjudicate work that is already on main.
                     #
-                    # THE MECHANISM.  After a task's work merges, re-dispatching
+                    # THE MECHANISM.  This is the AUTOMATIC, landing-keyed
+                    # re-cut: after a task's work merges, re-dispatching
                     # it re-cuts task/<id> from post-landing main, which
                     # correctly drops every commit as already-upstream and parks
                     # the ref on one of MAIN'S OWN merge commits at 0 commits
-                    # ahead of its recorded base.  The gate reads that empty
+                    # ahead of its recorded base.  (A second, ruling-keyed
+                    # trigger exists: metadata.recut_ruling, executed by the
+                    # dispatch gate in recut_ruling.py, parks the old branch as
+                    # task/<id>-<stamp> and cuts fresh from current main. That
+                    # branch is 0-ahead only at dispatch, so an empty range at
+                    # merge time means no work was produced, and
+                    # resolve_already_landed_branch still decides from main's
+                    # history, not from emptiness.)  The gate reads that empty
                     # range and emits the exact INVERSE of the truth —
                     # plan_files_not_touched, via _mark_blocked(...,
                     # escalate_to_human=True), whose default
@@ -11551,6 +11684,11 @@ class TaskWorkflow:
                             suggested_action='verify_landing_and_close',
                         )
                     narrowed = await self._try_narrow_plan(check.not_touched)
+                    exit_outcome = await self._consume_narrowing_exit_report(
+                        merge_phase=merge_phase,
+                    )
+                    if exit_outcome is not None:
+                        return exit_outcome
                     if narrowed:
                         # Re-check the (possibly narrowed) plan against the
                         # gate.  ``_task_files`` reads from ``self.plan``,
@@ -12681,6 +12819,7 @@ class TaskWorkflow:
             task_files=self._task_files,
             module_configs=self._module_configs,
             event_store=self.event_store,
+            escalation_queue=self.escalation_queue,
         )
 
     async def _attribute_train_failure(

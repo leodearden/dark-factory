@@ -3176,6 +3176,30 @@ class TestWatcherAllowedTools:
             f'current list: {_WATCHER_DISALLOWED_TOOLS}'
         )
 
+    def test_skill_tool_is_denied(self) -> None:
+        """The bare 'Skill' tool is denied, and never pre-granted.
+
+        On 2026-08-08 a resumed rotation invoked Skill{escalation-watcher}
+        and force-released the L2 watcher lease. The rotation runs under
+        bypassPermissions, where only the deny list blocks a tool, and an
+        allowlist entry is a permission pre-grant.
+        """
+        assert 'Skill' in _WATCHER_DISALLOWED_TOOLS, (
+            "'Skill' must be in _WATCHER_DISALLOWED_TOOLS: on 2026-08-08 a "
+            'resumed rotation invoked Skill{escalation-watcher} and '
+            'force-released the watcher lease, and under bypassPermissions '
+            f'only the deny list blocks; current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+        granted = [
+            t for t in _WATCHER_ALLOWED_TOOLS
+            if t == 'Skill' or t.startswith('Skill(')
+        ]
+        assert granted == [], (
+            f'_WATCHER_ALLOWED_TOOLS pre-grants the Skill tool via {granted}; '
+            'the 2026-08-08 incident (Skill{escalation-watcher} took the '
+            'watcher lease) needs it denied, not granted'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task 3999: the drain protocol in the rotation's system prompt

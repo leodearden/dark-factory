@@ -25,6 +25,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -183,6 +184,7 @@ def _emit_merge_attempt(
     origin_host: Literal['local', 'remote'] | None = None,
     probe_host: Literal['local', 'remote'] | None = None,
     skew_evidence: SkewEvidence | None = None,
+    gate_clearance: GateClearance | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` event for the given outcome.
 
@@ -234,6 +236,12 @@ def _emit_merge_attempt(
     is made self-describing. When omitted or None (every pre-3178 call site), no
     key is added — existing callers' payloads stay byte-identical.
 
+    *gate_clearance* is why a rebased tree cleared
+    :func:`_reverify_rebased_tree` (task 6647), written under
+    ``'gate_clearance'`` on a ``gate_retry`` row.  When omitted (every other
+    call site), no key is added -- existing callers' payloads stay
+    byte-identical.
+
     This helper is deliberately disposition-AGNOSTIC about evidence: it writes
     whatever bundle it is handed, and deciding *when* to emit at all is the
     caller's guard. That is what lets one code path serve both the
@@ -253,6 +261,8 @@ def _emit_merge_attempt(
             data['origin_host'] = origin_host
         if probe_host is not None:
             data['probe_host'] = probe_host
+        if gate_clearance is not None:
+            data['gate_clearance'] = gate_clearance.value
         if skew_evidence is not None:
             for key, items in (
                 ('failing_tests', skew_evidence.failing_tests),
@@ -903,7 +913,10 @@ async def _finalize_advanced_merge(
     from :class:`~orchestrator.git_ops.AdvanceOutcome`.advanced_sha (task
     1997) — callers must pass ``outcome.advanced_sha`` from the
     ``advance_main`` call that preceded this one.  ``None`` (e.g. no rebase
-    occurred) falls back to *merge_commit_fallback*.
+    occurred) falls back to *merge_commit_fallback*.  One caller lands nothing
+    itself: ``worker.py::SpeculativeMergeWorker._finalize_landed_by_successor``
+    passes a verified commit a later landing already carried onto main, so
+    there *advanced_sha* is on main but behind its tip (task 7196).
     """
     cas_retries.pop(req.task_id, None)
     timeouts.pop(req.task_id, None)
@@ -1019,8 +1032,11 @@ async def _finalize_advanced_merge(
     # so consecutive tip-advances count is cleared for this branch.
     if chain_ctx is not None:
         chain_ctx.counts.pop(req.branch.bare_id, None)
-    # Main is now at *advanced_sha* and every post-advance gate passed, so this
-    # tip is one a green gate run has been observed on.  Recorded here — the
+    # *advanced_sha* is on main and every post-advance gate passed, so it is a
+    # commit a green gate run has been observed on.  For every caller but
+    # _finalize_landed_by_successor it is main's tip; that caller's sha sits
+    # behind the tip and can never be a rebase target, so recording it is
+    # inert there.  Recorded here — the
     # single clean-landing return shared by the speculative CAS advance and the
     # train pipeline — so that a LATER request rebased onto it may trust the
     # disjoint-delta fast path (premise P2 in _disjoint_skip_blockers).  A tip
@@ -3302,11 +3318,40 @@ def _disjoint_skip_blockers(
     return blockers
 
 
+class GateClearance(StrEnum):
+    """Why a rebased tree cleared :func:`_reverify_rebased_tree` (task 6647)."""
+
+    same_tree = 'same_tree'
+    """The rebased tree is byte-identical to the tree whose verify passed."""
+    disjoint = 'disjoint'
+    """Footprint-disjoint from trusted drift; see :func:`_disjoint_skip_blockers`."""
+    reverified = 'reverified'
+    """A full re-verify of the rebased tree passed."""
+
+
+async def _same_tree(git_ops: GitOps, a: str, b: str) -> bool:
+    """True only when commits *a* and *b* positively resolve to one git tree.
+
+    An empty sha, a git error or any unexpected output answers False, the
+    fail-CLOSED direction of ``_OVERLAP_GIT_ERROR_SENTINEL``: a false "differs"
+    costs one verify, a false "same" lands an unverified tree.
+    """
+    if not a or not b:
+        return False
+    rc, out, _ = await _run(
+        ['git', 'rev-parse', f'{a}^{{tree}}', f'{b}^{{tree}}'],
+        cwd=git_ops.project_root,
+    )
+    trees = out.split()
+    return rc == 0 and len(trees) == 2 and trees[0] == trees[1]
+
+
 async def _reverify_rebased_tree(
     git_ops: GitOps,
     req: MergeRequest,
     merge_wt: Path,
     *,
+    verified_merge_sha: str,
     rebased_from: str,
     rebased_onto: str,
     timeouts: dict[str, int],
@@ -3316,7 +3361,7 @@ async def _reverify_rebased_tree(
     merge_sha: str = '',
     keep_worktrees: Collection[Path] | None = None,
     run_post_merge_verify: Callable[..., Awaitable[MergeOutcome | None]],
-) -> MergeOutcome | None:
+) -> MergeOutcome | GateClearance:
     """Shared gate for the disjoint-delta re-verify check.
 
     Called by both CAS loops after ``advance_main`` returns
@@ -3326,13 +3371,25 @@ async def _reverify_rebased_tree(
     every member's commits, so the branch-touched set is the train's union
     footprint, not the tip member's own diff.
 
+    Returns the :class:`GateClearance` the caller may advance on, or the
+    ``MergeOutcome`` that ends the attempt.
+
     Algorithm
     ---------
+    0. **Same tree**, only when the project declares
+       ``merge_gate_history_pure``: when *merge_sha*'s tree equals
+       *verified_merge_sha*'s, return ``GateClearance.same_tree`` with no
+       verify.  PRECONDITION: the gate's verdict is a function of the tree
+       alone.  A gate leg that reads git history (ancestry of HEAD, a
+       merge-base) can turn red on the same tree under a new parent, so for
+       such a project the key stays False and the tree is re-verified.  Under
+       the precondition a gate that passed tree T sees exactly T again, and
+       neither premise of :func:`_disjoint_skip_blockers` is consulted.
     1. Call ``_rebase_delta_touched_overlap`` to compute the intersection of
        the branch-touched file set and the intervening main delta.
     2. **Disjoint** (empty intersection): consult
-       :func:`_disjoint_skip_blockers`.  With NO blockers, return ``None`` —
-       the caller can advance immediately and no extra verify call is made.
+       :func:`_disjoint_skip_blockers`.  With NO blockers, return
+       ``GateClearance.disjoint`` — no extra verify call is made.
        With blockers, fall through to the re-verify in step 3 exactly as an
        overlap would, logging which premise of the disjointness inference could
        not be established.  Disjointness alone is NOT sufficient: see that
@@ -3342,7 +3399,7 @@ async def _reverify_rebased_tree(
        ``_run_post_merge_verify``, which runs the full post-merge scoped
        verification against the rebased *merge_wt*.
 
-       * ``None`` return → verification passed; caller may advance.
+       * ``None`` from it → ``GateClearance.reverified``.
        * ``MergeOutcome`` return → verification failed or disk-guard fired;
          *merge_wt* has already been cleaned up by ``_run_post_merge_verify``.
 
@@ -3354,6 +3411,9 @@ async def _reverify_rebased_tree(
         The MergeRequest whose worktree and task_id are inspected.
     merge_wt:
         The merge worktree, currently positioned at the rebased SHA.
+    verified_merge_sha:
+        The commit whose tree the lane already holds verified green: the
+        verified merge commit, or the tip a previous gate cleared.
     rebased_from:
         The original ``expected_main`` SHA (pre-churn main tip).
     rebased_onto:
@@ -3368,6 +3428,14 @@ async def _reverify_rebased_tree(
         The worker's ``_run_post_merge_verify``, which this gate delegates the
         re-verify to when the delta overlaps.
     """
+    history_pure = getattr(req.config, 'merge_gate_history_pure', False) is True
+    if history_pure and await _same_tree(git_ops, verified_merge_sha, merge_sha):
+        logger.info(
+            'Task %s: rebased tree %s is the tree verified at %s — skipping re-verify',
+            req.task_id, merge_sha[:8], verified_merge_sha[:8],
+        )
+        return GateClearance.same_tree
+
     overlap = await _rebase_delta_touched_overlap(
         req.worktree, rebased_from, rebased_onto, git_ops,
         task_id=req.task_id,
@@ -3384,7 +3452,7 @@ async def _reverify_rebased_tree(
                 '— skipping re-verify',
                 req.task_id, rebased_from[:8], rebased_onto[:8],
             )
-            return None
+            return GateClearance.disjoint
         logger.warning(
             'Task %s: rebased tree is disjoint from the intervening delta '
             '(%s..%s) but disjointness is NOT trustworthy here [%s] — '
@@ -3401,7 +3469,7 @@ async def _reverify_rebased_tree(
             req.task_id, rebased_from[:8], rebased_onto[:8],
             len(overlap), ', '.join(overlap[:5]),
         )
-    return await run_post_merge_verify(
+    failure = await run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts=timeouts,
         enospc_retries=enospc_retries,
@@ -3410,6 +3478,7 @@ async def _reverify_rebased_tree(
         merge_sha=merge_sha,
         keep_worktrees=keep_worktrees,
     )
+    return GateClearance.reverified if failure is None else failure
 
 
 async def _check_post_merge_pyright(
