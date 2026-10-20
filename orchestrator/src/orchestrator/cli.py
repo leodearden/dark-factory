@@ -728,9 +728,9 @@ def _run_remote_verify(
         # Always remove the pgid file so cancel-verify knows this run is done.
         if pgf is not None:
             remove_pgid_file(pgf)
-        # Contention must exit 0: a passed=False VerifyResult on stdout is the
-        # only delivery channel to beta — a non-zero exit makes RemoteRunner
-        # treat this as RunnerUnavailable and beta never sees the discriminant.
+        # Any preflight result exits 0: stdout is the only channel to
+        # RemoteRunner, which reads a non-zero exit as RunnerUnavailable and
+        # discards the result.
         click.echo(result_to_json(preflight_result))
         return
 
@@ -786,7 +786,9 @@ def _merge_lane_gate(ctx: _RemoteVerifyContext) -> Iterator['VerifyResult | None
 
     Yields a distinguished contention VerifyResult when a lane actor holds the
     lane (the caller emits it without touching the tree), else None while
-    holding the compat co-lock until exit.
+    holding the compat co-lock until exit.  The contention result is a
+    passed=False verdict that exits 0, so beta receives its discriminant
+    rather than a RunnerUnavailable.
     """
     from orchestrator.verify_runner import make_flock_contention_result
 

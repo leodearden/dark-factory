@@ -35,6 +35,11 @@ The subcommand also records its verify worktree beside the pgid file
 (:func:`write_worktree_path`).  A cancel SIGKILLs the tree and so skips the
 subcommand's own ``finally``; the record is what lets :func:`cancel_request`
 reap that worktree instead (PRD plans/remote-task-leg-verify-prd.md §4.2).
+Only a cancel that swept a real pgid reaps it.  A corrupt pgid file, or a
+watchdog ``os._exit`` that beats that ``finally``, leaves the record and its
+worktree to the age-keyed sweep
+(``merge_lane/worker.py::SpeculativeMergeWorker.reap_orphaned_merge_worktrees``)
+on a host that runs a merge worker.
 
 pgid-file directory
 -------------------

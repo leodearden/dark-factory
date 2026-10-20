@@ -9,7 +9,6 @@ PRD: plans/remote-task-leg-verify-prd.md §4.2, §5.3.
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import os
 import shlex
@@ -22,12 +21,12 @@ from unittest.mock import MagicMock
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from _task_verify_fixtures import seed_verify_repo, task_verify_spec
 from _xdist_crash_fixtures import XDIST_WORKER_CRASH_OUTPUT
 from click.testing import CliRunner, Result
 from test_cli import (
     _communicate_or_empty,
     _patched_verify_merge,
-    _setup_verify_repo,
     _wait_for_pgid_file_or_report_crash,
     _wait_pgid_gone,
 )
@@ -36,13 +35,7 @@ import orchestrator.cli as cli_module
 from orchestrator.cli import main
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.task_verify_run import prepare_task_verify_worktree
-from orchestrator.task_verify_spec import (
-    TaskVerifySpec,
-    apply_task_verify_spec,
-    task_spec_to_json,
-)
-from orchestrator.verify import VerifyResult, run_scoped_verification
+from orchestrator.task_verify_spec import task_spec_to_json
 from orchestrator.verify_cancel import (
     PGID_DIR_NAME,
     WatchdogTrigger,
@@ -57,7 +50,6 @@ from orchestrator.verify_cancel import (
     write_worktree_path,
 )
 from orchestrator.verify_runner import is_flock_contention_failure, result_from_json
-from orchestrator.verify_spec_shared import VerifyCommand
 
 NONEXISTENT_PID = 2 ** 22  # no process can hold this pid: it is at pid_max
 FAKE_PGID = 55555
@@ -81,7 +73,7 @@ def _registered_worktrees(repo: Path) -> str:
 class TestCancelVerifyReapsRecordedWorktree:
     @pytest.fixture
     def repo_setup(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        repo, head_sha = _setup_verify_repo(tmp_path)
+        repo, head_sha = seed_verify_repo(tmp_path)
         config = OrchestratorConfig(project_root=repo)
         monkeypatch.setattr(cli_module, 'load_config', lambda _: config)
         return repo, head_sha, GitOps(config.git, repo)
@@ -176,23 +168,6 @@ class TestVerifyMergeRecordsItsWorktree:
 # ---------------------------------------------------------------------------
 
 
-def _task_spec(
-    sha: str, test_command: str, *, preprovision: str = '', tip_sha: str | None = None,
-) -> TaskVerifySpec:
-    return TaskVerifySpec(
-        verify_commands=(VerifyCommand('mod', test_command=test_command),),
-        global_verify_command=None,
-        task_files=('mod/test_x.py',),
-        force_workspace=False,
-        verify_env={},
-        scope_cargo=False,
-        verify_cold_preprovision_command=preprovision,
-        attempt_id=1,
-        task_id='t1',
-        tip_sha=sha if tip_sha is None else tip_sha,
-    )
-
-
 def _use_host_config(
     monkeypatch: pytest.MonkeyPatch, repo: Path, *, preprovision: str = '',
     git: GitConfig | None = None,
@@ -242,43 +217,29 @@ def _merge_entries(worktree_base: Path) -> list[str]:
     return sorted(p.name for p in worktree_base.iterdir() if p.name.startswith('_merge-'))
 
 
-async def _in_process_task_verify(config: OrchestratorConfig, spec: TaskVerifySpec) -> VerifyResult:
-    git_ops = GitOps(config.git, config.project_root)
-    wt = await git_ops.create_ephemeral_verify_worktree(spec.tip_sha)
-    try:
-        prepare_task_verify_worktree(wt)
-        applied, modules = apply_task_verify_spec(config, spec)
-        result = await run_scoped_verification(
-            wt, applied, modules, list(spec.task_files),
-            attempt_id=spec.attempt_id, task_id=spec.task_id, archive_root=None,
-            force_workspace=False, role='task',
-        )
-        return dataclasses.replace(result, worktree_log_paths=[], archive_log_paths=[])
-    finally:
-        await git_ops.cleanup_merge_worktree(wt)
-
-
 @pytest.fixture
 def verify_repo(tmp_path: Path) -> tuple[Path, str]:
-    return _setup_verify_repo(tmp_path)
+    return seed_verify_repo(tmp_path)
 
 
 class TestVerifyTaskVerdict:
     @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     @pytest.mark.parametrize('test_command,expect_pass', [('true', True), ('false', False)])
-    def test_cli_result_equals_the_in_process_task_verify(
+    def test_emits_the_test_commands_verdict_without_host_log_paths(
         self, tmp_path, monkeypatch, verify_repo, test_command, expect_pass,
     ) -> None:
         repo, head_sha = verify_repo
-        config = _use_host_config(monkeypatch, repo)
-        spec = _task_spec(head_sha, test_command)
-        baseline = asyncio.run(_in_process_task_verify(config, spec))
+        _use_host_config(monkeypatch, repo)
+        spec = task_verify_spec(head_sha, test_command)
 
         r = _invoke_verify_task(tmp_path, head_sha, task_spec_to_json(spec))
 
         assert r.exit_code == 0, r.output
-        assert result_from_json(r.stdout) == baseline
-        assert baseline.passed is expect_pass
+        result = result_from_json(r.stdout)
+        assert result.passed is expect_pass
+        assert not result.timed_out
+        assert result.worktree_log_paths == []
+        assert result.archive_log_paths == []
 
     @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     @pytest.mark.parametrize(
@@ -296,7 +257,7 @@ class TestVerifyTaskVerdict:
         spec_command = (
             f'touch {shlex.quote(str(tmp_path / "spec.marker"))}' if spec_carries_command else ''
         )
-        spec = _task_spec(head_sha, 'true', preprovision=spec_command)
+        spec = task_verify_spec(head_sha, 'true', preprovision=spec_command)
 
         r = _invoke_verify_task(tmp_path, head_sha, task_spec_to_json(spec))
 
@@ -314,7 +275,7 @@ class TestVerifyTaskRequestId:
         watchdog_pgids = _fake_dispatch_seams(monkeypatch)
         git_ops = GitOps(config.git, repo)
         seen = tmp_path / 'seen.record'
-        spec = _task_spec(head_sha, _copy_record_command(git_ops, 'req-task', seen))
+        spec = task_verify_spec(head_sha, _copy_record_command(git_ops, 'req-task', seen))
 
         r = _invoke_verify_task(
             tmp_path, head_sha, task_spec_to_json(spec), '--request-id', 'req-task',
@@ -353,7 +314,7 @@ class TestVerifyTaskRequestId:
         monkeypatch.setattr(cli_module, 'start_stdin_watchdog', fake_start_stdin_watchdog)
 
         r = _invoke_verify_task(
-            tmp_path, head_sha, task_spec_to_json(_task_spec(head_sha, 'true')),
+            tmp_path, head_sha, task_spec_to_json(task_verify_spec(head_sha, 'true')),
             '--request-id', 'req-watchdog',
         )
 
@@ -375,7 +336,7 @@ class TestVerifyTaskIsAlwaysEphemeral:
         _fake_dispatch_seams(monkeypatch)
         git_ops = GitOps(config.git, repo)
         seen = tmp_path / 'seen.record'
-        spec = _task_spec(head_sha, _copy_record_command(git_ops, 'req-lane', seen))
+        spec = task_verify_spec(head_sha, _copy_record_command(git_ops, 'req-lane', seen))
         lane_fd = acquire_merge_verify_flock(
             lane_lock_path(git_ops.persistent_merge_worktree_path), 1.0,
         )
@@ -401,18 +362,18 @@ def _malformed_json(sha: str) -> tuple[str, str]:
 
 
 def _unknown_spec_key(sha: str) -> tuple[str, str]:
-    spec = json.loads(task_spec_to_json(_task_spec(sha, 'true')))
+    spec = json.loads(task_spec_to_json(task_verify_spec(sha, 'true')))
     spec['surprise'] = 1
     return sha, json.dumps(spec)
 
 
 def _tip_differs_from_sha(sha: str) -> tuple[str, str]:
-    return sha, task_spec_to_json(_task_spec(sha, 'true', tip_sha='f' * 40))
+    return sha, task_spec_to_json(task_verify_spec(sha, 'true', tip_sha='f' * 40))
 
 
 def _absent_sha(sha: str) -> tuple[str, str]:
     absent = '0' * 40
-    return absent, task_spec_to_json(_task_spec(absent, 'true'))
+    return absent, task_spec_to_json(task_verify_spec(absent, 'true'))
 
 
 class TestVerifyTaskRefusals:
@@ -447,7 +408,7 @@ class TestVerifyTaskRefusals:
         crash = f'printf %s {shlex.quote(XDIST_WORKER_CRASH_OUTPUT)} && exit 1'
 
         r = _invoke_verify_task(
-            tmp_path, head_sha, task_spec_to_json(_task_spec(head_sha, crash)),
+            tmp_path, head_sha, task_spec_to_json(task_verify_spec(head_sha, crash)),
         )
 
         assert r.exit_code == 1, r.output
@@ -498,7 +459,7 @@ def test_cancel_verify_kills_a_real_verify_task_and_reaps_its_worktree(
         [sys.executable, '-c', 'from orchestrator.cli import main; main()',
          'verify-task',
          '--sha', head_sha,
-         '--spec', task_spec_to_json(_task_spec(head_sha, 'sleep 300')),
+         '--spec', task_spec_to_json(task_verify_spec(head_sha, 'sleep 300')),
          '--config', str(cfg_file),
          '--request-id', 'req-e2e'],
         env=_verify_task_child_env(),

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
-from test_cli import _setup_verify_repo
+from _task_verify_fixtures import seed_verify_repo, task_verify_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
@@ -17,8 +17,6 @@ from orchestrator.task_verify_run import (
     prepare_task_verify_worktree,
     run_task_verify_on_worktree,
 )
-from orchestrator.task_verify_spec import TaskVerifySpec
-from orchestrator.verify_spec_shared import VerifyCommand
 
 
 class TestPrepareTaskVerifyWorktree:
@@ -45,21 +43,10 @@ class TestPrepareTaskVerifyWorktree:
 async def test_run_task_verify_on_a_fresh_worktree_persists_logs_and_strips_paths(
     tmp_path: Path,
 ) -> None:
-    repo, head_sha = _setup_verify_repo(tmp_path)
+    repo, head_sha = seed_verify_repo(tmp_path)
     config = OrchestratorConfig(project_root=repo, verify_cold_preprovision_command='')
     git_ops = GitOps(config.git, repo)
-    spec = TaskVerifySpec(
-        verify_commands=(VerifyCommand('mod', test_command='true'),),
-        global_verify_command=None,
-        task_files=('mod/test_x.py',),
-        force_workspace=False,
-        verify_env={},
-        scope_cargo=False,
-        verify_cold_preprovision_command='',
-        attempt_id=1,
-        task_id='t1',
-        tip_sha=head_sha,
-    )
+    spec = task_verify_spec(head_sha, 'true')
     wt = await git_ops.create_ephemeral_verify_worktree(head_sha)
     try:
         result = await run_task_verify_on_worktree(wt, config, spec)
