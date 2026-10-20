@@ -6,6 +6,7 @@ entry, and clusters the rest of the pending backlog into a ranked, capped
 adjudication queue."""
 from __future__ import annotations
 
+import argparse
 import copy
 import enum
 import math
@@ -509,3 +510,71 @@ def report_lines(record: Mapping[str, Any]) -> list[str]:
         *(_processed_line(item) for item in processed),
         *(_attached_line(item) for item in record["attached"]),
     ]
+
+
+# ---------------------------------------------------------------------------
+# The queue CLI: the stage's signal by hand, spending embeddings only
+# ---------------------------------------------------------------------------
+
+def _cluster_line(queued: QueuedCluster) -> str:
+    return (
+        f"- {queued.representative.key}: {prescreen.quoted_title(queued.representative.title)}, "
+        f"{len(queued.members)} member(s) across {queued.sessions} session(s)"
+    )
+
+
+def queue_lines(view: View, top: int) -> list[str]:
+    """What the queue CLI prints for *view*: its top *top* clusters."""
+    if view.skipped is not None:
+        return [f"similarity stage skipped: {view.skipped}"]
+    settings = view.settings
+    candidates, clusters = view.depth or (0, 0)
+    listed = view.select(top)
+    return [
+        f"model {view.model}; attach at cosine >= {settings.attach_min_similarity}, "
+        f"cluster at >= {settings.cluster_min_similarity}",
+        f"embeddings: {view.requests} request(s), {view.embedded} embedded, {view.cached} cached, "
+        f"{view.pruned} pruned",
+        f"attachable now: {len(view.attaches)} pending candidate(s) near an open entry",
+        f"queue depth: {candidates} pending candidate(s) in {clusters} cluster(s)",
+        f"top {len(listed)} cluster(s):",
+        *(_cluster_line(queued) for queued in listed),
+    ]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="similarity.py",
+        description="The census similarity stage over a project's codebook, read-only.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    queue = commands.add_parser(
+        "queue", help="print the adjudication queue's depth, the attachable count and the top clusters",
+    )
+    queue.add_argument("--project-root", required=True, type=Path)
+    queue.add_argument(
+        "--config", type=Path, default=None, help="default: <project-root>/docs/legibility/legibility.yaml",
+    )
+    queue.add_argument("--top", type=int, default=10, help="how many clusters to list (default 10)")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Embed the codebook's open entries and pending candidates and print the
+    queue; 1 when the stage is skipped. Writes only the vector cache."""
+    args = build_parser().parse_args(argv)
+    root = args.project_root
+    cfg = config.load_config(args.config or root / "docs" / "legibility" / "legibility.yaml")
+    cb = codebook.load(root / "docs" / "legibility" / "confusion-codebook.yaml")
+    view = build_view(
+        cb,
+        (),
+        embedder=embeddings.Embedder(embeddings.openai_embed, embeddings.cache_path(cfg.project_id)),
+        settings=cfg.census.adjudication,
+    )
+    print("\n".join(queue_lines(view, args.top)))
+    return 1 if view.skipped is not None else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
