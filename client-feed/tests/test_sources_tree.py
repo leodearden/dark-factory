@@ -16,7 +16,6 @@ from client_feed.contract import (
     TreeTotals,
 )
 from client_feed.policy import Policy, matches_any
-from client_feed.sources.git import main_head
 from client_feed.sources.tree import LineCounts, VisibleTree, visible_tree
 
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -258,10 +257,9 @@ def test_a_previous_snapshot_off_the_main_line_is_not_trusted(repo: Repo, tmp_pa
     assert _dates(second) == {'src/a.py': T0, 'src/b.py': T0, 'src/c.py': T2}
 
 
-def test_this_checkouts_main_lists_only_the_source_and_test_trees(tmp_path: Path) -> None:
+def test_the_commit_under_test_lists_only_the_source_and_test_trees(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[2]
-    commit = main_head(root)
-    assert commit is not None
+    commit = Repo(root).rev('HEAD^{commit}')
     visible = ('*/src/**', '*/tests/**')
     policy = _policy(root, tmp_path, *visible)
 
