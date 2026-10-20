@@ -7,9 +7,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from client_feed.sources.archive import ArchivedRun, read_archived_run
 
 from client_feed.contract import NOT_RECORDED, VerifyLeg
+from client_feed.sources.archive import ArchivedRun, read_archived_run
 
 TASK_ID = 7
 BASE = datetime(2026, 10, 1, 10, 0, tzinfo=UTC)
