@@ -22,6 +22,7 @@ from enum import StrEnum
 from orchestrator.event_store import EventStore, EventType
 
 MAX_RECORDED_OVERLAP_PATHS = 10
+MAX_LOGGED_OVERLAP_PATHS = 5
 
 
 class GateClearance(StrEnum):
@@ -36,6 +37,8 @@ class GateClearance(StrEnum):
 
 
 class ReverifyGateReason(StrEnum):
+    """How the gate decided one rebased tree; only the skips map to a ``GateClearance``."""
+
     same_tree = 'same_tree'
     """The rebased tree is the verified tree (only under ``merge_gate_history_pure``)."""
     disjoint = 'disjoint'

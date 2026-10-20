@@ -1210,7 +1210,9 @@ takes no arguments: it always re-reads that process's own
   leg of the project's merge gate judges the tree alone, reading no git
   history. Only then does `merge_lane/gates.py::_reverify_rebased_tree` skip
   the re-verify of a rebased tree byte-identical to the tree that just passed
-  (`gate_clearance: same_tree` on the `gate_retry` row). Dark-factory ships it
+  (`gate_clearance: same_tree` on the `gate_retry` row, which records the
+  outcome; the gate's decision itself, skip or fire, is its
+  `merge_reverify_gate` row, `reason: same_tree`). Dark-factory ships it
   `false`: several of its legs read HEAD's history (named in
   `dark-factory-orchestrator.yaml` beside the key). Green-tier for the same
   reason as the bullet above: read per gate evaluation, and it only decides

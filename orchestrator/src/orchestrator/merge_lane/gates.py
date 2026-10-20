@@ -33,6 +33,7 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S, GitOps, _run
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.merge_lane.reverify_gate_decision import (
+    MAX_LOGGED_OVERLAP_PATHS,
     GateClearance,
     ReverifyGateDecision,
     ReverifyGateReason,
@@ -3391,7 +3392,7 @@ def _log_reverify_gate_decision(decision: ReverifyGateDecision) -> None:
         decision.reason,
         decision.merge_sha[:8], decision.verified_merge_sha[:8],
         decision.rebased_from[:8], decision.rebased_onto[:8],
-        len(decision.overlap), ', '.join(decision.overlap[:5]),
+        len(decision.overlap), ', '.join(decision.overlap[:MAX_LOGGED_OVERLAP_PATHS]),
         '; '.join(decision.blockers),
     )
 
