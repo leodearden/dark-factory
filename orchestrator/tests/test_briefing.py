@@ -632,6 +632,17 @@ class TestBuildPlanTighteningPrompt:
         prompt = await _build_tightening_prompt(briefing)
         assert 'claude-task-2656-architect' in prompt
 
+    async def test_offers_the_exits_the_merge_gate_honours_and_forbids_the_rest(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await _build_tightening_prompt(briefing)
+        prescribed, heading, forbidden = prompt.partition(_FORBIDDEN_SECTION_HEADING)
+        assert heading
+        assert 'report_task_already_done' in prescribed
+        for discarded in ('report_ready_to_merge', 'report_blocking_dependency'):
+            assert discarded not in prescribed
+            assert discarded in forbidden
+
 
 @pytest.mark.asyncio
 class TestPlanTighteningPromptToolGrants:
