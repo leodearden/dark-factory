@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from client_feed.contract import (
     FEED_FILENAME,
+    FEED_MAJOR,
     FEED_VERSION,
     STATE_FILENAME,
     CommitSha,
@@ -27,6 +28,8 @@ from client_feed.contract import (
     FeedLine,
     FeedState,
     NonNegativeInt,
+    UnsupportedFeedVersion,
+    feed_major,
     parse_feed_line,
     parse_state,
     split_jsonl,
@@ -88,6 +91,7 @@ class FeedIoProblem(StrEnum):
     SEQ_NOT_INCREASING = 'seq_not_increasing'
     SYMLINK = 'symlink'
     CURSOR_AHEAD = 'cursor_ahead'
+    ROTATION_TARGET_EXISTS = 'rotation_target_exists'
 
 
 class FeedIoError(Exception):
@@ -227,6 +231,62 @@ def _feed_extent(out_dir: Path) -> tuple[int, int]:
         return 0, 0
 
 
+def _first_line(out_dir: Path) -> str | None:
+    """The feed's first complete line, or None when it has none."""
+    buffer = bytearray()
+    try:
+        with _opened(out_dir / FEED_FILENAME, _READ_FLAGS) as fd:
+            while (newline := buffer.find(b'\n')) == -1:
+                chunk = os.read(fd, _SCAN_CHUNK)
+                if not chunk:
+                    return None
+                buffer += chunk
+    except FileNotFoundError:
+        return None
+    return _decoded(bytes(buffer[:newline]), FEED_FILENAME)
+
+
+def _exists(path: Path) -> bool:
+    """Whether anything, a dangling symlink included, is at `path`."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _major_on_disk(out_dir: Path) -> int:
+    text = _first_line(out_dir)
+    if text is None:
+        return FEED_MAJOR
+    try:
+        parse_feed_line(text, line_no=1)
+    except UnsupportedFeedVersion as exc:
+        return feed_major(exc.found)
+    return FEED_MAJOR
+
+
+def _rotate_another_major(out_dir: Path) -> None:
+    """Move a feed of another major aside, dropping its cursor first, so the new feed starts from empty cursors."""
+    major = _major_on_disk(out_dir)
+    if major == FEED_MAJOR:
+        return
+    rotated = f'feed.{major}.jsonl'
+    if _exists(out_dir / rotated):
+        raise FeedIoError(
+            problem=FeedIoProblem.ROTATION_TARGET_EXISTS,
+            name=rotated,
+            detail=f'{FEED_FILENAME} of major {major} cannot be rotated to {rotated}, which exists',
+        )
+    for name in (CURSOR_FILENAME, STATE_FILENAME):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(out_dir / name)
+    os.rename(out_dir / FEED_FILENAME, out_dir / rotated)
+    with _opened(out_dir / rotated, _READ_FLAGS) as fd:
+        os.fchmod(fd, FILE_MODE)
+    _log.info('rotated %s of major %d to %s', FEED_FILENAME, major, rotated)
+
+
 def _is_leftover_temp(entry: str) -> bool:
     return entry.endswith(_TEMP_SUFFIX) and any(
         entry.startswith(_temp_prefix(name)) for name in _REPLACED
@@ -361,6 +421,7 @@ class OutDir:
         """out_dir recovered: every complete line folded, lines past the cursor uncommitted, a torn tail cut last."""
         require_usable_out_dir(out_dir)
         _remove_leftover_temps(out_dir)
+        _rotate_another_major(out_dir)
         size, complete_end = _feed_extent(out_dir)
         cursor = _stored_cursor(out_dir)
         tail = _uncommitted_tail(out_dir, cursor, _cursor_line_start(out_dir, cursor, complete_end))
