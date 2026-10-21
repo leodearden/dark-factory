@@ -9895,7 +9895,7 @@ def create_mcp_server(
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('task_id', task_id):
             return err
-        normalized = _normalize_project_root(project_root)
+        normalized = await asyncio.to_thread(_normalize_project_root, project_root)
         if isinstance(normalized, dict):
             return normalized
         try:
@@ -9937,7 +9937,7 @@ def create_mcp_server(
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('task_id', task_id):
             return err
-        normalized = _normalize_project_root(project_root)
+        normalized = await asyncio.to_thread(_normalize_project_root, project_root)
         if isinstance(normalized, dict):
             return normalized
         try:
@@ -9965,7 +9965,7 @@ def create_mcp_server(
         defect entries could not be read. A ref outside the grammar is a
         ``ValidationError`` naming the known prefixes.
         """
-        normalized = _normalize_project_root(project_root)
+        normalized = await asyncio.to_thread(_normalize_project_root, project_root)
         if isinstance(normalized, dict):
             return normalized
         try:
