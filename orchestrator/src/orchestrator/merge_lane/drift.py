@@ -1,11 +1,12 @@
 """Lever-C drift-check detective (MQ-refactor task γ).
 
-The drift-check runner (dispatches a local + remote pair through
-:class:`~orchestrator.verify_runner.DriftDetector` in a throwaway worktree),
-the remote-runner builder, and the land-hook cadence gate.  The local
-trust-anchor verifies through the worker's injected
-:class:`~orchestrator.merge_lane.ports.VerifyPort`; this module never imports
-the worker.
+The drift-check runner (runs a local and a remote leg concurrently through
+:class:`~orchestrator.verify_runner.DriftDetector`, the local leg in a
+throwaway worktree), the remote-runner builder, and the land-hook cadence
+gate.  A due check that cannot get both host slots defers, and the gate
+re-arms it for the next landing.  The local trust-anchor verifies through the
+worker's injected :class:`~orchestrator.merge_lane.ports.VerifyPort`; this
+module never imports the worker.
 
 Note: despite both being off-serial-lane detective controls spawned from the
 same 'done'-land hook, :func:`_run_drift_check` does NOT call
@@ -329,14 +330,18 @@ async def _run_drift_check(
 
     Mirrors ``_run_cold_shadow_verify`` / ``_run_shadow_compare`` as an
     off-serial-lane detective control (spawned via :func:`_maybe_run_drift_check`).
-    Creates a throwaway verify worktree, builds a 2-host pool (local trust-anchor
-    + eligible remote), runs ``DriftDetector.check_env_safely`` and then ``check``,
-    and propagates any quarantined remote name into *quarantine_set* (the worker-
-    level shared set consulted by ``_run_post_merge_verify``).
+    Creates a throwaway verify worktree for the local leg, waits up to
+    *host_settle_secs* for both host slots, builds a 2-host pool (local
+    trust-anchor + eligible remote), runs ``DriftDetector.check_env_safely`` and
+    then ``check``, and propagates any quarantined remote name into
+    *quarantine_set* (the worker-level shared set consulted by
+    ``_run_post_merge_verify``).
 
-    Exceptions are caught and logged so this detective control never crashes the
-    worker.  ``cleanup_merge_worktree`` and allocator slot releases are always
-    called in the ``finally`` block.
+    Each host slot is released the moment its own leg ends; the ``finally``
+    releases only what is still held, then ``cleanup_merge_worktree``.  If the
+    slots never come free the check DEFERS: it runs no leg, records the
+    deferral in *state_path* and emits ``drift_check_deferred``.  Exceptions
+    are caught and logged so this detective control never crashes the worker.
 
     The verify body runs under ``merge_verify_lease(lane_dir=wt)`` so a
     concurrent periodic worktree reap (task 3018) cannot delete the checkout
@@ -353,12 +358,15 @@ async def _run_drift_check(
         quarantine_set: Worker-level mutable set; quarantined remote names are
             added here so subsequent dispatches skip the diverged remote.
         allocator: Worker-lifetime :class:`~orchestrator.verify_runner.HostAllocator`
-            (β decision 5).  Both host slots are acquired via the allocator and
-            released in the finally block.
+            (β decision 5), from which both host slots are acquired.
         verifier: The worker's :class:`~orchestrator.merge_lane.ports.VerifyPort`;
             the local trust-anchor runs its scoped verify and unscoped type-checks.
         on_unavailable: Where the remote leg's RunnerUnavailable is reported
             (the worker's bench); the check itself stays INCONCLUSIVE.
+        state_path: The persisted :class:`DriftCheckState`, where a deferral is
+            recorded and cleared; None counts nothing.
+        host_settle_secs: How long to wait for both host slots before deferring.
+        host_poll_secs: How often to retry the slots while waiting.
     """
     # wt is initialised before the try so the finally guard (`if wt is not None`)
     # is safe even when create_ephemeral_verify_worktree itself raises.  Moving the
@@ -468,7 +476,7 @@ async def _run_drift_check(
             )
 
             # Cadence is already enforced upstream in _maybe_run_drift_check
-            # (_drift_land_count % every_n gate).  DriftDetector.should_sample is
+            # (DriftCheckState.is_due).  DriftDetector.should_sample is
             # never called on this path, so omitting every_n_lands here keeps a
             # single source of truth and avoids a dead duplicate cadence value.
             detector = DriftDetector(

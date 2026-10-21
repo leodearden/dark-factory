@@ -4291,6 +4291,54 @@
           "current": 31801
         }
       ]
+    },
+    {
+      "task_id": "6648",
+      "reason": "Net-additive: concurrent drift legs with per-leg host-lease release (on_leg_done + held-lease owner, ABA-safe), a bounded settle for the landing's own lease, and a persisted deferral that re-arms the cadence and emits drift_check_deferred instead of a silent DEBUG skip",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/drift.py",
+          "baseline": 22,
+          "current": 37
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/drift.py",
+          "baseline": 443,
+          "current": 612
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_drift.py",
+          "baseline": 12,
+          "current": 13
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/drift.py",
+          "baseline": 246,
+          "current": 274
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4913,
+          "current": 4928
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 58047,
+          "current": 58216
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31801,
+          "current": 31829
+        }
+      ]
     }
   ]
 }
