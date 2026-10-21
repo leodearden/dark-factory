@@ -208,7 +208,7 @@ class _CannedProject:
         self.updates: list[dict] = []
         self._update_reply = update_reply or (lambda args: {'success': True})
 
-    async def call_tool(self, name: str, arguments: dict) -> dict:
+    async def call_tool(self, name: str, arguments: dict, *, timeout: float | None = None) -> dict:
         if name == 'get_tasks':
             return {'tasks': self._tasks}
         if name == 'update_task':
@@ -1015,7 +1015,7 @@ class _UnreadableProject:
         self._reply = reply
         self.updates: list[dict] = []
 
-    async def call_tool(self, name: str, arguments: dict) -> Any:
+    async def call_tool(self, name: str, arguments: dict, *, timeout: float | None = None) -> Any:
         if name != 'get_tasks':
             raise AssertionError(f'unreadable root must not reach {name}')
         if self._raises is not None:

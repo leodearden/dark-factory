@@ -278,9 +278,11 @@ def _clip(value: Any, limit: int = 200) -> str:
 
 
 async def call_tool_with_retry(
-    client: FusedMemoryClient, name: str, arguments: dict,
+    client: FusedMemoryClient, name: str, arguments: dict, *, timeout: float | None = None,
 ) -> dict:
     """Call *name*, retrying only TRANSPORT-level failures. See :data:`CALL_RETRY_ATTEMPTS`.
+
+    *timeout* is passed to every attempt's :meth:`FusedMemoryClient.call_tool`.
 
     A rejection is not an exception here — the server answers, and
     :func:`write_failure_reason` classifies the answer — so the only thing this
@@ -295,7 +297,7 @@ async def call_tool_with_retry(
     """
     for attempt in range(1, CALL_RETRY_ATTEMPTS + 1):
         try:
-            return await client.call_tool(name, arguments)
+            return await client.call_tool(name, arguments, timeout=timeout)
         except httpx.TransportError as exc:
             if attempt >= CALL_RETRY_ATTEMPTS:
                 raise
