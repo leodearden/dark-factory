@@ -39,8 +39,8 @@ function mountTasksTab(t, projects) {
       [servingEndpoint(loader, 'TASKS_SNAPSHOT').stateKey]: { servedAt: PAYLOAD.served_at, receivedAt: Date.now() },
     },
   });
-  const { container } = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
-  return { harness, container, cells: harness.window.DF_DEFERRAL_CELL };
+  const { container, rerender } = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
+  return { harness, container, rerender, cells: harness.window.DF_DEFERRAL_CELL };
 }
 
 function rowsOf(projects, label) {
@@ -116,6 +116,37 @@ test('each project header counts the holds that need a human, as Python counts t
     assert.equal(chip.textContent, cells.deferralNeedsHumanChip(rowsOf(PAYLOAD.projects, label)).text);
     assert.ok(chip.textContent.startsWith(`${expected} `), `${label}: ${chip.textContent} is not ${expected}`);
   }
+});
+
+function showByPrd(window, container, label) {
+  const toggle = [...projectPanel(container, label).querySelectorAll('.proj-head .seg button')]
+    .find(button => button.textContent === 'by PRD');
+  assert.ok(toggle, `${label} offers no "by PRD" toggle`);
+  click(window, toggle);
+  assert.ok(projectPanel(container, label).querySelector('.prd-groups'), `${label} did not switch to the by-PRD view`);
+}
+
+function agedByADay(projects, label, row) {
+  const next = structuredClone(projects);
+  const aged = next[label].rows.value.find(r => r.id === row.id);
+  aged.deferral.age_seconds += 86400;
+  return { next, aged };
+}
+
+test('the by-PRD view draws the hold the latest poll carries, not the first one', t => {
+  const { harness, container, rerender, cells } = mountTasksTab(t, PAYLOAD.projects);
+  const [label] = Object.keys(PAYLOAD.projects);
+  showByPrd(harness.window, container, label);
+  const row = rowsOf(PAYLOAD.projects, label).find(r => r.deferral && r.deferral.age_seconds !== null);
+  assertDrawsHold(graphNode(projectPanel(container, label), row), cells.deferralCellState(row), `${row.id} first poll`);
+
+  const { next, aged } = agedByADay(PAYLOAD.projects, label, row);
+  const cell = cells.deferralCellState(aged);
+  assert.notEqual(cell.age, cells.deferralCellState(row).age, 'the second poll must change what the age reads');
+  seedDashboardData(harness.window, { TASKS_SNAPSHOT: next });
+  rerender(TAB_PROPS);
+
+  assertDrawsHold(graphNode(projectPanel(container, label), aged), cell, `${row.id} second poll`);
 });
 
 test("an older backend's rows render as before: no hold and no chip", t => {

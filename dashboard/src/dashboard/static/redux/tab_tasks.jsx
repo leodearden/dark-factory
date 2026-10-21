@@ -40,7 +40,6 @@ const INVARIANT_CHIP_TONE_T = {
   bad: 'var(--bad)',
 };
 
-// Persisted-state hook (same shape as elsewhere)
 // A deferred row's hold, drawn the same on its graph node and in the detail pane.
 function DeferralHold({ task }) {
   const cell = deferralCellState(task);
@@ -54,6 +53,7 @@ function DeferralHold({ task }) {
   );
 }
 
+// Persisted-state hook (same shape as elsewhere)
 function tasksPersistedState(key, def) {
   const [v, setV] = uS_T(() => {
     try { const r = localStorage.getItem(key); return r != null ? JSON.parse(r) : def; }
@@ -307,23 +307,19 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, rows, terminal, selecte
   // fresh array instances on every TasksTab render — each data poll and each
   // interaction — which would defeat a plain reference-keyed useMemo on every
   // one (same reasoning as the `layoutKey` of TaskGraphEdges and TaskGraph
-  // above). Unlike those, this signature must cover every field
-  // TaskGraph/renderNode displays for a grouped task (not just id/status/
-  // deps), since a stale cache here would freeze those fields' displayed
-  // values across polls — keep it in sync with renderNode if it starts
-  // reading more of a task.
-  const filteredSig = uM_T(() => graphTasks.map(t =>
-    `${t.id}:${t.status}:${t.prd || ''}:${t.title}:${t.started}:${t.completed || ''}:` +
-    `${t.train ? `${t.train.id}/${t.train.order}` : ''}:` +
-    `${'deferral' in t ? JSON.stringify(t.deferral) : ''}:` +
-    `${(t.deps || []).map(d => d.id + (d.done ? '1' : '0')).join(',')}`
-  ).join('|'), [graphTasks]);
+  // above). Bucketing, tiering and the neighborhood read only id, status, prd
+  // and dep ids, so `groupingKey` holds exactly those; a poll that changes only
+  // what a node draws (title, age, hold) reruns none of them. So `groups` is
+  // structure only: each box renders the CURRENT task objects, looked up by id
+  // in `taskById`, never the copies cached in `groups`.
+  const groupingKey = JSON.stringify(graphTasks.map(t => [t.id, t.status, t.prd || null, (t.deps || []).map(d => d.id)]));
   // fullMembersByPrd (below) only feeds summarizePrdMembers, which looks at
   // nothing but id/status/prd — a narrower, cheaper signature.
   const allSig = uM_T(() => allProjectTasks.map(t => `${t.id}:${t.status}:${t.prd || ''}`).join('|'), [allProjectTasks]);
 
-  const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(graphTasks), computeTiers), [filteredSig]);
-  const neighborhood = uM_T(() => computeNeighborhood(graphTasks, selectedId), [filteredSig, selectedId]);
+  const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(graphTasks), computeTiers), [groupingKey]);
+  const neighborhood = uM_T(() => computeNeighborhood(graphTasks, selectedId), [groupingKey, selectedId]);
+  const taskById = new Map(graphTasks.map(t => [t.id, t]));
 
   // The outline/pip aggregate status and the member bar both read from each
   // PRD's FULL member set (every task with that prd,
@@ -349,7 +345,8 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, rows, terminal, selecte
         const key = g.noPrd ? null : g.prd;
         const fullMembers = fullMembersByPrd.get(key) || g.tasks;
         return (
-          <PrdBox key={g.noPrd ? '__no_prd__' : g.prd} group={g} fullMembers={fullMembers} progress={progress}
+          <PrdBox key={g.noPrd ? '__no_prd__' : g.prd} group={g} currentTasks={g.tasks.map(t => taskById.get(t.id))}
+                  fullMembers={fullMembers} progress={progress}
                   selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus} nodeRefs={nodeRefs} />
         );
       })}
@@ -370,7 +367,7 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, rows, terminal, selecte
 // so each box's `collapsed` state is an independent useState — Rules of
 // Hooks requires one consistent hook set per mounted component instance,
 // not a variable-count hook call inside a loop over `groups`.
-function PrdBox({ group: g, fullMembers, progress, selectedId, onSelect, onEnterFocus, nodeRefs }) {
+function PrdBox({ group: g, currentTasks, fullMembers, progress, selectedId, onSelect, onEnterFocus, nodeRefs }) {
   const summary = uM_T(() => summarizePrdMembers(fullMembers), [fullMembers]);
   const agg = aggregatePrdStatus(summary);
 
@@ -439,7 +436,7 @@ function PrdBox({ group: g, fullMembers, progress, selectedId, onSelect, onEnter
       </div>
       {!collapsed && (
         <div className="prd-box-body">
-          <TaskGraph tasks={g.tasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus}
+          <TaskGraph tasks={currentTasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus}
                      nodeRefs={nodeRefs} renderEdges={false} />
         </div>
       )}
