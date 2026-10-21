@@ -1,8 +1,8 @@
-"""Host-side cancellation contract for ``orchestrator verify-merge``.
+"""Host-side cancellation contract for ``orchestrator verify-merge`` and ``verify-task``.
 
 Overview
 --------
-When ``orchestrator verify-merge --request-id X`` starts, it:
+When ``orchestrator verify-merge --request-id X`` (or ``verify-task``) starts, it:
 
 1. Calls :func:`start_own_process_group` to join a new session/process group
    (``os.setsid``), isolating itself from the SSH session that launched it.
@@ -30,6 +30,16 @@ fixes this:
 
 :func:`cancel_request` is its pgid-file caller: it roots the walk, and aims
 the backstop, at the recorded pgid.
+
+The subcommand also records its verify worktree beside the pgid file
+(:func:`write_worktree_path`).  A cancel SIGKILLs the tree and so skips the
+subcommand's own ``finally``; the record is what lets :func:`cancel_request`
+reap that worktree instead (PRD plans/remote-task-leg-verify-prd.md §4.2).
+Only a cancel that swept a real pgid reaps it.  A corrupt pgid file, or a
+watchdog ``os._exit`` that beats that ``finally``, leaves the record and its
+worktree to the age-keyed sweep
+(``merge_lane/worker.py::SpeculativeMergeWorker.reap_orphaned_merge_worktrees``)
+on a host that runs a merge worker.
 
 pgid-file directory
 -------------------
@@ -83,6 +93,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from shared.proc_group import read_stat_fields
+from shared.safe_io import atomic_write_text
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -129,25 +140,39 @@ def pgid_file(worktree_base: Path, request_id: str) -> Path:
 
 
 def write_pgid_file(path: Path, pgid: int) -> None:
-    """Atomically write *pgid* to *path*, creating parent directories first.
-
-    Uses a sibling tmp file + ``os.replace`` for atomicity so a concurrent
-    reader never sees a partial write.  The temp name is derived additively
-    (``path.name + '.tmp'``) rather than with ``path.with_suffix('.tmp')``:
-    ``with_suffix`` replaces from the *last* dot, so request-ids containing
-    dots (e.g. ``'1.2.3'``) would produce colliding tmp names (``'1.tmp'``)
-    and defeat the atomicity guarantee for concurrent runs.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / (path.name + '.tmp')
-    tmp.write_text(str(pgid))
-    os.replace(tmp, path)
+    """Atomically write *pgid* to *path*, creating parent directories first."""
+    atomic_write_text(path, str(pgid), mkdir=True)
 
 
 def remove_pgid_file(path: Path) -> None:
     """Remove *path* if it exists; silently a no-op when absent (idempotent)."""
     with contextlib.suppress(FileNotFoundError):
         path.unlink()
+
+
+def worktree_path_file(pgid_path: Path) -> Path:
+    """Return the worktree record kept beside the pgid file at *pgid_path*."""
+    return pgid_path.parent / (pgid_path.name + '.worktree')
+
+
+def write_worktree_path(pgid_path: Path, worktree: Path) -> None:
+    """Atomically record *worktree* as the verify worktree of *pgid_path*'s run."""
+    atomic_write_text(worktree_path_file(pgid_path), str(worktree), mkdir=True)
+
+
+def read_worktree_path(pgid_path: Path) -> Path | None:
+    """Return the recorded worktree, or None when the record is absent or empty."""
+    try:
+        raw = worktree_path_file(pgid_path).read_text().strip()
+    except FileNotFoundError:
+        return None
+    return Path(raw) if raw else None
+
+
+def remove_worktree_path(pgid_path: Path) -> None:
+    """Remove the worktree record; a no-op when absent (idempotent)."""
+    with contextlib.suppress(FileNotFoundError):
+        worktree_path_file(pgid_path).unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +318,9 @@ def cancel_request(
     killpg=os.killpg,
     failed_pids_out: list | None = None,
     killed_pgid_out: list[int] | None = None,
+    remove_worktree: Callable[[Path], None] | None = None,
 ) -> int:
-    """Cancel the verify-merge identified by the pgid file at *path*.
+    """Cancel the verify-merge or verify-task identified by the pgid file at *path*.
 
     Algorithm
     ---------
@@ -313,8 +339,8 @@ def cancel_request(
 
     3. If any live process could not be killed → return 1 and **retain** the
        pgid file (lets a retry or β's quarantine probe act on it).
-       Otherwise remove the file, report *pgid* on *killed_pgid_out*, and
-       return 0.
+       Otherwise remove the file, reap the recorded worktree (below), report
+       *pgid* on *killed_pgid_out*, and return 0.
 
     Parameters
     ----------
@@ -330,11 +356,17 @@ def cancel_request(
         return-0 paths (step 1) nor on the ``PermissionError`` return-1 path.
         Same out-param idiom as *failed_pids_out*: pass ``[]`` and inspect it
         after the call.
+    remove_worktree:
+        Called with the worktree the killed run recorded
+        (:func:`write_worktree_path`), then the record is removed — ONLY on
+        the swept-and-returned-0 path, after the pgid file is gone.  ``None``
+        retains the record.  Injected because this module cannot import
+        ``git_ops`` (which imports it).
 
     Return value
     ------------
-    * ``0`` — nothing to cancel, OR all processes killed (or already gone) and
-      the file removed.
+    * ``0`` — nothing to cancel, OR all processes killed (or already gone),
+      the file removed and any recorded worktree handed to *remove_worktree*.
     * ``1`` — at least one live process raised ``PermissionError``; file kept.
 
     **``0`` does NOT mean something was killed.**  Three of the four return-0
@@ -440,11 +472,24 @@ def cancel_request(
         # caller was about to declare free.
         return 1
     remove_pgid_file(path)
+    _reap_recorded_worktree(path, remove_worktree)
     # The ONLY path that both swept a real pgid and returned 0 — see the
     # docstring's "0 does NOT mean something was killed" note.
     if killed_pgid_out is not None:
         killed_pgid_out.append(pgid)
     return 0
+
+
+def _reap_recorded_worktree(
+    pgid_path: Path, remove_worktree: Callable[[Path], None] | None,
+) -> None:
+    """Hand the killed run's recorded worktree to *remove_worktree*, then drop the record."""
+    if remove_worktree is None:
+        return
+    worktree = read_worktree_path(pgid_path)
+    if worktree is not None:
+        remove_worktree(worktree)
+    remove_worktree_path(pgid_path)
 
 
 # ---------------------------------------------------------------------------

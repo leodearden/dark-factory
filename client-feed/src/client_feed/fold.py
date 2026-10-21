@@ -12,7 +12,9 @@ from client_feed.contract import (
     EVENT_MODELS,
     FEED_VERSION,
     BranchSnapshot,
+    CriteriaDeclared,
     CriteriaResults,
+    Criterion,
     Degradation,
     EventHeader,
     FactoryState,
@@ -86,6 +88,7 @@ class _Accumulator:
     in_flight: dict[int, InFlightTask]
     revealed: dict[str, RevealedFile]
     criteria: dict[RunKind, CriteriaResults]
+    criteria_declared: dict[str, Criterion]
     recent: OrderedDict[_RecentKey, FeedEvent]
 
     @classmethod
@@ -105,6 +108,7 @@ class _Accumulator:
             in_flight={task.task_id: task for task in start.in_flight},
             revealed={file.path: file for file in start.revealed},
             criteria=dict(start.criteria),
+            criteria_declared=dict(start.criteria_declared),
             recent=OrderedDict((_recent_key(event), event) for event in start.recent),
         )
 
@@ -125,6 +129,7 @@ class _Accumulator:
             tree=self.tree,
             revealed=tuple(file for _, file in sorted(self.revealed.items())),
             criteria=dict(sorted(self.criteria.items())),
+            criteria_declared=dict(sorted(self.criteria_declared.items())),
             recent=tuple(self.recent.values()),
         )
 
@@ -146,6 +151,7 @@ def _empty_state(project_id: str) -> FeedState:
         tree=None,
         revealed=(),
         criteria={},
+        criteria_declared={},
         recent=(),
     )
 
@@ -203,6 +209,10 @@ def _apply_criteria_results(acc: _Accumulator, event: CriteriaResults) -> None:
     acc.criteria[event.run_kind] = event
 
 
+def _apply_criteria_declared(acc: _Accumulator, event: CriteriaDeclared) -> None:
+    acc.criteria_declared = {criterion.id: criterion for criterion in event.criteria}
+
+
 def _no_state_change(acc: _Accumulator, event: FeedEvent) -> None:
     pass
 
@@ -252,6 +262,7 @@ _HANDLING: Final = _covering_every_event_model([
     _handled(FileRevealed, _apply_file_revealed, in_timeline=True),
     _handled(RevealRefused, _no_state_change, in_timeline=True),
     _handled(CriteriaResults, _apply_criteria_results, in_timeline=True),
+    _handled(CriteriaDeclared, _apply_criteria_declared, in_timeline=False),
 ])
 
 

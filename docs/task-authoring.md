@@ -782,8 +782,10 @@ unblock the task.
 Set `metadata.complexity = "simple"` to route a task to the single-agent
 SIMPLE_TASK fast path (one Sonnet agent explores, plans, edits, and
 commits; the architect+implementer pair is skipped, but verify/review/merge
-still run). The only meaningful value is `"simple"` — absent or any other
-value routes to the full architect path.
+still run). The only meaningful value is `"simple"`, matched
+case-insensitively and whitespace-stripped as the router matches it (so
+`" Simple "` counts) — absent or any other value routes to the full
+architect path.
 
 **When to declare `"simple"`:** the change is a single coherent edit — docs
 or comments, a rename, a localized behaviour-preserving refactor, a
@@ -793,6 +795,14 @@ task may be high-priority and may touch several files/modules, as long as
 the *change* is mechanically simple. **When unsure, omit it** — the full
 path is the safe default, and a mis-declared task simply falls back to the
 architect.
+
+**Declared files are mandatory:** a `simple` declaration must carry a
+non-empty `metadata.files` of FILE paths. Otherwise `submit_task` rejects it
+on both creation paths with `error_type: "SimpleTaskFilesRequired"` (guard
+`simple_task_files_error`, `required_key: "files"`). `files: []` does not
+satisfy it: it defers scope to the architect, and no architect runs. The fix
+is to name the files or drop `complexity`. The match is case-insensitive,
+like the router's. `update_task` is not gated.
 
 **Hard-blocker veto:** if the task description contains a hard-blocker
 token (`migration`, `architecture`, `integration test`, `design ... new`,
@@ -1362,7 +1372,8 @@ related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
 execution_class, merge_lane, pending_since, pending_since_backfilled,
-claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at
+claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at,
+main_health_signature
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 

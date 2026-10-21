@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from typing import get_args
 
 import pytest
@@ -37,6 +38,7 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
     register_metadata_submodel,
+    script_root_kind_conflict,
     validate_model_overrides,
 )
 
@@ -168,6 +170,51 @@ class TestBeforeDone:
     def test_kind_bogus_rejected(self):
         with pytest.raises(ValidationError):
             BeforeDone(script='scripts/x.sh', timeout_secs=60, kind='bogus')  # type: ignore[arg-type]
+
+    def test_script_root_defaults_to_project(self):
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60)
+        assert bd.script_root == 'project'
+
+    def test_factory_script_root_accepted_on_predicate(self):
+        bd = BeforeDone(
+            script='scripts/x.sh', timeout_secs=60, kind='predicate', script_root='factory',
+        )
+        assert bd.script_root == 'factory'
+
+    @pytest.mark.parametrize('kind_fields', [{'kind': 'deploy'}, {}], ids=['explicit', 'default'])
+    def test_factory_script_root_rejected_on_deploy(self, kind_fields):
+        with pytest.raises(ValidationError) as excinfo:
+            BeforeDone(script='scripts/x.sh', timeout_secs=60, script_root='factory', **kind_fields)
+        assert 'script_root' in str(excinfo.value)
+        assert 'predicate' in str(excinfo.value)
+
+    @pytest.mark.parametrize('kind', ['deploy', 'predicate'])
+    def test_project_script_root_accepted_on_both_kinds(self, kind):
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60, kind=kind, script_root='project')
+        assert bd.script_root == 'project'
+
+    def test_script_root_bogus_rejected(self):
+        with pytest.raises(ValidationError):
+            BeforeDone.model_validate(
+                {'script': 'scripts/x.sh', 'timeout_secs': 60, 'script_root': 'elsewhere'},
+            )
+
+    @pytest.mark.parametrize(
+        ('script_root', 'kind', 'refused'),
+        [
+            ('project', 'deploy', False),
+            ('project', 'predicate', False),
+            ('factory', 'predicate', False),
+            ('factory', 'deploy', True),
+        ],
+    )
+    def test_script_root_kind_conflict_matches_the_model(self, script_root, kind, refused):
+        conflict = script_root_kind_conflict(script_root, kind)
+
+        assert (conflict is not None) == refused
+        if conflict is not None:
+            with pytest.raises(ValidationError, match=re.escape(conflict)):
+                BeforeDone(script='scripts/x.sh', timeout_secs=60, kind=kind, script_root=script_root)
 
 
 class TestDoneProvenance:

@@ -732,6 +732,24 @@ write_triage:
   # 88.5% @50); the retired guard's limit=5 is the number this deliberately is
   # not. Counted as a TOTAL across the three Mem0-primary categories.
   candidate_k: 20
+  # ATTACH-GUARD KNOBS (task 7158) — hand-set operator knobs, green-tier; null
+  # switches a rule off. Evidence: the 2026-10-11..19 soak,
+  # data/write-triage-soak-2026-10-19/correctness-analysis-2026-10-19.md §1
+  # F2/F5 and team/A/fix_replay_out.md (gitignored, main checkout only). Both
+  # are in-sample and in the text-embedding-3-small cosine scale — re-derive
+  # them at the embedder cutover (task 6807, η).
+  #
+  # min_parent_cosine: never attach, in any band, to a target (the parent,
+  # after a hoist) whose cosine to the write is below this; store standalone.
+  # On replay the 0.60 floor removed 28 contested misfiles for 2 correct
+  # contests.
+  min_parent_cosine: 0.60
+  # hoist_max_cosine_gap: in the judge band, refuse to hoist from the matched
+  # child to its parent when the parent's cosine is more than this below the
+  # child's; store standalone. On replay the 0.05 gap removed 32 contested
+  # misfiles for 1 correct contest; with F1 (task 6956) contested misfile fell
+  # 0.32 -> 0.24.
+  hoist_max_cosine_gap: 0.05
   # JUDGE KNOBS (leaf gamma, task 3128) — also hand-set operator knobs, and
   # deliberately ABOVE the calibration fence below so --write-config preserves
   # them. Every judge knob is green-tier hot-reloadable and read live per

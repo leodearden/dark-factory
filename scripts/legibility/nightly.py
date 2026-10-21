@@ -1039,6 +1039,7 @@ def _record_trickle_progress(
     target_date: date,
     result: NightlyResult,
     *,
+    census: trickle_state.CensusObservation | None,
     recorder=None,
     retry_recorder=None,
     poster=None,
@@ -1053,6 +1054,8 @@ def _record_trickle_progress(
     and failed streaks that :mod:`check_trickle_progress` reads. This is
     the write half of the pair; ``check_trickle_liveness.sh`` still
     answers the separate "did the unit run" question and is untouched.
+    The night's census-trigger facts ride along as *census*; ``None`` means
+    the trigger was not evaluated.
 
     CLASSIFICATION READS ``exit_code`` FIRST (task 4514). A non-zero exit
     classifies ``failed`` whatever the sampler counters say, because the
@@ -1096,8 +1099,8 @@ def _record_trickle_progress(
     recorded_at = now if now is not None else datetime.now(UTC)
     doc = _record_run_state(
         cfg.project_id, sample, target_date, result,
-        recorder=recorder, retry_recorder=retry_recorder, now=recorded_at,
-        pass_kind=pass_kind,
+        census=census, recorder=recorder, retry_recorder=retry_recorder,
+        now=recorded_at, pass_kind=pass_kind,
     )
     if pass_kind is PassKind.RETRY:
         return
@@ -1114,6 +1117,7 @@ def _record_run_state(
     target_date: date,
     result: NightlyResult,
     *,
+    census: trickle_state.CensusObservation | None,
     recorder,
     retry_recorder,
     now: datetime | None,
@@ -1163,6 +1167,7 @@ def _record_run_state(
             budget_suppressed=result.budget_suppressed,
             capped=result.capped,
             scheduled=pass_kind is PassKind.SCHEDULED,
+            census=census,
         )
     except Exception as exc:  # noqa: BLE001 — deliberately total
         logger.warning(
@@ -1397,8 +1402,8 @@ def _load_config_for_project(
     except Exception:
         _record_run_state(
             project_id, _nothing_sampled(), target_date, NightlyResult(exit_code=1),
-            recorder=recorder, retry_recorder=retry_recorder, now=now,
-            pass_kind=pass_kind,
+            census=None, recorder=recorder, retry_recorder=retry_recorder,
+            now=now, pass_kind=pass_kind,
         )
         raise
 
@@ -1421,6 +1426,14 @@ def _nothing_sampled() -> sampling.SampleResult:
     return sampling.SampleResult(
         selected=[], per_stratum_counts={}, zero_signal_dropped=0, bytes_used=0,
     )
+
+
+def _census_anchor(state_path: Path) -> str | None:
+    """census-state's raw ``last_census_at``, or ``None`` when it has none
+    or cannot be read. Never raises, and never logs: the trigger's own read
+    of the same file owns the malformed WARNING."""
+    _status, anchor = trickle_state.read_last_census_at(state_path)
+    return anchor if isinstance(anchor, str) else None
 
 
 def _run_configured_nightly(
@@ -1461,6 +1474,7 @@ def _run_configured_nightly(
         exit_code=1,
         reason='legibility trickle run crashed before completing',
     )
+    census_observation: trickle_state.CensusObservation | None = None
     runner = None
     try:
         if projects_root is None:
@@ -1744,6 +1758,10 @@ def _run_configured_nightly(
             if ledger.error is not None else None
         )
 
+        # Read BEFORE the synchronous launch: trickle_state.CensusObservation.
+        census_state = census_trigger.census_state_path(cfg.project_root)
+        census_anchor = _census_anchor(census_state)
+
         # Task 4148. The decision was computed and returned on NightlyResult
         # below, but never LOGGED -- so only the census's failure modes
         # (census_trigger's own WARNINGs, FIRE-WITHOUT-LAUNCH, 4085's
@@ -1773,6 +1791,11 @@ def _run_configured_nightly(
             census_line, census_fire = evaluate_census_step(
                 cfg, now=now, status_fetcher=status_fetcher,
                 config_path=resolved_config_path,
+            )
+            census_observation = trickle_state.CensusObservation(
+                fired=census_fire,
+                last_census_at=census_anchor,
+                census_state_path=str(census_state),
             )
 
         result = NightlyResult(
@@ -1804,7 +1827,7 @@ def _run_configured_nightly(
                 runner.close()
         finally:
             _record_trickle_progress(
-                cfg, sample, target_date, result,
+                cfg, sample, target_date, result, census=census_observation,
                 recorder=recorder, retry_recorder=retry_recorder,
                 poster=poster, now=now, pass_kind=pass_kind,
             )

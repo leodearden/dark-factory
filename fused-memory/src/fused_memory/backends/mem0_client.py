@@ -1,5 +1,6 @@
 """Per-project Mem0 AsyncMemory instance manager."""
 
+import asyncio
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Sequence
 from contextlib import aclosing
@@ -1599,6 +1600,42 @@ class Mem0Backend:
             'get_points_by_ids',
         )
         return {str(record.id): dict(record.payload or {}) for record in records}
+
+    async def cosine_to_points(
+        self, query: str, memory_ids: Sequence[str], scope: Scope,
+    ) -> dict[str, float]:
+        """The cosine of *query* to each listed point: ``{id: cosine}``, absent ids omitted.
+
+        On the same scale as :meth:`search`'s scores (``store_score``): the
+        query is embedded by the project's own mem0 embedder exactly as mem0
+        search embeds it, and scored by the same Qdrant cosine.  No ids is no
+        embedding; an unprovisioned collection reads as no scores.
+        """
+        from qdrant_client.http import models as qmodels
+
+        if not memory_ids:
+            return {}
+        instance = await self._get_instance(scope)
+        vector = await self._timed_read(
+            asyncio.to_thread(instance.embedding_model.embed, query, 'search'),
+            'cosine_to_points',
+        )
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        response = await self._timed_collection_read(
+            client.query_points(
+                collection_name=collection_name,
+                query=vector,
+                query_filter=qmodels.Filter(must=[qmodels.HasIdCondition(has_id=list(memory_ids))]),
+                limit=len(memory_ids),
+                with_payload=False,
+                with_vectors=False,
+            ),
+            'cosine_to_points',
+            collection_name,
+            if_absent=qmodels.QueryResponse(points=[]),
+        )
+        return {str(point.id): float(point.score) for point in response.points}
 
     async def close(self) -> None:
         """Close all cached AsyncMemory instances and release their connections."""

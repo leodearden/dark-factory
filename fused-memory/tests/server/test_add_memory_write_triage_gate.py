@@ -30,6 +30,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.reconciliation.prompts import (
     FLAG_FOR_STAGE2_MARKER_KIND,
@@ -774,6 +775,10 @@ class TestTheForceStoreArms:
         The union is the honest quantity — ATTACH_OWNED_KEYS must cover every
         key ANY attach can overwrite, not merely the keys the commonest one
         does.
+
+        TRIAGE_CONTESTED_METADATA_KEY is the one key the attach writes that no
+        caller can own: it is defended by being discarded from caller input
+        (`TestOnlyTriageWritesTheTriageContestMarker`), not by the force-store.
         """
         written_by_attach: set[str] = set()
         for outcome in (OUTCOME_RESTATED, OUTCOME_AMENDED, OUTCOME_CONTESTED):
@@ -793,10 +798,15 @@ class TestTheForceStoreArms:
             persisted = mock_service.add_memory.await_args.kwargs['metadata']
             written_by_attach |= set(persisted) - {'source'}
 
-        assert written_by_attach == set(ATTACH_OWNED_KEYS), (
+        assert written_by_attach == set(ATTACH_OWNED_KEYS) | {TRIAGE_CONTESTED_METADATA_KEY}, (
             f'the attach writes {written_by_attach!r} but the force-store defends '
-            f'{set(ATTACH_OWNED_KEYS)!r}; a key in the first set and not the second '
-            f'is silently destroyed when a caller supplies it'
+            f'{set(ATTACH_OWNED_KEYS)!r} plus the discarded triage-contest marker; '
+            f'a key in the first set and not the second is silently destroyed when '
+            f'a caller supplies it'
+        )
+        assert TRIAGE_CONTESTED_METADATA_KEY not in ATTACH_OWNED_KEYS, (
+            'the marker is never caller-owned; force-storing on it would skip '
+            'triage for a key that is then discarded'
         )
 
 
@@ -1805,6 +1815,19 @@ class TestAContestedVerdictLandsAsAFlaggedAmendmentChild:
         assert metadata[CONTESTED_METADATA_KEY] is True, f'{metadata!r}'
 
     @pytest.mark.asyncio
+    async def test_the_contest_is_stamped_as_written_by_triage(
+        self, monkeypatch,
+    ) -> None:
+        """Link-heal's H1 row 2 tells a judge's contest from an agent's by this key."""
+        mock_service, server = self._server(monkeypatch)
+
+        await _call(server)
+
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert metadata[CONTESTED_METADATA_KEY] is True, f'{metadata!r}'
+        assert metadata[TRIAGE_CONTESTED_METADATA_KEY] is True, f'{metadata!r}'
+
+    @pytest.mark.asyncio
     async def test_the_contested_path_is_not_a_fail_open(
         self, monkeypatch, caplog,
     ) -> None:
@@ -1842,6 +1865,101 @@ class TestAContestedVerdictLandsAsAFlaggedAmendmentChild:
         mock_service.update_memory.assert_not_awaited()
         mock_service.delete_memory.assert_not_awaited()
         assert mock_service.add_memory.await_count == 1
+
+
+class TestOnlyTriageWritesTheTriageContestMarker:
+    """`TRIAGE_CONTESTED_METADATA_KEY` attests a contest triage's judge made.
+
+    Link-heal lifts H1 row 2's protection for exactly the contests carrying
+    it, so the marker has to mean what it says: written by the contested
+    attach and by nothing else — not by the other attach outcomes, and not by
+    a caller, whether forging it or copying metadata off a triage child.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('outcome', [OUTCOME_RESTATED, OUTCOME_AMENDED])
+    async def test_a_non_contested_attach_carries_no_marker(
+        self, outcome, monkeypatch,
+    ) -> None:
+        """The marker attests a triage contest, not a triage link."""
+        mock_service = AsyncMock()
+        configure_triage_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        monkeypatch.setattr(
+            tools, 'triage_write',
+            AsyncMock(return_value=BandDecision(
+                outcome, 'canonical-A', 0.95, T_HIGH, T_LOW,
+            )),
+        )
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result[ROUTED_KEY] == outcome, f'{result!r}'
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert TRIAGE_CONTESTED_METADATA_KEY not in metadata, f'{metadata!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('enabled', [True, False])
+    async def test_a_caller_supplied_marker_is_discarded_from_a_hand_declared_contest(
+        self, enabled,
+    ) -> None:
+        """The hand-declared contest link-heal must keep protecting.
+
+        On both the flag-on force-store path and the flag-off path the caller's
+        link keys survive and the forged marker does not, so the stored record
+        reads as hand-declared.
+        """
+        mock_service = AsyncMock()
+        configure_triage_config(mock_service, enabled=enabled)
+        _configure_pass_through_add_memory(mock_service)
+        if enabled:
+            mock_service.search.return_value = [search_candidate('canonical-A', 0.97)]
+        else:
+            mock_service.search.return_value = []
+        server = create_mcp_server(mock_service)
+
+        result = await _call(
+            server,
+            metadata={
+                PARENT_ID_KEY: _EXPLICIT_PARENT,
+                'kind': AMENDMENT_KIND,
+                CONTESTED_METADATA_KEY: True,
+                TRIAGE_CONTESTED_METADATA_KEY: True,
+            },
+        )
+
+        if enabled:
+            assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        else:
+            assert ROUTED_KEY not in result, f'the flag-off ack grew a key: {result!r}'
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert metadata[PARENT_ID_KEY] == _EXPLICIT_PARENT, f'{metadata!r}'
+        assert metadata['kind'] == AMENDMENT_KIND, f'{metadata!r}'
+        assert metadata[CONTESTED_METADATA_KEY] is True, f'{metadata!r}'
+        assert TRIAGE_CONTESTED_METADATA_KEY not in metadata, (
+            f'a forged marker would strip a hand-declared contest of its '
+            f'link-heal protection: {metadata!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_caller_supplied_marker_alone_does_not_skip_triage(self) -> None:
+        """The marker is not attach-owned, so it does not force-store."""
+        mock_service = AsyncMock()
+        configure_triage_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [search_candidate('canonical-A', 0.97)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(
+            server,
+            metadata={TRIAGE_CONTESTED_METADATA_KEY: True, 'source': 'notes'},
+        )
+
+        assert result[ROUTED_KEY] == OUTCOME_RESTATED, f'{result!r}'
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert TRIAGE_CONTESTED_METADATA_KEY not in metadata, f'{metadata!r}'
+        assert metadata['source'] == 'notes', f'{metadata!r}'
 
 
 #: Neutral marker text: no task-status or completion claim, so no recon-stage

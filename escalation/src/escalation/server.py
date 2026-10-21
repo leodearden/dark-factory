@@ -1033,9 +1033,10 @@ def create_server(
     *harness* is the running ``orchestrator.harness.Harness``.  When passed,
     it enables the ``release_workflow`` tool which lets external callers
     (humans via /unblock, automation) ask the orchestrator to soft-cancel a
-    workflow whose task has been completed out-of-band.  When omitted (e.g.
-    in tests with no orchestrator), the tool reports that no workflow is
-    active.
+    workflow whose task has been completed out-of-band, and the
+    ``clear_verify_host_quarantine`` operator clear.  When omitted (e.g. in
+    tests with no orchestrator), both tools report that no orchestrator is
+    attached.
 
     *dedupe_config* controls infra_issue deduplication.  When omitted,
     ``DedupeConfig()`` is used (enabled, 600 s window, infra_issue category).
@@ -4500,6 +4501,29 @@ def create_server(
         if outcome.superseded_by is not None:
             result['superseded_by'] = outcome.superseded_by
         return result
+
+    @mcp.tool()
+    async def clear_verify_host_quarantine(host: str) -> dict[str, Any]:
+        """Return a benched remote verify host to this orchestrator's verify pool.
+
+        The operator clear for a host the merge worker benched (task 6565,
+        design D6): an unreachable ('ru') or gate-skew ('skew') bench —
+        including a STICKY skew bench, which is never re-admitted
+        automatically — or a verdict-divergence quarantine.  It does not probe
+        the host first; use it once the cause is fixed.  A PARKED slot is still
+        freed only after a clean probe that no stale verify runs there.  The
+        open unreachability and skew L1s for the host are resolved.
+
+        Returns ``{host, cleared, quarantine_class, was_sticky}`` plus
+        ``reason`` when nothing was cleared (no orchestrator, no merge worker,
+        an unknown or un-benched host, or a PARKED slot not yet clean).
+        """
+        if harness is None:
+            return {
+                'host': host, 'cleared': False,
+                'reason': 'No orchestrator harness wired in — running in standalone mode',
+            }
+        return await harness.clear_verify_host_quarantine(host)
 
     @mcp.tool()
     async def release_workflow(

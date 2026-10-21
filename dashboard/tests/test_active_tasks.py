@@ -4,12 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 import pytest
+from _canned_mcp import CannedMCP
+from _deferral_fixture import (
+    CARRIED_LIVE,
+    CARRIER_DONE,
+    CARRIER_GONE,
+    CLOSABLE,
+    HELD_LIVE,
+    ORPHANED,
+    PLAIN,
+    STRAY,
+    UNRECORDED,
+    FixtureRow,
+    deferral_fixture,
+    expected_needs_human,
+    raw_rows,
+    status_map,
+)
+from _deferral_fixture import NOW as DEFERRAL_NOW
+from shared.process_identity import capture
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.task_statuses import ACTIVE, TaskStatus
@@ -3482,3 +3502,96 @@ class TestCollectTasksWithCountsFairness:
                 f'{expected} — the rendered order must stay canonical '
                 'primary-first root order at every rotation offset'
             )
+
+
+# ---------------------------------------------------------------------------
+# TestDeferredRowsCarryTheirHold — the `deferral` row key, read against the
+# unit's own referents (task 6527)
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredRowsCarryTheirHold:
+    """The collector words each deferred row's hold from what its unit measured.
+
+    The carrier status comes from the unit's status map, because a done
+    carrier is never among the ACTIVE rows. The holder liveness comes from
+    the unit's own read of /proc.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch):
+        _register_runtime(monkeypatch, {})
+        yield
+
+    @pytest.fixture()
+    def fixture_rows(self) -> tuple[FixtureRow, ...]:
+        live_holder = capture(os.getpid())
+        assert live_holder is not None
+        return deferral_fixture(now=DEFERRAL_NOW, live_holder=live_holder)
+
+    @staticmethod
+    async def _collect(monkeypatch, tmp_path, client, fixture_rows, *, map_fails=False):
+        canned = CannedMCP(rows=raw_rows(fixture_rows), status_map=status_map(fixture_rows))
+        if map_fails:
+            canned.fail_when = lambda call: call['tool'] == 'get_statuses'
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', canned)
+        root = tmp_path / 'dark-factory'
+        root.mkdir(parents=True, exist_ok=True)
+        active, _snapshots = await collect_tasks_with_counts(
+            client, DashboardConfig(project_root=root), now=DEFERRAL_NOW,
+        )
+        return {int(row['id'].rsplit('T-', 1)[-1]): row for row in active}
+
+    async def test_a_done_carrier_outside_the_rows_reads_closable(
+        self, monkeypatch, tmp_path, dummy_client, fixture_rows
+    ):
+        rows = await self._collect(monkeypatch, tmp_path, dummy_client, fixture_rows)
+
+        assert CARRIER_DONE not in rows, 'a done carrier is never an ACTIVE row'
+        assert rows[CLOSABLE]['deferral']['label'] == (
+            f'parked: carried by #{CARRIER_DONE} (closable)'
+        ), 'the carrier status must come from the unit\'s status map'
+
+    async def test_the_live_holder_reads_live(
+        self, monkeypatch, tmp_path, dummy_client, fixture_rows
+    ):
+        rows = await self._collect(monkeypatch, tmp_path, dummy_client, fixture_rows)
+
+        assert rows[HELD_LIVE]['deferral']['label'].endswith(' (live)')
+        assert rows[HELD_LIVE]['deferral']['state'] == 'held'
+
+    async def test_only_deferred_rows_carry_the_key_and_an_unrecorded_one_is_null(
+        self, monkeypatch, tmp_path, dummy_client, fixture_rows
+    ):
+        rows = await self._collect(monkeypatch, tmp_path, dummy_client, fixture_rows)
+
+        assert 'deferral' in rows[UNRECORDED] and rows[UNRECORDED]['deferral'] is None
+        for task_id in (STRAY, PLAIN):
+            assert 'deferral' not in rows[task_id], task_id
+
+    async def test_every_deferred_row_reads_the_shared_verdict(
+        self, monkeypatch, tmp_path, dummy_client, fixture_rows
+    ):
+        rows = await self._collect(monkeypatch, tmp_path, dummy_client, fixture_rows)
+
+        expected = expected_needs_human(fixture_rows, now=DEFERRAL_NOW)
+        assert {task_id for task_id, row in rows.items() if 'deferral' in row} == set(expected)
+        assert expected.pop(UNRECORDED) is not None
+        shown = {task_id: rows[task_id]['deferral']['needs_human'] for task_id in expected}
+        assert shown == {
+            task_id: None if reason is None else reason.value
+            for task_id, reason in expected.items()
+        }
+
+    async def test_an_unread_status_map_leaves_every_carrier_unknown(
+        self, monkeypatch, tmp_path, dummy_client, fixture_rows
+    ):
+        rows = await self._collect(
+            monkeypatch, tmp_path, dummy_client, fixture_rows, map_fails=True,
+        )
+
+        for task_id in (CLOSABLE, ORPHANED, CARRIED_LIVE, CARRIER_GONE):
+            hold = rows[task_id]['deferral']
+            assert hold['label'].endswith(' (carrier status unknown)'), hold
+            assert hold['state'] == 'unknown'
+            assert hold['needs_human'] is None

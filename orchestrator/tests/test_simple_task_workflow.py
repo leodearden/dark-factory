@@ -229,7 +229,7 @@ async def test_simple_task_no_plan_falls_through(tmp_path: Path):
     )
 
     outcome = await f.wf._run_simple_task()
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
 
 
 @pytest.mark.asyncio
@@ -244,7 +244,7 @@ async def test_simple_task_no_steps_done_falls_through(tmp_path: Path):
     )
 
     outcome = await f.wf._run_simple_task()
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
 
 
 @pytest.mark.asyncio
@@ -267,7 +267,7 @@ async def test_simple_task_invoke_failure_falls_through(tmp_path: Path):
     )
 
     outcome = await f.wf._run_simple_task()
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
 
 
 def _saturation_stamp_calls(update_task: AsyncMock) -> list:
@@ -300,7 +300,7 @@ async def test_simple_task_max_turns_stamps_saturated(tmp_path: Path):
 
     outcome = await f.wf._run_simple_task()
 
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
     stamp_calls = _saturation_stamp_calls(f.update_task)
     assert stamp_calls, (
         'expected a merge-mode routing stamp with simple_saturated=True'
@@ -319,7 +319,7 @@ async def test_simple_task_max_turns_in_memory_stamp_survives_write_failure(
     tmp_path: Path,
 ):
     """The saturation stamp is best-effort: when the merge-mode scheduler write
-    raises, ``_run_simple_task`` still returns REQUEUED (the exception is
+    raises, ``_run_simple_task`` still falls through, returning None (the exception is
     swallowed inside ``_stamp_simple_saturated``, never propagated to crash the
     fall-through to the architect) AND the persistence-independent in-memory
     ``self.task['metadata']['routing']['simple_saturated']`` flip still lands —
@@ -336,7 +336,7 @@ async def test_simple_task_max_turns_in_memory_stamp_survives_write_failure(
 
     outcome = await f.wf._run_simple_task()
 
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
     assert f.wf.task['metadata']['routing']['simple_saturated'] is True
 
 
@@ -358,7 +358,7 @@ async def test_simple_task_max_turns_already_saturated_no_double_write(
 
     outcome = await f.wf._run_simple_task()
 
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
     # Idempotent early-return: no scheduler write at all on this failure path.
     f.update_task.assert_not_awaited()
     assert not _saturation_stamp_calls(f.update_task)
@@ -379,7 +379,7 @@ async def test_simple_task_generic_failure_does_not_stamp(tmp_path: Path):
 
     outcome = await f.wf._run_simple_task()
 
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
     assert not _saturation_stamp_calls(f.update_task)
 
 
@@ -393,7 +393,29 @@ async def test_simple_task_invoke_exception_falls_through(tmp_path: Path):
     f.wf._invoke = _raising  # type: ignore[assignment]
 
     outcome = await f.wf._run_simple_task()
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
+
+
+@pytest.mark.asyncio
+async def test_simple_task_blocking_dependency_falls_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=_good_plan(),
+    )
+
+    async def _reports_blocking_dependency(*args, **kwargs):
+        f.artifacts.write_blocking_dependency(
+            depends_on_task_id='499', reason='needs 499 first',
+            main_sha_at_report='mainsha',
+        )
+        return _make_result()
+
+    monkeypatch.setattr(f.wf, '_invoke', _reports_blocking_dependency)
+
+    outcome = await f.wf._run_simple_task()
+    assert outcome is None
 
 
 @pytest.mark.asyncio
@@ -409,6 +431,55 @@ async def test_blast_radius_expansion_invoked_when_files_grow(tmp_path: Path):
     outcome = await f.wf._run_simple_task()
     assert outcome == WorkflowOutcome.PLANNED
     f.handle_blast_radius_expansion.assert_awaited_once()
+
+
+def _conflicting_plan() -> dict:
+    plan = _good_plan()
+    plan['files'] = ['mod_b/x.py']  # a module the task does not hold
+    return plan
+
+
+@pytest.mark.asyncio
+async def test_simple_task_lock_conflict_requeues(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=_conflicting_plan(), blast_radius_grants=False,
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.REQUEUED
+    f.handle_blast_radius_expansion.assert_awaited_once()
+    assert f.wf.modules == ['mod_a']
+    assert not [
+        c for c in f.update_task.call_args_list
+        if len(c.args) >= 2
+        and isinstance(c.args[1], dict)
+        and 'optimistic_path' in c.args[1]
+    ]
+    assert not [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.phase_skipped
+        and c.kwargs['data']['reason'] == 'architect_skipped_simple_task'
+    ]
+
+
+@pytest.mark.asyncio
+async def test_simple_task_lock_conflict_with_dead_repend_requeues(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=_conflicting_plan(), blast_radius_grants=False,
+    )
+    f.handle_blast_radius_expansion.return_value = BlastRadiusResult(
+        applied=False,
+        repend_error=RuntimeError(
+            'set_task_status(500, pending) failed after 4 transient retries',
+        ),
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.REQUEUED
 
 
 @pytest.mark.asyncio

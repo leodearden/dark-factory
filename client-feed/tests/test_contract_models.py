@@ -136,6 +136,24 @@ PAYLOADS: dict[str, dict[str, Any]] = {
             {'id': 'C-1', 'outcome': 'passed', 'tests': ['tests/test_ledger.py::test_ok']},
         ],
     },
+    'criteria_declared': {
+        'criteria': [
+            {
+                'id': 'C-1',
+                'prd': 'plans/ledger-prd.md',
+                'capability': 'Ledger',
+                'statement': 'Every entry shows the running balance after it.',
+                'kind': 'success',
+            },
+            {
+                'id': 'C-2',
+                'prd': 'plans/ledger-prd.md',
+                'capability': 'Ledger',
+                'statement': 'A balance is never rounded before the last entry.',
+                'kind': 'failure',
+            },
+        ],
+    },
 }
 
 MODEL_NAMES: dict[str, str] = {
@@ -152,6 +170,7 @@ MODEL_NAMES: dict[str, str] = {
     'file_revealed': 'FileRevealed',
     'reveal_refused': 'RevealRefused',
     'criteria_results': 'CriteriaResults',
+    'criteria_declared': 'CriteriaDeclared',
 }
 
 EMPTY_STATE: dict[str, Any] = {
@@ -170,6 +189,7 @@ EMPTY_STATE: dict[str, Any] = {
     'tree': None,
     'revealed': [],
     'criteria': {},
+    'criteria_declared': {},
     'recent': [],
 }
 
@@ -205,6 +225,7 @@ NESTED_SAMPLES: list[tuple[str, dict[str, Any]]] = [
     ('TreeFile', PAYLOADS['tree_snapshot']['files'][0]),
     ('RevealBudget', PAYLOADS['tree_snapshot']['budget']),
     ('CriterionResult', PAYLOADS['criteria_results']['results'][0]),
+    ('Criterion', PAYLOADS['criteria_declared']['criteria'][0]),
     ('InFlightTask', {'task_id': 7, 'phase': 'plan', 'since': AT}),
     ('RevealedFile', {'path': 'src/ledger.py', 'commit': SHA, 'lines': 30}),
     ('RevealRequested', {'seq': 1, 'at': AT, 'type': 'reveal_requested', 'path': 'src/a.py'}),
@@ -221,7 +242,7 @@ NESTED_SAMPLES: list[tuple[str, dict[str, Any]]] = [
 ]
 
 
-def test_event_models_cover_exactly_the_thirteen_wire_types() -> None:
+def test_event_models_cover_exactly_the_named_wire_types() -> None:
     assert set(contract.EVENT_MODELS) == set(MODEL_NAMES)
     for wire_type, name in MODEL_NAMES.items():
         assert contract.EVENT_MODELS[wire_type] is getattr(contract, name)
@@ -360,6 +381,39 @@ def test_merge_landed_refuses_titles_that_do_not_pair_with_task_ids() -> None:
     assert re.search(r'\b1\b', message)
 
 
+def test_criteria_declared_refuses_a_duplicate_id() -> None:
+    first, second = PAYLOADS['criteria_declared']['criteria']
+    with pytest.raises(ValidationError) as caught:
+        build('criteria_declared', criteria=[first, {**second, 'id': 'C-1'}])
+    message = first_error_message(caught.value)
+    assert 'C-1' in message
+    assert 'unique' in message
+
+
+def test_criteria_declared_accepts_an_empty_declaration() -> None:
+    declaration = contract.CriteriaDeclared.model_validate(
+        event_dict('criteria_declared', criteria=[])
+    )
+    assert declaration.criteria == ()
+
+
+@pytest.mark.parametrize(
+    'override',
+    [
+        {'kind': 'maybe'},
+        {'prd': '../x.md'},
+        {'prd': '/abs.md'},
+        {'id': ''},
+        {'statement': ''},
+        {'capability': ''},
+    ],
+    ids=['unknown-kind', 'escaping-prd', 'absolute-prd', 'empty-id', 'empty-statement', 'empty-capability'],
+)
+def test_a_criterion_refuses_a_bad_field(override: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        contract.Criterion.model_validate({**PAYLOADS['criteria_declared']['criteria'][0], **override})
+
+
 @pytest.mark.parametrize(('wire_type', 'field'), [('verify_run', 'legs'), ('merge_landed', 'review')])
 def test_not_recorded_is_the_one_accepted_string(wire_type: str, field: str) -> None:
     event = build(wire_type, **{field: 'not_recorded'})
@@ -411,6 +465,7 @@ def test_task_status_vocabulary_matches_the_factory() -> None:
         ),
         ('RunKind', {'verify', 'staging'}),
         ('CriterionOutcome', {'passed', 'failed', 'not_run'}),
+        ('CriterionKind', {'success', 'failure'}),
     ],
 )
 def test_feed_owned_vocabularies(enum_name: str, values: set[str]) -> None:
@@ -445,6 +500,7 @@ def test_feed_state_round_trips_with_every_section_filled() -> None:
             'tree': event_dict('tree_snapshot', seq=7),
             'revealed': [{'path': 'src/ledger.py', 'commit': SHA, 'lines': 30}],
             'criteria': {'verify': criteria},
+            'criteria_declared': {'C-1': PAYLOADS['criteria_declared']['criteria'][0]},
             'recent': [prd, task, event_dict('reveal_refused', seq=8), criteria],
         }
     )
@@ -455,6 +511,23 @@ def test_feed_state_round_trips_with_every_section_filled() -> None:
         'RevealRefused',
         'CriteriaResults',
     ]
+
+
+@pytest.mark.parametrize(
+    ('section', 'wrong_key', 'record', 'record_key'),
+    [
+        ('prds', 'plans/other-prd.md', event_dict('prd_upserted', seq=3), 'plans/ledger-prd.md'),
+        ('tasks', 6, event_dict('task_upserted', seq=4), '5'),
+        ('criteria', 'staging', event_dict('criteria_results', seq=9), 'verify'),
+        ('criteria_declared', 'C-2', PAYLOADS['criteria_declared']['criteria'][0], 'C-1'),
+    ],
+)
+def test_feed_state_refuses_a_key_that_names_another_record(
+    section: str, wrong_key: object, record: dict[str, object], record_key: str
+) -> None:
+    expected = f"{section} key '{wrong_key}' holds the record of '{record_key}'"
+    with pytest.raises(ValidationError, match=re.escape(expected)):
+        contract.FeedState.model_validate({**EMPTY_STATE, section: {wrong_key: record}})
 
 
 @pytest.mark.parametrize(
@@ -482,6 +555,7 @@ def test_keyed_events_expose_their_natural_key(wire_type: str, key: object) -> N
         'tree_snapshot',
         'reveal_refused',
         'criteria_results',
+        'criteria_declared',
     ],
 )
 def test_unkeyed_events_have_no_natural_key(wire_type: str) -> None:

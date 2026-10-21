@@ -47,6 +47,7 @@ __all__ = [
     'is_known_metadata_key',
     'parse_metadata',
     'register_metadata_submodel',
+    'script_root_kind_conflict',
     'validate_model_overrides',
 ]
 
@@ -168,6 +169,12 @@ class BeforeDone(BaseModel):
     ``deterministic_task_guard._validate_before_done`` (fused-memory); the
     filesystem-level checks (path containment, executable bit) stay at the
     ``submit_task`` guard — this model enforces only the type/shape layer.
+    With ``script_root='factory'`` the script resolves against
+    ``shared.repo_paths.resolve_dark_factory_root()`` while cwd stays
+    project_root. ``shared.before_done_paths`` resolves that path for both the
+    submit guard and the orchestrator's deterministic runner; only the guard
+    (``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``)
+    checks the resolved file on disk — the runner joins the path and runs it.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -179,6 +186,29 @@ class BeforeDone(BaseModel):
     timeout_secs: int = Field(gt=0)
     target_unit: str | None = None
     kind: Literal['deploy', 'predicate'] = 'deploy'
+    script_root: Literal['project', 'factory'] = 'project'
+
+    @model_validator(mode='after')
+    def _factory_script_root_requires_predicate(self) -> BeforeDone:
+        conflict = script_root_kind_conflict(self.script_root, self.kind)
+        if conflict is not None:
+            raise ValueError(f'BeforeDone: {conflict}')
+        return self
+
+
+def script_root_kind_conflict(script_root: str, kind: str) -> str | None:
+    """Why ``before_done`` may not pair *script_root* with *kind*; ``None`` when it may.
+
+    The single statement of the predicate-only rule for factory-rooted scripts,
+    called by ``BeforeDone``, the fused-memory submit guard and
+    ``shared.before_done_paths.resolve_script_base``.
+    """
+    if script_root == 'factory' and kind != 'predicate':
+        return (
+            f"script_root='factory' requires kind='predicate' (got kind={kind!r}); "
+            'a deploy runs a script from its own project.'
+        )
+    return None
 
 
 class DoneProvenance(BaseModel):
@@ -1345,6 +1375,10 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # fused-memory's amendment advisory (task 4034).
         'plan_text_fp',
         'plan_authored_at',
+        # The sha-independent main-break signature a fix-main task owns (task 5471):
+        # written by orchestrator/src/orchestrator/main_health_fix_owner.py, which
+        # also reads it back through find_tasks_by_metadata as its dedupe key.
+        'main_health_signature',
     }
 )
 

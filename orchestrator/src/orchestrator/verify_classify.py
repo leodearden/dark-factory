@@ -58,8 +58,32 @@ def is_external_kill_rc(rc: int) -> bool:
     shell-reported ``128 + N`` status (e.g. 137 for SIGKILL) is NOT treated as
     a kill, because the predicate must not guess at shell conventions — a
     plain positive rc is a real exit status the process chose to return.
+    A caller that interposed the shell itself reads that convention with
+    ``is_shell_reported_external_kill`` instead.
     """
     return rc < 0 and -rc in _EXTERNAL_KILL_SIGNALS
+
+
+_SHELL_REPORTED_KILL_SIGNALS: frozenset[int] = _EXTERNAL_KILL_SIGNALS - {signal.SIGKILL}
+
+
+def is_shell_reported_external_kill(rc: int) -> bool:
+    """Return True when *rc* is a shell's ``128 + N`` report of an external
+    SIGTERM, SIGINT or SIGHUP.
+
+    PRECONDITION: *rc* is the exit status of a POSIX shell the CALLER
+    interposed, so ``128 + N`` means that shell's child died of signal N.
+    ``verify.classify_leg`` is the caller: every leg runs under
+    ``_run_cmd``'s ``/bin/bash`` wrapper. Calling this on any other rc is the
+    shell-convention guessing ``is_external_kill_rc`` refuses.
+
+    SIGKILL is excluded: a positive 137 is the ordinary branch-caused OOM of a
+    memory-hungry grandchild.
+
+    It decides nothing alone. The caller must also establish that the leg
+    printed no failure verdict.
+    """
+    return rc > 128 and (rc - 128) in _SHELL_REPORTED_KILL_SIGNALS
 
 # ---------------------------------------------------------------------------
 # Shared regex primitives — patterns that legitimately belong to more than
@@ -1082,13 +1106,15 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
       ``_classify_cargo``, the text table.
     - ``ToolKind.NPX`` -> ``_classify_npx``.
     - ``ToolKind.PYRIGHT`` -> a structured ``--outputjson`` parse
-      (``_parse_pyright_json``) is attempted FIRST (Invariant C2); otherwise
-      falls back to ``_classify_opaque`` (no dedicated PYRIGHT text table —
-      preserves today's on-the-wire mapping).
+      (``_parse_pyright_json``, yielding ``TYPE_ERROR``) is attempted FIRST
+      (Invariant C2); otherwise falls back to ``_classify_opaque``. There is
+      deliberately no PYRIGHT text table, so human-text output takes the
+      OPAQUE ladder unchanged.
     - ``ToolKind.RUFF`` -> a structured ``--output-format json`` parse
-      (``_parse_ruff_json``) is attempted FIRST (Invariant C2); otherwise
-      falls back to ``_classify_opaque`` (no dedicated RUFF text table —
-      preserves today's on-the-wire mapping).
+      (``_parse_ruff_json``, yielding ``LINT_ERROR``) is attempted FIRST
+      (Invariant C2); otherwise falls back to ``_classify_opaque``. There is
+      deliberately no RUFF text table, so human-text output takes the OPAQUE
+      ladder unchanged.
     - ``ToolKind.OPAQUE`` -> ``_classify_opaque``, the FULL legacy generic
       ladder (moved verbatim from verify.py's ``_CLASSIFY_PATTERNS``) — the
       ONLY survivor of the tool-blind ladder.
@@ -1188,8 +1214,8 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 # producer, so any reasoning that relied on env_transient implying the failing
 # leg was the TEST leg must be re-derived rather than assumed. The one place
 # that reasoning was load-bearing is verify.py's env-recovery retry gate, which
-# task 3367 tightens with an explicit `attempt.test.rc != 0` check instead of
-# leaning on the retired corollary.
+# now reads the TEST leg's own classification (task 4843; task 3367 first
+# restricted it to the test leg) instead of leaning on the retired corollary.
 # ---------------------------------------------------------------------------
 
 # Shared-venv mutation signatures (task 2048): a concurrent `uv sync` from
@@ -1367,11 +1393,10 @@ def _classify_npx(output: str) -> FailureCategory:
 
 
 # ---------------------------------------------------------------------------
-# ToolKind.PYRIGHT — structured JSON only (Invariant C2); no dedicated text
-# table exists — non-JSON PYRIGHT output falls through to the OPAQUE
-# placeholder ladder (see classify_failure's docstring), preserving today's
-# on-the-wire mapping. Adding a dedicated PYRIGHT/type-check FailureCategory
-# is out of scope for this task.
+# ToolKind.PYRIGHT — structured JSON only (Invariant C2). An error
+# diagnostic is TYPE_ERROR (task 4843). There is still NO text table, so
+# non-JSON PYRIGHT output deliberately falls through to the OPAQUE ladder
+# (Invariants C1/C2; see classify_failure's docstring).
 # ---------------------------------------------------------------------------
 
 
@@ -1387,8 +1412,7 @@ def _parse_pyright_json(output: str) -> FailureCategory | None:
         ], "summary": {...}}
 
     A ``generalDiagnostics`` entry with ``severity == "error"`` maps to
-    ``UNKNOWN_TEST_FAILURE`` — the preserved on-the-wire category (no
-    dedicated PYRIGHT category exists — see module docstring). Exception-safe:
+    ``TYPE_ERROR``; warnings and information alone claim nothing. Exception-safe:
     *output* that isn't valid JSON, or isn't shaped like this schema, returns
     ``None`` rather than raising, so the caller falls back to
     ``_classify_opaque``, the text table.
@@ -1404,16 +1428,15 @@ def _parse_pyright_json(output: str) -> FailureCategory | None:
         return None
     for diagnostic in diagnostics:
         if isinstance(diagnostic, dict) and diagnostic.get('severity') == 'error':
-            return FailureCategory.UNKNOWN_TEST_FAILURE
+            return FailureCategory.TYPE_ERROR
     return None
 
 
 # ---------------------------------------------------------------------------
-# ToolKind.RUFF — structured JSON only (Invariant C2); no dedicated text
-# table exists — non-JSON RUFF output falls through to the OPAQUE placeholder
-# ladder (see classify_failure's docstring), preserving today's on-the-wire
-# mapping. Adding a dedicated RUFF/lint FailureCategory is out of scope for
-# this task.
+# ToolKind.RUFF — structured JSON only (Invariant C2). A violations array is
+# LINT_ERROR (task 4843). There is still NO text table, so non-JSON RUFF
+# output deliberately falls through to the OPAQUE ladder (Invariants C1/C2;
+# see classify_failure's docstring).
 # ---------------------------------------------------------------------------
 
 
@@ -1427,9 +1450,8 @@ def _parse_ruff_json(output: str) -> FailureCategory | None:
         [{"cell": null, "code": "F821", "filename": "...",
           "message": "...", "severity": "error", ...}]
 
-    A non-empty violations array maps to ``UNKNOWN_TEST_FAILURE`` — the
-    preserved on-the-wire category (no dedicated RUFF category exists — see
-    module docstring). Exception-safe: *output* that isn't valid JSON, or
+    A non-empty violations array maps to ``LINT_ERROR``; an empty one claims
+    nothing. Exception-safe: *output* that isn't valid JSON, or
     isn't shaped like this schema, returns ``None`` rather than raising, so
     the caller falls back to ``_classify_opaque``, the text table.
     """
@@ -1441,7 +1463,7 @@ def _parse_ruff_json(output: str) -> FailureCategory | None:
         return None
     if not any(isinstance(item, dict) for item in payload):
         return None
-    return FailureCategory.UNKNOWN_TEST_FAILURE
+    return FailureCategory.LINT_ERROR
 
 
 # ---------------------------------------------------------------------------

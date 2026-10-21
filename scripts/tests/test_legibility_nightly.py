@@ -4277,6 +4277,230 @@ class TestRunNightlyRecordsTrickleState:
         assert doc['target_date'] == '2026-07-13'
 
 
+_CHECK_CENSUS_PROGRESS = (
+    Path(__file__).parent.parent / 'legibility' / 'check_census_progress.py'
+)
+
+
+def _census_state(repo: Path) -> Path:
+    return repo / 'docs' / 'legibility' / 'census-state.json'
+
+
+def _write_census_state(repo: Path, state: dict) -> None:
+    _census_state(repo).write_text(json.dumps(state), encoding='utf-8')
+
+
+def _stub_census_launcher(monkeypatch, on_launch=None):
+    """Replace the real launcher, which would subprocess census.py. Returns
+    the call list; *on_launch(project_root)* runs inside each launch."""
+    launches = []
+
+    def _launch(project_root, **kwargs):
+        launches.append(project_root)
+        if on_launch is not None:
+            on_launch(Path(project_root))
+
+    monkeypatch.setattr(nightly, '_default_census_launcher', _launch)
+    return launches
+
+
+def _run_census_progress_probe(project_id: str, threshold: int):
+    """The REAL predicate by subprocess. It inherits this process's
+    environment, so it reads the conftest-isolated state root."""
+    return subprocess.run(
+        [sys.executable, str(_CHECK_CENSUS_PROGRESS), project_id, str(threshold)],
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+class TestRunNightlyRecordsTheCensusObservation:
+    """The nightly records what the census trigger did, so
+    check_census_progress.py can tell a FIRE whose census never advanced
+    census-state from one whose census landed.
+
+    HAZARD. A test reaching a FIRE seeds
+    ``<repo>/docs/legibility/census-state.json`` = ``{"last_census_at":
+    "2026-06-01"}``: no session_watermark, so the floor anchors on
+    last_census_at (43 days) and max-interval (stock 10d) FIREs; and no
+    ``last_census_done_count``, so compute_tasks_landed never reaches the
+    REAL status fetcher these fixtures build from ``status_fetcher=None``.
+    Every test here ALWAYS stubs ``nightly._default_census_launcher``:
+    evaluate_census_step resolves that global at call time, and the real
+    one subprocess-runs census.py.
+    """
+
+    _OLD_CENSUS = {'last_census_at': '2026-06-01'}
+
+    def test_a_no_fire_night_records_census_fired_false(self, tmp_path, monkeypatch):
+        """Never censused: the floor anchors on the codebook's earliest
+        date, the night's own 2026-07-13 sighting, one day before now and
+        inside floor_days=5."""
+        launches = _stub_census_launcher(monkeypatch)
+        recorder, calls = _recorder_spy()
+
+        result, _repo = _run_e2e_nightly(tmp_path, recorder=recorder)
+
+        assert result.census_fire is False
+        assert launches == []
+        doc = _one_recorded(calls)
+        assert doc['census_fired'] is False
+        assert doc['census_fire_streak'] is None
+
+    def test_a_fire_night_records_the_streak(self, tmp_path, monkeypatch):
+        launches = _stub_census_launcher(monkeypatch)
+        runner = _NightRunner(tmp_path)
+        _write_census_state(runner.repo, self._OLD_CENSUS)
+
+        result = runner.night(13, 'quiet')
+
+        assert result.census_fire is True
+        assert len(launches) == 1
+        doc = runner.recorded()
+        assert doc['census_fired'] is True
+        assert doc['census_fire_streak'] == {
+            'fires': 1,
+            'last_census_at': '2026-06-01',
+            'census_state_path': str(_census_state(runner.repo)),
+            'since': '2026-07-13',
+        }
+
+    def test_the_anchor_is_read_before_the_synchronous_launch(
+        self, tmp_path, monkeypatch,
+    ):
+        """A census that lands rewrites census-state INSIDE the launch; an
+        anchor read afterwards would equal the new value and a census that
+        advanced would read as unadvanced."""
+        _stub_census_launcher(
+            monkeypatch,
+            on_launch=lambda root: _write_census_state(
+                root, {'last_census_at': '2026-07-14'},
+            ),
+        )
+        runner = _NightRunner(tmp_path)
+        _write_census_state(runner.repo, self._OLD_CENSUS)
+
+        runner.night(13, 'quiet')
+
+        assert json.loads(_census_state(runner.repo).read_text())[
+            'last_census_at'] == '2026-07-14'
+        assert runner.recorded()['census_fire_streak'][
+            'last_census_at'] == '2026-06-01'
+
+    def test_a_malformed_census_state_warns_once_per_night(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """The trigger's own read owns the malformed WARNING; the anchor
+        read must not repeat it in the journal."""
+        launches = _stub_census_launcher(monkeypatch)
+        runner = _NightRunner(tmp_path)
+        _census_state(runner.repo).write_text('{not json', encoding='utf-8')
+
+        with caplog.at_level('WARNING'):
+            runner.night(13, 'quiet')
+
+        malformed = [
+            r.getMessage() for r in caplog.records
+            if 'census state at' in r.getMessage()
+        ]
+        assert len(malformed) == 1, malformed
+        assert launches == []
+        assert runner.recorded()['census_fired'] is False
+
+    @pytest.mark.parametrize('branch', ['storm', 'capped'])
+    def test_a_night_that_returns_before_the_census_step_records_none(
+        self, tmp_path, monkeypatch, branch,
+    ):
+        launches = _stub_census_launcher(monkeypatch)
+        recorder, calls = _recorder_spy()
+
+        _run_e2e_nightly(tmp_path, branch=branch, recorder=recorder)
+
+        assert launches == []
+        doc = _one_recorded(calls)
+        assert doc['census_fired'] is None
+        assert doc['census_fire_streak'] is None
+
+    def test_a_project_whose_config_does_not_load_records_none(
+        self, tmp_path, monkeypatch,
+    ):
+        _stub_census_launcher(monkeypatch)
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+        recorder, calls = _recorder_spy()
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13),
+                now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC), recorder=recorder,
+                pass_kind=nightly.PassKind.MANUAL,
+            )
+
+        doc = _one_recorded(calls)
+        assert doc['census_fired'] is None
+        assert doc['census_fire_streak'] is None
+
+    def test_a_night_without_a_census_step_carries_the_streak(
+        self, tmp_path, monkeypatch,
+    ):
+        _stub_census_launcher(monkeypatch)
+        runner = _NightRunner(tmp_path)
+        _write_census_state(runner.repo, self._OLD_CENSUS)
+
+        runner.night(13, 'quiet')
+        fired = runner.recorded()['census_fire_streak']
+        stormed = runner.night(14, 'storm')
+
+        assert stormed.exit_code == 1
+        doc = runner.recorded()
+        assert doc['census_fired'] is None
+        assert doc['census_fire_streak'] == fired
+        assert fired['fires'] == 1
+
+    def test_unadvanced_fires_through_the_real_pipeline_are_flagged(
+        self, tmp_path, monkeypatch,
+    ):
+        """ACCEPTANCE. Every night is quiet, so the walk is census-safe
+        beyond the launcher stub."""
+        launches = _stub_census_launcher(monkeypatch)
+        runner = _NightRunner(tmp_path)
+        _write_census_state(runner.repo, self._OLD_CENSUS)
+
+        for day in (13, 14, 15):
+            runner.night(day, 'quiet')
+
+        assert len(launches) == 3
+        assert runner.recorded()['census_fire_streak']['fires'] == 3
+        probe = _run_census_progress_probe('testproj', 3)
+        assert probe.returncode != 0, (
+            f'stdout={probe.stdout!r} stderr={probe.stderr!r}'
+        )
+        assert '2026-06-01' in probe.stderr
+
+    def test_a_census_that_advanced_through_the_real_pipeline_passes(
+        self, tmp_path, monkeypatch,
+    ):
+        """The inverse: night 13's census lands, so nights 14 and 15 are
+        NO-FIRE inside the stock floor_days=5."""
+        _stub_census_launcher(
+            monkeypatch,
+            on_launch=lambda root: _write_census_state(root, {
+                'last_census_at': '2026-07-14',
+                'session_watermark': '2026-07-14T00:00:00+00:00',
+            }),
+        )
+        runner = _NightRunner(tmp_path)
+        _write_census_state(runner.repo, self._OLD_CENSUS)
+
+        fires = [runner.night(day, 'quiet').census_fire for day in (13, 14, 15)]
+
+        assert fires == [True, False, False]
+        assert runner.recorded()['census_fire_streak'] is None
+        probe = _run_census_progress_probe('testproj', 3)
+        assert probe.returncode == 0, (
+            f'stdout={probe.stdout!r} stderr={probe.stderr!r}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # task 3340 step-11/12: edge-triggered barren-streak escalation
 # ---------------------------------------------------------------------------
@@ -4686,6 +4910,7 @@ def _seed_state(*, day: int, exit_code: int) -> None:
         recorded_at=datetime(2026, 7, day + 1, 3, 0, tzinfo=UTC), exit_code=exit_code,
         total_records=0, zero_signal_dropped=0, dedupe_collapsed=0,
         below_sampling_cut=0, budget_skipped=0, selected_count=0,
+        census=None,
     )
 
 

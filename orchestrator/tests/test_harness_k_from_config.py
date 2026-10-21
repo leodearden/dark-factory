@@ -88,8 +88,12 @@ class TestHarnessKFromConfig:
 
         RED until step-12 wires K from config.enabled_verify_runners.
         """
-        r1 = VerifyRunnerConfig(name='r1', ssh_host='h1.local', git_remote='remote1')
-        r2 = VerifyRunnerConfig(name='r2', ssh_host='h2.local', git_remote='remote2')
+        r1 = VerifyRunnerConfig(
+            name='r1', ssh_host='h1.local', git_remote='remote1', df_checkout_path='/df',
+        )
+        r2 = VerifyRunnerConfig(
+            name='r2', ssh_host='h2.local', git_remote='remote2', df_checkout_path='/df',
+        )
         mock_orch_config.enabled_verify_runners = [r1, r2]
         mock_orch_config.max_concurrent_tasks = 2
         mock_orch_config.fused_memory.project_id = 'test'
@@ -195,6 +199,7 @@ class TestStartMergeWorkerK2LivenessRepro:
                 name='laptop',
                 ssh_host='leo-laptop',
                 git_remote='leo-laptop',
+                df_checkout_path='/home/leo/src/dark-factory',
             )],
             merge_verify_cold_command_timeout_secs=7200,
             git=GitConfig(

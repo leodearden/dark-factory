@@ -49,6 +49,7 @@ from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
+from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
 from fused_memory.middleware.deferral_gate import StatusWriteScope
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
@@ -88,6 +89,7 @@ from fused_memory.middleware.routing_intent_guard import (
     routing_intent_reject,
     routing_intent_warning,
 )
+from fused_memory.middleware.simple_task_files_guard import simple_task_files_error
 from fused_memory.middleware.task_interceptor import (
     TERMINAL_STATUSES,
     TicketStoreNotConfiguredError,
@@ -4022,6 +4024,9 @@ def create_mcp_server(
             # allow_near_duplicate is a write-time-only control flag for the
             # guard above; it must never be persisted into stored metadata.
             cleaned_meta.pop('allow_near_duplicate', None)
+            # Only the contested attach below may write this, so no caller can
+            # make a hand-declared contest look triage-written.
+            cleaned_meta.pop(TRIAGE_CONTESTED_METADATA_KEY, None)
         # An ATTACH outcome reroutes this same write into a child of the memory
         # it restates: same content, same category, same agent, plus the parent
         # link. It does NOT touch the canonical — triage issues no
@@ -4078,10 +4083,11 @@ def create_mcp_server(
             _triage_fail_open_counter.record(project=project_id)
         write_meta = cleaned_meta
         if attached_to is not None:
-            # Every key written here is an ATTACH_OWNED_KEY, and overwriting
-            # them is safe ONLY because `caller_owns_attach_keys` force-stored
-            # every write that carried any one of them — so none can be
-            # present here. Adding a key to this dict without adding it to
+            # Every key written here is an ATTACH_OWNED_KEY (the triage-contest
+            # marker excepted: TestOnlyTriageWritesTheTriageContestMarker), and
+            # overwriting them is safe ONLY because `caller_owns_attach_keys`
+            # force-stored every write that carried any one of them — so none
+            # can be present here. Adding a key to this dict without adding it to
             # ATTACH_OWNED_KEYS re-opens the loss for that key; the gate suite
             # pins the two sets against each other for exactly that reason,
             # unioned across the outcomes because they no longer write the
@@ -4116,6 +4122,8 @@ def create_mcp_server(
                 # this one. The canonical it contradicts is left exactly as it
                 # was, and nothing is scheduled to settle the disagreement.
                 write_meta[CONTESTED_METADATA_KEY] = True
+                # Read by link-heal's H1 row 2: a contest triage made is healable.
+                write_meta[TRIAGE_CONTESTED_METADATA_KEY] = True
         try:
             result = await memory_service.add_memory(
                 content=content,
@@ -9267,9 +9275,13 @@ def create_mcp_server(
                 the change is a single coherent edit — docs or comments, a
                 rename, a localized behaviour-preserving refactor, a typo/wording
                 fix, a one-spot bug fix — that needs no new abstraction and no
-                cross-module design, and you can name the target file(s). It is
-                fine for a simple task to be high priority or to touch several
-                files/modules, as long as the change is mechanically simple.
+                cross-module design, and you can name the target file(s).
+                Declaring "simple" REQUIRES a non-empty metadata.files naming
+                those files: a fileless simple submission is rejected
+                (error_type='SimpleTaskFilesRequired'), and files=[] does not
+                satisfy it. It is fine for a simple task to be high priority or
+                to touch several files/modules, as long as the change is
+                mechanically simple.
                 When unsure, omit it — the full path is the safe default, and a
                 mis-declared task simply falls back to the architect.
             tag: Tag context (optional)
@@ -9366,6 +9378,16 @@ def create_mcp_server(
         _retired_err = retired_key_modules_error(metadata)
         if _retired_err is not None:
             return _retired_err
+
+        # Simple-task files guard δ (task 4524, plans/module-tagger-retirement-prd.md
+        # decision 2): a complexity='simple' submission must declare
+        # metadata.files. Placed after inject_task_kind and before the
+        # interceptor's planning_mode branch, so both creation paths are
+        # covered; after ε, so a modules carrier is first told to use files.
+        # update_task and commit_planning deliberately do not call it.
+        _simple_err = simple_task_files_error(metadata)
+        if _simple_err is not None:
+            return _simple_err
 
         # model_overrides shape guard ζ (PRD adaptive-model-routing, decision 9):
         # reject a malformed metadata.model_overrides (unknown role name,

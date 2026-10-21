@@ -2151,8 +2151,10 @@ class ReconciliationConfig(BaseModel):
             'Resolved-caller prefixes permitted to record a `deterministic-*` '
             'done provenance (PRD C5). The orchestrator sends no agent_id, so '
             'server/tools.py::_resolve_identity falls back to the '
-            'clientInfo.name that server/mcp_lifecycle.py::McpSession.initialize '
-            "advertises — the literal 'orchestrator', which is why that is the "
+            'clientInfo.name the orchestrator advertises '
+            '(orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY, '
+            'sent by shared/src/shared/mcp_session.py::McpSession.initialize) '
+            "— the literal 'orchestrator', which is why that is the "
             'sole default. DENY-ON-MISSING is the consumer contract: a caller '
             'matching no prefix is refused, and an EMPTY list denies every '
             'caller (the live kill switch for the provenance kind). The '
@@ -2631,10 +2633,12 @@ class WriteTriageConfig(BaseModel):
     Every CALIBRATED BAND field (t_high, t_low, calibration_report_path,
     t_high_by_category) defaults to None, and that is load-bearing: None means
     UNCALIBRATED, which the triage router must read as fail-open to `stored`.
-    The two OPERATOR KNOBS below (`enabled`, `candidate_k`) deliberately do
-    NOT follow that rule — they are hand-set and ship with real defaults,
-    because there is no such thing as an uncalibrated kill switch, and a
-    retrieval width of None would have no fail-open reading at all.
+    The OPERATOR KNOBS below (`enabled`, `candidate_k`, and the attach-guard
+    pair `min_parent_cosine` / `hoist_max_cosine_gap`) deliberately do NOT
+    follow that rule — they are hand-set and ship with real defaults, because
+    there is no such thing as an uncalibrated kill switch, and a retrieval
+    width of None would have no fail-open reading at all. On the guard pair
+    None means the rule is OFF, not uncalibrated.
     """
 
     enabled: bool = Field(
@@ -2675,6 +2679,36 @@ class WriteTriageConfig(BaseModel):
             'read as "no comparable candidate" on every write and route '
             'everything to `stored` with nothing logged. Green-tier '
             'hot-reloadable, read live per write.'
+        ),
+    )
+    min_parent_cosine: float | None = Field(
+        default=0.60,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Attach-guard FLOOR (task 7158): never attach a write, in any band '
+            'and under any attach outcome, to a target whose cosine to the write '
+            'is below this; the write is stored standalone instead. The target '
+            'is the record the write would be filed under, i.e. the parent after '
+            'a child hoist. None switches the rule off. Chosen in-sample on the '
+            '2026-10-11..19 soak, in the text-embedding-3-small cosine scale, so '
+            'it must be re-derived at the embedder cutover (task 6807) alongside '
+            't_high/t_low. Green-tier hot-reloadable, read live per write.'
+        ),
+    )
+    hoist_max_cosine_gap: float | None = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Attach-guard HOIST GAP (task 7158): in the judge band only, refuse '
+            'to hoist a write from the matched child to its parent when the '
+            "parent's cosine to the write is more than this below the child's; "
+            'the write is stored standalone instead, never filed under the '
+            'child. None switches the rule off. Chosen in-sample on the '
+            '2026-10-11..19 soak, in the text-embedding-3-small cosine scale, so '
+            'it must be re-derived at the embedder cutover (task 6807) alongside '
+            't_high/t_low. Green-tier hot-reloadable, read live per write.'
         ),
     )
 

@@ -66,7 +66,7 @@ def test_eval_profile_sentinel_single_sourced_from_fm_retry():
     """The D8 fused_memory.url sentinel is the shared fm_retry constant (task 2880).
 
     The eval profile neutralizes FM writes with a non-routable sentinel; the
-    McpSession transport (mcp_lifecycle._retry_backoffs) must recognize exactly
+    fused-memory session factory (mcp_lifecycle.fm_session) must recognize exactly
     that same string to fail fast on it instead of spinning the ~120s
     fm-restart window. Single-sourcing the string in fm_retry — with
     evals/profile.py importing it DOWN — makes profile<->transport drift

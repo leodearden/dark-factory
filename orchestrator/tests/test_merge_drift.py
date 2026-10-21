@@ -346,7 +346,7 @@ class TestDriftCheckFullGateSpecNoDerivation:
         from orchestrator.verify_runner import HostAllocator
 
         git_ops = MagicMock()
-        git_ops.create_throwaway_verify_worktree = AsyncMock(
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(
             return_value=Path('/repo/_throwaway')
         )
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -360,7 +360,8 @@ class TestDriftCheckFullGateSpecNoDerivation:
         req.config = OrchestratorConfig(
             project_root=tmp_path,
             verify_runners=[  # type: ignore[arg-type]
-                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin',
+                 'df_checkout_path': '/df'},
             ],
             verify_env_probes=_LEVER_C_OFF,
         )
@@ -555,7 +556,7 @@ class TestDriftCheckEnvDivergenceWiring:
         from orchestrator.verify_runner import HostAllocator
 
         git_ops = MagicMock()
-        git_ops.create_throwaway_verify_worktree = AsyncMock(
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(
             return_value=Path('/repo/_throwaway')
         )
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -678,7 +679,7 @@ class TestDriftCheckEnvDivergenceWiring:
         from orchestrator.verify_runner import HostAllocator
 
         git_ops = MagicMock()
-        git_ops.create_throwaway_verify_worktree = AsyncMock(
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(
             return_value=Path('/repo/_throwaway')
         )
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -785,7 +786,7 @@ class TestDriftCheckEnvDivergenceWiring:
         from orchestrator.verify_runner import HostAllocator
 
         git_ops = MagicMock()
-        git_ops.create_throwaway_verify_worktree = AsyncMock(
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(
             return_value=Path('/repo/_throwaway')
         )
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -866,7 +867,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         from orchestrator.verify_runner import DriftDetector, HostAllocator
 
         git_ops = MagicMock()
-        git_ops.create_throwaway_verify_worktree = AsyncMock(
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(
             return_value=Path('/repo/_throwaway')
         )
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -924,7 +925,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         from orchestrator.verify_runner import DriftDetector, HostAllocator
 
         git_ops = MagicMock()
-        git_ops.create_throwaway_verify_worktree = AsyncMock(
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(
             return_value=Path('/repo/_throwaway')
         )
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -989,7 +990,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
 #
 # Sibling of TestColdShadowVerifyHoldsLaneLease in test_merge_shadow.py — the
 # drift detective creates its throwaway `_merge-<uuid>` worktree through the
-# very same `create_throwaway_verify_worktree` primitive and runs a full merge
+# very same `create_ephemeral_verify_worktree` primitive and runs a full merge
 # verify inside it, so it inherits the identical exposure: the tree is neither
 # registered in `_owned_merge_worktrees` (the reap's owned-ledger skip misses
 # it) nor touched by `_touch_owned_merge_worktrees` (its measured age is real

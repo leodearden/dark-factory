@@ -77,7 +77,9 @@ DEFAULT_TAG = 'master'
 DEFAULT_CAP = 6
 _LAUNCH_RETENTION_DAYS = 30  # prune launches older than this many days (bound state-file growth)
 
-_FAILURE_REPORT_CAPTURED_HEADINGS = ('Test Failures', 'Lint Issues', 'Type Errors')
+_FAILURE_REPORT_CAPTURED_HEADINGS = (
+    'Test Failures', 'Test Output', 'Lint Issues', 'Type Errors', 'Type Check Output',
+)
 _CAPTURED_OUTPUT_RE = re.compile(
     r'^(## (?:' + '|'.join(map(re.escape, _FAILURE_REPORT_CAPTURED_HEADINGS)) + r')\n\n)'
     r'```\n.*?^```[ \t]*$',

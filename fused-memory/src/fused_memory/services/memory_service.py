@@ -12,7 +12,7 @@ import os
 import re
 import time
 import uuid as uuid_mod
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
@@ -8628,6 +8628,16 @@ class MemoryService:
         if payload is None:
             return None
         return {'id': memory_id, 'content': _mem0_content(payload), 'metadata': payload}
+
+    async def cosine_to_memories(
+        self, *, query: str, memory_ids: Sequence[str], project_id: str,
+    ) -> dict[str, float]:
+        """The Mem0 cosine of *query* to each listed memory id: ``{id: cosine}``.
+
+        On the scale search stamps as ``metadata['store_score']``; ids not in
+        the store are omitted.  Errors propagate: the caller owns any fail-open.
+        """
+        return await self.mem0.cosine_to_points(query, memory_ids, Scope(project_id=project_id))
 
     async def get_mem0_deletion_tombstone(
         self,

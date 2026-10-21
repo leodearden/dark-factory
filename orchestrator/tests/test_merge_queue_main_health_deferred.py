@@ -18,6 +18,7 @@ test_merge_queue_dry_run_unblock.py, which does the same).
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,13 +34,23 @@ from test_merge_queue_main_health import (
     _make_req,
 )
 
+from orchestrator import flake_recorder
 from orchestrator.event_store import EventStore
+from orchestrator.flake_ledger import (
+    FlakeCallSite,
+    FlakeSuppression,
+    FlakeVerdict,
+    ledger_db_path,
+    read_occurrences,
+)
+from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     OutcomeKind,
     RealMergeItem,
     SpeculativeMergeWorker,
     _build_main_health_outcome,
+    _classify_main_health_red,
     _emit_merge_attempt,
     _main_health_fingerprint,
     _MainHealthProbeHandles,
@@ -406,6 +417,14 @@ class TestDeferredProbeHappyPath:
             f'Expected detail derived from the main-red reason; '
             f'got {esc.detail!r}'
         )
+        assert esc.level == 1, (
+            f'A main-health escalation is for the auto-watcher, never a '
+            f'steward: expected level 1; got {esc.level}'
+        )
+        assert esc.suggested_action == MainHealthNextAction.NO_FIX_OWNER, (
+            f'The escalation-only fallback has no fix owner; got '
+            f'{esc.suggested_action!r}'
+        )
 
         calls = event_store.emit.call_args_list
         main_health_calls = [
@@ -584,6 +603,7 @@ class TestDeferredProbeDedupeFold:
             category='preexisting_main_break',
             summary='Pre-existing main-red (sibling probe)',
             dedupe_fingerprint=fp,
+            level=1,
         )
         escalation_queue.submit(parent)
 
@@ -796,6 +816,13 @@ class TestAutoHealMainHealthDeferredHappyPath:
             f'outcome; got {esc.dedupe_fingerprint!r} vs '
             f'{outcome.dedupe_fingerprint!r}'
         )
+        assert esc.level == 1, (
+            f'The halt-owner escalation must be L1; got {esc.level}'
+        )
+        assert esc.suggested_action == MainHealthNextAction.AUTO_HEAL_IN_FLIGHT, (
+            f'The halt owner names the in-flight auto-heal; got '
+            f'{esc.suggested_action!r}'
+        )
         esc_id = esc.id
 
         sig = RetryLedger.compute_merge_outcome_signature(
@@ -899,6 +926,13 @@ class TestAutoHealMainHealthDeferredGuards:
             f'Expected category=preexisting_main_break; got '
             f'{pending[0].category!r}'
         )
+        assert pending[0].level == 1, (
+            f'Expected level 1; got {pending[0].level}'
+        )
+        assert pending[0].suggested_action == MainHealthNextAction.NO_FIX_OWNER, (
+            f'A non-mechanical break has no fix owner; got '
+            f'{pending[0].suggested_action!r}'
+        )
 
     def test_attempt_cap_hard_escalates_without_halt_or_spawn(
         self, tmp_path: Path,
@@ -935,6 +969,13 @@ class TestAutoHealMainHealthDeferredGuards:
             f'Expected exactly one preexisting_main_break escalation to be '
             f'filed; got {pending}'
         )
+        assert pending[0].level == 1, (
+            f'Expected level 1; got {pending[0].level}'
+        )
+        assert pending[0].suggested_action == MainHealthNextAction.AUTO_HEAL_EXHAUSTED, (
+            f'An attempt-capped re-break has exhausted the auto-heal; got '
+            f'{pending[0].suggested_action!r}'
+        )
 
     def test_already_halted_no_second_attempt_or_spawn(
         self, tmp_path: Path,
@@ -951,15 +992,17 @@ class TestAutoHealMainHealthDeferredGuards:
             'compile_error', outcome.failure_cause_hint, outcome.reason,
         )
 
-        # Simulates a concurrent auto-heal already in flight — halted
-        # directly (not via a prior _auto_heal_main_health_deferred call),
-        # mirroring test_merge_queue_auto_heal.py's TestAutoHealIdempotency.
+        # Simulates THIS signature's auto-heal already in flight — its
+        # attempt recorded and the lane halted directly (not via a prior
+        # _auto_heal_main_health_deferred call).  A lane halted by anything
+        # else is task 5471's foreign-halt branch, not this one.
+        worker.auto_heal_registry.record_attempt(sig)
         worker.halt_lane('normal', 'x')
 
         asyncio.run(worker._auto_heal_main_health_deferred(outcome, req))
 
         worker._spawn_main_health_fix_task.assert_not_awaited()
-        assert worker.auto_heal_registry.attempts(sig) == 0, (
+        assert worker.auto_heal_registry.attempts(sig) == 1, (
             f'The idempotency branch must NOT record a second attempt; got '
             f'{worker.auto_heal_registry.attempts(sig)}'
         )
@@ -967,6 +1010,13 @@ class TestAutoHealMainHealthDeferredGuards:
         assert len(pending) == 1, (
             f'Expected the idempotency branch to still file/fold exactly one '
             f'pending escalation; got {pending}'
+        )
+        assert pending[0].level == 1, (
+            f'Expected level 1; got {pending[0].level}'
+        )
+        assert pending[0].suggested_action == MainHealthNextAction.AUTO_HEAL_IN_FLIGHT, (
+            f'The idempotency branch files the halt owner; got '
+            f'{pending[0].suggested_action!r}'
         )
 
     def test_no_escalation_queue_escalates_only_without_raising_or_halting(
@@ -1409,3 +1459,117 @@ class TestDeferredProbeOriginHostTelemetry:
             f'A stale-main probe verdict must emit no main_health_red event; '
             f'got {calls}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3788: the classifier's task-mu fork hands a flake it suppressed to a
+# sink both probe sites bind to the flake recorder.
+# ---------------------------------------------------------------------------
+
+_PROBED_MAIN_SHA = 'c3' * 20
+
+
+def _classifier_that_suppresses() -> AsyncMock:
+    """A classifier double that does what the mu fork does on an isolated pass:
+    hand the observation to the sink, then answer task-own."""
+    calls = iter(range(1_000))
+
+    async def classify(*args, flake_sink, **kwargs):
+        await flake_sink(
+            FlakeSuppression(
+                verdict=FlakeVerdict.passes_in_isolation,
+                test_ids=(f'orchestrator/tests/test_x.py::test_{next(calls)}',),
+                observed_at=datetime.now(UTC).isoformat(),
+                call_site=FlakeCallSite.main_probe,
+                runner='local',
+                psi_cpu_some10=None,
+                unconfirmable_reason=None,
+            ),
+            _PROBED_MAIN_SHA,
+        )
+        return False, ''
+
+    return AsyncMock(side_effect=classify)
+
+
+class TestTheMuForkFlakeSinkIsWired:
+    @pytest.fixture(autouse=True)
+    def _fresh_storm_streak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(flake_recorder, '_merge_flake_suppression_streak', 0)
+
+    def test_the_deferred_probe_records_the_suppression_against_the_probed_sha(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        with patch(
+            'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+            new=_classifier_that_suppresses(),
+        ):
+            asyncio.run(_run_deferred_main_health_probe(
+                _make_git_ops(tmp_path), req, TEST_FAILURE_RESULT,
+                escalation_queue=escalation_queue,
+            ))
+
+        [row] = read_occurrences(ledger_db_path(config.project_root))
+        assert (row.call_site, row.merge_sha, row.task_id) == ('main_probe', _PROBED_MAIN_SHA, '99')
+        assert escalation_queue.get_pending() == []
+
+    def test_the_sync_probe_reaches_the_storm_escalation_through_its_queue(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _five_suppressions() -> list[object]:
+            return [
+                await _classify_main_health_red(
+                    _make_git_ops(tmp_path), req, TEST_FAILURE_RESULT, None,
+                    escalation_queue=escalation_queue,
+                )
+                for _ in range(5)
+            ]
+
+        with patch(
+            'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+            new=_classifier_that_suppresses(),
+        ):
+            outcomes = asyncio.run(_five_suppressions())
+
+        assert outcomes == [None] * 5
+        assert len(read_occurrences(ledger_db_path(config.project_root))) == 5
+        [storm] = escalation_queue.get_pending()
+        assert storm.task_id == 'merge-flake-suppression-storm'
+
+    def test_the_post_merge_verify_threads_its_queue_to_the_sync_probe(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _five_red_merges() -> None:
+            for _ in range(5):
+                await _run_post_merge_verify(
+                    _make_git_ops(tmp_path), req, merge_wt,
+                    timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+                    escalation_queue=escalation_queue,
+                    verifier=FakeVerifier(default=VerifyScript(result=TEST_FAILURE_RESULT)),
+                )
+
+        with patch(
+            'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+            new=_classifier_that_suppresses(),
+        ):
+            asyncio.run(_five_red_merges())
+
+        rows = read_occurrences(ledger_db_path(config.project_root))
+        assert sum(row.call_site == 'main_probe' for row in rows) == 5
+        assert [e.task_id for e in escalation_queue.get_pending()] == [
+            'merge-flake-suppression-storm',
+        ]

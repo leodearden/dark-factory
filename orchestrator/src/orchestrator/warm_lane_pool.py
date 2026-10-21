@@ -495,7 +495,7 @@ class WarmLanePool:
 
         Used by the on-disk backstop in ``acquire_warm_lane`` to restore the
         in-memory map after a process restart (when *lane* is discovered on
-        disk carrying *task_id*'s plan.json).  Does NOT change lane state —
+        disk carrying *task_id*'s metadata.json).  Does NOT change lane state —
         the caller must ensure the lane is ASSIGNED before calling.
 
         *task_id* is always a bare task id (e.g. ``'42'``), never a real

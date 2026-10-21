@@ -11,6 +11,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.config import (
     DEFAULT_TIER,
     PRIORITY_TIERS,
@@ -36,6 +37,7 @@ from orchestrator.config import (
     default_price_table,
     diff_config,
     load_config,
+    project_review_config,
 )
 
 
@@ -353,8 +355,8 @@ class TestDefaults:
             'RELOADABLE_FIELDS'
         )
         # task 4755: how old the in-flight fleet-redeploy lease may get before
-        # its readers stop believing it. DERIVED from the --drain verify-wait cap
-        # (worst legitimate sweep ~13,300s), not picked, and deliberately far
+        # its readers stop believing it. Fixed (a --drain sweep is fitted under
+        # it at scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS), and deliberately far
         # below the 8h min-interval so a lease leaked by a SIGKILLed sweep
         # delays at most one window. Red-tier / restart-only like its
         # siblings — captured at coordinator construction.
@@ -483,6 +485,46 @@ class TestDefaults:
         """
         with pytest.raises(ValidationError):
             OrchestratorConfig(terminal_status_hard_cancel_polls=0)
+
+    def test_wedged_slot_backstop_defaults_leave_room_for_the_bounded_cleanup(
+        self, monkeypatch, tmp_path,
+    ):
+        """Task 6660: one abandoned cleanup entry takes at most 3 grace windows
+        (its grace plus cancel_bounded's two), so the force-release backstop,
+        counted in watcher polls past the hard-cancel, must wait longer."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.terminal_cleanup_cancel_grace_secs == 120.0
+        assert config.terminal_status_force_release_polls == 15
+        assert (
+            config.terminal_status_force_release_polls * config.terminal_status_poll_interval_secs
+            > 3 * config.terminal_cleanup_cancel_grace_secs
+        )
+
+    def test_terminal_cleanup_cancel_grace_secs_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(terminal_cleanup_cancel_grace_secs=0)
+
+    def test_terminal_status_force_release_polls_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(terminal_status_force_release_polls=0)
+
+    def test_force_release_backstop_must_outlast_the_bounded_cleanup(self):
+        """Task 6660 (heuristic 10): a backstop no longer than one abandoned
+        entry's three grace windows is refused at load, naming both sides."""
+        with pytest.raises(ValidationError, match='must exceed') as excinfo:
+            OrchestratorConfig(
+                terminal_status_force_release_polls=4,
+                terminal_status_poll_interval_secs=30.0,
+                terminal_cleanup_cancel_grace_secs=40.0,
+            )
+        assert '120.0s' in str(excinfo.value)
+        OrchestratorConfig(
+            terminal_status_force_release_polls=5,
+            terminal_status_poll_interval_secs=30.0,
+            terminal_cleanup_cancel_grace_secs=40.0,
+        )
 
     def test_run_forever_idle_defaults(self, monkeypatch, tmp_path):
         """Run-forever idle + full-review rate-limit fields carry their defaults.
@@ -1769,17 +1811,20 @@ class TestVerifyRunnerConfig:
         """VerifyRunnerConfig parses from required str fields."""
         from orchestrator.config import VerifyRunnerConfig
 
-        cfg = VerifyRunnerConfig(name='laptop', ssh_host='laptop.local', git_remote='origin')
+        cfg = VerifyRunnerConfig(
+            name='laptop', ssh_host='laptop.local', git_remote='origin', df_checkout_path='/df',
+        )
         assert cfg.name == 'laptop'
         assert cfg.ssh_host == 'laptop.local'
         assert cfg.git_remote == 'origin'
 
     def test_verify_runner_config_defaults(self):
-        """config_path defaults None, enabled defaults True."""
+        """config_path and gate_checkouts_path default None, enabled defaults True."""
         from orchestrator.config import VerifyRunnerConfig
 
-        cfg = VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g')
+        cfg = VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g', df_checkout_path='/df')
         assert cfg.config_path is None
+        assert cfg.gate_checkouts_path is None
         assert cfg.enabled is True
 
     def test_verify_runner_config_explicit_values(self):
@@ -1796,12 +1841,50 @@ class TestVerifyRunnerConfig:
         assert cfg.config_path == '/etc/orch.yaml'
         assert cfg.enabled is False
 
-    def test_verify_runner_config_df_checkout_path_defaults_none(self):
-        """df_checkout_path defaults None — INV-2 auto-sync opt-in/off (task 2884)."""
+    def test_an_enabled_runner_without_df_checkout_path_is_rejected_by_name(self):
+        """A runner that cannot be gated is a config error, never a shared-tree dispatch (task 6565)."""
         from orchestrator.config import VerifyRunnerConfig
 
-        cfg = VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g')
+        with pytest.raises(ValidationError, match="verify_runners\\['laptop'\\].*df_checkout_path"):
+            VerifyRunnerConfig(name='laptop', ssh_host='h', git_remote='g')
+
+    @pytest.mark.parametrize('path', ['', 'relative/df'])
+    def test_a_non_absolute_df_checkout_path_is_rejected(self, path):
+        from orchestrator.config import VerifyRunnerConfig
+
+        with pytest.raises(ValidationError, match='absolute'):
+            VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g', df_checkout_path=path)
+
+    def test_a_disabled_runner_needs_no_df_checkout_path(self):
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g', enabled=False)
         assert cfg.df_checkout_path is None
+
+    def test_gate_paths_default_the_root_beside_the_source(self):
+        """design D2: <dirname(df_checkout_path)>/dark-factory-gate, absolute."""
+        from orchestrator.config import RemoteGatePaths, VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(
+            name='r', ssh_host='h', git_remote='g', df_checkout_path='/home/leo/src/dark-factory/',
+        )
+        assert cfg.gate_paths() == RemoteGatePaths(
+            source='/home/leo/src/dark-factory/', root='/home/leo/src/dark-factory-gate',
+        )
+
+    def test_an_explicit_gate_root_must_be_absolute(self):
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(
+            name='r', ssh_host='h', git_remote='g', df_checkout_path='/df',
+            gate_checkouts_path='/gates',
+        )
+        assert cfg.gate_paths().root == '/gates'
+        with pytest.raises(ValidationError, match='gate_checkouts_path'):
+            VerifyRunnerConfig(
+                name='r', ssh_host='h', git_remote='g', df_checkout_path='/df',
+                gate_checkouts_path='~/gates',
+            )
 
     def test_verify_runner_config_df_checkout_path_accepts_string(self):
         """df_checkout_path accepts a remote-host path string (task 2884)."""
@@ -1826,13 +1909,12 @@ class TestVerifyRunnerConfig:
         rebuilt = VerifyRunnerConfig(**dumped)
         assert rebuilt.df_checkout_path == '/remote/df'
 
-    def test_verify_runner_config_backcompat_block_without_df_checkout_path(self):
-        """An existing verify_runners block omitting df_checkout_path still validates
-        and defaults the field to None (back-compat — task 2884)."""
-        config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
-            {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
-        ])
-        assert config.verify_runners[0].df_checkout_path is None
+    def test_a_verify_runners_block_without_df_checkout_path_fails_validation(self):
+        """The pre-6565 opt-out is gone: an enabled runner must name its gate source."""
+        with pytest.raises(ValidationError, match='df_checkout_path'):
+            OrchestratorConfig.model_validate({'verify_runners': [
+                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+            ]})
 
     @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_verify_runners_defaults_empty(self):
@@ -1845,7 +1927,8 @@ class TestVerifyRunnerConfig:
         from orchestrator.config import VerifyRunnerConfig
 
         config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
-            {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+            {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin',
+             'df_checkout_path': '/df'},
         ])
         assert len(config.verify_runners) == 1
         assert isinstance(config.verify_runners[0], VerifyRunnerConfig)
@@ -1870,7 +1953,8 @@ class TestVerifyRunnerConfig:
     def test_enabled_verify_runners_filters_disabled(self):
         """enabled_verify_runners returns only runners with enabled=True."""
         config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
-            {'name': 'active', 'ssh_host': 'h1', 'git_remote': 'r1', 'enabled': True},
+            {'name': 'active', 'ssh_host': 'h1', 'git_remote': 'r1', 'enabled': True,
+             'df_checkout_path': '/df'},
             {'name': 'disabled', 'ssh_host': 'h2', 'git_remote': 'r2', 'enabled': False},
         ])
         enabled = config.enabled_verify_runners
@@ -1887,8 +1971,8 @@ class TestVerifyRunnerConfig:
     def test_enabled_verify_runners_all_when_all_enabled(self):
         """enabled_verify_runners returns all runners when all have enabled=True."""
         config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
-            {'name': 'r1', 'ssh_host': 'h1', 'git_remote': 'g1'},
-            {'name': 'r2', 'ssh_host': 'h2', 'git_remote': 'g2'},
+            {'name': 'r1', 'ssh_host': 'h1', 'git_remote': 'g1', 'df_checkout_path': '/df'},
+            {'name': 'r2', 'ssh_host': 'h2', 'git_remote': 'g2', 'df_checkout_path': '/df'},
         ])
         assert len(config.enabled_verify_runners) == 2
 
@@ -4574,3 +4658,51 @@ class TestInfoL0RouterConfig:
         assert live.info_l0_router_ticket_timeout_secs == 60.0
         assert live.info_l0_router_max_conversions_per_sweep == 5
         assert live.info_l0_note_detail_chars == 400
+
+
+class TestReviewerBriefingConfig:
+    """``review.reviewer_briefing`` selects the reviewer generation (task 5369).
+
+    Default diff-only, so every project keeps today's reviewer until an
+    operator flips it; green-tier, like every other review.* knob, so the
+    flip and its kill switch are a reload_config away.
+    """
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_the_default_is_diff_only(self):
+        assert OrchestratorConfig().review.reviewer_briefing is ReviewBriefing.DIFF_ONLY
+
+    def test_d2_parses_to_context_complete(self):
+        config = OrchestratorConfig.model_validate({'review': {'reviewer_briefing': 'd2'}})
+
+        assert config.review.reviewer_briefing is ReviewBriefing.CONTEXT_COMPLETE
+
+    def test_an_unknown_generation_is_rejected(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig.model_validate({'review': {'reviewer_briefing': 'd3'}})
+
+    def test_the_leaf_is_green_tier_reloadable(self):
+        assert 'review.reviewer_briefing' in RELOADABLE_FIELDS
+
+
+class TestProjectReviewConfig:
+    """``project_review_config`` reads another project's ``review`` block as its orchestrator would (task 5369)."""
+
+    def test_a_projects_override_is_layered_over_the_shipped_defaults(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'some-other-project.yaml'))
+        (tmp_path / 'dark-factory-orchestrator.yaml').write_text(
+            'review:\n  briefing_path: docs/review-conventions.yaml\n',
+        )
+
+        review = project_review_config(tmp_path)
+
+        assert review.briefing_path == 'docs/review-conventions.yaml'
+        assert review.reports_dir == _load_package_defaults()['review']['reports_dir']
+        assert os.environ['ORCH_CONFIG_PATH'] == str(tmp_path / 'some-other-project.yaml')
+
+    def test_a_project_without_a_config_file_gets_the_shipped_defaults(self, tmp_path: Path):
+        review = project_review_config(tmp_path)
+
+        assert review.briefing_path == _load_package_defaults()['review']['briefing_path']

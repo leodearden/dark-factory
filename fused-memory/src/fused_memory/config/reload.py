@@ -127,6 +127,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Retrieval width, tuned against measured recall on a running server rather
     # than by redeploying. Read live per write, same path as the flag above.
     'write_triage.candidate_k',
+    # The attach-guard knobs (task 7158): hand-set, read live per write by
+    # server/write_triage.py's resolvers; None is each rule's hot off-switch.
+    'write_triage.min_parent_cosine',
+    'write_triage.hoist_max_cosine_gap',
     # The write-triage JUDGE knobs (task 3128, PRD leaf gamma). Green-tier
     # for exactly the reason the two operator knobs above are: every one of
     # them is read LIVE off the shared memory_service.config.write_triage

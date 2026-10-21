@@ -1377,8 +1377,10 @@ class TestReconciliationDeterministicProvenancePrefixes:
 
     def test_default_is_orchestrator_only(self):
         """The orchestrator sends no agent_id, so tools.py::_resolve_identity
-        falls back to the clientInfo.name that mcp_lifecycle.py::
-        McpSession.initialize advertises — the literal 'orchestrator'."""
+        falls back to the clientInfo.name the orchestrator advertises
+        (orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY,
+        sent by shared/src/shared/mcp_session.py::McpSession.initialize) — the
+        literal 'orchestrator'."""
         assert ReconciliationConfig().deterministic_provenance_allowed_agent_prefixes == [
             'orchestrator',
         ]

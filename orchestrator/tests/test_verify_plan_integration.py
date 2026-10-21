@@ -227,7 +227,7 @@ _PYTEST_UV_DIRECTORY_RAW = (
 
 # The historical broken lint/type_check &&-chain (orchestrator/config.yaml:50)
 # — recognised-but-unstructurable (ruff + a follow-up script, not pytest/cargo
-# chain-aware), classifies OPAQUE, and must never be scoped (P1).
+# chain-aware), resolves RUFF raw-retained, and must never be scoped (P1).
 _LINT_CHAIN_RAW = (
     'uv run ruff check shared escalation fused-memory orchestrator dashboard && '
     'python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests '
@@ -245,7 +245,7 @@ class TestVerifyCmdRoundTrip:
     and ACTUALLY EXECUTED (runner side) against a throwaway probe file,
     proving the two sides agree on what "scoped" means. Row 2/P1 pins the
     real historical broken lint/type_check &&-chain (orchestrator/config.yaml:50)
-    as OPAQUE and never scoped.
+    as raw-retained and never scoped.
 
     RED until step-2 GREEN imports parse_config_command/render/ToolKind/
     scope_to/strip_cwd/VerifyCmd from orchestrator.verify_cmd and adds the
@@ -330,16 +330,17 @@ class TestVerifyCmdRoundTrip:
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert '1 passed' in proc.stdout
 
-    # ── scenario 2 / Row 2 / P1: OPAQUE is never scoped ──────────────────────
-    def test_opaque_lint_chain_is_never_scoped(self):
-        """The historical broken &&-chain classifies OPAQUE and scope_to no-ops on it.
+    # ── scenario 2 / Row 2 / P1: a raw-retained chain is never scoped ────────
+    def test_raw_retained_lint_chain_is_never_scoped(self):
+        """The historical broken &&-chain resolves RUFF, raw-retained, and scope_to no-ops on it.
 
         render(parse(x)) == x verbatim (raw retained unchanged) — this is the
         exact lint_command value at orchestrator/config.yaml:50 that regressed
         under the old string-surgery scoper.
         """
         cmd = parse_config_command(_LINT_CHAIN_RAW)
-        assert cmd.tool is ToolKind.OPAQUE
+        assert cmd.tool is ToolKind.RUFF
+        assert cmd.raw is not None
         assert scope_to(cmd, ['orchestrator/src/orchestrator/foo.py']) is cmd
         assert render(parse_config_command(_LINT_CHAIN_RAW)) == _LINT_CHAIN_RAW
 

@@ -4788,9 +4788,13 @@ class TestGetMergeQueue:
         async def fake_cleanup_merge_worktree(path):
             pass
 
+        async def not_on_main(ancestor, descendant):
+            return False
+
         git_ops_stub = types.SimpleNamespace(
             advance_main=fake_advance_main,
             cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            is_ancestor_checked=not_on_main,
             config=config,
         )
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
@@ -5186,9 +5190,13 @@ class TestGetMergeQueue:
         async def fake_cleanup_merge_worktree(path):
             pass
 
+        async def not_on_main(ancestor, descendant):
+            return False
+
         git_ops_stub = types.SimpleNamespace(
             advance_main=fake_advance_main,
             cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            is_ancestor_checked=not_on_main,
             config=config,
         )
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
@@ -5330,11 +5338,15 @@ class TestGetMergeQueue:
         async def fake_cleanup_merge_worktree(path):
             pass
 
+        async def not_on_main(ancestor, descendant):
+            return False
+
         # Deliberately NO _last_advanced_sha/_rebased_from/_rebased_onto —
         # the SHAs must ride the AdvanceOutcome return value alone (task 1997).
         git_ops_stub = types.SimpleNamespace(
             advance_main=fake_advance_main,
             cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            is_ancestor_checked=not_on_main,
             config=config,
         )
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]

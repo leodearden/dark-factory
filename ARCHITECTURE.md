@@ -196,10 +196,11 @@ for the whole fleet. Entry: `fused-memory/src/fused_memory/server/main.py`
   separate staleness pass *intends* at most one fleet-wide redeploy per 8
   hours (shared clock file `data/orchestrator/last_redeploy_orchestrator.json`,
   plus an in-flight lease), delegating to
-  `scripts/restart-all-orchestrators.sh --drain`, a two-stage drain that
-  halts merge admission and holds each unit's restart while a merge verify is
-  in flight, until it ends or passes its own deadline (a sweep-wide cap bounds
-  the wait; units on pre-5371 code keep the old merge-idle gate). Full
+  `scripts/restart-all-orchestrators.sh --drain`, a two-stage drain that,
+  as the sweep reaches each unit, halts its merge admission and holds its
+  restart while one of its merge verifies is in flight, until it ends or
+  passes its own deadline (a per-unit cap and a sweep-wide ceiling bound the
+  wait; units on pre-5371 code keep the old merge-idle gate). Full
   redeploy story (liveness vs. staleness vs. coordinator) in
   [OPERATIONS.md](OPERATIONS.md).
 
@@ -422,9 +423,11 @@ For a normal task, `TaskWorkflow._drive()`
    `integration test`, `design ... new`, `implement ... new feature`) and
    `metadata.force_full_path` isn't set, `_run_simple_task()` runs: **one**
    Sonnet agent (role `simple_task`) explores, plans, implements, and
-   commits in a single session. Success falls through to VERIFY; a terminal
-   outcome (done/blocked) ends the workflow there; anything else discards
-   the plan and runs the full architect path instead.
+   commits in a single session. Success falls through to VERIFY; any other
+   verdict ends the dispatch there — done, blocked, or a requeue when the
+   plan's file scope needs a module lock another task holds. Only a give-up
+   (no plan, no step marked done, agent failure) discards the plan and runs
+   the full architect path instead.
 3. **PLAN.** `architect` explores the codebase, verifies its premises, and
    builds a step-by-step TDD plan (alternating test-step, implementation-
    step) via plan-tools (`create_plan`/`add_plan_step`/`confirm_plan`).
@@ -833,6 +836,17 @@ Operators can inspect and pause the merge lane directly: `get_merge_queue()`
 gives a live snapshot (lane states, conflict graph, frozen prefix, metrics)
 that the event store alone can't reconstruct; `halt_merge_queue`/
 `unhalt_merge_queue`/`get_merge_halt_status` are operator-only controls.
+
+A remote verify host never runs whatever code its checkout happens to hold.
+Each dispatcher pushes its own deployed commit to the host as `refs/gate/<sha>`
+and verifies in an immutable per-sha gate checkout built from it
+(`orchestrator/src/orchestrator/remote_gate.py`, `remote_gate/ensure-gate.sh`),
+reached through the host's `orchestrator` shim via `ORCH_GATE_BIN`. Before any
+verify is spent a `gate-identity` handshake compares the gate's commit and
+verify-wire fingerprint with the dispatcher's. A host that fails it, or whose
+verify yields no usable verdict, is benched in the `skew` class (distinct from
+an unreachable `ru` bench) and re-admitted by a passing `ensure-gate`; see
+`OPERATIONS.md` §"Reading a verify-host bench".
 
 ---
 

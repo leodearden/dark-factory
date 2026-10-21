@@ -13,6 +13,7 @@ from orchestrator.offline_lane_filing import (
     EvidenceNote,
     build_lane_command_task_arguments,
     build_lane_fix_task_arguments,
+    covering_lane_task,
 )
 from orchestrator.offline_lane_filing import TestEvidence as _Evidence
 
@@ -373,3 +374,76 @@ def test_the_command_level_block_carries_the_lane_metadata_naming_its_pseudo_tes
     assert arguments['planning_mode'] is True
     assert arguments['priority'] == 'high'
     assert 'project_root' not in arguments
+
+
+OTHER_NODE = 'tests/test_other.py::test_two'
+THIRD_NODE = 'tests/test_third.py::test_three'
+OTHER_COMMAND = 'interpreter-matrix'
+LEGACY_METADATA = {
+    'spawn_context': 'offline_lane_red',
+    'failing_tests': [NODE],
+    'offline_lane_fingerprint': 'f00dfeed',
+}
+
+
+def _tasks(*metadatas) -> dict[str, dict]:
+    return {str(850 + i): {'metadata': metadata} for i, metadata in enumerate(metadatas)}
+
+
+def test_a_fix_task_built_by_this_module_covers_its_nodes_for_its_command_only():
+    metadata = _build([_test(), _test(node=OTHER_NODE)])['metadata']
+    tasks = _tasks(metadata)
+
+    assert covering_lane_task(tasks, COMMAND, NODE) == '850'
+    assert covering_lane_task(tasks, COMMAND, OTHER_NODE) == '850'
+    assert covering_lane_task(tasks, OTHER_COMMAND, NODE) is None
+    assert covering_lane_task(tasks, COMMAND, THIRD_NODE) is None
+
+
+def test_a_command_level_task_covers_its_pseudo_test_for_its_command_only():
+    tasks = _tasks(_command_level()['metadata'])
+
+    assert covering_lane_task(tasks, COMMAND, PSEUDO_NODE) == '850'
+    assert covering_lane_task(tasks, OTHER_COMMAND, PSEUDO_NODE) is None
+    assert covering_lane_task(tasks, COMMAND, NODE) is None
+
+
+@pytest.mark.parametrize('command', [COMMAND, OTHER_COMMAND])
+def test_a_pre_cutover_task_covers_its_failing_tests_for_any_command(command):
+    tasks = _tasks(LEGACY_METADATA)
+
+    assert covering_lane_task(tasks, command, NODE) == '850'
+    assert covering_lane_task(tasks, command, OTHER_NODE) is None
+
+
+@pytest.mark.parametrize(
+    'metadata',
+    [
+        {'failing_tests': [NODE]},
+        {'spawn_context': 'merge_skew', 'failing_tests': [NODE]},
+        {'spawn_context': 'merge_skew', 'x_offline_lane': {'command': COMMAND, 'nodes': [NODE]}},
+        'offline_lane_red',
+        None,
+        {'spawn_context': 'offline_lane_red', 'x_offline_lane': {'command': COMMAND, 'nodes': NODE}},
+        {'spawn_context': 'offline_lane_red', 'failing_tests': NODE},
+    ],
+    ids=[
+        'no-spawn-context',
+        'other-spawn-context-legacy',
+        'other-spawn-context-lane',
+        'metadata-a-string',
+        'metadata-none',
+        'nodes-not-a-list',
+        'failing-tests-not-a-list',
+    ],
+)
+def test_nothing_is_covered_by_a_task_that_is_not_a_well_formed_lane_task(metadata):
+    assert covering_lane_task(_tasks(metadata), COMMAND, NODE) is None
+
+
+def test_the_first_covering_task_in_mapping_order_wins_and_its_id_is_returned_as_given():
+    lane = _build()['metadata']
+    tasks = {'869': {'metadata': lane}, '850': {'metadata': LEGACY_METADATA}}
+
+    assert covering_lane_task(tasks, COMMAND, NODE) == '869'
+    assert covering_lane_task(dict(reversed(tasks.items())), COMMAND, NODE) == '850'

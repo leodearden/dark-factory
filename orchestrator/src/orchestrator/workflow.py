@@ -69,10 +69,11 @@ from shared.transcript_archive import (
 )
 
 from orchestrator import chronic_flake
+from orchestrator.agents.briefing import PriorAttemptCause, VerifyAttemptContext
 from orchestrator.agents.invoke import AgentResult, invoke_agent
+from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.agents.roles import (
     _ESCALATION_TOOLS,
-    ALL_REVIEWERS,
     ARCHITECT,
     DEBUGGER,
     IMPLEMENTER,
@@ -83,6 +84,7 @@ from orchestrator.agents.roles import (
     SIMPLE_TASK,
     STEWARD,
     AgentRole,
+    reviewers_for,
 )
 from orchestrator.agents.triage import suggestion_hash
 from orchestrator.agents.write_set import (
@@ -117,6 +119,14 @@ from orchestrator.git_ops import (
     _run,
     is_wip_safety_commit,
 )
+from orchestrator.main_health_actions import MainHealthNextAction
+from orchestrator.main_health_fix_owner import (
+    FixOwner,
+    FixSpawnContext,
+    MainBreak,
+    build_main_fix_task_arguments,
+    ensure_main_fix_owner,
+)
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
 from orchestrator.merge_lane.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
@@ -127,6 +137,9 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_reported_landing,
 )
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.recut_ruling import ruling_to_enforce
+from orchestrator.review_inputs import gather_review_subject, review_fork_point
+from orchestrator.review_outcome import review_completed_payload
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.routing import (
     PlanShape,
@@ -579,11 +592,16 @@ class _BriefingLike(Protocol):
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = ...,
         task_id: str | None = ...,
+        *, attempt_context: VerifyAttemptContext | None = ...,
     ) -> str: ...
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = ...,
         *, amendment_suggestions: list[dict] | None = ...,
         task: dict | None = ...,
+    ) -> str: ...
+    async def build_context_complete_reviewer_prompt(
+        self, reviewer_type: str, subject: ReviewSubject, context: str | None = ...,
+        *, amendment_suggestions: list[dict] | None = ...,
     ) -> str: ...
     async def build_merger_prompt(self, conflicts: str, task_intent: str) -> str: ...
     async def build_revalidation_prompt(
@@ -715,9 +733,11 @@ def compute_preexisting_main_break_fingerprint(
 ) -> str:
     """Shared fingerprint for preexisting-main-break escalations.
 
-    Composes the same triple used by _verify_debugfix_loop inline so that
-    task-verify escalations and merge-queue escalations for the SAME broken
-    main fold into ONE parent via submit_or_dedupe.
+    Composes the same triple used by _verify_debugfix_loop inline, so every
+    escalation for the SAME broken main shares one fingerprint.
+    submit_or_dedupe folds only within a ladder level
+    (escalation/dedupe.py::find_dedupe_parent): the task-verify L0s fold into
+    one parent, and the merge-lane L1s into another.
 
     Returns '' on any exception (fail-safe — an empty fingerprint triggers
     the raw-submit path, not a crash).
@@ -2559,6 +2579,9 @@ class TaskWorkflow:
                     else None
                 ),
                 train=cast(TrainMembership, train_meta) if isinstance(train_meta, dict) else None,
+                # Redundant second enforcement of the harness gate's ruling
+                # (orchestrator/recut_ruling.py), from the same dispatch snapshot.
+                recut_ruling=ruling_to_enforce(self.task),
             )
             self.worktree = worktree_info.path
             self._reify_debug_port = worktree_info.reify_debug_port
@@ -2830,31 +2853,26 @@ class TaskWorkflow:
             # declaration.  The priority guard and file/lock-footprint
             # caps are intentionally absent — a simple task may be
             # high-priority or span several files as long as the change is
-            # mechanically simple.  Falls through to the architect path on
-            # any failure (no plan written, unactionable artifact, no steps
-            # marked done).  metadata.force_full_path is the hard escape
+            # mechanically simple.  Falls through to the architect path when
+            # SIMPLE_TASK gives up (no plan written, no steps marked done,
+            # agent failure).  metadata.force_full_path is the hard escape
             # that always forces the full path.
             if self._should_run_simple_task():
                 self._enter_phase(WorkflowState.PLAN)
                 simple_outcome = await self._run_simple_task()
-                if simple_outcome == WorkflowOutcome.PLANNED:
-                    # Plan written + step(s) marked done by SIMPLE_TASK.
-                    # _execute_iterations will see no pending steps and
-                    # return cleanly, allowing VERIFY to take over.
-                    pass  # fall through to the post-PLAN section below
-                elif simple_outcome != WorkflowOutcome.REQUEUED:
-                    # An exit handler's verdict (DONE, BLOCKED, ESCALATED,
-                    # CANCELLED) ends this dispatch.
-                    return simple_outcome
-                else:
-                    # Fallthrough sentinel — drop the plan so the
-                    # architect path runs cleanly.
+                if simple_outcome is None:
+                    # SIMPLE_TASK gave up — drop the plan so the architect
+                    # path runs cleanly.
                     if self.artifacts is not None:
                         plan_path = self.artifacts.root / 'plan.json'
                         plan_path.unlink(missing_ok=True)
                         (self.artifacts.root / 'plan.lock').unlink(
                             missing_ok=True,
                         )
+                elif simple_outcome != WorkflowOutcome.PLANNED:
+                    # Any other verdict, REQUEUED included, already settled
+                    # this dispatch and ends it.
+                    return simple_outcome
 
             # PLAN (skip if initial_plan was provided — eval mode, or if
             # the SIMPLE_TASK path above already populated self.plan)
@@ -3477,12 +3495,17 @@ class TaskWorkflow:
         :class:`WorkflowCancelled`, caught at this EXACTLY ONE site.
         """
         cancel_kind: Literal['hard', 'soft'] | None = None
-        scope = CancellationScope(self._cancel_event, self._on_terminal_cleanups())
+        scope = CancellationScope(
+            self._cancel_event, self._on_terminal_cleanups(),
+            cancel_grace_secs=self.config.terminal_cleanup_cancel_grace_secs,
+        )
         try:
             outcome = await scope.supervise(self._drive())
         except WorkflowCancelled as wc:
             cancel_kind = wc.kind
             outcome = await self._finalise_cancellation(wc.kind)
+        finally:
+            self._record_abandoned_cleanup(scope.abandoned_entries)
         report = (
             self._terminal_report
             if (
@@ -3511,6 +3534,29 @@ class TaskWorkflow:
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
         return report
+
+    def _record_abandoned_cleanup(self, entries: tuple[str, ...]) -> None:
+        """Make a bounded-but-wedged terminal cleanup loud (task 6660, INV-11).
+
+        An event and an ERROR, no escalation: the scope did return, so the
+        slot and its module locks are released as usual.  A slot that never
+        returns is the harness's to report: ``workflow_slot_wedged``, from
+        ``orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot``.
+        """
+        if not entries:
+            return
+        logger.error(
+            'Task %s: terminal cleanup abandoned %s after a hard-cancel; the '
+            'slot is released, but whatever those entries own may be left behind',
+            self.task_id, list(entries),
+        )
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.workflow_cleanup_abandoned,
+                task_id=self.task_id,
+                phase=self.machine.state.value,
+                data={'entries': list(entries)},
+            )
 
     async def _exit_status_facts(
         self, cancel_kind: Literal['hard', 'soft'] | None,
@@ -3988,6 +4034,12 @@ class TaskWorkflow:
                 merge_phase=True,
             )
             if merge_outcome == WorkflowOutcome.DONE:
+                # Closed without a merge (found on main): nothing to finalise —
+                # same as _recover_before_merge's terminal DONE.
+                if self.machine.is_terminal():
+                    await self._clear_merge_retry_pending()
+                    await self._clear_merge_phase_entered()
+                    return merge_outcome
                 break
             if merge_outcome != WorkflowOutcome.REQUEUED:
                 # BLOCKED / ESCALATED — exit slot. A soft-cancel inside
@@ -4533,9 +4585,12 @@ class TaskWorkflow:
         ``self.modules`` is left UNCHANGED (the scheduler has already
         persisted ``metadata.files=plan_files`` and requeued the task to
         pending on its own). Either way it returns the scheduler's
-        ``BlastRadiusResult`` — callers decide what "not applied" means for
-        their own flow (REQUEUED report, decline-and-fall-through-to-architect,
-        or silent no-op).
+        ``BlastRadiusResult``. A not-applied result means the scheduler has
+        already taken the row out of this slot's hands: either it re-pended
+        the row and released every lock, or (``repend_error``) that write
+        failed with the locks still held. The caller's only correct response
+        is to exit through ``_requeue_on_lock_conflict``;
+        ``_apply_revalidation_skip`` still falls through instead (task 6119).
         """
         new_modules = derive_modules(
             plan_files, self.config.lock_depth, task_id=self.task_id,
@@ -4670,13 +4725,14 @@ class TaskWorkflow:
         lock conflict, stash it on ``self._terminal_report``, and return
         ``WorkflowOutcome.REQUEUED`` (task 2874 amendment).
 
-        Shared by the three sites that convert "the scheduler couldn't
+        Shared by the four sites that convert "the scheduler couldn't
         acquire an additional module lock for a widened file scope" into a
-        requeue: ``_plan()``'s blast-radius path, the escalation-resume
-        scope-grant path, and ``_execute_verify_review_loop()``'s
-        post-replan reconcile. *files* is the full target file set the
-        caller wanted scope to cover (not just the delta) — the missing
-        locks are re-derived from it here so the diagnostic always reflects
+        requeue: ``_plan()``'s blast-radius path, ``_run_simple_task()``'s
+        scope refinement, the escalation-resume scope-grant path, and
+        ``_execute_verify_review_loop()``'s post-replan reconcile. *files*
+        is the full target file set the caller wanted scope to cover (not
+        just the delta) — the missing locks are re-derived from it here so
+        the diagnostic always reflects
         the actual unavailable modules on the same basis as the real
         conflict detection in ``_reconcile_scope_locks``. *reason* is the
         ``TerminalReport.reason`` string callers (and the retry-cap report)
@@ -4841,9 +4897,11 @@ class TaskWorkflow:
           ``BlastRadiusResult.repend_error``, which
           ``_requeue_on_lock_conflict`` hands to the exit-write ledger.
           Routing it through here would be a duplicate write.
-        * ``_run_simple_task`` — its REQUEUED is an internal fall-through
-          sentinel, consumed by ``_drive()``'s ``else:`` arm (drop the plan,
-          run the architect path); it is never returned to the harness.
+        * ``_run_simple_task`` — it no longer uses REQUEUED as a
+          fall-through (its give-up sentinel is ``None``). Any REQUEUED it
+          returns is either ``_requeue_on_lock_conflict``'s (the bullet
+          above) or an exit handler's verdict, whose status write that
+          handler made.
 
         So the strand class this helper closes IS closed for the exits that
         can produce it.  A future REQUEUED return that EXITS the slot is a new
@@ -5265,12 +5323,11 @@ class TaskWorkflow:
             # work is on the BRANCH, not main — but more decisive than a
             # re-looping blocking_dependency); blocking_dependency may re-loop
             # the architect.
-            if self.artifacts.read_unactionable_task() is not None:
-                return await self._handle_unactionable_task_report()
-            if self.artifacts.read_false_premise() is not None:
-                return await self._handle_false_premise_report()
-            if self.artifacts.read_already_done() is not None:
-                return await self._handle_already_done_report()
+            verdict = await self._route_task_verdict_report()
+            if verdict is not None:
+                return verdict
+            # ready_to_merge / blocking_dependency are branch-scoped, so they
+            # sit outside the task-verdict router.
             if self.artifacts.read_ready_to_merge() is not None:
                 return await self._handle_ready_to_merge_report()
             # Fix B: the architect may have written a blocking_dependency
@@ -5662,7 +5719,7 @@ class TaskWorkflow:
             and not RoutingState.from_metadata(metadata).simple_saturated
         )
 
-    async def _run_simple_task(self) -> WorkflowOutcome:
+    async def _run_simple_task(self) -> WorkflowOutcome | None:
         """Lever C — single-agent simple-task path.
 
         Dispatches the SIMPLE_TASK role (sonnet) to explore, register a
@@ -5675,8 +5732,9 @@ class TaskWorkflow:
                 invoking the implementer.
             ``DONE`` — SIMPLE_TASK reported the work is already on main.
             ``BLOCKED`` — SIMPLE_TASK reported the task is unactionable.
-            ``REQUEUED`` (sentinel) — SIMPLE_TASK gave up partway; caller
-                falls through to the architect path.
+            An exit handler may also return ``REQUEUED`` or another verdict.
+            ``None`` — SIMPLE_TASK gave up partway; the caller drops the plan
+                and falls through to the architect path.
         """
         assert self.worktree is not None and self.artifacts is not None
 
@@ -5693,7 +5751,7 @@ class TaskWorkflow:
                 'falling through to architect path',
                 self.task_id, exc,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
 
         if not result.success:
             cls = classify_agent_failure(result)
@@ -5711,23 +5769,22 @@ class TaskWorkflow:
                 'falling through to architect path',
                 self.task_id, cls.kind.value,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
 
         # Architect-style escape hatches — same artifacts so the existing
         # handlers work unchanged.
-        if self.artifacts.read_unactionable_task() is not None:
-            return await self._handle_unactionable_task_report()
-        if self.artifacts.read_false_premise() is not None:
-            return await self._handle_false_premise_report()
-        if self.artifacts.read_already_done() is not None:
-            return await self._handle_already_done_report()
+        verdict = await self._route_task_verdict_report()
+        if verdict is not None:
+            return verdict
+        # ready_to_merge / blocking_dependency are branch-scoped, so they sit
+        # outside the task-verdict router.
         if self.artifacts.read_ready_to_merge() is not None:
             return await self._handle_ready_to_merge_report()
         if self.artifacts.read_blocking_dependency() is not None:
             # Falling through — the architect path's
             # _handle_blocking_dep_report logic re-acquires base_commit
             # context and registers the dependency cleanly.
-            return WorkflowOutcome.REQUEUED
+            return None
 
         plan = self.artifacts.read_plan()
         if not plan or not plan.get('steps'):
@@ -5735,7 +5792,7 @@ class TaskWorkflow:
                 'Task %s: SIMPLE_TASK wrote no plan — falling through',
                 self.task_id,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
 
         # Verify at least one step is done — the SIMPLE_TASK contract is
         # plan + implement + mark-done. Anything less and we let the
@@ -5752,7 +5809,7 @@ class TaskWorkflow:
                 'falling through to architect path',
                 self.task_id,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
 
         # Stamp provenance + acquire plan lock (same shape as _plan()).
         try:
@@ -5763,18 +5820,21 @@ class TaskWorkflow:
                 'falling through',
                 self.task_id, exc,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
         self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id)
         self.plan = self.artifacts.read_plan()
 
-        # Refresh module assignments from the plan's files (handles the
-        # case where the SIMPLE_TASK agent expanded scope by one file).
+        # A conflict means the scheduler already re-pended the row and
+        # released every lock (or, with repend_error, failed that write with
+        # the locks held), so this dispatch exits here.
         plan_files = self.plan.get('files', [])
-        if plan_files:
-            # Silent no-op on lock conflict (same as before this was
-            # extracted into _reconcile_scope_locks): SIMPLE_TASK doesn't
-            # fail out here, it just doesn't re-tighten the lock.
-            await self._reconcile_plan_scope(plan_files)
+        if plan_files and not (
+            scope := await self._reconcile_plan_scope(plan_files)
+        ).applied:
+            return await self._requeue_on_lock_conflict(
+                scope, plan_files, 'plan_blast_radius_lock_conflict',
+                'SIMPLE_TASK plan expansion',
+            )
 
         await self._stamp_optimistic_path('simple_task')
 
@@ -7031,7 +7091,37 @@ class TaskWorkflow:
         await self.scheduler.set_task_status(self.task_id, 'pending')
         return WorkflowOutcome.REQUEUED
 
-    async def _handle_already_done_report(self) -> WorkflowOutcome:
+    async def _route_task_verdict_report(
+        self, *, merge_phase: bool = False,
+    ) -> WorkflowOutcome | None:
+        """Dispatch the architect's task-verdict exit artifact, if one exists.
+
+        The three verdicts about the TASK itself, in decisiveness order:
+        ``unactionable_task`` and ``false_premise`` (straight to a level-1
+        escalation, bypassing the steward), then ``already_done`` (a clean
+        DONE).  Returns ``None`` when none is present.  The branch-scoped
+        exits (``ready_to_merge``, ``blocking_dependency``) are deliberately
+        not routed here.  *merge_phase* is forwarded to every handler so a
+        refusal parks the row the way the in-slot merge retry expects.
+        """
+        assert self.artifacts is not None
+        if self.artifacts.read_unactionable_task() is not None:
+            return await self._handle_unactionable_task_report(
+                merge_phase=merge_phase,
+            )
+        if self.artifacts.read_false_premise() is not None:
+            return await self._handle_false_premise_report(
+                merge_phase=merge_phase,
+            )
+        if self.artifacts.read_already_done() is not None:
+            return await self._handle_already_done_report(
+                merge_phase=merge_phase,
+            )
+        return None
+
+    async def _handle_already_done_report(
+        self, *, merge_phase: bool = False,
+    ) -> WorkflowOutcome:
         """Process a ``.task/already_done.json`` report from the architect.
 
         Caller has already verified the artifact exists.
@@ -7085,6 +7175,7 @@ class TaskWorkflow:
                 'Architect wrote malformed already_done.json '
                 '(missing commit)',
                 detail=json.dumps(report, indent=2)[:2000],
+                merge_phase=merge_phase,
             )
 
         main_sha = await self.git_ops.get_main_sha()
@@ -7097,6 +7188,7 @@ class TaskWorkflow:
                     f'commit: {commit}\nmain_sha: {main_sha}\n'
                     f'evidence: {evidence}'
                 )[:2000],
+                merge_phase=merge_phase,
             )
 
         metadata = self.task.get('metadata') or {}
@@ -7110,7 +7202,7 @@ class TaskWorkflow:
         )
         if not verdict.accepted or verdict.evidence_sha is None:
             return await self._hold_unattributed_already_done(
-                branch, verdict, commit, evidence,
+                branch, verdict, commit, evidence, merge_phase=merge_phase,
             )
 
         block = await self._delivered_checks_block(
@@ -7127,6 +7219,7 @@ class TaskWorkflow:
                     f'failed_check: {block.failed_check}\n'
                     f'evidence: {evidence}'
                 )[:2000],
+                merge_phase=merge_phase,
             )
 
         logger.info(
@@ -7156,12 +7249,14 @@ class TaskWorkflow:
             return await self._mark_blocked(
                 f'Architect already_done rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
+                merge_phase=merge_phase,
             )
         self._enter_phase(WorkflowState.DONE)
         return WorkflowOutcome.DONE
 
     async def _hold_unattributed_already_done(
         self, branch: str, verdict: LandingVerdict, commit: str, evidence: str,
+        *, merge_phase: bool = False,
     ) -> WorkflowOutcome:
         """Hold an uncorroborated already_done report BLOCKED behind one L1.
 
@@ -7195,6 +7290,7 @@ class TaskWorkflow:
                 f'evidence: {evidence}'
             )[:2000],
             skip_escalation=held,
+            merge_phase=merge_phase,
         )
 
     async def _handle_ready_to_merge_report(self) -> WorkflowOutcome:
@@ -7843,7 +7939,9 @@ class TaskWorkflow:
             self.task_id, esc.id, status,
         )
 
-    async def _handle_unactionable_task_report(self) -> WorkflowOutcome:
+    async def _handle_unactionable_task_report(
+        self, *, merge_phase: bool = False,
+    ) -> WorkflowOutcome:
         """Process a ``.task/unactionable_task.json`` report from the architect.
 
         Caller has already verified the artifact exists.
@@ -7876,15 +7974,19 @@ class TaskWorkflow:
                 '(missing reason)',
                 detail=json.dumps(report, indent=2)[:2000],
                 escalate_to_human=True,
+                merge_phase=merge_phase,
             )
 
         return await self._mark_blocked(
             f'Architect reported task unactionable: {reason}',
             detail=f'reason: {reason}\nevidence: {evidence}'[:2000],
             escalate_to_human=True,
+            merge_phase=merge_phase,
         )
 
-    async def _handle_false_premise_report(self) -> WorkflowOutcome:
+    async def _handle_false_premise_report(
+        self, *, merge_phase: bool = False,
+    ) -> WorkflowOutcome:
         """Process a ``.task/false_premise.json`` report from the architect.
 
         Caller has already verified the artifact exists.
@@ -7919,6 +8021,7 @@ class TaskWorkflow:
                 detail=json.dumps(report, indent=2)[:2000],
                 escalate_to_human=True,
                 category='design_concern',
+                merge_phase=merge_phase,
             )
         else:
             result = await self._mark_blocked(
@@ -7930,6 +8033,7 @@ class TaskWorkflow:
                 )[:2000],
                 escalate_to_human=True,
                 category='design_concern',
+                merge_phase=merge_phase,
             )
         # Clear only after the L1 escalation has been successfully submitted —
         # if _mark_blocked raises, the artifact survives for the next retry.
@@ -7940,8 +8044,9 @@ class TaskWorkflow:
         """Stable digest of the review-input identity for the verdict cache.
 
         Captures what determines the reviewers that WOULD run — the active
-        reviewer roster (``ALL_REVIEWERS``) plus, per reviewer role, its
-        configured model (``config.models`` at the ``_config_key`` collapsed
+        reviewer roster (``reviewers_for`` the configured generation) plus,
+        per reviewer role, its prompt harness version, its configured model
+        (``config.models`` at the ``_config_key`` collapsed
         key the resolver itself reads — reviewer* → ``reviewer``), its
         role-default model, and any per-task ``metadata.model_overrides`` pin
         (keyed by the FULL role name, matching the resolver's override layer)
@@ -7967,7 +8072,7 @@ class TaskWorkflow:
             if not isinstance(overrides, dict):
                 overrides = {}
             roster = []
-            for role in ALL_REVIEWERS:
+            for role in reviewers_for(self.config.review.reviewer_briefing):
                 # config.models uses the reviewer* → 'reviewer' collapsed key
                 # (the resolver's own _config_key); metadata.model_overrides
                 # uses the FULL role name (the collapsed key is inert there).
@@ -7979,6 +8084,7 @@ class TaskWorkflow:
                         None if configured is None else str(configured),
                         str(role.default_model),
                         None if override is None else str(override),
+                        str(role.prompt_harness_version),
                     ]
                 )
             payload = json.dumps(sorted(roster), sort_keys=True)
@@ -7990,6 +8096,16 @@ class TaskWorkflow:
                 self.task_id, exc,
             )
             return None
+
+    def _emit_review_completed(self, cycle: int, reviews: ReviewAggregation) -> None:
+        if self.event_store is None:
+            return
+        self.event_store.emit(
+            EventType.review_completed,
+            task_id=self.task_id,
+            phase='review',
+            data=review_completed_payload(cycle, reviews),
+        )
 
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""
@@ -8159,13 +8275,8 @@ class TaskWorkflow:
                             block_status='infra-hold',
                         )
                     if self._inherited_break_info is not None:
-                        info = self._inherited_break_info
-                        return await self._mark_blocked(
-                            info['reason'],
-                            detail=info['detail'],
-                            category=info['category'],
-                            dedupe_fingerprint=info['fingerprint'],
-                            suggested_action='await_preexisting_main_hotfix',
+                        return await self._block_on_inherited_break(
+                            self._inherited_break_info,
                         )
                     detail = self._last_verify_result.failure_report() if self._last_verify_result else ''
                     return await self._mark_blocked('Verification attempts exhausted', detail=detail)
@@ -8355,6 +8466,7 @@ class TaskWorkflow:
                     )
                     continue  # re-loop: EXECUTE → VERIFY → REVIEW
 
+                self._emit_review_completed(review_cycle + 1, reviews)
                 # Cap exhausted or nothing in-scope — existing DONE path.
                 # Route suggestions directly to the curator intake (fire-and-
                 # forget); fall back to memory write when there are none.
@@ -8388,6 +8500,7 @@ class TaskWorkflow:
                 self.artifacts.set_review_counters(
                     review_cycles_total=review_cycle
                 )
+            self._emit_review_completed(review_cycle, reviews)
 
             # Archive reviews from this cycle before re-plan overwrites them
             if self.artifacts:
@@ -10311,6 +10424,7 @@ class TaskWorkflow:
         """Run verification, invoke debugger on failures."""
         assert self.worktree is not None and self.artifacts is not None
         verify_attempt = 0
+        prior_causes: list[PriorAttemptCause] = []
 
         while True:
             # Fix 3: rebase onto main BEFORE each verify (including the first).
@@ -10376,14 +10490,18 @@ class TaskWorkflow:
                 fp = compute_preexisting_main_break_fingerprint(
                     result.category or '', result.cause_hint, _probe_sha,
                 )
+                inherited_reason = (
+                    f'Verify failure is preexisting on main '
+                    f'(category={result.category!r}): {result.cause_hint[:120]}'
+                )
                 self._inherited_break_info = {
-                    'reason': (
-                        f'Verify failure is preexisting on main '
-                        f'(category={result.category!r}): {result.cause_hint[:120]}'
-                    ),
+                    'reason': inherited_reason,
                     'detail': result.failure_report(),
                     'category': 'preexisting_main_break',
                     'fingerprint': fp,
+                    'main_break': MainBreak(
+                        result.category or '', result.cause_hint or '', inherited_reason,
+                    ),
                 }
                 logger.warning(
                     'Task %s: verify failure classified as inherited from main '
@@ -10449,11 +10567,24 @@ class TaskWorkflow:
             # Invoke debugger
             self.plan = self.artifacts.read_plan()
             failure_report = result.failure_report()
+            attempt_context = VerifyAttemptContext(
+                attempt=verify_attempt,
+                max_attempts=self.config.max_verify_attempts,
+                prior_causes=tuple(prior_causes),
+            )
 
-            async def build_prompt(failure_report: str = failure_report) -> str:
+            async def build_prompt(
+                failure_report: str = failure_report,
+                attempt_context: VerifyAttemptContext = attempt_context,
+            ) -> str:
                 return await self.briefing.build_debugger_prompt(
                     failure_report, self._live_plan(), task_id=self.task_id,
+                    attempt_context=attempt_context,
                 )
+
+            prior_causes.append(PriorAttemptCause(
+                category=result.category, cause=result.cause_hint or result.summary,
+            ))
 
             pre_head = await self._get_head_commit()
             debug_result = await self._invoke(DEBUGGER, build_prompt, self.worktree)
@@ -10745,11 +10876,21 @@ class TaskWorkflow:
         enforceable guarantee; this only reduces wasted reviewer effort.
         """
         assert self.worktree is not None and self.artifacts is not None
-        base_commit = self.artifacts.read_base_commit()
-        if base_commit:
-            diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
+        briefing = self.config.review.reviewer_briefing
+        roster = reviewers_for(briefing)
+        subject = None
+        if briefing is ReviewBriefing.CONTEXT_COMPLETE:
+            try:
+                subject = await self._context_complete_review_subject()
+            except Exception as exc:
+                return self._review_inputs_unavailable(roster, exc)
+            diff = subject.change.diff
         else:
-            diff = await self.git_ops.get_diff_from_main(self.worktree)
+            base_commit = self.artifacts.read_base_commit()
+            if base_commit:
+                diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
+            else:
+                diff = await self.git_ops.get_diff_from_main(self.worktree)
 
         amendment_suggestions = (
             amendment_ctx.amended_suggestions if amendment_ctx is not None else None
@@ -10761,10 +10902,10 @@ class TaskWorkflow:
             if idx > 0:
                 await asyncio.sleep(idx * stagger)
             return await self._run_reviewer(
-                role, diff, amendment_suggestions=amendment_suggestions,
+                role, diff, amendment_suggestions=amendment_suggestions, subject=subject,
             )
 
-        tasks = [_staggered(i, r) for i, r in enumerate(ALL_REVIEWERS)]
+        tasks = [_staggered(i, r) for i, r in enumerate(roster)]
         results = list(await asyncio.gather(*tasks, return_exceptions=True))
 
         # Retry ERROR verdicts and exceptions
@@ -10784,14 +10925,15 @@ class TaskWorkflow:
                 await asyncio.sleep(stagger)
                 try:
                     results[i] = await self._run_reviewer(
-                        ALL_REVIEWERS[i], diff,
+                        roster[i], diff,
                         amendment_suggestions=amendment_suggestions,
+                        subject=subject,
                     )
                 except Exception as exc:
                     results[i] = exc
 
         # Write results — synthesize ERROR for persistent exceptions
-        for role, result in zip(ALL_REVIEWERS, results, strict=True):
+        for role, result in zip(roster, results, strict=True):
             if isinstance(result, Exception):
                 logger.error(
                     f'Reviewer {role.name} failed after retries: {result}',
@@ -10806,6 +10948,50 @@ class TaskWorkflow:
             if isinstance(result, dict):
                 self.artifacts.write_review(role.name, result)
 
+        return self.artifacts.aggregate_reviews()
+
+    async def _context_complete_review_subject(self) -> ReviewSubject:
+        """The context-complete reviewer's inputs, from the worktree at a fresh fork point.
+
+        The fork point is re-derived now, because the stored base goes stale
+        once main is merged into the branch (task 5695); the stored base and
+        then the main branch name are the fallbacks.
+        """
+        assert self.worktree is not None and self.artifacts is not None
+        main_branch = self.config.git.main_branch
+        base = (
+            await review_fork_point(self.worktree, main_branch)
+            or self.artifacts.read_base_commit()
+            or main_branch
+        )
+        return await gather_review_subject(
+            self.worktree, base,
+            task=self.task,
+            plan=self.artifacts.read_plan() or None,
+            plan_absent_reason='this task has no plan.json (a simple-task run writes none)',
+            conventions_relpath=self.config.review.briefing_path,
+        )
+
+    def _review_inputs_unavailable(
+        self, roster: list[AgentRole], exc: Exception,
+    ) -> ReviewAggregation:
+        """An ERROR verdict for every reviewer when the review's inputs cannot be gathered.
+
+        They route through the caller's ``reviewer_errors`` -> ``_mark_blocked``
+        path like any reviewer failure, with the cause in each review's summary.
+        """
+        assert self.artifacts is not None
+        logger.error(
+            'Task %s: review inputs could not be gathered, so no reviewer ran: %s',
+            self.task_id, exc, exc_info=exc,
+        )
+        for role in roster:
+            self.artifacts.write_review(role.name, {
+                'reviewer': role.name,
+                'verdict': 'ERROR',
+                'issues': [],
+                'summary': f'Review inputs could not be gathered: {exc}',
+            })
         return self.artifacts.aggregate_reviews()
 
     def _salvageable_verdict_payload(
@@ -10879,18 +11065,26 @@ class TaskWorkflow:
     async def _run_reviewer(
         self, role: AgentRole, diff: str,
         amendment_suggestions: list[dict] | None = None,
+        *, subject: ReviewSubject | None = None,
     ) -> dict:
         """Run a single reviewer and read its verdict artifact.
 
         *amendment_suggestions*, when set, threads the post-amendment advisory
-        scope section into the reviewer prompt (task 2750).
+        scope section into the reviewer prompt (task 2750). *subject*, when
+        set, briefs the context-complete generation from it instead of *diff*.
         """
         assert self.worktree is not None and self.artifacts is not None
-        build_prompt = partial(
-            self.briefing.build_reviewer_prompt,
-            role.name, diff, amendment_suggestions=amendment_suggestions,
-            task=self.task,
-        )
+        if subject is None:
+            build_prompt = partial(
+                self.briefing.build_reviewer_prompt,
+                role.name, diff, amendment_suggestions=amendment_suggestions,
+                task=self.task,
+            )
+        else:
+            build_prompt = partial(
+                self.briefing.build_context_complete_reviewer_prompt,
+                role.name, subject, amendment_suggestions=amendment_suggestions,
+            )
 
         # I-FRESH: never consume a stale verdict from a prior invocation on
         # this same worktree (mirrors _resolve_and_resubmit's pre-spawn
@@ -11271,6 +11465,63 @@ class TaskWorkflow:
         # to the gate's re-check below.
         return True
 
+    async def _consume_narrowing_exit_report(
+        self, *, merge_phase: bool,
+    ) -> WorkflowOutcome | None:
+        """Honour the exit report the merge-gate narrowing agent left, if any.
+
+        The narrowing pass runs the architect, which holds every ``report_*``
+        exit tool, so it may answer with an exit artifact instead of a
+        narrowed plan.  The three verdicts on the TASK (``already_done``,
+        ``unactionable_task``, ``false_premise``) are routed to their plan-phase
+        handlers, which carry their own validation, and a ``DONE`` /
+        ``BLOCKED`` outcome ends the submit.  The branch-scoped exits
+        (``ready_to_merge``, ``blocking_dependency``) mean nothing here — the
+        merge is already under way and the gate decides — so they are logged
+        and cleared unread; no report outlives the pass.  ``None`` means the
+        gate carries on.
+
+        ``already_done`` is honoured only when every patch this BRANCH carries
+        is already on main: the handler attributes the reported commit to the
+        task by ANY one declared file, which proves the task's work is on main
+        but not that this branch's own delivery is, and a DONE here would
+        drop the branch unmerged.  Anything short of proven (a ``+`` line from
+        ``git cherry``, or a git error) discards the report and the gate decides.
+        """
+        assert self.artifacts is not None
+        for name, read, clear in (
+            ('ready_to_merge', self.artifacts.read_ready_to_merge,
+             self.artifacts.clear_ready_to_merge),
+            ('blocking_dependency', self.artifacts.read_blocking_dependency,
+             self.artifacts.clear_blocking_dependency),
+        ):
+            discarded = read()
+            if discarded is not None:
+                self._warn_discarded_exit_report(name, discarded)
+                clear()
+        unlanded_claim = self.artifacts.read_already_done()
+        if unlanded_claim is not None and not await self._branch_patches_all_on_main():
+            self._warn_discarded_exit_report('already_done', unlanded_claim)
+            self.artifacts.clear_already_done()
+        return await self._route_task_verdict_report(merge_phase=merge_phase)
+
+    def _warn_discarded_exit_report(self, name: str, report: dict) -> None:
+        logger.warning(
+            'Task %s: merge-gate narrowing pass wrote %s.json, which is not '
+            'an exit at the merge gate — discarding: %s',
+            self.task_id, name, json.dumps(report)[:500],
+        )
+
+    async def _branch_patches_all_on_main(self) -> bool:
+        """True only when ``git cherry`` proves every branch patch is on main."""
+        rc, out, _ = await _run(
+            ['git', 'cherry', self.git_ops.config.main_branch, 'HEAD'],
+            cwd=self.worktree,
+        )
+        return rc == 0 and not any(
+            line.startswith('+') for line in out.splitlines()
+        )
+
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,
         *, merge_phase: bool = False,
@@ -11376,11 +11627,19 @@ class TaskWorkflow:
                     # that was going to escalate anyway, and the architect is
                     # never asked to adjudicate work that is already on main.
                     #
-                    # THE MECHANISM.  After a task's work merges, re-dispatching
+                    # THE MECHANISM.  This is the AUTOMATIC, landing-keyed
+                    # re-cut: after a task's work merges, re-dispatching
                     # it re-cuts task/<id> from post-landing main, which
                     # correctly drops every commit as already-upstream and parks
                     # the ref on one of MAIN'S OWN merge commits at 0 commits
-                    # ahead of its recorded base.  The gate reads that empty
+                    # ahead of its recorded base.  (A second, ruling-keyed
+                    # trigger exists: metadata.recut_ruling, executed by the
+                    # dispatch gate in recut_ruling.py, parks the old branch as
+                    # task/<id>-<stamp> and cuts fresh from current main. That
+                    # branch is 0-ahead only at dispatch, so an empty range at
+                    # merge time means no work was produced, and
+                    # resolve_already_landed_branch still decides from main's
+                    # history, not from emptiness.)  The gate reads that empty
                     # range and emits the exact INVERSE of the truth —
                     # plan_files_not_touched, via _mark_blocked(...,
                     # escalate_to_human=True), whose default
@@ -11480,6 +11739,11 @@ class TaskWorkflow:
                             suggested_action='verify_landing_and_close',
                         )
                     narrowed = await self._try_narrow_plan(check.not_touched)
+                    exit_outcome = await self._consume_narrowing_exit_report(
+                        merge_phase=merge_phase,
+                    )
+                    if exit_outcome is not None:
+                        return exit_outcome
                     if narrowed:
                         # Re-check the (possibly narrowed) plan against the
                         # gate.  ``_task_files`` reads from ``self.plan``,
@@ -11905,40 +12169,27 @@ class TaskWorkflow:
             result.reason, merge_phase=merge_phase, category=category,
         )
 
-    async def _spawn_main_health_fix_task(
-        self,
-        signature: str,
-        escalation_id: str,
-        category: str,
-        cause_hint: str,
-        detail: str,
-    ) -> None:
-        """Schedule a high-lane fix task for a confirmed main-health break.
+    async def _spawn_main_health_fix_task(self, brk: MainBreak, escalation_id: str) -> None:
+        """Give *brk* its HIGH-lane auto-heal fix task.
 
-        Builds a submit_task argument block with:
-        - title/description from :func:`~orchestrator.merge_lane.worker.compose_fix_main_brief`
-        - ``merge_lane='high'`` so the fix merges via the HIGH lane
-        - Correlation keys so the auto-watcher can link it to its escalation:
-          ``spawn_context``, ``main_health_signature``, ``main_health_escalation_id``
-
-        Delegates the actual POST to :meth:`_post_submit_tasks` via
-        ``asyncio.create_task`` so the caller is not blocked.
+        With a task store wired, the merge worker's shared filer adopts an
+        open owner of the signature or files one under its lock (task 5471).
+        Without one, the task is POSTed fire-and-forget through
+        :meth:`_post_submit_tasks`.
         """
-        from orchestrator.merge_lane.worker import compose_fix_main_brief
-
-        title, description = compose_fix_main_brief(category, cause_hint, detail)
-        arguments = {
-            'title': title,
-            'description': description,
-            'priority': 'high',
-            'project_root': str(self.config.project_root),
-            'metadata': {
-                'merge_lane': 'high',
-                'spawn_context': 'main_health_auto_heal',
-                'main_health_signature': signature,
-                'main_health_escalation_id': escalation_id,
-            },
-        }
+        filer = self.merge_worker.main_fix_filer if self.merge_worker is not None else None
+        if filer is not None:
+            await filer.ensure(
+                brk, project_root=str(self.config.project_root),
+                spawn_context=FixSpawnContext.AUTO_HEAL, escalation_id=escalation_id,
+            )
+            return
+        arguments = build_main_fix_task_arguments(
+            brk,
+            project_root=str(self.config.project_root),
+            spawn_context=FixSpawnContext.AUTO_HEAL,
+            escalation_id=escalation_id,
+        )
         if self.mcp is not None:
             try:
                 _task = asyncio.create_task(
@@ -11953,6 +12204,120 @@ class TaskWorkflow:
                     self.task_id, exc,
                 )
 
+    async def _ensure_main_fix_owner(self, brk: MainBreak) -> FixOwner:
+        """The fix-main task owning *brk* (task 5471), through the merge worker's shared filer."""
+        filer = self.merge_worker.main_fix_filer if self.merge_worker is not None else None
+        return await ensure_main_fix_owner(
+            filer, brk, project_root=str(self.config.project_root),
+        )
+
+    def _file_main_health_l1(
+        self,
+        summary: str,
+        *,
+        detail: str,
+        fingerprint: str | None,
+        suggested_action: MainHealthNextAction,
+        root_cause: str = '',
+    ) -> str | None:
+        """Submit or fold this task's merge-lane ``preexisting_main_break`` L1.
+
+        Returns the SURVIVING (parent) escalation id, or ``None`` with no
+        escalation queue.  Folds with the inf-window content-fingerprint
+        :class:`~escalation.dedupe.DedupeConfig` that
+        ``orchestrator/src/orchestrator/merge_lane/worker.py::_file_main_health_escalation``
+        uses, so worker- and workflow-filed L1s for one break collapse into
+        one parent.
+        """
+        from escalation.dedupe import DedupeConfig, content_fingerprint_key
+        from escalation.models import Escalation
+
+        if self.escalation_queue is None:
+            return None
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='blocking',
+            category='preexisting_main_break',
+            summary=summary[:200],
+            detail=detail,
+            suggested_action=suggested_action,
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
+            level=1,
+            root_cause=root_cause,
+        )
+        if not fingerprint:
+            self.escalation_queue.submit(esc)
+            return esc.id
+        esc.dedupe_fingerprint = fingerprint
+        submit_result = submit_or_dedupe(
+            self.escalation_queue,
+            esc,
+            DedupeConfig(
+                infra_dedupe_enabled=True,
+                infra_dedupe_window_secs=float('inf'),
+                infra_dedupe_categories=('preexisting_main_break',),
+                key_fn=content_fingerprint_key,
+            ),
+        )
+        # A child folded into a pending parent answers {'id': parent_id,
+        # 'parent_id': parent_id, 'child_id': esc.id}; only the parent
+        # resolves, so the halt owner and the fix-task correlation key must
+        # reference it.  A fresh submit carries no 'parent_id'.
+        submit_result_dict: dict = submit_result if isinstance(submit_result, dict) else {}
+        return (
+            submit_result_dict.get('parent_id')
+            or submit_result_dict.get('id')
+            or esc.id
+        )
+
+    async def _block_on_owned_main_break(
+        self,
+        brk: MainBreak,
+        fingerprint: str | None,
+        *,
+        merge_phase: bool,
+        otherwise: MainHealthNextAction,
+        summary: str | None = None,
+        root_cause: str = '',
+    ) -> WorkflowOutcome:
+        """Ensure *brk*'s fix-main task, file the shared L1 naming it, and block.
+
+        *otherwise* is the L1's next action when no task could be ensured.
+        """
+        owner = await self._ensure_main_fix_owner(brk)
+        self._file_main_health_l1(
+            summary or brk.reason,
+            detail=owner.escalation_detail(brk.reason),
+            fingerprint=fingerprint,
+            suggested_action=owner.next_action(otherwise),
+            root_cause=root_cause,
+        )
+        return await self._mark_blocked(
+            summary or brk.reason,
+            detail=brk.reason,
+            merge_phase=merge_phase,
+            skip_escalation=True,
+        )
+
+    async def _block_on_inherited_break(self, info: dict) -> WorkflowOutcome:
+        """Block a task whose verify failure is inherited from main.
+
+        Ensures the break's fix-main task (task 5471) and names it on the
+        cross-task-folded L0 the task's steward reads.
+        """
+        owner = await self._ensure_main_fix_owner(info['main_break'])
+        return await self._mark_blocked(
+            info['reason'],
+            detail=owner.escalation_detail(info['detail']),
+            category=info['category'],
+            dedupe_fingerprint=info['fingerprint'],
+            suggested_action=owner.next_action(MainHealthNextAction.NO_FIX_OWNER),
+        )
+
     async def _auto_heal_main_health(
         self, result: Any, *, merge_phase: bool,
     ) -> WorkflowOutcome:
@@ -11960,159 +12325,102 @@ class TaskWorkflow:
 
         Branches:
         (d) NOT mechanical (category not in AUTO_HEAL_MECHANICAL_CATEGORIES)
-            → escalate to human, no halt, no spawn.
+            → ensure a fix-main task, file the shared L1 naming it, no halt.
         (e) Attempt cap reached (sha-independent signature recurred after prior heal)
-            → hard-escalate, no halt, no spawn.
-        (idempotency) Normal lane already halted (auto-heal in flight)
-            → fold escalation, no second halt/spawn.
+            → the same as (d), with the re-break recorded as root cause.
+        (idempotency) Normal lane already halted → no second halt/spawn;
+            adopt this signature's owner (its in-flight heal: fold into the
+            halt owner) or file one.
         (a) Happy path: record attempt; halt 'normal' lane; submit one dedup'd
-            L1 escalation; register it as halt-owner; spawn a HIGH-lane fix task;
-            block via _mark_blocked(skip_escalation=True).
+            L1 escalation; register it as halt-owner; spawn a HIGH-lane fix task.
+        Every branch blocks via _mark_blocked(skip_escalation=True).
         """
-        from escalation.dedupe import DedupeConfig, content_fingerprint_key
-        from escalation.models import Escalation
-
         from orchestrator.merge_lane.worker import (
             MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS,
             is_auto_heal_eligible,
         )
 
         fp = getattr(result, 'dedupe_fingerprint', None) or None
-        category = getattr(result, 'failure_category', None) or ''
-        cause_hint = getattr(result, 'failure_cause_hint', None) or ''
         reason = getattr(result, 'reason', str(result))
+        # Sha-independent signature for attempt-cap / re-break-loop detection,
+        # derived from THIS outcome's (category, cause_hint).  Never
+        # self._merge_outcome_signature(): the MAIN_HEALTH_RED_REASON_PREFIX
+        # fast-path returns before the generic blocked path sets
+        # _last_merge_failure_*, so every break would share one constant key.
+        brk = MainBreak(
+            getattr(result, 'failure_category', None) or '',
+            getattr(result, 'failure_cause_hint', None) or '',
+            reason,
+        )
 
         # Branch (d): non-mechanical, no merge_worker (cannot halt lanes), or no
         # escalation_queue (cannot register a halt-owner → unhalt_lanes_owned_by can
         # never match → normal lane stays halted permanently → livelock).
-        # → escalate-only, no halt/spawn.
         if (
-            not is_auto_heal_eligible(category, cause_hint)
+            not is_auto_heal_eligible(brk.category, brk.cause_hint)
             or self.merge_worker is None
             or self.escalation_queue is None
         ):
-            return await self._mark_blocked(
-                reason,
-                merge_phase=merge_phase,
-                escalate_to_human=True,
-                category='preexisting_main_break',
-                dedupe_fingerprint=fp,
-                suggested_action='await_preexisting_main_hotfix',
+            return await self._block_on_owned_main_break(
+                brk, fp, merge_phase=merge_phase,
+                otherwise=MainHealthNextAction.NO_FIX_OWNER,
             )
 
-        # Sha-independent signature for attempt-cap / re-break-loop detection.
-        # Derived from THIS outcome's (category, cause_hint) — distinct per break,
-        # stable across the heal→re-break loop (same category+cause_hint at a new
-        # main SHA).  Must NOT use self._merge_outcome_signature() here because the
-        # MAIN_HEALTH_RED_REASON_PREFIX fast-path returns before the generic blocked
-        # path that sets _last_merge_failure_*; those fields stay at __init__
-        # defaults, collapsing every break to the same empty-basis constant key.
-        sig = _compute_merge_outcome_signature(category, cause_hint, reason)
-
-        registry = (
-            self.merge_worker.auto_heal_registry
-            if self.merge_worker is not None else None
-        )
+        sig = brk.signature
+        registry = self.merge_worker.auto_heal_registry
 
         # Branch (e): attempt cap reached — genuine re-break after a prior heal.
         # Only fires when the lane is NOT currently halted.  If an auto-heal is
         # in flight (lane already halted), concurrent same-signature tasks must
         # fold via the idempotency branch below, NOT be mis-classified as
-        # re-break loops with a wrong root_cause.  The re-break cap is a
-        # guard against a completed-heal → new-break cycle, not an in-flight
-        # duplicate arriving while the same heal is still running.
+        # re-break loops with a wrong root_cause.
         if (
-            registry is not None
-            # Runtime-redundant (registry is not None already implies
-            # merge_worker is not None per the ternary above); kept so pyright
-            # can narrow merge_worker for the .is_lane_halted() call below.
-            and self.merge_worker is not None
-            and registry.attempts(sig) >= MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
+            registry.attempts(sig) >= MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
             and not self.merge_worker.is_lane_halted('normal')
         ):
-            return await self._mark_blocked(
-                (
+            return await self._block_on_owned_main_break(
+                brk, fp, merge_phase=merge_phase,
+                otherwise=MainHealthNextAction.AUTO_HEAL_EXHAUSTED,
+                summary=(
                     f'Main-health auto-heal attempt cap reached (signature recurred '
                     f'after auto-heal): {reason[:160]}'
                 ),
-                detail=reason,
-                merge_phase=merge_phase,
-                escalate_to_human=True,
-                category='preexisting_main_break',
-                dedupe_fingerprint=fp,
                 root_cause=f'main-health-auto-heal-rebreak:{sig}',
-                suggested_action='await_preexisting_main_hotfix',
             )
 
-        # Build and submit the dedup'd L1 escalation (shared across all three
-        # remaining branches: idempotency + happy path both file/fold it).
-        esc_id: str | None = None
-        if self.escalation_queue is not None:
-            esc = Escalation(
-                id=self.escalation_queue.make_id(self.task_id),
-                task_id=self.task_id,
-                agent_role='orchestrator',
-                severity='blocking',
-                category='preexisting_main_break',
-                summary=reason[:200],
-                detail=reason,
-                suggested_action='main_health_auto_heal_in_flight',
-                worktree=str(self.worktree) if self.worktree else None,
-                workflow_state=self.state.value,
-                filing_claimant_run_id=self._filing_claimant_run_id,
+        # Branch (idempotency): the lane is already halted.  No second
+        # attempt/halt/spawn; the break is owned by whatever task owns its
+        # signature — this signature's in-flight heal, whose halt-owner L1
+        # this folds into, or a fix-main task filed for it now.
+        if self.merge_worker.is_lane_halted('normal'):
+            owner = await self._ensure_main_fix_owner(brk)
+            self._file_main_health_l1(
+                reason, detail=owner.escalation_detail(reason), fingerprint=fp,
+                suggested_action=owner.behind_halt_action(
+                    heal_attempted=registry.attempts(sig) > 0,
+                ),
             )
-            if fp:
-                esc.dedupe_fingerprint = fp
-                submit_result = submit_or_dedupe(
-                    self.escalation_queue,
-                    esc,
-                    DedupeConfig(
-                        infra_dedupe_enabled=True,
-                        infra_dedupe_window_secs=float('inf'),
-                        infra_dedupe_categories=('preexisting_main_break',),
-                        key_fn=content_fingerprint_key,
-                    ),
-                )
-                # Derive esc_id from the SURVIVING (parent) escalation.
-                # submit_or_dedupe returns {'id': parent_id, 'status': 'dedup_skipped',
-                # 'parent_id': parent_id, 'child_id': esc.id} when the child folds
-                # into a pending parent — only the parent resolves, so the halt owner
-                # and the fix-task correlation key must reference the parent.
-                # For a fresh (non-dedup) submit the dict has no 'parent_id', so we
-                # fall back to 'id', then to esc.id as the final safety net.
-                submit_result_dict: dict = submit_result if isinstance(submit_result, dict) else {}
-                esc_id = (
-                    submit_result_dict.get('parent_id')
-                    or submit_result_dict.get('id')
-                    or esc.id
-                )
-            else:
-                self.escalation_queue.submit(esc)
-                esc_id = esc.id
-
-        # Branch (idempotency): lane already halted → adopt the in-flight auto-heal
-        if self.merge_worker is not None and self.merge_worker.is_lane_halted('normal'):
             return await self._mark_blocked(
                 reason,
                 merge_phase=merge_phase,
                 skip_escalation=True,
             )
 
-        # Branch (a): happy path — record attempt, halt lane, register owner, spawn fix
-        if registry is not None:
-            registry.record_attempt(sig)
-
-        if self.merge_worker is not None:
-            self.merge_worker.halt_lane(
-                'normal',
-                f'main-health auto-heal in flight (task {self.task_id})',
-            )
-            if esc_id:
-                self.merge_worker.set_lane_halt_owner('normal', esc_id)
-
-        await self._spawn_main_health_fix_task(
-            sig, esc_id or '', category, cause_hint, reason,
+        esc_id = self._file_main_health_l1(
+            reason, detail=reason, fingerprint=fp,
+            suggested_action=MainHealthNextAction.AUTO_HEAL_IN_FLIGHT,
         )
+
+        # Branch (a): happy path — record attempt, halt lane, register owner, spawn fix
+        registry.record_attempt(sig)
+        self.merge_worker.halt_lane(
+            'normal',
+            f'main-health auto-heal in flight (task {self.task_id})',
+        )
+        if esc_id:
+            self.merge_worker.set_lane_halt_owner('normal', esc_id)
+
+        await self._spawn_main_health_fix_task(brk, esc_id or '')
 
         return await self._mark_blocked(
             reason,
@@ -12610,6 +12918,7 @@ class TaskWorkflow:
             task_files=self._task_files,
             module_configs=self._module_configs,
             event_store=self.event_store,
+            escalation_queue=self.escalation_queue,
         )
 
     async def _attribute_train_failure(
