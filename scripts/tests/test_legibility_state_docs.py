@@ -12,6 +12,7 @@ import json
 import logging
 import subprocess
 from datetime import UTC, date, datetime, timedelta, timezone
+from enum import StrEnum
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,11 @@ class _Doc:
 
     def to_json(self) -> dict:
         return {'name': self.name, 'count': self.count}
+
+
+class _Colour(StrEnum):
+    RED = 'red'
+    BLUE = 'blue'
 
 
 def _warnings(caplog) -> list[logging.LogRecord]:
@@ -193,6 +199,15 @@ class TestFieldReaders:
         assert state_docs.required(doc, 't', state_docs.as_datetime) == datetime(
             2026, 10, 1, 4, tzinfo=timezone(timedelta(hours=2))
         )
+
+    def test_as_member_accepts_only_the_enum_values(self):
+        parse = state_docs.as_member(_Colour)
+        assert state_docs.required({'c': 'red'}, 'c', parse) is _Colour.RED
+        with pytest.raises(ValueError) as excinfo:
+            state_docs.required({'c': 'mauve'}, 'c', parse)
+        assert 'c' in str(excinfo.value)
+        assert "'mauve'" in str(excinfo.value)
+        assert "'red'" in str(excinfo.value)
 
     def test_a_naive_datetime_is_read_as_utc(self):
         stamp = state_docs.required(
