@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, hangs_until
+from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
@@ -1308,7 +1309,9 @@ class TestDriftCheckReleasesEachLeaseAtItsLegsEnd:
         verifier = FakeVerifier(default=hangs_until(local_gate, entered=local_entered))
         drift = asyncio.create_task(scene.run(verifier))
         try:
-            await asyncio.wait_for(local_entered.wait(), _WAIT_SECS)
+            await wait_responsive(
+                local_entered.wait(), timeout=_WAIT_SECS, label='drift local leg entered',
+            )
             await _until(lambda: scene.slot('laptop') == 'free')
             assert scene.slot('local') == 'busy'
         finally:
@@ -1328,7 +1331,9 @@ class TestDriftCheckReleasesEachLeaseAtItsLegsEnd:
         verifier = FakeVerifier(default=hangs_until(local_gate, entered=local_entered))
         drift = asyncio.create_task(scene.run(verifier))
         try:
-            await asyncio.wait_for(local_entered.wait(), _WAIT_SECS)
+            await wait_responsive(
+                local_entered.wait(), timeout=_WAIT_SECS, label='drift local leg entered',
+            )
             await _until(lambda: scene.slot('laptop') == 'free')
             assert scene.allocator.acquire_remote() is not None
         finally:
@@ -1345,7 +1350,9 @@ class TestDriftCheckReleasesEachLeaseAtItsLegsEnd:
         )
         drift = asyncio.create_task(scene.run(FakeVerifier()))
         try:
-            await asyncio.wait_for(remote_entered.wait(), _WAIT_SECS)
+            await wait_responsive(
+                remote_entered.wait(), timeout=_WAIT_SECS, label='drift remote leg entered',
+            )
             await _until(lambda: scene.slot('local') == 'free')
             assert scene.slot('laptop') == 'busy'
         finally:
@@ -1542,7 +1549,9 @@ class TestDriftCheckLandHookReArmsAndCoalesces:
         first = await land('c1')
         assert first is not None
         try:
-            await asyncio.wait_for(entered.wait(), _WAIT_SECS)
+            await wait_responsive(
+                entered.wait(), timeout=_WAIT_SECS, label='first drift check entered its verify',
+            )
             assert await land('c2') is None
         finally:
             gate.set()

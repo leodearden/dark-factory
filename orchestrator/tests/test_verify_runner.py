@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _gate_fixtures import gate_argv, gated_remote_runner
-from _orch_helpers import pydantic_spec
+from _orch_helpers import pydantic_spec, wait_responsive
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
@@ -5587,7 +5587,9 @@ class TestDriftDetectorConcurrentLegs:
         remote_fake.run_merge_verify = AsyncMock(side_effect=_remote)
         check = asyncio.create_task(DriftDetector(pool).check('sha1', _make_spec()))
         try:
-            await asyncio.wait_for(remote_started.wait(), _LEG_WAIT_SECS)
+            await wait_responsive(
+                remote_started.wait(), timeout=_LEG_WAIT_SECS, label='remote leg started',
+            )
         finally:
             local_gate.set()
             result = await asyncio.wait_for(check, _LEG_WAIT_SECS)
@@ -5605,7 +5607,10 @@ class TestDriftDetectorConcurrentLegs:
             detector.check('sha1', _make_spec(), on_leg_done=recorder)
         )
         try:
-            await asyncio.wait_for(recorder.ended['laptop'].wait(), _LEG_WAIT_SECS)
+            await wait_responsive(
+                recorder.ended['laptop'].wait(), timeout=_LEG_WAIT_SECS,
+                label='remote leg reported done',
+            )
             assert recorder.done == ['laptop']
         finally:
             local_gate.set()
@@ -5638,7 +5643,10 @@ class TestDriftDetectorConcurrentLegs:
             detector.check('sha1', _make_spec(), on_leg_done=recorder)
         )
         try:
-            await asyncio.wait_for(recorder.ended['laptop'].wait(), _LEG_WAIT_SECS)
+            await wait_responsive(
+                recorder.ended['laptop'].wait(), timeout=_LEG_WAIT_SECS,
+                label='remote leg reported done',
+            )
             assert ('local finished',) not in log
         finally:
             local_gate.set()
@@ -5663,7 +5671,10 @@ class TestDriftDetectorConcurrentLegs:
             DriftDetector(pool).check('sha1', _make_spec(), on_leg_done=recorder)
         )
         try:
-            await asyncio.wait_for(recorder.ended['local'].wait(), _LEG_WAIT_SECS)
+            await wait_responsive(
+                recorder.ended['local'].wait(), timeout=_LEG_WAIT_SECS,
+                label='local leg reported done',
+            )
         finally:
             remote_gate.set()
             result = await asyncio.wait_for(check, _LEG_WAIT_SECS)
@@ -5683,7 +5694,10 @@ class TestDriftDetectorConcurrentLegs:
             DriftDetector(pool).check('sha1', _make_spec(), on_leg_done=recorder)
         )
         try:
-            await asyncio.wait_for(recorder.ended['local'].wait(), _LEG_WAIT_SECS)
+            await wait_responsive(
+                recorder.ended['local'].wait(), timeout=_LEG_WAIT_SECS,
+                label='local leg reported done',
+            )
         finally:
             remote_gate.set()
         with pytest.raises(ValueError, match='boom'):
