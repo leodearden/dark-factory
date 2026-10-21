@@ -147,7 +147,7 @@ gap. Inference, not measured per cell: solar's surviving excess is the part
 of section 3 the guards cannot reach. That is direct judged attaches in the
 0.60–0.75 range, with the judge's retargets among them.
 
-On amended attaches the guard removes 172 of 590 on solar and 106 of 633 on
+On amended attaches the guard removes 172 of 588 on solar and 106 of 633 on
 dark_factory_reify. That costs 3 rated solar attaches, 2 of them misfiles.
 
 ## 5. Pooled vs per-project band replay
@@ -159,7 +159,7 @@ Both arms replay to the diagonal:
 
 | project | arm | restated→restated | judge→judge | stored→stored | movers |
 |---|---|---|---|---|---|
-| solar_challenge | project / project_category | 65 | 848 | 1 | 0 |
+| solar_challenge | project / project_category | 65 | 846 | 1 | 0 |
 | solar_challenge_platform | project / project_category | 16 | 643 | 2 | 0 |
 
 No edge was derived, so every arm edge is the pooled fallback (`edges` in the
@@ -186,7 +186,15 @@ solar write differently.
   as the attach source. The judge may in fact have named a sibling that
   hoists to the same canonical.
 - **Exclusions.** 6 writes have no triage cosine, and 47 are
-  caller-declared children (section 2).
+  caller-declared children (section 2). An attach the axes cannot read in
+  full is excluded too, with its reason tallied, rather than routed on a
+  defaulted value. Two solar_challenge amended attaches, both unrated, are
+  retargets that name an id missing from their slate (`retarget_off_slate`),
+  so their source cosine is unknown. Five attach rows have no slate and no
+  cosine to their parent. Their children were deleted after the soak, so
+  their records also lack a triage cosine. They are counted once, under
+  `no_triage_cosine`, and the `no_slate` and `no_parent_cosine` tallies are
+  empty.
 
 ## 7. Recommendation: a judge-side change
 

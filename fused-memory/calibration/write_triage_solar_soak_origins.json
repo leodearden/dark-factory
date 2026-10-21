@@ -30,8 +30,8 @@
       ]
     },
     "population": {
-      "writes": 3354,
-      "attached": 1817,
+      "writes": 3352,
+      "attached": 1815,
       "excluded": {
         "no_triage_cosine": {
           "count": 6,
@@ -95,6 +95,21 @@
             "3a0b4263-7d57-415e-8bdc-b6a95d2a6711",
             "9ff40fa1-fc8c-4867-b914-8cbfff919c46"
           ]
+        },
+        "no_slate": {
+          "count": 0,
+          "memory_ids": []
+        },
+        "retarget_off_slate": {
+          "count": 2,
+          "memory_ids": [
+            "56f7f191-fa58-4689-a848-c1c48564d4ad",
+            "8cd7ae15-c485-4850-9107-cd9e71aedc68"
+          ]
+        },
+        "no_parent_cosine": {
+          "count": 0,
+          "memory_ids": []
         }
       }
     }
@@ -181,7 +196,7 @@
             }
           },
           "amended": {
-            "attaches": 590,
+            "attaches": 588,
             "misfile": {
               "k": 6,
               "n": 19,
@@ -500,7 +515,7 @@
             }
           },
           "amended": {
-            "attaches": 339,
+            "attaches": 337,
             "misfile": {
               "k": 3,
               "n": 11,
@@ -643,7 +658,7 @@
             }
           },
           "amended": {
-            "attaches": 477,
+            "attaches": 475,
             "misfile": {
               "k": 3,
               "n": 16,
@@ -1018,7 +1033,7 @@
             }
           },
           "amended": {
-            "attaches": 249,
+            "attaches": 247,
             "misfile": {
               "k": 0,
               "n": 8,
@@ -1211,7 +1226,7 @@
             }
           },
           "amended": {
-            "attaches": 227,
+            "attaches": 225,
             "misfile": {
               "k": 2,
               "n": 6,
@@ -1574,7 +1589,7 @@
             }
           },
           "amended": {
-            "attaches": 130,
+            "attaches": 128,
             "misfile": {
               "k": 1,
               "n": 5,
@@ -1723,7 +1738,7 @@
             }
           },
           "amended": {
-            "attaches": 261,
+            "attaches": 259,
             "misfile": {
               "k": 1,
               "n": 6,
@@ -2203,7 +2218,7 @@
             }
           },
           "amended": {
-            "attaches": 136,
+            "attaches": 134,
             "misfile": {
               "k": 1,
               "n": 4,
@@ -2393,7 +2408,7 @@
             }
           },
           "amended": {
-            "attaches": 245,
+            "attaches": 244,
             "misfile": {
               "k": 5,
               "n": 12,
@@ -2536,7 +2551,7 @@
             }
           },
           "amended": {
-            "attaches": 88,
+            "attaches": 87,
             "misfile": {
               "k": 1,
               "n": 1,
@@ -3202,7 +3217,7 @@
             }
           },
           "amended": {
-            "attaches": 131,
+            "attaches": 130,
             "misfile": {
               "k": 2,
               "n": 7,
@@ -3345,7 +3360,7 @@
             }
           },
           "amended": {
-            "attaches": 51,
+            "attaches": 50,
             "misfile": {
               "k": 1,
               "n": 1,
@@ -3571,7 +3586,7 @@
         }
       },
       "amended": {
-        "attaches": 590,
+        "attaches": 588,
         "removed": 172,
         "removed_by_reason": {
           "below_min_parent_cosine": 67,
@@ -3975,7 +3990,7 @@
         }
       },
       "amended": {
-        "attaches": 339,
+        "attaches": 337,
         "removed": 120,
         "removed_by_reason": {
           "below_min_parent_cosine": 49,
@@ -4136,7 +4151,7 @@
           },
           "judge": {
             "restated": 0,
-            "judge": 848,
+            "judge": 846,
             "stored": 0
           },
           "stored": {
@@ -4206,7 +4221,7 @@
           },
           "judge": {
             "restated": 0,
-            "judge": 848,
+            "judge": 846,
             "stored": 0
           },
           "stored": {

@@ -44,6 +44,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import sys
 import types
 from collections import Counter, defaultdict
@@ -149,6 +150,9 @@ class Exclusion(StrEnum):
 
     NO_TRIAGE_COSINE = 'no_triage_cosine'
     CALLER_DECLARED_CHILD = 'caller_declared_child'
+    NO_SLATE = 'no_slate'
+    RETARGET_OFF_SLATE = 'retarget_off_slate'
+    NO_PARENT_COSINE = 'no_parent_cosine'
 
 
 class Band(StrEnum):
@@ -184,14 +188,24 @@ class RecordClass(StrEnum):
 
 
 class CosParentBucket(StrEnum):
-    """The attached write's cosine to its filed parent, bucketed on the routing edges."""
+    """The attached write's cosine to its filed parent, bucketed on the routing edges.
+
+    The judge band is split at the fixed points 0.65 and 0.75. An absent
+    routing edge leaves its end of the scale bounded by the split point alone.
+    """
 
     BELOW_T_LOW = 'below_t_low'
     T_LOW_TO_0_65 = 't_low_to_0.65'
+    BELOW_0_65 = 'below_0.65'
     FROM_0_65_TO_0_75 = '0.65_to_0.75'
     FROM_0_75_TO_T_HIGH = '0.75_to_t_high'
     AT_OR_ABOVE_T_HIGH = 'at_or_above_t_high'
+    AT_OR_ABOVE_0_75 = 'at_or_above_0.75'
     NOT_ATTACHED = NOT_ATTACHED
+
+
+_COS_PARENT_LOW_SPLIT = 0.65
+_COS_PARENT_HIGH_SPLIT = 0.75
 
 
 @dataclass(frozen=True)
@@ -237,10 +251,15 @@ class SoakWrite:
 
 @dataclass(frozen=True)
 class SoakPopulation:
-    """The analysed writes, and the ids of every soak row left out, by reason."""
+    """The analysed writes, the ids of every soak row left out by reason, and what they were read from.
+
+    ``evidence_sha256`` digests the exact bytes the writes were parsed from,
+    keyed on each file's path under the evidence directory.
+    """
 
     writes: tuple[SoakWrite, ...]
     excluded: Mapping[Exclusion, tuple[str, ...]]
+    evidence_sha256: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -256,17 +275,17 @@ class Routing:
 
 
 def load_soak_writes(evidence_dir: Path) -> SoakPopulation:
-    """Read the soak evidence under *evidence_dir* into a parsed population."""
-    records = [
-        json.loads(line)
-        for line in (evidence_dir / RECORDS_FILE).read_text().splitlines()
-        if line.strip()
-    ]
-    attaches = json.loads((evidence_dir / ATTACHES_FILE).read_text())
-    return _population(records, attaches)
+    """Read the soak evidence under *evidence_dir* once into a parsed, digested population."""
+    raw = {name: (evidence_dir / name).read_bytes() for name in EVIDENCE_FILES}
+    records = [json.loads(line) for line in raw[RECORDS_FILE].decode('utf-8').splitlines() if line.strip()]
+    attaches = json.loads(raw[ATTACHES_FILE])
+    digests = {name.as_posix(): hashlib.sha256(data).hexdigest() for name, data in raw.items()}
+    return _population(records, attaches, digests)
 
 
-def _population(records: Iterable[dict], attaches: Iterable[dict]) -> SoakPopulation:
+def _population(
+    records: Iterable[dict], attaches: Iterable[dict], evidence_sha256: Mapping[str, str],
+) -> SoakPopulation:
     soak = [
         record for record in records
         if record['window'] == _SOAK_WINDOW and record['class'] in (_STANDALONE_CLASS, _CHILD_CLASS)
@@ -283,6 +302,7 @@ def _population(records: Iterable[dict], attaches: Iterable[dict]) -> SoakPopula
     return SoakPopulation(
         writes=tuple(writes),
         excluded=MappingProxyType({reason: tuple(ids) for reason, ids in excluded.items()}),
+        evidence_sha256=MappingProxyType(dict(evidence_sha256)),
     )
 
 
@@ -301,8 +321,23 @@ def _attaches_by_child(soak: list[dict], attaches: Iterable[dict]) -> dict[str, 
 def _exclusion_of(record: dict, attach_by_child: Mapping[str, dict]) -> Exclusion | None:
     if record.get('nn_triage') is None:
         return Exclusion.NO_TRIAGE_COSINE
-    if record['class'] == _CHILD_CLASS and record['memory_id'] not in attach_by_child:
+    if record['class'] != _CHILD_CLASS:
+        return None
+    attach = attach_by_child.get(record['memory_id'])
+    if attach is None:
         return Exclusion.CALLER_DECLARED_CHILD
+    return _attach_evidence_gap(attach)
+
+
+def _attach_evidence_gap(attach: dict) -> Exclusion | None:
+    """What evidence an origin axis reads is missing from *attach*; None when it carries it all."""
+    slate_ids = {entry['id'] for entry in attach.get('slate20') or ()}
+    if not slate_ids:
+        return Exclusion.NO_SLATE
+    if attach.get('rt_named') is not None and attach['rt_named'] not in slate_ids:
+        return Exclusion.RETARGET_OFF_SLATE
+    if attach.get('cos_parent') is None:
+        return Exclusion.NO_PARENT_COSINE
     return None
 
 
@@ -319,7 +354,7 @@ def _soak_write(record: dict, attach: dict | None) -> SoakWrite:
         category=record['category'],
         outcome=_attach_outcome(attach),
         max_cosine=float(record['nn_triage']),
-        slate=tuple(_slate_entry(entry) for entry in attach.get('slate20') or ()),
+        slate=tuple(_slate_entry(entry) for entry in attach['slate20']),
         parent_id=attach['parent_id'],
         cos_parent=attach['cos_parent'],
         retarget_named_id=attach.get('rt_named'),
@@ -439,19 +474,47 @@ def record_class_of(write: SoakWrite, routing: Routing) -> RecordClass:
 
 
 def cos_parent_bucket_of(write: SoakWrite, routing: Routing) -> CosParentBucket:
-    """*write*'s cosine to its filed parent, bucketed lower-inclusive on the routing edges."""
+    """*write*'s cosine to its filed parent, bucketed lower-inclusive on the routing edges.
+
+    Raises ``ValueError`` for a routing whose edges fall inside the fixed
+    0.65-0.75 split, where the bucket names would no longer describe them.
+    """
+    floors = _cos_parent_floors(routing)
     if write.cos_parent is None:
         return CosParentBucket.NOT_ATTACHED
-    floors = (
-        (routing.t_high, CosParentBucket.AT_OR_ABOVE_T_HIGH),
-        (0.75, CosParentBucket.FROM_0_75_TO_T_HIGH),
-        (0.65, CosParentBucket.FROM_0_65_TO_0_75),
-        (routing.t_low, CosParentBucket.T_LOW_TO_0_65),
-    )
-    return next(
-        (bucket for floor, bucket in floors if floor is not None and write.cos_parent >= floor),
-        CosParentBucket.BELOW_T_LOW,
-    )
+    return next(bucket for floor, bucket in floors if write.cos_parent >= floor)
+
+
+def _cos_parent_floors(routing: Routing) -> tuple[tuple[float, CosParentBucket], ...]:
+    """Each bucket's inclusive lower edge, highest first; the last is unbounded below."""
+    misplaced = [
+        f'{name}={edge}'
+        for name, edge, inside_the_split in (
+            ('t_low', routing.t_low, routing.t_low is not None and routing.t_low > _COS_PARENT_LOW_SPLIT),
+            ('t_high', routing.t_high, routing.t_high is not None and routing.t_high < _COS_PARENT_HIGH_SPLIT),
+        )
+        if inside_the_split
+    ]
+    if misplaced:
+        raise ValueError(
+            f'the cos_parent axis splits the judge band at {_COS_PARENT_LOW_SPLIT} and '
+            f'{_COS_PARENT_HIGH_SPLIT}; routing edge {", ".join(misplaced)} falls inside that split',
+        )
+    if routing.t_high is None:
+        upper = ((_COS_PARENT_HIGH_SPLIT, CosParentBucket.AT_OR_ABOVE_0_75),)
+    else:
+        upper = (
+            (routing.t_high, CosParentBucket.AT_OR_ABOVE_T_HIGH),
+            (_COS_PARENT_HIGH_SPLIT, CosParentBucket.FROM_0_75_TO_T_HIGH),
+        )
+    if routing.t_low is None:
+        lower = ((-math.inf, CosParentBucket.BELOW_0_65),)
+    else:
+        lower = (
+            (routing.t_low, CosParentBucket.T_LOW_TO_0_65),
+            (-math.inf, CosParentBucket.BELOW_T_LOW),
+        )
+    return (*upper, (_COS_PARENT_LOW_SPLIT, CosParentBucket.FROM_0_65_TO_0_75), *lower)
 
 
 Axis = Callable[[SoakWrite, Routing], StrEnum]
@@ -779,10 +842,7 @@ def _provenance(
 ) -> dict[str, Any]:
     return {
         'evidence_dir': str(evidence_dir),
-        'evidence_files': {
-            str(name): hashlib.sha256((evidence_dir / name).read_bytes()).hexdigest()
-            for name in EVIDENCE_FILES
-        },
+        'evidence_files': dict(population.evidence_sha256),
         'pooled_bands': {'t_high': routing.t_high, 't_low': routing.t_low},
         'judge_candidate_count': routing.judge_candidate_count,
         'attach_guard': {

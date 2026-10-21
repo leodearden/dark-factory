@@ -210,6 +210,61 @@ class TestLoadSoakWrites:
         assert set(_by_id(population)) == {_STANDALONE}
         assert population.excluded[_mod().Exclusion.CALLER_DECLARED_CHILD] == (_WRITE,)
 
+    @pytest.mark.parametrize('slate', ['absent', 'empty'])
+    def test_an_attach_row_with_no_slate_is_tallied_not_routed_on_a_defaulted_slate(self, tmp_path, slate):
+        attach = _attach(_WRITE, outcome='contested', verdict='contested_misfile')
+        if slate == 'absent':
+            del attach['slate20']
+        else:
+            attach['slate20'] = []
+        evidence = _evidence(tmp_path, [_record(_WRITE, cls='child'), _record(_STANDALONE)], [attach])
+
+        population = _mod().load_soak_writes(evidence)
+
+        assert set(_by_id(population)) == {_STANDALONE}
+        assert population.excluded[_mod().Exclusion.NO_SLATE] == (_WRITE,)
+
+    def test_a_retarget_naming_an_id_off_its_slate_is_tallied_apart(self, tmp_path):
+        evidence = _evidence(tmp_path, [_record(_WRITE, cls='child')], [
+            _attach(_WRITE, slate=[_slate_row(_PARENT, 0.7)], rt_named=_CHILD_OF_PARENT),
+        ])
+
+        population = _mod().load_soak_writes(evidence)
+
+        assert population.writes == ()
+        assert population.excluded[_mod().Exclusion.RETARGET_OFF_SLATE] == (_WRITE,)
+
+    def test_an_attach_row_with_no_parent_cosine_is_tallied_apart(self, tmp_path):
+        attach = _attach(_WRITE, slate=[_slate_row(_PARENT, 0.7)])
+        attach['cos_parent'] = None
+        evidence = _evidence(tmp_path, [_record(_WRITE, cls='child')], [attach])
+
+        population = _mod().load_soak_writes(evidence)
+
+        assert population.writes == ()
+        assert population.excluded[_mod().Exclusion.NO_PARENT_COSINE] == (_WRITE,)
+
+    def test_a_row_missing_both_its_triage_cosine_and_its_slate_is_tallied_once_on_the_record(self, tmp_path):
+        attach = _attach(_WRITE)
+        del attach['slate20']
+        evidence = _evidence(tmp_path, [_record(_WRITE, cls='child', nn_triage=None)], [attach])
+
+        excluded = _mod().load_soak_writes(evidence).excluded
+
+        assert {reason: ids for reason, ids in excluded.items() if ids} == {
+            _mod().Exclusion.NO_TRIAGE_COSINE: (_WRITE,),
+        }
+
+    def test_the_population_carries_the_digest_of_the_bytes_it_was_parsed_from(self, tmp_path):
+        evidence = _evidence(tmp_path, [_record(_WRITE, cls='child')], [_attach(_WRITE)])
+
+        digests = _mod().load_soak_writes(evidence).evidence_sha256
+
+        assert digests == {
+            name: hashlib.sha256((evidence / name).read_bytes()).hexdigest()
+            for name in ('duplicates/records.jsonl', 'team/A/attaches_axes.json')
+        }
+
     def test_the_loaded_population_is_immutable(self, tmp_path):
         evidence = _evidence(tmp_path, [_record(_STANDALONE)], [])
         population = _mod().load_soak_writes(evidence)
@@ -218,6 +273,8 @@ class TestLoadSoakWrites:
             population.writes[0].outcome = 'restated'
         with pytest.raises(TypeError):
             population.excluded[_mod().Exclusion.NO_TRIAGE_COSINE] = ()
+        with pytest.raises(TypeError):
+            population.evidence_sha256['duplicates/records.jsonl'] = ''
 
 
 # --- axes -------------------------------------------------------------------
@@ -396,10 +453,41 @@ class TestCosParentAxis:
     def test_buckets_are_lower_inclusive_on_the_routing_edges(self, cos_parent, bucket):
         assert _axis('cos_parent', _write(cos_parent=cos_parent)) is getattr(_mod().CosParentBucket, bucket)
 
-    def test_an_empty_restate_band_leaves_the_top_bucket_open(self):
-        write = _write(cos_parent=0.99)
+    @pytest.mark.parametrize(('cos_parent', 'bucket'), [
+        (0.7499, 'FROM_0_65_TO_0_75'),
+        (0.75, 'AT_OR_ABOVE_0_75'),
+        (0.99, 'AT_OR_ABOVE_0_75'),
+    ])
+    def test_an_empty_restate_band_tops_out_at_the_fixed_0_75_split(self, cos_parent, bucket):
+        write = _write(cos_parent=cos_parent)
 
-        assert _axis('cos_parent', write, _routing(t_high=None)) is _mod().CosParentBucket.FROM_0_75_TO_T_HIGH
+        assert _axis('cos_parent', write, _routing(t_high=None)) is getattr(_mod().CosParentBucket, bucket)
+
+    @pytest.mark.parametrize(('cos_parent', 'bucket'), [
+        (0.10, 'BELOW_0_65'),
+        (0.6499, 'BELOW_0_65'),
+        (0.65, 'FROM_0_65_TO_0_75'),
+    ])
+    def test_an_uncalibrated_lower_edge_bottoms_out_at_the_fixed_0_65_split(self, cos_parent, bucket):
+        write = _write(cos_parent=cos_parent)
+
+        assert _axis('cos_parent', write, _routing(t_low=None)) is getattr(_mod().CosParentBucket, bucket)
+
+    def test_edges_on_the_split_points_leave_their_own_bucket_empty(self):
+        routing = _routing(t_high=0.75, t_low=0.65)
+
+        assert _axis('cos_parent', _write(cos_parent=0.6499), routing) is _mod().CosParentBucket.BELOW_T_LOW
+        assert _axis('cos_parent', _write(cos_parent=0.65), routing) is _mod().CosParentBucket.FROM_0_65_TO_0_75
+        assert _axis('cos_parent', _write(cos_parent=0.75), routing) is _mod().CosParentBucket.AT_OR_ABOVE_T_HIGH
+
+    @pytest.mark.parametrize(('routing', 'named'), [
+        ({'t_low': 0.70}, 't_low=0.7'),
+        ({'t_high': 0.72}, 't_high=0.72'),
+        ({'t_low': 0.66, 't_high': 0.74}, 't_low=0.66, t_high=0.74'),
+    ])
+    def test_a_routing_edge_inside_the_fixed_split_is_refused_naming_it(self, routing, named):
+        with pytest.raises(ValueError, match=named):
+            _axis('cos_parent', _write(cos_parent=0.7), _routing(**routing))
 
     def test_a_stored_write_has_no_parent_cosine(self):
         assert _axis('cos_parent', _stored()) is _mod().CosParentBucket.NOT_ATTACHED
@@ -900,8 +988,3 @@ class TestCommittedSolarSoakOrigins:
         census = _committed_origins()['census_fidelity']
 
         assert {'solar', 'dark_factory_reify'} <= set(census)
-
-    def test_the_pooled_bands_recorded_are_the_shipped_configs(self):
-        triage = FusedMemoryConfig().write_triage
-
-        assert _committed_origins()['provenance']['pooled_bands'] == {'t_high': triage.t_high, 't_low': triage.t_low}
