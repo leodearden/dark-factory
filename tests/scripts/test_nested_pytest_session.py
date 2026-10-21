@@ -131,15 +131,11 @@ def test_a_nested_session_leaves_the_hosts_default_temp_root_untouched(
     assert result.returncode == 0, _output(result)
     assert '1 passed' in _output(result), _output(result)
     assert (root / 'inherited-temproot').read_text() == str(host), (
-        'the nested session never inherited PYTEST_DEBUG_TEMPROOT, so it would '
-        'use the real host temp root and leave the stand-in untouched with or '
-        'without a private basetemp: the assertion below would pass vacuously'
+        'nested session did not inherit PYTEST_DEBUG_TEMPROOT'
     )
     after = _listing(host)
     assert after == before, (
-        "a nested session must not create, lock or clean dirs in the host's "
-        "default pytest temp root: its exit-time cleanup of other sessions' "
-        'dead dirs is unbounded and runs outside pytest-timeout\n'
+        "nested session touched the host's default temp root\n"
         f'before: {before}\nafter:  {after}'
     )
 

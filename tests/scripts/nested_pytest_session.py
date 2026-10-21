@@ -6,8 +6,8 @@ the only way to observe that contract is to spawn a nested pytest session wired
 to the guard and read its exit code and output. Every guard module in this
 directory does that through :func:`run_nested_pytest`, so the copy, rootdir
 isolation, private basetemp, spawn and timeout cannot drift between them. Why
-the basetemp is private: test_nested_pytest_session.py::
-test_a_nested_session_leaves_the_hosts_default_temp_root_untouched.
+the basetemp is private:
+test_nested_pytest_session.py::test_a_nested_session_leaves_the_hosts_default_temp_root_untouched.
 
 It lives here, a sibling helper module, rather than in ``df_pytest_isolation``
 for two reasons. Every caller is in ``tests/scripts/``. And that plugin is
