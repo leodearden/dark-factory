@@ -36,6 +36,7 @@ from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
     closure_exists_probe,
 )
 from fused_memory.server.markup_guard import install_markup_guard  # noqa: E402
+from fused_memory.server.markup_residue_spool import MarkupResidueSpool  # noqa: E402
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
     create_mcp_server,
@@ -579,7 +580,7 @@ async def run_server():
         run_periodic_write_ops_prune,
     )
 
-    wj_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
+    wj_data_dir = _server_data_dir(config)
     write_journal = WriteJournal(wj_data_dir)
     await write_journal.initialize()
     memory_service.set_write_journal(write_journal)
@@ -1001,7 +1002,7 @@ async def run_server():
 
         event_buffer = EventBuffer(db_path=None)
         await event_buffer.initialize()
-        _disabled_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
+        _disabled_data_dir = _server_data_dir(config)
         ticket_store = await _build_ticket_store(_disabled_data_dir)
         task_interceptor = TaskInterceptor(
             taskmaster, None, event_buffer,
@@ -1024,6 +1025,9 @@ async def run_server():
     # way, and the leaf is read live at each of them.
     topic_cluster_store = build_topic_cluster_store(wj_data_dir)
 
+    # The floor under the markup guard's residue queue (task 4809).
+    markup_residue_spool = MarkupResidueSpool(wj_data_dir / 'markup_residue')
+
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
         memory_service, task_interceptor, write_journal,
@@ -1039,7 +1043,9 @@ async def run_server():
     # ordering rationale lives on the helper, and is pinned by
     # tests/test_markup_guard_fused_memory.py::TestInstallationOrder rather
     # than by this comment.
-    _install_tool_dispatch_guards(mcp, known_projects=_known_projects_map)
+    _install_tool_dispatch_guards(
+        mcp, known_projects=_known_projects_map, residue_spool=markup_residue_spool
+    )
 
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
@@ -1821,6 +1827,11 @@ async def _build_task_backend(taskmaster_config, task_metadata_config):
     )
 
 
+def _server_data_dir(config: FusedMemoryConfig) -> Path:
+    """The server's own data dir: reconciliation's when configured, else ``./data``."""
+    return Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
+
+
 async def _build_ticket_store(data_dir: Path) -> TicketStore:
     """Construct and initialise a :class:`TicketStore` for the given data directory.
 
@@ -2068,7 +2079,10 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
 
 
 def _install_tool_dispatch_guards(
-    mcp: Any, *, known_projects: dict[str, str] | None = None
+    mcp: Any,
+    *,
+    known_projects: dict[str, str] | None = None,
+    residue_spool: MarkupResidueSpool,
 ) -> None:
     """Install both ``ToolManager.call_tool`` wrappers, in the ONE order that works.
 
@@ -2107,6 +2121,11 @@ def _install_tool_dispatch_guards(
     which the guard's storm-escalation sink uses to place a burst in the right
     queue.
 
+    *residue_spool* is REQUIRED: its ``preserve`` is the floor under the
+    guard's residue queue. ``add_memory`` declares ``content`` before
+    ``project_id``, so a forward-consuming leak in ``content`` eats the routing
+    key, and preservation therefore may not depend on routing (task 4809).
+
     REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory (section 4,
     C2), declared HERE at the interception point rather than inferred per tool
     (INV-1). This is also the primary server only: the recon-report server
@@ -2117,6 +2136,7 @@ def _install_tool_dispatch_guards(
         mcp,
         policy=RepairPolicy.REJECT_WITH_REPAIR,
         known_projects=known_projects,
+        residue_floor=residue_spool.preserve,
     )
 
 
