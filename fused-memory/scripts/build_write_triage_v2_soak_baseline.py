@@ -10,8 +10,7 @@ ones. Items whose correctness the v1 labels leave open are rated blind under
 
 Subcommands, run from ``fused-memory/``:
 
-- ``shards``: select the rating set (:func:`needs_rating`) plus a few fully
-  determined anchors per shard, and write the primary shards, a seeded
+- ``shards``: write the primary shards over every item, a seeded
   second-rater overlap, attach-time shards for parents edited after attach,
   ``key.json`` and ``rater_prompt.md`` into ``--scratch``.
 - ``third``: after the first ratings, write a shard holding exactly the pairs
@@ -29,8 +28,8 @@ import math
 import random
 import sqlite3
 import sys
-from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections import Counter, defaultdict
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
@@ -87,56 +86,168 @@ sampled, and all 473 contested attaches were rated (``correctness/analyze.py``).
 _BAND_BY_HIGH: Mapping[bool | None, str | None] = MappingProxyType({
     True: OUTCOME_RESTATED, False: OUTCOME_JUDGE, None: None,
 })
-_HOME_YES = frozenset({'SAME', 'EXTENDS', 'SUBSUMED'})
+_HOME_YES = frozenset({'SAME', 'SUBSUMED'})
 _HOME_NO = frozenset({'RELATED', 'UNRELATED'})
 _CONFLICT_NO = frozenset({'SAME', 'SUBSUMED', 'UNRELATED'})
-_V1_WORDS = _HOME_YES | _HOME_NO | {'CORRECTS', 'UNCLEAR'}
+_V1_WORDS = _HOME_YES | _HOME_NO | {'EXTENDS', 'CORRECTS', 'UNCLEAR'}
 _SCOPE_BY_DISPUTE: Mapping[str, StrEnum] = MappingProxyType({
     'genuine_correction': _rubric.Scope.CENTRAL, 'one_detail': _rubric.Scope.SECONDARY,
 })
-_FOLLOW_UPS: Mapping[Binary, Binary] = MappingProxyType({
-    Binary.SCOPE: Binary.CONFLICT, Binary.DIGEST: Binary.LOSS,
-})
+DERIVATION_MIN_COMPARED = 20
+DERIVATION_MIN_AGREEMENT = 0.90
+_CHECKED_ROLES = frozenset({Role.PRIMARY, Role.SECOND})
 _SUMMARY_KEYS = ('derived', 'rated', 'n_compared', 'agree')
 
 
-def v1_determined(row: Mapping[str, Any]) -> dict[_rubric.Binary, StrEnum]:
-    """The v2 answers a soak adjudication's v1 labels fix; every other binary stays open.
+@dataclass(frozen=True)
+class V1Row:
+    """A v1 label pattern, the rubric v2.1 binary it may fix, and the answer it fixes.
 
-    HOME is fixed by SAME/EXTENDS/SUBSUMED (YES) and RELATED/UNRELATED (NO);
-    CORRECTS covers "same claim or subject", so it cannot fix HOME (ruling 5a).
-    LOSS is fixed only by ``new_detail`` false, since v1 never asked whether a
-    reader acting on the parent would need the detail. CONFLICT is fixed by
-    SAME/SUBSUMED/UNRELATED (NO) and by CORRECTS when its dispute question
-    was answered: action-changing genuine_correction or one_detail is YES,
-    with SCOPE CENTRAL or SECONDARY; not action-changing, or noise, is NO.
-    EXTENDS and RELATED leave CONFLICT open, because v1 asked the dispute
-    question only of CORRECTS. UNCLEAR fixes nothing.
+    ``fixed`` gives the answer for a soak adjudication, or None when the row
+    does not apply to it. Rationale: ``calibration/write_triage_reader_metrics.md``.
+    """
+
+    name: str
+    binary: Binary
+    fixed: Callable[[Mapping[str, Any]], StrEnum | None]
+
+
+def _word_row(name: str, binary: Binary, words: frozenset[str], answer: StrEnum) -> V1Row:
+    return V1Row(name, binary, lambda row: answer if row['rater_verdict'] in words else None)
+
+
+def _action_changing_scope(row: Mapping[str, Any]) -> StrEnum | None:
+    if row['rater_verdict'] != 'CORRECTS' or row.get('action_changing') is not True:
+        return None
+    return _SCOPE_BY_DISPUTE.get(row.get('dispute') or '')
+
+
+def _action_changing_conflict(row: Mapping[str, Any]) -> StrEnum | None:
+    return None if _action_changing_scope(row) is None else Answer.YES
+
+
+def _noise_conflict(row: Mapping[str, Any]) -> StrEnum | None:
+    return Answer.NO if row['rater_verdict'] == 'CORRECTS' and row.get('dispute') == 'noise' else None
+
+
+def _not_action_changing_conflict(row: Mapping[str, Any]) -> StrEnum | None:
+    corrects = row['rater_verdict'] == 'CORRECTS' and row.get('dispute') != 'noise'
+    return Answer.NO if corrects and row.get('action_changing') is False else None
+
+
+def _no_new_detail_loss(row: Mapping[str, Any]) -> StrEnum | None:
+    known = row['rater_verdict'] != 'UNCLEAR'
+    return Answer.NO if known and row.get('new_detail') is False else None
+
+
+V1_ROWS: tuple[V1Row, ...] = (
+    _word_row('related_unrelated_home_no', Binary.HOME, _HOME_NO, Answer.NO),
+    _word_row('same_subsumed_home_yes', Binary.HOME, _HOME_YES, Answer.YES),
+    _word_row('same_subsumed_unrelated_conflict_no', Binary.CONFLICT, _CONFLICT_NO, Answer.NO),
+    V1Row('corrects_action_changing_conflict_yes', Binary.CONFLICT, _action_changing_conflict),
+    V1Row('corrects_action_changing_scope', Binary.SCOPE, _action_changing_scope),
+    V1Row('corrects_noise_conflict_no', Binary.CONFLICT, _noise_conflict),
+    V1Row('no_new_detail_loss_no', Binary.LOSS, _no_new_detail_loss),
+)
+"""The candidate rows: each fixes its binary only while :func:`derivation_check` holds it."""
+
+RETIRED_V1_ROWS: tuple[V1Row, ...] = (
+    _word_row('extends_home_yes', Binary.HOME, frozenset({'EXTENDS'}), Answer.YES),
+    V1Row('corrects_not_action_changing_conflict_no', Binary.CONFLICT,
+          _not_action_changing_conflict),
+)
+"""The rows ruling R7 retired: measured by :func:`derivation_check`, never applied."""
+
+_CANDIDATE_NAMES = frozenset(row.name for row in V1_ROWS)
+
+
+def v1_determined(
+    row: Mapping[str, Any], held: frozenset[str] = _CANDIDATE_NAMES,
+) -> dict[_rubric.Binary, StrEnum]:
+    """The answers the *held* candidate rows fix for a soak adjudication; every other binary stays open.
+
+    A follow-up whose ``FOLLOW_UPS`` requirements this same determination does
+    not meet is pruned, so LOSS stays only beside HOME YES and CONFLICT NO.
     """
     word = row['rater_verdict']
     if word not in _V1_WORDS:
         raise ValueError(f'adjudication {row.get("child_memory_id")!r}: unknown v1 word {word!r}')
-    if word == 'UNCLEAR':
-        return {}
-    determined: dict[_rubric.Binary, StrEnum] = {}
-    if word in _HOME_YES or word in _HOME_NO:
-        determined[Binary.HOME] = Answer.YES if word in _HOME_YES else Answer.NO
-    if row.get('new_detail') is False:
-        determined[Binary.LOSS] = Answer.NO
-    if word in _CONFLICT_NO:
-        determined[Binary.CONFLICT] = Answer.NO
-    elif word == 'CORRECTS':
-        determined.update(_corrects_determined(row))
-    return determined
+    determined = {
+        v1.binary: answer for v1 in V1_ROWS
+        if v1.name in held and (answer := v1.fixed(row)) is not None
+    }
+    return _without_unmet_follow_ups(determined)
 
 
-def _corrects_determined(row: Mapping[str, Any]) -> dict[_rubric.Binary, StrEnum]:
-    scope = _SCOPE_BY_DISPUTE.get(row.get('dispute') or '')
-    if row.get('action_changing') is True and scope is not None:
-        return {Binary.CONFLICT: Answer.YES, Binary.SCOPE: scope}
-    if row.get('action_changing') is False or row.get('dispute') == 'noise':
-        return {Binary.CONFLICT: Answer.NO}
-    return {}
+def _without_unmet_follow_ups(
+    determined: dict[_rubric.Binary, StrEnum],
+) -> dict[_rubric.Binary, StrEnum]:
+    kept = dict(determined)
+    while unmet := [
+        follow_up for follow_up in kept
+        if any(kept.get(binary) != needed
+               for binary, needed in _rubric.FOLLOW_UPS.get(follow_up, {}).items())
+    ]:
+        for follow_up in unmet:
+            del kept[follow_up]
+    return kept
+
+
+@dataclass(frozen=True)
+class RowCheck:
+    """How the primary and second raters' current-basis answers compare with one v1 row."""
+
+    binary: Binary
+    n_items: int
+    n_compared: int
+    agree: int
+    held: bool
+    retired: bool
+
+
+def derivation_check(
+    adjudications: Mapping[tuple[str, str], Mapping[str, Any] | None],
+    rated_rows: Iterable[Mapping[str, Any]],
+) -> Mapping[str, RowCheck]:
+    """Each candidate and retired v1 row, measured against the raters' answers on its binary.
+
+    *adjudications* maps each (entry, target) pair to its soak adjudication, or
+    None for an item v1 never labelled. Only decided primary and second answers
+    on the current basis are compared: third raters see only ties. A candidate
+    row is held at :data:`DERIVATION_MIN_COMPARED` compared answers and
+    :data:`DERIVATION_MIN_AGREEMENT` agreement.
+    """
+    rated: defaultdict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rated_rows:
+        if row['basis'] == Basis.CURRENT and row['role'] in _CHECKED_ROLES:
+            rated[row['entry_id'], row['target_id']].append(row)
+    rows = [(v1, False) for v1 in V1_ROWS] + [(v1, True) for v1 in RETIRED_V1_ROWS]
+    checks: dict[str, RowCheck] = {}
+    for v1, retired in rows:
+        fixed = {
+            pair: answer for pair, adjudication in adjudications.items()
+            if adjudication is not None and (answer := v1.fixed(adjudication)) is not None
+        }
+        compared = [
+            answer == row[v1.binary]
+            for pair, answer in fixed.items() for row in rated.get(pair, ())
+            if v1.binary in row and not _rubric.is_abstain(row[v1.binary])
+        ]
+        agree = sum(compared)
+        checks[v1.name] = RowCheck(
+            binary=v1.binary, n_items=len(fixed), n_compared=len(compared), agree=agree,
+            held=not retired and _holds(len(compared), agree), retired=retired,
+        )
+    return MappingProxyType(checks)
+
+
+def _holds(n_compared: int, agree: int) -> bool:
+    return n_compared >= DERIVATION_MIN_COMPARED and agree >= DERIVATION_MIN_AGREEMENT * n_compared
+
+
+def held_rows(check: Mapping[str, RowCheck]) -> frozenset[str]:
+    """The names of the rows *check* holds."""
+    return frozenset(name for name, row_check in check.items() if row_check.held)
 
 
 def item_row(
@@ -184,13 +295,6 @@ def _current_derivation(
         superseded_marks=frozenset(item['superseded_marks']),
         in_m1_band=item['band'] == _rubric.M1_BAND,
     )
-
-
-def needs_rating(item: Mapping[str, Any], determined: Mapping[_rubric.Binary, StrEnum]) -> bool:
-    """Whether the v1 labels alone leave a binary the derivation needs unrated."""
-    rows = [_derived_row(item['entry_id'], item['target_id'], determined)] if determined else []
-    derivation = _current_derivation(item, _rubric.resolve_judgements(rows))
-    return isinstance(derivation, _rubric.Incomplete)
 
 
 def decisive_ties(
@@ -336,10 +440,10 @@ def assemble(
 def _open_answers(row: Mapping[str, Any], fixed: Mapping[Any, StrEnum]) -> dict[str, str]:
     kept = {
         str(binary): row[binary] for binary in Binary
-        if binary in row and binary not in fixed and binary not in _FOLLOW_UPS
+        if binary in row and binary not in fixed and binary not in _rubric.FOLLOW_UPS
     }
-    for follow_up, asked_after in _FOLLOW_UPS.items():
-        if follow_up in row and asked_after in kept:
+    for follow_up, needs in _rubric.FOLLOW_UPS.items():
+        if follow_up in row and all(asked_after in kept for asked_after in needs):
             kept[str(follow_up)] = row[follow_up]
     return kept
 
@@ -484,8 +588,8 @@ def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
     scratch = _Scratch(args.scratch)
     key: dict[str, Any] = {'shards': {}, 'items': {}, 'attach_time_unrecoverable': []}
     rng = random.Random(args.seed)
-    needed = [soaked for soaked in soak if needs_rating(soaked.item, soaked.determined)]
-    settled = [soaked for soaked in soak if not needs_rating(soaked.item, soaked.determined)]
+    needed = list(soak)
+    settled: list[_SoakItem] = []
     rng.shuffle(needed)
     count = math.ceil(len(needed) / PRIMARY_SHARD_SIZE)
     anchors = rng.sample(settled, min(len(settled), ANCHORS_PER_SHARD * count))
