@@ -355,8 +355,8 @@ class TestDefaults:
             'RELOADABLE_FIELDS'
         )
         # task 4755: how old the in-flight fleet-redeploy lease may get before
-        # its readers stop believing it. DERIVED from the --drain verify-wait cap
-        # (worst legitimate sweep ~13,300s), not picked, and deliberately far
+        # its readers stop believing it. Fixed (a --drain sweep is fitted under
+        # it at scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS), and deliberately far
         # below the 8h min-interval so a lease leaked by a SIGKILLed sweep
         # delays at most one window. Red-tier / restart-only like its
         # siblings — captured at coordinator construction.
