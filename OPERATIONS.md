@@ -1865,10 +1865,10 @@ inside one 8-hour window.** Two corrections measured 2026-08-24/25:
   derived to fit under it in one place:
   `scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS`.
   One residual remains: a unit that never acknowledges its drain request while
-  merge-busy (pre-5371 code, or a refused request) waits out its busy grace
-  after the ceiling, and enough of them overrun the lease. A sweep that
-  overruns it loses its lease
-  mid-sweep and degrades to exactly the pre-4755 collision. And the
+  merge-busy (pre-5371 code, a refused request, or an unwritable request)
+  waits out its busy grace after the ceiling, and enough of them overrun the
+  lease. A sweep that overruns it loses its lease mid-sweep and degrades to
+  exactly the pre-4755 collision. And the
   **fused-memory tier has no lease at all** — `fused_memory_staleness_pass`
   can still collide with its own in-flight `restart-fused-memory.sh`, because
   fm's clock is likewise stamped only on completion. So "one deploy per 8h" is

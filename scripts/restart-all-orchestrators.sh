@@ -133,7 +133,7 @@ set -euo pipefail
 #                                         merge-verify command timeout, + 600)
 #   ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS sweep-wide ceiling on verify-awaiting,
 #                                         counted from sweep start (default:
-#                                         10400, derived at its assignment
+#                                         10300, derived at its assignment
 #                                         below)
 
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
@@ -264,19 +264,20 @@ DRAIN_VERIFY_MAX_WAIT_SECS="${ORCH_DRAIN_VERIFY_MAX_WAIT_SECS:-11400}"
 # The fleet lease max-age (ORCH_FLEET_LEASE_MAX_AGE_SECS, 14400; its readers'
 # copies are pinned together) is FIXED, and this default is derived to fit
 # under it -- the one home of that arithmetic. Past the ceiling a sweep can still spend, at worst:
-#   - on the unit in progress when it elapses, 990s: a busy branch that began
-#     just before it runs on for its 600s grace, one 30s poll and one 120s
-#     stale re-probe, then a restart of TimeoutStopSec 90 + VERIFY_TIMEOUT 30 +
-#     VERIFY_GRACE 120 = 240s. A verifying unit is caught sooner: within one
-#     poll + one stale re-probe, 150s, before the same restart.
+#   - on the unit in progress when it elapses, 1080s: one that never
+#     acknowledges spends a 120s opening stale grace, its 600s busy grace and a
+#     final 120s stale re-probe, then a restart of TimeoutStopSec 90 +
+#     VERIFY_TIMEOUT 30 + VERIFY_GRACE 120 = 240s. A verifying unit is caught
+#     sooner: within one poll + one stale re-probe, 150s, before the same
+#     restart.
 #   - on each of up to 7 later units (8 orchestrator units run, measured
 #     2026-10-21), 420s: two 30s polls to see its acknowledgement, one 120s
 #     stale re-probe and the 240s restart.
-# 14400 - 990 - 7 x 420 = 10470, rounded down to 10400.
+# 14400 - 1080 - 7 x 420 = 10380, rounded down to 10300.
 # Residual: a later unit that never acknowledges while merge-busy (pre-5371
-# code, or a refused request) waits out its busy grace instead of two polls,
-# up to ~570s more each.
-DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS="${ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS:-10400}"
+# code, a refused request, or an unwritable request) waits out its busy grace
+# instead of two polls, up to ~660s more each.
+DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS="${ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS:-10300}"
 # Sweep state written by drain_request_write and read by drain_check_verdict:
 # the requested_ts this sweep wrote for each unit (cleared for a unit that
 # refuses it).
