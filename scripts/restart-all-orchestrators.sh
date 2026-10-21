@@ -261,9 +261,9 @@ DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"
 DRAIN_UNKNOWN_GRACE_SECS="${ORCH_DRAIN_UNKNOWN_GRACE_SECS:-120}"
 DRAIN_POLL_TRACE_FILE="${ORCH_DRAIN_POLL_TRACE_FILE:-}"
 DRAIN_VERIFY_MAX_WAIT_SECS="${ORCH_DRAIN_VERIFY_MAX_WAIT_SECS:-11400}"
-# The fleet lease max-age (14400, four pinned copies; see LEASE_FILE) is FIXED,
-# and this default is derived to fit under it -- the one home of that
-# arithmetic. Past the ceiling a sweep can still spend, at worst:
+# The fleet lease max-age (ORCH_FLEET_LEASE_MAX_AGE_SECS, 14400; its readers'
+# copies are pinned together) is FIXED, and this default is derived to fit
+# under it -- the one home of that arithmetic. Past the ceiling a sweep can still spend, at worst:
 #   - on the unit in progress when it elapses, 990s: a busy branch that began
 #     just before it runs on for its 600s grace, one 30s poll and one 120s
 #     stale re-probe, then a restart of TimeoutStopSec 90 + VERIFY_TIMEOUT 30 +
