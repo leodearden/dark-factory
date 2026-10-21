@@ -31,9 +31,11 @@ from orchestrator.merge_lane.types import MergeRequest
 from orchestrator.verify_runner import (
     DriftDetector,
     HostAllocator,
+    HostLease,
     LocalRunner,
     RemoteRunner,
     RunnerUnavailableSink,
+    VerifyRunner,
     VerifyRunnerPool,
     build_merge_verify_spec,
 )
@@ -204,6 +206,33 @@ def _record_drift_start(path: Path | None) -> int:
     return state.consecutive_deferrals
 
 
+class _HeldHostLeases:
+    """The host-slot leases one drift check still holds; each is released once.
+
+    ``HostAllocator.release`` keys on slot state, not lease identity, so a
+    second release of a lease whose slot was since re-acquired would free the
+    new occupant.  A lease is forgotten before it is released.
+    """
+
+    def __init__(self, allocator: HostAllocator) -> None:
+        self._allocator = allocator
+        self._held: list[HostLease] = []
+
+    def hold(self, *leases: HostLease | None) -> None:
+        self._held.extend(lease for lease in leases if lease is not None)
+
+    async def release_leg(self, runner: VerifyRunner) -> None:
+        """Release the lease whose runner just ended its leg; idempotent."""
+        lease = next((held for held in self._held if held.runner is runner), None)
+        if lease is not None:
+            self._held.remove(lease)
+            await self._allocator.release(lease)
+
+    async def release_remaining(self) -> None:
+        while self._held:
+            await self._allocator.release(self._held.pop())
+
+
 async def _run_drift_check(
     git_ops: GitOps,
     req: MergeRequest,
@@ -256,8 +285,7 @@ async def _run_drift_check(
     # creation inside the try ensures the docstring contract ("Exceptions are caught
     # and logged") holds for all failure modes — disk-full / git errors included.
     wt = None
-    local_lease = None
-    remote_lease = None
+    held = _HeldHostLeases(allocator)
     try:
         wt = await git_ops.create_ephemeral_verify_worktree(merge_commit)
         # Hold THIS throwaway lane's flock for the duration of the drift
@@ -306,9 +334,9 @@ async def _run_drift_check(
         # verify body and closes before the finally.  If cleanup ran while we
         # still held the lease, `remove_merge_worktree_guarded`'s NON-BLOCKING
         # acquire would fail against OURSELVES, return 'skipped_lease_held',
-        # and leak the very tree the finally exists to remove.  The allocator
-        # local_lease/remote_lease releases stay in the finally untouched:
-        # those are host-SLOT leases, orthogonal to this lane flock.
+        # and leak the very tree the finally exists to remove.  The host-SLOT
+        # leases (`held`) are orthogonal to this lane flock: each is released
+        # as its own leg ends, with the finally as the safety net.
         async with git_ops.merge_verify_lease(lane_dir=wt):
             # FULL-GATE drift spec (task 2886 fix 1b, PRD §8δ): the drift check
             # re-dispatches this spec to BOTH the local trust-anchor and the
@@ -341,6 +369,7 @@ async def _run_drift_check(
 
             local_lease = allocator.acquire_local(_local_factory)
             remote_lease = allocator.acquire_remote()
+            held.hold(local_lease, remote_lease)
             if local_lease is None or remote_lease is None:
                 logger.debug(
                     'Drift check skipped for task %s: host slots unavailable '
@@ -372,7 +401,9 @@ async def _run_drift_check(
             # name even after the pool quarantines it (eligible_remote() returns
             # None after quarantine).
             eligible_before = pool.eligible_remote()
-            result = await detector.check(merge_commit, spec)
+            result = await detector.check(
+                merge_commit, spec, on_leg_done=held.release_leg,
+            )
             if result.quarantined and eligible_before is not None:
                 quarantine_set.add(eligible_before.name)
     except Exception:
@@ -382,10 +413,7 @@ async def _run_drift_check(
             exc_info=True,
         )
     finally:
-        if local_lease is not None:
-            await allocator.release(local_lease)
-        if remote_lease is not None:
-            await allocator.release(remote_lease)
+        await held.release_remaining()
         if wt is not None:
             await git_ops.cleanup_merge_worktree(wt)
 
