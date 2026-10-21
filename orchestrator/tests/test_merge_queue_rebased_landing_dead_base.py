@@ -252,7 +252,7 @@ class TestRebasedLandingRecordsItsPreRebaseCommitDead:
             await queue.put(req_a)
             await queue.put(req_b)
             await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
-            await asyncio.wait_for(b_entered.wait(), timeout=_SETTLE_TIMEOUT)
+            await wait_responsive(b_entered.wait(), label='B to enter its remote verify')
             a_pre = await _stacked_base(store, 'mv-b')
 
             await _land_foreign_commit(git_repo)
@@ -295,7 +295,7 @@ class TestRebasedLandingRecordsItsPreRebaseCommitDead:
             await queue.put(req_a)
             await queue.put(req_b)
             await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
-            await asyncio.wait_for(b_entered.wait(), timeout=_SETTLE_TIMEOUT)
+            await wait_responsive(b_entered.wait(), label='B to enter its remote verify')
             a_pre = await _stacked_base(store, 'pl-b')
 
             head_gate.set()
