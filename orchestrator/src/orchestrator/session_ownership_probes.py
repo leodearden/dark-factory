@@ -13,12 +13,12 @@ See ``docs/session-hook-ownership.md`` §Process-tree probes.
 
 from __future__ import annotations
 
+import enum
 import logging
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +99,10 @@ def _owning_claude_pid(tree: ProcessTree) -> int | None:
     return None
 
 
-#: "Not computed yet", distinct from None, which is a resolved answer.
-_UNRESOLVED: Any = object()
+class _Unresolved(enum.Enum):
+    """"Not computed yet", distinct from None, which is a resolved answer."""
+
+    TOKEN = enum.auto()
 
 
 class EventProbes:
@@ -115,12 +117,12 @@ class EventProbes:
     def __init__(self, env: Mapping[str, str], process_tree: ProcessTree | None) -> None:
         self._env = env
         self._tree = ProcessTree() if process_tree is None else process_tree
-        self._pid: Any = _UNRESOLVED
-        self._verdict: Any = _UNRESOLVED
+        self._pid: int | None | _Unresolved = _Unresolved.TOKEN
+        self._verdict: bool | None | _Unresolved = _Unresolved.TOKEN
 
     def owning_claude_pid(self) -> int | None:
         """The pid of the ``claude`` that fired this event, or None when unresolvable."""
-        if self._pid is _UNRESOLVED:
+        if self._pid is _Unresolved.TOKEN:
             self._pid = _owning_claude_pid(self._tree)
         return self._pid
 
@@ -132,7 +134,7 @@ class EventProbes:
         read, so callers fail soft. See ``docs/session-hook-ownership.md``
         §Owner or inheritor.
         """
-        if self._verdict is _UNRESOLVED:
+        if self._verdict is _Unresolved.TOKEN:
             self._verdict = self._compute_owner_ppid_verdict()
         return self._verdict
 

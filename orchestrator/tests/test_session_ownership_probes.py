@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections.abc import Callable
 
 import pytest
 from _process_tree_fakes import claude_process_tree, counting_walks, fake_process_tree
@@ -172,15 +173,6 @@ def test_nested_claude_liveness_pid_falls_back_to_the_durable_pid() -> None:
     assert EventProbes({}, tree).nested_claude_liveness_pid() == 515151
 
 
-def test_nested_claude_liveness_pid_walks_once_with_the_verdict() -> None:
-    tree, walks = counting_walks(claude_process_tree(4193501, 4193500))
-    probes = EventProbes({'CLAUDE_SPAWN_OWNER_PPID': '4193500'}, tree)
-
-    assert probes.owner_ppid_verdict() is True
-    assert probes.nested_claude_liveness_pid() == 4193501
-    assert len(walks) == 1
-
-
 # ---------------------------------------------------------------------------
 # EventProbes -- one process-tree observation per hook event
 # ---------------------------------------------------------------------------
@@ -205,18 +197,24 @@ def test_event_probes_walks_proc_once_for_repeated_verdicts() -> None:
     assert len(walks) == 1
 
 
-@pytest.mark.parametrize('verdict_first', [True, False])
-def test_event_probes_share_one_walk_across_both_probes(verdict_first: bool) -> None:
-    """The verdict and the bind-time pid stamp consume ONE walk, either order."""
+_ProbeRead = tuple[Callable[[EventProbes], object], object]
+_VERDICT: _ProbeRead = (EventProbes.owner_ppid_verdict, True)
+_OWNER_PID: _ProbeRead = (EventProbes.owning_claude_pid, 4193501)
+_NESTED_LIVENESS_PID: _ProbeRead = (EventProbes.nested_claude_liveness_pid, 4193501)
+
+
+@pytest.mark.parametrize(
+    'reads',
+    [(_VERDICT, _OWNER_PID), (_OWNER_PID, _VERDICT), (_VERDICT, _NESTED_LIVENESS_PID)],
+    ids=['verdict-then-pid', 'pid-then-verdict', 'verdict-then-nested-liveness-pid'],
+)
+def test_event_probes_share_one_walk_across_the_verdict_and_pid_reads(reads: tuple[_ProbeRead, ...]) -> None:
+    """The verdict and every pid read consume ONE walk, in any order."""
     tree, walks = counting_walks(claude_process_tree(4193501, 4193500))
     probes = EventProbes({'CLAUDE_SPAWN_OWNER_PPID': '4193500'}, tree)
 
-    if verdict_first:
-        assert probes.owner_ppid_verdict() is True
-        assert probes.owning_claude_pid() == 4193501
-    else:
-        assert probes.owning_claude_pid() == 4193501
-        assert probes.owner_ppid_verdict() is True
+    for read, expected in reads:
+        assert read(probes) == expected
     assert len(walks) == 1
 
 
