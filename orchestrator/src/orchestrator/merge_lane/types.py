@@ -915,6 +915,53 @@ class MergeRequest:
 
 
 @dataclass(frozen=True)
+class LaneMetadataWrite:
+    """Whether ``merge_relane`` persisted the new lane as one task's
+    ``metadata.merge_lane`` (task 5246)."""
+
+    task_id: str
+    written: bool
+
+
+@dataclass(frozen=True)
+class RelaneOutcome:
+    """What an operator's ``merge_relane`` did to a waiting merge (task 5246).
+
+    ``relaned`` is True when the addressed request, or for a coalesced member
+    the train carrying it (``via_train``), now belongs to ``lane``.
+    ``request_id`` and ``from_lane`` name that queue entry, and ``task_ids``
+    lists the tasks it carries: the request's own task, or every member of
+    the train.
+
+    That is the LIVE lane, and it lives only as long as the queue entry. A
+    solo request's journal record keeps it across a restart, but a train is
+    never journaled and is dissolved by a restart drain, so its live lane is
+    lost there. The DURABLE lane is ``metadata.merge_lane`` on each of
+    ``task_ids``: re-enqueued members inherit it. ``metadata_writes`` reports
+    that write per task. It is empty when nothing moved, and a False entry
+    means that task will re-enqueue at its old lane.
+
+    Otherwise ``refusal`` says why nothing moved:
+    - ``'already_picked'``: the merger has taken the request, so no lane
+      orders it any more. ``state`` is its lifecycle state.
+    - ``'not_found'``: nothing the lane holds answers to that id, or its
+      outcome is already decided. It can be transient while the request
+      passes between two of the lane's containers, so re-read
+      ``get_merge_queue``.
+    """
+
+    relaned: bool
+    lane: Literal['normal', 'high']
+    request_id: str | None = None
+    from_lane: Literal['normal', 'high'] | None = None
+    via_train: str | None = None
+    task_ids: tuple[str, ...] = ()
+    metadata_writes: tuple[LaneMetadataWrite, ...] = ()
+    refusal: Literal['already_picked', 'not_found'] | None = None
+    state: str | None = None
+
+
+@dataclass(frozen=True)
 class TrainCallbacks:
     """Scheduler-backed callbacks for a single train, built in the harness.
 

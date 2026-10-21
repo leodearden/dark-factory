@@ -1509,8 +1509,20 @@ asymmetry is deliberate; the reason for it is stated once, in
 `escalation/src/escalation/merge_lane_resolution.py`, under the same one-place
 rule this section applies to the carrier census below.
 
+The lane is decided once, at enqueue. Editing `metadata.merge_lane` on a task
+whose request is already queued moves nothing (task 5246). An operator moves a
+request that is still waiting for the merger with the `merge_relane` MCP tool
+(`escalation/src/escalation/server.py::merge_relane`). It also reaches a
+coalesced member by task id and moves the member's whole train. The tool
+changes the live lane at once and writes the new lane as `metadata.merge_lane`
+on every task the entry carries. That write is the durable lane: a train's live
+lane is lost when the train dissolves (for example at a restart drain), but its
+members re-enqueue at the written lane. The tool reports each write, so a
+failed one shows up and can be repeated by hand.
+
 `'high'` remains reserved for the **rare, gated hotfix / main-health class**
-(task 1689) — its three machine writers are all of that shape. Routine work
+(task 1689) — its three machine writers are all of that shape, and its fourth
+writer, the operator's `merge_relane`, is meant for the same class. Routine work
 declaring itself urgent starves the normal lane, which is the failure the
 reservation exists to prevent. The carrier census and the reason this key was
 blessed rather than typed are recorded beside the frozenset entry in

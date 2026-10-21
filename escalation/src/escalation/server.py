@@ -7,7 +7,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, assert_never, cast
@@ -86,6 +86,7 @@ if TYPE_CHECKING:
         MergeQueueStore,
         PersistedMergeRequest,
     )
+    from orchestrator.merge_lane.types import LaneMetadataWrite
 
 logger = logging.getLogger(__name__)
 
@@ -3836,8 +3837,9 @@ def create_server(
           ``lane_applied`` is **False** here and the resolution is audit only.
           Branch on ``lane_applied``, never on ``lane`` alone: a ``lane='high'``
           hotfix that coalesced is riding a possibly-``'normal'`` in-flight
-          entry.  To actually get the high lane, ``merge_cancel`` the
-          in-flight entry and resubmit, or wait for it and resubmit after.
+          entry.  To actually get the high lane, ``merge_relane`` that
+          entry while it still waits for the merger; once it has been picked,
+          ``merge_cancel`` it and resubmit, or wait for it and resubmit after.
           The in-flight entry's OWN lane is not echoed here — this arm can
           reach a foreign or pre-restart merger for which no in-process entry
           exists at all (``poll_by='branch'``), so it is not knowable
@@ -5362,5 +5364,115 @@ def create_server(
             event_store=event_store,
         )
         return {'cancelled': True, 'state': MergeState.abandoned, 'reason': None}
+
+    # ── merge_relane — move an already-enqueued request between lanes (task 5246) ──
+
+    @mcp.tool()
+    async def merge_relane(
+        lane: str,
+        request_id: str | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Move a merge request that is still waiting for the merger into *lane*.
+
+        A request's lane is decided ONCE, at enqueue, from ``merge_request``'s
+        ``lane`` or the task's ``metadata.merge_lane``.  Editing that metadata
+        afterwards moves nothing, so this tool is the lever for an
+        already-enqueued request.  ``lane='high'`` gets the request picked
+        ahead of every normal-lane request, and ``lane='normal'`` demotes it.
+        It is non-preemptive: a merge or verify already in progress is never
+        touched.
+
+        Name the request with exactly one of *request_id* (as
+        ``get_merge_queue`` lists it) or *task_id*.  A task coalesced into a
+        train has no queue entry of its own, because coalescing retired its
+        request id.  Address it by *task_id* instead: its whole train moves,
+        named by ``via_train``.
+
+        The LIVE lane changes at once.  The DURABLE lane is this tool's
+        ``metadata.merge_lane`` write (``metadata_mode='merge'``, that key
+        only) on every task the entry carries: the request's own task, or
+        every member of a train.  A train's live lane is lost when the train
+        dissolves (a restart drain dissolves an unstarted one), but its
+        members re-enqueue at the written lane.  ``metadata_writes`` reports
+        each write.  A ``written: False`` entry means that task will
+        re-enqueue at its old lane, so set its ``metadata.merge_lane`` by
+        hand.
+        If you relane a request seconds after it was enqueued, re-read
+        ``metadata_writes`` or ``get_task``: a workflow's whole-blob metadata
+        write at the enqueue boundary can race the ``merge_lane`` write.
+
+        Returns ``{relaned, lane, request_id, from_lane, via_train, task_ids,
+        metadata_writes, refusal, state}``
+        (orchestrator/src/orchestrator/merge_lane/types.py::RelaneOutcome).
+        ``refusal`` is ``'already_picked'`` once the merger has taken the
+        request (``state`` names where it is) and nothing is written.
+        ``'not_found'`` can be transient while a request passes between two
+        of the lane's containers, so re-read ``get_merge_queue`` before
+        concluding it is gone.  Bad input or no merge worker returns
+        ``{error, code, hint}`` with ``code`` ``'invalid_lane'``,
+        ``'invalid_target'`` or ``'no_merge_worker'``, and nothing moves.
+
+        Operator-only: this tool appears in no agent role's allow-list.
+        """
+        try:
+            validated_lane = validate_requested_lane(lane)
+        except InvalidMergeLane as exc:
+            valid = ', '.join(repr(v) for v in exc.valid_lanes)
+            return {
+                'error': f'invalid merge lane {exc.value!r}',
+                'code': 'invalid_lane',
+                'hint': f'lane must be one of: {valid}',
+            }
+        if (request_id is None) == (task_id is None):
+            return {
+                'error': 'name the request with exactly one of request_id or task_id',
+                'code': 'invalid_target',
+                'hint': 'a coalesced member is addressed by task_id',
+            }
+        worker = _get_merge_worker(harness)
+        if worker is None or not hasattr(worker, 'relane'):
+            return {
+                'error': 'Merge worker not available',
+                'code': 'no_merge_worker',
+                'hint': 'the orchestrator is not running in this process',
+            }
+        outcome = worker.relane(validated_lane, request_id=request_id, task_id=task_id)
+        if outcome.relaned:
+            outcome = replace(
+                outcome,
+                metadata_writes=await _write_merge_lane_metadata(outcome.task_ids, outcome.lane),
+            )
+        answer = asdict(outcome)
+        if outcome.refusal == 'not_found' and request_id is not None:
+            answer['hint'] = (
+                "a coalesced member's own request id is retired: address it by task_id"
+            )
+        return answer
+
+    async def _write_merge_lane_metadata(
+        task_ids: Sequence[str], lane: str,
+    ) -> tuple[LaneMetadataWrite, ...]:
+        """Persist *lane* as ``metadata.merge_lane`` on each task, concurrently.
+
+        Through the scheduler's own ``update_task`` with ``metadata_mode='merge'``
+        and only that key, so every sibling key is preserved.  Each result is
+        reported, never swallowed: no scheduler counts as a failed write.
+        """
+        from orchestrator.merge_lane.types import (
+            LaneMetadataWrite,
+        )
+
+        scheduler = getattr(harness, 'scheduler', None)
+
+        async def _write(tid: str) -> LaneMetadataWrite:
+            written = scheduler is not None and await scheduler.update_task(
+                tid, {'merge_lane': lane}, metadata_mode='merge',
+            )
+            if not written:
+                logger.warning('merge_relane: metadata.merge_lane=%s not written for task %s', lane, tid)
+            return LaneMetadataWrite(task_id=tid, written=bool(written))
+
+        return tuple(await asyncio.gather(*(_write(tid) for tid in task_ids)))
 
     return mcp
