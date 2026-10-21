@@ -6282,7 +6282,7 @@ class Harness:
         # an owner.  And a `preexisting_main_break` pin (task 4645): this clause
         # ALONE relaxes the wider `recovery_pins.ON_MAIN_REMEDIABLE_ESC_CATEGORIES`,
         # because it only fires with the branch ON MAIN, where that escalation's
-        # ask (`await_preexisting_main_hotfix`) is already satisfied.  The
+        # ask (a fixed main so the branch can merge) is already satisfied.  The
         # off-main clause below keeps the shared set — there the ask is unmet.
         #
         # The relaxation itself is why this clause exists at all (PRD leaf δ):

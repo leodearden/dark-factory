@@ -6,19 +6,13 @@ in ``orchestrator/src/orchestrator/exit_contract.py`` (module docstring).
 from __future__ import annotations
 
 import logging
-import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from _orch_helpers import (
-    ORCH_DIR,
-    ORCH_PYPROJECT,
-    ExitContractViolationCollector,
-    sanitized_probe_env,
-)
+from _orch_helpers import ExitContractViolationCollector
+from _probe_session import run_probe_session
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
@@ -410,20 +404,17 @@ _GUARD_PROBE = Path(__file__).with_name('_exit_contract_guard_probe.py')
 _GUARD_PROBE_KILL_SECS = 60
 
 
-def test_a_violation_logged_while_a_leaked_task_is_drained_fails_the_test_that_leaked_it():
+def test_a_violation_logged_while_a_leaked_task_is_drained_fails_the_test_that_leaked_it(
+    tmp_path: Path,
+):
     """A leaked run() whose exit is logged while conftest.py's
     ``_drain_leaked_tasks`` cancels it must fail the test that leaked it, not
     be dropped because the guard already tore down, and not be blamed on the
     next test.  Runs the probe in a REAL nested session under the shipped
     conftest, mirroring test_leaked_task_drain.py."""
-    run = subprocess.run(
-        [
-            sys.executable, '-m', 'pytest', str(_GUARD_PROBE),
-            '-c', str(ORCH_PYPROJECT), '-o', 'addopts=', '-p', 'no:cacheprovider',
-            f'--timeout={_GUARD_PROBE_KILL_SECS}', '--timeout-method=thread', '-q',
-        ],
-        cwd=ORCH_DIR, env=sanitized_probe_env(), capture_output=True, text=True,
-        timeout=_GUARD_PROBE_KILL_SECS * 4,
+    run = run_probe_session(
+        _GUARD_PROBE, basetemp=tmp_path / 'probe-basetemp',
+        kill_secs=_GUARD_PROBE_KILL_SECS, backstop_secs=_GUARD_PROBE_KILL_SECS * 4,
     )
     output = run.stdout[-4000:] + run.stderr[-2000:]
     assert run.returncode != 0, output

@@ -519,6 +519,15 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .node .id { font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
 .taskgraph .node .ttl { font-size: 11px; color: var(--fg-1); line-height: 1.25; white-space: normal; }
 .taskgraph .node .meta { display: flex; gap: 6px; align-items: center; margin-top: 2px; }
+.deferral { display: flex; gap: 6px; align-items: baseline; min-width: 0; font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.taskgraph .node .deferral { font-size: 10px; margin-top: 2px; }
+.deferral .deferral-text { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.deferral .deferral-age { flex: none; color: var(--fg-3); }
+.deferral .deferral-human { flex: none; font-size: 9px; padding: 0 3px; border: 1px solid currentColor; border-radius: 3px; }
+.deferral[data-state="held"] { color: var(--fg-2); }
+.deferral[data-state="needs_human"], .deferral[data-state="unrecorded"] { color: var(--warn); }
+.deferral[data-state="unknown"] { color: var(--fg-3); font-style: italic; }
+.proj-head .deferral-chip { color: var(--warn); font-size: 10px; }
 .taskgraph .node.dim { opacity: 0.5; }
 .taskgraph .node .status-pip { width: 6px; height: 6px; border-radius: 50%; }
 .taskgraph .node.s-in-progress .status-pip { background: var(--accent); box-shadow: 0 0 4px oklch(0.72 0.14 230 / 0.6); }

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, get_args
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from shared import process_identity
+from shared.mcp_envelope import write_failure_reason
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
@@ -7722,43 +7723,12 @@ def _reject_directory_locks_in_update_metadata(
 def interceptor_write_succeeded(resp: object) -> bool:
     """Return True iff *resp* represents a successful TaskInterceptor write.
 
-    Centralises the success/failure contract for *internal* consumers that
-    need a boolean classification (e.g. reconciliation hint-attachment in
-    ``TargetedReconciler._on_task_blocked``).  MCP passthrough call sites
-    (such as ``server/tools.py``'s ``update_task`` handler) must return the
-    raw response dict to the client so rejection details (``error``,
-    ``hint``, ``task_id``) reach the user — do **not** route them through
-    this helper.
-
-    Rejection-dict shapes this helper recognises as failures:
-
-    * The canonical write-authority rejection shape — defined once in
-      ``fused_memory.backends.task_backend_errors``
-      (``status_via_update_task_error`` / ``done_provenance_via_update_task_error``,
-      tasks C1/C2) and surfaced here via
-      ``StatusWriteAuthorityError`` / ``DoneProvenanceWriteAuthorityError
-      .to_error_dict()`` →
-      ``{'success': False, 'error': 'status_via_update_task' | 'done_provenance_via_update_task', 'task_id': …, …}``
-    * ``BacklogVerdict.to_error_dict()`` (and other no-``success``/has-``error``
-      shapes, e.g. lock-charter rejections) →
-      ``{'error': '<rendered-msg>', 'error_type': 'ReconciliationBacklogExceeded', …}``
-      (no ``success`` key — defeated by the ``not resp.get('error')`` clause)
-
-    The ``success`` key defaults to ``True`` so a successful Taskmaster passthrough
-    that does not include an explicit ``success`` field still classifies correctly.
-    Non-dict responses (``None``, strings, lists) are always treated as failures.
-
-    An empty dict ``{}`` carries no positive write signal and is therefore treated as
-    **failure** (``bool({})`` is ``False``). Production Taskmaster responses always
-    include at least one of ``success`` or ``id``; if you see ``{}`` in logs,
-    investigate the caller.
+    The predicate's single home is ``shared.mcp_envelope.write_failure_reason``;
+    this boolean form is for INTERNAL consumers (e.g.
+    ``TargetedReconciler._on_task_blocked``).  MCP passthrough sites
+    (``server/tools.py``'s ``update_task``) must return the raw dict instead.
     """
-    return (
-        isinstance(resp, dict)
-        and bool(resp)
-        and bool(resp.get('success', True))
-        and not resp.get('error')
-    )
+    return write_failure_reason(resp) is None
 
 
 def _journal_error_text(resp: object) -> str | None:

@@ -24,9 +24,29 @@ against HEAD alone, every measure MERGE_HEAD moved is a "raise" -- 18 of them
 refused esc-3620-11's resolver, all main's own. So a merge's artifacts are
 audited against BOTH parents: each measure is bounded by the 3-way rule git
 applies to the text (a side's own move stands, up or down; where both sides
-moved, the higher one bounds it), and only the ledger entries the merge itself
-appends cover anything above that bound. The restore carve-out is a
+moved, the higher one bounds it), and only the ledger entry files the merge
+itself adds cover anything above that bound. The restore carve-out is a
 single-parent rule and is not consulted.
+
+THE LEDGER IS A DIRECTORY, one file per authorization
+(``metrics.LEDGER_DIR_RELPATH``), so append-only is a comparison of file
+listings: every entry file a parent holds must be staged with the same blob,
+and a commit's own entries are the files no parent holds. The retired
+single-array file (``metrics.LEGACY_LEDGER_RELPATH``) appears here for one
+reason: the commit that splits it into files is held to
+``metrics.retire_legacy_ledger``'s set-equal rule, and nothing may stage it
+back once a parent has dropped it.
+
+AN ENTRY IS ATTRIBUTED, NOT MERELY NAMED (Leo, 2026-10-21, task 7298). A NEW
+entry file's ``task_id`` must be a task this BRANCH works on: the id in its
+name (``task/<id>``, the orchestrator's branches; ``carry/<id>`` or a name
+ending ``-<id>``, a hand carry's), or an id an earlier commit on the branch
+since main cites -- as its conventional scope, ``fix(<id>): ...``, or as
+``task <id>``; the commit being made has no message yet. That admits a
+carrier landing another task's work, whose commits cite the carried id. Its
+``reason`` may not be blank. Before this, an entry with a blank or foreign
+``task_id`` covered a raise whenever its measures matched. The task store is
+deliberately not consulted: a git hook does not depend on ``tasks.db``.
 
 WHY THIS IS A SEPARATE FILE from the instrument it calls. ``merge_lane_metrics``
 deliberately has no git dependency -- ``repo_root()`` derives from ``__file__``,
@@ -37,7 +57,8 @@ testable against a real repo. Same-directory import: running this file puts
 ``scripts/`` on ``sys.path[0]``, so no path surgery is needed.
 
 EXIT LADDER: 0 clean; 1 a POLICY refusal this commit must fix -- an unrecorded
-raise, a staged deletion of the baseline, or a rewritten ledger history; 2 the
+raise, a staged deletion of the baseline, a rewritten ledger history, a retired
+ledger split wrongly or staged back, or an entry this branch may not record; 2 the
 gate could not do its job -- its environment is wrong, git failed, or a staged
 artifact is unreadable. The split is the only machine-readable thing this gate
 says, and it is what lets a later caller (CI, a merge-lane gate, the residual
@@ -47,6 +68,7 @@ without ever waving a policy refusal through under it.
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 import tempfile
@@ -70,8 +92,23 @@ except ImportError as exc:  # pragma: no cover - exercised by the hook, not pyte
     )
     raise SystemExit(2) from exc
 
-#: The two committed artifacts this gate is about, named once.
-_ARTIFACTS = (metrics.BASELINE_RELPATH, metrics.LEDGER_RELPATH)
+#: A branch naming the task it works on: the orchestrator's ``task/<id>``, or a
+#: hand carry's ``carry/<id>``, the id leading (``task/5722-gate``) or ending the
+#: name after a dash (``carry/A4-4614``).
+_BRANCH_TASK = re.compile(r'(?:task|carry)/(?:(\d+)(?!\d).*|.*-(\d+))$')
+
+#: How a commit subject cites a task: a conventional scope of ids
+#: (``fix(3774): ...``), or ``task <id>`` in its text (CONTRIBUTING.md section 7).
+_SUBJECT_SCOPE = re.compile(r'[a-z]+\(([\d, ]+)\)!?:')
+_SUBJECT_TASK = re.compile(r'\btask (\d+)\b', re.IGNORECASE)
+
+#: The committed artifacts this gate is about, named once: the baseline, the
+#: ledger directory, and the retired ledger whose split and burial it audits.
+_ARTIFACTS = (
+    metrics.BASELINE_RELPATH,
+    metrics.LEDGER_DIR_RELPATH,
+    metrics.LEGACY_LEDGER_RELPATH,
+)
 
 
 def _git(root: Path, *args: str, stdin: str | None = None) -> str:
@@ -164,22 +201,10 @@ def _image(root: Path, oid: str, target: Path) -> Path:
     return target
 
 
-def _ledger_image(root: Path, revision: str, scratch: Path, name: str) -> dict:
-    """The ledger at *revision*, or the fail-CLOSED empty ledger when absent.
-
-    ``load_ledger`` owns both polarities -- absent is empty, malformed is fatal
-    -- so neither is re-implemented here.
-    """
-    oid = _object_id(root, revision)
-    if oid is None:
-        return metrics.empty_ledger()
-    return metrics.load_ledger(_image(root, oid, scratch / name))
-
-
 def _refuse_unrecorded(
     raises: list[metrics.Violation], appended: list[dict]
 ) -> list[str]:
-    """The refusal lines for every raise this commit's ledger entries do not name."""
+    """The refusal lines for every raise this commit's own ledger entries do not cover."""
     unrecorded = metrics.unrecorded_raises(raises, appended)
     if not unrecorded:
         return []
@@ -248,41 +273,129 @@ def _restores_previous_image(root: Path, staged_oid: str) -> str | None:
     return None
 
 
-def _appended_ledger_entries(root: Path, scratch: Path) -> list[dict]:
-    """This commit's NEW ledger entries, refusing any rewrite of the recorded ones.
+def _blob_text(root: Path, oid: str) -> str:
+    return _git(root, 'cat-file', 'blob', oid)
+
+
+def _entry_listing(root: Path, revision: str | None) -> dict[str, str]:
+    """The ledger's entry files at *revision* (None: the index), as name -> blob id.
+
+    ``_README.json`` is left out: it records no authorization, and it is the
+    one file there that may change. A revision that names nothing -- an unborn
+    HEAD -- holds no entries. An index entry still unmerged is a fault, not an
+    answer: the gate never guesses which stage a resolution meant.
+    """
+    ledger = metrics.LEDGER_DIR_RELPATH
+    if revision is None:
+        listing = _git(root, 'ls-files', '--stage', '-z', '--', ledger)
+    elif _object_id(root, revision) is None:
+        return {}
+    else:
+        listing = _git(root, 'ls-tree', '-r', '-z', '--full-tree', revision, '--', ledger)
+    entries: dict[str, str] = {}
+    for record in filter(None, listing.split('\0')):
+        meta, path = record.split('\t', 1)
+        fields = meta.split()
+        if revision is None and fields[2] != '0':
+            raise metrics.RatchetError(f'{path} is unmerged in the index')
+        name = path.removeprefix(f'{ledger}/')
+        if name != metrics.LEDGER_README_NAME:
+            entries[name] = fields[1] if revision is None else fields[2]
+    return entries
+
+
+def _own_entries(root: Path, parents: list[str]) -> list[dict]:
+    """This commit's OWN ledger entries, refusing any rewrite of a parent's.
 
     Resolved whenever a ratchet artifact is staged, not only when the baseline
     moved: the append-only promise is broken precisely by a commit that touches
     the ledger ALONE, so an audit conditioned on the baseline would leave it
-    unenforced in the one case that breaks it (heuristic 10, uniformly).
-
-    The refusal is ``ledger_appended_entries``' own ``AppendOnlyViolation``
-    rather than a line this function composes, and :func:`_audit` gives it the
-    policy rung of the ladder. That asymmetry against the baseline arm is
-    deliberate: a rewritten history cannot be excused by anything else in the
-    commit, whereas a measured raise can be -- by a covering ledger entry, or by
-    a restore.
+    unenforced in the one case that breaks it (heuristic 10, uniformly). The
+    refusals are ``metrics``' own ``AppendOnlyViolation`` verdicts, which
+    :func:`_audit` puts on the policy rung.
     """
-    return metrics.ledger_appended_entries(
-        _ledger_image(root, f'HEAD:{metrics.LEDGER_RELPATH}', scratch, 'head.json'),
-        _ledger_image(root, f':{metrics.LEDGER_RELPATH}', scratch, 'staged.json'),
+    staged = _entry_listing(root, None)
+    own_names = metrics.own_entry_names(
+        [_entry_listing(root, parent) for parent in parents], staged
     )
+    own = [metrics.parse_entry(name, _blob_text(root, staged[name])) for name in own_names]
+    return metrics.retire_legacy_ledger(_retired_entries(root, parents), staged, own)
 
 
-def _merged_ledger_entries(root: Path, scratch: Path, merge_head: str) -> list[dict]:
-    """A merge's OWN new ledger entries, refusing any rewrite of either parent's.
+def _retired_entries(root: Path, parents: list[str]) -> list[dict]:
+    """The retired array's entries in every parent that held it, if this commit drops it.
 
-    Both parents' recorded entries are HISTORY: a record MERGE_HEAD committed is
-    not "appended" by this commit merely because HEAD lacks it, so it can never
-    cover a raise the merge makes (LEDGER_README: nothing in the file grants a
-    future raise).
+    Staging it while some parent lacks it -- a merge resolution that kept a
+    branch's copy of the array -- buries an entry where nothing reads it, so
+    that is refused outright rather than retired.
     """
-    ledger = metrics.LEDGER_RELPATH
-    return metrics.ledger_merged_entries(
-        _ledger_image(root, f'HEAD:{ledger}', scratch, 'head.json'),
-        _ledger_image(root, f'{merge_head}:{ledger}', scratch, 'merge_head.json'),
-        _ledger_image(root, f':{ledger}', scratch, 'staged.json'),
-    )
+    legacy = metrics.LEGACY_LEDGER_RELPATH
+    held = {parent: _object_id(root, f'{parent}:{legacy}') for parent in parents}
+    if _object_id(root, f':{legacy}') is not None:
+        if None in held.values():
+            raise metrics.AppendOnlyViolation(
+                f'{legacy} was retired: a raise is recorded as one file under '
+                f'{metrics.LEDGER_DIR_RELPATH}/. Delete it from this commit and '
+                'split any entry only it carries with '
+                'scripts/split_merge_lane_ratchet_ledger.py.'
+            )
+        return []
+    return [
+        entry
+        for oid in held.values()
+        if oid is not None
+        for entry in metrics.legacy_ledger_entries(_blob_text(root, oid))
+    ]
+
+
+def _branch_task_ids(root: Path) -> set[str]:
+    """The task ids this branch works on: its name's, and every one its own commits cite.
+
+    "Its own commits" are those reachable from HEAD and not from main, so an id
+    only main's history cites licenses nothing here. A detached HEAD has no
+    name, an unborn one no commits, and a repository with no main no fork
+    point to measure from -- each just contributes nothing.
+    """
+    ids: set[str] = set()
+    try:
+        branch = _git(root, 'symbolic-ref', '--quiet', '--short', 'HEAD').strip()
+    except subprocess.CalledProcessError:
+        branch = ''
+    if named := _BRANCH_TASK.match(branch):
+        ids.update(group for group in named.groups() if group)
+    if _object_id(root, 'HEAD') is None or _object_id(root, 'refs/heads/main') is None:
+        return ids
+    for subject in _git(root, 'log', '--format=%s', 'refs/heads/main..HEAD').splitlines():
+        if scope := _SUBJECT_SCOPE.match(subject):
+            ids.update(re.findall(r'\d+', scope.group(1)))
+        ids.update(_SUBJECT_TASK.findall(subject))
+    return ids
+
+
+def _refuse_unattributed(own_entries: list[dict], task_ids: set[str]) -> list[str]:
+    """The refusal lines for every own entry this branch may not record."""
+    lines = []
+    for entry in own_entries:
+        task_id, reason = entry.get('task_id'), entry.get('reason')
+        name = metrics.entry_filename(entry)
+        if not isinstance(reason, str) or not reason.strip():
+            lines.append(f'  {name} records no reason')
+        if not isinstance(task_id, str) or task_id.strip() not in task_ids:
+            lines.append(f'  {name} records task_id {task_id!r}')
+    if not lines:
+        return []
+    return [
+        f'ratchet commit gate: {len(lines)} new {metrics.LEDGER_DIR_RELPATH} '
+        'entr(ies) are not attributed to a task this branch works on:',
+        *lines,
+        "An entry's task_id must be this branch's own task (task/<id>, "
+        'carry/<id>, or a name ending -<id>) or one an EARLIER commit on this '
+        'branch cites -- `fix(<id>): ...` or `task <id>`; this branch names or '
+        f'cites: {sorted(task_ids) or "none"}. The commit being made cannot cite '
+        'itself, because pre-commit runs before its message exists: commit the '
+        'code first and the entry after it, or name the branch carry/<id>. Its '
+        'reason may not be blank. Record the raise with --authorize-raise <that id>.',
+    ]
 
 
 def _audit_baseline(
@@ -360,7 +473,19 @@ def _audit_merged_baseline(
         theirs=image(theirs_oid, 'theirs.json'),
         current=_image(root, staged_oid, scratch / 'current.json'),
     )
-    return _refuse_unrecorded(raises, own_entries)
+    refusals = _refuse_unrecorded(raises, own_entries)
+    if not refusals:
+        return []
+    return [
+        *refusals,
+        'FINISHING A MERGE where both sides raised one key: the bound is the '
+        "higher side, so the composed value (the ratchet-baseline driver's, or "
+        'a regeneration\'s) is this merge\'s own raise -- and --write-baseline '
+        'records nothing over a file that already holds it. Run `git checkout '
+        f'HEAD -- {metrics.BASELINE_RELPATH}` (ours; `--ours` is a no-op once the '
+        'driver resolved the file), then the --write-baseline --authorize-raise '
+        "command above: it measures from ours and records the merge's own entry.",
+    ]
 
 
 def _first_write(absent_from: str) -> list[str]:
@@ -406,21 +531,22 @@ def _audit(root: Path) -> int:
     with tempfile.TemporaryDirectory() as scratch_dir:
         scratch = Path(scratch_dir)
         # The ledger audit runs on BOTH paths; the baseline audit only when the
-        # baseline is staged. Neither can excuse the other: a covering append
+        # baseline is staged. Neither can excuse the other: a covering entry
         # does not launder a rewritten history, and an untouched history does
         # not excuse an unrecorded raise.
+        parents = ['HEAD'] if merge_head is None else ['HEAD', merge_head]
         try:
-            own_entries = (
-                _appended_ledger_entries(root, scratch)
-                if merge_head is None
-                else _merged_ledger_entries(root, scratch, merge_head)
-            )
+            own_entries = _own_entries(root, parents)
         except metrics.AppendOnlyViolation as exc:
             # A VERDICT, so the POLICY rung -- never the instrument-failure one
             # its ``MetricsError`` siblings take at ``main``. It returns here
             # rather than joining the baseline arm's lines because nothing else
             # in the commit can excuse it.
             return _refuse([f'ratchet commit gate: {exc}'])
+        if own_entries:
+            unattributed = _refuse_unattributed(own_entries, _branch_task_ids(root))
+            if unattributed:
+                return _refuse(unattributed)
         if metrics.BASELINE_RELPATH not in staged:
             return 0
         refusals = (

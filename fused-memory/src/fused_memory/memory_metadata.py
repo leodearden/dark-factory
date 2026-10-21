@@ -100,6 +100,7 @@ __all__ = [
     'SERVER_STAMPED_KEYS',
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
+    'TRIAGE_CONTESTED_METADATA_KEY',
     'check_canonical_routing',
     'classify_unknown_keys',
     'is_orchestrator_completion_record',
@@ -116,6 +117,13 @@ __all__ = [
 #: it is experimenting should be able to say so without manufacturing census
 #: noise.
 EXPERIMENTAL_KEY_PREFIX = 'x_'
+
+#: Marks a ``server/grouped_read.py::CONTESTED_METADATA_KEY`` flag that write
+#: triage's judge stamped, not one an agent declared. Only
+#: ``server/tools.py::add_memory``'s contested attach writes it, and that tool
+#: discards any value a caller supplies. Read by
+#: ``plans/write-triage-link-healing-prd.md`` H1 row 2.
+TRIAGE_CONTESTED_METADATA_KEY = f'{EXPERIMENTAL_KEY_PREFIX}contested_by_triage'
 
 
 def normalize_supersedes(value: Any) -> list[Any]:

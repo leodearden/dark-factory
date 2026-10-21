@@ -188,7 +188,7 @@ class BlockDisposition:
     catch sites (workflow.py/steward.py/review_checkpoint.py/
     dry_run_unblock.py) now consult instead of hand-writing their own.
 
-    ``category`` is the ``verify_classify.classify_failure`` 12-value
+    ``category`` is the ``verify_classify.classify_failure``
     output domain (:class:`FailureCategory`) — a DISTINCT concept from the
     escalation-taxonomy string (``'infra_issue'``/``'wip_conflict'``/
     ``'task_failure'``) ``_mark_blocked`` separately accepts as its

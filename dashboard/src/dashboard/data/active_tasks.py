@@ -59,6 +59,8 @@ selected task from ``dashboard/src/dashboard/api/task_prose.py::api_task_prose``
         'meta_files': ['src/...py', ...],  # taskmaster metadata.files; retained on API for
                                            # debugging/tooling — no frontend UI reads it directly
         'train': {'id': 'demo', 'order': 0},  # present when metadata.train is set; None otherwise
+        'deferral': {...},  # ONLY on a deferred row: dashboard.data.deferral_summary's summary,
+                            # or None when the row carries no record
     }
 
 Lock state is surfaced via the scheduler endpoint (see /api/v2/dashboard/scheduler).
@@ -81,11 +83,13 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.timestamps import parse_timestamp_or_warn
 
 from dashboard.config import DashboardConfig
+from dashboard.data.deferral_summary import UNREAD, HoldReads, deferral_row_fields
 from dashboard.data.task_runtime import fetch_task_runtime
 from dashboard.data.task_snapshot import (
     SnapshotFailure,
     TaskSnapshot,
     acquire_snapshot,
+    measured_status_map,
     unmeasured_snapshot,
     withhold_rows,
 )
@@ -372,6 +376,7 @@ def _build_task_row(
     *,
     prd: str | None = None,
     now: datetime | None = None,
+    hold_reads: HoldReads = UNREAD,
 ) -> dict:
     """Build the common row fields shared by active and done task rows.
 
@@ -413,6 +418,10 @@ def _build_task_row(
     NOT the render instant, so a stale half is not re-judged against a later
     clock; ``shape_terminal_rows`` passes the render instant, which a terminal
     row never consults (the predicate gates on ``in-progress``).
+
+    ``deferral`` is present only on a deferred row, worded against
+    *hold_reads* by ``dashboard.data.deferral_summary``, and ``None`` when the
+    row carries no record.
     """
     metadata = task.get('metadata') or {}
     meta_files = list(metadata.get('files') or [])
@@ -449,6 +458,7 @@ def _build_task_row(
         'train': train,
         'external_deps': external_deps,
         'prd': prd if prd is not None else _coalesce_prd(metadata),
+        **deferral_row_fields(task, now=resolve_now(now), reads=hold_reads),
     }
 
 
@@ -662,6 +672,10 @@ def _shape_one_project(
 
     # Lookup table for dep title/status resolution within the same project.
     by_id: dict[int, dict] = {t['id']: t for t in tasks if isinstance(t.get('id'), int)}
+    hold_reads = HoldReads(
+        carrier_statuses=measured_status_map(snapshot),
+        holder_liveness=snapshot.holder_liveness,
+    )
 
     active: list[dict] = []
     for task in tasks:
@@ -670,7 +684,9 @@ def _shape_one_project(
             continue
         rt = _runtime_fields(runtime_index, runtime_status, task_id, now=now)
         uid = task_uid(project, task_id)
-        row = _build_task_row(project, task, task_id, rt, uid, now=judged_at)
+        row = _build_task_row(
+            project, task, task_id, rt, uid, now=judged_at, hold_reads=hold_reads,
+        )
         # active rows: started from the runtime entry; deps from task tree.
         row['started'] = rt['started']
         row['deps'] = _resolve_deps(task, by_id, project, status_map=snapshot.status_map)

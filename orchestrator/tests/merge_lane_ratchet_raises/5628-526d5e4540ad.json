@@ -1,0 +1,12 @@
+{
+  "task_id": "5628",
+  "reason": "net-additive call-site tests for the verify admission gate (task 5628, esc-5628-1): test_verify_admission_call_sites.py drives the three private call-site seams the plan mandates (_verify_debugfix_loop, _run_merge_phase, _run_main_tip_sweep) plus the two merge-phase preamble stubs it cannot run without, and test_verify_admission_order_integration.py injects module configs through config._module_configs as 30 other test files do",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6647,
+      "current": 6653
+    }
+  ]
+}

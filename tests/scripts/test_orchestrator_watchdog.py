@@ -12233,9 +12233,10 @@ def test_fleet_lease_max_age_matches_config_default(monkeypatch: pytest.MonkeyPa
 
     Modelled on test_orch_restart_min_interval_secs_matches_config_default
     above. The bound is what makes a SIGKILLed sweep cost at most one delayed
-    window, and its 14400s value is DERIVED (worst legitimate sweep ~= 13,300s),
-    not chosen — so a tier drifting off it is a silent correctness change, not
-    a cosmetic one.
+    window, and a --drain sweep is fitted under its 14400s value (at
+    scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS) —
+    so a tier drifting off it is a silent correctness change, not a cosmetic
+    one.
 
     Two statements, because there are exactly two tiers that READ the value:
     the coordinator via OrchestratorConfig and the watchdog via its own env
