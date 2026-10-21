@@ -842,3 +842,66 @@ class TestMain:
                 '--evidence-dir', str(tmp_path), '--project-report', 'p=a.json', '--project-report', 'p=b.json',
                 '--out', str(tmp_path / 'o.json'),
             ])
+
+
+# --- the committed origins artifact -----------------------------------------
+
+PACKAGE_ROOT = SCRIPTS.parent
+ORIGINS_PATH = PACKAGE_ROOT / 'calibration' / 'write_triage_solar_soak_origins.json'
+
+
+@functools.cache
+def _committed_origins() -> dict[str, Any]:
+    assert ORIGINS_PATH.exists(), f'origins artifact missing: {ORIGINS_PATH}'
+    return json.loads(ORIGINS_PATH.read_text())
+
+
+def _k_of_n_cells(node: Any) -> list[dict[str, Any]]:
+    if isinstance(node, dict):
+        own = [node] if set(node) == {'k', 'n', 'rate', 'wilson95'} else []
+        return own + [cell for child in node.values() for cell in _k_of_n_cells(child)]
+    if isinstance(node, list):
+        return [cell for child in node for cell in _k_of_n_cells(child)]
+    return []
+
+
+class TestCommittedSolarSoakOrigins:
+    def test_the_replay_covers_exactly_the_two_solar_reports_and_each_is_committed(self):
+        reports = _committed_origins()['provenance']['project_reports']
+
+        assert set(reports) == {'solar_challenge', 'solar_challenge_platform'}
+        assert set(_committed_origins()['replay']) == set(reports)
+        assert all((PACKAGE_ROOT / path).exists() for path in reports.values())
+
+    def test_every_replay_arms_edges_are_those_of_the_report_its_provenance_names(self):
+        origins = _committed_origins()
+        provenance = origins['provenance']
+        pooled = _mod().Routing(
+            t_high=provenance['pooled_bands']['t_high'], t_low=provenance['pooled_bands']['t_low'],
+            judge_candidate_count=provenance['judge_candidate_count'],
+        )
+
+        for project, path in provenance['project_reports'].items():
+            report = json.loads((PACKAGE_ROOT / path).read_text())
+            arms = _mod().project_band_arms(report, pooled)
+            assert set(origins['replay'][project]) == set(arms)
+            for name, arm in arms.items():
+                assert origins['replay'][project][name]['edges'] == arm.as_json(), (project, name)
+
+    def test_every_rate_and_interval_recomputes_from_its_own_counts(self):
+        cells = _k_of_n_cells(_committed_origins())
+
+        assert cells
+        for cell in cells:
+            assert cell['rate'] == _stats().rate(cell['k'], cell['n']), cell
+            assert cell['wilson95'] == _stats().wilson95(cell['k'], cell['n']), cell
+
+    def test_census_fidelity_carries_the_two_census_groups(self):
+        census = _committed_origins()['census_fidelity']
+
+        assert {'solar', 'dark_factory_reify'} <= set(census)
+
+    def test_the_pooled_bands_recorded_are_the_shipped_configs(self):
+        triage = FusedMemoryConfig().write_triage
+
+        assert _committed_origins()['provenance']['pooled_bands'] == {'t_high': triage.t_high, 't_low': triage.t_low}
