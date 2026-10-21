@@ -2573,22 +2573,33 @@ def test_a_legacy_heartbeat_under_drain_behaves_exactly_as_before(tmp_path):
     assert ["--user", "restart", UNIT_R] in state["calls"], context
 
 
-def test_the_sweep_wide_ceiling_cuts_a_later_units_await_and_drops_the_rest_to_the_merge_idle_gate(
-    tmp_path,
-):
-    """Per-unit caps add up, so a sweep-wide ceiling counted from the first
-    unit's request bounds all verify-awaiting together (task 7297): a lapsed
-    fleet lease would let a second sweep start. Here UNIT_R drains in time,
-    the ceiling trips while UNIT_S is still verifying -- long before UNIT_S's
-    own cap -- and UNIT_SELF gets no request, so its heartbeat, verifying if
-    it were asked to drain but merge-idle by the old measure, reads idle."""
-    ceiling_secs = 8
+_CEILING_TRIP_LINE = re.compile(
+    r"^sweep-wide drain verify-wait ceiling of (?P<ceiling>\d+)s spent after "
+    r"(?P<elapsed>\d+)s, at (?P<unit>\S+); this and later units are "
+    r"force-restarted at their first acknowledged poll$",
+    re.MULTILINE,
+)
+
+
+def _ceiling_trips(stdout):
+    return [m.groupdict() for m in _CEILING_TRIP_LINE.finditer(stdout)]
+
+
+def test_the_sweep_wide_ceiling_counts_from_sweep_start_and_force_restarts_the_rest(tmp_path):
+    """Task 7297: one ceiling, counted from sweep start, bounds verify-awaiting
+    across the whole sweep so it ends inside the fleet lease. UNIT_R spends
+    most of it; the ceiling trips while UNIT_S is verifying -- long before
+    UNIT_S's own cap, and after fewer polls than a clock restarted at UNIT_S
+    would allow; UNIT_SELF still gets its request and is restarted at its first
+    acknowledged poll instead of awaited."""
+    ceiling_secs = load_scaled_grace(8, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
+    unit_r_polls = ceiling_secs * 5 // 8
     bin_dir, state_path, fleet_dir, trace_path, env = _three_unit_drain_sweep(
         tmp_path,
         {
             UNIT_R: _hb_drain([_verifying_entry(deadline_in=3600)]),
             UNIT_S: _hb_drain([_verifying_entry(deadline_in=3600)]),
-            UNIT_SELF: {**_hb_drain([_verifying_entry(deadline_in=3600)]), "merge_idle": True},
+            UNIT_SELF: _hb_drain([_verifying_entry(deadline_in=3600)]),
         },
     )
     env["ORCH_DRAIN_VERIFY_MAX_WAIT_SECS"] = "600"
@@ -2596,37 +2607,94 @@ def test_the_sweep_wide_ceiling_cuts_a_later_units_await_and_drops_the_rest_to_t
 
     with _rewrites_on_gate_polls(
         fleet_dir, UNIT_R, trace_path,
-        [_Rewrite(after="verifying", to=_hb_drain([]), polls=2)],
+        [_Rewrite(after="verifying", to=_hb_drain([]), polls=unit_r_polls)],
     ):
-        result = _run_script(bin_dir, state_path, fleet_dir, "--drain", env=env, timeout=40)
+        result = _run_script(
+            bin_dir, state_path, fleet_dir, "--drain", env=env, timeout=ceiling_secs + 30,
+        )
 
     polls = read_drain_poll_trace(trace_path)
     context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
     assert result.returncode == 0, context
     out = result.stdout
-    trip_lines = [line for line in out.splitlines() if "sweep-wide drain verify-wait ceiling of" in line]
-    assert len(trip_lines) == 1 and trip_lines[0].startswith(
-        f"sweep-wide drain verify-wait ceiling of {ceiling_secs}s spent after "
-    ) and f", at {UNIT_S};" in trip_lines[0], (
-        f"the ceiling must be announced once, naming {UNIT_S}. {context}"
+    [trip] = _ceiling_trips(out) or [None]
+    assert trip is not None and len(_ceiling_trips(out)) == 1, (
+        f"the ceiling must be announced exactly once. {context}"
+    )
+    assert trip["unit"] == UNIT_S and int(trip["ceiling"]) == ceiling_secs, context
+    assert ceiling_secs <= int(trip["elapsed"]) <= (
+        ceiling_secs + _DRAIN_POLL_INTERVAL_SECS + load_scaled_grace(2, cap_secs=10)
+    ), f"the trip must be caught within about one poll of the ceiling. {context}"
+    assert polls.count(("verifying", UNIT_R)) >= unit_r_polls, context
+    assert polls.count(("verifying", UNIT_S)) <= (
+        (ceiling_secs - unit_r_polls * _DRAIN_POLL_INTERVAL_SECS) // _DRAIN_POLL_INTERVAL_SECS + 1
+    ), (
+        f"{UNIT_R} spent >= {unit_r_polls}s of the {ceiling_secs}s ceiling, so "
+        f"{UNIT_S} may be polled only for what is left of it: more polls mean "
+        f"the ceiling's clock restarted at {UNIT_S}. {context}"
     )
     assert f"force-restarting {UNIT_S}: sweep-wide drain verify-wait ceiling spent" in out, context
+    assert f"force-restarting {UNIT_SELF}: sweep-wide drain verify-wait ceiling spent" in out, context
     assert "drain verify-wait cap of" not in out, (
         f"no unit may reach its own per-unit cap. {context}"
     )
-    assert polls.count(("verifying", UNIT_S)) >= 1, context
-    assert [p for p in polls if p[1] == UNIT_SELF] == [("idle", UNIT_SELF)], (
-        f"after the ceiling {UNIT_SELF} must be read by merge_idle alone. {context}"
+    assert [p for p in polls if p[1] == UNIT_SELF] == [("verifying", UNIT_SELF)], (
+        f"after the ceiling {UNIT_SELF} must be restarted at its first acknowledged poll. {context}"
     )
     assert f"awaiting in-flight merge verify on {UNIT_SELF}" not in out, context
-    assert f"requested a merge-admission drain on {UNIT_SELF}" not in out, context
     held_at_each_restart = [
         (unit, sorted(held)) for unit, held in _drain_observations(_load_state(state_path))
     ]
     assert held_at_each_restart == [
-        (UNIT_R, [f"{UNIT_R}.drain.json"]),
-        (UNIT_S, [f"{UNIT_S}.drain.json"]),
-        (UNIT_SELF, []),
+        (unit, [f"{unit}.drain.json"]) for unit in (UNIT_R, UNIT_S, UNIT_SELF)
+    ], f"every unit, after the ceiling too, must hold its own request at its restart. {context}"
+
+
+def test_a_ceiling_spent_between_units_is_announced_at_the_next_units_entry(tmp_path):
+    """The ceiling can expire while no verify is awaited: here during UNIT_R's
+    busy defer (an unacknowledged request, whose busy grace the ceiling
+    does not cut). UNIT_S then announces it on entry, still gets its request,
+    and is force-restarted at its first acknowledged poll."""
+    ceiling_secs = load_scaled_grace(3, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
+    busy_grace_secs = ceiling_secs + 2
+    bin_dir, state_path, fleet_dir, trace_path, env = _three_unit_drain_sweep(
+        tmp_path,
+        {
+            UNIT_R: {"merge_idle": False, "drain": None, "verifies_in_flight": []},
+            UNIT_S: _hb_drain([_verifying_entry(deadline_in=3600)]),
+            UNIT_SELF: _hb_drain([]),
+        },
+    )
+    env["ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS"] = str(ceiling_secs)
+    env["ORCH_RESTART_FORCE_FIRE_AFTER_SECS"] = str(busy_grace_secs)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain", env=env, timeout=busy_grace_secs + 30,
+    )
+
+    polls = read_drain_poll_trace(trace_path)
+    context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == 0, context
+    out = result.stdout
+    assert f"force-restarting {UNIT_R}: mid-merge grace of {busy_grace_secs}s exceeded" in out, context
+    trips = _ceiling_trips(out)
+    assert [t["unit"] for t in trips] == [UNIT_S], (
+        f"the ceiling must be announced once, on {UNIT_S}'s entry. {context}"
+    )
+    assert int(trips[0]["elapsed"]) >= ceiling_secs, context
+    trip_at = out.index("sweep-wide drain verify-wait ceiling of")
+    assert out.index(f"Restarting {UNIT_R}") < trip_at < out.index(
+        f"requested a merge-admission drain on {UNIT_S}"
+    ), context
+    assert [p for p in polls if p[1] == UNIT_S] == [("verifying", UNIT_S)], context
+    assert f"force-restarting {UNIT_S}: sweep-wide drain verify-wait ceiling spent" in out, context
+    assert f"awaiting in-flight merge verify on {UNIT_S}" not in out, context
+    assert [p for p in polls if p[1] == UNIT_SELF] == [("idle", UNIT_SELF)], context
+    held_at_each_restart = [
+        (unit, sorted(held)) for unit, held in _drain_observations(_load_state(state_path))
+    ]
+    assert held_at_each_restart == [
+        (unit, [f"{unit}.drain.json"]) for unit in (UNIT_R, UNIT_S, UNIT_SELF)
     ], context
 
 
