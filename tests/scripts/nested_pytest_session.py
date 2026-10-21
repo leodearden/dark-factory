@@ -87,6 +87,12 @@ def run_nested_pytest(
     clobbered = sorted(_HARNESS_FILES.intersection(files))
     if clobbered:
         raise ValueError(f"files may not replace the harness's own files: {clobbered}")
+    smuggled = [t for t in targets if t == '--basetemp' or t.startswith('--basetemp=')]
+    if smuggled:
+        raise ValueError(
+            "a nested session runs under the harness's own basetemp; "
+            f'targets may not set --basetemp: {smuggled}'
+        )
     basetemp = root.with_name(f'{root.name}.basetemp')
     root.mkdir(parents=True)
     shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
