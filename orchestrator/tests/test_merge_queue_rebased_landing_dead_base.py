@@ -140,11 +140,26 @@ async def _until(predicate, *, what: str, timeout: float = _SETTLE_TIMEOUT) -> N
     raise AssertionError(f'timed out after {timeout}s waiting for {what}')
 
 
+async def _git_until_it_takes(repo: Path, *argv: str) -> None:
+    """Run one git command, retrying while the live lane holds the repo's index lock."""
+    deadline = asyncio.get_running_loop().time() + _SETTLE_TIMEOUT
+    while True:
+        rc, _, err = await _run(['git', *argv], cwd=repo)
+        if rc == 0:
+            return
+        assert 'index.lock' in err and asyncio.get_running_loop().time() < deadline, err
+        await asyncio.sleep(0.05)
+
+
 async def _land_foreign_commit(repo: Path) -> None:
-    """Move main the way a human direct commit does, disjoint from every branch."""
+    """Move main the way a human direct commit does, disjoint from every branch.
+
+    Stages only foreign.txt: ``add -A`` also stages the lane's live ``.worktrees/_merge-*``
+    directories, and races their creation.
+    """
     (repo / 'foreign.txt').write_text('landed elsewhere\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Foreign landing'], cwd=repo)
+    await _git_until_it_takes(repo, 'add', 'foreign.txt')
+    await _git_until_it_takes(repo, 'commit', '-m', 'Foreign landing')
 
 
 def _events(store: _LateArrivalFakeEventStore, kind: EventType, task_id: str) -> list[dict]:
