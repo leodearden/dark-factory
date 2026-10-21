@@ -1806,3 +1806,69 @@ class TestPreservationFailuresAreReadable:
 
         assert 'markup_residue' in status
         assert 'markup_residue' not in status['queue']
+
+
+class TestTheLastTierLogLineIsHonest:
+    """When neither the queue nor the floor held a payload, the guard's log line
+    is where it survives. That line must not claim more than it knows: other
+    copies may exist (the caller's own), and it must say why nothing durable
+    holds this one.
+    """
+
+    _GUARD_LOGGER = 'fused_memory.server.markup_guard'
+
+    async def _last_tier_text(self, caplog, residue_floor: Any = None) -> str:
+        server, _ = _build_guarded_server(
+            'add_system_record',
+            known_projects={'some_other_project': '/elsewhere'},
+            residue_floor=residue_floor,
+        )
+        with caplog.at_level('ERROR', logger=self._GUARD_LOGGER):
+            payload = await TestUnrepairableResidueIsPreserved._refuse(server)
+        assert payload['escalation_id'] is None
+        return '\n'.join(
+            r.getMessage() for r in caplog.records
+            if r.name == self._GUARD_LOGGER and r.levelname == 'ERROR'
+        )
+
+    @pytest.mark.asyncio
+    async def test_it_does_not_claim_to_be_the_only_copy(self, caplog):
+        text = await self._last_tier_text(caplog)
+
+        assert 'only copy' not in text
+
+    @pytest.mark.asyncio
+    async def test_it_says_nothing_durable_was_preserved(self, caplog):
+        text = await self._last_tier_text(caplog)
+
+        assert 'nowhere durable' in text, text
+
+    @pytest.mark.asyncio
+    async def test_it_names_an_absent_floor(self, caplog):
+        text = await self._last_tier_text(caplog)
+
+        assert 'no residue floor is wired' in text, text
+
+    @pytest.mark.asyncio
+    async def test_it_names_a_failed_floor(self, caplog, tmp_path):
+        blocker = tmp_path / 'not-a-directory'
+        blocker.write_text('occupied')
+
+        text = await self._last_tier_text(
+            caplog, MarkupResidueSpool(blocker / 'spool').preserve
+        )
+
+        assert 'the residue floor failed' in text, text
+
+    @pytest.mark.asyncio
+    async def test_it_says_the_caller_was_told_to_keep_its_own_copy(self, caplog):
+        text = await self._last_tier_text(caplog)
+
+        assert 'keep its own copy' in text, text
+
+    @pytest.mark.asyncio
+    async def test_it_still_carries_the_payload(self, caplog):
+        text = await self._last_tier_text(caplog)
+
+        assert TestUnrepairableResidueIsPreserved._unrepairable('one') in text
+        assert MARKUP_RECURRENCE_ROUTING in text

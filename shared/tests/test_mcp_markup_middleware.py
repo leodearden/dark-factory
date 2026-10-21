@@ -1836,6 +1836,75 @@ def _raises_for_test(record: dict[str, Any]) -> str:
     """A sink that fails, as a module-level name so it is reusable in a table."""
     raise RuntimeError('queue unavailable')
 
+
+class TestResidueRecordsClaimOnlyWhatTheyCarry:
+    """A residue record is built BEFORE any sink runs (task 4809).
+
+    So its ``summary`` cannot know where the record will end up: a queue, a
+    floor, or the last-tier log line of a host that could preserve it nowhere.
+    It states what the record CARRIES, which is true in all three. The
+    caller-facing hint, chosen AFTER the sink answered, is what may speak of
+    preservation, and that selection is unchanged.
+    """
+
+    async def _refusal_record(self, policy) -> tuple[dict[str, Any], str]:
+        h, value, _ = await TestB5UnrepairableIsNeverGuessed()._refuse(policy)
+        [record] = h.escalations
+        return record, value
+
+    @BOTH_POLICIES
+    async def test_the_refusal_record_does_not_claim_preservation(self, policy):
+        record, _ = await self._refusal_record(policy)
+
+        assert 'preserved' not in record['summary'], record['summary']
+
+    @BOTH_POLICIES
+    async def test_the_refusal_record_states_it_carries_the_raw_payload(self, policy):
+        record, value = await self._refusal_record(policy)
+
+        assert 'carries' in record['summary'], record['summary']
+        assert 'full raw payload' in record['summary'], record['summary']
+        assert record['raw_value'] == value
+
+    async def test_the_dropped_slice_record_claims_only_what_it_carries(self):
+        truncated = '[{"observation": "the tail was cut off'
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call(
+            'escalate_info_typed',
+            {
+                **TestCoercionNeverGuesses.REQUIRED,
+                'detail': TestCoercionNeverGuesses()._payload('Ill-formed.', 'evidence', truncated),
+            },
+        )
+
+        [record] = [
+            r for r in h.escalations if r['error_type'] == 'mcp_markup_unrecovered_param'
+        ]
+        assert 'preserved' not in record['summary'], record['summary']
+        assert 'carries' in record['summary'], record['summary']
+        assert 'full raw payload' in record['summary'], record['summary']
+        assert record['raw_value'] == truncated
+
+    @pytest.mark.parametrize(
+        ('sink', 'preserved'),
+        [
+            (lambda record: ESCALATION_ID, True),
+            (lambda record: None, False),
+            (_raises_for_test, False),
+        ],
+        ids=['sink-returns-an-id', 'sink-returns-none', 'sink-raises'],
+    )
+    @BOTH_POLICIES
+    async def test_the_hint_still_follows_what_the_sink_answered(self, policy, sink, preserved):
+        """Negative control: only the record's wording changed."""
+        _, payload = await TestTheHintNeverOverclaimsPreservation()._refuse(
+            policy, escalation_sink=sink
+        )
+
+        assert ('preserved verbatim' in payload['hint']) is preserved
+        assert ('nothing was preserved' in payload['hint'].lower()) is not preserved
+
 class TestB8RecoveredNameOutsideTheToolSchema:
     """A tail that parses CLEANLY but names a parameter the tool does not have.
 
