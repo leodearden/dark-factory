@@ -40,6 +40,7 @@ That side is
 from __future__ import annotations
 
 import dataclasses
+import getpass
 import importlib.util
 import os
 import pathlib
@@ -48,6 +49,7 @@ import shlex
 import subprocess
 import sys
 import tomllib
+from collections.abc import Mapping
 
 import pytest
 
@@ -233,12 +235,39 @@ def test_three():
     pass
 '''
 
+_RECORDER_INI = '[pytest]\n'
+
+_TEMPROOT_RECORDER_MODULE = '''\
+import pathlib
+import tempfile
+
+
+def test_records_the_temproot(tmp_path):
+    record = pathlib.Path(__file__).resolve().with_name('seen-temproot')
+    record.write_text(tempfile.gettempdir())
+'''
+
 
 @dataclasses.dataclass(frozen=True)
 class _SyntheticSuite:
     root: pathlib.Path
     ini: pathlib.Path
     signals: pathlib.Path
+    basetemp: pathlib.Path
+
+
+def _write_suite(
+    parent: pathlib.Path, *, ini: str, sources: Mapping[str, str]
+) -> _SyntheticSuite:
+    root = parent / 'suite'
+    root.mkdir()
+    ini_path = root / 'pytest.ini'
+    ini_path.write_text(ini, encoding='utf-8')
+    for name, text in sources.items():
+        (root / name).write_text(text, encoding='utf-8')
+    signals = parent / 'signals'
+    signals.mkdir()
+    return _SyntheticSuite(root=root, ini=ini_path, signals=signals, basetemp=parent / 'basetemp')
 
 
 @pytest.fixture
@@ -252,16 +281,17 @@ def synthetic_suite(tmp_path: pathlib.Path) -> _SyntheticSuite:
         f'_SYNTHETIC_CONFTEST does not read {unread!r}, the environment '
         '_run_synthetic_suite sets for it: the two spellings drifted apart.'
     )
-    root = tmp_path / 'suite'
-    root.mkdir()
-    ini = root / 'pytest.ini'
-    ini.write_text(_SYNTHETIC_INI, encoding='utf-8')
-    (root / 'conftest.py').write_text(_SYNTHETIC_CONFTEST, encoding='utf-8')
-    for index in range(1, REPRO_MODULE_COUNT + 1):
-        (root / f'test_m{index:02d}.py').write_text(_SYNTHETIC_MODULE, encoding='utf-8')
-    signals = tmp_path / 'signals'
-    signals.mkdir()
-    return _SyntheticSuite(root=root, ini=ini, signals=signals)
+    return _write_suite(
+        tmp_path,
+        ini=_SYNTHETIC_INI,
+        sources={
+            'conftest.py': _SYNTHETIC_CONFTEST,
+            **{
+                f'test_m{index:02d}.py': _SYNTHETIC_MODULE
+                for index in range(1, REPRO_MODULE_COUNT + 1)
+            },
+        },
+    )
 
 
 def _run_synthetic_suite(
@@ -303,6 +333,10 @@ def _run_synthetic_suite(
 
 def _captured(result: subprocess.CompletedProcess[str]) -> str:
     return f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+
+
+def _listing(root: pathlib.Path) -> list[str]:
+    return sorted(str(path.relative_to(root)) for path in root.rglob('*'))
 
 
 @pytest.mark.xdist_group(RESTART_REPRO_GROUP)
@@ -377,5 +411,46 @@ def test_restarts_disabled_attribute_the_worker_death(
     )
     assert re.search(r'^FAILED ', output, re.MULTILINE), (
         'no FAILED line in the short test summary.\n'
+        f'{_captured(result)}'
+    )
+
+
+@pytest.mark.timeout(180)
+def test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = tmp_path / 'host-temp'
+    (host / f'pytest-of-{getpass.getuser()}' / 'garbage-seeded' / 'leftover').mkdir(parents=True)
+    before = _listing(host)
+    monkeypatch.setenv('TMPDIR', str(host))
+    suite = _write_suite(
+        tmp_path,
+        ini=_RECORDER_INI,
+        sources={'test_records_temproot.py': _TEMPROOT_RECORDER_MODULE},
+    )
+
+    result = _run_synthetic_suite(suite)
+
+    assert result.returncode == pytest.ExitCode.OK, (
+        f'the recorder suite exited {result.returncode}, not '
+        f'{int(pytest.ExitCode.OK)} (OK).\n'
+        f'{_captured(result)}'
+    )
+    seen = pathlib.Path((suite.root / 'seen-temproot').read_text(encoding='utf-8'))
+    assert seen.resolve() == host.resolve(), (
+        f'the child ran against temp root {seen}, not the stand-in {host}, so '
+        'the listing check below would pass vacuously.\n'
+        f'{_captured(result)}'
+    )
+    after = _listing(host)
+    assert after == before, (
+        'a synthetic suite run must not create, lock or clean dirs in the host '
+        "default temp root: its exit-time sweep of other sessions' dead dirs "
+        'runs outside pytest-timeout and counts against the child\'s timeout.\n'
+        f'before: {before}\nafter:  {after}\n'
+        f'{_captured(result)}'
+    )
+    assert suite.basetemp.is_dir(), (
+        f'the session did not create its private basetemp {suite.basetemp}.\n'
         f'{_captured(result)}'
     )
