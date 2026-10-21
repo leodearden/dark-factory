@@ -243,6 +243,10 @@ const QUALITY = A.quality_guidance
   ? `The quality definition this review judges by follows, rendered from the normative docs/code-quality.md (this project carries no copy). Judge by its Definition:\n\n${A.quality_guidance}\n\n`
   : `Read ${ROOT}/docs/code-quality.md first and judge by its Definition: `
 const QUALITY_REF = A.quality_guidance ? 'the quality definition above' : `${ROOT}/docs/code-quality.md`
+// The dangling-tree rule (failure mode 8), one home for every prompt that reads ROOT.
+const TREE_EXPORT = `${A.scratch}/tree-export`
+const treeGuard = (noteField) => `IF THE TREE DOES NOT RESOLVE (${ROOT} missing, or a dangling path): do not read the main checkout or any other tree, whatever state it is in. Read the export of ${A.as_of_sha} at ${TREE_EXPORT} in place of ${ROOT} wherever this prompt or your work reads the tree, and say so in ${noteField}. When ${TREE_EXPORT} does not exist yet, build it with this one command; it extracts into a fresh directory and renames that into place, so a concurrent seat never reads a half-written tree, and a failed rename means another seat built it first — use theirs:
+d=$(mktemp -d -p ${A.scratch}) && git -C ${A.project.main_root} archive ${A.as_of_sha} | tar -x -C "$d" && mv -T "$d" ${TREE_EXPORT} || rm -rf "$d"`
 
 // ANCHOR_RE, LINE_PIN_RE, SYMBOL_PATH_RE and normAnchor mirror skills/hotspot-survey/scripts/findings_artefact.py
 // (ANCHOR_RE, LINE_PIN_RE, SYMBOL_PATH_RE, normalise_anchor) — the interim key reference of contract §2; the
@@ -313,7 +317,7 @@ function topReads(s) {
 function areaPrompt(s) {
   return `You are one seat of a whole-project quality review of ${A.project.id}. The tree is ${ROOT}, a detached checkout of ${A.as_of_sha}. READ-ONLY: modify nothing, run no state-changing command, make no MCP write. Intermediates go under ${A.scratch}/seats/${s.seat}/.
 
-IF THE TREE DOES NOT RESOLVE (${ROOT} missing, or a dangling path): do not review the main checkout or any other tree, whatever state it is in. Export the pinned commit into your own scratch with git -C ${A.project.main_root} archive ${A.as_of_sha} | tar -x -C ${A.scratch}/seats/${s.seat}/tree (mkdir the target first), read that export in place of ${ROOT} for every path below, and say so in area_health.
+${treeGuard('area_health')}
 
 ${QUALITY}quality is the expected cost and risk of the next change, made by an agent from a partial view. The fourteen heuristics and the two stances are lenses you name on each finding (tags), not a checklist to walk; one finding per heuristic is the failure mode this prompt exists to prevent.
 
@@ -338,6 +342,8 @@ Emit at most ${MAX} findings ranked by next-change cost removed. Fewer is correc
 
 function skepticPrompt(label, findings, gone) {
   return `You are an adversarial verifier for a whole-project quality review of ${A.project.id} at ${ROOT} (detached checkout of ${A.as_of_sha}). READ-ONLY.
+
+${treeGuard("each verdict's checked")}
 
 ${A.quality_guidance ? QUALITY : ''}A reviewer judged "${label}" against ${QUALITY_REF} and produced the findings below as statements with measurements. You are deliberately not shown their proposals or severities. Try to REFUTE each.
 
@@ -461,6 +467,8 @@ function digestFindings(fs) {
 
 function crossPrompt(l) {
   return `You are the ${l.title} seat (heuristic ${l.tag}) of a whole-project quality review of ${A.project.id} at ${ROOT} (detached checkout of ${A.as_of_sha}). READ-ONLY; intermediates under ${A.scratch}/cross/${l.lens}/.
+
+${treeGuard('method')}
 
 ${QUALITY}your lens is the one heuristic no single-area reader can judge whole. QUESTION: ${l.question}
 
@@ -643,6 +651,8 @@ const digest = {
 function synthesisPrompt(critique, mechanical) {
   return `You are the synthesis seat of a whole-project quality review of ${A.project.id} at ${ROOT} (detached checkout of ${A.as_of_sha}). READ-ONLY; verify in code where a join depends on it.
 
+${treeGuard('method')}
+
 ${QUALITY}then read docs/quality-findings-contract.md §1–§4, §6 (in the dark-factory checkout if this project carries no copy). Below: verified findings from ${seats.length} area seats and ${crossSeats.length} cross-area seats, standing (accepted) findings, and the observation classes already computed (new / re_observed / standing / fixed). The ${priorOpen.size} prior open findings from earlier instrument runs are in the JSON file ${A.prior.full_path} — Read it: their statements, severities, classes and keys are inputs to the matrix and streams exactly like this run's findings. digest.prior_ids maps each prior's short id to its canonical in that file. Each finding carries its skeptic's verdict_notes (and calibration_disputes_verdict where a fresh skeptic disputed it); digest.refuted lists the refuted findings with why — none is ranked.
 
 IDS: every finding and prior has a short id (f<n>, p<n>) in the digest. In matrix.ranked, streams.canonicals and contradictions.between write bare ids and nothing else — no canonicals, no paths, no abbreviation scheme of your own, no area prefixes, no appended flags such as [w] or [p]; the pipeline maps ids back to canonicals, and anything that is not a bare id is reported as unresolved. Name findings by id in exonerations and method too.
@@ -686,6 +696,8 @@ const firstJoinErrors = mechanicalJoinErrors(synthesis)
 function criticPrompt(mechanical) {
   return `You are the critic of an assembled synthesis for a whole-project quality review of ${A.project.id} at ${ROOT}. READ-ONLY; open code where a check needs it.
 
+${treeGuard('notes')}
+
 You are not a third reviewer of the code. You read the JOIN: the places where seats' results were combined. ${QUALITY}attend to its "What to measure" and "Do not steer by" sections. Findings are named by short id (f<n>, p<n>) in both documents below; use those ids in where. Check, and report each hit as a join_error with a fix:
 - inconsistent-rule: two figures compared under different rules (one seat counted prose lines, another did not; one measured per function, another per module) — compare the rules figure by figure, not seat by seat.
 - one-term-of-sum: a conclusion about complexity or size that reads one term of a pair (module total without the per-function maximum, or the reverse; a split that lowers file size while total complexity rises).
@@ -712,11 +724,15 @@ ${JSON.stringify(digest, null, 1)}`
 const RECHECK_SCHEMA = { type: 'object', required: ['items'], properties: {
   items: { type: 'array', items: { type: 'object', required: ['join_error', 'resolved', 'checked'], properties: {
     join_error: { type: 'integer', description: '0-based index into the critic join_errors' },
-    resolved: { type: 'boolean', description: 'true when the revised synthesis no longer carries the error, or a declined item\'s reason holds against the tree' },
-    checked: { type: 'string', description: 'the synthesis entry and the code or file you opened' } } } } } }
+    resolved: { type: 'boolean', description: 'true when an accepted item\'s entry now says what its fix asked, or a declined item\'s reason holds in the code it cites; false for an item the responses do not answer' },
+    checked: { type: 'string', description: 'the synthesis entry you read, and for a declined item the code or file you opened' } } } } } }
 
 function recheckPrompt(errors, responses, revisedSynthesis) {
-  return `You are a re-check seat for a whole-project quality review of ${A.project.id} at ${ROOT}. READ-ONLY. A critic listed join errors in a synthesis; the synthesis was revised. For each listed item, decide from the revised synthesis alone whether the error is gone: the named entry (short id, stream or matrix cell) must now say what the item's fix asked, and a declined item must carry a reason that holds when you open the code it cites. This is a cheap re-check of the critic's listed items only — do not look for new errors, and do not re-judge the findings. One entry per item, in order.
+  return `You are a re-check seat for a whole-project quality review of ${A.project.id} at ${ROOT}. READ-ONLY.
+
+${treeGuard("each item's checked")}
+
+A critic listed join errors in a synthesis; the synthesis was revised, and the revision's responses say which items it accepted. Judge an accepted item from the revised synthesis: the named entry (short id, stream or matrix cell) must now say what the item's fix asked. For a declined item, open the code its reason cites and decide whether the reason holds. An item the responses do not answer is not resolved. This is a cheap re-check of the critic's listed items only — do not look for new errors, and do not re-judge the findings. One entry per item, in order.
 
 CRITIC JOIN ERRORS:
 ${JSON.stringify(errors, null, 1)}
@@ -803,7 +819,7 @@ Expected per-seat spend, extrapolated from the hotspot run's measured 100–140k
 5. **Verdict join by display_id.** Unmatched ids fall to `unverified` and are counted separately; never conflate "survived" with "confirmed".
 6. **`fixed` without evidence.** A prior finding is `fixed` only when the seat said `gone` and the skeptic confirmed the locating evidence; the critic's `unverified-fixed` is the backstop.
 7. **The result is too large to read raw** (expect 300–600 KB). The lead writes it to `<scratch>/workflow-result.json` and digests with a script (SKILL.md Phase 5).
-8. **Main moves during a three-hour run.** Every seat reads the detached worktree at `as_of_sha`, never the main checkout; the lead removes the worktree after the report is committed. No stash anywhere (CLAUDE.md §Working in the main checkout).
+8. **Main moves during a three-hour run.** Every seat reads the detached worktree at `as_of_sha`, never the main checkout; the lead removes the worktree after the report is committed. No stash anywhere (CLAUDE.md §Working in the main checkout). If that worktree is missing when a seat starts, the seat must not fall back to whatever tree it can find: every prompt that reads `ROOT` (area, skeptic, cross, synthesis, critic, re-check) carries `treeGuard`, which points it at one shared `git archive` export of `as_of_sha` at `<scratch>/tree-export`. The first seat to need it builds it in a fresh directory and renames it into place, so seats running at the same time never read a half-written tree and the export is built once, not once per slice.
 9. **Budget directive.** `budget` (`total`, `spent()`, `remaining()`) is a documented Workflow script global (`workflow-authoring` reference §Script body hooks). Under a `+Nk` directive, the guard before `phase('Cross-area')` skips the lenses when fewer than ~800k tokens remain (four opus seats plus skeptics) and logs it; synthesis and critic still run on what exists, and the report lists the lenses under Dropped and degraded. Without a directive `budget.total` is null and the guard is inert.
 10. **A prior finding silently unchecked.** Legacy hotspot areas `<area>/<sub>` are split in Phase 0 into the plain area and `sub_area` and assigned to the slice holding those files; after the area pipeline the script lists every assigned prior that came back without a verdict under `observation.unchecked`, so a seat that skipped its re-verification duty is visible in the report rather than read as "still open, nothing changed".
 11. **`args` too large to pass inline.** With every slice's read list, test patch targets, prior statements and leads embedded, the first dark-factory run's `args` was 820 KB, which the lead would have had to emit as a single tool-call value. The run moved the static inputs to one brief file per seat and one `prior_open.json` (§The slice brief) and passed a 60 KB `args` of identities, paths and counts; that is now the shape. The script derives the open prior set from `slices[].prior_open` and never carries a second copy. Even 60 KB is a large tool-call value; the zero-paste alternative, used on the first reify run, is to write `const A = <args JSON>` into the script file in place of `const A = args` and launch with `scriptPath` only (`args` unused) — the journal's replay key is each call's prompt and opts, which this leaves unchanged.
@@ -817,4 +833,4 @@ Expected per-seat spend, extrapolated from the hotspot run's measured 100–140k
 19. **Calibration outcomes went nowhere.** Measured on reify: 5 of 10 sampled highs came back `weakened` (solar_challenge_platform: 2 of 10), and every one stayed `confirmed` in the record, the matrix and the streams — `calibrate()` returned its outcomes and nothing consumed them; it also ran only at zero refutations. Now it runs under a 5 % refutation rate (failure mode 4); `recordOutcome` attaches `calibration_disputes_verdict: {to, note}` to each sampled finding a fresh skeptic weakens (or refutes) and leaves the finding's own verdict standing — one skeptic does not silently overwrite another, the deliberation rules (`report-format.md` §Artefact 2); and a sample with ≥ 30 % disputed or ≥ 2 disputed highs is the drift signal: the `Reverify high stratum` step gives every remaining confirmed `high` a fresh skeptic (`A.routing.skeptic`), records outcomes the same way under `calibration.high_stratum`, and sets `calibration.high_stratum_reverified = true`. The sample is awaited before the digest, so the synthesis and the critic see the disputes.
 20. **Skeptic notes never reached the join.** `digestFindings` carried the verdict but not the skeptic's note, so a weakened finding reached the synthesis uncorrected and the critic could not check it (reify's critic worked "vs fNN skeptic notes" by hand; solar_challenge's: "skeptic notes are absent"). The digest now carries each finding's `verdict_notes` and `calibration_disputes_verdict`, and `digest.refuted` the refuted list (the one the result returns), and the critic prompt tells it to check weakened and disputed findings against them.
 21. **Critics re-found set-membership errors by hand.** All three critics reported the same structural join errors, and the lesser items never reached the revision. `mechanicalJoinErrors` now runs after the synthesis and again after a revision — new: a key in two streams, a key twice in one matrix cell, a high structural finding in no stream (mechanical highs are filed by the lead, not streamed; priors carry no severity in the script and are not checked) — logs them, feeds the first set to the critic (as already found) and to the revision, and returns the final set as `synthesis.join_errors_mechanical`. Kept unchanged: the critic's `weakened-hidden` class and the pipeline's duplicate-canonical-across-seats log. The critic's budget goes to evidence-contradicts-conclusion and exonerations (17 of 53 critic errors across three runs were in exonerations; 8 were duplicate-mechanism).
-22. **A revision nobody checked.** The revised synthesis answered the critic's items in `critic_responses`, and the lead's digest took those answers on trust. One sonnet/medium seat now makes a cheap re-check of exactly the critic's listed items against the revised synthesis (`recheckPrompt`) and the result returns as `critic_recheck`; an item with `resolved: false` is the lead's to rule on at the digest. The same revision carries the two checks the critic kept finding by hand — a proposed helper the tree already has, and an exoneration resting on a test-share ratio or a per-function max alone (synthesis jobs 4–5) — and the area seat asks of each high whether the wrong version is caught, and by what (every one of the four critic downgrades was high → medium on that basis).
+22. **A revision nobody checked.** The revised synthesis answered the critic's items in `critic_responses`, and the lead's digest took those answers on trust. One sonnet/medium seat now makes a cheap re-check of exactly the critic's listed items (`recheckPrompt`): an accepted item against the revised synthesis, a declined item's reason against the code it cites. The result returns as `critic_recheck`; an item with `resolved: false` is the lead's to rule on at the digest. The same revision carries the two checks the critic kept finding by hand — a proposed helper the tree already has, and an exoneration resting on a test-share ratio or a per-function max alone (synthesis jobs 4–5) — and the area seat asks of each high whether the wrong version is caught, and by what (every one of the four critic downgrades was high → medium on that basis).
