@@ -101,6 +101,17 @@ class MergeBounceRegistry:
         self._bounces.pop(branch, None)
 
 
+def _cancel_args(future: asyncio.Future | None) -> tuple[Any, ...]:
+    """The ``cancel()`` arguments that pass *future*'s cancel message on, if it has one."""
+    if future is None or not future.cancelled():
+        return ()
+    try:
+        future.result()
+    except asyncio.CancelledError as cancelled:
+        return cancelled.args
+    return ()
+
+
 @dataclass
 class _InFlightEntry:
     """Registry slot for a single in-flight merge branch.
@@ -146,10 +157,15 @@ class _InFlightEntry:
     """request_ids of the waiters :meth:`release_waiters` cancelled and dropped."""
 
     def release_waiters(self) -> None:
-        """Cancel every still-pending waiter, then drop them all, keeping their ids."""
+        """Cancel every still-pending waiter, then drop them all, keeping their ids.
+
+        Each waiter is cancelled with the primary's own cancel message, so an
+        operator's cancel reaches an attached TaskWorkflow as one.
+        """
+        cancel_args = _cancel_args(self.primary_future)
         for w in self.waiters:
             if not w.future.done():
-                w.future.cancel()
+                w.future.cancel(*cancel_args)
         self.released_waiter_ids = tuple(w.request_id for w in self.waiters)
         self.waiters.clear()
 
@@ -451,6 +467,14 @@ class InFlightMergeRegistry:
         """Return the in-flight entry for *branch*, or None if free."""
         return self._slots.get(branch)
 
+    def has_workflow_waiter(self, branch: str, request_id: str) -> bool:
+        """True while a TaskWorkflow waits, attached, on *request_id*'s slot for *branch*."""
+        entry = self._slots.get(branch)
+        return (
+            entry is not None and entry.request_id == request_id
+            and any(w.source == 'workflow' for w in entry.waiters)
+        )
+
     def primary_entry(self, branch: str, future: asyncio.Future) -> _InFlightEntry | None:
         """The live entry for *branch* only while *future* is its primary.
 
@@ -520,7 +544,7 @@ class InFlightMergeRegistry:
                 if target.done():
                     return  # guard: pre-resolved / detached future — skip
                 if pf.cancelled():
-                    target.cancel()
+                    target.cancel(*_cancel_args(pf))
                 elif (exc := pf.exception()) is not None:
                     target.set_exception(exc)
                 else:
@@ -714,7 +738,8 @@ class MergeCancelRefusal(StrEnum):
     FINALIZE_WINDOW = 'finalize_window'
     """The request is landing; a cancel could abandon a merge that still lands."""
     TRAIN_CANCEL_UNSUPPORTED = 'train_cancel_unsupported'
-    """The request is a merge train; see ``worker.py::_train_cancel_refusal``."""
+    """The request is, or is being stacked into, a merge train; see
+    ``worker.py::_train_cancel_refusal``."""
 
 
 @dataclass(frozen=True)
@@ -722,13 +747,17 @@ class MergeCancelVerdict:
     """What ``MergeLane.cancel_request`` did with one request id.
 
     *task_id*/*branch* name the request the lane found, so the caller can
-    retire it by branch; both are None when nothing was found.
+    retire it by branch, *state* is the ``snapshot()`` wire state it was in,
+    and *awaited_by_workflow* is the request's own flag; all are empty when
+    nothing was found.
     """
 
     request_id: str
     refusal: MergeCancelRefusal | None
     task_id: str | None = None
     branch: str | None = None
+    state: str | None = None
+    awaited_by_workflow: bool = False
 
     @property
     def cancelled(self) -> bool:

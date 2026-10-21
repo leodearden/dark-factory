@@ -4570,24 +4570,27 @@ async def enqueue_merge_request(
     _emit_merge_queued(event_store, req, queue_depth=queue.qsize(), source=source)
 
 
-_FINALIZE_WINDOW_STATES = frozenset({
-    ItemLifecycleState.GATE_REVERIFY, ItemLifecycleState.FINALIZING,
-})
-"""The states ``SpeculativeMergeWorker._finalize_inflight`` moves a request
-through.  Its CAS loop consults the cancel only on a halt result, so a cancel
-there could abandon a merge that still lands."""
+_FINALIZE_WINDOW_STATES = frozenset({ItemLifecycleState.FINALIZING})
+"""The states in which ``SpeculativeMergeWorker._finalize_inflight`` may be mid-CAS.
+Its CAS loop consults the cancel only on a halt result, so a cancel there could
+abandon a merge that still lands.  GATE_REVERIFY is not among them: main has not
+moved, and the loop checks the cancel before it CASes again."""
 
 
-def _train_cancel_refusal(req: MergeRequest) -> MergeCancelRefusal | None:
+def _train_cancel_refusal(
+    req: MergeRequest, coalescing_ids: frozenset[str],
+) -> MergeCancelRefusal | None:
     """TRAIN SEAM: every train is refused, on Leo's 2026-10-21 ruling on task 5248.
 
     Neither a whole-train cancel nor a member eject is safe yet:
     ``_do_train_merge`` has no abandonment checkpoint, and a train dropped
     before its merge never reaches ``SpeculativeMergeWorker._unwind_coalesce_train``,
-    so its members would stay merge-deferred on their stacked tips.  Task 7309,
+    so its members would stay merge-deferred on their stacked tips.  A single
+    the coalescing pass is stacking right now (*coalescing_ids*) is refused too:
+    the pass would absorb it into a train whatever its future says.  Task 7309,
     which makes both safe, replaces this function and nothing else.
     """
-    if isinstance(req, GroupMergeRequest):
+    if isinstance(req, GroupMergeRequest) or req.request_id in coalescing_ids:
         return MergeCancelRefusal.TRAIN_CANCEL_UNSUPPORTED
     return None
 
@@ -10090,6 +10093,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # the last _maybe_coalesce_waiting_singles attempt (incl. no-viable-train
         # attempts).  Short-circuits when the waiting set is unchanged.
         self._last_coalesce_signature: frozenset[str] | None = None
+        # The candidates the coalescing pass is stacking across its awaits;
+        # cancel_request refuses them (see _train_cancel_refusal).
+        self._coalescing_ids: frozenset[str] = frozenset()
         # The most recent request whose merge commit was handed to the verifier
         # and has NOT yet been finalized (verified + CAS-advanced).  Read ONLY by
         # _await_unadvanced_predecessor, which parks a train behind it — see that
@@ -14098,13 +14104,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if found is None:
             return MergeCancelVerdict(request_id, MergeCancelRefusal.NOT_LIVE)
         req, state = found
-        refusal = _train_cancel_refusal(req)
+        refusal = _train_cancel_refusal(req, self._coalescing_ids)
         if refusal is None and state in _FINALIZE_WINDOW_STATES:
             refusal = MergeCancelRefusal.FINALIZE_WINDOW
         if refusal is None:
             req.result.cancel(OperatorMergeCancel(request_id))
         return MergeCancelVerdict(
             request_id, refusal, task_id=req.task_id, branch=req.branch.bare_id,
+            state=_REGISTRY_STATE_TO_WIRE[state],
+            awaited_by_workflow=req.awaited_by_workflow,
         )
 
     def _live_request(
@@ -16290,6 +16298,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
             return False
 
+        self._coalescing_ids = frozenset(c.request_id for c in candidates)
+        try:
+            return await self._stack_coalesce_train(candidates, exclusions, orch_config)
+        finally:
+            self._coalescing_ids = frozenset()
+
+    async def _stack_coalesce_train(
+        self,
+        candidates: list[MergeRequest],
+        exclusions: list[dict[str, str]],
+        orch_config: OrchestratorConfig,
+    ) -> bool:
+        """The await-bearing half of :meth:`_maybe_coalesce_waiting_singles`.
+
+        Stacks the eligible *candidates* into one GroupMergeRequest; runs while
+        ``_coalescing_ids`` names them, so no operator cancel lands mid-stack.
+        """
         # ── Step-6: core pass body ─────────────────────────────────────────────
         # SELECTION: fan out line-range fetches concurrently (one git subprocess
         # per candidate), then delegate to the greedy mutually-stackable selector.
@@ -20700,6 +20725,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 break
             _lane, _idx, link_req = taken
+            if self._request_abandoned(link_req):
+                # Cancelled while the head verified: it must not land, and
+                # every later link's tree contains it, so the walk ends here.
+                self._restore_chain_link_request(_lane, _idx, link_req)
+                break
             # Set the instant the link's future is resolved, which is the point
             # of no return: past it the link is TERMINAL and putting it back in
             # a lane buffer would re-merge an item that already landed.  Every
@@ -21742,6 +21772,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # request failed its post-rebase reverify gate. The
                         # chokepoint already performs the not-done guard.
                         self._resolve_or_drop_abandoned(req, gate)
+                        return False
+                    if self._request_abandoned(req):
+                        # Cancelled during the re-verify: main has not moved and
+                        # no CAS is in flight, so it leaves as a failed gate does.
+                        self._gate_retries.pop(req.task_id, None)
+                        await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
+                        self._retire_item(req.request_id)
                         return False
 
                     current_sha = rebased_sha

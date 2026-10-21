@@ -1,8 +1,9 @@
 """``MergeLane.cancel_request``: an operator's cancel of a live request by id (task 5248).
 
 An operator holding only a request id from ``get_merge_queue``/``merge_status``
-must be able to cancel it whether it is queued or verifying, with no caller
-blocked on its future; a request that is landing, or a train, is refused.
+must be able to cancel it whether it is queued, verifying or re-verifying a
+rebased tree, with no caller blocked on its future; a request mid-CAS, a train,
+or a single being stacked into one is refused.
 Every scene runs a real lane over a tmp repo, and reads the outcome back off
 the lane's public census, the request's own future, and main.
 """
@@ -18,20 +19,24 @@ from _git_fixtures import seed_repo
 from _merge_lane_fakes import (
     FakeVerifier,
     hangs_until,
+    lane_scene_config,
     lane_state,
     make_lane,
     running_lane,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import AdvanceOutcome, GitOps
 from orchestrator.merge_lane import (
     GroupMergeRequest,
+    InFlightMergeRegistry,
     MergeCancelRefusal,
     MergeRequest,
     OperatorMergeCancel,
     QueuedBranch,
+    WaiterRecord,
 )
+from orchestrator.merge_lane.types import TrainCallbacks
 from orchestrator.verify import VerifyResult
 
 pytestmark = pytest.mark.asyncio
@@ -62,7 +67,9 @@ def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
     return OrchestratorConfig(project_root=git_repo, git=git_config)
 
 
-def _request(task_id: str, worktree: Path, config: OrchestratorConfig) -> MergeRequest:
+def _request(
+    task_id: str, worktree: Path, config: OrchestratorConfig, **flags: bool,
+) -> MergeRequest:
     return MergeRequest(
         task_id=task_id,
         branch=QueuedBranch.parse(task_id, config.git.branch_prefix),
@@ -72,6 +79,7 @@ def _request(task_id: str, worktree: Path, config: OrchestratorConfig) -> MergeR
         module_configs=[],
         config=config,
         result=asyncio.get_running_loop().create_future(),
+        **flags,
     )
 
 
@@ -170,6 +178,51 @@ class TestCancellable:
         assert await git_ops.get_main_sha() == main_before
 
 
+    async def test_a_request_cancelled_while_its_rebased_tree_reverifies_is_dropped(
+        self, git_ops: GitOps, config: OrchestratorConfig, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        lane = make_lane(git_ops, queue)
+        request = _request('gr', await _branch(git_ops, 'gr'), config)
+        main_before = await git_ops.get_main_sha()
+        advances: list[Any] = []
+        reverifying, release = asyncio.Event(), asyncio.Event()
+
+        async def _main_moved_under_it(*args: Any, **kwargs: Any) -> AdvanceOutcome:
+            advances.append(args)
+            return AdvanceOutcome(
+                'rebased_pending_reverify',
+                advanced_sha='ab' * 20, rebased_from='ba' * 20, rebased_onto='cd' * 20,
+            )
+
+        async def _held_reverify(*args: Any, **kwargs: Any) -> VerifyResult:
+            reverifying.set()
+            await release.wait()
+            return VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='', summary='',
+            )
+
+        monkeypatch.setattr(git_ops, 'advance_main', _main_moved_under_it)
+        monkeypatch.setattr(
+            'orchestrator.merge_lane.worker.run_scoped_verification', _held_reverify,
+        )
+        async with running_lane(lane):
+            await queue.put(request)
+            await asyncio.wait_for(reverifying.wait(), _SCENE_TIMEOUT)
+            assert lane_state(lane, request.request_id) == 'gate_reverify'
+
+            verdict = lane.cancel_request(request.request_id)
+            release.set()
+
+            assert verdict.cancelled
+            await _until(
+                lambda: lane_state(lane, request.request_id) is None, 'the drop',
+            )
+        assert _operator_cancel_on(request) == OperatorMergeCancel(request.request_id)
+        assert len(advances) == 1, 'a cancelled request must not CAS again'
+        assert await git_ops.get_main_sha() == main_before
+
+
 class TestRefused:
     async def test_a_landing_request_is_refused_and_still_lands(
         self, git_ops: GitOps, config: OrchestratorConfig, monkeypatch: pytest.MonkeyPatch,
@@ -242,3 +295,72 @@ class TestRefused:
         assert again.refusal is MergeCancelRefusal.NOT_LIVE
         assert unknown.refusal is MergeCancelRefusal.NOT_LIVE
         assert (unknown.task_id, unknown.branch) == (None, None)
+
+    async def test_a_single_being_stacked_into_a_train_is_refused(
+        self, git_ops: GitOps, git_repo: Path, git_config: GitConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config = lane_scene_config(git_repo, git_config, merge_train_coalesce_enabled=True)
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        lane = make_lane(git_ops, queue, train_callback_factory=lambda _train_id: (
+            TrainCallbacks(
+                status_check=AsyncMock(return_value={}), mark_member_done=AsyncMock(),
+                redrive_member=AsyncMock(),
+            )
+        ))
+        first, second = [
+            _request(name, await _branch(git_ops, name), config, awaited_by_workflow=True)
+            for name in ('st-a', 'st-b')
+        ]
+        stacking, release = asyncio.Event(), asyncio.Event()
+        line_ranges = git_ops.get_changed_line_ranges
+
+        async def _held_line_ranges(task_id: str) -> Any:
+            stacking.set()
+            await release.wait()
+            return await line_ranges(task_id)
+
+        monkeypatch.setattr(git_ops, 'get_changed_line_ranges', _held_line_ranges)
+        for request in (first, second):
+            queue.put_nowait(request)
+        async with running_lane(lane) as run:
+            await asyncio.wait_for(stacking.wait(), _SCENE_TIMEOUT)
+
+            verdict = lane.cancel_request(first.request_id)
+            release.set()
+
+            assert verdict.refusal is MergeCancelRefusal.TRAIN_CANCEL_UNSUPPORTED
+            assert (await run.outcome(first)).status == 'superseded'
+
+
+class TestAttachedWaiters:
+    """An operator's cancel reaches every waiter attached to the request's slot."""
+
+    def _slot_with_a_workflow_peer(self) -> tuple[Any, Any, InFlightMergeRegistry]:
+        loop = asyncio.get_running_loop()
+        primary, peer = loop.create_future(), loop.create_future()
+        registry = InFlightMergeRegistry()
+        registry.acquire('br', 't1', primary, request_id='mr-primary')
+        registry.attach('br', WaiterRecord(request_id='mr-peer', future=peer, source='workflow'))
+        return primary, peer, registry
+
+    def _carried(self, future: Any) -> OperatorMergeCancel | None:
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            future.result()
+        return OperatorMergeCancel.carried_by(cancelled.value)
+
+    async def test_the_mirror_forwards_the_operator_cancel(self) -> None:
+        primary, peer, _registry = self._slot_with_a_workflow_peer()
+
+        primary.cancel(OperatorMergeCancel('mr-primary'))
+        await asyncio.sleep(0)
+
+        assert self._carried(peer) == OperatorMergeCancel('mr-primary')
+
+    async def test_releasing_the_slot_forwards_the_operator_cancel(self) -> None:
+        primary, peer, registry = self._slot_with_a_workflow_peer()
+
+        primary.cancel(OperatorMergeCancel('mr-primary'))
+        registry.release('br', detach_waiters=True)
+
+        assert self._carried(peer) == OperatorMergeCancel('mr-primary')

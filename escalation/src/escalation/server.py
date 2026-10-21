@@ -5213,11 +5213,13 @@ def create_server(
         key = _PollKey(request_id=request_id, branch=branch, task_id=task_id)
         return (await _resolve(key)).to_response()
 
-    async def _cancel_in_lane(request_id: str, live_state: Any) -> dict[str, Any]:
+    async def _cancel_in_lane(request_id: str) -> dict[str, Any]:
         """merge_cancel for a live request this server holds no waiter for (task 5248).
 
         The merge lane cancels it by id, whoever awaits it; a cancel then
-        retires it here exactly as the waiter path does.
+        retires it here exactly as the waiter path does.  A TaskWorkflow that
+        awaits it blocks and escalates on the cancel; when none does, this
+        server files that escalation itself, so no cancel goes unowned.
         """
         from orchestrator.merge_lane import (
             MergeCancelRefusal,
@@ -5237,22 +5239,30 @@ def create_server(
                     'cancel reached it; poll merge_status for its outcome.'
                 ),
                 MergeCancelRefusal.FINALIZE_WINDOW: (
-                    f'Request {request_id!r} is landing (CAS or gate re-verify in '
-                    'progress); a cancel now could abandon a merge that still lands. '
-                    'Poll merge_status for its outcome.'
+                    f'Request {request_id!r} is landing (its CAS is in progress); a '
+                    'cancel now could abandon a merge that still lands. Poll '
+                    'merge_status for its outcome.'
                 ),
                 MergeCancelRefusal.TRAIN_CANCEL_UNSUPPORTED: (
-                    f'Request {request_id!r} is a merge train, and trains cannot be '
-                    'cancelled yet. Block the member tasks instead, or wait for '
-                    "the train's outcome."
+                    f'Request {request_id!r} is, or is being stacked into, a merge '
+                    'train, and trains cannot be cancelled yet. Block the member '
+                    "tasks instead, or wait for the train's outcome."
                 ),
             }
+            state = (
+                _map_live_state(verdict.state) if verdict.state is not None
+                else (await _resolve(_PollKey(request_id=request_id))).state
+            )
             return {
                 'cancelled': False,
-                'state': live_state,
+                'state': state,
                 'reason': refusal_reasons[verdict.refusal],
                 'code': verdict.refusal.value,
             }
+        workflow_awaits = verdict.awaited_by_workflow or (
+            _registry is not None and verdict.branch is not None
+            and _registry.has_workflow_waiter(verdict.branch, request_id)
+        )
         await retire_cancelled_merge_request(
             request_id=request_id,
             branch=verdict.branch,
@@ -5262,7 +5272,33 @@ def create_server(
             git_ops=getattr(harness, 'git_ops', None),
             event_store=event_store,
         )
+        if not workflow_awaits and verdict.task_id is not None:
+            await _escalate_workflowless_cancel(verdict.task_id, request_id, verdict.branch)
         return {'cancelled': True, 'state': MergeState.abandoned, 'reason': None}
+
+    async def _escalate_workflowless_cancel(
+        task_id: str, request_id: str, branch: str | None,
+    ) -> None:
+        """File the L1 a TaskWorkflow would have filed for an operator's cancel."""
+        await _submit_or_dedupe(Escalation(
+            id=await asyncio.to_thread(queue.make_id, task_id),
+            task_id=task_id,
+            agent_role='escalation-server',
+            severity='blocking',
+            category='merge_cancelled_by_operator',
+            summary=(
+                f'Merge request {request_id} for task {task_id} cancelled by an '
+                'operator (merge_cancel); no workflow awaited it, so the branch '
+                'was not merged and nothing will resubmit it'
+            ),
+            detail=(
+                f'request_id={request_id} branch={branch} task_id={task_id}. The '
+                'request was submitted with no TaskWorkflow awaiting it (journal '
+                'recovery, the stranded-branch reaper, or an MCP merge_request '
+                'whose submitter is gone).'
+            ),
+            level=1,
+        ))
 
     # ── merge_cancel — explicit cancellation via waiter-future cancel (PRD β2 / task 1632) ──
 
@@ -5303,9 +5339,11 @@ def create_server(
              prior runs → no_record; git needs a branch, so it is skipped).  A live hit
              (a workflow-enqueued, recovered, or otherwise waiterless request) is
              cancelled by the merge lane itself, MergeLane.cancel_request, then
-             retired as on path 4.  The lane refuses a request in its finalize window
-             or a train: cancelled False with the live state and a ``code`` naming
-             the refusal (orchestrator.merge_lane.MergeCancelRefusal).  A current-run
+             retired as on path 4; when no TaskWorkflow awaits it, this server files
+             the merge_cancelled_by_operator L1 the workflow would have.  The lane
+             refuses a request mid-CAS or a train: cancelled False with the lane's
+             state and a ``code`` naming the refusal
+             (orchestrator.merge_lane.MergeCancelRefusal).  A current-run
              outcome returns that state with 'Request already finalized; cannot
              cancel.'; an epistemic answer returns its state with the reason's hint.
              Coalesced submissions (in_flight / attached paths in merge_request) do
@@ -5361,7 +5399,7 @@ def create_server(
                     ),
                 }
             if answer.source is MergeStatusSource.live:
-                return await _cancel_in_lane(request_id, answer.state)
+                return await _cancel_in_lane(request_id)
             return {
                 'cancelled': False,
                 'state': answer.state,
