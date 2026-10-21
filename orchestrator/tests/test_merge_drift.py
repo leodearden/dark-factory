@@ -84,7 +84,7 @@ class TestDriftCheckStatePersistence:
     Fix 1a (task 2886): the drift-check cadence counter must be PERSISTED so it
     survives the ~8h fleet redeploy that resets the in-memory worker counter
     (which is why the drift check has NEVER fired).  The persistence primitive
-    is an EXACT mirror of merge_shadow's ShadowCompareState +
+    is modelled on merge_shadow's ShadowCompareState +
     _load_shadow_compare_state/_save_shadow_compare_state (fail-safe JSON), the
     same contract asserted by
     test_merge_queue_warm_cold_shadow.py::TestShadowCompareStatePersistence.

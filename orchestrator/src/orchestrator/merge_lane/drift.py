@@ -94,7 +94,7 @@ def _build_remote_runners(
 # ---------------------------------------------------------------------------
 # Lever-C drift-check cadence persistence (task 2886 fix 1a)
 #
-# EXACT mirror of merge_shadow's ShadowCompareState +
+# Modelled on merge_lane/shadow.py::ShadowCompareState and its
 # _load_shadow_compare_state / _save_shadow_compare_state.  The drift-check
 # land counter was a worker-level in-memory int (``worker._drift_land_count``)
 # that the ~8h fleet redeploy resets to 0 before it ever reaches
@@ -107,7 +107,7 @@ def _build_remote_runners(
 # WINDOW note).
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class DriftCheckState:
     """Persisted cadence state for the Lever-C drift check.
 
@@ -118,14 +118,31 @@ class DriftCheckState:
     reaches ``verify_drift_check_every_n_lands``).
 
     Fields:
-        land_count: Count of successful ('done') lands observed so far.  The
-            drift check fires when
-            ``land_count % verify_drift_check_every_n_lands == 0``.  Additive
-            across the worker lifetime (never reset), mirroring the in-memory
-            ``worker._drift_land_count`` it supersedes.
+        land_count: Count of successful ('done') lands observed so far.
+            Additive across the worker lifetime (never reset or decremented),
+            mirroring the in-memory ``worker._drift_land_count`` it supersedes.
+        consecutive_deferrals: Consecutive due checks that could not acquire
+            both host slots.  Greater than 0 means a check is overdue and
+            fires at the next land; reset when a check acquires its slots.
     """
 
     land_count: int = 0
+    consecutive_deferrals: int = 0
+
+    def is_due(self, every_n: int) -> bool:
+        """The firing rule: a cadence multiple, or a deferred check still owed."""
+        return self.consecutive_deferrals > 0 or self.land_count % every_n == 0
+
+    def after_land(self) -> DriftCheckState:
+        return dataclasses.replace(self, land_count=self.land_count + 1)
+
+    def after_deferral(self) -> DriftCheckState:
+        return dataclasses.replace(
+            self, consecutive_deferrals=self.consecutive_deferrals + 1,
+        )
+
+    def after_start(self) -> DriftCheckState:
+        return dataclasses.replace(self, consecutive_deferrals=0)
 
 
 def _load_drift_check_state(path: Path) -> DriftCheckState:
@@ -133,8 +150,9 @@ def _load_drift_check_state(path: Path) -> DriftCheckState:
 
     Fail-safe: returns a default ``DriftCheckState()`` on any error (file not
     found, unreadable, unparseable JSON, or missing/wrong-typed keys) so the
-    orchestrator never fails to start due to a corrupt state file.  Exact
-    mirror of :func:`orchestrator.merge_lane.shadow._load_shadow_compare_state`.
+    orchestrator never fails to start due to a corrupt state file.  A file
+    written before ``consecutive_deferrals`` existed loads with 0 deferrals.
+    Modelled on merge_lane/shadow.py::_load_shadow_compare_state.
 
     Args:
         path: Path to the JSON state file (typically
@@ -145,7 +163,10 @@ def _load_drift_check_state(path: Path) -> DriftCheckState:
     """
     try:
         data = json.loads(path.read_text())
-        return DriftCheckState(land_count=int(data['land_count']))
+        return DriftCheckState(
+            land_count=int(data['land_count']),
+            consecutive_deferrals=int(data.get('consecutive_deferrals', 0)),
+        )
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return DriftCheckState()
 
@@ -153,8 +174,8 @@ def _load_drift_check_state(path: Path) -> DriftCheckState:
 def _save_drift_check_state(path: Path, state: DriftCheckState) -> None:
     """Persist the drift-check cadence state to a JSON file.
 
-    Creates parent directories as needed.  Exact mirror of
-    :func:`orchestrator.merge_lane.shadow._save_shadow_compare_state`.
+    Creates parent directories as needed.  Modelled on
+    merge_lane/shadow.py::_save_shadow_compare_state.
 
     Args:
         path: Destination path for the JSON state file.
@@ -162,6 +183,25 @@ def _save_drift_check_state(path: Path, state: DriftCheckState) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(dataclasses.asdict(state)))
+
+
+def _record_drift_deferral(path: Path | None) -> int:
+    """Persist one more consecutive deferral; the new count (1 with no state file)."""
+    if path is None:
+        return 1
+    state = _load_drift_check_state(path).after_deferral()
+    _save_drift_check_state(path, state)
+    return state.consecutive_deferrals
+
+
+def _record_drift_start(path: Path | None) -> int:
+    """Clear the deferral count once a check holds its slots; the count it cleared."""
+    if path is None:
+        return 0
+    state = _load_drift_check_state(path)
+    if state.consecutive_deferrals > 0:
+        _save_drift_check_state(path, state.after_start())
+    return state.consecutive_deferrals
 
 
 async def _run_drift_check(
