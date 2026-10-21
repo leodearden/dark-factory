@@ -58,6 +58,7 @@ from fused_memory.server.markup_guard import (
     _resolve_project_root,
     install_markup_guard,
 )
+from fused_memory.server.markup_residue_spool import MarkupResidueSpool
 from fused_memory.server.tools import create_mcp_server
 
 _PROJECT_ID = 'dark_factory'
@@ -155,7 +156,9 @@ def _pass_through(mock_service: AsyncMock, method: str) -> None:
 
 
 def _build_guarded_server(
-    *methods: str, known_projects: dict[str, str] | None = None
+    *methods: str,
+    known_projects: dict[str, str] | None = None,
+    residue_floor: Any = None,
 ) -> tuple[Any, AsyncMock]:
     """A real bundled-FastMCP server with the boundary guard installed.
 
@@ -172,6 +175,7 @@ def _build_guarded_server(
         server,
         policy=RepairPolicy.REJECT_WITH_REPAIR,
         known_projects=_KNOWN_PROJECTS if known_projects is None else known_projects,
+        residue_floor=residue_floor,
     )
     return server, mock_service
 
@@ -597,6 +601,11 @@ def _escalations(root) -> list[dict]:
         json.loads(path.read_text())
         for path in sorted((root / 'data' / 'escalations').glob('esc-*.json'))
     ]
+
+
+def _spooled(spool_dir: Path, locator: str) -> Any:
+    """The ``raw_value`` the floor holds under *locator*."""
+    return json.loads((spool_dir / locator).read_text(encoding='utf-8'))['raw_value']
 
 
 class TestStormEscape:
@@ -1340,23 +1349,30 @@ class TestUnrepairableResidueIsPreserved:
         assert self._unrepairable('second') in details
 
     @pytest.mark.asyncio
-    async def test_an_unfilable_residue_falls_back_to_the_log(self, tmp_path, caplog):
-        """When there is genuinely no queue, the log line IS the only copy — so
-        that is when the full record is dumped, and only then."""
+    async def test_an_unfilable_residue_falls_back_to_the_spool(self, tmp_path, caplog):
+        """No queue resolves, so the floor holds the payload and the caller is
+        handed its locator. The payload is not dumped into the log as well."""
+        spool = MarkupResidueSpool(tmp_path / 'spool')
         server, _ = _build_guarded_server(
-            'add_system_record', known_projects={'some_other_project': str(tmp_path)}
+            'add_system_record',
+            known_projects={'some_other_project': str(tmp_path)},
+            residue_floor=spool.preserve,
         )
 
         with caplog.at_level('ERROR', logger='fused_memory.server.markup_guard'):
             payload = await self._refuse(server)
 
-        assert payload['escalation_id'] is None
+        assert payload['escalation_id'] is not None
+        assert _spooled(tmp_path / 'spool', payload['escalation_id']) == self._unrepairable('one')
         assert not (tmp_path / 'data' / 'escalations').exists()
-        text = '\n'.join(r.getMessage() for r in caplog.records)
-        assert 'only copy' in text
-        assert self._unrepairable('one') in text, (
-            f'the payload has to survive somewhere: {text!r}'
+        text = '\n'.join(
+            r.getMessage() for r in caplog.records
+            if r.name == 'fused_memory.server.markup_guard'
         )
+        assert payload['escalation_id'] in text, (
+            f'the operator still needs the pointer: {text!r}'
+        )
+        assert self._unrepairable('one') not in text
 
     @pytest.mark.asyncio
     async def test_a_filed_residue_does_not_dump_the_payload_into_the_log(
@@ -1391,15 +1407,20 @@ class TestUnrepairableResidueIsPreserved:
             raise RuntimeError('queue on fire')
 
         monkeypatch.setattr(guard_module, 'emit_markup_residue_escalation', _boom)
+        spool = MarkupResidueSpool(tmp_path / 'spool')
         server, mock_service = _build_guarded_server(
-            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
+            'add_system_record',
+            known_projects={_PROJECT_ID: str(tmp_path)},
+            residue_floor=spool.preserve,
         )
 
         payload = await self._refuse(server)
 
         assert payload['error_type'] == 'mcp_markup_unrepairable'
-        assert payload['escalation_id'] is None
         mock_service.add_system_record.assert_not_awaited()
+        # The floor caught the payload the raising filer dropped.
+        assert payload['escalation_id'] is not None
+        assert _spooled(tmp_path / 'spool', payload['escalation_id']) == self._unrepairable('one')
 
 
 class TestRoutingIdentityIsRederivedFromTheResidue:
@@ -1489,3 +1510,150 @@ class TestRoutingIdentityIsRederivedFromTheResidue:
     )
     def test_it_routes_nowhere_without_raising(self, record, known_projects):
         assert _rederive_project(record, known_projects) is None
+
+
+class TestPreservationIsUnconditional:
+    """C2/B5/INV-7: a refused payload is preserved whether or not routing survived.
+
+    add_memory declares ``content`` before ``project_id``, so a forward-consuming
+    leak in ``content`` eats the routing key. Before task 4809 that made
+    preservation depend on parameter DECLARATION ORDER: the 2026-08-23..27
+    refusals of add_memory were all lost.
+    """
+
+    #: A registry that resolves none of the corpus payloads.
+    _UNRELATED = 'some_other_project'
+
+    #: Values for the arguments a specimen declares it supplied besides ``content``.
+    _SUPPLIED_VALUES = {
+        'project_id': 'not_a_registered_project',
+        'agent_id': 'claude-task-4809-specimen',
+        'category': 'observations_and_summaries',
+    }
+
+    @classmethod
+    def _arguments(cls, specimen: dict[str, Any]) -> dict[str, Any]:
+        arguments = {name: cls._SUPPLIED_VALUES[name] for name in specimen['supplied']
+                     if name != specimen['param']}
+        arguments[specimen['param']] = specimen['value']
+        return arguments
+
+    @staticmethod
+    async def _refuse(server, tool: str, arguments: dict[str, Any]) -> dict:
+        with pytest.raises(ToolError) as exc_info:
+            await server._tool_manager.call_tool(tool, arguments)
+        payload = _payload(exc_info)
+        assert payload['error_type'] == 'mcp_markup_unrepairable', payload
+        return payload
+
+    @staticmethod
+    def _content_naming_its_project(project_id: str) -> str:
+        """An add_memory leak that ate ``project_id`` and then a whole second
+        call, so it cannot be repaired — the measured residue-loss shape."""
+        return (
+            _CLEAN_CONTENT
+            + closer_for('content')
+            + CANONICAL_OPENER_PREFIX
+            + f'"project_id">{project_id}'
+            + closer_for('parameter')
+            + closer_for('invoke')
+            + '\nthe head of the next tool call'
+        )
+
+    @pytest.mark.parametrize(
+        'specimen',
+        [
+            pytest.param(specimen, id=specimen['tool_use_id'])
+            for specimen in _unrepairable_add_memory_specimens()
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_every_corpus_refusal_of_add_memory_is_preserved(self, tmp_path, specimen):
+        spool = MarkupResidueSpool(tmp_path / 'spool')
+        server, mock_service = _build_guarded_server(
+            known_projects={self._UNRELATED: str(tmp_path / 'other')},
+            residue_floor=spool.preserve,
+        )
+
+        payload = await self._refuse(server, 'add_memory', self._arguments(specimen))
+
+        assert payload['escalation_id'] is not None, payload
+        assert _spooled(tmp_path / 'spool', payload['escalation_id']) == specimen['value']
+        assert 'NOTHING WAS PRESERVED' not in payload['hint']
+        mock_service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_registered_project_named_only_in_the_residue_files_into_its_queue(
+        self, tmp_path
+    ):
+        spool_dir = tmp_path / 'spool'
+        server, mock_service = _build_guarded_server(
+            known_projects={_PROJECT_ID: str(tmp_path)},
+            residue_floor=MarkupResidueSpool(spool_dir).preserve,
+        )
+
+        payload = await self._refuse(
+            server, 'add_memory', {'content': self._content_naming_its_project(_PROJECT_ID)}
+        )
+
+        records = _escalations(tmp_path)
+        assert [record['id'] for record in records] == [payload['escalation_id']]
+        assert 'UNVERIFIED ROUTING' in records[0]['suggested_action']
+        assert 'never for the write' in records[0]['suggested_action']
+        assert 'project=None' in records[0]['detail']
+        assert not spool_dir.exists(), 'the queue stays primary; the floor is not touched'
+        mock_service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_surviving_project_root_files_exactly_as_before(self, tmp_path, monkeypatch):
+        """The positive control: submit_task declares ``project_root`` first, so
+        its identity survives and the residue takes the unchanged route."""
+        monkeypatch.setattr(
+            'fused_memory.server.tools.resolve_main_checkout', lambda p: str(p)
+        )
+        interceptor = AsyncMock()
+        server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+        spool_dir = tmp_path / 'spool'
+        install_markup_guard(
+            server,
+            policy=RepairPolicy.REJECT_WITH_REPAIR,
+            known_projects={_PROJECT_ID: str(tmp_path)},
+            residue_floor=MarkupResidueSpool(spool_dir).preserve,
+        )
+
+        payload = await self._refuse(
+            server,
+            'submit_task',
+            {
+                'project_root': str(tmp_path),
+                'prompt': 'Reconcile the queue',
+                'description': 'Reconcile the queue' + closer_for('invoke'),
+            },
+        )
+
+        records = _escalations(tmp_path)
+        assert [record['id'] for record in records] == [payload['escalation_id']]
+        assert 'UNVERIFIED' not in records[0]['suggested_action']
+        assert not spool_dir.exists()
+        interceptor.submit_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_when_every_tier_fails_the_caller_is_told_nothing_was_preserved(
+        self, tmp_path
+    ):
+        blocker = tmp_path / 'not-a-directory'
+        blocker.write_text('occupied')
+        server, mock_service = _build_guarded_server(
+            known_projects={self._UNRELATED: str(tmp_path / 'other')},
+            residue_floor=MarkupResidueSpool(blocker / 'spool').preserve,
+        )
+
+        payload = await self._refuse(
+            server,
+            'add_memory',
+            {'content': _CLEAN_CONTENT + closer_for('invoke'), 'project_id': 'unregistered'},
+        )
+
+        assert payload['escalation_id'] is None
+        assert 'NOTHING WAS PRESERVED' in payload['hint']
+        mock_service.add_memory.assert_not_awaited()
