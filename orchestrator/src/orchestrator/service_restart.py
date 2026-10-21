@@ -112,9 +112,12 @@ FLEET_DEPLOY_CLOCK_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
 FLEET_LEASE_RELPATH = 'data/orchestrator/fleet_redeploy_lease.json'
 
 # How old a lease may be before its readers stop believing it. The default of
-# orchestrator.config's orchestrator_restart_lease_max_age_secs, where its
-# derivation from the worst legitimate --drain sweep lives (task 5371: the
-# verify-wait cap made that ~13,300s, so 4h). A lease leaked by a SIGKILLed
+# orchestrator.config's orchestrator_restart_lease_max_age_secs. A --drain
+# sweep's per-unit verify-wait caps add up (task 7297), so what keeps a sweep
+# inside 4h is the script's sweep-wide ceiling: 11400s of verify-awaiting from
+# the first unit's drain request, then only restarts and the merge-idle gate
+# (~13,200s; derivation at scripts/orchestrator-watchdog.py::FLEET_LEASE_MAX_AGE_SECS).
+# A lease leaked by a SIGKILLed
 # sweep (whose EXIT trap cannot run, by construction) therefore delays at most
 # ONE redeploy window and can never wedge the fleet.
 DEFAULT_FLEET_LEASE_MAX_AGE_SECS = 14400.0
