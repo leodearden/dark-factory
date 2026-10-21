@@ -560,8 +560,7 @@ class TestConsumption:
     @pytest.mark.parametrize(('outcome', 'vote', 'options', 'consumed'), [
         ('contested', {'home': 'NO', 'conflict': 'YES'}, {}, {('p', 'conflict')}),
         ('contested', _HOME_FLAT, {}, {('p', 'conflict'), ('p', 'home'), ('p', 'loss')}),
-        ('restated', {'home': 'NO', 'conflict': 'NO', 'loss': 'UNCLEAR'}, {},
-         {('p', 'conflict'), ('p', 'home')}),
+        ('restated', {'home': 'NO', 'conflict': 'NO'}, {}, {('p', 'conflict'), ('p', 'home')}),
         ('amended', {**_HOME_MORE, 'digest': 'NO'}, {'in_m1_band': True},
          {('p', 'conflict'), ('p', 'home'), ('p', 'loss'), ('p', 'digest')}),
         ('amended', {**_HOME_MORE, 'digest': 'NO'}, {},
@@ -571,7 +570,6 @@ class TestConsumption:
         self, outcome: str, vote: dict[str, str], options: dict[str, Any],
         consumed: set[tuple[str, str]],
     ) -> None:
-        vote = {**vote, 'unclear_reason': 'never read'} if 'UNCLEAR' in vote.values() else vote
         assert _decided(_derive(outcome, vote, **options)).consumed == consumed
 
     def test_a_stored_write_names_every_earlier_record(self) -> None:

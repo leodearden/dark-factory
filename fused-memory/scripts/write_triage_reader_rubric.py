@@ -19,6 +19,7 @@ from functools import partial
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
+from fused_memory.server.grouped_read import _digest
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -323,7 +324,9 @@ def _non_consumed_violation(row: Mapping[str, Any]) -> str | None:
 
 def _judgement(key: PairKey, votes: tuple[Vote, ...]) -> Judgement:
     resolved = {
-        binary: _majority([vote.answers[binary] for vote in votes if binary in vote.answers], binary)
+        binary: _RESOLVERS[binary](
+            [vote.answers[binary] for vote in votes if binary in vote.answers], binary,
+        )
         for binary in _WORDS
         if any(binary in vote.answers for vote in votes)
     }
@@ -346,6 +349,39 @@ def _strict_majority(yes: int, votes: int) -> bool | None:
     if 2 * yes == votes:
         return None
     return 2 * yes > votes
+
+
+def _all_visible(words: list[StrEnum], binary: Binary) -> Resolved:
+    """YES only when every decided vote is YES: a reader of the digest misses any span one rater needed."""
+    decided = [word for word in words if not is_abstain(word)]
+    if not decided:
+        return Resolved.UNCLEAR
+    positive, negative = _POLES[binary]
+    return positive if all(word == positive for word in decided) else negative
+
+
+_RESOLVERS: Mapping[Binary, Callable[[list[StrEnum], Binary], Resolved]] = MappingProxyType({
+    binary: _all_visible if binary is Binary.DIGEST else _majority for binary in _WORDS
+})
+"""How each binary's votes resolve: DIGEST by the all-visible rule, every other by strict majority."""
+
+
+def quote_found(quote: str, text: str) -> bool:
+    """Whether *quote* occurs in *text* verbatim up to whitespace; an empty quote is never found."""
+    needle = _normalised(quote)
+    return bool(needle) and needle in _normalised(text)
+
+
+def digest_visible(loss_spans: Sequence[str], child_text: str) -> bool:
+    """Whether every span lies inside the digest a reader of the parent sees of *child_text*."""
+    if not loss_spans:
+        raise ValueError('digest_visible needs at least one loss span')
+    digest = _digest(child_text)
+    return all(quote_found(span, digest) for span in loss_spans)
+
+
+def _normalised(text: str) -> str:
+    return ' '.join(text.split())
 
 
 class Cell(StrEnum):
@@ -418,12 +454,17 @@ class Decided:
 
     ``conflict`` says whether the write disputes its parent or any earlier
     record. ``m1_hidden`` is None outside the M1 band.
+    ``m1_hidden_as_amended`` is the counterfactual M1 of a band attach read as
+    if it were amended; None outside the band and for a stored write.
+    ``consumed`` names every (target, binary) the derivation read.
     """
 
     triage_cells: frozenset[Cell]
     status_quo_cells: frozenset[Cell]
     m1_hidden: bool | None
     conflict: bool
+    m1_hidden_as_amended: bool | None
+    consumed: frozenset[tuple[str, Binary]]
 
 
 @dataclass(frozen=True)
@@ -458,16 +499,18 @@ def derive(
     one is derived on its own. Binaries are asked lazily, in a fixed order per
     outcome, so a binary is decisive exactly when the derivation asks for it: a
     decisive unrated or tied binary makes the write Incomplete (naming every
-    gap the three derivations met), a decisive UNCLEAR one makes it Unclear,
-    and a binary never asked never blocks. The triage, status-quo and M1
-    derivations stand or fall together: a gap or an UNCLEAR in any one of them
-    decides the whole write, even when the others are complete.
+    gap the derivations met), a decisive UNCLEAR one makes it Unclear, and a
+    binary never asked never blocks. The triage, status-quo, M1 and
+    counterfactual-M1 derivations stand or fall together: a gap or an UNCLEAR
+    in any one of them decides the whole write, even when the others are
+    complete.
     ``supersedes_target`` and ``superseded_marks`` are metadata facts
     (ruling 5c), never rater answers.
     """
+    asked: set[tuple[str, Binary]] = set()
     regimes = _regimes(
         outcome, judgements_by_target, supersedes_target=supersedes_target,
-        superseded_marks=superseded_marks, in_m1_band=in_m1_band,
+        superseded_marks=superseded_marks, in_m1_band=in_m1_band, asked=asked,
     )
     results: dict[str, list[Any]] = {regime: [] for regime in regimes}
     gaps: set[Gap] = set()
@@ -492,6 +535,8 @@ def derive(
         status_quo_cells=_Reading.union(results['status_quo']).cells,
         m1_hidden=results['m1'][0] if in_m1_band else None,
         conflict=triage.conflict,
+        m1_hidden_as_amended=results['m1_as_amended'][0] if regimes['m1_as_amended'] else None,
+        consumed=frozenset(asked),
     )
 
 
@@ -510,13 +555,18 @@ class _Abstained(Exception):
 
 @dataclass(frozen=True)
 class _Reader:
-    """Lazy access to one record's judgement; ``marked`` = it carries a superseded-by mark."""
+    """Lazy access to one record's judgement; ``marked`` = it carries a superseded-by mark.
+
+    Every binary asked is recorded in ``asked``, the one derive call's set.
+    """
 
     target_id: str
     judgement: Judgement | None
+    asked: set[tuple[str, Binary]]
     marked: bool = False
 
     def yes(self, binary: Binary) -> bool:
+        self.asked.add((self.target_id, binary))
         resolved = None if self.judgement is None else self.judgement.answer(binary)
         if resolved is None:
             raise _Undecided(Gap(self.target_id, binary, GapKind.UNRATED))
@@ -601,13 +651,14 @@ def _regimes(
     supersedes_target: bool,
     superseded_marks: frozenset[str],
     in_m1_band: bool,
+    asked: set[tuple[str, Binary]],
 ) -> dict[str, list[Callable[[], Any]]]:
     """The deferred derivations of each regime, refusing a write the rubric cannot read."""
     rule = _CELL_RULES.get(outcome)
     if rule is None:
         raise ValueError(f'outcome {outcome!r} is not one of {sorted(TRIAGE_OUTCOMES)}')
     readers = [
-        _Reader(target, judgement, marked=target in superseded_marks)
+        _Reader(target, judgement, asked, marked=target in superseded_marks)
         for target, judgement in sorted(judgements_by_target.items())
     ]
     if outcome == OUTCOME_STORED:
@@ -622,4 +673,8 @@ def _regimes(
         'triage': [partial(rule, reader) for reader in readers],
         'status_quo': [partial(_stored_cells, reader) for reader in flat],
         'm1': [partial(_m1_hidden, outcome, readers)] if in_m1_band else [],
+        'm1_as_amended': (
+            [partial(_m1_hidden, OUTCOME_AMENDED, readers)]
+            if in_m1_band and outcome != OUTCOME_STORED else []
+        ),
     }
