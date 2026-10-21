@@ -284,79 +284,218 @@ class TestAttachTimeText:
         assert _mod().attach_time_text(history, 'p3', '2026-10-02T00:00:00+00:00', 'lost') is None
 
 
+CHILD = 'The deploy uses blue-green.\nRollback takes   five minutes.'
+PARENT = 'The deploy uses canary releases. Rollback is manual.'
+
+
+def _line(**fields: Any) -> dict[str, Any]:
+    return {'id': 'primary_00-000', 'reason': 'two claims', **fields}
+
+
+class TestValidateRating:
+    def _problems(self, line: dict[str, Any]) -> list[str]:
+        return _mod().validate_rating(line, CHILD, PARENT)
+
+    def test_verbatim_quotes_and_spans_pass(self) -> None:
+        assert self._problems(_line(
+            home='YES', conflict='YES', scope='CENTRAL', action_changing='YES',
+            conflict_quote={'parent': 'The deploy uses canary releases.',
+                            'child': 'The deploy uses blue-green.'},
+        )) == []
+        assert self._problems(_line(
+            home='YES', conflict='NO', loss='YES', loss_spans=['Rollback takes five minutes.'],
+        )) == []
+        assert self._problems(_line(home='NO')) == []
+
+    def test_a_quote_differing_only_in_whitespace_passes(self) -> None:
+        assert self._problems(_line(
+            home='YES', conflict='YES', scope='CENTRAL',
+            conflict_quote={'parent': 'canary\n  releases.', 'child': 'blue-green. Rollback takes five'},
+        )) == []
+
+    @pytest.mark.parametrize(('field', 'quote', 'conflict_quote'), [
+        ('conflict_quote.child', 'The deploy is blue-green.',
+         {'parent': 'canary releases', 'child': 'The deploy is blue-green.'}),
+        ('conflict_quote.child', 'Rollback is manual.',
+         {'parent': 'canary releases', 'child': 'Rollback is manual.'}),
+        ('conflict_quote.parent', 'The deploy uses blue-green.',
+         {'parent': 'The deploy uses blue-green.', 'child': 'blue-green'}),
+    ])
+    def test_a_conflict_quote_not_in_its_text_fails(
+        self, field: str, quote: str, conflict_quote: dict[str, str],
+    ) -> None:
+        problems = self._problems(_line(
+            home='YES', conflict='YES', scope='CENTRAL', conflict_quote=conflict_quote,
+        ))
+        assert len(problems) == 1
+        assert field in problems[0] and quote in problems[0]
+
+    def test_each_loss_span_must_be_in_child(self) -> None:
+        problems = self._problems(_line(
+            home='YES', conflict='NO', loss='YES',
+            loss_spans=['Rollback takes five minutes.', 'Rollback is manual.', 'uses canary'],
+        ))
+        assert len(problems) == 2
+        assert 'loss_spans' in problems[0] and 'Rollback is manual.' in problems[0]
+        assert 'loss_spans' in problems[1] and 'uses canary' in problems[1]
+
+    def test_a_rater_line_carrying_digest_fails(self) -> None:
+        problems = self._problems(_line(
+            home='YES', conflict='NO', loss='YES', loss_spans=['five minutes'], digest='YES',
+        ))
+        assert len(problems) == 1
+        assert 'digest is computed from loss_spans' in problems[0]
+
+
+class TestEffectiveRatings:
+    def test_the_highest_round_of_each_rater_on_each_pair_and_basis_survives(self) -> None:
+        reasked = {**_rated('e1', role='primary', home='YES'), 'batch': 'reask_01_primary'}
+        rows = [
+            {**reasked, 'round': 1},
+            {**_rated('e1', role='primary', home='NO'), 'round': 0},
+            {**_rated('e1', role='second', home='NO'), 'round': 0},
+            {**_rated('e1', role='primary', basis='attach_time', home='NO'), 'round': 0},
+        ]
+        effective = _mod().effective_ratings(rows)
+        assert sorted(effective, key=lambda row: (row['basis'], row['rater'])) == [
+            _rated('e1', role='primary', basis='attach_time', home='NO'),
+            reasked,
+            _rated('e1', role='second', home='NO'),
+        ]
+
+
+EARLY = 'Early detail sits here.'
+LATE = 'Late detail sits here.'
+LONG_CHILD = f'{EARLY} {"x" * 300} {LATE}'
+
+
+def _with_spans(row: dict[str, Any], *spans: str) -> dict[str, Any]:
+    return {**row, 'loss_spans': list(spans)}
+
+
 class TestAssemble:
+    """Ten UNRELATED pairs and one RELATED pair hold the HOME NO and CONFLICT NO rows.
+
+    r10's raters both say HOME YES against its held row, s0's SAME row fails the
+    check, and x0 is an extension item v1 never labelled.
+    """
+
+    def _adjudications(self) -> dict[tuple[str, str], dict[str, Any] | None]:
+        adjudications: dict[tuple[str, str], dict[str, Any] | None] = {
+            (f'r{index}', 'p1'): _adjudication('UNRELATED', child_memory_id=f'r{index}')
+            for index in range(10)
+        }
+        adjudications['r10', 'p1'] = _adjudication('RELATED', child_memory_id='r10')
+        adjudications['s0', 'p1'] = _adjudication('SAME', child_memory_id='s0')
+        adjudications['x0', 'p1'] = None
+        return adjudications
+
+    def _rated_rows(self) -> list[dict[str, Any]]:
+        rows = [
+            _rated(f'r{index}', role=role, home='NO', conflict='NO')
+            for index in range(10) for role in ('primary', 'second')
+        ]
+        rows += [
+            _with_spans(_rated('r10', role='primary', home='YES', conflict='NO', loss='YES'), EARLY),
+            _with_spans(_rated('r10', role='second', home='YES', conflict='NO', loss='YES'),
+                        EARLY, LATE),
+            _rated('s0', role='primary', home='NO', conflict='NO'),
+            _rated('s0', role='second', home='NO', conflict='UNCLEAR'),
+            _rated('x0', role='primary', home='YES', conflict='YES', scope='CENTRAL',
+                   action_changing='YES'),
+            _rated('x0', role='second', home='YES', conflict='YES', scope='SECONDARY',
+                   action_changing='NO'),
+            _with_spans(_rated('r0', role='primary', basis='attach_time', home='YES',
+                               conflict='NO', loss='YES'), EARLY),
+            _rated('r0', role='second', basis='attach_time', home='YES', conflict='NO', loss='NO'),
+        ]
+        return rows
+
     def _assembly(self) -> Any:
-        determined = {
-            ('e1', 'p1'): {'home': 'YES', 'conflict': 'NO'},
-            ('e2', 'p2'): {},
-            ('e3', 'p3'): {'home': 'YES', 'loss': 'NO', 'conflict': 'NO'},
-        }
-        rubric = _rubric()
-        typed = {
-            pair: {rubric.Binary(binary): answer for binary, answer in answers.items()}
-            for pair, answers in determined.items()
-        }
-
-        def rated(entry: str, target: str, role: str, rater: str, **answers: str) -> dict[str, Any]:
-            return {
-                'entry_id': entry, 'target_id': target, 'basis': answers.pop('basis', 'current'),
-                'rater': rater, 'role': role, 'batch': 'shard-0', 'reason': 'two claims', **answers,
-            }
-
-        return _mod().assemble(typed, [
-            rated('e1', 'p1', 'primary', 'opus', home='YES', loss='YES', conflict='NO',
-                  digest='NO'),
-            rated('e1', 'p1', 'second', 'sonnet', home='NO', loss='NO', conflict='YES',
-                  scope='CENTRAL'),
-            rated('e2', 'p2', 'primary', 'opus', home='YES', loss='NO', conflict='NO'),
-            rated('e1', 'p1', 'primary', 'opus', basis='attach_time', home='YES', loss='NO',
-                  conflict='YES', scope='SECONDARY'),
-            rated('e3', 'p3', 'primary', 'opus', home='YES', loss='NO', conflict='NO'),
-        ])
+        child_texts = {entry_id: LONG_CHILD for entry_id, _ in self._adjudications()}
+        return _mod().assemble(self._adjudications(), self._rated_rows(), child_texts)
 
     def _rows(self) -> dict[tuple[str, str, str], dict[str, Any]]:
         return {
-            (row['entry_id'], row['basis'], row['role']): row
-            for row in self._assembly().verdicts
+            (row['entry_id'], row['basis'], row['role']): row for row in self._assembly().verdicts
         }
 
-    def _answers(self, row: dict[str, Any]) -> dict[str, str]:
-        return {key: row[key] for key in ('home', 'loss', 'conflict', 'scope', 'digest') if key in row}
+    def _judgement(self, entry_id: str) -> Any:
+        rubric = _rubric()
+        judgements = rubric.resolve_judgements(self._assembly().verdicts)
+        return judgements[rubric.PairKey(entry_id, 'p1', rubric.Basis.CURRENT)]
 
-    def test_one_derived_row_carries_each_pairs_v1_binaries(self) -> None:
+    def test_one_derived_row_per_adjudicated_pair_from_the_held_rows(self) -> None:
+        derived = {
+            row['entry_id']: {key: row[key] for key in ('home', 'loss', 'conflict', 'scope')
+                              if key in row}
+            for row in self._assembly().verdicts if row['role'] == 'derived'
+        }
+        assert derived == {
+            **{f'r{index}': {'home': 'NO', 'conflict': 'NO'} for index in range(10)},
+            'r10': {'home': 'NO'}, 's0': {'conflict': 'NO'},
+        }
+
+    def test_every_rated_row_is_kept_whole(self) -> None:
+        rows = {
+            (row['entry_id'], row['basis'], row['rater']): row for row in self._assembly().verdicts
+        }
+        for rated in self._rated_rows():
+            kept = rows[rated['entry_id'], rated['basis'], rated['rater']]
+            assert {key: kept[key] for key in rated} == rated
+            assert set(kept) - set(rated) <= {'non_consumed', 'digest'}
+
+    def test_answers_a_derived_row_fixes_are_marked_non_consumed(self) -> None:
         rows = self._rows()
-        assert self._answers(rows['e1', 'current', 'derived']) == {'home': 'YES', 'conflict': 'NO'}
-        assert self._answers(rows['e3', 'current', 'derived']) == {
-            'home': 'YES', 'loss': 'NO', 'conflict': 'NO',
-        }
-        assert ('e2', 'current', 'derived') not in rows
+        assert rows['r0', 'current', 'primary']['non_consumed'] == ['conflict', 'home']
+        assert rows['r10', 'current', 'second']['non_consumed'] == ['home']
+        assert rows['s0', 'current', 'second']['non_consumed'] == ['conflict']
+        assert 'non_consumed' not in rows['x0', 'current', 'primary']
+        assert 'non_consumed' not in rows['r0', 'attach_time', 'primary']
+        assert 'non_consumed' not in rows['r0', 'attach_time', 'second']
 
-    def test_rated_rows_keep_only_what_v1_left_open(self) -> None:
+    def test_digest_is_computed_from_the_loss_spans(self) -> None:
         rows = self._rows()
-        assert self._answers(rows['e1', 'current', 'primary']) == {'loss': 'YES', 'digest': 'NO'}
-        assert self._answers(rows['e1', 'current', 'second']) == {'loss': 'NO'}
-        assert self._answers(rows['e2', 'current', 'primary']) == {
-            'home': 'YES', 'loss': 'NO', 'conflict': 'NO',
-        }
-        assert ('e3', 'current', 'primary') not in rows
-        assert rows['e1', 'current', 'primary']['reason'] == 'two claims'
+        assert rows['r10', 'current', 'primary']['digest'] == 'YES'
+        assert rows['r10', 'current', 'second']['digest'] == 'NO'
+        assert rows['r0', 'attach_time', 'primary']['digest'] == 'YES'
+        assert [row for row in self._assembly().verdicts
+                if 'digest' in row and row.get('loss') != 'YES'] == []
+        assert 'digest' not in rows['r0', 'attach_time', 'second']
 
-    def test_attach_time_rows_keep_every_answer(self) -> None:
-        assert self._answers(self._rows()['e1', 'attach_time', 'primary']) == {
-            'home': 'YES', 'loss': 'NO', 'conflict': 'YES', 'scope': 'SECONDARY',
-        }
+    def test_the_corpus_is_a_valid_verdict_corpus_in_order(self) -> None:
+        verdicts = self._assembly().verdicts
+        _rubric().resolve_judgements(verdicts)
+        order = [(row['entry_id'], row['target_id'], row['basis'], row['rater']) for row in verdicts]
+        assert order == sorted(order)
 
-    def test_the_corpus_is_a_valid_verdict_corpus(self) -> None:
-        _rubric().resolve_judgements(self._assembly().verdicts)
+    def test_a_held_row_outvotes_both_raters(self) -> None:
+        assert self._judgement('r10').answer(_rubric().Binary.HOME) == 'NO'
 
-    def test_answers_on_v1_binaries_feed_only_the_derivation_check(self) -> None:
-        assert self._assembly().derivation == {
-            'home': {'derived': 2, 'rated': 1, 'n_compared': 3, 'agree': 2},
-            'loss': {'derived': 1, 'rated': 3, 'n_compared': 1, 'agree': 1},
-            'conflict': {'derived': 2, 'rated': 1, 'n_compared': 3, 'agree': 2},
-            'scope': {'derived': 0, 'rated': 0, 'n_compared': 0, 'agree': 0},
-            'digest': {'derived': 0, 'rated': 1, 'n_compared': 0, 'agree': 0},
+    def test_a_pair_whose_row_failed_the_check_resolves_from_the_raters(self) -> None:
+        judgement = self._judgement('s0')
+        assert judgement.answer(_rubric().Binary.HOME) == 'NO'
+        assert judgement.answer(_rubric().Binary.CONFLICT) == 'NO'
+        assert self._judgement('x0').answer(_rubric().Binary.CONFLICT) == 'YES'
+
+    def test_the_derivation_reports_each_row_check_and_the_held_rows(self) -> None:
+        derivation = self._assembly().derivation
+        assert derivation['check'] == {
+            'min_compared': 20, 'min_agreement': 0.90, 'roles': ['primary', 'second'],
         }
+        assert set(derivation['rows']) == set(CANDIDATE_ROWS) | set(RETIRED_ROWS)
+        assert derivation['rows']['related_unrelated_home_no'] == {
+            'binary': 'home', 'n_items': 11, 'n_compared': 22, 'agree': 20, 'held': True,
+            'retired': False,
+        }
+        assert derivation['rows']['same_subsumed_unrelated_conflict_no'] == {
+            'binary': 'conflict', 'n_items': 11, 'n_compared': 21, 'agree': 21, 'held': True,
+            'retired': False,
+        }
+        assert derivation['rows']['same_subsumed_home_yes']['held'] is False
+        assert derivation['held_rows'] == [
+            'related_unrelated_home_no', 'same_subsumed_unrelated_conflict_no',
+        ]
 
 
 class TestItemRow:
