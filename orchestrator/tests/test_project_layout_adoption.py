@@ -5,7 +5,9 @@ Contract: plans/review-all-s14-shared-leaves-prd.md (decisions 2, 3, 4; B2, B3).
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 from collections import deque
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -14,6 +16,7 @@ import pytest
 import yaml
 from _escalation_server_capture import create_server_kwargs
 from _orch_helpers import _init_harness_state_for_test
+from escalation.queue import EscalationQueue
 from pydantic import ValidationError
 from shared import project_layout
 from shared.cli_invoke import AgentResult
@@ -24,11 +27,23 @@ from shared.project_layout import (
     park_eviction_requests_db,
     runs_db,
     scheduler_overrides_db,
+    tasks_db,
+)
+from test_sandbox_soak import (
+    PROBE_REPORT_PATH,
+    _build_events_db,
+    _build_tasks_db,
+    _git,
+    _init_repo_on_main,
+    _write_report,
 )
 
+from orchestrator import b3_gate, sandbox_soak
 from orchestrator.config import OrchestratorConfig, load_config
+from orchestrator.config_census_ignore import read_task_statuses
 from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.harness import Harness
+from orchestrator.mcp import markup_sink
 
 
 @pytest.fixture
@@ -149,3 +164,76 @@ class TestHarnessFollowsTheLayout:
 @pytest.mark.usefixtures('relocated_layout')
 def test_the_flake_ledger_lives_in_the_layout_runs_db(tmp_path):
     assert ledger_db_path(tmp_path) == runs_db(tmp_path)
+
+
+@pytest.mark.usefixtures('relocated_layout')
+class TestOperatorToolsFollowTheLayout:
+    def test_the_b3_state_file_lands_in_the_layout_queue(self, tmp_path):
+        assert b3_gate.main(['charge', '--task-id', '42', '--project-root', str(tmp_path)]) == 0
+        assert (escalation_queue_dir(tmp_path) / 'b3-state.json').is_file()
+
+    def test_the_sandbox_soak_defaults_read_the_layout_stores(self, tmp_path, capsys):
+        repo = tmp_path / 'repo'
+        _init_repo_on_main(repo)
+        _write_report(repo)
+        _git(repo, 'add', PROBE_REPORT_PATH)
+        _git(repo, 'commit', '-q', '-m', 'add probe report')
+        runs_db(repo).parent.mkdir(parents=True)
+        _build_events_db(runs_db(repo))
+        tasks_db(repo).parent.mkdir(parents=True)
+        _build_tasks_db(tasks_db(repo), [(1, 'done'), (2, 'done'), (3, 'done')])
+
+        rc = sandbox_soak.main(['--repo-root', str(repo), '--min-done', '3'])
+
+        assert rc == 0, capsys.readouterr()
+
+    @pytest.mark.asyncio
+    async def test_the_markup_guard_files_into_the_layout_queue(self, tmp_path):
+        spec = markup_sink.MarkupSinkSpec(
+            server_label='plan-tools',
+            agent_role='plan-tools-markup-guard',
+            residue_anchor_task_id='plan-tools-markup-residue',
+            storm_anchor_task_id='plan-tools-markup-storm',
+            refusal_consequence='Nothing was written to the plan.',
+            storm_consequence='every later leaked call is written through.',
+            attribution_source='read the test journal',
+        )
+        sink = markup_sink.make_escalation_sink(
+            worktree=tmp_path / 'proj' / '.worktrees' / '6714',
+            spec=spec,
+            subject_task_id=lambda: '6714',
+            resolve_root=lambda _wt: tmp_path,
+        )
+
+        filed = await sink({
+            'error_type': markup_sink.MARKUP_STORM_ERROR_TYPE,
+            'count': 7,
+            'threshold': 5,
+            'window_seconds': 3600,
+            'outcome': 'repaired',
+            'project': None,
+            'callers': [],
+        })
+
+        assert [e.id for e in EscalationQueue(escalation_queue_dir(tmp_path)).get_pending()] == [
+            filed,
+        ]
+
+
+def test_the_census_ignore_audit_reads_the_layout_task_store(tmp_path):
+    db = tasks_db(tmp_path)
+    db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(db)
+    conn.execute('CREATE TABLE tasks (tag TEXT, id INTEGER, status TEXT, metadata TEXT)')
+    conn.execute(
+        'INSERT INTO tasks VALUES (?, ?, ?, ?)',
+        ('master', 7, 'deferred', json.dumps({'do_not_complete': True})),
+    )
+    conn.commit()
+    conn.close()
+
+    statuses = read_task_statuses(tmp_path)
+
+    assert statuses is not None
+    assert statuses[7].status == 'deferred'
+    assert statuses[7].do_not_complete is True
