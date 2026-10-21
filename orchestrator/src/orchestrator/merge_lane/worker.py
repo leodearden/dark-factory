@@ -14141,14 +14141,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return None
         return req, state
 
-    def _queued_arrivals(self) -> list[MergeRequest]:
-        """The requests still in the external queue, which the registry has not seen."""
-        return [
-            _q_req
-            for _q_req in self._queue._queue  # type: ignore[attr-defined]
-            if _q_req is not None
-        ]
-
     def _decided_predispatch_ids(self, arrivals: Sequence[MergeRequest]) -> frozenset[str]:
         """Ids of the requests waiting for the merger whose outcome is already decided.
 
