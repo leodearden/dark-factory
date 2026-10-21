@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import itertools
+import logging
 import os
 import stat
 import tempfile
@@ -14,18 +15,21 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final, TypedDict
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from client_feed.contract import (
     FEED_FILENAME,
     FEED_VERSION,
     STATE_FILENAME,
     CommitSha,
+    ContractViolation,
     FeedEvent,
     FeedLine,
     FeedState,
     NonNegativeInt,
+    parse_feed_line,
     parse_state,
+    split_jsonl,
 )
 from client_feed.fold import fold
 from client_feed.policy import require_usable_out_dir
@@ -36,6 +40,12 @@ FILE_MODE: Final = 0o640
 
 _APPEND_FLAGS: Final = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
 _READ_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+_TRUNCATE_FLAGS: Final = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+_REPLACED: Final = (STATE_FILENAME, CURSOR_FILENAME)
+_TEMP_SUFFIX: Final = '.tmp'
+_SCAN_CHUNK: Final = 1 << 16
+
+_log = logging.getLogger(__name__)
 
 
 class Envelope(TypedDict):
@@ -77,6 +87,7 @@ class Cursor(BaseModel):
 class FeedIoProblem(StrEnum):
     SEQ_NOT_INCREASING = 'seq_not_increasing'
     SYMLINK = 'symlink'
+    CURSOR_AHEAD = 'cursor_ahead'
 
 
 class FeedIoError(Exception):
@@ -140,9 +151,13 @@ def _require_not_symlink(path: Path) -> None:
             raise _symlink_refused(path.name)
 
 
+def _temp_prefix(name: str) -> str:
+    return f'.{name}.'
+
+
 def _atomic_write(out_dir: Path, name: str, text: str) -> None:
     """Replace out_dir/name by a complete, fsynced file of mode FILE_MODE, or leave it as it was."""
-    fd, temp = tempfile.mkstemp(dir=out_dir, prefix=f'.{name}.', suffix='.tmp')
+    fd, temp = tempfile.mkstemp(dir=out_dir, prefix=_temp_prefix(name), suffix=_TEMP_SUFFIX)
     try:
         try:
             os.fchmod(fd, FILE_MODE)
@@ -158,20 +173,157 @@ def _atomic_write(out_dir: Path, name: str, text: str) -> None:
         raise
 
 
+def _decoded(data: bytes, name: str) -> str:
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise ContractViolation(line_no=None, detail=f'{name} is not UTF-8: {exc}') from exc
+
+
 def _read_text(path: Path) -> str | None:
     try:
         with _opened(path, _READ_FLAGS) as fd:
-            return _read_all(fd).decode('utf-8')
+            data = _read_all(fd)
     except FileNotFoundError:
         return None
+    return _decoded(data, path.name)
 
 
-def _feed_size(out_dir: Path) -> int:
+def read_feed_lines(out_dir: Path, *, from_byte: int = 0) -> tuple[FeedLine, ...]:
+    """The complete lines of out_dir's feed from `from_byte`, numbered from 1 there; a partial last line is left unread."""
+    with _opened(out_dir / FEED_FILENAME, _READ_FLAGS) as fd:
+        os.lseek(fd, from_byte, os.SEEK_SET)
+        data = _read_all(fd)
+    texts = split_jsonl(_decoded(data[: data.rfind(b'\n') + 1], FEED_FILENAME))
+    return tuple(parse_feed_line(text, line_no=line_no) for line_no, text in enumerate(texts, 1))
+
+
+def _lines_if_any(out_dir: Path, from_byte: int) -> tuple[FeedLine, ...]:
+    try:
+        return read_feed_lines(out_dir, from_byte=from_byte)
+    except FileNotFoundError:
+        return ()
+
+
+def _line_start(fd: int, end: int) -> int:
+    """The offset just past the last newline before `end`, or 0 when there is none."""
+    position = end
+    while position > 0:
+        start = max(0, position - _SCAN_CHUNK)
+        newline = os.pread(fd, position - start, start).rfind(b'\n')
+        if newline != -1:
+            return start + newline + 1
+        position = start
+    return 0
+
+
+def _feed_extent(out_dir: Path) -> tuple[int, int]:
+    """The feed's size and the end of its last complete line; (0, 0) when there is no feed."""
     try:
         with _opened(out_dir / FEED_FILENAME, _READ_FLAGS) as fd:
-            return os.fstat(fd).st_size
+            size = os.fstat(fd).st_size
+            return size, _line_start(fd, size)
     except FileNotFoundError:
+        return 0, 0
+
+
+def _is_leftover_temp(entry: str) -> bool:
+    return entry.endswith(_TEMP_SUFFIX) and any(
+        entry.startswith(_temp_prefix(name)) for name in _REPLACED
+    )
+
+
+def _remove_leftover_temps(out_dir: Path) -> None:
+    for entry in os.listdir(out_dir):
+        if _is_leftover_temp(entry):
+            os.unlink(out_dir / entry)
+
+
+def _stored_cursor(out_dir: Path) -> Cursor:
+    text = _read_text(out_dir / CURSOR_FILENAME)
+    if text is None:
+        return Cursor()
+    try:
+        return Cursor.model_validate_json(text)
+    except ValidationError as exc:
+        _log.warning('%s is not a cursor (%s); every source restarts from the beginning', CURSOR_FILENAME, exc)
+        return Cursor()
+
+
+def _cursor_ahead(detail: str) -> FeedIoError:
+    return FeedIoError(problem=FeedIoProblem.CURSOR_AHEAD, name=CURSOR_FILENAME, detail=detail)
+
+
+def _cursor_line_start(out_dir: Path, cursor: Cursor, complete_end: int) -> int:
+    """Where the committed line ending at cursor.feed_bytes starts; refused unless a complete line ends there."""
+    end = cursor.feed_bytes
+    if end > complete_end:
+        raise _cursor_ahead(
+            f'cursor.json records feed_bytes {end} but {FEED_FILENAME} holds {complete_end}'
+            ' bytes of complete lines'
+        )
+    if end == 0:
         return 0
+    with _opened(out_dir / FEED_FILENAME, _READ_FLAGS) as fd:
+        if os.pread(fd, 1, end - 1) != b'\n':
+            raise _cursor_ahead(f'cursor.json records feed_bytes {end}, which is not the end of a feed line')
+        return _line_start(fd, end - 1)
+
+
+def _uncommitted_tail(out_dir: Path, cursor: Cursor, line_start: int) -> tuple[FeedLine, ...]:
+    """The lines past the cursor, once the line ending at feed_bytes is shown to carry through_seq."""
+    lines = _lines_if_any(out_dir, line_start)
+    at_cursor, tail = (lines[0].seq, lines[1:]) if cursor.feed_bytes else (0, lines)
+    if at_cursor != cursor.through_seq:
+        raise _cursor_ahead(
+            f'cursor.json records through_seq {cursor.through_seq} but the line ending at'
+            f' feed_bytes {cursor.feed_bytes} carries seq {at_cursor}'
+        )
+    return tail
+
+
+def _stored_state(out_dir: Path, project_id: str) -> FeedState | None:
+    """state.json when it is a state of this project; None when it is absent or not a state."""
+    text = _read_text(out_dir / STATE_FILENAME)
+    if text is None:
+        return None
+    try:
+        stored = parse_state(text)
+    except ContractViolation as exc:
+        _log.warning('%s is not a state (%s); it will be refolded', STATE_FILENAME, exc)
+        return None
+    return fold((), project_id=project_id, start=stored)
+
+
+def _recovered_state(
+    out_dir: Path, project_id: str, cursor: Cursor, tail: tuple[FeedLine, ...]
+) -> FeedState:
+    """The fold of every complete line: state.json plus the tail past it, else the whole feed refolded."""
+    stored = _stored_state(out_dir, project_id)
+    last_seq = tail[-1].seq if tail else cursor.through_seq
+    if stored is not None and cursor.through_seq <= stored.watermark_seq <= last_seq:
+        past = (line for line in tail if line.seq > stored.watermark_seq)
+        return fold(past, project_id=project_id, start=stored)
+    lines = _lines_if_any(out_dir, 0)
+    if lines:
+        why = 'absent' if stored is None else f'at watermark {stored.watermark_seq}'
+        _log.warning(
+            '%s %s, outside [%d, %d]: refolding the %d lines of %s',
+            STATE_FILENAME, why, cursor.through_seq, last_seq, len(lines), FEED_FILENAME,
+        )
+    return fold(lines, project_id=project_id)
+
+
+def _cut_torn_tail(out_dir: Path, size: int, complete_end: int) -> None:
+    if size == complete_end:
+        return
+    with _opened(out_dir / FEED_FILENAME, _TRUNCATE_FLAGS) as fd:
+        os.ftruncate(fd, complete_end)
+        os.fsync(fd)
+    _log.warning(
+        '%s: cut a torn final line of %d bytes at byte %d',
+        FEED_FILENAME, size - complete_end, complete_end,
+    )
 
 
 def _require_increasing(events: Sequence[FeedEvent], last_seq: int) -> None:
@@ -206,19 +358,16 @@ class OutDir:
 
     @classmethod
     def open(cls, out_dir: Path, *, project_id: str) -> OutDir:
-        """out_dir's state and cursor as the last commit left them."""
+        """out_dir recovered: every complete line folded, lines past the cursor uncommitted, a torn tail cut last."""
         require_usable_out_dir(out_dir)
-        cursor_text = _read_text(out_dir / CURSOR_FILENAME)
-        cursor = Cursor() if cursor_text is None else Cursor.model_validate_json(cursor_text)
-        state_text = _read_text(out_dir / STATE_FILENAME)
-        stored = None if state_text is None else parse_state(state_text)
-        state = fold((), project_id=project_id, start=stored)
+        _remove_leftover_temps(out_dir)
+        size, complete_end = _feed_extent(out_dir)
+        cursor = _stored_cursor(out_dir)
+        tail = _uncommitted_tail(out_dir, cursor, _cursor_line_start(out_dir, cursor, complete_end))
+        state = _recovered_state(out_dir, project_id, cursor, tail)
+        _cut_torn_tail(out_dir, size, complete_end)
         return cls(
-            out_dir,
-            state=state,
-            cursor=cursor,
-            uncommitted=(),
-            feed_bytes=_feed_size(out_dir),
+            out_dir, state=state, cursor=cursor, uncommitted=tail, feed_bytes=complete_end
         )
 
     @property
