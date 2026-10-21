@@ -84,10 +84,9 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _publishing_policy(config: Path) -> Policy:
-    """The policy, with the publisher's progress logged to stderr."""
+def _configure_logging() -> None:
+    """The publisher's progress, logged to stderr."""
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
-    return load_policy(config)
 
 
 def _publish_until_signalled(policy: Policy, clock: Callable[[], datetime]) -> None:
@@ -118,8 +117,9 @@ def _publish_until_signalled(policy: Policy, clock: Callable[[], datetime]) -> N
 
 
 def _run_publish(args: argparse.Namespace) -> int:
+    _configure_logging()
     try:
-        _publish_until_signalled(_publishing_policy(args.config), _utc_now)
+        _publish_until_signalled(load_policy(args.config), _utc_now)
     except _REFUSALS as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -135,8 +135,9 @@ def _add_publish(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]
 
 
 def _run_snapshot(args: argparse.Namespace) -> int:
+    _configure_logging()
     try:
-        report = snapshot(_publishing_policy(args.config), now=_utc_now())
+        report = snapshot(load_policy(args.config), now=_utc_now())
     except _REFUSALS as exc:
         print(exc, file=sys.stderr)
         return 1
