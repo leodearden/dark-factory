@@ -16,6 +16,7 @@ import pytest
 import yaml
 from _escalation_server_capture import create_server_kwargs
 from _orch_helpers import _init_harness_state_for_test
+from click.testing import CliRunner
 from escalation.queue import EscalationQueue
 from pydantic import ValidationError
 from shared import project_layout
@@ -23,6 +24,7 @@ from shared.cli_invoke import AgentResult
 from shared.project_id import project_id_for_root
 from shared.project_layout import (
     ESCALATION_QUEUE_RELPATH,
+    default_project_root,
     escalation_queue_dir,
     park_eviction_requests_db,
     runs_db,
@@ -39,8 +41,11 @@ from test_sandbox_soak import (
 )
 
 from orchestrator import b3_gate, sandbox_soak
+from orchestrator import resume_age_bound as rab
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.config_census_ignore import read_task_statuses
+from orchestrator.evals.prompt_opt.__main__ import cli as prompt_opt_cli
+from orchestrator.evals.reviewer_trial.__main__ import cli as reviewer_trial_cli
 from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.harness import Harness
 from orchestrator.mcp import markup_sink
@@ -237,3 +242,28 @@ def test_the_census_ignore_audit_reads_the_layout_task_store(tmp_path):
     assert statuses is not None
     assert statuses[7].status == 'deferred'
     assert statuses[7].do_not_complete is True
+
+
+@pytest.mark.usefixtures('relocated_layout')
+class TestHomePathDefaultsDeriveFromTheMainCheckout:
+    def test_the_resume_age_bound_reads_the_layout_runs_db(self, monkeypatch):
+        monkeypatch.delenv(rab.RUNS_DB_ENV_VAR, raising=False)
+        assert rab.default_runs_db_path() == runs_db(default_project_root())
+
+    def test_the_prompt_opt_canary_reads_the_layout_runs_db(self, monkeypatch):
+        monkeypatch.delenv('PROMPT_OPT_RUNS_DB', raising=False)
+
+        result = CliRunner().invoke(prompt_opt_cli, [
+            'canary', '--deploy-at', '2026-06-15T00:00:00+00:00', '--project-id', 'dark_factory',
+        ])
+
+        assert result.exit_code == 2, result.output
+        assert f'runs.db not found at {runs_db(default_project_root())}' in result.output
+
+    def test_the_reviewer_trial_miner_reads_the_layout_runs_db(self, monkeypatch):
+        monkeypatch.delenv('REVIEWER_TRIAL_RUNS_DB', raising=False)
+
+        result = CliRunner().invoke(reviewer_trial_cli, ['mine'])
+
+        assert result.exit_code == 1, result.output
+        assert f'runs.db not found at {runs_db(default_project_root())}' in result.output
