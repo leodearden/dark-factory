@@ -163,8 +163,9 @@ class TestEitherMode:
         assert first.headers["accept"] == MCP_POST_HEADERS["Accept"]
         assert all(name == name.lower() for name in first.headers)
         assert recorded[1].body is None
+        frozen_field = "path"
         with pytest.raises(dataclasses.FrozenInstanceError):
-            first.path = "/elsewhere"  # type: ignore[misc]
+            setattr(first, frozen_field, "/elsewhere")
 
 
     def test_unavailable_tool_calls_are_503_then_served(self, stateful):

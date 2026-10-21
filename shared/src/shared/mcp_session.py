@@ -462,7 +462,7 @@ class SyncMcpSession:
         try:
             if session_id is not None:
                 client.delete(self._endpoint, headers=_request_headers(session_id))
-        except Exception as exc:  # noqa: BLE001 — a release must never mask the call's outcome
+        except Exception as exc:  # a release must never mask the call's outcome
             logger.debug('MCP session %s release to %s failed: %s', session_id, self._endpoint, exc)
         finally:
             client.close()

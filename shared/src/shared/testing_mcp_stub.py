@@ -305,7 +305,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._respond = respond
         super().__init__(*args, **kwargs)
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 — stdlib signature
+    def log_message(self, format: str, *args: Any) -> None:
         return
 
     def do_POST(self) -> None:
