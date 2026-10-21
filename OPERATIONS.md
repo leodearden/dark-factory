@@ -621,9 +621,15 @@ There are two enforcement points:
    existing; this check is what sees it.
 
 **Reading a failed link.** A link that exits non-zero files a born-at-L2
-`milestone_check_failed`. Its detail is the output tail: one line per
-request, then each overage with its largest leaf fields and the task and
-reason behind the current budget, then a JSON summary. The remedy is one of:
+`milestone_check_failed`. The checker prints one line per request, then each
+overage with its largest leaf fields and the task and reason behind the
+current budget, worst overage last, then a JSON summary. The detail keeps
+only the last 2,000 characters of that output. So what reliably survives is
+the summary, which names every over-budget request and the worst ratio, and
+usually the worst overage just above it. One overage runs to 1,100-1,400
+characters, so the per-request lines and every other overage are usually
+cut. For the full report, run `scripts/check_dashboard_payload_budgets.sh`
+by hand. The remedy is one of:
 
 - shrink the payload; or
 - merge a raise appended to that request's history, naming your task and
@@ -639,14 +645,17 @@ exist yet. Task 5835 records the seed id here. The link's metadata:
 ```
 task_kind:   deterministic
 milestone:   {mode: dated, at: <first run>}
-before_done: {kind: predicate, script: scripts/check_dashboard_payload_budgets.sh, timeout_secs: 1200}
+before_done: {kind: predicate, script: scripts/check_dashboard_payload_budgets.sh, timeout_secs: 2400}
 recurrence:  {key: dashboard-payload-budgets, interval_secs: 86400}
 ```
 
-`timeout_secs` covers the worst case: 17 requests run one at a time, each
-with the checker's 60 s default timeout, is 1,020 s. With a shorter budget, a
-dashboard that hangs on every request becomes a no-verdict timeout instead of
-exit 2. Minting renews the chain every interval. See
+`timeout_secs` covers the worst case. The checker's `--timeout`, 60 s by
+default, is a wall-clock deadline per request, checked as each chunk of the
+body arrives, and it also caps each network operation. So a request that
+stalls a read just as its deadline passes ends within twice the timeout, and
+17 requests run one at a time at that bound take 2,040 s. With a shorter
+budget, a dashboard that stalls on every request becomes a no-verdict timeout
+instead of exit 2. Minting renews the chain every interval. See
 `docs/task-authoring.md` §6 for the predicate contract and §6.1 for
 recurring chains.
 

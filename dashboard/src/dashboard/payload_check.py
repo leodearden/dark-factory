@@ -21,9 +21,15 @@ stays exit 1 even beside a failure, because it is a verdict either way.
 Output, in order: one line per request in table order; then each overage's
 largest leaf fields, worst last; then ONE compact JSON summary line of at
 most :data:`SUMMARY_MAX_CHARS`. The runner merges stdout and stderr and keeps
-their tail as the escalation detail, and it keeps a trailing JSON line as the
-done note, so the line that must survive comes last. Requests run one at a
-time: a measurement must not compete with the next one for the dashboard.
+only their last 2,000 characters as the escalation detail, and it keeps a
+trailing JSON line as the done note, so the lines that must survive come
+last. Requests run one at a time: a measurement must not compete with the
+next one for the dashboard.
+
+Each request has a wall-clock deadline, checked as each chunk of its body
+arrives, so a dashboard trickling a large body cannot hold the run. Every
+network operation is also capped by the same timeout, so a request ends
+within about twice it.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,15 +74,10 @@ class CheckReport:
 class _Measured:
     entry: EndpointBudget
     size: int
-    body: bytes
 
     @property
     def ratio(self) -> float:
         return self.size / self.entry.budget_bytes
-
-    @property
-    def over(self) -> bool:
-        return self.size > self.entry.budget_bytes
 
     def line(self) -> str:
         return (
@@ -83,16 +85,10 @@ class _Measured:
             f'{self.entry.budget_bytes:,}-byte budget ({self.ratio:.2f})'
         )
 
-    def overage(self) -> str:
-        try:
-            payload = json.loads(self.body)
-        except ValueError:
-            return (
-                f'{self.entry.url_suffix()} served {self.size:,} bytes, over its '
-                f'{self.entry.budget_bytes:,}-byte budget ({self.ratio:.2f}x). The body is '
-                'not JSON, so no breakdown was possible.'
-            )
-        return render_overage(self.entry, self.size, field_breakdown(payload, self.entry.data_keyed_maps))
+
+@dataclass(frozen=True)
+class _Over(_Measured):
+    explanation: str
 
 
 @dataclass(frozen=True)
@@ -104,17 +100,49 @@ class _Unmeasured:
         return f'{self.entry.url_suffix()}: NOT MEASURED, {self.cause}'
 
 
-def _measure(client: httpx.Client, base_url: str, entry: EndpointBudget) -> _Measured | _Unmeasured:
-    """Request *entry* once. Identity encoding makes the body's length the wire bytes."""
+def _judged(entry: EndpointBudget, body: bytes) -> _Measured:
+    """Measure *body*, explaining it only when it is over budget, the one case that reads it."""
+    size = len(body)
+    if size <= entry.budget_bytes:
+        return _Measured(entry, size)
+    return _Over(entry, size, _explain_overage(entry, size, body))
+
+
+def _explain_overage(entry: EndpointBudget, size: int, body: bytes) -> str:
     try:
-        response = client.get(
-            f'{base_url}{entry.path}', params=dict(entry.query), headers={'Accept-Encoding': 'identity'},
+        payload = json.loads(body)
+    except ValueError:
+        return (
+            f'{entry.url_suffix()} served {size:,} bytes, over its '
+            f'{entry.budget_bytes:,}-byte budget ({size / entry.budget_bytes:.2f}x). The body is '
+            'not JSON, so no breakdown was possible.'
         )
+    return render_overage(entry, size, field_breakdown(payload, entry.data_keyed_maps))
+
+
+def _measure(
+    client: httpx.Client, base_url: str, entry: EndpointBudget, deadline_seconds: float,
+) -> _Measured | _Unmeasured:
+    """Request *entry* once, abandoning it at the first body chunk past its deadline.
+
+    Identity encoding makes the body's length the wire bytes.
+    """
+    give_up_at = time.monotonic() + deadline_seconds
+    body = bytearray()
+    try:
+        with client.stream(
+            'GET', f'{base_url}{entry.path}', params=dict(entry.query),
+            headers={'Accept-Encoding': 'identity'},
+        ) as response:
+            if response.status_code != 200:
+                return _Unmeasured(entry, f'HTTP {response.status_code}')
+            for chunk in response.iter_bytes():
+                body += chunk
+                if time.monotonic() > give_up_at:
+                    return _Unmeasured(entry, f'the response ran past its {deadline_seconds:g} s deadline')
     except httpx.HTTPError as exc:
         return _Unmeasured(entry, f'{type(exc).__name__}: {exc}')
-    if response.status_code != 200:
-        return _Unmeasured(entry, f'HTTP {response.status_code}')
-    return _Measured(entry, len(response.content), response.content)
+    return _judged(entry, bytes(body))
 
 
 def _compact(obj: object) -> str:
@@ -127,7 +155,7 @@ def _trimmed(requests: Sequence[str], keep: int) -> list[str]:
     return [*requests[:keep], f'+{len(requests) - keep} more']
 
 
-def _summary(checked: int, over: Sequence[_Measured], unmeasured: Sequence[_Unmeasured], worst: _Measured | None) -> str:
+def _summary(checked: int, over: Sequence[_Over], unmeasured: Sequence[_Unmeasured], worst: _Measured | None) -> str:
     """The digest, its lists trimmed until it fits the runner's note cap."""
     over_requests = [m.entry.url_suffix() for m in sorted(over, key=lambda m: -m.ratio)]
     failed_requests = [u.entry.url_suffix() for u in unmeasured]
@@ -144,16 +172,24 @@ def _summary(checked: int, over: Sequence[_Measured], unmeasured: Sequence[_Unme
     return line
 
 
-def check_endpoints(client: httpx.Client, base_url: str, table: BudgetTable) -> CheckReport:
+def check_endpoints(
+    client: httpx.Client,
+    base_url: str,
+    table: BudgetTable,
+    *,
+    deadline_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> CheckReport:
     """Measure every request in *table* against the dashboard at *base_url*, one at a time."""
-    results = [_measure(client, base_url.rstrip('/'), entry) for entry in table.endpoints]
+    results = [
+        _measure(client, base_url.rstrip('/'), entry, deadline_seconds) for entry in table.endpoints
+    ]
     measured = [r for r in results if isinstance(r, _Measured)]
     unmeasured = [r for r in results if isinstance(r, _Unmeasured)]
-    over = sorted((m for m in measured if m.over), key=lambda m: m.ratio)
+    over = sorted((m for m in measured if isinstance(m, _Over)), key=lambda m: m.ratio)
     worst = max(measured, key=lambda m: m.ratio, default=None)
     lines = [
         *(result.line() for result in results),
-        *(m.overage() for m in over),
+        *(m.explanation for m in over),
         _summary(len(results), over, unmeasured, worst),
     ]
     exit_code = 1 if over else 2 if unmeasured else 0
@@ -167,7 +203,8 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument('--base-url', default=DEFAULT_BASE_URL, help='the dashboard to measure')
     parser.add_argument(
-        '--timeout', type=float, default=DEFAULT_TIMEOUT_SECONDS, help='seconds allowed per request',
+        '--timeout', type=float, default=DEFAULT_TIMEOUT_SECONDS,
+        help='seconds of wall clock allowed per request, and per network operation within it',
     )
     parser.add_argument('--table', type=Path, default=TABLE_PATH, help='the budget table to measure against')
     return parser.parse_args(argv)
@@ -182,7 +219,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     # The dashboard is local, so no proxy from the environment applies to it.
     with httpx.Client(timeout=args.timeout, trust_env=False) as client:
-        report = check_endpoints(client, args.base_url, table)
+        report = check_endpoints(client, args.base_url, table, deadline_seconds=args.timeout)
     print('\n'.join(report.lines))
     return report.exit_code
 
