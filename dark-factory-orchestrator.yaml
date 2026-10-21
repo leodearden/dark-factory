@@ -91,13 +91,16 @@ lock_depth: 12
 # ~115 pending tasks, and that lock serialised dispatch on top of the merge
 # conflicts it was meant to prevent. Authorizations are now one file each and the
 # baseline merges through the ratchet-baseline driver, so concurrent declarers
-# no longer collide. The ledger key is the RETIRED array path, kept because
-# pending tasks still declare it. Same red tier as above.
+# no longer collide. The ledger keys are the RETIRED array path, kept because
+# pending tasks still declare it, and the directory's one fixed file. A PARK
+# still reserves these keys exclusively (task 7313 makes the park gate honour the
+# override). Same red tier as above.
 module_overrides:
   orchestrator/src/orchestrator/workflow.py: 2
   orchestrator/src/orchestrator/harness.py: 2
   orchestrator/tests/merge_lane_ratchet_baseline.json: 99
   orchestrator/tests/merge_lane_ratchet_authorized_raises.json: 99
+  orchestrator/tests/merge_lane_ratchet_raises/_README.json: 99
 
 # Verification commands (dark-factory multi-subproject layout)
 # test_command fans out per-subproject so each runs in its own venv with its

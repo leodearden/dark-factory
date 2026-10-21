@@ -972,11 +972,12 @@ LEDGER_README = (
     f'sum of their (current - baseline); a {NEW_FILE_OVER_CEILING} or '
     f'{NEW_FUNCTION_OVER_CEILING} row is covered when an added entry names it. '
     'An added entry must be ATTRIBUTED: its task_id is the task the branch '
-    'works on -- the id in task/<id> or carry/<id> -- or one a commit on the '
-    'branch since main cites, as its scope (fix(<id>): ...) or as "task <id>", '
-    'which is how a carrier records the task it lands; and its reason is not '
-    'blank. Pre-commit (scripts/check_staged_ratchet_raise.py) refuses any '
-    'other, without reading the task store. '
+    'works on -- the id in task/<id> or carry/<id>, or ending the branch name '
+    'as -<id> -- or one an earlier commit on the branch since main cites, as '
+    'its scope (fix(<id>): ...) or as "task <id>", which is how a carrier '
+    'records the task it lands; and its reason is not blank. Pre-commit '
+    '(scripts/check_staged_ratchet_raise.py) refuses any other, without '
+    'reading the task store. '
     'Each entry\'s "measures" block is DERIVED from the measured raises the '
     'write gate computed, never hand-written, so it describes the BRANCH COMMIT '
     'it accompanied, not a state of main: when the ratchet-baseline merge '
@@ -1260,6 +1261,13 @@ def unrecorded_raises(
     task 7298's design replayed the json-touching landings of 2026-10-06..20; the
     sum refused none, and still refuses an unrecorded rise, because only the
     commit's own entries are summed and a stale entry claims less than the rise.
+
+    THE SLACK THE SUM ADMITS, stated so nobody trusts more than is true: two
+    entries for ONE raise (``--authorize-raise`` rerun after ``git checkout --
+    <baseline>``, with a different reason, so a different file) both count, and
+    double that key's allowance in that commit. The write gate still refuses
+    every rise it measures, so the slack is reachable only by a baseline staged
+    past it by hand.
 
     The inverse of ``authorization_record``, and placed beside it so the writer
     and the auditor read a raise out of one field vocabulary (SPOT).

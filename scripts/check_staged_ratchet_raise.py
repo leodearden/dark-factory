@@ -39,9 +39,10 @@ back once a parent has dropped it.
 
 AN ENTRY IS ATTRIBUTED, NOT MERELY NAMED (Leo, 2026-10-21, task 7298). A NEW
 entry file's ``task_id`` must be a task this BRANCH works on: the id in its
-name (``task/<id>``, the orchestrator's branches; ``carry/<id>``, a hand
-carry's), or an id a commit on the branch since main cites -- as its
-conventional scope, ``fix(<id>): ...``, or as ``task <id>``. That admits a
+name (``task/<id>``, the orchestrator's branches; ``carry/<id>`` or a name
+ending ``-<id>``, a hand carry's), or an id an earlier commit on the branch
+since main cites -- as its conventional scope, ``fix(<id>): ...``, or as
+``task <id>``; the commit being made has no message yet. That admits a
 carrier landing another task's work, whose commits cite the carried id. Its
 ``reason`` may not be blank. Before this, an entry with a blank or foreign
 ``task_id`` covered a raise whenever its measures matched. The task store is
@@ -92,8 +93,9 @@ except ImportError as exc:  # pragma: no cover - exercised by the hook, not pyte
     raise SystemExit(2) from exc
 
 #: A branch naming the task it works on: the orchestrator's ``task/<id>``, or a
-#: hand carry's ``carry/<id>``. A suffix (``task/5722-gate``) is allowed.
-_BRANCH_TASK = re.compile(r'(?:task|carry)/(\d+)(?!\d)')
+#: hand carry's ``carry/<id>``, the id leading (``task/5722-gate``) or ending the
+#: name after a dash (``carry/A4-4614``).
+_BRANCH_TASK = re.compile(r'(?:task|carry)/(?:(\d+)(?!\d).*|.*-(\d+))$')
 
 #: How a commit subject cites a task: a conventional scope of ids
 #: (``fix(3774): ...``), or ``task <id>`` in its text (CONTRIBUTING.md section 7).
@@ -360,7 +362,7 @@ def _branch_task_ids(root: Path) -> set[str]:
     except subprocess.CalledProcessError:
         branch = ''
     if named := _BRANCH_TASK.match(branch):
-        ids.add(named.group(1))
+        ids.update(group for group in named.groups() if group)
     if _object_id(root, 'HEAD') is None or _object_id(root, 'refs/heads/main') is None:
         return ids
     for subject in _git(root, 'log', '--format=%s', 'refs/heads/main..HEAD').splitlines():
@@ -386,10 +388,13 @@ def _refuse_unattributed(own_entries: list[dict], task_ids: set[str]) -> list[st
         f'ratchet commit gate: {len(lines)} new {metrics.LEDGER_DIR_RELPATH} '
         'entr(ies) are not attributed to a task this branch works on:',
         *lines,
-        "An entry's task_id must be this branch's own task (task/<id> or "
-        'carry/<id>) or one a commit on this branch cites -- `fix(<id>): ...` '
-        f'or `task <id>`; cited here: {sorted(task_ids) or "none"}. Its reason '
-        'may not be blank. Record the raise with --authorize-raise <that id>.',
+        "An entry's task_id must be this branch's own task (task/<id>, "
+        'carry/<id>, or a name ending -<id>) or one an EARLIER commit on this '
+        'branch cites -- `fix(<id>): ...` or `task <id>`; this branch names or '
+        f'cites: {sorted(task_ids) or "none"}. The commit being made cannot cite '
+        'itself, because pre-commit runs before its message exists: commit the '
+        'code first and the entry after it, or name the branch carry/<id>. Its '
+        'reason may not be blank. Record the raise with --authorize-raise <that id>.',
     ]
 
 
@@ -468,7 +473,19 @@ def _audit_merged_baseline(
         theirs=image(theirs_oid, 'theirs.json'),
         current=_image(root, staged_oid, scratch / 'current.json'),
     )
-    return _refuse_unrecorded(raises, own_entries)
+    refusals = _refuse_unrecorded(raises, own_entries)
+    if not refusals:
+        return []
+    return [
+        *refusals,
+        'FINISHING A MERGE where both sides raised one key: the bound is the '
+        "higher side, so the composed value (the ratchet-baseline driver's, or "
+        'a regeneration\'s) is this merge\'s own raise -- and --write-baseline '
+        'records nothing over a file that already holds it. Run `git checkout '
+        f'HEAD -- {metrics.BASELINE_RELPATH}` (ours; `--ours` is a no-op once the '
+        'driver resolved the file), then the --write-baseline --authorize-raise '
+        "command above: it measures from ours and records the merge's own entry.",
+    ]
 
 
 def _first_write(absent_from: str) -> list[str]:

@@ -597,6 +597,30 @@ class TestUnrecordedRaises:
 
         assert metrics.unrecorded_raises([self._lines_raise()], records) == []
 
+    def test_three_partial_records_cover_exactly_their_sum(self) -> None:
+        # No single record reaches the rise; only their SUM does. One count
+        # short of it, the same records refuse.
+        records = [
+            self._record([metrics.Violation.rose('lines', 'a.py', 1000, 1001)]),
+            self._record([metrics.Violation.rose('lines', 'a.py', 1001, 1002)], '5723'),
+            self._record([metrics.Violation.rose('lines', 'a.py', 1002, 1005)], '5724'),
+        ]
+
+        assert metrics.unrecorded_raises([self._lines_raise()], records) == []
+        assert metrics.unrecorded_raises(
+            [metrics.Violation.rose('lines', 'a.py', 1000, 1006)], records
+        ) != []
+
+    def test_derived_total_rows_sum_across_records_too(self) -> None:
+        total = metrics.CLUSTER_TOTAL_KEY
+        records = [
+            self._record([metrics.Violation.rose('total:lines', total, 1200, 1202)]),
+            self._record([metrics.Violation.rose('total:lines', total, 1300, 1303)], '5723'),
+        ]
+
+        landed = metrics.Violation.rose('total:lines', total, 1400, 1405)
+        assert metrics.unrecorded_raises([landed], records) == []
+
     def test_one_record_of_part_of_the_rise_does_not_cover_it(self) -> None:
         # The other half of the sum: the midpoint record alone authorized 3, and
         # the commit raised 5. (Under the retired absolute rule its matching

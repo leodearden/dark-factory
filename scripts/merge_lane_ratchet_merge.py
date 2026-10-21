@@ -249,10 +249,15 @@ def _text_merge(base: Path, ours: Path, theirs: Path) -> str | None:
 
 
 def merge(base: Path, ours: Path, theirs: Path) -> int:
-    """The driver: write the merge to *ours* and return 0, or record a conflict and return 1."""
+    """The driver: write the merge to *ours* and return 0, or record a conflict and return 1.
+
+    ANY failure is a conflict, not only a refusal by rule: git's contract reads
+    every non-zero exit as one, and the resolver should then meet git's own
+    markers rather than a silently kept ``ours``.
+    """
     try:
         text = render_merge(base, ours, theirs)
-    except (MergeRefused, metrics.RatchetError) as exc:
+    except Exception as exc:
         print(
             f'{DRIVER_NAME} merge driver: {exc}. Recorded as a conflict: resolve '
             'the code, then regenerate with python scripts/merge_lane_metrics.py '

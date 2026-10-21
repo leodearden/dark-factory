@@ -390,7 +390,10 @@ which records it as ONE NEW FILE under
 `orchestrator/tests/merge_lane_ratchet_raises/`. The pre-commit auditor
 `scripts/check_staged_ratchet_raise.py` refuses a commit whose raises its own new
 entry files do not cover, and one that modifies, deletes or renames a recorded
-entry. The baseline itself merges through a structured 3-way driver (installed
+entry. A new entry's task id must be one the branch works on -- the id in its
+name (`task/<id>`, `carry/<id>`, or a name ending `-<id>`) or one an earlier commit
+on the branch cites (`fix(<id>): ...` or `task <id>`) -- and its reason may not
+be blank; the commit being made cannot cite itself. The baseline itself merges through a structured 3-way driver (installed
 by `scripts/setup-host.sh` step 9), so two branches moving different code no
 longer conflict on it.
 

@@ -2100,6 +2100,18 @@ Include in the escalation summary (and in the `submit_merge_disposition`
 reason): the list of dropped files and a one-line description of what each
 dropped file contributes that the kept side lacks.
 
+## A Conflict Resolved by a Script, Never by Hand
+
+In a repository carrying `scripts/split_merge_lane_ratchet_ledger.py` (dark-factory):
+a modify/delete conflict on `orchestrator/tests/merge_lane_ratchet_authorized_raises.json`
+means this branch appended a raise entry to the RETIRED single-array ledger,
+which main has split into one file per entry under
+`orchestrator/tests/merge_lane_ratchet_raises/`. Resolve it ONLY by running
+`python3 scripts/split_merge_lane_ratchet_ledger.py` from the worktree root, then
+`git add -A orchestrator/tests`: it writes each entry as its file and deletes the
+array. Never `git rm` the array (that silently drops this branch's entries) and
+never keep it.
+
 ## CRITICAL: Git Staging Rules
 
 Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`

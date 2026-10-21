@@ -46,8 +46,11 @@ import pytest
 from _merge_lane_ratchet_fixtures import metrics, synthetic_report
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
+from orchestrator.agents.roles import MERGER
+
 _REPO_ROOT = Path(__file__).parents[2]
 _GATE = _REPO_ROOT / metrics.COMMIT_GATE_RELPATH
+_SPLIT = _REPO_ROOT / 'scripts' / 'split_merge_lane_ratchet_ledger.py'
 
 
 def _report_with(mutate: Callable[[dict], None]) -> dict:
@@ -374,6 +377,29 @@ class TestTheStagedDiffIsAudited:
 
         # THE SANCTIONED PATH. A raise is not forbidden -- it is never silent.
         assert result.returncode == 0, result.stderr
+
+    def test_two_authorized_writes_in_one_commit_cover_their_sum(
+        self, tmp_path: Path
+    ) -> None:
+        # Through the real writer: `--write-baseline --authorize-raise` run
+        # twice records 1000->1002 and 1002->1005, and the commit's delta reads
+        # 1000->1005, which neither entry reaches alone.
+        repo = _Repo.seeded(tmp_path)
+        target = repo.root / metrics.BASELINE_RELPATH
+        ledger = repo.root / metrics.LEDGER_DIR_RELPATH
+        for lines, reason in ((1002, 'first half'), (1005, 'second half')):
+            metrics.write_baseline(
+                target,
+                _with_a_py_lines(lines),
+                authorization=metrics.RaiseAuthorization(task_id='5722', reason=reason),
+                ledger=ledger,
+            )
+        assert len(metrics.load_ledger(ledger)) == 2
+        repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stdout + result.stderr
 
     def test_a_stale_ledger_entry_does_not_cover_the_rise(
         self, tmp_path: Path
@@ -973,6 +999,42 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
 
         assert authorized.returncode == 0, authorized.stdout + authorized.stderr
 
+    def test_the_refusal_names_the_workaround_and_the_workaround_passes(
+        self, tmp_path: Path
+    ) -> None:
+        # Both sides raised a.py; the composed 1008 (what the ratchet-baseline
+        # driver writes) is above the higher side. The write gate records
+        # nothing over a file already holding 1008, so the recipe the refusal
+        # prints is: take ours back, then authorize the rise from it.
+        repo = _Repo.mid_merge(
+            tmp_path,
+            ours=_with_a_py_lines(1005),
+            theirs=_with_a_py_lines(1003),
+            ours_entries=(_a_py_lines_raise(1000, 1005, '5722'),),
+            theirs_entries=(_a_py_lines_raise(1000, 1003, '3620'),),
+        )
+        repo.write_baseline(_with_a_py_lines(1008))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        refused = repo.gate()
+
+        assert refused.returncode == 1, refused.stdout + refused.stderr
+        assert f'git checkout HEAD -- {metrics.BASELINE_RELPATH}' in refused.stderr
+
+        repo.git('checkout', 'HEAD', '--', metrics.BASELINE_RELPATH)
+        written = metrics.write_baseline(
+            repo.root / metrics.BASELINE_RELPATH,
+            _with_a_py_lines(1008),
+            authorization=metrics.RaiseAuthorization(task_id='5792', reason='both sides'),
+            ledger=repo.root / metrics.LEDGER_DIR_RELPATH,
+        )
+        assert written.record is not None
+        repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
+
+        authorized = repo.gate()
+
+        assert authorized.returncode == 0, authorized.stdout + authorized.stderr
+
     def test_unrelated_histories_are_bounded_by_the_higher_parent(
         self, tmp_path: Path
     ) -> None:
@@ -1214,6 +1276,13 @@ class TestTheWiringIsStructurallyPinned:
         assert metrics.LEGACY_LEDGER_RELPATH in source
         assert metrics.COMMIT_GATE_RELPATH in source
 
+    def test_the_merger_role_resolves_a_retired_array_conflict_with_the_split(self) -> None:
+        # The merger agent is who meets a branch's modify/delete on the retired
+        # array at the lane; its prompt must name the path and the script.
+        assert metrics.LEGACY_LEDGER_RELPATH in MERGER.system_prompt
+        assert _SPLIT.relative_to(_REPO_ROOT).as_posix() in MERGER.system_prompt
+        assert _SPLIT.is_file()
+
 
 class TestTheCarveOutIsOneStepBack:
     """The carve-out admits the path's IMMEDIATELY-PREVIOUS value, nothing older.
@@ -1351,8 +1420,6 @@ class TestTheCarveOutIsOneStepBack:
         assert '1009' in result.stdout
 
 
-_SPLIT = _REPO_ROOT / 'scripts' / 'split_merge_lane_ratchet_ledger.py'
-
 
 def _legacy_array(*records: dict) -> str:
     """The retired single-array ledger's bytes, as its writer last rendered them."""
@@ -1481,6 +1548,41 @@ class TestTheLedgerSplitCommit:
         assert 'nothing to split' in split.stdout
         assert repo.git('status', '--porcelain') == ''
 
+    def test_a_branch_still_carrying_the_array_rebases_onto_a_main_that_split_it(
+        self, tmp_path: Path
+    ) -> None:
+        # THE LANE'S PATH for the live branches that appended to the array: a
+        # bounce rebases them (no hook runs), the rebase stops on a
+        # modify/delete, and the resolver runs the split, as the merger role
+        # prompt instructs. The branch's commit then ADDS its entry's file.
+        shared, branch_own, _unused = self._history()
+        repo = self._with_array(tmp_path, shared)
+        repo.git('switch', '--quiet', '-c', 'task/5675')
+        (repo.root / metrics.LEGACY_LEDGER_RELPATH).write_text(
+            _legacy_array(shared, branch_own), encoding='utf-8'
+        )
+        repo.commit_all('fix(5675): an entry in the old format')
+        repo.git('switch', '--quiet', 'main')
+        self._split(repo)
+        repo.commit_all('main: split the ledger')
+        repo.git('switch', '--quiet', 'task/5675')
+        stopped = repo.git('rebase', 'main', check=False)
+        assert 'CONFLICT (modify/delete)' in stopped or repo.git(
+            'diff', '--name-only', '--diff-filter=U'
+        ) == metrics.LEGACY_LEDGER_RELPATH
+
+        split = self._split(repo)
+        repo.git('add', '-A', 'orchestrator/tests')
+        repo.git('-c', 'core.editor=true', 'rebase', '--continue')
+
+        assert split.returncode == 0, split.stderr
+        assert not (repo.root / metrics.LEGACY_LEDGER_RELPATH).exists()
+        added = repo.git('diff', '--name-status', 'main..HEAD').splitlines()
+        assert added == [
+            f'A\t{metrics.LEDGER_DIR_RELPATH}/{metrics.entry_filename(branch_own)}'
+        ]
+        assert 'nothing to split' in self._split(repo).stdout
+
     def test_staging_the_retired_array_back_is_refused(self, tmp_path: Path) -> None:
         repo = self._with_array(tmp_path, *self._history())
         self._split(repo)
@@ -1550,14 +1652,31 @@ class TestANewEntryIsAttributedToTheBranchsTask:
 
         assert result.returncode == 0, result.stdout + result.stderr
 
-    def test_a_carry_branch_named_for_its_task_is_accepted(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize('branch', ['carry/7298', 'carry/A4-7298', 'task/7298-retry'])
+    def test_a_branch_named_for_its_task_is_accepted(self, tmp_path: Path, branch: str) -> None:
+        # The id leads the name, or ends it after a dash.
         repo = _Repo.seeded(tmp_path)
-        repo.git('switch', '--quiet', '-c', 'carry/7298')
+        repo.git('switch', '--quiet', '-c', branch)
         self._raise_recorded_for(repo, '7298')
 
         result = repo.gate()
 
         assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_the_commit_being_made_cannot_cite_itself_and_says_so(
+        self, tmp_path: Path
+    ) -> None:
+        # pre-commit runs before the message exists, so `fix(5471): ...` on THIS
+        # commit cannot admit its own entry: the refusal must say how to proceed.
+        repo = _Repo.seeded(tmp_path)
+        repo.git('switch', '--quiet', '-c', 'carry/B4')
+        self._raise_recorded_for(repo, '5471')
+
+        result = repo.gate()
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'cannot cite itself' in result.stderr
+        assert 'carry/<id>' in result.stderr
 
     @pytest.mark.parametrize(
         'subject',

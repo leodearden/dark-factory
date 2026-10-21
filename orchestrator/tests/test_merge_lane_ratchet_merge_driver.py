@@ -273,6 +273,23 @@ class TestTheMergeVerb:
         err = capsys.readouterr().err
         assert 'complexipy_version' in err and metrics.BASELINE_RELPATH in err
 
+    def test_any_failure_is_a_conflict_with_markers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # git reads every non-zero exit as a conflict; the resolver must still
+        # meet git's markers rather than a silently kept ours.
+        def explode(*images: dict) -> dict:
+            raise KeyError('a bug the rules never anticipated')
+
+        monkeypatch.setattr(driver, 'merge_baselines', explode)
+        base = _image(tmp_path, 'O', synthetic_report())
+        ours = _image(tmp_path, 'A', _with(_a_py('lines', 1005)))
+        theirs = _image(tmp_path, 'B', _with(_a_py('lines', 1010)))
+
+        assert driver.main(['merge', str(base), str(ours), str(theirs)]) == 1
+
+        assert '<<<<<<< ours' in ours.read_text(encoding='utf-8')
+
     def test_an_unreadable_image_is_a_conflict(self, tmp_path: Path) -> None:
         # git hands an EMPTY base for an add/add.
         base = tmp_path / 'O'
