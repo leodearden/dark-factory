@@ -259,6 +259,7 @@ class _SyntheticSuite:
 def _write_suite(
     parent: pathlib.Path, *, ini: str, sources: Mapping[str, str]
 ) -> _SyntheticSuite:
+    """Lay the suite out under *parent*; basetemp is a not-yet-created sibling of its root."""
     root = parent / 'suite'
     root.mkdir()
     ini_path = root / 'pytest.ini'
@@ -301,6 +302,10 @@ def _run_synthetic_suite(
 
     ``PYTEST_*`` is scrubbed from the child's environment so an inherited
     ``PYTEST_ADDOPTS`` (a ``-q``, say) cannot suppress the literals asserted on.
+
+    The child runs under the suite's private basetemp, never in the host's
+    default pytest temp root; why:
+    ``test_xdist_worker_restart_policy.py::test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched``.
     """
     missing = [
         plugin for plugin in ('xdist', 'pytest_timeout')
@@ -320,6 +325,7 @@ def _run_synthetic_suite(
             '-p', 'no:cacheprovider',
             '-n', str(REPRO_INITIAL_WORKERS),
             '--dist', 'loadgroup',
+            f'--basetemp={suite.basetemp}',
             *restart_args,
         ],
         cwd=str(suite.root),
