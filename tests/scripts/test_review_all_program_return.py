@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -166,3 +167,138 @@ def test_a_file_that_does_not_parse_is_a_form_error(reader: Any) -> None:
         (state.RejectionClass.FORM, '<file>'),
     ]
     assert check.value is None
+
+
+RUN_ID = 'review-all-fixture-20261019'
+AUTHORED = (
+    {'seq': 1, 'at': '2026-10-19T12:00:00Z', 'by': 'lead', 'op': 'stream_status', 'stream': 'S1',
+     'status': 'authored', 'prd_path': 'plans/review-all-fixture-s1-prd.md'},
+    {'seq': 2, 'at': '2026-10-19T12:00:00Z', 'by': 'lead', 'op': 'stream_status', 'stream': 'S2',
+     'status': 'authored', 'prd_path': 'plans/review-all-fixture-s2-prd.md'},
+)
+
+
+def _contradictions(check: Any) -> dict[str, list[str]]:
+    assert check.value is None
+    assert check.rejections
+    assert all(r.kind is state.RejectionClass.CONTRADICTION for r in check.rejections)
+    found: dict[str, list[str]] = {}
+    for rejection in check.rejections:
+        found.setdefault(rejection.field, []).append(rejection.reason)
+    return found
+
+
+def _set_filed(index: int, **fields: Any) -> Mutation:
+    def mutate(data: dict[str, Any]) -> None:
+        data['filed'][index].update(fields)
+    return mutate
+
+
+def test_a_decompose_return_consistent_with_the_store_is_accepted(reader: Any) -> None:
+    check = _validate(_text('S1.decompose.json'), reader, AUTHORED)
+    assert check.ok, check.rejections
+    assert check.measured_at is not None
+    assert [f.task_id for f in check.value.filed] == [101, 102]
+
+
+def test_a_release_onto_a_store_dependency_is_accepted(reader: Any) -> None:
+    check = _validate(_text('S2.decompose.json'), reader, AUTHORED)
+    assert check.ok, check.rejections
+    [released] = check.value.released
+    assert (released.task_id, released.onto) == (113, (106,))
+
+
+def test_a_decompose_before_its_author_return_is_a_contradiction(reader: Any) -> None:
+    found = _contradictions(_validate(_text('S1.decompose.json'), reader, ()))
+    assert any('S1' in reason and 'author' in reason for reason in found['pass'])
+
+
+def test_a_filed_id_absent_from_the_store_is_a_contradiction(reader: Any) -> None:
+    found = _contradictions(_validate(_text('S1.decompose.absent-filed.json'), reader, AUTHORED))
+    assert any('999' in reason for reason in found['filed[0].task_id'])
+
+
+def test_a_filed_key_outside_the_streams_keys_after_amendments(reader: Any) -> None:
+    text = _mutated('S1.decompose.json', _set_filed(1, keys=['fk-0000000000b1']))
+    found = _contradictions(_validate(text, reader, AUTHORED))
+    assert any('fk-0000000000b1' in reason for reason in found['filed[1].keys[0]'])
+    amended = (*AUTHORED, {
+        'seq': 3, 'at': '2026-10-19T12:00:00Z', 'by': 'lead', 'op': 'amend_stream',
+        'stream': 'S1', 'field': 'keys', 'change': 'add', 'value': 'fk-0000000000b1',
+        'ruling': 'D1',
+    })
+    assert _validate(text, reader, amended).ok
+
+
+def test_a_filed_task_of_another_run_is_a_contradiction(reader: Any) -> None:
+    text = _mutated('S1.decompose.json', _set_filed(0, task_id=201))
+    reasons = _contradictions(_validate(text, reader, AUTHORED))['filed[0].task_id']
+    assert any(RUN_ID in reason and 'None' in reason for reason in reasons)
+
+
+def test_an_unadopted_filed_task_must_carry_the_streams_prd_path(reader: Any) -> None:
+    unadopted = _mutated('S1.decompose.json', _set_filed(0, task_id=108, gate_dep=False))
+    reasons = _contradictions(_validate(unadopted, reader, AUTHORED))['filed[0].task_id']
+    assert any('prd_path' in reason for reason in reasons)
+    adopted = _mutated('S1.decompose.json', _set_filed(0, task_id=108, gate_dep=False, adopted=True))
+    assert _validate(adopted, reader, AUTHORED).ok
+
+
+def test_a_held_leaf_must_be_deferred_and_waiting(reader: Any) -> None:
+    text = _mutated('S1.decompose.json', _set_in('held', 0, 'task_id', 101))
+    reasons = _contradictions(_validate(text, reader, AUTHORED))['held[0].task_id']
+    assert any('deferred' in reason for reason in reasons)
+    assert any('x_seam_wait' in reason for reason in reasons)
+
+
+def test_a_held_leaf_must_wait_on_the_stream_the_store_records(reader: Any) -> None:
+    text = _mutated('S1.decompose.json', _set_in('held', 0, 'waits_on', 'S3'))
+    reasons = _contradictions(_validate(text, reader, AUTHORED))['held[0].waits_on']
+    assert any('S2' in reason and 'S3' in reason for reason in reasons)
+
+
+def test_a_gate_dep_the_gate_does_not_hold_is_a_contradiction(reader: Any) -> None:
+    text = _mutated('S1.decompose.json', _set_filed(1, gate_dep=True))
+    reasons = _contradictions(_validate(text, reader, AUTHORED))['filed[1].gate_dep']
+    assert any('102' in reason and '110' in reason for reason in reasons)
+
+
+def test_a_gate_dep_without_a_gate_is_a_contradiction(tmp_path: Path) -> None:
+    data = json.loads((FIXTURE_DIR / 'store.json').read_text())
+    data['tasks'] = [task for task in data['tasks'] if task['id'] != 110]
+    gateless = tmp_path / 'store.json'
+    gateless.write_text(json.dumps(data))
+    with running_fake_store(store=gateless) as running:
+        check = _validate(
+            _text('S1.decompose.json'), state.StoreReader(running.url, PROJECT_ROOT), AUTHORED,
+        )
+    reasons = _contradictions(check)['filed[0].gate_dep']
+    assert f'no human_gate task carries trigger_chain.run_id = {RUN_ID}' in reasons
+
+
+def _released(task_id: int, onto: list[int]) -> Mutation:
+    return _set('released', [
+        {'task_id': task_id, 'onto': onto, 'contract_as_delivered': 'C1 as delivered'},
+    ])
+
+
+def test_a_release_of_an_unreleased_task_is_a_contradiction(reader: Any) -> None:
+    text = _mutated('S1.decompose.json', _released(103, [101]))
+    reasons = _contradictions(_validate(text, reader, AUTHORED))['released[0].task_id']
+    assert any('103' in reason and 'x_seam_released' in reason for reason in reasons)
+
+
+def test_a_release_onto_a_task_it_does_not_depend_on_is_a_contradiction(reader: Any) -> None:
+    text = _mutated('S1.decompose.json', _released(113, [102]))
+    reasons = _contradictions(_validate(text, reader, AUTHORED))['released[0].onto[0]']
+    assert any('102' in reason and '113' in reason for reason in reasons)
+
+
+def test_several_contradictions_are_reported_together(reader: Any) -> None:
+    text = _mutated(
+        'S1.decompose.json',
+        _set_in('held', 0, 'waits_on', 'S3'),
+        _set_filed(1, gate_dep=True),
+    )
+    found = _contradictions(_validate(text, reader, AUTHORED))
+    assert {'held[0].waits_on', 'filed[1].gate_dep'} <= set(found)
