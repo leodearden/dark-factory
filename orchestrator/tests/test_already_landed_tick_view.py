@@ -54,8 +54,9 @@ class TestAlreadyLandedTickView:
 
         assert isinstance(view, AlreadyLandedTickView)
         assert view.local_branches == await git_ops.list_local_branches()
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            view.local_branches = frozenset()  # type: ignore[misc]
+        pytest.raises(
+            dataclasses.FrozenInstanceError, setattr, view, 'local_branches', frozenset(),
+        )
 
     async def test_a_never_created_unmarked_branch_abstains(self, git_ops: GitOps):
         view = await read_already_landed_tick_view(git_ops)

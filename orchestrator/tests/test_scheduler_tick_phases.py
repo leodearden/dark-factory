@@ -958,10 +958,11 @@ class TestTickTelemetry:
 
     @pytest.mark.asyncio
     async def test_the_two_landed_consults_are_timed_as_separate_phases(
-        self, scheduler: Scheduler,
+        self, tmp_path,
     ):
-        event_store = _RecordingEventStore()
-        scheduler.event_store = event_store  # type: ignore[assignment]
+        event_store = EventStore(tmp_path / 'runs.db', run_id='tick-phases')
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)
+        scheduler.finish_startup()
         task = {
             'id': 'A', 'title': 'Task A', 'status': 'pending', 'dependencies': [],
             'metadata': {'files': ['backend']}, 'priority': 'medium',
@@ -971,10 +972,11 @@ class TestTickTelemetry:
         scheduler._already_landed_gate = AsyncMock(return_value=False)
 
         await scheduler.acquire_next()
+        await scheduler.work_product.join()
 
-        ticks = [e for e in event_store.events if e[0] == 'scheduler_tick']
+        ticks = event_store.fetch_events_by_type('scheduler_tick')
         assert len(ticks) == 1
-        phases = ticks[0][1]['data']['phases']
+        phases = ticks[0]['data']['phases']
         assert isinstance(phases['landed_outbox_gate'], int)
         assert isinstance(phases['already_landed_gate'], int)
 
