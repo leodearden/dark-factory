@@ -9139,19 +9139,23 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
         callers=(
             'downstream Python consumers that import orchestrator.session_registry '
             'with orchestrator/src on PYTHONPATH but no install (T4 verify, T5 '
-            'result, T6 hooks, T7 leases). This row carries the assertion formerly '
-            'made by test_imports_under_a_bare_interpreter_with_no_workspace_'
-            'packages (task 3223 step-31).'
+            'result, T6 hooks, T7 leases). Nothing on that path reaches `shared`; '
+            "the module's own bootstrap appends this checkout's shared/src, so only "
+            'its stdlib-only shared leaves are importable. This row carries the '
+            'assertion formerly made by test_imports_under_a_bare_interpreter_with_'
+            'no_workspace_packages (task 3223 step-31).'
         ),
     ),
     _BareShellEntrypoint(
         name='session_registry.py (tier-1: bare shell, NO PYTHONPATH)',
         path=_SR_PKG_ROOT / 'orchestrator' / 'session_registry.py',
         # THE POINT OF THIS ROW: running a script by absolute path puts only
-        # the script's OWN directory on sys.path. Nothing else is reachable —
-        # not `shared`, not `orchestrator.<sibling>`. That is a STRICTLY
-        # stronger contract than the tier-2 row above, which the PYTHONPATH
-        # entry makes able to reach every intra-orchestrator sibling.
+        # the script's OWN directory on sys.path. Nothing else is reachable
+        # from the env — not `shared`, not `orchestrator.<sibling>` — so the
+        # only `shared` the module sees is the checkout's shared/src its own
+        # bootstrap appends. That is a STRICTLY stronger contract than the
+        # tier-2 row above, which the PYTHONPATH entry makes able to reach
+        # every intra-orchestrator sibling.
         pythonpath=(),
         shape=_EntrypointShape.SCRIPT,
         argv=('--help',),
@@ -9159,7 +9163,8 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
         callers=(
             'skills/spawn/spawn-claude.sh lines 145 (launching), 428 (exit), 596 '
             'and 693 (refresh), 871 (set-display) — `python3 "$SESSION_REGISTRY_PY"` '
-            'with no venv, no install and no PYTHONPATH. FOUR OF THE FIVE end in '
+            'with no venv, no install and no PYTHONPATH — and the SKILL.md verb '
+            'lines that run it the same way. FOUR OF THE FIVE spawn lines end in '
             '`|| true`, so a break here is SILENT: the subprocess simply never '
             'writes record.json and the session goes missing from the fleet.'
         ),
@@ -9205,7 +9210,12 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
 #: entrypoint.  This is the load-bearing signal — a guard that has never been
 #: observed to fail is not evidence that it guards anything.
 _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
-    ('session_registry.py', 'from shared import safe_io'),
+    # session_registry's own bootstrap puts this checkout's shared/src on
+    # sys.path, and its payloads are injected AFTER that (see
+    # ``_INJECTION_ANCHORS``), so `shared` itself is reachable here by design.
+    # What must still be refused is a shared module with a third-party
+    # dependency: config_models fails on its pydantic import.
+    ('session_registry.py', 'from shared import config_models'),
     ('session_registry.py', 'from orchestrator import config'),
     ('session_registry.py', 'from orchestrator import stop_instruction'),
     # The dependency-footprint half of the contract: a plain third-party import
@@ -9223,8 +9233,10 @@ _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
     # session_hooks.py's contract is the WEAKER tier-2 one: it does
     # `from orchestrator import session_registry` at module scope (line 50) and
     # its callers export PYTHONPATH for exactly that, so `orchestrator.*` is
-    # ALLOWED. `shared` and third-party are not — nothing puts shared/src or a
-    # site-packages on that path.
+    # ALLOWED. `shared` and third-party are not: its env puts neither shared/src
+    # nor a site-packages on the path, and the payload lands at the
+    # `from __future__` anchor, before the session_registry import whose
+    # bootstrap would otherwise make `shared` reachable as a side effect.
     ('session_hooks.py', 'from shared import safe_io'),
     ('session_hooks.py', 'import pydantic'),
     ('session_ownership_probes.py', 'from shared import safe_io'),
@@ -9461,10 +9473,38 @@ def _first_bare_importable_sibling(probes: _BareShellProbes) -> str | None:
     return None
 
 
+#: The line a payload is injected after, per entrypoint; any other entrypoint
+#: uses ``from __future__ import annotations``.  session_registry's payloads go
+#: after its shared import, so each is judged with the module's own shared/src
+#: bootstrap already applied: that is the environment a later module-scope
+#: import in that file really runs in.
+_INJECTION_ANCHORS: dict[str, str] = {
+    'session_registry.py': 'from shared.project_id import ',
+}
+_DEFAULT_INJECTION_ANCHOR = 'from __future__ import annotations'
+
+
+def _inject_after_anchor(source: str, entrypoint_filename: str, payload: str) -> str:
+    anchor = _INJECTION_ANCHORS.get(entrypoint_filename, _DEFAULT_INJECTION_ANCHOR)
+    lines = source.splitlines(keepends=True)
+    anchored = [index for index, line in enumerate(lines) if line.startswith(anchor)]
+    assert anchored, (
+        f'{entrypoint_filename} has no module-scope line starting `{anchor}` to '
+        'anchor the injection on; pick another anchor rather than injecting blindly'
+    )
+    insert_at = anchored[0] + 1
+    return ''.join([*lines[:insert_at], f'{payload}\n', *lines[insert_at:]])
+
+
 def _inject_import_sandbox(tmp_path: Path, entrypoint_filename: str, payload: str) -> Path:
-    """Mirror the orchestrator package, with ``payload`` injected into one file.
+    """Mirror the checkout layout, with ``payload`` injected into one file.
 
     Returns the directory that stands in for ``orchestrator/src``.
+
+    The sandbox is laid out like a checkout: the package sits at
+    ``<sandbox>/orchestrator/src/orchestrator`` and ``<sandbox>/shared/src``
+    links the real ``shared/src``, so a mutated session_registry.py resolves its
+    ``__file__``-relative shared bootstrap exactly as the real file does.
 
     Every entry of the real package is mirrored as a SYMLINK (``__pycache__``
     excepted) and only the mutated entrypoint is a real file.  Faithfulness and
@@ -9475,8 +9515,11 @@ def _inject_import_sandbox(tmp_path: Path, entrypoint_filename: str, payload: st
     """
     slug = re.sub(r'\W+', '-', f'{entrypoint_filename}-{payload}').strip('-')
     sandbox = tmp_path / f'sandbox-{slug}'
-    pkg = sandbox / 'orchestrator'
+    pkg_root = sandbox / 'orchestrator' / 'src'
+    pkg = pkg_root / 'orchestrator'
     pkg.mkdir(parents=True)
+    (sandbox / 'shared').mkdir()
+    (sandbox / 'shared' / 'src').symlink_to(_SR_REPO_ROOT / 'shared' / 'src')
 
     real_pkg = _SR_PKG_ROOT / 'orchestrator'
     for entry in real_pkg.iterdir():
@@ -9484,33 +9527,36 @@ def _inject_import_sandbox(tmp_path: Path, entrypoint_filename: str, payload: st
             continue
         (pkg / entry.name).symlink_to(entry)
 
-    marker = 'from __future__ import annotations\n'
     source = (real_pkg / entrypoint_filename).read_text()
-    assert marker in source, (
-        f'{entrypoint_filename} has no `{marker.strip()}` line to anchor the '
-        'injection on; pick another anchor rather than injecting blindly'
-    )
     (pkg / entrypoint_filename).unlink()
-    (pkg / entrypoint_filename).write_text(source.replace(marker, f'{marker}{payload}\n', 1))
-    return sandbox
+    (pkg / entrypoint_filename).write_text(
+        _inject_after_anchor(source, entrypoint_filename, payload)
+    )
+    return pkg_root
 
 
 class TestStdlibOnlySelfContainment:
-    """The bare-shell entrypoints must run with NO venv, install or workspace deps.
+    """The bare-shell entrypoints must run with NO venv, install or third-party deps.
 
     This is an architectural contract, not a style preference.  Two production
     shell paths execute orchestrator modules directly, and they do it under
     DIFFERENT environments — so this class pins a REGISTRY
-    (``_BARE_SHELL_ENTRYPOINTS``) of invocations, not one module:
+    (``_BARE_SHELL_ENTRYPOINTS``) of invocations, not one module.  What such a
+    module may import is the stdlib plus this checkout's stdlib-only ``shared``
+    leaves, and the only route to those is session_registry's own bootstrap,
+    which appends the checkout's ``shared/src`` (derived from ``__file__``) to
+    ``sys.path``; no caller exports anything for it.
 
     - **tier-1 — bare shell, NO PYTHONPATH.**  ``skills/spawn/spawn-claude.sh``
-      runs ``session_registry.py`` by absolute path with nothing exported, so
-      only the script's own directory is on ``sys.path``: no ``shared``, no
-      third-party, and no ``orchestrator.<sibling>`` either.
+      and the SKILL.md verb lines run ``session_registry.py`` by absolute path
+      with nothing exported, so only the script's own directory is on
+      ``sys.path``: no third-party, no ``orchestrator.<sibling>``, and no
+      ``shared`` beyond what the bootstrap appends.
     - **tier-2 — bare shell (or plain import) WITH PYTHONPATH=orchestrator/src.**
       ``skills/spawn/hooks/*.sh`` run ``session_hooks.py``, and Python consumers
       import ``orchestrator.session_registry``.  Intra-orchestrator siblings are
-      reachable here; ``shared`` and third-party are still not.
+      reachable here; third-party is still not, and ``shared`` only through the
+      same bootstrap.
 
     Tier-1 is STRICTLY STRONGER, so the rows are not interchangeable and neither
     may be deleted as a duplicate of the other — pinned by
@@ -9522,9 +9568,10 @@ class TestStdlibOnlySelfContainment:
     dependency and against a control run of the SAME sandbox with nothing
     injected — so a degraded sandbox cannot masquerade as a working guard.  A
     guard that has never been observed to fail is not evidence of anything —
-    task 3223's consolidation added ``from shared import safe_io`` and broke
-    exactly this contract (escalation esc-3223-2) while the only symptom in the
-    suite was two downstream ``test_session_hooks.py`` failures.  A row counts
+    task 3223's consolidation added ``from shared import safe_io`` before any
+    bootstrap existed and broke exactly this contract (escalation esc-3223-2)
+    while the only symptom in the suite was two downstream
+    ``test_session_hooks.py`` failures.  A row counts
     as able to discriminate only when BOTH its own vacuity ``probe`` AND the
     payload under test are unreachable under its documented env; otherwise it
     SKIPS loudly rather than reporting a green it did not earn.
@@ -9581,6 +9628,47 @@ class TestStdlibOnlySelfContainment:
             'genuinely required, the caller can no longer run it bare).\n'
             f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
         )
+
+    def test_bare_shell_write_decision_folds_project_through_shared(self, tmp_path):
+        """The production spawn-claude/SKILL invocation reaches the shared fold.
+
+        ``write-decision`` run by absolute path with no PYTHONPATH stores its
+        project folded by ``shared.project_id.fold_project_token``, so the fold
+        the cockpit reads with is reachable from a bare shell.
+        """
+        interpreter = _non_venv_interpreter()
+        if interpreter is None:
+            pytest.skip('no non-venv interpreter available on this host')
+        fleet = tmp_path / 'fleet'
+
+        result = subprocess.run(
+            [
+                interpreter,
+                str(_SR_PKG_ROOT / 'orchestrator' / 'session_registry.py'),
+                'write-decision',
+                '--id', 'esc-1-1',
+                '--project', 'Dark-Factory',
+                '--text', 'Approve the bare-shell filing?',
+                '--escalations-dir', str(tmp_path / 'escalations'),
+            ],
+            env={
+                'PATH': '/usr/bin:/bin',
+                'HOME': str(tmp_path),
+                'PYTHONNOUSERSITE': '1',
+                'PYTHONDONTWRITEBYTECODE': '1',
+                'CLAUDE_FLEET_ROOT': str(fleet),
+            },
+            # Neutral cwd, LOAD-BEARING for the reasons ``_run_row`` gives.
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert result.returncode == 0, f'stderr:\n{result.stderr}'
+        assert [decision.project for decision in sr.list_decisions(root=fleet)] == [
+            fold_project_token('Dark-Factory')
+        ], f'stderr:\n{result.stderr}'
 
     def test_tier1_is_strictly_stronger_than_tier2(self, tmp_path, bare_shell_probes):
         """The two session_registry rows encode DIFFERENT contracts, not one twice.
