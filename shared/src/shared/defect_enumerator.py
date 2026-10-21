@@ -4,8 +4,8 @@ plans/defect-tests-prd.md decision 8 makes this static scan the authoritative bi
 ref to its node ids, and decision 14 makes completeness part of every answer: a file whose refs
 cannot all be read statically is incomplete, never clean. Collection mirrors pytest's DEFAULT
 rules only, so a project that overrides them is a known, fail-safe limit. A Test class's bases are
-read only where the module itself defines them: a constructor or ``__test__`` inherited from an
-imported base is invisible, so such a class still reads as collected.
+resolved only where the module defines them, so test methods, marks, constructors and ``__test__``
+inherited from an imported base are all invisible.
 """
 
 from __future__ import annotations
@@ -236,14 +236,23 @@ def _classes(definitions: Iterable[_Definition]) -> dict[str, ast.ClassDef]:
     return {definition.name: definition for definition in definitions if isinstance(definition, ast.ClassDef)}
 
 
-def _lineage(
+def _depth_first(
     node: ast.ClassDef, classes: Mapping[str, ast.ClassDef], visiting: frozenset[str]
 ) -> Iterator[ast.ClassDef]:
-    """*node*, then each base *classes* defines, depth-first: the static stand-in for its MRO."""
     yield node
     for base in node.bases:
         if isinstance(base, ast.Name) and base.id not in visiting and base.id in classes:
-            yield from _lineage(classes[base.id], classes, visiting | {base.id})
+            yield from _depth_first(classes[base.id], classes, visiting | {base.id})
+
+
+def _lineage(node: ast.ClassDef, classes: Mapping[str, ast.ClassDef]) -> tuple[ast.ClassDef, ...]:
+    """*node* and each base *classes* defines, once each in MRO order: the static stand-in for its MRO.
+
+    Each class keeps its last depth-first place, so a diamond's shared base follows both its
+    subclasses, as C3 places it.
+    """
+    walk = tuple(_depth_first(node, classes, frozenset({node.name})))
+    return tuple(reversed(dict.fromkeys(reversed(walk))))
 
 
 def _defines_constructor(node: ast.ClassDef) -> bool:
@@ -262,48 +271,90 @@ def _test_flag(bodies: Iterable[Sequence[ast.stmt]]) -> bool:
     return True
 
 
-def _is_test_class(node: ast.ClassDef, classes: Mapping[str, ast.ClassDef]) -> bool:
-    if not node.name.startswith(_TEST_CLASS_PREFIX):
-        return False
-    lineage = tuple(_lineage(node, classes, frozenset({node.name})))
+def _is_collected(lineage: tuple[ast.ClassDef, ...]) -> bool:
+    """Whether pytest collects a ``Test*`` class of *lineage*: no constructor in it and a truthy ``__test__``."""
     if any(_defines_constructor(ancestor) for ancestor in lineage):
         return False
     return _test_flag(ancestor.body for ancestor in lineage)
 
 
-def _test_items(
-    body: Sequence[ast.stmt],
-    inherited: _ScopeMarks,
+def _lineage_marks(lineage: tuple[ast.ClassDef, ...], scope: _ScopeMarks) -> _ScopeMarks:
+    """*scope* plus every lineage class's own marks: its pytestmark binding and its decorators."""
+    for ancestor in lineage:
+        scope = scope.with_elements([*pytestmark_elements(ancestor.body), *ancestor.decorator_list])
+    return scope
+
+
+@dataclass(frozen=True)
+class _Member:
+    """A definition a scope holds, with the classes its bases resolve among."""
+
+    definition: _Definition
+    classes: Mapping[str, ast.ClassDef]
+
+
+def _members(bodies: Iterable[Sequence[ast.stmt]], module_classes: Mapping[str, ast.ClassDef]) -> list[_Member]:
+    """The definitions a scope merged from *bodies* holds: the first body to define a name keeps it.
+
+    A member's bases resolve among the module's classes and those of the body defining it.
+    """
+    members: dict[str, _Member] = {}
+    for body in bodies:
+        definitions = _winning_definitions(body)
+        classes = {**module_classes, **_classes(definitions)}
+        for definition in definitions:
+            members.setdefault(definition.name, _Member(definition, classes))
+    return list(members.values())
+
+
+_Item = tuple[str, _ScopeMarks]
+
+
+def _scope_items(
+    members: Iterable[_Member],
+    scope: _ScopeMarks,
     class_chain: tuple[str, ...],
     module_classes: Mapping[str, ast.ClassDef],
-) -> Iterator[tuple[str, _ScopeMarks]]:
-    """Each item pytest's default collection takes from a scope *body*, named, with the marks reaching it.
-
-    A class's bases resolve among the classes its own scope and the module define.
-    """
-    scope = inherited.with_elements(pytestmark_elements(body))
-    definitions = _winning_definitions(body)
-    visible = {**module_classes, **_classes(definitions)}
-    for definition in definitions:
-        marks = scope.with_elements(definition.decorator_list)
+) -> Iterator[_Item]:
+    """Each item pytest's default collection takes from a scope's *members*, named, with the marks reaching it."""
+    for member in members:
+        definition = member.definition
         if isinstance(definition, ast.ClassDef):
-            if _is_test_class(definition, visible):
-                yield from _test_items(definition.body, marks, (*class_chain, definition.name), module_classes)
+            yield from _class_items(definition, member.classes, scope, class_chain, module_classes)
         elif definition.name.startswith(_TEST_FUNCTION_PREFIX):
-            yield '::'.join((*class_chain, definition.name)), marks
+            yield '::'.join((*class_chain, definition.name)), scope.with_elements(definition.decorator_list)
 
 
-def _module_items(body: Sequence[ast.stmt]) -> Iterator[tuple[str, _ScopeMarks]]:
+def _class_items(
+    node: ast.ClassDef,
+    classes: Mapping[str, ast.ClassDef],
+    enclosing: _ScopeMarks,
+    class_chain: tuple[str, ...],
+    module_classes: Mapping[str, ast.ClassDef],
+) -> Iterator[_Item]:
+    """The items of a collected Test class: its lineage's members and marks, named under its own chain."""
+    if not node.name.startswith(_TEST_CLASS_PREFIX):
+        return
+    lineage = _lineage(node, classes)
+    if not _is_collected(lineage):
+        return
+    members = _members((ancestor.body for ancestor in lineage), module_classes)
+    yield from _scope_items(members, _lineage_marks(lineage, enclosing), (*class_chain, node.name), module_classes)
+
+
+def _module_items(body: Sequence[ast.stmt]) -> Iterator[_Item]:
     if not _test_flag((body,)):
         return iter(())
-    return _test_items(body, _ScopeMarks(), (), _classes(_winning_definitions(body)))
+    module_classes = _classes(_winning_definitions(body))
+    scope = _ScopeMarks().with_elements(pytestmark_elements(body))
+    return _scope_items(_members((body,), module_classes), scope, (), module_classes)
 
 
 _Reading = str | EnumerationGap
 
 
 def _carriers(
-    items: Iterator[tuple[str, _ScopeMarks]],
+    items: Iterator[_Item],
     readings: Mapping[int, _Reading],
     node_of: Callable[[str], NodeId],
 ) -> tuple[dict[str, tuple[Carrier, ...]], frozenset[int]]:
