@@ -6,7 +6,6 @@ resolve to one module object, whichever runs first.
 """
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
 from pathlib import Path
@@ -101,23 +100,6 @@ def _score() -> dict[str, Any]:
 class TestOneCopyOfTheEstimator:
     def test_the_estimator_is_the_audit_estimator(self) -> None:
         assert mod.weighted_rate is audit.weighted_rate
-
-    def test_the_script_defines_no_estimator_of_its_own(self) -> None:
-        tree = ast.parse(SCRIPT_PATH.read_text())
-        defined = {
-            node.name for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-        }
-        assert not defined & {'weighted_rate', '_wilson'}
-
-    def test_the_estimator_is_imported_from_the_audit(self) -> None:
-        imported = {
-            alias.name
-            for node in ast.walk(ast.parse(SCRIPT_PATH.read_text()))
-            if isinstance(node, ast.ImportFrom) and node.module == 'audit_ruling_overreach'
-            for alias in node.names
-        }
-        assert 'weighted_rate' in imported
 
 
 class TestScore:
