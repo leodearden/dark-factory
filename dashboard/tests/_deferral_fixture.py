@@ -59,6 +59,8 @@ INVALID: Final = 151
 UNRECORDED: Final = 161
 STRAY: Final = 171
 PLAIN: Final = 181
+SECOND_CLOSABLE: Final = 201
+SECOND_PLAIN: Final = 202
 
 OTHER_HOST: Final = 'elsewhere.invalid'
 FORGED_BOOT_ID: Final = 'forged-boot-id-a-reboot-ago'
@@ -166,6 +168,14 @@ def deferral_fixture(*, now: datetime, live_holder: ProcessIdentity) -> tuple[Fi
         *_held_by_session_rows(now, live_holder),
         *_unattended_rows(now),
         *_not_deferred_rows(now),
+    )
+
+
+def second_project_fixture(*, now: datetime) -> tuple[FixtureRow, ...]:
+    """A second project's rows: one closable carried_by hold and one plain pending row."""
+    return (
+        _carried(SECOND_CLOSABLE, 'second project: carrier done', CARRIER_DONE, now),
+        FixtureRow(SECOND_PLAIN, TaskStatus.PENDING, 'second project: plain pending', None),
     )
 
 
