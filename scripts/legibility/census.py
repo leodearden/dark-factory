@@ -69,7 +69,7 @@ import tempfile
 import textwrap
 import time
 import traceback
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -1215,7 +1215,11 @@ class ReportSection:
         return "\n".join(self.lines)
 
 
-CENSUS_RECORD_VERSION = 1
+CENSUS_RECORD_VERSION = 2
+"""The shape of :func:`build_census_record`'s value. 2 replaced version 1's
+``synthesis_md`` prose with the ``synthesis`` mapping
+(``synthesis.SynthesisReport.to_record``); :func:`census_report_sections`
+renders this version only."""
 
 
 def _selection_evidence(
@@ -1409,6 +1413,11 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
     was rejected (*mass_rejection*): that anomaly must not commit a report
     indistinguishable from a clean census.
     """
+    if record.get("record_version") != CENSUS_RECORD_VERSION:
+        raise ValueError(
+            f"census record version {record.get('record_version')!r} is not "
+            f"{CENSUS_RECORD_VERSION}, the only shape census_report_sections renders"
+        )
     mining = record["mining"]
     batch_stats = [BatchStats(**stats) for stats in mining["batch_stats"]]
     stop_reason = mining["stop_reason"]
@@ -2038,6 +2047,78 @@ def _synthesize(
     if brief.is_empty:
         return None
     return synthesis.parse(synthesize_fn(brief, model=model), brief)
+
+
+def _accepted(result: synthesis.Synthesis | synthesis.Unavailable | None) -> synthesis.Synthesis:
+    """The document *result* accepted, or the empty one when none was."""
+    return result if isinstance(result, synthesis.Synthesis) else synthesis.Synthesis()
+
+
+@dataclass(frozen=True)
+class _Synthesized:
+    """A run's synthesis before its corrections: the brief, the document
+    accepted or why none was (None when no call was made), and the run's
+    codebook and verified clusters with its phase refinements applied."""
+
+    brief: synthesis.Brief
+    result: synthesis.Synthesis | synthesis.Unavailable | None
+    refined: synthesis.Refined
+
+
+def _synthesis_stage(
+    brief: synthesis.Brief,
+    cb: dict,
+    *,
+    standing: Mapping[str, Any],
+    clusters: Sequence[tuple[dict, str | None]],
+    synthesize_fn,
+    model: str,
+    project_id: str,
+    escalate_fn,
+) -> _Synthesized:
+    """Synthesize *brief*, then refine the phases of the run's placed
+    *clusters* and of every entry of *cb* that is not in *standing*, the
+    codebook before the run. A refused reply is one info escalation and
+    refines nothing."""
+    result = _synthesize(brief, synthesize_fn=synthesize_fn, model=model)
+    if isinstance(result, synthesis.Unavailable):
+        _escalate_unavailable_synthesis(result.reason, project_id=project_id, escalate_fn=escalate_fn)
+    stood = {entry["id"] for entry in standing.get("entries") or []}
+    refined = synthesis.apply_refinements(
+        cb,
+        _accepted(result),
+        clusters=clusters,
+        created=[entry["id"] for entry in cb.get("entries") or [] if entry["id"] not in stood],
+    )
+    return _Synthesized(brief, result, refined)
+
+
+def _apply_synthesis_corrections(
+    cb: dict,
+    synthesized: _Synthesized,
+    *,
+    standing: Mapping[str, Any],
+    run_id: str,
+    date: str,
+    project_id: str,
+    invariant_slugs: Collection[str],
+) -> tuple[dict, synthesis.SynthesisReport]:
+    """*cb* with the synthesis corrections merged as one coding record, and
+    the run's synthesis report, counted against *standing*, the codebook
+    before the run."""
+    corrections = synthesis.corrections_record(
+        _accepted(synthesized.result), run_id=run_id, date=date, project=project_id,
+    )
+    counts = codebook.MergeCounts()
+    if corrections is not None:
+        merged = codebook.apply_coding_records(cb, [corrections], invariant_slugs=invariant_slugs)
+        cb, counts = merged.codebook, merged.counts
+    return cb, synthesis.SynthesisReport(
+        brief=synthesized.brief,
+        result=synthesized.result,
+        applied=synthesis.Applied.of(synthesized.refined, counts),
+        standing=synthesis.standing_count(standing, cb),
+    )
 
 
 def _detect_mass_rejection(offered: int, verified: int, *, clusters: str, escalate_fn) -> MassRejection | None:
@@ -3363,20 +3444,13 @@ def run_census(
             **adjudication_report.counts(),
         },
     )
-    synthesized = _synthesize(brief, synthesize_fn=synthesize_fn, model=config.models.census_synthesis)
-    if isinstance(synthesized, synthesis.Unavailable):
-        _escalate_unavailable_synthesis(synthesized.reason, project_id=project_id, escalate_fn=escalate_fn)
-    document = synthesized if isinstance(synthesized, synthesis.Synthesis) else synthesis.Synthesis()
-    standing_ids = {entry["id"] for entry in codebook_dict.get("entries") or []}
-    refined = synthesis.apply_refinements(
-        updated_codebook,
-        document,
-        clusters=placed,
-        created=[entry["id"] for entry in updated_codebook.get("entries") or [] if entry["id"] not in standing_ids],
+    synthesized = _synthesis_stage(
+        brief, updated_codebook, standing=codebook_dict, clusters=placed, synthesize_fn=synthesize_fn,
+        model=config.models.census_synthesis, project_id=project_id, escalate_fn=escalate_fn,
     )
-    updated_codebook = refined.codebook
+    updated_codebook = synthesized.refined.codebook
     matrix_md = render_matrix(compute_matrix(
-        [sighting for cluster in refined.clusters for sighting in cluster.get("sightings") or []],
+        [sighting for cluster in synthesized.refined.clusters for sighting in cluster.get("sightings") or []],
     ))
 
     _require_valid(updated_codebook, "merge")
@@ -3464,16 +3538,9 @@ def run_census(
     )
     # Synthesis corrections land after filing, so this run's title-keyed
     # pairing and sighting counts read the codebook the run verified.
-    corrections = synthesis.corrections_record(document, run_id=run_id, date=date, project=project_id)
-    correction_counts = codebook.MergeCounts()
-    if corrections is not None:
-        corrected = codebook.apply_coding_records(updated_codebook, [corrections], invariant_slugs=invariant_slugs)
-        updated_codebook, correction_counts = corrected.codebook, corrected.counts
-    synthesis_report = synthesis.SynthesisReport(
-        brief=brief,
-        result=synthesized,
-        applied=synthesis.Applied.of(refined, correction_counts),
-        standing=synthesis.standing_count(codebook_dict, updated_codebook),
+    updated_codebook, synthesis_report = _apply_synthesis_corrections(
+        updated_codebook, synthesized, standing=codebook_dict, run_id=run_id, date=date,
+        project_id=project_id, invariant_slugs=invariant_slugs,
     )
     # The backfill, back-links, resolutions and corrections changed the
     # codebook after the merge check, so it is held to the schema again before

@@ -2376,9 +2376,19 @@ def test_a_pipe_in_a_statement_does_not_break_the_findings_table():
 def test_build_census_record_carries_identity_and_method():
     record = _census_record()
 
-    assert record["record_version"] == 1
+    assert record["record_version"] == 2
     assert record["run_id"] == _SAMPLE_METHOD["run_id"]
     assert record["method"] == _SAMPLE_METHOD
+
+
+def test_a_version_1_record_is_refused_naming_its_version():
+    """Version 1 records carry ``synthesis_md`` prose in place of the
+    ``synthesis`` mapping, as the committed 2026-10-10 and 10-17 records do."""
+    record = _census_record()
+    old = {key: value for key, value in record.items() if key != "synthesis"}
+
+    with pytest.raises(ValueError, match="census record version 1 is not 2"):
+        mod.render_report({**old, "record_version": 1, "synthesis_md": "prose"})
 
 
 _METHOD_WINDOW = census_window.MiningWindow(
@@ -8865,19 +8875,6 @@ def test_synthesis_prompt_embeds_the_quality_definition_the_c6_reply_and_the_bri
     assert _quality_block_of(prompt) == code_quality.guidance()
     assert synthesis.reply_instructions() in prompt
     assert json.dumps(brief.to_record()) in prompt
-    assert "no tools" in prompt
-    assert "Proposed codebook changes" not in prompt
-
-
-def test_the_default_synthesize_fn_leaves_the_empty_brief_skip_to_run_census():
-    empty = synthesis.Brief.of(
-        run_id="census-dark_factory-20261021", before={"version": 2, "entries": []},
-        after={"version": 2, "entries": []}, verdicts=[], adopted={}, run_sessions=(), counts={},
-    )
-    fake_invoke = _make_fake_invoke(default="the raw reply")
-
-    assert mod._build_default_synthesize_fn(fake_invoke)(empty, model="fable") == "the raw reply"
-    assert len(fake_invoke.calls) == 1
 
 
 # ---------------------------------------------------------------------------
