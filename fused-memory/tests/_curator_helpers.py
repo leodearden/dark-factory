@@ -5,16 +5,22 @@ A plain module rather than conftest.py, for the reason ``_fm_helpers.py`` gives.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock
 
 from shared.cli_invoke import AgentResult
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import (
+    CandidateTask,
     CuratorDecision,
+    PreparedCandidate,
     _PoolEntry,
     is_combine_eligible_status,
 )
+
+EMPTY_POOL_SIZES: Final = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
 
 
 def make_config() -> FusedMemoryConfig:
@@ -62,3 +68,25 @@ def curator_returning(*decisions: CuratorDecision) -> MagicMock:
     curator.reembed_task = AsyncMock(return_value=None)
     curator.close = AsyncMock()
     return curator
+
+
+def prepared(
+    title: str, pool: Iterable[_PoolEntry] = (), corpus_error: str | None = None,
+) -> PreparedCandidate:
+    """A prepared bundle for *title* over *pool*; *corpus_error* marks a failed assembly."""
+    entries = list(pool)
+    return PreparedCandidate(
+        candidate=CandidateTask(title=title),
+        pool=entries,
+        pool_sizes={**EMPTY_POOL_SIZES, 'module': len(entries)},
+        prompt_tokens=0,
+        corpus_error=corpus_error,
+    )
+
+
+def zot_agent_result() -> AgentResult:
+    """An LLM call that hung with zero output until its timeout killed it."""
+    return AgentResult(
+        success=False, output='', subtype='error_empty_output',
+        timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
+    )

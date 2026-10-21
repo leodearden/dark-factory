@@ -18,6 +18,7 @@ import pytest
 from _curator_helpers import agent_result as _agent_result
 from _curator_helpers import make_config as _make_config
 from _curator_helpers import pool_with_ids as _pool_with_ids
+from _curator_helpers import zot_agent_result
 from shared.cli_invoke import AgentResult
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import (
@@ -1901,13 +1902,6 @@ def _prepared(candidate: CandidateTask) -> PreparedCandidate:
     )
 
 
-def _zot_agent_result() -> AgentResult:
-    return AgentResult(
-        success=False, output='', subtype='error_empty_output',
-        timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
-    )
-
-
 class TestCuratorDecisionZotMarker:
     """Task 5491: a structured marker says dedupe was skipped by a ZOT hang."""
 
@@ -1937,7 +1931,7 @@ class TestCuratorDecisionZotMarker:
     @pytest.mark.asyncio
     async def test_zot_curate_is_marked_with_the_escalation_id(self):
         decision = await self._curate(
-            self._curator(), CandidateTask(title='ZOT candidate'), _zot_agent_result(),
+            self._curator(), CandidateTask(title='ZOT candidate'), zot_agent_result(),
         )
         assert decision.action == 'create'
         assert decision.degraded_by_zot is True
@@ -1960,10 +1954,10 @@ class TestCuratorDecisionZotMarker:
     @pytest.mark.asyncio
     async def test_curate_breaker_short_circuit_is_marked(self):
         curator = self._curator(breaker_threshold=1)
-        await self._curate(curator, CandidateTask(title='Opener'), _zot_agent_result())
+        await self._curate(curator, CandidateTask(title='Opener'), zot_agent_result())
 
         decision = await self._curate(
-            curator, CandidateTask(title='Second distinct candidate'), _zot_agent_result(),
+            curator, CandidateTask(title='Second distinct candidate'), zot_agent_result(),
         )
         assert decision.justification == 'zero-output-breaker-open'
         assert decision.degraded_by_zot is True
@@ -1972,14 +1966,14 @@ class TestCuratorDecisionZotMarker:
     @pytest.mark.asyncio
     async def test_batch_breaker_short_circuit_marks_every_decision(self):
         curator = self._curator(breaker_threshold=1)
-        await self._curate(curator, CandidateTask(title='Opener'), _zot_agent_result())
+        await self._curate(curator, CandidateTask(title='Opener'), zot_agent_result())
 
         prepared = [
             _prepared(CandidateTask(title='Batch Alpha', description='alpha details')),
             _prepared(CandidateTask(title='Batch Beta', description='beta details')),
         ]
         with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(return_value=_zot_agent_result())):
+                   new=AsyncMock(return_value=zot_agent_result())):
             decisions = await curator.curate_batch_prepared(
                 prepared, project_id='p', project_root='/x',
             )
@@ -1996,7 +1990,7 @@ class TestCuratorDecisionZotMarker:
         candidate = CandidateTask(title='ZOT with no orchestrator')
         with (
             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                  new=AsyncMock(return_value=_zot_agent_result())),
+                  new=AsyncMock(return_value=zot_agent_result())),
             pytest.raises(CuratorFailureError) as exc_info,
         ):
             await curator.curate(
