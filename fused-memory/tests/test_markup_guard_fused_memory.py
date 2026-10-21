@@ -54,6 +54,7 @@ from shared.toolcall_markup import (
 
 from fused_memory.server.main import _install_safe_tool_wrapper
 from fused_memory.server.markup_guard import (
+    _rederive_project,
     _resolve_project_root,
     install_markup_guard,
 )
@@ -1399,3 +1400,92 @@ class TestUnrepairableResidueIsPreserved:
         assert payload['error_type'] == 'mcp_markup_unrepairable'
         assert payload['escalation_id'] is None
         mock_service.add_system_record.assert_not_awaited()
+
+
+class TestRoutingIdentityIsRederivedFromTheResidue:
+    """add_memory declares ``content`` before ``project_id``, so a leak in
+    ``content`` eats the routing key. The id survives only inside the refused
+    payload, and is recovered from there for QUEUE PLACEMENT only — every
+    scanned token is still vouched for by the one registry check,
+    ``_resolve_project_root``.
+    """
+
+    @staticmethod
+    def _registry(tmp_path) -> dict[str, str]:
+        return {'reify': str(tmp_path / 'reify'), 'dark_factory': str(tmp_path / 'df')}
+
+    @staticmethod
+    def _echo(name: str, value: str) -> str:
+        return '\x3c' + name + '>' + value + closer_for(name)
+
+    @pytest.mark.parametrize(
+        ('raw_value', 'project_id'),
+        [
+            pytest.param(raw_value, project_id, id=f'{index}-{project_id}')
+            for index, (raw_value, project_id) in enumerate(_residue_loss_specimens())
+        ],
+    )
+    def test_every_measured_residue_loss_routes_to_its_own_project(
+        self, tmp_path, raw_value, project_id
+    ):
+        registry = self._registry(tmp_path)
+
+        assert _rederive_project({'raw_value': raw_value}, registry) == registry[project_id]
+
+    def test_an_unregistered_id_routes_nowhere(self, tmp_path):
+        raw = _leaked(_CLEAN_CONTENT, 'project_id', 'not_a_registered_project')
+
+        assert _rederive_project({'raw_value': raw}, self._registry(tmp_path)) is None
+
+    def test_an_unvouched_absolute_root_routes_nowhere(self, tmp_path):
+        chosen = str(tmp_path / 'chosen-by-the-caller')
+        raw = _leaked(_CLEAN_CONTENT, 'project_root', chosen)
+
+        assert _rederive_project({'raw_value': raw}, self._registry(tmp_path)) is None
+        assert not (tmp_path / 'chosen-by-the-caller').exists()
+
+    def test_a_registered_absolute_root_routes_to_itself(self, tmp_path):
+        registry = self._registry(tmp_path)
+        raw = _leaked(_CLEAN_CONTENT, 'project_root', registry['reify'])
+
+        assert _rederive_project({'raw_value': raw}, registry) == registry['reify']
+
+    def test_two_different_registered_projects_route_nowhere(self, tmp_path):
+        registry = self._registry(tmp_path)
+        raw = (
+            _leaked(_CLEAN_CONTENT, 'project_id', 'reify')
+            + self._echo('project_root', registry['dark_factory'])
+        )
+
+        assert _rederive_project({'raw_value': raw}, registry) is None
+
+    def test_one_id_with_two_values_routes_nowhere(self, tmp_path):
+        raw = (
+            _leaked(_CLEAN_CONTENT, 'project_id', 'reify')
+            + self._echo('project_id', 'dark_factory')
+        )
+
+        assert _rederive_project({'raw_value': raw}, self._registry(tmp_path)) is None
+
+    def test_an_id_and_a_root_naming_the_same_project_agree(self, tmp_path):
+        registry = self._registry(tmp_path)
+        raw = (
+            _leaked(_CLEAN_CONTENT, 'project_id', 'reify')
+            + self._echo('project_root', registry['reify'])
+        )
+
+        assert _rederive_project({'raw_value': raw}, registry) == registry['reify']
+
+    @pytest.mark.parametrize(
+        ('record', 'known_projects'),
+        [
+            ({'raw_value': _leaked(_CLEAN_CONTENT, 'project_id', 'reify')}, None),
+            ({'raw_value': _leaked(_CLEAN_CONTENT, 'project_id', 'reify')}, {}),
+            ({}, {'reify': '/reify'}),
+            ({'raw_value': None}, {'reify': '/reify'}),
+            ({'raw_value': 12345}, {'reify': '/reify'}),
+        ],
+        ids=['no-registry', 'empty-registry', 'no-raw-value', 'none-raw-value', 'int-raw-value'],
+    )
+    def test_it_routes_nowhere_without_raising(self, record, known_projects):
+        assert _rederive_project(record, known_projects) is None
