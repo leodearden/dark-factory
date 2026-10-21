@@ -484,7 +484,7 @@ _CALLER_METADATA = {'source': 'acceptance-test', 'spawn_context': 'manual'}
 
 @pytest.mark.asyncio
 async def test_a_fail_open_create_carries_the_dedupe_skipped_marker(server):
-    curator = _Curator(_in_turn({'Work': [CAPPED, CuratorFailureError('llm down')]}))
+    curator = _Curator(_in_turn({'Work': [CAPPED, CuratorFailureError('llm hung', zero_output_timeout=True)]}))
     interceptor, janitor, _ = await server.boot(_config(), curator)
     ticket_id = await _park(interceptor, 'Work', metadata=_CALLER_METADATA)
     curator.batch_raises.append(CuratorFailureError('batch down'))
@@ -492,7 +492,7 @@ async def test_a_fail_open_create_carries_the_dedupe_skipped_marker(server):
     await _let_tiny_backoff_pass()
     await _bounded(janitor.tick())
 
-    reason = 'curator-failed: CuratorFailureError: llm down'
+    reason = 'curator-failed: CuratorFailureError: llm hung'
     assert await _resolve(interceptor, ticket_id) == {
         'status': 'created', 'task_id': '101', 'reason': f'create: {reason}',
     }

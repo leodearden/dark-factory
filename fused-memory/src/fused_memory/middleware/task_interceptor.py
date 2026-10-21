@@ -48,6 +48,7 @@ from fused_memory.middleware import deferral_gate, recon_write_policy
 from fused_memory.middleware.curation_deferral import (
     POOL_UNAVAILABLE_ERRORS,
     CurationRetryPolicy,
+    DeferReason,
     dedupe_skipped_marker,
     pool_defer_reason,
 )
@@ -456,17 +457,21 @@ def _format_ticket_result(row: dict) -> dict:
     return result
 
 
-def _create_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
-    """Degrade a curator failure that escaped ``curate()`` to create.
+def _decision_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
+    """Decide a ticket whose curation raised out of ``curate()``.
 
-    Keeps the ZOT marker, so the no-orchestrator path still gets swept and
-    stamped even though no escalation could be filed for it.
+    A zero-output hang degrades to create with the ZOT marker, so the
+    no-orchestrator path still gets swept and stamped even though no
+    escalation could be filed for it. Any other failure defers, so the ticket
+    is parked until the curator can judge it.
     """
+    if not exc.zero_output_timeout:
+        return CuratorDecision.deferred(DeferReason.LLM_FAILED)
     return CuratorDecision(
         action='create',
         justification=f'curator-failed: {exception_summary(exc)}',
         degraded=True,
-        degraded_by_zot=exc.zero_output_timeout,
+        degraded_by_zot=True,
     )
 
 
@@ -4347,10 +4352,12 @@ class TaskInterceptor:
         synthetic failed dict WITHOUT mutating the ticket row — the worker may
         still resolve it later.
 
-        ``awaiting_curation`` is the one non-terminal answer: the curator's
-        account pool could not serve, so the submission is durably parked and
-        retried by the ticket janitor. It carries the row's ``reason`` and no
-        ``task_id``; a waiter blocked before the park is woken with it.
+        ``awaiting_curation`` is the one non-terminal answer: the curator
+        could not judge the submission (its account pool, LLM call or corpus
+        was unavailable, its zero-output breaker was open, or it raised), so
+        the submission is durably parked and retried by the ticket janitor. It
+        carries the row's ``reason`` and no ``task_id``; a waiter blocked
+        before the park is woken with it.
 
         The worker-liveness reaper (:meth:`TicketJanitor.tick`) terminalises
         pending tickets whose project's curator worker has died, marking them
@@ -4580,9 +4587,11 @@ class TaskInterceptor:
         Failure handling: an exception escaping the batch is logged, every
         ticket in it is marked ``failed/curator_failed`` (best-effort) and its
         waiters are signalled so ``resolve_ticket`` callers are not blocked
-        forever. The worker never waits on account-pool capacity: a pool that
-        cannot serve comes back as a ``defer`` decision, which parks the ticket
-        durably (``awaiting_curation``) for the ticket janitor to requeue.
+        forever. The worker never waits for the curator to recover: a
+        submission the curator could not judge (pool, LLM, corpus or breaker
+        outage, or a curator that raised) comes back as a ``defer`` decision,
+        which parks the ticket durably (``awaiting_curation``) for the ticket
+        janitor to requeue.
 
         Independent workers per project restore the per-project fairness of
         the old curator_lock approach: project B is never blocked by a slow
@@ -5355,15 +5364,12 @@ class TaskInterceptor:
                     except CuratorFailureError as exc:
                         logger.warning(
                             '_process_add_ticket: curator.curate raised CuratorFailureError '
-                            'for %s; degrading to create. reason=%s',
+                            'for %s; deferring unless it hung with zero output. reason=%s',
                             ticket_id,
                             exc,
                         )
-                        # Degrade gracefully to create — avoids losing the task on
-                        # transient LLM failures.  Record the failure so the facade
-                        # and callers can see it in result_json.
                         curator_degrade_reason = str(exc)
-                        decision = _create_after_curator_failure(exc)
+                        decision = _decision_after_curator_failure(exc)
 
                 status, task_id, reason, result_dict, _ = await self._dispatch_ticket_decision(
                     ticket_id=ticket_id,
@@ -5509,11 +5515,14 @@ class TaskInterceptor:
         Per-ticket failures are isolated: one ticket failing does not prevent
         other tickets from being processed.
 
-        A curator account pool that cannot serve (``POOL_UNAVAILABLE_ERRORS``,
-        whether returned as ``defer`` decisions or raised from
-        ``curate_batch_prepared``) parks every LLM-bound ticket
-        ``awaiting_curation``, and a within-batch drop onto a parked sibling
-        parks with it; nothing is created for them.
+        A submission the curator could not judge parks ``awaiting_curation``,
+        and a within-batch drop onto a parked sibling parks with it; nothing
+        is created for them. That covers a ``defer`` decision (pool, LLM,
+        corpus or breaker outage), an account pool that cannot serve raised
+        from ``curate_batch_prepared`` (``POOL_UNAVAILABLE_ERRORS``), a
+        :class:`CuratorFailureError` escaping ``curate()`` other than a
+        zero-output hang, and any other exception ``curate_batch_prepared``
+        raises instead of deciding.
         """
         if self._ticket_store is None:
             return
@@ -5681,9 +5690,10 @@ class TaskInterceptor:
                         '_process_add_tickets_batch_prepared: '
                         'curate_batch_prepared raised CuratorFailureError '
                         'for project %s; falling back to %d individual '
-                        'curate() calls',
+                        'curate() calls: %s',
                         project_id,
                         len(non_none_prepared),
+                        exc,
                     )
                     # Iterate curatable_records only — unprepared_records are
                     # curated exactly once by the dedicated backfill loop
@@ -5702,20 +5712,19 @@ class TaskInterceptor:
                                 project_root,
                             )
                         except CuratorFailureError as e:
-                            rec.decision = _create_after_curator_failure(e)
+                            rec.decision = _decision_after_curator_failure(e)
                             rec.degrade_reason = str(e)
-                    # Refer to exc to satisfy linters; main signal logged above.
-                    _ = exc
-                except Exception:  # pyright: ignore[reportUnusedExcept]
+                except Exception:
                     logger.exception(
                         '_process_add_tickets_batch_prepared: '
                         'curate_batch_prepared failed for project %s; '
-                        'degrading all %d candidates to create',
+                        'deferring %d candidates',
                         project_id,
-                        len(non_none_prepared),
+                        len(curatable_records),
                     )
-                    for rec in records:
-                        rec.decision = None
+                    for rec in curatable_records:
+                        rec.decision = CuratorDecision.deferred(DeferReason.CURATOR_RAISED)
+                        rec.target = None
 
             # Backfill any unprepared candidates via single-item curate() so
             # we still get a curator decision instead of falling through to
@@ -5735,7 +5744,7 @@ class TaskInterceptor:
                             project_root,
                         )
                     except CuratorFailureError as exc:
-                        rec.decision = _create_after_curator_failure(exc)
+                        rec.decision = _decision_after_curator_failure(exc)
                         rec.degrade_reason = str(exc)
 
             # ── Topologically-ordered dispatch ────────────────────────────────

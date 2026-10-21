@@ -184,7 +184,7 @@ async def _submit_normal_and_get(
     ``task_kind`` on this path: a no-op 'create' decision carries no routing
     opinion of its own.
     """
-    async def _neutral_curate(self, candidate, project_id, project_root):
+    async def _neutral_curate(self, candidate, project_id, project_root, *, prepared=None):
         return CuratorDecision(action='create', justification='ζ-test-neutralized')
 
     monkeypatch.setattr(TaskCurator, 'curate', _neutral_curate)
