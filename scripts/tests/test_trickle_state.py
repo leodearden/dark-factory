@@ -10,7 +10,7 @@ The classifier under test is not a tuned heuristic; it is a derivation from
 Every counter fixture below therefore SATISFIES that identity — an
 inconsistent fixture would prove nothing about a classifier derived from it.
 
-The three outcomes:
+The outcomes of a night that exited 0 and was not deferred by the usage cap:
 
 - ``productive`` — ``selected > 0``; digests were built.
 - ``barren``     — ``selected == 0`` and real, distinct, non-duplicate signal
@@ -21,6 +21,9 @@ The three outcomes:
   decision 7 protects, so a quiet or dormant project can never be
   classified barren — the no-false-alarm guarantee as a PROOF from the
   invariant rather than a threshold someone picked.
+
+A night that did not exit 0 is ``failed``; one the usage cap deferred is
+``deferred``.
 """
 from __future__ import annotations
 
@@ -31,15 +34,17 @@ import os
 import pwd
 import tempfile
 from datetime import UTC, date, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 
 import pytest
 from legibility import trickle_state
+from legibility.state_docs import Malformed, Missing, Ok
 from legibility.trickle_state import (
-    OUTCOME_BARREN,
-    OUTCOME_FAILED,
-    OUTCOME_PRODUCTIVE,
-    OUTCOME_QUIET,
+    CensusFireStreak,
+    RunCounters,
+    RunOutcome,
+    TrickleState,
     classify_run,
 )
 
@@ -51,11 +56,11 @@ def _counters(
     below_sampling_cut=0,
     budget_skipped=0,
     selected_count=0,
-):
-    """Build a classify_run kwargs dict whose ``total_records`` is DERIVED
-    from the other five counters, so every fixture satisfies SampleResult's
-    conservation identity by construction."""
-    return dict(
+) -> RunCounters:
+    """A RunCounters whose ``total_records`` is DERIVED from the other five
+    counters, so every fixture satisfies SampleResult's conservation
+    identity by construction."""
+    return RunCounters(
         total_records=(
             zero_signal_dropped
             + dedupe_collapsed
@@ -71,28 +76,25 @@ def _counters(
     )
 
 
-def _classify(exit_code=0, **counters):
-    """Call classify_run with a derived-total counter set and an explicit
-    exit code.
-
-    ``exit_code`` is a REQUIRED keyword-only parameter of ``classify_run``
-    (task 4514), so every call site must state it. It lives here rather
-    than in ``_counters`` because it is not a counter and must not be
-    folded into the conservation identity that helper exists to satisfy."""
-    return classify_run(exit_code=exit_code, **_counters(**counters))
+def _classify(exit_code=0, *, capped=False, **counters):
+    """classify_run over a derived-total counter set, with the exit code and
+    cap verdict stated explicitly (both are required keywords)."""
+    return classify_run(
+        exit_code=exit_code, counters=_counters(**counters), capped=capped
+    )
 
 
 class TestClassifyRun:
-    """The three-valued absence classifier."""
+    """The absence classifier over a night that exited 0 uncapped."""
 
     def test_selected_is_productive(self):
-        assert _classify(selected_count=3) == OUTCOME_PRODUCTIVE
+        assert _classify(selected_count=3) == RunOutcome.PRODUCTIVE
 
     def test_partially_truncated_night_is_still_productive(self):
         """A night that digested SOMETHING and skipped the rest on budget is
         the byte budget working as designed — never barren."""
         result = _classify(selected_count=2, budget_skipped=9)
-        assert result == OUTCOME_PRODUCTIVE
+        assert result == RunOutcome.PRODUCTIVE
 
     def test_selected_with_every_other_door_open_is_productive(self):
         result = _classify(
@@ -102,51 +104,50 @@ class TestClassifyRun:
             dedupe_collapsed=2,
             zero_signal_dropped=5,
         )
-        assert result == OUTCOME_PRODUCTIVE
+        assert result == RunOutcome.PRODUCTIVE
 
     def test_budget_door_is_barren(self):
         """Reproduction of the real 2026-07-16..29 incident: candidates
         existed, competed, and were ALL discarded on the byte budget."""
         result = _classify(selected_count=0, budget_skipped=4)
-        assert result == OUTCOME_BARREN
+        assert result == RunOutcome.BARREN
 
     def test_sampling_cut_door_is_barren(self):
-        """The sibling absence mode task 3270 does NOT cover: real, distinct
-        signal held back by the sampling cut, nothing digested. Different
-        remedy (sampling.top_fraction/per_stratum_min, never
-        budgets.max_daily_digest_bytes) — see SampleResult's docstring."""
+        """Real, distinct signal held back by the sampling cut, nothing
+        digested. Different remedy (sampling.top_fraction/per_stratum_min,
+        never budgets.max_daily_digest_bytes) — see SampleResult's
+        docstring."""
         result = _classify(
             selected_count=0, below_sampling_cut=3, budget_skipped=0
         )
-        assert result == OUTCOME_BARREN
+        assert result == RunOutcome.BARREN
 
     def test_both_doors_open_is_barren(self):
         result = _classify(
             selected_count=0, below_sampling_cut=3, budget_skipped=4
         )
-        assert result == OUTCOME_BARREN
+        assert result == RunOutcome.BARREN
 
     def test_dormant_project_is_quiet(self):
         """All counters zero — nothing was even enumerated. A dormant
         project is a legitimate state, not a degradation."""
-        assert _classify() == OUTCOME_QUIET
+        assert _classify() == RunOutcome.QUIET
 
     def test_all_zero_signal_is_quiet(self):
         result = _classify(zero_signal_dropped=17)
-        assert result == OUTCOME_QUIET
+        assert result == RunOutcome.QUIET
 
     def test_zero_signal_plus_dedupe_only_is_quiet(self):
         result = _classify(
             zero_signal_dropped=6, dedupe_collapsed=3
         )
-        assert result == OUTCOME_QUIET
+        assert result == RunOutcome.QUIET
 
-    def test_outcome_constants_are_distinct_strings(self):
-        outcomes = {
-            OUTCOME_PRODUCTIVE, OUTCOME_QUIET, OUTCOME_BARREN, OUTCOME_FAILED,
+    def test_the_outcome_vocabulary_is_a_str_enum_of_five_values(self):
+        assert issubclass(RunOutcome, StrEnum)
+        assert {member.value for member in RunOutcome} == {
+            'productive', 'quiet', 'barren', 'failed', 'deferred',
         }
-        assert len(outcomes) == 4
-        assert all(isinstance(o, str) and o for o in outcomes)
 
 
 class TestQuietNightNeverBarren:
@@ -173,7 +174,7 @@ class TestQuietNightNeverBarren:
             budget_skipped=0,
             selected_count=0,
         )
-        assert result == OUTCOME_QUIET, (
+        assert result == RunOutcome.QUIET, (
             f"zero_signal_dropped={zero_signal_dropped} "
             f"dedupe_collapsed={dedupe_collapsed} classified {result!r}; a "
             f"night where every record left by the zero-signal or dedupe "
@@ -183,62 +184,50 @@ class TestQuietNightNeverBarren:
 
 
 class TestFailedOutcome:
-    """The fourth outcome and its PRIORITY over the other three.
-
-    A run that did not complete cannot be described by the sampler
+    """A run that did not complete cannot be described by the sampler
     counters: ``selected_count > 0`` proves signal reached the digest
     stage, never that the night FINISHED. So ``exit_code != 0`` is read
     first and wins outright.
     """
 
-    def test_failed_constant_is_the_expected_string(self):
-        assert OUTCOME_FAILED == 'failed'
+    def test_failed_member_is_the_expected_string(self):
+        assert RunOutcome.FAILED == 'failed'
 
     def test_failure_beats_productive(self):
-        """THE regression this task exists for. The 2026-08-18 reify run
-        selected six digests, exited 1, applied 0 and made no commit — and
-        recorded ``productive``. Generalised: a permanently broken coder
-        samples > 0, storms, exits 1, and records ``productive`` / streak
-        0 / a fresh ``last_productive_at`` every night forever."""
-        assert _classify(exit_code=1, selected_count=6) == OUTCOME_FAILED
+        """The 2026-08-18 reify run selected six digests, exited 1, applied
+        0 and made no commit — and recorded ``productive``."""
+        assert _classify(exit_code=1, selected_count=6) == RunOutcome.FAILED
 
     def test_failure_beats_barren_at_the_budget_door(self):
-        assert _classify(exit_code=1, budget_skipped=4) == OUTCOME_FAILED
+        assert _classify(exit_code=1, budget_skipped=4) == RunOutcome.FAILED
 
     def test_failure_beats_barren_at_the_sampling_cut(self):
-        assert _classify(exit_code=1, below_sampling_cut=3) == OUTCOME_FAILED
+        assert _classify(exit_code=1, below_sampling_cut=3) == RunOutcome.FAILED
 
     def test_failure_beats_quiet(self):
-        assert _classify(exit_code=1) == OUTCOME_FAILED
-        assert _classify(exit_code=1, zero_signal_dropped=17) == OUTCOME_FAILED
+        assert _classify(exit_code=1) == RunOutcome.FAILED
+        assert _classify(exit_code=1, zero_signal_dropped=17) == RunOutcome.FAILED
 
     @pytest.mark.parametrize('exit_code', [1, 2, 127, 137, -1])
     def test_any_non_zero_code_is_failed(self, exit_code):
         """Not just 1. 127 is a missing interpreter, 137 a SIGKILL/OOM, and
         a negative code is how ``subprocess`` reports a signal — every one
         of them is a night that did not finish."""
-        assert _classify(exit_code=exit_code, selected_count=6) == OUTCOME_FAILED
+        assert _classify(exit_code=exit_code, selected_count=6) == RunOutcome.FAILED
 
     def test_a_clean_exit_still_classifies_by_the_counters(self):
-        """The no-false-alarm guarantee is unweakened BY CONSTRUCTION: the
-        new branch is gated purely on ``exit_code != 0``, so an
-        ``exit_code == 0`` night falls through to exactly the branches
-        that classified it before."""
-        assert _classify(exit_code=0) == OUTCOME_QUIET
-        assert _classify(exit_code=0, selected_count=3) == OUTCOME_PRODUCTIVE
-        assert _classify(exit_code=0, budget_skipped=4) == OUTCOME_BARREN
+        assert _classify(exit_code=0) == RunOutcome.QUIET
+        assert _classify(exit_code=0, selected_count=3) == RunOutcome.PRODUCTIVE
+        assert _classify(exit_code=0, budget_skipped=4) == RunOutcome.BARREN
 
     @pytest.mark.parametrize('zero_signal_dropped', range(0, 6))
     @pytest.mark.parametrize('dedupe_collapsed', range(0, 6))
     def test_a_quiet_night_that_exited_zero_is_still_never_barren(
         self, zero_signal_dropped, dedupe_collapsed
     ):
-        """``TestQuietNightNeverBarren``'s 36-case property RE-STATED with
-        an explicit ``exit_code=0`` rather than replaced, so PRD decision
-        7's guarantee stays MEASURED across the contract change. The proof
-        it rests on is ``trickle_state.py::classify_run``'s "WHY BRANCH 3
-        IS PROVABLY SAFE" derivation from the conservation identity — not
-        restated here."""
+        """``TestQuietNightNeverBarren``'s property RE-STATED with an
+        explicit ``exit_code=0``, so the guarantee stays measured across the
+        failed branch."""
         result = _classify(
             exit_code=0,
             zero_signal_dropped=zero_signal_dropped,
@@ -247,7 +236,376 @@ class TestFailedOutcome:
             budget_skipped=0,
             selected_count=0,
         )
-        assert result == OUTCOME_QUIET
+        assert result == RunOutcome.QUIET
+
+
+class TestDeferredOutcome:
+    """A night the usage cap deferred coded nothing, so its counters say
+    nothing about whether signal flows or the pipeline finishes."""
+
+    @pytest.mark.parametrize('counters', [
+        pytest.param(dict(selected_count=6), id='digests-selected'),
+        pytest.param(dict(budget_skipped=4), id='budget-door-open'),
+        pytest.param(dict(below_sampling_cut=3), id='sampling-door-open'),
+        pytest.param(dict(), id='all-zero'),
+    ])
+    def test_a_capped_clean_exit_is_deferred_whatever_the_counters(
+        self, counters
+    ):
+        assert _classify(exit_code=0, capped=True, **counters) == (
+            RunOutcome.DEFERRED
+        )
+
+    @pytest.mark.parametrize('exit_code', [1, 137])
+    def test_a_capped_night_that_crashed_is_failed(self, exit_code):
+        assert _classify(
+            exit_code=exit_code, capped=True, selected_count=6
+        ) == RunOutcome.FAILED
+
+    def test_capped_is_a_required_keyword(self):
+        with pytest.raises(TypeError):
+            classify_run(exit_code=0, counters=_counters())  # type: ignore[call-arg]
+
+
+class TestRunCounters:
+    @pytest.mark.parametrize('field', [
+        f.name for f in dataclasses.fields(RunCounters)
+    ])
+    @pytest.mark.parametrize('bad', [-1, '3', True, 2.0])
+    def test_a_negative_or_non_int_counter_is_rejected_by_name(self, field, bad):
+        values = dataclasses.asdict(_counters())
+        values[field] = bad
+        with pytest.raises(ValueError, match=field):
+            RunCounters(**values)
+
+
+_CENSUS_STATE = '/p/docs/legibility/census-state.json'
+
+_T0 = datetime(2026, 7, 1, 3, 0, 0, tzinfo=UTC)
+
+
+def _state(**overrides) -> TrickleState:
+    """A fully populated TrickleState: every optional field set."""
+    fields = dict(
+        project_id='dark_factory',
+        target_date=date(2026, 7, 1),
+        recorded_at=_T0,
+        exit_code=0,
+        outcome=RunOutcome.PRODUCTIVE,
+        applied=2,
+        commit_made=True,
+        budget_suppressed=False,
+        capped=False,
+        consecutive_barren_runs=0,
+        consecutive_failed_runs=0,
+        last_productive_at=_T0,
+        last_scheduled_target_date=date(2026, 7, 1),
+        census_fired=True,
+        census_fire_streak=CensusFireStreak(
+            fires=2,
+            last_census_at='2026-06-01',
+            census_state_path=_CENSUS_STATE,
+            since='2026-06-30',
+        ),
+        counters=_counters(selected_count=2, zero_signal_dropped=4),
+        retry_backlog={date(2026, 6, 29): 1},
+        barren_escalated=True,
+    )
+    fields.update(overrides)
+    return TrickleState(**fields)
+
+
+def _pre_gamma_doc(**overrides) -> dict:
+    """A document exactly as the first record_run wrote it: no
+    consecutive_failed_runs, capped, retry_backlog,
+    last_scheduled_target_date, census fields or barren_escalated."""
+    doc = {
+        'schema_version': 1,
+        'project_id': 'dark_factory',
+        'target_date': '2026-07-01',
+        'recorded_at': '2026-07-01T03:00:00+00:00',
+        'exit_code': 0,
+        'outcome': 'barren',
+        'applied': 0,
+        'commit_made': False,
+        'budget_suppressed': False,
+        'consecutive_barren_runs': 2,
+        'last_productive_at': None,
+        'counters': {
+            'total_records': 4,
+            'zero_signal_dropped': 0,
+            'dedupe_collapsed': 0,
+            'below_sampling_cut': 0,
+            'budget_skipped': 4,
+            'selected_count': 0,
+        },
+    }
+    doc.update(overrides)
+    return doc
+
+
+def _write(tmp_path: Path, doc) -> Path:
+    path = tmp_path / 'trickle-state.json'
+    path.write_text(json.dumps(doc))
+    return path
+
+
+def _warnings(caplog):
+    return [r for r in caplog.records if r.levelname == 'WARNING']
+
+
+class TestTrickleStateCodec:
+    def test_a_fully_populated_state_round_trips(self):
+        state = _state()
+        assert TrickleState.from_json(state.to_json()) == state
+
+    def test_the_round_trip_survives_json_text(self):
+        state = _state(outcome=RunOutcome.DEFERRED, capped=True)
+        raw = json.loads(json.dumps(state.to_json()))
+        assert TrickleState.from_json(raw) == state
+
+    def test_to_json_writes_the_recorded_key_set(self):
+        assert set(_state().to_json()) == {
+            'schema_version', 'project_id', 'target_date', 'recorded_at',
+            'exit_code', 'outcome', 'applied', 'commit_made',
+            'budget_suppressed', 'capped', 'consecutive_barren_runs',
+            'consecutive_failed_runs', 'last_productive_at',
+            'last_scheduled_target_date', 'census_fired',
+            'census_fire_streak', 'counters', 'retry_backlog',
+            'barren_escalated',
+        }
+
+    def test_to_json_uses_iso_text_and_plain_values(self):
+        doc = _state().to_json()
+        assert doc['schema_version'] == trickle_state.STATE_SCHEMA_VERSION
+        assert doc['target_date'] == '2026-07-01'
+        assert doc['recorded_at'] == '2026-07-01T03:00:00+00:00'
+        assert doc['last_productive_at'] == '2026-07-01T03:00:00+00:00'
+        assert doc['outcome'] == 'productive'
+        assert doc['retry_backlog'] == {'2026-06-29': 1}
+        assert doc['census_fire_streak'] == {
+            'fires': 2,
+            'last_census_at': '2026-06-01',
+            'census_state_path': _CENSUS_STATE,
+            'since': '2026-06-30',
+        }
+        assert doc['counters']['selected_count'] == 2
+        assert doc['barren_escalated'] is True
+
+    def test_the_backlog_is_read_only(self):
+        state = _state()
+        with pytest.raises(TypeError):
+            state.retry_backlog[date(2026, 7, 2)] = 1  # type: ignore[index]
+
+    def test_the_state_is_frozen(self):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            _state().consecutive_barren_runs = 9  # type: ignore[misc]
+
+
+class TestLoadState:
+    """``load_state(path)`` answers Missing | Malformed(reason) | Ok(state)."""
+
+    def test_missing_file_is_missing_and_silent(self, tmp_path, caplog):
+        """A project that has never recorded a run is a NORMAL state, not a
+        degradation — so it logs nothing."""
+        path = tmp_path / 'nope.json'
+        with caplog.at_level('WARNING'):
+            read = trickle_state.load_state(path)
+
+        assert read == Missing(path)
+        assert not caplog.records
+
+    def test_invalid_json_is_malformed_with_one_warning(self, tmp_path, caplog):
+        path = tmp_path / 'trickle-state.json'
+        path.write_text('{not json at all')
+
+        with caplog.at_level('WARNING'):
+            read = trickle_state.load_state(path)
+
+        assert isinstance(read, Malformed)
+        assert 'JSON' in read.reason
+        assert len(_warnings(caplog)) == 1
+
+    @pytest.mark.parametrize('doc, field', [
+        pytest.param(['a', 'list'], 'object', id='non-object'),
+        pytest.param(_pre_gamma_doc(schema_version=99999), 'schema_version',
+                     id='unknown-schema-version'),
+        pytest.param(_pre_gamma_doc(outcome='sideways'), 'outcome',
+                     id='unknown-outcome'),
+        pytest.param(_pre_gamma_doc(recorded_at='not-a-timestamp'),
+                     'recorded_at', id='unparseable-recorded_at'),
+        pytest.param(_pre_gamma_doc(consecutive_barren_runs='2'),
+                     'consecutive_barren_runs', id='non-int-streak'),
+        pytest.param(_pre_gamma_doc(barren_escalated='yes'),
+                     'barren_escalated', id='non-bool-escalated'),
+        pytest.param(_pre_gamma_doc(counters={'total_records': 1}),
+                     'zero_signal_dropped', id='incomplete-counters'),
+    ])
+    def test_an_invalid_document_is_malformed_naming_the_field(
+        self, tmp_path, caplog, doc, field
+    ):
+        """A reader that silently accepts a shape it does not understand is
+        the silent-degradation mode this module exists to close."""
+        path = _write(tmp_path, doc)
+
+        with caplog.at_level('WARNING'):
+            read = trickle_state.load_state(path)
+
+        assert isinstance(read, Malformed)
+        assert field in read.reason
+        assert len(_warnings(caplog)) == 1
+
+    def test_unreadable_path_is_malformed_not_raised(self, tmp_path, caplog):
+        """A directory where a file is expected raises OSError on read; the
+        reader must absorb it, never propagate."""
+        path = tmp_path / 'trickle-state.json'
+        path.mkdir()
+
+        with caplog.at_level('WARNING'):
+            read = trickle_state.load_state(path)
+
+        assert isinstance(read, Malformed)
+
+    def test_a_valid_document_is_ok(self, tmp_path):
+        state = _state()
+        path = _write(tmp_path, state.to_json())
+
+        assert trickle_state.load_state(path) == Ok(state)
+
+
+class TestPreGammaDocuments:
+    """Every live state file predates some additive field. Such a document
+    must load Ok with documented defaults: reading it malformed would be a
+    guaranteed false alarm per project on the first post-deploy probe."""
+
+    def test_the_original_writer_shape_loads_ok(self, tmp_path, caplog):
+        path = _write(tmp_path, _pre_gamma_doc())
+
+        with caplog.at_level('WARNING'):
+            read = trickle_state.load_state(path)
+
+        assert isinstance(read, Ok)
+        state = read.value
+        assert state.outcome == RunOutcome.BARREN
+        assert state.consecutive_barren_runs == 2
+        assert state.consecutive_failed_runs == 0
+        assert state.capped is False
+        assert dict(state.retry_backlog) == {}
+        assert state.last_scheduled_target_date is None
+        assert state.census_fired is None
+        assert state.census_fire_streak is None
+        assert state.last_productive_at is None
+        assert not _warnings(caplog)
+
+    def test_an_absent_barren_escalated_is_unrecorded_not_false(self, tmp_path):
+        read = trickle_state.load_state(_write(tmp_path, _pre_gamma_doc()))
+        assert isinstance(read, Ok)
+        assert read.value.barren_escalated is None
+
+    @pytest.mark.parametrize('recorded', [True, False])
+    def test_a_recorded_barren_escalated_reads_as_written(
+        self, tmp_path, recorded
+    ):
+        doc = _pre_gamma_doc(barren_escalated=recorded)
+        read = trickle_state.load_state(_write(tmp_path, doc))
+        assert isinstance(read, Ok)
+        assert read.value.barren_escalated is recorded
+
+    @pytest.mark.parametrize('field', [
+        'consecutive_failed_runs', 'capped', 'retry_backlog',
+        'last_scheduled_target_date', 'census_fired', 'census_fire_streak',
+    ])
+    def test_each_later_additive_field_may_be_absent_alone(
+        self, tmp_path, field
+    ):
+        doc = _state().to_json()
+        del doc[field]
+        assert isinstance(trickle_state.load_state(_write(tmp_path, doc)), Ok)
+
+    def test_schema_version_is_not_bumped_for_an_additive_field(self):
+        """Pins the no-bump decision so a later tidy-up bump has to argue
+        with a test."""
+        assert trickle_state.STATE_SCHEMA_VERSION == 1
+
+
+class TestRecordedCensusFireStreak:
+    """The recorded ``census_fire_streak`` keeps its under-reporting parse:
+    an unusable streak object reads as no streak, never as malformed."""
+
+    _WELL_FORMED = {
+        'fires': 2,
+        'last_census_at': '2026-08-02',
+        'census_state_path': _CENSUS_STATE,
+        'since': '2026-07-01',
+    }
+
+    def _streak(self, raw):
+        return TrickleState.from_json(
+            _pre_gamma_doc(census_fire_streak=raw)
+        ).census_fire_streak
+
+    def test_a_well_formed_streak_parses_to_a_frozen_value(self):
+        streak = self._streak(dict(self._WELL_FORMED))
+
+        assert streak == CensusFireStreak(
+            fires=2,
+            last_census_at='2026-08-02',
+            census_state_path=_CENSUS_STATE,
+            since='2026-07-01',
+        )
+        assert streak is not None
+        for field in dataclasses.fields(streak):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(streak, field.name, None)
+
+    def test_a_never_censused_anchor_parses(self):
+        streak = self._streak(dict(self._WELL_FORMED, last_census_at=None))
+        assert streak is not None
+        assert streak.last_census_at is None
+
+    @pytest.mark.parametrize('raw', [
+        pytest.param(None, id='null'),
+        pytest.param([1, 2], id='not-a-dict'),
+        pytest.param('streak', id='a-string'),
+    ])
+    def test_no_streak_object_parses_to_none(self, raw):
+        assert self._streak(raw) is None
+
+    @pytest.mark.parametrize('field, value', [
+        pytest.param('fires', '3', id='fires-str'),
+        pytest.param('fires', True, id='fires-bool'),
+        pytest.param('fires', 0, id='fires-zero'),
+        pytest.param('fires', -1, id='fires-negative'),
+        pytest.param('census_state_path', None, id='path-null'),
+        pytest.param('since', 20260701, id='since-int'),
+        pytest.param('last_census_at', 20260802, id='anchor-int'),
+    ])
+    def test_an_unusable_field_parses_to_none(self, field, value):
+        assert self._streak(dict(self._WELL_FORMED, **{field: value})) is None
+
+
+class TestRecordedRetryBacklog:
+    """The recorded ``retry_backlog`` keeps :func:`parse_retry_backlog`'s
+    under-reporting parse inside the codec."""
+
+    def test_invalid_entries_are_dropped_and_valid_ones_kept(self):
+        raw = {
+            '2026-07-01': 2,
+            'not-a-date': 1,
+            '2026-07-02': 0,
+            '2026-07-03': -1,
+            '2026-07-04': True,
+        }
+        state = TrickleState.from_json(_pre_gamma_doc(retry_backlog=raw))
+        assert dict(state.retry_backlog) == {
+            date(2026, 7, 1): 2, date(2026, 7, 2): 0,
+        }
+
+    @pytest.mark.parametrize('raw', [['2026-07-01'], '2026-07-01', 3])
+    def test_a_non_mapping_backlog_reads_empty(self, raw):
+        state = TrickleState.from_json(_pre_gamma_doc(retry_backlog=raw))
+        assert dict(state.retry_backlog) == {}
+
 
 class TestTrickleStatePath:
     """Where the state file lives — and, just as load-bearing, WHY it is
@@ -428,98 +786,6 @@ class TestTrickleStatePath:
         ), f'{result} must not live under the git-tracked docs/legibility/'
 
 
-class TestLoadState:
-    """The three-valued reader.
-
-    Shape AND vocabulary are copied VERBATIM from the sibling reader in
-    this same package, ``census_trigger.load_census_state``
-    (census_trigger.py:239) — same tuple shape, same literal status
-    strings ``'missing' | 'malformed' | 'ok'`` (NOT ``'invalid'``), same
-    fail-safe posture — so the two state readers in scripts/legibility/
-    cannot drift into two vocabularies for one concept.
-    """
-
-    def test_missing_file_is_missing_and_silent(self, tmp_path, caplog):
-        """A project that has never recorded a run is a NORMAL state, not a
-        degradation — so it logs nothing."""
-        with caplog.at_level('WARNING'):
-            status, data = trickle_state.load_state(tmp_path / 'nope.json')
-
-        assert (status, data) == ('missing', None)
-        assert not caplog.records
-
-    def test_invalid_json_is_malformed_with_one_warning(self, tmp_path, caplog):
-        path = tmp_path / 'trickle-state.json'
-        path.write_text('{not json at all')
-
-        with caplog.at_level('WARNING'):
-            status, data = trickle_state.load_state(path)
-
-        assert (status, data) == ('malformed', None)
-        assert len([r for r in caplog.records if r.levelname == 'WARNING']) == 1
-
-    def test_non_dict_top_level_is_malformed(self, tmp_path, caplog):
-        path = tmp_path / 'trickle-state.json'
-        path.write_text('["a", "list"]')
-
-        with caplog.at_level('WARNING'):
-            status, data = trickle_state.load_state(path)
-
-        assert (status, data) == ('malformed', None)
-        assert len([r for r in caplog.records if r.levelname == 'WARNING']) == 1
-
-    def test_unknown_schema_version_is_malformed(self, tmp_path, caplog):
-        """A reader that silently accepts a shape it does not understand is
-        the silent-degradation mode this module exists to close."""
-        path = tmp_path / 'trickle-state.json'
-        path.write_text(
-            '{"schema_version": 99999, "project_id": "dark_factory"}'
-        )
-
-        with caplog.at_level('WARNING'):
-            status, data = trickle_state.load_state(path)
-
-        assert (status, data) == ('malformed', None)
-        assert len([r for r in caplog.records if r.levelname == 'WARNING']) == 1
-
-    def test_unreadable_path_is_malformed_not_raised(self, tmp_path, caplog):
-        """A directory where a file is expected raises OSError on read; the
-        reader must absorb it, never propagate."""
-        path = tmp_path / 'trickle-state.json'
-        path.mkdir()
-
-        with caplog.at_level('WARNING'):
-            status, data = trickle_state.load_state(path)
-
-        assert (status, data) == ('malformed', None)
-
-    def test_well_formed_is_ok(self, tmp_path):
-        path = tmp_path / 'trickle-state.json'
-        path.write_text(
-            f'{{"schema_version": {trickle_state.STATE_SCHEMA_VERSION}, '
-            f'"project_id": "dark_factory", "outcome": "quiet"}}'
-        )
-
-        status, data = trickle_state.load_state(path)
-
-        assert status == 'ok'
-        assert isinstance(data, dict)
-        assert data['project_id'] == 'dark_factory'
-
-    def test_uses_the_same_vocabulary_as_the_sibling_reader(self, tmp_path):
-        """Guards against drift into a second vocabulary for one concept."""
-        from legibility import census_trigger
-
-        census_path = tmp_path / 'census-state.json'
-        assert census_trigger.load_census_state(census_path)[0] == 'missing'
-        assert trickle_state.load_state(tmp_path / 'nope.json')[0] == 'missing'
-
-        census_path.write_text('{oops')
-        (tmp_path / 'bad.json').write_text('{oops')
-        assert census_trigger.load_census_state(census_path)[0] == 'malformed'
-        assert trickle_state.load_state(tmp_path / 'bad.json')[0] == 'malformed'
-
-
 def _record(project_id='dark_factory', *, day=1, hour=3, exit_code=0,
             applied=0, commit_made=False, budget_suppressed=False,
             capped=False, scheduled=False,
@@ -566,7 +832,7 @@ class TestRecordRun:
         assert doc['target_date'] == '2026-07-01'
         assert doc['recorded_at'] == '2026-07-01T03:00:00+00:00'
         assert doc['exit_code'] == 0
-        assert doc['outcome'] == OUTCOME_PRODUCTIVE
+        assert doc['outcome'] == RunOutcome.PRODUCTIVE
         assert doc['applied'] == 2
         assert doc['commit_made'] is True
         assert doc['budget_suppressed'] is False
@@ -597,7 +863,7 @@ class TestRecordRun:
         _record(day=1, budget_skipped=4)
         _record(day=2, budget_skipped=4)
         doc = _record(day=3, selected_count=1)
-        assert doc['outcome'] == OUTCOME_PRODUCTIVE
+        assert doc['outcome'] == RunOutcome.PRODUCTIVE
         assert doc['consecutive_barren_runs'] == 0
 
     def test_quiet_run_also_resets_the_streak(self):
@@ -606,7 +872,7 @@ class TestRecordRun:
         _record(day=1, budget_skipped=4)
         _record(day=2, budget_skipped=4)
         doc = _record(day=3, zero_signal_dropped=5)
-        assert doc['outcome'] == OUTCOME_QUIET
+        assert doc['outcome'] == RunOutcome.QUIET
         assert doc['consecutive_barren_runs'] == 0
 
     def test_streak_rearms_after_a_reset(self):
@@ -666,7 +932,7 @@ class TestRecordRun:
         with caplog.at_level('WARNING'):
             doc = _record(day=3, budget_skipped=4)
 
-        assert doc['outcome'] == OUTCOME_BARREN
+        assert doc['outcome'] == RunOutcome.BARREN
         assert doc['consecutive_barren_runs'] == 1, (
             'a lost predecessor restarts the streak from this run alone'
         )
@@ -702,7 +968,7 @@ class TestRecordRunFailedStreak:
         answer."""
         doc = _record(day=1, exit_code=1, selected_count=6)
 
-        assert doc['outcome'] == OUTCOME_FAILED
+        assert doc['outcome'] == RunOutcome.FAILED
         assert doc['exit_code'] == 1
         assert doc['counters']['selected_count'] == 6
 
@@ -727,7 +993,7 @@ class TestRecordRunFailedStreak:
 
         capped = _record(day=2, capped=True, selected_count=6)
 
-        assert capped['outcome'] == OUTCOME_PRODUCTIVE
+        assert capped['outcome'] == RunOutcome.PRODUCTIVE
         assert capped['last_productive_at'] == stamp
 
     def test_last_productive_at_stays_none_when_the_first_run_fails(self):
@@ -751,7 +1017,7 @@ class TestRecordRunFailedStreak:
         _record(day=2, exit_code=1)
 
         doc = _record(day=3, **resetter)
-        assert doc['outcome'] != OUTCOME_FAILED
+        assert doc['outcome'] != RunOutcome.FAILED
         assert doc['consecutive_failed_runs'] == 0
 
     def test_failed_streak_rearms_after_a_reset(self):
@@ -769,7 +1035,7 @@ class TestRecordRunFailedStreak:
         assert _record(day=2, budget_skipped=4)['consecutive_barren_runs'] == 2
 
         crashed = _record(day=3, exit_code=1, selected_count=6)
-        assert crashed['outcome'] == OUTCOME_FAILED
+        assert crashed['outcome'] == RunOutcome.FAILED
         assert crashed['consecutive_barren_runs'] == 2, (
             'a crashed run is evidence about the RUN, not about whether '
             'signal is flowing'
@@ -786,7 +1052,7 @@ class TestRecordRunFailedStreak:
         path.write_text(json.dumps({
             'schema_version': trickle_state.STATE_SCHEMA_VERSION,
             'project_id': 'dark_factory',
-            'outcome': OUTCOME_PRODUCTIVE,
+            'outcome': RunOutcome.PRODUCTIVE,
             'consecutive_barren_runs': 0,
             'last_productive_at': '2026-07-01T03:00:00+00:00',
         }))
@@ -826,8 +1092,6 @@ class TestRecordRunFailedStreak:
             < trickle_state.DEFAULT_MAX_BARREN_RUNS
         )
 
-
-_CENSUS_STATE = '/p/docs/legibility/census-state.json'
 
 
 def _fire(anchor: str | None = '2026-08-02', path=_CENSUS_STATE):
@@ -935,7 +1199,7 @@ class TestRecordRunCensusFireStreak:
         path.write_text(json.dumps({
             'schema_version': trickle_state.STATE_SCHEMA_VERSION,
             'project_id': 'dark_factory',
-            'outcome': OUTCOME_QUIET,
+            'outcome': RunOutcome.QUIET,
             'consecutive_barren_runs': 0,
             'consecutive_failed_runs': 0,
             'last_productive_at': None,
@@ -963,66 +1227,6 @@ class TestRecordRunCensusFireStreak:
         census = inspect.signature(trickle_state.record_run).parameters['census']
         assert census.kind is inspect.Parameter.KEYWORD_ONLY
         assert census.default is inspect.Parameter.empty
-
-
-class TestReadCensusFireStreak:
-    """``read_census_fire_streak(doc)``: the ONE parser of the recorded
-    streak, shared by the writer's fold and the census progress probe."""
-
-    _WELL_FORMED = {
-        'fires': 2,
-        'last_census_at': '2026-08-02',
-        'census_state_path': _CENSUS_STATE,
-        'since': '2026-07-01',
-    }
-
-    def test_a_well_formed_streak_parses_to_a_frozen_value(self):
-        streak = trickle_state.read_census_fire_streak(
-            {'census_fire_streak': dict(self._WELL_FORMED)}
-        )
-
-        assert streak == trickle_state.CensusFireStreak(
-            fires=2,
-            last_census_at='2026-08-02',
-            census_state_path=_CENSUS_STATE,
-            since='2026-07-01',
-        )
-        assert streak is not None
-        for field in dataclasses.fields(streak):
-            with pytest.raises(dataclasses.FrozenInstanceError):
-                setattr(streak, field.name, None)
-
-    def test_a_never_censused_anchor_parses(self):
-        raw = dict(self._WELL_FORMED, last_census_at=None)
-        streak = trickle_state.read_census_fire_streak(
-            {'census_fire_streak': raw}
-        )
-        assert streak is not None
-        assert streak.last_census_at is None
-
-    @pytest.mark.parametrize('doc', [
-        pytest.param({}, id='key-absent'),
-        pytest.param({'census_fire_streak': None}, id='null'),
-        pytest.param({'census_fire_streak': [1, 2]}, id='not-a-dict'),
-        pytest.param(None, id='doc-not-a-dict'),
-    ])
-    def test_no_streak_object_parses_to_none(self, doc):
-        assert trickle_state.read_census_fire_streak(doc) is None
-
-    @pytest.mark.parametrize('field, value', [
-        pytest.param('fires', '3', id='fires-str'),
-        pytest.param('fires', True, id='fires-bool'),
-        pytest.param('fires', 0, id='fires-zero'),
-        pytest.param('fires', -1, id='fires-negative'),
-        pytest.param('census_state_path', None, id='path-null'),
-        pytest.param('since', 20260701, id='since-int'),
-        pytest.param('last_census_at', 20260802, id='anchor-int'),
-    ])
-    def test_an_unusable_field_parses_to_none(self, field, value):
-        raw = dict(self._WELL_FORMED, **{field: value})
-        assert trickle_state.read_census_fire_streak(
-            {'census_fire_streak': raw}
-        ) is None
 
 
 class TestReadLastCensusAt:
@@ -1060,48 +1264,29 @@ class TestReadLastCensusAt:
 
 
 class TestRecordedAgeHours:
-    """``recorded_age_hours(doc)`` — the freshness helper SHARED by
-    ``check_trickle_progress.py``'s staleness branch and
-    ``check_trickle_health.py``'s barren-edge suppression.
+    """``recorded_age_hours(state)`` — the freshness reading both probes
+    share, so they cannot drift into two readings of "fresh"."""
 
-    It exists so those two cannot drift into two readings of "fresh"; the
-    three-valued contract below is what lets each caller keep its own
-    distinct wording for an input it cannot assess."""
-
-    def test_a_document_stamped_n_hours_ago_reports_approximately_n(self):
+    def test_a_state_stamped_n_hours_ago_reports_approximately_n(self):
         stamp = datetime.now(UTC) - timedelta(hours=30)
-        age = trickle_state.recorded_age_hours({'recorded_at': stamp.isoformat()})
+        age = trickle_state.recorded_age_hours(_state(recorded_at=stamp))
 
-        assert age is not None
         # A tolerance, not equality: the wall clock advances between the
-        # write above and the read inside the helper.
+        # stamp above and the read inside the helper.
         assert abs(age - 30) < 0.5
 
-    def test_a_naive_recorded_at_is_read_as_utc(self):
-        """Matches the normalization ``check_trickle_progress.py``'s
-        staleness branch already did, so the refactor onto this helper is
-        provably behaviour-preserving on the one input shape most likely
-        to differ."""
+    def test_an_injected_clock_is_used_exactly(self):
+        now = _T0 + timedelta(hours=7)
+        assert trickle_state.recorded_age_hours(_state(), now=now) == 7.0
+
+    def test_a_naive_recorded_at_on_disk_is_read_as_utc(self, tmp_path):
         naive = (datetime.now(UTC) - timedelta(hours=10)).replace(tzinfo=None)
-        age = trickle_state.recorded_age_hours({'recorded_at': naive.isoformat()})
+        doc = _pre_gamma_doc(recorded_at=naive.isoformat())
 
-        assert age is not None
-        assert abs(age - 10) < 0.5
+        read = trickle_state.load_state(_write(tmp_path, doc))
 
-    @pytest.mark.parametrize('doc', [
-        pytest.param({}, id='recorded_at-absent'),
-        pytest.param({'recorded_at': 'not-a-timestamp'}, id='unparseable'),
-        pytest.param({'recorded_at': None}, id='recorded_at-None'),
-        pytest.param(None, id='not-a-dict'),
-        pytest.param('a string', id='a-string'),
-    ])
-    def test_what_cannot_be_assessed_is_none(self, doc):
-        """``None`` means "freshness cannot be assessed" — deliberately NOT
-        "old" and NOT "fresh". Each caller decides what that means, which
-        is exactly what lets the progress probe keep its own unparseable
-        verdict while the health probe treats the same input as
-        post-worthy."""
-        assert trickle_state.recorded_age_hours(doc) is None
+        assert isinstance(read, Ok)
+        assert abs(trickle_state.recorded_age_hours(read.value) - 10) < 0.5
 
 
 def _d(day):
@@ -1574,7 +1759,7 @@ class TestRecordRunRetryBacklog:
         path.write_text(json.dumps({
             'schema_version': trickle_state.STATE_SCHEMA_VERSION,
             'project_id': 'dark_factory',
-            'outcome': OUTCOME_PRODUCTIVE,
+            'outcome': RunOutcome.PRODUCTIVE,
             'consecutive_barren_runs': 0,
             'consecutive_failed_runs': 0,
         }))
@@ -1873,7 +2058,7 @@ class TestDueRetries:
     @pytest.mark.parametrize('doc', [
         pytest.param(None, id='None'),
         pytest.param(['2026-07-01'], id='not-a-dict'),
-        pytest.param({'outcome': OUTCOME_PRODUCTIVE}, id='no-backlog-key'),
+        pytest.param({'outcome': RunOutcome.PRODUCTIVE}, id='no-backlog-key'),
         pytest.param({'retry_backlog': 'garbage'}, id='garbage-backlog'),
         pytest.param(
             {'retry_backlog': {'2026-07-01': 1}}, id='outside-the-window'
