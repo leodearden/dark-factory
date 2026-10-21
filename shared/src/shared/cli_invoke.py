@@ -132,6 +132,15 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         takes the supervisor's unclean path.
 #                                         Neither blocks a queue.
 #
+# orchestrator/evals/runner.py            14-day default OK (esc-4002-1, task
+#   (run_architect_eval invocation)       7320).  A cap lands MID-cell after
+# orchestrator/evals/measurement.py       real spend, which --resume carries
+#   (measured_call invocation)            across the account switch: waiting
+#                                         is ~free, while tainting re-spends
+#                                         it.  AllAccountsCappedException is
+#                                         recorded as an Unmeasured with cause
+#                                         cap_exhausted, never raised.
+#
 # fused_memory/middleware/task_curator.py _CURATOR_CAP_WAIT_SANITY_SECS=120s
 #   (LLM triage calls)                    + park_on_frozen_pool=False.  DEFERS,
 #                                         never creates, when the pool cannot

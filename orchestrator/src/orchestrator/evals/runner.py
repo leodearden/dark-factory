@@ -1175,7 +1175,7 @@ async def run_architect_eval(
         logger.error(
             f'Architect eval {task_id} × {config.name}: all accounts capped '
             f'after {e.retries} retries ({e.elapsed_secs:.1f}s) — giving up on '
-            f'this cell rather than stalling the campaign'
+            f'this cell after the shared cap-wait bound; recorded as cap_tainted'
         )
         outcome = 'blocked'
         arch_unmeasured = arch_unmeasured or Unmeasured(
