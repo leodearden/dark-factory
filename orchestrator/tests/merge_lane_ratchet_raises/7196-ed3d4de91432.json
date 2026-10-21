@@ -1,0 +1,30 @@
+{
+  "task_id": "7196",
+  "reason": "review fix: _finalize_advanced_merge's docstring and queue-verified-tip comment name the already-on-main caller, whose sha is on main but behind its tip",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 3556,
+      "current": 3562
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 1609,
+      "current": 1615
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57380,
+      "current": 57386
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31632,
+      "current": 31638
+    }
+  ]
+}

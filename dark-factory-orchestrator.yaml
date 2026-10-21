@@ -84,9 +84,23 @@ lock_depth: 12
 # RED TIER: module_overrides is not in RELOADABLE_FIELDS and _limit_for memoises
 # per process, so this takes effect at the next orchestrator restart (the
 # explicit deploy task filed with this carrier), not on reload_config.
+#
+# THE TWO RATCHET JSON PATHS (Leo's ruling 3 of 2026-10-21, task 7298) are
+# UNBOUNDED, not widened: 99 is above any max_concurrent_tasks this repo has run.
+# They are derived artefacts the gate regenerates, declared in metadata.files by
+# ~115 pending tasks, and that lock serialised dispatch on top of the merge
+# conflicts it was meant to prevent. Authorizations are now one file each and the
+# baseline merges through the ratchet-baseline driver, so concurrent declarers
+# no longer collide. The ledger keys are the RETIRED array path, kept because
+# pending tasks still declare it, and the directory's one fixed file. A PARK
+# still reserves these keys exclusively (task 7313 makes the park gate honour the
+# override). Same red tier as above.
 module_overrides:
   orchestrator/src/orchestrator/workflow.py: 2
   orchestrator/src/orchestrator/harness.py: 2
+  orchestrator/tests/merge_lane_ratchet_baseline.json: 99
+  orchestrator/tests/merge_lane_ratchet_authorized_raises.json: 99
+  orchestrator/tests/merge_lane_ratchet_raises/_README.json: 99
 
 # Verification commands (dark-factory multi-subproject layout)
 # test_command fans out per-subproject so each runs in its own venv with its
