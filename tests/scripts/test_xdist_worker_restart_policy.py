@@ -300,6 +300,8 @@ def _run_synthetic_suite(
 ) -> subprocess.CompletedProcess[str]:
     """Run the suite at ``-n REPRO_INITIAL_WORKERS --dist loadgroup`` plus *restart_args*.
 
+    *restart_args* must be ``--max-worker-restart`` flags; anything else is refused.
+
     ``PYTEST_*`` is scrubbed from the child's environment so an inherited
     ``PYTEST_ADDOPTS`` (a ``-q``, say) cannot suppress the literals asserted on.
 
@@ -307,6 +309,12 @@ def _run_synthetic_suite(
     default pytest temp root; why:
     ``test_xdist_worker_restart_policy.py::test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched``.
     """
+    refused = [arg for arg in restart_args if not arg.startswith(RESTART_FLAG_PREFIX)]
+    if refused:
+        raise ValueError(
+            f'_run_synthetic_suite takes only {RESTART_FLAG_PREFIX} flags (its '
+            f'basetemp and output options are fixed); refused: {refused!r}'
+        )
     missing = [
         plugin for plugin in ('xdist', 'pytest_timeout')
         if importlib.util.find_spec(plugin) is None
