@@ -2,7 +2,9 @@
 
 Every test runs the script's ``main`` against a real ``WriteJournal``-initialized
 journal under ``tmp_path``, seeded by direct INSERT with history older than the
-deploy grace, the way an operator would run it against the live file.
+deploy grace, the way an operator would run it against the live file. A test that
+needs a seam ``main`` does not expose (the migration connection, the migration
+clock) calls the public function ``main`` would.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import sqlite3
 import subprocess
 import time
 from collections import Counter
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -20,7 +23,11 @@ import pytest
 from _fm_helpers import load_script_module
 
 from fused_memory.config.schema import WriteJournalConfig
-from fused_memory.services.read_rollup import PREWARM_PRIMARY_KEY_SQL, keeps_read_row
+from fused_memory.services.read_rollup import (
+    DELETE_COUNT_ONLY_READS_SQL,
+    PREWARM_PRIMARY_KEY_SQL,
+    keeps_read_row,
+)
 from fused_memory.services.write_journal import SCHEMA_SQL, WriteJournal
 from fused_memory.services.write_ops_retention import prune_write_ops_pass
 
@@ -229,6 +236,19 @@ class TestMigrateApply:
         assert report['seconds'] < 0.4
 
 
+OUTSIDE = 2.0
+INSIDE = 1.0
+
+
+class _StatementClock:
+    """A virtual monotonic clock that the statement trace advances."""
+
+    now: float = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 class TestTheWriteLockHold:
     """What happens before BEGIN, inside the lock, and after COMMIT, seen through
     the public connect_for_migration seam with SQLite's own statement trace."""
@@ -236,21 +256,20 @@ class TestTheWriteLockHold:
     @pytest.fixture
     def traced(self, journal, capsys, monkeypatch):
         statements: list[str] = []
-        callbacks: list = []
         connect = _script.connect_for_migration
 
         def tracing_connect(path):
             conn = connect(path)
-            conn.set_trace_callback(lambda text: (statements.append(text), *(cb(text) for cb in callbacks)))
+            conn.set_trace_callback(statements.append)
             return conn
 
         monkeypatch.setattr(_script, 'connect_for_migration', tracing_connect)
-        return statements, callbacks
+        return statements
 
     def test_each_chunk_prewarms_then_locks_then_commits_then_checkpoints(
         self, journal, capsys, traced,
     ):
-        statements, _ = traced
+        statements = traced
         prewarm_text = PREWARM_PRIMARY_KEY_SQL.split('?')[0]
 
         code, report, err = _migrate(journal, capsys)
@@ -276,33 +295,33 @@ class TestTheWriteLockHold:
         finally:
             conn.close()
 
-    def test_the_reported_lock_hold_spans_only_the_transaction(
-        self, journal, capsys, traced,
-    ):
-        _, callbacks = traced
+    def test_the_reported_lock_hold_spans_only_the_transaction(self, journal):
+        clock = _StatementClock()
         prewarm_text = PREWARM_PRIMARY_KEY_SQL.split('?')[0]
-        delayed_delete = []
+        delete_text = DELETE_COUNT_ONLY_READS_SQL.split('?')[0]
+        advanced_inside: list[str] = []
 
-        def slow_outside_then_once_inside(text: str) -> None:
+        def advance(text: str) -> None:
             if text.startswith(prewarm_text) or text == 'PRAGMA wal_checkpoint(PASSIVE)':
-                time.sleep(0.2)
-            elif text.startswith('DELETE FROM write_ops') and not delayed_delete:
-                delayed_delete.append(text)
-                time.sleep(0.1)
+                clock.now += OUTSIDE
+            elif text.startswith(delete_text) and not advanced_inside:
+                advanced_inside.append(text)
+                clock.now += INSIDE
 
-        callbacks.append(slow_outside_then_once_inside)
+        with closing(_script.connect_for_migration(journal)) as conn:
+            conn.set_trace_callback(advance)
+            report = _script.migrate(
+                conn,
+                _script.MigrationLimits(
+                    chunk_rowids=11, pause_seconds=0.0, max_seconds=None, max_chunks=None,
+                ),
+                clock=clock,
+            )
 
-        code, report, err = _migrate(journal, capsys)
-
-        assert code == 0, err
-        assert report is not None and report['chunks'] > 1
-        assert (
-            report['max_chunk_seconds']
-            >= 0.2
-            > report['max_lock_seconds']
-            >= 0.1
-            > report['mean_lock_seconds']
-        )
+        assert report.chunks > 1
+        assert report.max_chunk_seconds == 2 * OUTSIDE + INSIDE
+        assert report.max_lock_seconds == INSIDE
+        assert report.mean_lock_seconds == round(INSIDE / report.chunks, 3)
 
 
 def _snapshot(journal: Path, capsys, out: Path, *extra: str) -> int:
