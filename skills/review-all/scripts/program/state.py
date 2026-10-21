@@ -476,7 +476,7 @@ def _shared_key_violations(rows: Sequence[_StreamRow]) -> list[str]:
     ]
 
 
-def _unknown_dep_violations(rows: Sequence[_StreamRow], known: Collection[str]) -> list[str]:
+def _unknown_dep_violations(rows: Sequence[_StreamRow], known: Collection[object]) -> list[str]:
     return [
         f'{row.where}.deps[{d}]: {dep!r} names no stream'
         for row in rows for d, dep in enumerate(row.deps) if dep not in known
@@ -524,7 +524,7 @@ def _cycle_violations(rows: Sequence[_StreamRow]) -> list[str]:
     return []
 
 
-def _cross_stream_violations(rows: Sequence[_StreamRow], known: Collection[str]) -> list[str]:
+def _cross_stream_violations(rows: Sequence[_StreamRow], known: Collection[object]) -> list[str]:
     """The rules streams obey together, checked at parse and again after the ledger's amendments."""
     return (
         _duplicate_id_violations(rows)
