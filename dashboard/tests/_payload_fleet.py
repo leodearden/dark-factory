@@ -31,8 +31,18 @@ from typing import Any
 import pytest
 import yaml
 from _canned_mcp import ByRoot, CannedMCP
-from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS
+from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS, build_dual_escalation_tree
+from _payload_fleet_seed import (
+    EscalationShape,
+    seed_merge_events,
+    seed_pending_escalations,
+    seed_resolved_history,
+    seed_task_results,
+    text,
+)
+from _tasks_db_fixture import task_row, write_tasks_db
 from fastapi.testclient import TestClient
+from shared.project_id import normalize_project_id
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.task_statuses import TERMINAL, TaskStatus
 
@@ -40,6 +50,7 @@ import dashboard.api.escalations as api_escalations
 import dashboard.app
 from dashboard.config import DashboardConfig
 from dashboard.data import active_tasks, escalation_corpus, task_lookup, task_snapshot
+from dashboard.data.escalation_corpus import corpus_queues, reconciliation_queue
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.orchestrator import find_running_orchestrators
 from dashboard.data.scheduler import _scheduler_cache_clear
@@ -68,6 +79,12 @@ class RootCensus:
     skipped: int = 0
     pinned: int = 0
     recovery_events: int = 0
+    pending_escalations: int = 0
+    resolved_escalations: int = 0
+    completed_hours: int = 0
+    claimed_terminal: int = 0
+    merges: int = 0
+    trains: int = 0
 
 
 @dataclass(frozen=True)
@@ -106,6 +123,11 @@ class FleetCensus:
     claimant_len: int
     lock_depth: int
     skip_events_per_task: int
+    metadata_extra_len: int
+    escalation: EscalationShape
+    reconciliation_escalations: int
+    merge_history_days: int
+    live_queue_depth: int
 
 
 CENSUS = FleetCensus(
@@ -119,46 +141,62 @@ CENSUS = FleetCensus(
             {TaskStatus.DONE: 4929, TaskStatus.CANCELLED: 396},
             files_per_row=5, modules=2792, deps_per_100_rows=25,
             parked=5, skipped=4, pinned=17, recovery_events=1,
+            pending_escalations=38, resolved_escalations=1968,
+            completed_hours=1555, claimed_terminal=40, merges=600, trains=50,
         ),
         RootCensus(
             'reify',
             {TaskStatus.PENDING: 2095, TaskStatus.DEFERRED: 223, TaskStatus.IN_PROGRESS: 23},
             {TaskStatus.DONE: 6076, TaskStatus.CANCELLED: 772},
             files_per_row=5, modules=3775, deps_per_100_rows=131, parked=4, skipped=4,
+            pending_escalations=7, resolved_escalations=8658,
+            completed_hours=2123, claimed_terminal=37, merges=600, trains=4,
         ),
         RootCensus(
             'solar-challenge-platform',
             {TaskStatus.PENDING: 499, TaskStatus.IN_PROGRESS: 18, TaskStatus.BLOCKED: 9},
             {TaskStatus.DONE: 715, TaskStatus.CANCELLED: 94},
             files_per_row=8, modules=1255, deps_per_100_rows=247,
+            pending_escalations=35, resolved_escalations=1380,
+            completed_hours=529, merges=400,
         ),
         RootCensus(
             'solar-challenge',
             {TaskStatus.PENDING: 200, TaskStatus.IN_PROGRESS: 20, TaskStatus.BLOCKED: 3},
             {TaskStatus.DONE: 658, TaskStatus.CANCELLED: 133},
             files_per_row=8, modules=354, deps_per_100_rows=270, recovery_events=6,
+            pending_escalations=48, resolved_escalations=633,
+            completed_hours=397, merges=400,
         ),
         RootCensus(
             'scoping-intake',
             {TaskStatus.PENDING: 45, TaskStatus.IN_PROGRESS: 3},
             {TaskStatus.DONE: 50, TaskStatus.CANCELLED: 3},
             files_per_row=5, modules=88, deps_per_100_rows=181,
+            pending_escalations=3, resolved_escalations=67,
+            completed_hours=32, merges=51,
         ),
         RootCensus(
             'know-live',
             {TaskStatus.DEFERRED: 10, TaskStatus.BLOCKED: 6},
             {TaskStatus.DONE: 594, TaskStatus.CANCELLED: 2},
             files_per_row=2, modules=10, deps_per_100_rows=214,
+            pending_escalations=83, resolved_escalations=13,
+            completed_hours=113, merges=300,
         ),
         RootCensus(
             'pump-web-ui', {TaskStatus.BLOCKED: 5}, {TaskStatus.DONE: 14, TaskStatus.CANCELLED: 1},
             files_per_row=1, modules=2,
+            pending_escalations=45,
+            completed_hours=13, merges=15,
         ),
         RootCensus(
             'autopilot-video',
             {TaskStatus.DEFERRED: 1, TaskStatus.BLOCKED: 1},
             {TaskStatus.DONE: 615, TaskStatus.CANCELLED: 37},
             files_per_row=1, modules=2,
+            pending_escalations=31, resolved_escalations=7,
+            completed_hours=58, merges=250,
         ),
         RootCensus('autotrade', {}, {}, orchestrator_running=False),
         RootCensus('mission-control', {}, {}, orchestrator_running=False),
@@ -173,6 +211,13 @@ CENSUS = FleetCensus(
     claimant_len=40,
     lock_depth=4,
     skip_events_per_task=10,
+    metadata_extra_len=3000,
+    escalation=EscalationShape(
+        detail_len=1950, summary_len=150, triage_note_len=250, option_len=110, history_days=30,
+    ),
+    reconciliation_escalations=62,
+    merge_history_days=196,
+    live_queue_depth=5,
 )
 
 TERMINAL_WINDOW_ROOT = 'dark-factory'
@@ -200,13 +245,6 @@ _KNOWN_PS_IMPORTERS = frozenset({
     'dashboard.data.metrics',
     'dashboard.data.burndown',
 })
-
-
-def _text(seed: str, length: int) -> str:
-    """*seed*, padded with ASCII filler to exactly *length* characters."""
-    if len(seed) >= length:
-        raise ValueError(f'seed {seed!r} does not fit in {length} characters')
-    return seed + ' ' + 'x' * (length - len(seed) - 1)
 
 
 def _module_path(index: int, length: int) -> str:
@@ -255,8 +293,9 @@ class _TreeBuilder:
         self._now = now
         self._pool = [_module_path(i, fleet.file_path_len) for i in range(root.modules)]
         self._terminal_total = sum(root.terminal.values())
-        self._description = _text('fleet task description', fleet.description_len)
-        self._prd = _text('plans/fleet', fleet.prd_path_len - len('.md')) + '.md'
+        self._description = text('fleet task description', fleet.description_len)
+        self._prd = text('plans/fleet', fleet.prd_path_len - len('.md')) + '.md'
+        self._notes = text('fleet task notes', fleet.metadata_extra_len)
         self._dep_count = 0
 
     def build(self) -> _Tree:
@@ -290,14 +329,16 @@ class _TreeBuilder:
         self, task_id: int, status: TaskStatus, *,
         files: list[str], dependencies: list[int], prd: bool = False, external: bool = False,
     ) -> dict[str, Any]:
-        metadata: dict[str, Any] = {'files': files}
+        # 'notes' stands for every metadata key no row shaper reads; escalation
+        # cards embed the whole metadata, so its size is theirs.
+        metadata: dict[str, Any] = {'files': files, 'notes': self._notes}
         if prd:
             metadata['prd'] = self._prd
         if external:
             metadata['external_deps'] = [f'fleet-external:{task_id}']
         row: dict[str, Any] = {
             'id': str(task_id),
-            'title': _text(f'{self._root.label} task {task_id}', self._fleet.title_len),
+            'title': text(f'{self._root.label} task {task_id}', self._fleet.title_len),
             'description': self._description,
             'status': status.value,
             'dependencies': dependencies,
@@ -305,7 +346,7 @@ class _TreeBuilder:
             'updatedAt': self._now.isoformat(),
         }
         if status is TaskStatus.IN_PROGRESS:
-            row['claimant_run_id'] = _text(f'run-fleet/{task_id}', self._fleet.claimant_len)
+            row['claimant_run_id'] = text(f'run-fleet/{task_id}', self._fleet.claimant_len)
             row['heartbeat_at'] = self._now.isoformat()
         return row
 
@@ -404,7 +445,11 @@ class FleetMcp:
             'get_scheduler_state': self._scheduler_state,
             'get_scheduler_events': self._scheduler_events,
             'get_external_statuses': self._external_statuses,
+            'get_pending_escalations': self._pending_escalations,
+            'get_merge_queue': self._merge_queue,
+            'get_merge_halt_status': self._merge_halt_status,
         }
+        self._live_queue_depth = fleet.live_queue_depth
 
     async def __call__(self, client, url, tool, args, **kwargs):
         if tool in _TASK_TOOLS:
@@ -417,23 +462,27 @@ class FleetMcp:
             )
         return handler(url, args)
 
-    def _tree(self, label: str) -> _Tree:
+    def tree(self, label: str) -> _Tree:
         try:
             return self._trees[label]
         except KeyError:
             raise LookupError(f'the payload fleet holds no root labelled {label!r}') from None
 
     def _root_tree(self, args: Mapping[str, Any]) -> _Tree:
-        return self._tree(Path(args['project_root']).name)
+        return self.tree(Path(args['project_root']).name)
 
-    def _runtime_state(self, base_url: str, _args: Mapping[str, Any]) -> Mapping[str, Any]:
+    def _tree_at(self, base_url: str) -> _Tree:
+        """The tree of the orchestrator whose escalation server is at *base_url*."""
         # mcp_tool_call is handed a BASE url and posts to its /mcp endpoint,
         # which is the form the config's escalation URLs are written in.
         endpoint = f'{base_url}/mcp'
         label = self._label_by_mcp_endpoint.get(endpoint)
         if label is None:
             raise LookupError(f'the payload fleet has no orchestrator at {endpoint!r}')
-        return self._tree(label).runtime
+        return self.tree(label)
+
+    def _runtime_state(self, base_url: str, _args: Mapping[str, Any]) -> Mapping[str, Any]:
+        return self._tree_at(base_url).runtime
 
     def _scheduler_state(self, _url: str, args: Mapping[str, Any]) -> dict[str, Any]:
         return dict(self._root_tree(args).scheduler_state)
@@ -467,6 +516,27 @@ class FleetMcp:
 
     def _external_statuses(self, _url: str, args: Mapping[str, Any]) -> dict[str, str]:
         return dict.fromkeys(args['deps'], 'done')
+
+    def _merge_queue(self, base_url: str, _args: Mapping[str, Any]) -> dict[str, Any]:
+        """The orchestrator's live merge queue: its newest pending tasks, waiting."""
+        tree = self._tree_at(base_url)
+        waiting = tree.ids(TaskStatus.PENDING)[-self._live_queue_depth:]
+        return {
+            'entries': [
+                {'task_id': str(tid), 'branch': f'task/{tid}', 'state': 'queued',
+                 'age_secs': 60.0 * (n + 1), 'position': n, 'waiter_alive': True}
+                for n, tid in enumerate(waiting)
+            ],
+            'metrics': {},
+        }
+
+    def _merge_halt_status(self, base_url: str, _args: Mapping[str, Any]) -> dict[str, Any]:
+        self._tree_at(base_url)
+        return {'wired': True, 'halted': False, 'owner_esc_id': None}
+
+    def _pending_escalations(self, _url: str, _args: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """No record carries a pins_recovery annotation: a read that succeeded and pins nothing."""
+        return []
 
 
 def _event(at: datetime, task_id: str, event_type: str, data: Mapping[str, Any]) -> dict[str, Any]:
@@ -503,6 +573,72 @@ def _running_orchestrators(fleet: FleetCensus, roots: Sequence[Path]) -> list[di
     ]
 
 
+def _escalated_task_ids(tree: _Tree, count: int) -> list[str]:
+    """The task each of *count* escalations names: two in three a task of *tree*, the rest no task.
+
+    A non-numeric id is how a record about no single task (a disk alarm, a
+    fleet-wide incident) is filed; its row carries no card.
+    """
+    rows = tree.rows
+    return [
+        f'{tree.census.label}-concern-{n}' if n % 3 == 2 or not rows
+        else rows[(n * 37) % len(rows)]['id']
+        for n in range(count)
+    ]
+
+
+def _seed_escalations(
+    config: DashboardConfig, fleet: FleetCensus, substrate: FleetMcp, *, now: datetime,
+) -> None:
+    """Every orchestrator queue's live records and archive, and the reconciliation queue's.
+
+    Reconciliation records name the primary root's active tasks and carry a
+    worktree under it, which is how that queue's rows find their owner.
+    """
+    queues = {queue.label: queue for queue in corpus_queues(config)}
+    for root in fleet.roots:
+        queue_dir = queues[root.label].directory
+        tree = substrate.tree(root.label)
+        seed_pending_escalations(
+            queue_dir, fleet.escalation, _escalated_task_ids(tree, root.pending_escalations), now=now,
+        )
+        seed_resolved_history(queue_dir, fleet.escalation, root.resolved_escalations, now=now)
+    primary = substrate.tree(config.project_root.name)
+    active = [row['id'] for row in primary.rows if row['status'] not in TERMINAL]
+    seed_pending_escalations(
+        reconciliation_queue(config).directory, fleet.escalation,
+        [active[(n * 13) % len(active)] for n in range(fleet.reconciliation_escalations)],
+        now=now, worktree_root=config.project_root,
+    )
+
+
+def _seed_ledgers_and_stores(
+    config: DashboardConfig, fleet: FleetCensus, substrate: FleetMcp, *, now: datetime,
+) -> None:
+    """Each root's run ledger and task store, and the primary root's memory-eval artifacts.
+
+    A task store holds the root's whole tree. Its first ``claimed_terminal``
+    finished tasks still carry a claimant: the violations /invariants lists.
+    """
+    stale = (now - timedelta(hours=6)).isoformat()
+    for root, path in zip(fleet.roots, [config.project_root, *config.known_project_roots], strict=True):
+        rows = substrate.tree(root.label).rows
+        runs_db = path / 'data' / 'orchestrator' / 'runs.db'
+        seed_task_results(runs_db, normalize_project_id(root.label), root.completed_hours, now=now)
+        if rows:
+            seed_merge_events(
+                runs_db, [row['id'] for row in rows], root.merges, root.trains,
+                history_days=fleet.merge_history_days, now=now,
+            )
+        finished = [row for row in rows if row['status'] in TERMINAL]
+        claimed = {row['id'] for row in finished[:root.claimed_terminal]}
+        write_tasks_db(path / '.taskmaster' / 'tasks' / 'tasks.db', [
+            task_row(int(row['id']), row['status'], *((f'run-fleet/{row["id"]}', stale) if row['id'] in claimed else ()))
+            for row in rows
+        ])
+    build_dual_escalation_tree(config.project_root)
+
+
 def _bindings_of(target: object, name: str, known: frozenset[str]) -> list[ModuleType]:
     """Every ``dashboard.*`` module binding *target* as *name*.
 
@@ -527,6 +663,7 @@ def _clear_caches() -> None:
     api_escalations._analytics_memo_clear()
     _scheduler_cache_clear()
     active_tasks._reset_root_rotation()
+    dashboard.app._memory_evals_cache_clear()
 
 
 @contextmanager
@@ -547,7 +684,10 @@ def open_fleet_client(fleet: FleetCensus = CENSUS) -> Iterator[TestClient]:
             known_project_roots=roots[1:],
             fused_memory_urls=list(HERMETIC_FUSED_MEMORY_URLS),
         )
-        substrate = FleetMcp(fleet, config.escalation_urls, now=datetime.now(UTC).replace(microsecond=0))
+        now = datetime.now(UTC).replace(microsecond=0)
+        substrate = FleetMcp(fleet, config.escalation_urls, now=now)
+        _seed_escalations(config, fleet, substrate, now=now)
+        _seed_ledgers_and_stores(config, fleet, substrate, now=now)
         processes = _running_orchestrators(fleet, roots)
         with pytest.MonkeyPatch.context() as mp:
             for module in _bindings_of(mcp_tool_call, 'mcp_tool_call', _KNOWN_MCP_IMPORTERS):
