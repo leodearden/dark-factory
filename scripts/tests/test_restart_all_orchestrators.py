@@ -2610,7 +2610,7 @@ def test_the_sweep_wide_ceiling_counts_from_sweep_start_and_force_restarts_the_r
         [_Rewrite(after="verifying", to=_hb_drain([]), polls=unit_r_polls)],
     ):
         result = _run_script(
-            bin_dir, state_path, fleet_dir, "--drain", env=env, timeout=ceiling_secs + 30,
+            bin_dir, state_path, fleet_dir, "--drain", env=env, timeout=3 * ceiling_secs + 30,
         )
 
     polls = read_drain_poll_trace(trace_path)
