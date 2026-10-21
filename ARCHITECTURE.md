@@ -199,8 +199,8 @@ for the whole fleet. Entry: `fused-memory/src/fused_memory/server/main.py`
   `scripts/restart-all-orchestrators.sh --drain`, a two-stage drain that,
   as the sweep reaches each unit, halts its merge admission and holds its
   restart while one of its merge verifies is in flight, until it ends or
-  passes its own deadline (a per-unit cap bounds the wait; units on pre-5371
-  code keep the old merge-idle gate). Full
+  passes its own deadline (a per-unit cap and a sweep-wide ceiling bound the
+  wait; units on pre-5371 code keep the old merge-idle gate). Full
   redeploy story (liveness vs. staleness vs. coordinator) in
   [OPERATIONS.md](OPERATIONS.md).
 

@@ -1759,7 +1759,8 @@ restart:
   5371, see [Reading a drain](#reading-a-drain)) that, unit by unit as the
   sweep reaches it, halts that unit's merge admission and holds its restart
   while one of its merge verifies is in flight on any host, until it ends or
-  passes its own deadline (a per-unit cap bounds the wait). Units still on pre-5371 code, and units that refuse the request, keep
+  passes its own deadline (a per-unit cap and a sweep-wide ceiling bound the
+  wait). Units still on pre-5371 code, and units that refuse the request, keep
   the legacy merge-idle gate: defer while busy, then force-restart after
   `ORCH_RESTART_FORCE_FIRE_AFTER_SECS` (10 minutes since 2026-08-26, 75
   minutes before that). The script stamps the clock only
@@ -1864,9 +1865,18 @@ inside one 8-hour window.** Two corrections measured 2026-08-24/25:
   `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` verify-wait cap, plus 7 x (30s verify +
   120s grace) and 7 x 120s unknown-grace); it was 7200s while the worst sweep
   was one busy unit burning the 600s-to-4500s busy grace. Since task 7297 the
-  cap counts per unit from that unit's own request, so verify waits on
-  different units now add up instead of overlapping: two units each awaiting
-  a long verify can overrun the bound on their own. Units on the legacy
+  verify-wait cap counts per unit from that unit's own request, so waits on
+  different units add up instead of overlapping; what keeps the sweep inside
+  the lease is the sweep-wide ceiling `ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS`
+  (default 11400), counted from the first unit's drain request. It bounds
+  everything the sweep does up to the moment it trips, on the wall clock. After
+  it, the unit being awaited is restarted at once and each later unit costs only
+  its restart verification (at most 30s + 120s grace) plus the merge-idle gate:
+  nothing if idle, up to 120s unknown-grace if its heartbeat is stale or
+  absent, up to the 600s busy grace if busy. With six units after the trip, all
+  stale: 11400 + 150 + 6 x 270 = 13,170s < 14400s. Units left on the busy
+  branch after the ceiling are the remaining exposure: each adds up to ~600s
+  more, so three or more of them can still overrun it. Units on the legacy
   merge-idle gate (pre-5371 code, or a refused request) still add up to the
   600s busy grace each, so two of them on top of a capped verify wait overrun
   it. A sweep that overruns it loses its lease
@@ -1895,7 +1905,12 @@ meanwhile. **Stage B**: the script classifies the heartbeat
 - `verifying` — a merge verify is inside its own deadline: wait, with no busy
   grace, until it finishes, goes `overdue`, or the cap
   `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` (default 11400, counted from this unit's
-  own request) expires.
+  own request) expires, or the sweep-wide ceiling
+  `ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS` (default 11400, counted from the
+  first unit's request) is spent. The ceiling trips once per sweep, with the
+  line `sweep-wide drain verify-wait ceiling of …s spent after …s, at <unit>`:
+  that unit is force-restarted, and every later unit gets no drain request
+  and goes through the merge-idle gate, as before 5371.
 - `overdue` — every in-flight verify is past its own command timeout: restart
   at once.
 - `busy` / `refused` — not acknowledged yet, or the unit declined the request:
