@@ -11,8 +11,9 @@ import json
 from datetime import UTC, datetime
 
 import pytest
-from fused_memory.server.markup_residue_spool import MarkupResidueSpool
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
+
+from fused_memory.server.markup_residue_spool import MarkupResidueSpool
 
 _LOGGER = 'fused_memory.server.markup_residue_spool'
 _LOCATOR_TIME_FORMAT = '%Y%m%dT%H%M%S.%fZ'
