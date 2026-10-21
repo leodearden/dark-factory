@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
 
 from orchestrator import session_registry as sr
 
@@ -6347,115 +6348,6 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
 # Project-token canonicalization (task 3807)
 # ---------------------------------------------------------------------------
 
-_PROJECT_TOKEN_CASES: list[tuple[str, str]] = [
-    # Separator/case folding: one project, five spellings, one token.
-    ('dark_factory', 'dark_factory'),
-    ('dark-factory', 'dark_factory'),
-    ('Dark-Factory', 'dark_factory'),
-    ('DARK_FACTORY', 'dark_factory'),
-    ('  dark-factory  ', 'dark_factory'),
-    # Alias: the one seeded PROJECT_TOKEN_ALIASES entry, itself folded first.
-    ('df', 'dark_factory'),
-    ('DF', 'dark_factory'),
-    (' df ', 'dark_factory'),
-    ('-df-', 'dark_factory'),
-    # Unset sentinel -- '' is never a token (mirrors normalize_escalations_dir).
-    ('', ''),
-    ('   ', ''),
-    ('\t\n', ''),
-    # Pass-through: an already-canonical token of another project is untouched.
-    ('reify', 'reify'),
-    # A split whose spellings differ ONLY by separator folds with no alias
-    # entry -- and autopilot_video is also what that project's config
-    # declares, so folding fully resolves it.
-    ('autopilot-video', 'autopilot_video'),
-    ('autopilot_video', 'autopilot_video'),
-    # solar-challenge's two spellings fold into ONE bucket, but that bucket
-    # is NOT its declared memory.project_id. See the residual-gap test below
-    # -- this row deliberately does not claim folding resolved it.
-    ('solar-challenge', 'solar_challenge'),
-    ('solar_challenge', 'solar_challenge'),
-]
-
-
-@pytest.mark.parametrize(('raw', 'expected'), _PROJECT_TOKEN_CASES)
-def test_normalize_project_token_table(raw: str, expected: str) -> None:
-    """One project must have ONE token, whatever spelling it was filed under.
-
-    The live population that motivated this (2026-08-06): 41 OPEN
-    dark-factory decisions split 22/17/2 across ``dark_factory``/``df``/
-    ``dark-factory``, each partition invisible to a reap scoped to either of
-    the others.
-    """
-    assert sr.normalize_project_token(raw) == expected
-
-
-def test_normalize_project_token_does_not_merge_solar_challenge_platform() -> None:
-    """COLLAPSE GUARD: folding must never merge two DIFFERENT projects.
-
-    ``/home/leo/src/solar-challenge`` declares ``my_solar_challenge`` and
-    ``/home/leo/src/solar-challenge-platform`` declares
-    ``solar_challenge_platform`` -- separate project roots, separate
-    orchestrator configs, separate escalation queues, whose tokens merely
-    share a prefix. Merging them would let one project's reaper close the
-    other's decisions, which is strictly worse than the bug being fixed. Only
-    case and separator differences may ever fold.
-    """
-    assert sr.normalize_project_token('solar_challenge_platform') == 'solar_challenge_platform'
-    assert sr.normalize_project_token('solar-challenge-platform') == 'solar_challenge_platform'
-    assert sr.normalize_project_token('solar_challenge_platform') != sr.normalize_project_token(
-        'solar-challenge'
-    )
-
-
-@pytest.mark.parametrize('raw', [case[0] for case in _PROJECT_TOKEN_CASES])
-def test_normalize_project_token_is_idempotent(raw: str) -> None:
-    """f(f(x)) == f(x) for every token in the table.
-
-    Load-bearing twice over: the migration decides a record is already
-    canonical by comparing ``normalize_project_token(p) == p``, so a
-    non-idempotent fold would rewrite the same record on every run; and the
-    reaper normalizes an already-normalized stored token on every compare.
-    """
-    once = sr.normalize_project_token(raw)
-    assert sr.normalize_project_token(once) == once
-
-
-@pytest.mark.parametrize('raw', [None, 42, 3.5, Path('/tmp/x'), object()])
-def test_normalize_project_token_fail_soft_on_non_str(raw: object) -> None:
-    """Fail-soft, matching normalize_escalations_dir's contract for helpers a
-    C8 watch loop calls directly: a non-str value never raises into the
-    caller.
-    """
-    assert isinstance(sr.normalize_project_token(raw), str)
-
-
-def test_normalize_project_token_coerces_non_str_to_a_matchless_token() -> None:
-    """Pins the VALUE a coercion produces, not just that it is a str.
-
-    ``isinstance(..., str)`` alone is a tautology under a ``return str(...)``
-    body -- it cannot fail, so it cannot defend the docstring's actual claim
-    that a coerced token "matches no real project". These assert the claim.
-    """
-    assert sr.normalize_project_token(42) == '42'
-    assert sr.normalize_project_token(3.5) == '3.5'
-
-
-def test_normalize_project_token_maps_none_to_the_unset_sentinel() -> None:
-    """``None`` means UNSET, so it must land on ``''``, not on ``'none'``.
-
-    ``str(None)`` folds to ``'none'`` -- an ordinary-looking token, not a
-    sentinel. That matters because ``DecisionRecord.from_dict`` reads
-    ``data['project']`` with no coercion, so a hand-edited record carrying
-    ``"project": null`` round-trips a real ``None``; without this case the
-    migration would rewrite it onto a literal ``'none'`` bucket that a
-    reaper scoped to a project spelled that way could then match. ``''``
-    only ever matches ``''``, keeping the fail-OPEN direction.
-    """
-    assert sr.normalize_project_token(None) == ''
-    assert sr.normalize_project_token(None) != 'none'
-
-
 def test_solar_challenge_alias_was_decided_and_declined() -> None:
     """The naming mismatch is a DECIDED, standing state -- not a pending gap.
 
@@ -6484,29 +6376,29 @@ def test_solar_challenge_alias_was_decided_and_declined() -> None:
     humans and watchers that read it, and both CLI verbs warn if you pass
     the config-declared token.
     """
-    assert sr.normalize_project_token('solar-challenge') == 'solar_challenge'
-    assert sr.normalize_project_token('solar-challenge') == sr.normalize_project_token(
+    assert fold_project_token('solar-challenge') == 'solar_challenge'
+    assert fold_project_token('solar-challenge') == fold_project_token(
         'solar_challenge'
     )
-    assert sr.normalize_project_token('my_solar_challenge') != sr.normalize_project_token(
+    assert fold_project_token('my_solar_challenge') != fold_project_token(
         'solar-challenge'
     )
-    assert 'solar_challenge' not in sr.PROJECT_TOKEN_ALIASES
+    assert 'solar_challenge' not in PROJECT_ID_ALIASES
 
 
 def test_project_token_aliases_maps_folded_to_folded() -> None:
-    """Every PROJECT_TOKEN_ALIASES key AND value must already be canonical
+    """Every PROJECT_ID_ALIASES key AND value must already be canonical
     under the fold, or a lookup would miss (key) or emit a non-canonical
     token (value) -- the alias map is applied AFTER folding, never before.
     """
-    assert sr.PROJECT_TOKEN_ALIASES['df'] == 'dark_factory'
-    for alias, canonical in sr.PROJECT_TOKEN_ALIASES.items():
-        assert sr.normalize_project_token(alias) == canonical
-        assert sr.normalize_project_token(canonical) == canonical
+    assert PROJECT_ID_ALIASES['df'] == 'dark_factory'
+    for alias, canonical in PROJECT_ID_ALIASES.items():
+        assert fold_project_token(alias) == canonical
+        assert fold_project_token(canonical) == canonical
 
 
 def test_project_token_alias_declines_registry_shape() -> None:
-    """The DECLINE registry is the mirror image of PROJECT_TOKEN_ALIASES, and
+    """The DECLINE registry is the mirror image of PROJECT_ID_ALIASES, and
     it is what makes task 3813's decision durable rather than prose.
 
     A decision task's product has to survive the session that made it. Task
@@ -6535,17 +6427,17 @@ def test_project_token_alias_declines_registry_shape() -> None:
 
     # THE GUARD: the two tables partition the alias space. Adding a declined
     # alias to the live table without removing the decline fails right here.
-    assert set(declined) & set(sr.PROJECT_TOKEN_ALIASES) == set()
+    assert set(declined) & set(PROJECT_ID_ALIASES) == set()
 
     # Same folded-to-folded hygiene invariant the live table carries (see
     # test_project_token_aliases_maps_folded_to_folded), so promoting an
     # entry is a one-line move between the two dicts.
     for alias, (canonical, _reason) in declined.items():
-        assert sr.normalize_project_token(alias) == alias
-        assert sr.normalize_project_token(canonical) == canonical
+        assert fold_project_token(alias) == alias
+        assert fold_project_token(canonical) == canonical
 
     # The decline is IN FORCE in the fold, not merely recorded beside it.
-    assert sr.normalize_project_token('solar_challenge') != sr.normalize_project_token(
+    assert fold_project_token('solar_challenge') != fold_project_token(
         'my_solar_challenge'
     )
 
@@ -6660,7 +6552,7 @@ def test_declined_project_token_hint_is_none_for_everything_else(token: str) -> 
 
 @pytest.mark.parametrize('token', [None, 42, 3.5, Path('/tmp/x'), object()])
 def test_declined_project_token_hint_fail_soft_on_non_str(token: object) -> None:
-    """Fail-soft, mirroring normalize_project_token's contract: a helper a C8
+    """Fail-soft, mirroring fold_project_token's contract: a helper a C8
     watch loop calls on its filing path never raises into the caller.
     """
     assert sr.declined_project_token_hint(token) is None
@@ -9941,7 +9833,7 @@ def test_migrate_decision_project_tokens_changes_only_the_project_field(tmp_path
 def test_migrate_decision_project_tokens_is_idempotent(tmp_path: Path) -> None:
     """A second sweep is a no-op: nothing reported, no file rewritten.
 
-    Follows from normalize_project_token's idempotence, and is what makes the
+    Follows from fold_project_token's idempotence, and is what makes the
     verb safe to keep as a permanent repair tool rather than a one-shot
     script that must be deleted after use.
     """
