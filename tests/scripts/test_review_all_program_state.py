@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from review_all_program_fixture import FIXTURE_DIR, PROGRAM_DIR, load_state
+from review_all_program_fixture import FIXTURE_DIR, PROGRAM_DIR, REPO_ROOT, load_state
 
 from shared import task_statuses
 
@@ -307,3 +307,110 @@ def test_stream_of_refuses_keys_that_hit_two_streams() -> None:
     message = str(caught.value)
     assert '150' in message
     assert 'S1' in message and 'S2' in message
+
+
+RUN_ID = 'review-all-fixture-20261019'
+
+
+def test_run_home_is_the_run_id_under_review_all_home(tmp_path: Path) -> None:
+    home = state.run_home(RUN_ID, environ={'REVIEW_ALL_HOME': str(tmp_path)})
+    assert home.root == tmp_path / RUN_ID
+
+
+def test_run_home_defaults_under_the_users_claude_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('HOME', str(tmp_path))
+    assert state.run_home(RUN_ID, environ={}).root == tmp_path / '.claude' / 'review-all' / RUN_ID
+
+
+def test_run_home_refuses_a_relative_review_all_home() -> None:
+    with pytest.raises(state.StateError, match='REVIEW_ALL_HOME'):
+        state.run_home(RUN_ID, environ={'REVIEW_ALL_HOME': 'relative/homes'})
+
+
+@pytest.mark.parametrize('run_id', ['', '.', '..', 'a/b'])
+def test_run_home_refuses_a_run_id_that_is_not_one_path_segment(
+    run_id: str, tmp_path: Path,
+) -> None:
+    with pytest.raises(state.StateError) as caught:
+        state.run_home(run_id, environ={'REVIEW_ALL_HOME': str(tmp_path)})
+    assert repr(run_id) in str(caught.value)
+
+
+def test_home_names_the_state_layout_files(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    assert home.program_json == tmp_path / 'program.json'
+    assert home.rulings == tmp_path / 'rulings.jsonl'
+    assert home.ledger == tmp_path / 'ledger.jsonl'
+    assert home.sessions_json == tmp_path / 'sessions.json'
+    assert home.handoff == tmp_path / 'HANDOFF.md'
+    assert home.prds_dir('S1') == tmp_path / 'prds' / 'S1'
+    assert home.brief_file('S1', state.Pass.AUTHOR) == tmp_path / 'briefs' / 'S1.author.md'
+    assert tuple(home.batch_files(1)) == (
+        tmp_path / 'actions' / 'batch-1.json',
+        tmp_path / 'actions' / 'batch-1.prompt.md',
+        tmp_path / 'actions' / 'batch-1.result.json',
+    )
+
+
+@pytest.mark.parametrize(('method', 'folder'), [('inbox_file', 'inbox'), ('returns_file', 'returns')])
+def test_return_files_are_named_by_stream_pass_and_item(
+    method: str, folder: str, tmp_path: Path,
+) -> None:
+    locate = getattr(state.Home(tmp_path), method)
+    assert locate('S1', state.Pass.AUTHOR) == tmp_path / folder / 'S1.author.json'
+    assert locate('S1', state.Pass.INVESTIGATE, item='Q2') == (
+        tmp_path / folder / 'S1.investigate-Q2.json'
+    )
+    with pytest.raises(state.StateError, match='investigate'):
+        locate('S1', state.Pass.INVESTIGATE)
+    with pytest.raises(state.StateError, match='Q2'):
+        locate('S1', state.Pass.DECOMPOSE, item='Q2')
+
+
+def test_handback_files_carry_the_checkpoint_number(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    assert home.handback_file('S1', state.Pass.AUTHOR, checkpoint=2) == (
+        tmp_path / 'handbacks' / 'S1.author.checkpoint-2.md'
+    )
+    assert home.handback_file('S1', state.Pass.AUTHOR) == tmp_path / 'handbacks' / 'S1.author.md'
+
+
+def test_render_paths_and_the_published_snapshot(tmp_path: Path) -> None:
+    program = _program()
+    home = state.Home(tmp_path)
+    assert home.render_doc(program) == tmp_path / 'render' / 'review-all-program-fixture-20261019.md'
+    assert home.render_state_dir == tmp_path / 'render' / '.state'
+    published = Path('/review-all-fixture/project/plans/review-all-program-fixture-20261019.md')
+    assert state.published_doc(program) == published
+    assert state.snapshot_dir(program) == published.with_suffix('.state')
+
+
+def test_fused_memory_url_prefers_the_environment(tmp_path: Path) -> None:
+    url = state.fused_memory_url(environ={'FUSED_MEMORY_URL': 'http://x/mcp'}, checkout=tmp_path)
+    assert url == 'http://x/mcp'
+
+
+def test_fused_memory_url_falls_back_to_the_checkouts_mcp_json(tmp_path: Path) -> None:
+    (tmp_path / '.mcp.json').write_text(json.dumps(
+        {'mcpServers': {'fused-memory': {'type': 'http', 'url': 'http://127.0.0.1:9/mcp'}}}
+    ))
+    assert state.fused_memory_url(environ={}, checkout=tmp_path) == 'http://127.0.0.1:9/mcp'
+
+
+@pytest.mark.parametrize('mcp_json', [None, {'mcpServers': {'escalation': {'url': 'http://e/mcp'}}}])
+def test_fused_memory_url_without_a_source_names_both(
+    mcp_json: dict[str, Any] | None, tmp_path: Path,
+) -> None:
+    if mcp_json is not None:
+        (tmp_path / '.mcp.json').write_text(json.dumps(mcp_json))
+    with pytest.raises(state.StateError) as caught:
+        state.fused_memory_url(environ={}, checkout=tmp_path)
+    assert 'FUSED_MEMORY_URL' in str(caught.value)
+    assert str(tmp_path / '.mcp.json') in str(caught.value)
+
+
+def test_fused_memory_url_defaults_to_this_checkouts_mcp_json() -> None:
+    expected = json.loads((REPO_ROOT / '.mcp.json').read_text())['mcpServers']['fused-memory']['url']
+    assert state.fused_memory_url(environ={}) == expected
