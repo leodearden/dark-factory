@@ -61,6 +61,7 @@ from escalation.merge_status_answer import (
     hint_for,
     map_terminal_state,
 )
+from escalation.mismatch_streak import DEFAULT_MISMATCH_STREAK_THRESHOLD, MismatchStreak
 from escalation.models import (
     ACTION_KEEP_DRIVING,
     ACTION_TERMINATE_CLEANLY,
@@ -74,6 +75,7 @@ from escalation.models import (
     max_severity,
 )
 from escalation.pins import classify_pins
+from escalation.project_root_guard import ProjectRootGuard
 from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
 from escalation.related_pending import related_pending
@@ -497,29 +499,51 @@ class _ProbeFailed(Exception):
         )
 
 
-def _require_matching_project_root(harness: Any, project_root: str) -> str | None:
-    """Return an error message if *project_root* doesn't match this server's project.
+def _require_matching_project_root(wired_root: Path, project_root: str) -> str | None:
+    """Return an error message if *project_root* doesn't match *wired_root*.
 
-    The escalation server closes over exactly one project's ``harness``, so
-    *project_root* can never be used to route a call — it is a defensive
-    validation guard.  Resolved-path equality (not string equality) so
-    trailing slashes / relative segments / symlink differences don't produce
-    false-positive mismatches.  Returns None when they match.
+    The escalation server closes over exactly one project, so *project_root*
+    can never be used to route a call — it is a defensive validation guard.
+    Resolved-path equality (not string equality) so trailing slashes /
+    relative segments / symlink differences don't produce false-positive
+    mismatches.  Returns None when they match.
 
     Shared by claim_warm_worktree and release_warm_worktree (PRD β, task
-    2011) so a multi-project interactive caller (/do, /warm) that mis-targets
-    an escalation MCP endpoint gets a clean testable failure instead of
-    claiming/releasing a worktree against the wrong orchestrator.
+    2011), which pass their harness's git_ops root, and by
+    ``_project_root_refusal``, which passes the store identity's root, so a
+    caller that mis-targets an escalation MCP endpoint gets one clean,
+    testable failure wording.
     """
-    gops_root = Path(harness.git_ops.project_root).resolve()
+    wired_resolved = wired_root.resolve()
     given_root = Path(project_root).resolve()
-    if given_root != gops_root:
+    if given_root != wired_resolved:
         return (
             f'project_root mismatch: {project_root!r} does not match this '
-            f"server's wired project ({harness.git_ops.project_root!s}, "
-            f'resolved {gops_root!s}).'
+            f"server's wired project ({wired_root!s}, "
+            f'resolved {wired_resolved!s}).'
         )
     return None
+
+
+def _project_root_refusal(identity: StoreIdentity, project_root: str) -> str | None:
+    """The PRD §6.3 verdict on an asserted *project_root*: a refusal message, or None to proceed.
+
+    ``create_server`` hands it to ``escalation.project_root_guard::ProjectRootGuard``.
+    """
+    if identity.kind == 'reconciliation':
+        return (
+            f'this endpoint serves the reconciliation store ({identity.queue_dir}), '
+            'not a project task queue; it never contains orchestrator task escalations '
+            f'(asserted project_root={project_root!r}).'
+        )
+    assert identity.project_root is not None
+    mismatch = _require_matching_project_root(identity.project_root, project_root)
+    if mismatch is None:
+        return None
+    return (
+        f'{mismatch} This endpoint serves project {identity.project_id!r} '
+        f'(escalation store {identity.queue_dir}).'
+    )
 
 
 def _project_task_runtime_entry(s: Any) -> TaskRuntimeEntry:
@@ -1028,6 +1052,7 @@ def create_server(
     startup_sweep: bool = True,
     startup_sweep_now: datetime | None = None,
     store_identity: StoreIdentity | None = None,
+    mismatch_streak_threshold: int = DEFAULT_MISMATCH_STREAK_THRESHOLD,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
 
@@ -1088,8 +1113,15 @@ def create_server(
     (``escalation.store_identity::StoreIdentity``), passed by both production
     call sites.  When given, one transform appends the PRD §6.2 store-identity
     block to every tool's description; None leaves each description exactly
-    its docstring.  ``plans/escalation-store-ambiguity-prd.md`` §6.3 specifies
-    its other consumer.
+    its docstring.  It is also read by the optional ``project_root`` guard
+    (``escalation.project_root_guard::ProjectRootGuard``,
+    ``plans/escalation-store-ambiguity-prd.md`` §6.3): a tool call asserting a
+    root this store does not serve is refused; with no identity, nothing is.
+
+    *mismatch_streak_threshold* (default 5) — how many refused assertions of
+    one ``project_root`` within the streak's window file (or fold) ONE
+    ``infra_issue`` L1 into this server's own queue
+    (``escalation.mismatch_streak::MismatchStreak``).
     """
     mcp = FastMCP('escalation', instructions=ESCALATION_SERVER_INSTRUCTIONS)
     if store_identity is not None:
@@ -1174,13 +1206,14 @@ def create_server(
         subject_task_id = record.get('subject_task_id')
         detail = '\n'.join([
             # WHOSE call leaked. Rendered FIRST and unconditionally because on
-            # this server it is the only attribution that ever resolves: the
+            # this server it is the only attribution that always resolves: the
             # middleware's `_identity` reads `agent_id` / `project_root` /
-            # `project_id` off the call's own arguments, and no escalation tool
-            # declares any of the three, so the two fields below it are
-            # structurally None here. The record's own `task_id` is the
-            # synthetic anchor, not the caller's, so without these two lines a
-            # critical L2 record names nobody at all.
+            # `project_id` off the call's own arguments; no escalation tool
+            # declares `agent_id` or `project_id`, and the five that accept an
+            # OPTIONAL `project_root` see it omitted by fleet callers, so
+            # `project` below usually stays None. The record's own `task_id` is
+            # the synthetic anchor, not the caller's, so without these two
+            # lines a critical L2 record names nobody at all.
             f'subject_task_id={subject_task_id!r}',
             f'subject_agent_role={record.get("subject_agent_role")!r}',
             # The OWNER that will exit this hold unprompted (INV-7), read off
@@ -1329,6 +1362,15 @@ def create_server(
     mcp.add_middleware(MissingArgumentMiddleware())
 
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
+
+    # --- Optional project_root assertion (PRD §6.3) ---
+    # Sync tools call check() directly: FastMCP already runs them on a worker
+    # thread.  Async tools await check_off_loop().
+    project_root_guard = ProjectRootGuard(
+        store_identity,
+        MismatchStreak(queue, threshold=mismatch_streak_threshold),
+        _project_root_refusal,
+    )
 
     # --- Startup sweep (pre-serving single-writer window) ---
     if startup_sweep:
@@ -1848,6 +1890,7 @@ def create_server(
         workflow_state: str | None = None,
         evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Report a non-blocking observation. The agent continues working after this call.
 
@@ -1902,6 +1945,8 @@ def create_server(
           ``action`` key — that is only on the blocker path — so an info filer
           simply carries on, as it already does on every other branch.
         """
+        if (refusal := await project_root_guard.check_off_loop(project_root)) is not None:
+            return refusal
         if severity not in KNOWN_SEVERITIES:
             return {
                 'error': (
@@ -1945,6 +1990,7 @@ def create_server(
         evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
         level: int = 0,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Report a blocking problem. After calling this, follow the response's
         ``action``: on ``'terminate_cleanly'`` commit any in-progress work, log your
@@ -2050,6 +2096,8 @@ def create_server(
           way — so its state is unknown).  ``action`` is
           ``'terminate_cleanly'`` on every OTHER branch above.
         """
+        if (refusal := await project_root_guard.check_off_loop(project_root)) is not None:
+            return refusal
         if severity not in KNOWN_SEVERITIES:
             return {
                 'error': (
@@ -2645,7 +2693,8 @@ def create_server(
         task_id: str | None = None,
         level: int | None = None,
         compact: bool = False,
-    ) -> list[dict[str, Any]]:
+        project_root: str | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         """List all pending escalations, optionally filtered by task ID and/or level.
 
         *level* — when set, returns only escalations at the given escalation level:
@@ -2709,6 +2758,8 @@ def create_server(
         prevent, so callers must treat an absent key as UNKNOWN and render
         nothing rather than "not pinning".
         """
+        if (refusal := await project_root_guard.check_off_loop(project_root)) is not None:
+            return refusal
         # Read the pending set ONCE, unfiltered, and narrow it in memory.  The
         # `level` filter is applied here rather than pushed into the queue
         # because `_annotate_pins_recovery` needs the UNFILTERED set to classify
@@ -2860,6 +2911,7 @@ def create_server(
     def get_task_escalation_history(
         task_id: str,
         level: int | None = None,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Every escalation ever filed for a task, as a self-describing envelope.
 
@@ -2919,6 +2971,8 @@ def create_server(
         unlike the adjacent ``get_escalation``: this is a scan, not an id
         lookup, so zero matches is a valid answer rather than a failure.
         """
+        if (refusal := project_root_guard.check(project_root)) is not None:
+            return refusal
         escalations = get_task_escalations(task_id, level=level)
         return {
             'task_id': task_id,
@@ -2930,8 +2984,11 @@ def create_server(
     @mcp.tool()
     def get_escalation(
         escalation_id: str,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Get a single escalation by ID."""
+        if (refusal := project_root_guard.check(project_root)) is not None:
+            return refusal
         esc = queue.get(escalation_id)
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
@@ -4881,7 +4938,9 @@ def create_server(
         """
         if harness is None or getattr(harness, 'git_ops', None) is None:
             return {'error': 'escalation server running standalone — no harness wired'}
-        mismatch = _require_matching_project_root(harness, project_root)
+        mismatch = _require_matching_project_root(
+            Path(harness.git_ops.project_root), project_root,
+        )
         if mismatch is not None:
             return {'error': mismatch}
 
@@ -4950,7 +5009,9 @@ def create_server(
         """
         if harness is None or getattr(harness, 'git_ops', None) is None:
             return {'error': 'escalation server running standalone — no harness wired'}
-        mismatch = _require_matching_project_root(harness, project_root)
+        mismatch = _require_matching_project_root(
+            Path(harness.git_ops.project_root), project_root,
+        )
         if mismatch is not None:
             return {'error': mismatch}
 
