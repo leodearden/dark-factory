@@ -272,17 +272,9 @@ FLEET_LEASE_PATH = os.environ.get(
 )
 
 # How long a lease may go unrefreshed before every reader treats it as expired,
-# whatever its pid says. DERIVED from the drain knobs rather than guessed, so a
-# reviewer can re-check it. A --drain sweep (tasks 5371, 7297) awaits each
-# unit's merge verifies under a per-unit cap (ORCH_DRAIN_VERIFY_MAX_WAIT_SECS),
-# and those waits add up, so the lease is bounded instead by the sweep-wide
-# ceiling ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS (11400s from the first unit's
-# drain request, on the wall clock). After it trips, the remaining units skip
-# the verify wait: at most 6 x (RESTART_VERIFY_TIMEOUT 30 +
-# RESTART_VERIFY_GRACE_SECS 120 + ORCH_DRAIN_UNKNOWN_GRACE_SECS 120) + 150 for
-# the unit it tripped on = 11400 + 1770 = 13170s ~= 3.7h; each later unit on
-# the merge-idle gate's busy branch can add up to its 600s busy grace on top,
-# so it is not a worst case. 14400 clears the common case with ~8% headroom while staying far below
+# whatever its pid says. FIXED: a --drain sweep is fitted under it by the
+# script's sweep-wide verify-wait ceiling, derived at
+# scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS. 4h stays far below
 # the 72h ORCH_RESTART_MIN_INTERVAL_SECS, and that inequality is the whole
 # point: a leaked lease can therefore delay at most ONE redeploy window and can
 # never wedge the fleet indefinitely — the same reasoning that makes the pid
