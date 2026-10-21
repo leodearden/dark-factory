@@ -726,8 +726,8 @@ def mine(
             click.echo(
                 f'runs.db not found at {runs_db}\n'
                 '  This is an offline generation tool that reads the gitignored '
-                'orchestrator run history (data/orchestrator/runs.db in the MAIN repo '
-                "checkout, not a task worktree -- see corpus/README.md). Pass --runs-db, "
+                'orchestrator run history, which lives in the MAIN repo checkout, not '
+                "a task worktree (see corpus/README.md). Pass --runs-db, "
                 'or set REVIEWER_TRIAL_RUNS_DB, to point at a real runs.db -- otherwise '
                 "sqlite3 silently creates an empty one and this fails later with "
                 "'no such table: task_results'.",

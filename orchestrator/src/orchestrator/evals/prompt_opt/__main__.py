@@ -381,9 +381,9 @@ def canary(
     if not runs_db.is_file():
         click.echo(
             f'runs.db not found at {runs_db}\n'
-            '  This reads the gitignored orchestrator run history '
-            '(data/orchestrator/runs.db in the MAIN repo checkout, not a task '
-            'worktree). Pass --runs-db, or set PROMPT_OPT_RUNS_DB.',
+            '  This reads the gitignored orchestrator run history, which lives in '
+            'the MAIN repo checkout, not a task worktree. Pass --runs-db, or set '
+            'PROMPT_OPT_RUNS_DB.',
             err=True,
         )
         sys.exit(_USAGE_ERROR_EXIT_CODE)
