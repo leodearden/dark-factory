@@ -1198,10 +1198,6 @@ def _escalate_barren_streak(
     ``check_trickle_liveness.sh`` into a nightly false alarm for a timer
     that is running."""
     counters = night.counters
-    last_productive_at = (
-        None if night.last_productive_at is None
-        else night.last_productive_at.isoformat()
-    )
     summary = (
         f'legibility trickle has produced nothing for {max_barren_runs} '
         f'consecutive runs'
@@ -1212,7 +1208,7 @@ def _escalate_barren_streak(
         f'consecutive_barren_runs={night.consecutive_barren_runs} '
         f'below_sampling_cut={counters.below_sampling_cut} '
         f'budget_skipped={counters.budget_skipped} '
-        f'last_productive_at={last_productive_at}. '
+        f'last_productive_at={trickle_state.isoformat_or_none(night.last_productive_at)}. '
         f'Real confusion signal reached the sampling/budget stage on each of '
         f'those runs and NOTHING was digested -- {max_barren_runs} '
         f'consecutive means persistent config state, not a run of bad luck. '

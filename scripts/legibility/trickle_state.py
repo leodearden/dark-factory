@@ -659,8 +659,8 @@ class TrickleState:
             'capped': self.capped,
             'consecutive_barren_runs': self.consecutive_barren_runs,
             'consecutive_failed_runs': self.consecutive_failed_runs,
-            'last_productive_at': _isoformat_or_none(self.last_productive_at),
-            'last_scheduled_target_date': _isoformat_or_none(
+            'last_productive_at': isoformat_or_none(self.last_productive_at),
+            'last_scheduled_target_date': isoformat_or_none(
                 self.last_scheduled_target_date
             ),
             'census_fired': self.census_fired,
@@ -674,7 +674,8 @@ class TrickleState:
         }
 
 
-def _isoformat_or_none(value: date | None) -> str | None:
+def isoformat_or_none(value: date | None) -> str | None:
+    """*value* as the document spells it: ISO, or ``None`` when unset."""
     return None if value is None else value.isoformat()
 
 

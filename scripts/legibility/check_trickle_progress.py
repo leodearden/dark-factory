@@ -56,7 +56,6 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 # The deterministic runner EXECs a bound predicate directly
@@ -163,7 +162,7 @@ def _judge(
         f'(threshold {limits.max_barren_runs}), '
         f'consecutive_failed_runs={state.consecutive_failed_runs} '
         f'(threshold {limits.max_failed_runs}), '
-        f'last_productive_at={_isoformat(state.last_productive_at)}, '
+        f'last_productive_at={trickle_state.isoformat_or_none(state.last_productive_at)}, '
         f'{_escalation_fact(state)}.'
     )
     return 0
@@ -201,7 +200,7 @@ def _failed_streak_verdict(
         f'{state.exit_code}. {flow} Remedy: read '
         f'journalctl --user -u legibility-trickle@{project_id} --since '
         f"'{failed_streak + 1} days ago'. "
-        f'last_productive_at={_isoformat(state.last_productive_at)}. '
+        f'last_productive_at={trickle_state.isoformat_or_none(state.last_productive_at)}. '
         f'{_escalation_fact(state)}. State file: {path}'
     )
 
@@ -216,7 +215,7 @@ def _barren_streak_verdict(
     streak = state.consecutive_barren_runs
     counters = state.counters
     facts = (
-        f'last_productive_at={_isoformat(state.last_productive_at)}. '
+        f'last_productive_at={trickle_state.isoformat_or_none(state.last_productive_at)}. '
         f'{_escalation_fact(state)}. State file: {path}'
     )
     match state.outcome:
@@ -269,10 +268,6 @@ def _escalation_fact(state: trickle_state.TrickleState) -> str:
     recorded; ``unrecorded`` for a document written before the field."""
     recorded = 'unrecorded' if state.barren_escalated is None else state.barren_escalated
     return f'barren_escalated={recorded}'
-
-
-def _isoformat(stamp: datetime | None) -> str | None:
-    return None if stamp is None else stamp.isoformat()
 
 
 def _fail(verdict: str) -> int:
