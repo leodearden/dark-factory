@@ -1929,7 +1929,7 @@ class TestCuratorDecisionZotMarker:
         assert decision.zot_escalation_id is None
 
     @pytest.mark.asyncio
-    async def test_batch_breaker_short_circuit_marks_every_decision(self):
+    async def test_batch_breaker_short_circuit_defers_every_decision_unmarked(self):
         curator = self._curator(breaker_threshold=1)
         await self._curate(curator, CandidateTask(title='Opener'), zot_agent_result())
 
@@ -1944,8 +1944,8 @@ class TestCuratorDecisionZotMarker:
             )
         assert len(decisions) == 2
         for decision in decisions:
-            assert decision.justification == 'zero-output-breaker-open'
-            assert decision.degraded_by_zot is True
+            assert decision.defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
+            assert decision.degraded_by_zot is False
 
     @pytest.mark.asyncio
     async def test_interactive_path_reraises_with_the_zot_marker(self, tmp_path):
@@ -5342,7 +5342,7 @@ class TestSizeOneBatchReusesThePreparedCorpus:
     @pytest.mark.asyncio
     async def test_a_failed_bundle_is_rebuilt_rather_than_reused(self):
         """A corpus failure degrades the bundle to an empty pool — reusing THAT
-        would trade a loud `corpus-failed` create for an LLM call over nothing,
+        would trade a `corpus-failed` deferral for an LLM call over nothing,
         and would drop the retry the rebuild gave the size-1 path."""
         curator = TaskCurator(config=_make_config(), taskmaster=None)
         build = AsyncMock(return_value=(
@@ -7109,8 +7109,8 @@ class TestZeroOutputBreakerBatchPath:
         )
 
     async def test_breaker_open_gates_batch_llm_calls(self):
-        """With breaker OPEN, curate_batch_prepared short-circuits all LLM-bound
-        candidates to action='create' without invoking invoke_with_cap_retry."""
+        """With breaker OPEN, curate_batch_prepared defers all LLM-bound
+        candidates without invoking invoke_with_cap_retry."""
         from fused_memory.middleware.task_curator import PreparedCandidate
 
         config = _make_config()
@@ -7151,66 +7151,14 @@ class TestZeroOutputBreakerBatchPath:
                 prepared, project_id='p', project_root='/x',
             )
 
-        # (a) Every returned decision must be action='create' (short-circuit).
+        # (a) Every returned decision is a breaker deferral (short-circuit).
         assert len(decisions) == 2
         for decision in decisions:
-            assert decision.action == 'create'
-            assert 'zero-output-breaker' in decision.justification
+            assert decision.action == 'defer'
+            assert decision.defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
 
         # (b) LLM must NOT have been invoked for the batch dispatch.
         assert mock_llm.await_count == call_count_before_batch
-
-    async def test_breaker_open_batch_decisions_count_toward_degraded_streak(self):
-        """esc-4448-11: while the breaker is open the batch path files every
-        candidate without dedupe, so each short-circuited decision is degraded
-        and advances the class-agnostic streak — the same as the size-1
-        curate() breaker-open path. Otherwise a batch-dominant deployment could
-        sit behind an open breaker indefinitely with the alarm silent."""
-        from fused_memory.middleware.task_curator import PreparedCandidate
-
-        config = _make_config()
-        config.curator.zero_output_breaker_threshold = 1
-        config.curator.zero_output_breaker_cooldown_seconds = 600.0
-        config.curator.degraded_streak_threshold = 5
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
-        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
-
-        mock_llm = AsyncMock(return_value=self._zot_result())
-
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        # One ZOT opens the breaker (and is itself degraded: streak 1).
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=mock_llm):
-            await curator.curate(
-                CandidateTask(title='Opener'), project_id='p', project_root='/x',
-            )
-        escalator.report_consecutive_degraded.assert_not_awaited()
-
-        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
-        prepared = [
-            PreparedCandidate(
-                candidate=CandidateTask(title=f'Batch {i}', description=f'body {i}'),
-                pool=[], pool_sizes=empty_sizes, prompt_tokens=20,
-            )
-            for i in range(config.curator.degraded_streak_threshold)
-        ]
-        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=mock_llm):
-            decisions = await curator.curate_batch_prepared(
-                prepared, project_id='p', project_root='/x',
-            )
-
-        assert mock_llm.await_count == 1
-        assert [d.justification for d in decisions] == (
-            ['zero-output-breaker-open'] * len(prepared)
-        )
-        assert all(d.action == 'create' and d.degraded for d in decisions)
-        escalator.report_consecutive_degraded.assert_awaited_once()
 
     async def test_batch_zot_without_preopen_trips_breaker(self):
         """A curate_batch_prepared call (no pre-opened breaker) where all candidates
@@ -7260,7 +7208,7 @@ class TestZeroOutputBreakerBatchPath:
 
         llm_calls_after_first = mock_llm.await_count  # 1 (the ZOT call)
 
-        # Second batch: 3 candidates, breaker is open → all short-circuited.
+        # Second batch: 3 candidates, breaker is open → all deferred.
         prepared_second = [
             PreparedCandidate(
                 candidate=CandidateTask(title=f'Post-breaker {i}', description=f'd{i}'),
@@ -7276,8 +7224,8 @@ class TestZeroOutputBreakerBatchPath:
 
         assert len(second_decisions) == 3
         for d in second_decisions:
-            assert d.action == 'create'
-            assert 'zero-output-breaker' in d.justification
+            assert d.action == 'defer'
+            assert d.defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
 
         # No LLM calls during second batch (breaker-open gate).
         assert mock_llm.await_count == llm_calls_after_first

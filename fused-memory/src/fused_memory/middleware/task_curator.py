@@ -2065,8 +2065,9 @@ class TaskCurator:
         Split out from :meth:`curate_batch` so the interceptor's curator
         worker can incrementally accumulate prepared candidates and decide,
         before fetching the next ticket, whether the in-flight batch has
-        already exceeded the soft ``batch_token_threshold``.  Corpus failures
-        degrade to an empty pool — same behaviour as inside ``curate_batch``.
+        already exceeded the soft ``batch_token_threshold``.  A corpus failure
+        yields an empty pool with ``corpus_error`` set, which the curation
+        paths defer rather than curate over that empty pool.
         """
         corpus_error: str | None = None
         try:
@@ -2302,11 +2303,11 @@ class TaskCurator:
         # round-trip.  `llm_k_list` holds positions *within unique_indices*
         # (k values) for candidates that were NOT in the cache.
         llm_k_list: list[int] = []
-        cache_hit_map: dict[int, CuratorDecision] = {}  # unique-space k → decision
+        decided_without_llm: dict[int, CuratorDecision] = {}  # unique-space k → decision
         for k, original_i in enumerate(unique_indices):
             cached = self._check_cache(candidates[original_i].payload_hash())
             if cached is not None:
-                cache_hit_map[k] = cached
+                decided_without_llm[k] = cached
             else:
                 llm_k_list.append(k)
 
@@ -2335,15 +2336,15 @@ class TaskCurator:
 
         # ── Zero-output-timeout circuit breaker gate (task 1743) ──────────────
         # Check the breaker BEFORE the expensive batch LLM round-trip (up to
-        # batch_timeout_cap_seconds = 360s).  If open, resolve every LLM-bound
-        # unique candidate to action='create' immediately — the bisect fallback
-        # path would eventually reach size-1 curate() calls which check the
-        # breaker individually, but this gate avoids the first batch LLM call
-        # (and the bisect overhead) entirely.
+        # batch_timeout_cap_seconds = 360s).  If open, defer every LLM-bound
+        # unique candidate immediately — the bisect fallback path would
+        # eventually reach size-1 curate() calls which check the breaker
+        # individually, but this gate avoids the first batch LLM call (and the
+        # bisect overhead) entirely.
         #
-        # Breaker-open decisions are NOT written to the idempotency cache (so
-        # once the breaker closes, an identical candidate is re-evaluated by
-        # the real LLM rather than being pinned to a stale 'create' for the TTL).
+        # Breaker-open decisions are NOT written to the idempotency cache:
+        # _store_cache skips every defer, so once the breaker closes an
+        # identical candidate is re-evaluated by the real LLM.
         #
         # Batch ZOT counting: each size-1 curate() that bisects out of a batch
         # ZOT records the failure independently via its own except block.
@@ -2360,22 +2361,40 @@ class TaskCurator:
         # curate().
         if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
             logger.warning(
-                'curate_batch: zero-output-breaker open — short-circuiting %d '
-                'LLM-bound candidate(s) to create (consecutive ZOTs=%d)',
+                'curate_batch: zero-output-breaker open — deferring curation of %d '
+                'LLM-bound candidate(s) (consecutive ZOTs=%d)',
                 len(llm_k_list),
                 self._consecutive_zero_output_timeouts,
             )
             for _k in llm_k_list:
-                cache_hit_map[_k] = await self._degraded_create(
-                    justification='zero-output-breaker-open',
+                decided_without_llm[_k] = CuratorDecision.deferred(
+                    DeferReason.ZERO_OUTPUT_BREAKER_OPEN,
                     pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-                    start=start,
-                    candidate=candidates[unique_indices[_k]],
-                    project_id=project_id,
-                    project_root=project_root,
-                    degraded_by_zot=True,
+                    latency_ms=int((time.monotonic() - start) * 1000),
                 )
             llm_k_list = []
+
+        # ── Failed corpus assembly ─────────────────────────────────────────────
+        # A bundle whose corpus failed carries an empty pool that only LOOKS
+        # like a real one; the batch prompt would tell the LLM to answer
+        # 'create' for it.  Defer it instead, in curate()'s guard order:
+        # cache → route → breaker → corpus → LLM.
+        llm_bound_k: list[int] = []
+        for _k in llm_k_list:
+            bundle = prepared[unique_indices[_k]]
+            if bundle.corpus_error is None:
+                llm_bound_k.append(_k)
+                continue
+            logger.warning(
+                'curate_batch: corpus assembly failed, deferring curation of %r: %s',
+                bundle.candidate.title, bundle.corpus_error,
+            )
+            decided_without_llm[_k] = CuratorDecision.deferred(
+                DeferReason.CORPUS_FAILED,
+                pool_sizes=bundle.pool_sizes,
+                latency_ms=int((time.monotonic() - start) * 1000),
+            )
+        llm_k_list = llm_bound_k
 
         # ── LLM dispatch for non-cached unique candidates ────────────────────
         # Re-use the pre-built pools/pool_sizes from the prepared bundles
@@ -2415,8 +2434,8 @@ class TaskCurator:
         # ── Merge: build unique_decision_map with original-space indices ───────
         # batch_target_index from the helper is in LLM-local space (positions
         # within to_llm_candidates).  Remap LLM-local → unique-space →
-        # original-space.  Cache hits have batch_target_index=None.
-        unique_decisions_by_k: dict[int, CuratorDecision] = dict(cache_hit_map)
+        # original-space.  Decisions made without the LLM have batch_target_index=None.
+        unique_decisions_by_k: dict[int, CuratorDecision] = dict(decided_without_llm)
         for llm_j, k in enumerate(llm_k_list):
             dec = llm_raw_decisions[llm_j]
             if dec.batch_target_index is not None:
