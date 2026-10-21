@@ -172,3 +172,138 @@ def test_parse_program_reports_every_violation_together() -> None:
     violations = caught.value.violations
     assert any('fk-0000000000a2' in v for v in violations)
     assert any('streams[1].risk' in v and 'extreme' in v for v in violations)
+
+
+PRD_PATHS = {
+    'S1': 'plans/review-all-fixture-s1-prd.md',
+    'S2': 'plans/review-all-fixture-s2-prd.md',
+    'S3': 'plans/review-all-fixture-s3-prd.md',
+}
+
+
+def _program() -> Any:
+    return state.parse_program(_fixture_program_data())
+
+
+def _line(seq: int, op: str, **fields: Any) -> dict[str, Any]:
+    return {'seq': seq, 'at': '2026-10-19T12:00:00Z', 'by': 'lead', 'op': op, **fields}
+
+
+def _status(seq: int, stream: str, status: str, **fields: Any) -> dict[str, Any]:
+    return _line(seq, 'stream_status', stream=stream, status=status, **fields)
+
+
+def _amend(seq: int, stream: str, field: str, change: str, value: Any) -> dict[str, Any]:
+    return _line(
+        seq, 'amend_stream', stream=stream, field=field, change=change, value=value,
+        ruling='D1',
+    )
+
+
+def _authored(seq: int, stream: str) -> dict[str, Any]:
+    return _status(seq, stream, 'authored', prd_path=PRD_PATHS[stream])
+
+
+def _row(task_id: int, **metadata: Any) -> Any:
+    return state.TaskRow(
+        task_id=task_id, title=f'task {task_id}', status='pending', priority='medium',
+        updated_at='2026-10-19T12:00:00Z', metadata=metadata, dependencies=(),
+    )
+
+
+def test_stream_views_without_a_ledger_are_the_program_rows() -> None:
+    views = state.stream_views(_program(), ())
+    assert set(views) == {'S1', 'S2', 'S3'}
+    assert views['S1'].keys == ('fk-0000000000a1', 'fk-0000000000a2')
+    assert views['S2'].deps == ('S1',)
+    assert views['S1'].status is None
+    assert views['S1'].prd_path is None
+    assert views['S1'].authored is False
+
+
+def test_stream_status_lines_fold_status_and_keep_the_authored_prd_path() -> None:
+    authored = state.stream_views(_program(), [_authored(1, 'S1')])['S1']
+    assert authored.status is state.StreamStatus.AUTHORED
+    assert authored.prd_path == PRD_PATHS['S1']
+    assert authored.authored is True
+
+    committed = state.stream_views(
+        _program(), [_authored(1, 'S1'), _status(2, 'S1', 'committed')],
+    )['S1']
+    assert committed.status is state.StreamStatus.COMMITTED
+    assert committed.prd_path == PRD_PATHS['S1']
+    assert committed.authored is True
+
+
+def test_amend_stream_lines_change_the_stream_row() -> None:
+    views = state.stream_views(_program(), [
+        _amend(1, 'S1', 'keys', 'add', 'fk-0000000000e1'),
+        _amend(2, 'S1', 'keys', 'remove', 'fk-0000000000a1'),
+        _amend(3, 'S2', 'deps', 'add', 'S3'),
+        _amend(4, 'S3', 'mode', 'set', 'spawn'),
+    ])
+    assert views['S1'].keys == ('fk-0000000000a2', 'fk-0000000000e1')
+    assert views['S2'].deps == ('S1', 'S3')
+    assert views['S3'].mode is state.StreamMode.SPAWN
+
+
+@pytest.mark.parametrize(
+    ('field', 'change', 'value'),
+    [('keys', 'set', ['fk-0000000000e1']), ('mode', 'add', 'spawn')],
+)
+def test_amend_stream_refuses_a_change_its_field_does_not_take(
+    field: str, change: str, value: Any,
+) -> None:
+    with pytest.raises(state.StateError) as caught:
+        state.stream_views(_program(), [_authored(1, 'S1'), _amend(2, 'S1', field, change, value)])
+    message = str(caught.value)
+    assert 'seq 2' in message
+    assert field in message and change in message
+
+
+def test_waves_are_one_plus_the_latest_upstream_wave() -> None:
+    assert dict(state.waves(state.stream_views(_program(), ()))) == {'S1': 1, 'S2': 2, 'S3': 1}
+    amended = state.stream_views(_program(), [_amend(1, 'S3', 'deps', 'add', 'S2')])
+    assert dict(state.waves(amended)) == {'S1': 1, 'S2': 2, 'S3': 3}
+
+
+def test_waves_refuse_an_amendment_that_makes_a_cycle() -> None:
+    cyclic = state.stream_views(_program(), [_amend(1, 'S1', 'deps', 'add', 'S2')])
+    with pytest.raises(state.StateError) as caught:
+        state.waves(cyclic)
+    assert 'S1' in str(caught.value) and 'S2' in str(caught.value)
+
+
+def test_stream_of_matches_prd_path_before_finding_keys() -> None:
+    views = state.stream_views(_program(), [_authored(1, 'S1'), _authored(2, 'S2')])
+    row = _row(104, prd_path=PRD_PATHS['S1'], x_finding_key=['fk-0000000000b1'])
+    assert state.stream_of(row, views) == 'S1'
+
+
+@pytest.mark.parametrize('keys', [['fk-0000000000c1'], 'fk-0000000000c1'])
+def test_stream_of_falls_back_to_the_finding_key(keys: Any) -> None:
+    views = state.stream_views(_program(), [_authored(1, 'S1')])
+    assert state.stream_of(_row(108, x_finding_key=keys), views) == 'S3'
+
+
+@pytest.mark.parametrize(
+    'metadata',
+    [{}, {'x_finding_key': ['fk-00000000ffff']}],
+    ids=['keyless', 'keys-in-no-stream'],
+)
+def test_stream_of_puts_an_unmatched_program_task_in_the_unstreamed_bucket(
+    metadata: dict[str, Any],
+) -> None:
+    views = state.stream_views(_program(), ())
+    assert state.UNSTREAMED == 'unstreamed'
+    assert state.stream_of(_row(107, **metadata), views) == state.UNSTREAMED
+
+
+def test_stream_of_refuses_keys_that_hit_two_streams() -> None:
+    views = state.stream_views(_program(), ())
+    row = _row(150, x_finding_key=['fk-0000000000a1', 'fk-0000000000b1'])
+    with pytest.raises(state.AmbiguousStream) as caught:
+        state.stream_of(row, views)
+    message = str(caught.value)
+    assert '150' in message
+    assert 'S1' in message and 'S2' in message
