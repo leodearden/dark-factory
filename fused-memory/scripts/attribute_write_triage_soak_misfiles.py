@@ -40,6 +40,8 @@ Run from ``fused-memory/``::
 """
 from __future__ import annotations
 
+import argparse
+import hashlib
 import importlib.util
 import json
 import sys
@@ -92,8 +94,10 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 
 
 if TYPE_CHECKING:
+    import calibrate_write_triage as _calibrate
     import write_triage_stats as _stats
 else:
+    _calibrate = _load_script(_SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
     _stats = _load_script(_SCRIPTS / 'write_triage_stats.py', 'write_triage_stats')
 
 RECORDS_FILE = Path('duplicates') / 'records.jsonl'
@@ -107,6 +111,9 @@ _ATTACH_OUTCOMES = TRIAGE_OUTCOMES - {OUTCOME_STORED}
 _REPORTED_OUTCOMES = (OUTCOME_CONTESTED, OUTCOME_AMENDED, OUTCOME_RESTATED)
 _COMPLETION_SOURCE = 'orchestrator_completion'
 NOT_ATTACHED = 'not_attached'
+COUNTERFACTUAL_UNKNOWN = 'unknown'
+PROJECT_ARM = 'project'
+PROJECT_CATEGORY_ARM = 'project_category'
 
 #: The soak census's own grouping: 'solar' is the group that measured 98/232.
 GROUPS: Mapping[str, frozenset[str]] = MappingProxyType({
@@ -583,3 +590,255 @@ def _residual_summary(judged: list[tuple[SoakWrite, frozenset[AttachRefusal]]]) 
         'misfile_before': _misfile_k_of_n(write for write, _ in judged),
         'misfile_after': _misfile_k_of_n(write for write, refusals in judged if not refusals),
     }
+
+
+# --- per-project band arms and the replay -----------------------------------
+
+
+class EdgeSource(StrEnum):
+    """Where a replay arm's band edge came from."""
+
+    REPORT = 'report'
+    POOLED_FALLBACK = 'pooled_fallback'
+
+
+@dataclass(frozen=True)
+class ArmEdge:
+    value: float | None
+    source: EdgeSource
+
+    def as_json(self) -> dict[str, Any]:
+        return {'value': self.value, 'source': self.source.value}
+
+
+@dataclass(frozen=True)
+class ArmEdges:
+    t_high: ArmEdge
+    t_low: ArmEdge
+
+    def routing(self, judge_candidate_count: int) -> Routing:
+        return Routing(
+            t_high=self.t_high.value, t_low=self.t_low.value,
+            judge_candidate_count=judge_candidate_count,
+        )
+
+    def as_json(self) -> dict[str, Any]:
+        return {'t_high': self.t_high.as_json(), 't_low': self.t_low.as_json()}
+
+
+@dataclass(frozen=True)
+class BandArm:
+    """One replay arm: band edges per write category, *default* for a category it does not name."""
+
+    default: ArmEdges
+    by_category: Mapping[str, ArmEdges]
+
+    def edges_for(self, category: str) -> ArmEdges:
+        return self.by_category.get(category, self.default)
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            'default': self.default.as_json(),
+            'by_category': {category: edges.as_json() for category, edges in self.by_category.items()},
+        }
+
+
+def project_band_arms(report: Mapping[str, Any], pooled: Routing) -> dict[str, BandArm]:
+    """The project-level and per-category replay arms a calibration *report* proposes.
+
+    An edge the report did not derive takes the *pooled* write-path edge: a
+    refusal means no per-project evidence, never 'store everything'.
+    """
+    per_category = report.get('per_category') or {}
+    return {
+        PROJECT_ARM: BandArm(
+            default=_resolve_edges(report.get('chosen_t_high'), report.get('chosen_t_low'), pooled),
+            by_category=MappingProxyType({}),
+        ),
+        PROJECT_CATEGORY_ARM: BandArm(
+            default=_resolve_edges(None, None, pooled),
+            by_category=MappingProxyType({
+                category: _resolve_edges(outcome.get('t_high'), outcome.get('t_low'), pooled)
+                for category, outcome in per_category.items()
+            }),
+        ),
+    }
+
+
+def _resolve_edges(t_high: float | None, t_low: float | None, pooled: Routing) -> ArmEdges:
+    return ArmEdges(t_high=_resolve_edge(t_high, pooled.t_high), t_low=_resolve_edge(t_low, pooled.t_low))
+
+
+def _resolve_edge(derived: float | None, pooled: float | None) -> ArmEdge:
+    if derived is None:
+        return ArmEdge(value=pooled, source=EdgeSource.POOLED_FALLBACK)
+    return ArmEdge(value=float(derived), source=EdgeSource.REPORT)
+
+
+def replay_bands(
+    writes: Iterable[SoakWrite], pooled: Routing, arms: Mapping[str, Mapping[str, BandArm]],
+) -> dict[str, Any]:
+    """Per project with arms, and per arm: how each write's band moves from *pooled* to the arm."""
+    writes = list(writes)
+    return {
+        project: {
+            name: _replay_arm([write for write in writes if write.project == project], pooled, arm)
+            for name, arm in project_arms.items()
+        }
+        for project, project_arms in arms.items()
+    }
+
+
+_Move = tuple[Band, Band, SoakWrite]
+
+
+def _replay_arm(writes: list[SoakWrite], pooled: Routing, arm: BandArm) -> dict[str, Any]:
+    moves: list[_Move] = [
+        (
+            band_of(write, pooled),
+            band_of(write, arm.edges_for(write.category).routing(pooled.judge_candidate_count)),
+            write,
+        )
+        for write in writes
+    ]
+    return {
+        'edges': arm.as_json(),
+        'matrix': _transition_matrix(moves),
+        'into_stored': _into_stored([
+            write for source, target, write in moves if source != target and target is Band.STORED
+        ]),
+        'other_moves': _other_moves(moves),
+    }
+
+
+def _transition_matrix(moves: list[_Move]) -> dict[str, dict[str, int]]:
+    counts = Counter((source, target) for source, target, _ in moves)
+    return {source.value: {target.value: counts[(source, target)] for target in Band} for source in Band}
+
+
+def _into_stored(movers: list[SoakWrite]) -> dict[str, int]:
+    rated = [write for write in movers if write.rated]
+    return {
+        'movers': len(movers),
+        'rated_misfiles_removed': sum(write.misfiled for write in rated),
+        'rated_non_misfiles_lost': sum(not write.misfiled for write in rated),
+        'unrated': len(movers) - len(rated),
+    }
+
+
+def _other_moves(moves: list[_Move]) -> list[dict[str, Any]]:
+    by_move: defaultdict[tuple[Band, Band], list[SoakWrite]] = defaultdict(list)
+    for source, target, write in moves:
+        if source != target and target is not Band.STORED:
+            by_move[(source, target)].append(write)
+    return [
+        _move_summary(source, target, by_move[(source, target)])
+        for source in Band for target in Band if (source, target) in by_move
+    ]
+
+
+def _move_summary(source: Band, target: Band, movers: list[SoakWrite]) -> dict[str, Any]:
+    verdicts = [write.verdict.value for write in movers if write.rated and write.verdict is not None]
+    return {
+        'from': source.value,
+        'to': target.value,
+        'movers': len(movers),
+        'soak_outcomes': dict(sorted(Counter(write.outcome for write in movers).items())),
+        'rated_verdicts': dict(sorted(Counter(verdicts).items())),
+        'unrated': len(movers) - len(verdicts),
+        'counterfactual_verdict': COUNTERFACTUAL_UNKNOWN,
+    }
+
+
+# --- the origins document and its CLI ---------------------------------------
+
+
+def analyse(
+    population: SoakPopulation,
+    routing: Routing,
+    guard: AttachGuard,
+    reports: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Every table the origins document carries, from the parsed evidence alone."""
+    groups = groups_with_projects(GROUPS, population.writes)
+    arms = {project: project_band_arms(report, routing) for project, report in reports.items()}
+    return {
+        'census_fidelity': census_fidelity(population.writes, groups),
+        'origin_tables': origin_tables(population.writes, groups, routing),
+        'guard_residual': guard_residual(population.writes, guard, routing, groups),
+        'replay': replay_bands(population.writes, routing, arms),
+    }
+
+
+def _provenance(
+    evidence_dir: Path,
+    report_paths: Mapping[str, Path],
+    population: SoakPopulation,
+    routing: Routing,
+    guard: AttachGuard,
+) -> dict[str, Any]:
+    return {
+        'evidence_dir': str(evidence_dir),
+        'evidence_files': {
+            str(name): hashlib.sha256((evidence_dir / name).read_bytes()).hexdigest()
+            for name in EVIDENCE_FILES
+        },
+        'pooled_bands': {'t_high': routing.t_high, 't_low': routing.t_low},
+        'judge_candidate_count': routing.judge_candidate_count,
+        'attach_guard': {
+            'min_parent_cosine': guard.min_parent_cosine,
+            'hoist_max_cosine_gap': guard.hoist_max_cosine_gap,
+        },
+        'project_reports': {
+            project: _calibrate.package_relative(path) for project, path in report_paths.items()
+        },
+        'groups': {name: sorted(projects) for name, projects in GROUPS.items()},
+        'population': {
+            'writes': len(population.writes),
+            'attached': sum(write.attached for write in population.writes),
+            'excluded': {
+                reason.value: {'count': len(ids), 'memory_ids': list(ids)}
+                for reason, ids in population.excluded.items()
+            },
+        },
+    }
+
+
+def _project_report_arg(value: str) -> tuple[str, Path]:
+    project, separator, path = value.partition('=')
+    if not (separator and project and path):
+        raise argparse.ArgumentTypeError(f'expected <project>=<path>, got {value!r}')
+    return project, Path(path)
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='Attribute the write-triage soak misfiles per project.')
+    parser.add_argument('--evidence-dir', type=Path, required=True)
+    parser.add_argument(
+        '--project-report', type=_project_report_arg, action='append', default=[],
+        metavar='PROJECT=PATH',
+    )
+    parser.add_argument('--out', type=Path, required=True)
+    args = parser.parse_args(argv)
+    projects = [project for project, _ in args.project_report]
+    if len(set(projects)) != len(projects):
+        parser.error(f'--project-report names a project more than once: {projects}')
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    report_paths = dict(args.project_report)
+    population = load_soak_writes(args.evidence_dir)
+    routing, guard = shipped_write_path()
+    reports = {project: json.loads(path.read_text()) for project, path in report_paths.items()}
+    document = {
+        'provenance': _provenance(args.evidence_dir, report_paths, population, routing, guard),
+        **analyse(population, routing, guard, reports),
+    }
+    args.out.write_text(json.dumps(document, indent=2) + '\n')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

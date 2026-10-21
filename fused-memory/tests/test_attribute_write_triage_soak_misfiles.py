@@ -10,6 +10,7 @@ evidence is never read.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import types
 from dataclasses import replace
@@ -79,7 +80,7 @@ def _attach(
 
 
 def _evidence(tmp_path: Path, records: list[dict], attaches: list[dict]) -> Path:
-    (tmp_path / 'duplicates').mkdir()
+    (tmp_path / 'duplicates').mkdir(parents=True)
     (tmp_path / 'team' / 'A').mkdir(parents=True)
     (tmp_path / 'duplicates' / 'records.jsonl').write_text(
         ''.join(json.dumps(row) + '\n' for row in records),
@@ -697,7 +698,7 @@ def _replay(writes: list[Any], report: dict[str, Any], arm: str = 'project') -> 
 
 def _matrix(**cells: int) -> dict[str, dict[str, int]]:
     bands = ('restated', 'judge', 'stored')
-    matrix = {source: dict.fromkeys(bands, 0) for source in bands}
+    matrix: dict[str, dict[str, int]] = {source: {target: 0 for target in bands} for source in bands}
     for cell, count in cells.items():
         source, target = cell.split('__')
         matrix[source][target] = count
@@ -791,3 +792,53 @@ class TestReplayBands:
         replay = _mod().replay_bands([_move('h', 0.6, project='dark_factory')], _pooled(), arms)
 
         assert set(replay) == {'solar_challenge'}
+
+
+class TestMain:
+    def _run(self, tmp_path: Path, *extra: str) -> dict[str, Any]:
+        evidence = _evidence(tmp_path / 'evidence', [
+            _record(_STANDALONE, nn_triage=0.4), _record(_WRITE, cls='child'), _record(_OTHER, cls='child'),
+        ], [_attach(_WRITE, outcome='contested', verdict='contested_misfile')])
+        report = tmp_path / 'report.json'
+        report.write_text(json.dumps(_report(per_category={'procedural_knowledge': (None, None)})))
+        out = tmp_path / 'origins.json'
+
+        assert _mod().main([
+            '--evidence-dir', str(evidence), '--project-report', f'solar_challenge={report}',
+            '--out', str(out), *extra,
+        ]) == 0
+        return json.loads(out.read_text())
+
+    def test_it_writes_one_document_with_the_five_top_level_sections(self, tmp_path):
+        document = self._run(tmp_path)
+
+        assert list(document) == ['provenance', 'census_fidelity', 'origin_tables', 'guard_residual', 'replay']
+        assert document['census_fidelity']['solar'] == _kn(1, 1)
+        assert set(document['replay']) == {'solar_challenge'}
+
+    def test_provenance_pins_the_inputs_the_shipped_write_path_and_the_exclusions(self, tmp_path):
+        document = self._run(tmp_path)
+        provenance = document['provenance']
+        routing, guard = _mod().shipped_write_path()
+
+        records = tmp_path / 'evidence' / 'duplicates' / 'records.jsonl'
+        assert provenance['evidence_files']['duplicates/records.jsonl'] == hashlib.sha256(records.read_bytes()).hexdigest()
+        assert provenance['pooled_bands'] == {'t_high': routing.t_high, 't_low': routing.t_low}
+        assert provenance['judge_candidate_count'] == routing.judge_candidate_count
+        assert provenance['attach_guard'] == {
+            'min_parent_cosine': guard.min_parent_cosine, 'hoist_max_cosine_gap': guard.hoist_max_cosine_gap,
+        }
+        assert provenance['project_reports'] == {'solar_challenge': str(tmp_path / 'report.json')}
+        assert provenance['population']['excluded']['caller_declared_child'] == {'count': 1, 'memory_ids': [_OTHER]}
+
+    @pytest.mark.parametrize('bad', ['solar_challenge', '=x.json', 'solar_challenge='])
+    def test_a_malformed_project_report_is_refused(self, tmp_path, bad):
+        with pytest.raises(SystemExit):
+            _mod().main(['--evidence-dir', str(tmp_path), '--project-report', bad, '--out', str(tmp_path / 'o.json')])
+
+    def test_a_project_named_twice_is_refused(self, tmp_path):
+        with pytest.raises(SystemExit):
+            _mod().main([
+                '--evidence-dir', str(tmp_path), '--project-report', 'p=a.json', '--project-report', 'p=b.json',
+                '--out', str(tmp_path / 'o.json'),
+            ])
