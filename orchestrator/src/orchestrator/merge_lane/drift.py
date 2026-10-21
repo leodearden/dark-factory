@@ -21,7 +21,7 @@ import asyncio
 import dataclasses
 import json
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -230,6 +230,10 @@ class _HeldHostLeases:
     def hold(self, *leases: HostLease | None) -> None:
         self._held.extend(lease for lease in leases if lease is not None)
 
+    def seat(self, lease: HostLease, runner: VerifyRunner) -> None:
+        """Put *runner* on held *lease*'s slot, so the end of its leg releases it."""
+        self._held[self._held.index(lease)] = dataclasses.replace(lease, runner=runner)
+
     async def release_leg(self, runner: VerifyRunner) -> None:
         """Release the lease whose runner just ended its leg; idempotent."""
         lease = next((held for held in self._held if held.runner is runner), None)
@@ -243,13 +247,18 @@ class _HeldHostLeases:
 
 
 async def _try_acquire_drift_hosts(
-    allocator: HostAllocator, local_factory: Callable[[], LocalRunner],
+    allocator: HostAllocator,
 ) -> tuple[HostLease, HostLease] | None:
-    """One all-or-nothing attempt: (local, remote) leases, or None holding neither."""
+    """One all-or-nothing attempt: (local, remote) leases, or None holding neither.
+
+    The local lease claims the slot with no runner yet: the local leg's runner
+    needs its worktree, which is built only once both slots are held (see
+    :meth:`_HeldHostLeases.seat`), so a deferral costs no git work.
+    """
     remote = allocator.acquire_remote()
     if remote is None:
         return None
-    local = allocator.acquire_local(local_factory)
+    local = allocator.acquire_local(lambda: None)
     if local is None:
         await allocator.release(remote)
         return None
@@ -258,7 +267,6 @@ async def _try_acquire_drift_hosts(
 
 async def _acquire_drift_hosts(
     allocator: HostAllocator,
-    local_factory: Callable[[], LocalRunner],
     *,
     settle_secs: float,
     poll_secs: float,
@@ -270,7 +278,7 @@ async def _acquire_drift_hosts(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + settle_secs
     while True:
-        leases = await _try_acquire_drift_hosts(allocator, local_factory)
+        leases = await _try_acquire_drift_hosts(allocator)
         if leases is not None or loop.time() >= deadline:
             return leases
         await asyncio.sleep(poll_secs)
@@ -330,8 +338,8 @@ async def _run_drift_check(
 
     Mirrors ``_run_cold_shadow_verify`` / ``_run_shadow_compare`` as an
     off-serial-lane detective control (spawned via :func:`_maybe_run_drift_check`).
-    Creates a throwaway verify worktree for the local leg, waits up to
-    *host_settle_secs* for both host slots, builds a 2-host pool (local
+    Waits up to *host_settle_secs* for both host slots, then creates a
+    throwaway verify worktree for the local leg, builds a 2-host pool (local
     trust-anchor + eligible remote), runs ``DriftDetector.check_env_safely`` and
     then ``check``, and propagates any quarantined remote name into
     *quarantine_set* (the worker-level shared set consulted by
@@ -339,9 +347,10 @@ async def _run_drift_check(
 
     Each host slot is released the moment its own leg ends; the ``finally``
     releases only what is still held, then ``cleanup_merge_worktree``.  If the
-    slots never come free the check DEFERS: it runs no leg, records the
-    deferral in *state_path* and emits ``drift_check_deferred``.  Exceptions
-    are caught and logged so this detective control never crashes the worker.
+    slots never come free the check DEFERS: it builds no worktree, runs no leg,
+    records the deferral in *state_path* and emits ``drift_check_deferred``.
+    Exceptions are caught and logged so this detective control never crashes
+    the worker.
 
     The verify body runs under ``merge_verify_lease(lane_dir=wt)`` so a
     concurrent periodic worktree reap (task 3018) cannot delete the checkout
@@ -375,6 +384,20 @@ async def _run_drift_check(
     wt = None
     held = _HeldHostLeases(allocator)
     try:
+        # β decision 5: both hosts come through the allocator so slot
+        # accounting is respected (≤1 verify-merge per host at any time).
+        leases = await _acquire_drift_hosts(
+            allocator, settle_secs=host_settle_secs, poll_secs=host_poll_secs,
+        )
+        if leases is None:
+            _report_drift_deferral(
+                event_store, req, merge_commit, allocator,
+                _record_drift_deferral(state_path),
+            )
+            return
+        held.hold(*leases)
+        _report_drift_start(req, merge_commit, _record_drift_start(state_path))
+        local_slot, remote_lease = leases
         wt = await git_ops.create_ephemeral_verify_worktree(merge_commit)
         # Hold THIS throwaway lane's flock for the duration of the drift
         # verify (task 3018).  Three things to know:
@@ -440,36 +463,15 @@ async def _run_drift_check(
             # LocalRunner below run the whole suite.
             task_files_tuple = None
             spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
-
-            # β decision 5: acquire both hosts through the allocator so slot
-            # accounting is respected (≤1 verify-merge per host at any time).
-            # The throwaway worktree (wt) was created unconditionally above; only
-            # the LocalRunner *object* is deferred to the factory so it is not
-            # constructed if the local slot is unavailable.
-
-            def _local_factory() -> LocalRunner:
-                return LocalRunner(
-                    wt, req.config, req.module_configs, task_files_tuple,
-                    run_scoped=verifier.run_scoped,
-                    run_unscoped=verifier.run_unscoped_typechecks,
-                    task_id=req.task_id,
-                )
-
-            leases = await _acquire_drift_hosts(
-                allocator, _local_factory,
-                settle_secs=host_settle_secs, poll_secs=host_poll_secs,
+            local_runner = LocalRunner(
+                wt, req.config, req.module_configs, task_files_tuple,
+                run_scoped=verifier.run_scoped,
+                run_unscoped=verifier.run_unscoped_typechecks,
+                task_id=req.task_id,
             )
-            if leases is None:
-                _report_drift_deferral(
-                    event_store, req, merge_commit, allocator,
-                    _record_drift_deferral(state_path),
-                )
-                return
-            held.hold(*leases)
-            _report_drift_start(req, merge_commit, _record_drift_start(state_path))
-            local_lease, remote_lease = leases
+            held.seat(local_slot, local_runner)
             pool = VerifyRunnerPool(
-                [local_lease.runner, remote_lease.runner],
+                [local_runner, remote_lease.runner],
                 event_store=event_store,
                 task_id=req.task_id,
                 on_unavailable=on_unavailable,

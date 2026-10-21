@@ -1399,7 +1399,38 @@ class TestDriftCheckDefersWhenAHostSlotIsBusy:
         assert {h['name']: h['slot_state'] for h in deferral['hosts']}['laptop'] == 'busy'
         assert _load_drift_check_state(state_path).consecutive_deferrals == 1
         assert (scene.slot('local'), scene.slot('laptop')) == ('free', 'busy')
+        scene.git_ops.create_ephemeral_verify_worktree.assert_not_awaited()
+        scene.git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+    async def test_a_check_waiting_for_its_slots_has_built_no_worktree(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _DriftScene.build(tmp_path)
+        merge_lease = scene.allocator.acquire_remote()
+        assert merge_lease is not None
+        drift = asyncio.create_task(
+            scene.run(FakeVerifier(), host_settle_secs=5, host_poll_secs=0.01),
+        )
+        try:
+            await asyncio.sleep(0.05)
+            scene.git_ops.create_ephemeral_verify_worktree.assert_not_awaited()
+        finally:
+            await scene.allocator.release(merge_lease)
+            await asyncio.wait_for(drift, 2 * _WAIT_SECS)
+        scene.git_ops.create_ephemeral_verify_worktree.assert_awaited_once_with('drift-sha')
         scene.git_ops.cleanup_merge_worktree.assert_awaited_once()
+        assert scene.parity_events() == 1
+
+    async def test_worktree_failure_frees_both_slots_it_acquired(self, tmp_path: Path) -> None:
+        scene = _DriftScene.build(tmp_path)
+        scene.git_ops.create_ephemeral_verify_worktree.side_effect = OSError('disk full')
+
+        await scene.run(FakeVerifier(), host_settle_secs=0)
+
+        assert (scene.slot('local'), scene.slot('laptop')) == ('free', 'free')
+        scene.remote.run_merge_verify.assert_not_awaited()
+        scene.git_ops.cleanup_merge_worktree.assert_not_awaited()
+        assert _deferrals(scene) == []
 
     async def test_both_slots_busy_defers_and_leaves_both_holders_untouched(
         self, tmp_path: Path,
