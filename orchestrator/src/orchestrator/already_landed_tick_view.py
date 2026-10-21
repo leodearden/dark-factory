@@ -10,6 +10,10 @@ provisioning re-created a branch whose earlier incarnation left a marker on
 main, can only cost a missed auto-done, never cause a false one (task 4900; see
 ``orchestrator/src/orchestrator/git_ops.py::GitOps.find_merge_marker``'s
 branch-existence gate).
+
+``AlreadyLandedGate`` is the gate's call contract, the signature the
+scheduler calls and the harness implements. It lives here, beside the view it
+carries, so the scheduler can type the gate without importing the harness.
 """
 
 from __future__ import annotations

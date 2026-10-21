@@ -13805,7 +13805,15 @@ class Harness:
 
         **Per-tick inputs** (task 4900): ``task`` is the scheduler's candidate
         dict, so the gate re-reads it via ``scheduler.get_task`` only when it
-        is absent. ``tick_view`` is the consult's shared branch snapshot; it
+        is absent. That dict is tick-start state, minutes old for a late
+        candidate in a long tick. That is safe only while nothing rewrites
+        this gate's veto inputs on a PENDING task mid-tick. ``reopen_at``
+        changes only when a done task is reopened, and fused-memory's
+        ``done_evidence_stale`` gate re-reads the stored value at write time
+        anyway. ``branch_base_sha`` is stamped by the task's own workflow,
+        which runs only after dispatch. A new mid-tick writer of either field
+        must make this gate re-read the task before it flips one.
+        ``tick_view`` is the consult's shared branch snapshot; it
         is consulted only after every veto above, and only to abstain early —
         the safety argument lives in
         ``orchestrator/src/orchestrator/already_landed_tick_view.py``.
