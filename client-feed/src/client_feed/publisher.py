@@ -176,7 +176,7 @@ def _stream_unit(
     stamp: Stamp,
     degraded: list[Degradation],
     *,
-    skip_unreadable_before: datetime | None,
+    skip_missing_before: datetime | None,
 ) -> StreamOutput | None:
     """The stream's events, all or none: a failure reading the landed merges holds the whole batch."""
     if store is None:
@@ -189,7 +189,7 @@ def _stream_unit(
             max_cases=policy.max_cases_per_run,
             published=_published(out.uncommitted),
             stamp=stamp,
-            skip_unreadable_before=skip_unreadable_before,
+            skip_missing_before=skip_missing_before,
         ),
         degraded,
     )
@@ -217,8 +217,11 @@ def _read_git(policy: Policy, *, cursor: Cursor, view: FeedState) -> _Git:
     return _Git(head=head, branches=branches, tree=tree)
 
 
-def _skip_unreadable_before(git: _Git | None, now: datetime) -> datetime | None:
-    """Merges git cannot read stop holding the stream UNKNOWN_MERGE_GRACE after they landed, only while git reads main."""
+def _skip_missing_before(git: _Git | None, now: datetime) -> datetime | None:
+    """A landing whose commit the repository does not hold stops holding the stream UNKNOWN_MERGE_GRACE after it landed.
+
+    Only while git reads main.
+    """
     return None if git is None or git.head is None else now - UNKNOWN_MERGE_GRACE
 
 
@@ -283,7 +286,7 @@ def run_pass(
     view = fold(upserts, project_id=out.state.project_id, start=out.state)
     git = _guarded(lambda: _read_git(policy, cursor=cursor, view=view), degraded)
     stream = _stream_unit(
-        policy, out, store, view, stamp, degraded, skip_unreadable_before=_skip_unreadable_before(git, now)
+        policy, out, store, view, stamp, degraded, skip_missing_before=_skip_missing_before(git, now)
     )
     factory = None if store is None else factory_event(store.factory, state=view, stamp=stamp, now=now)
     branches = None if git is None else branch_event(git.branches, state=view, stamp=stamp, now=now)

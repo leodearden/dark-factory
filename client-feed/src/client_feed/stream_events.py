@@ -39,7 +39,7 @@ from client_feed.sources.events import (
     VerifyVerdict,
     read_review_counts,
 )
-from client_feed.sources.git import GitError, MergeStats, merge_stats
+from client_feed.sources.git import GitError, MergeStats, has_commit, merge_stats
 
 VERIFY_PHASE: Final = 'verify'  # orchestrator/src/orchestrator/workflow_types.py::WorkflowState.VERIFY
 _MERGE_LANDED: Final = MergeLanded.model_fields['type'].default
@@ -198,15 +198,20 @@ def _landing_identity(landing: LandedCommit) -> Identity:
     return _MERGE_LANDED, landing.commit
 
 
-def _stats(root: Path, landing: LandedCommit, skip_unreadable_before: datetime | None) -> MergeStats | None:
-    """The landing's merge stats; None for a merge git cannot read that landed before the cutoff."""
+def _missing_before(root: Path, landing: LandedCommit, cutoff: datetime | None) -> bool:
+    """A landing older than the cutoff whose commit git, running, says the repository does not hold."""
+    return cutoff is not None and landing.at < cutoff and not has_commit(root, landing.commit)
+
+
+def _stats(root: Path, landing: LandedCommit, skip_missing_before: datetime | None) -> MergeStats | None:
+    """The landing's merge stats; None for a merge the repository does not hold that landed before the cutoff."""
     try:
         return merge_stats(root, landing.commit)
     except GitError as exc:
-        if skip_unreadable_before is None or landing.at >= skip_unreadable_before:
+        if not _missing_before(root, landing, skip_missing_before):
             raise
         _log.error(
-            'skipping the landing of %s (event %d) at %s: git cannot read it (%s)',
+            'skipping the landing of %s (event %d) at %s: the repository does not hold that commit (%s)',
             landing.commit, landing.event_id, landing.at.isoformat(), exc.reason,
         )
         return None
@@ -226,7 +231,7 @@ def _landed(
     root: Path,
     stream: Sequence[StreamEvent],
     published: AbstractSet[Identity],
-    skip_unreadable_before: datetime | None,
+    skip_missing_before: datetime | None,
 ) -> _Landed:
     """Git read in landing order, before any archive, and only for landings not yet published."""
     first = _first_landings(stream)
@@ -235,7 +240,7 @@ def _landed(
     for commit, landing in first.items():
         if _landing_identity(landing) in published:
             continue
-        read = _stats(root, landing, skip_unreadable_before)
+        read = _stats(root, landing, skip_missing_before)
         if read is None:
             skipped += 1
         else:
@@ -250,7 +255,7 @@ def _skipped_landings(landed: _Landed) -> tuple[Degradation, ...]:
     if not landed.skipped:
         return ()
     noun = 'landing' if landed.skipped == 1 else 'landings'
-    reason = f'skipped {landed.skipped} {noun} whose merge git cannot read'
+    reason = f'skipped {landed.skipped} {noun} whose merge commit is not in the repository'
     return (Degradation(source=Source.GIT, reason=reason),)
 
 
@@ -286,15 +291,16 @@ def stream_events(
     max_cases: int,
     published: AbstractSet[Identity],
     stamp: Stamp,
-    skip_unreadable_before: datetime | None,
+    skip_missing_before: datetime | None,
 ) -> StreamOutput:
     """The feed events of `stream` in id order, less those already `published`.
 
     A workflow_verify verdict adds none: its verify-phase exit reports the run. A GitError or StoreReadError
-    reading the landed merges propagates, so the caller holds the whole batch; but a merge git cannot read
-    that landed before `skip_unreadable_before` emits no merge_landed and is named in `degraded` instead.
+    reading the landed merges propagates, so the caller holds the whole batch; but a merge the repository
+    does not hold that landed before `skip_missing_before` emits no merge_landed and is named in `degraded`
+    instead. Any other GitError propagates, however old the landing.
     """
-    landed = _landed(root, stream, published, skip_unreadable_before)
+    landed = _landed(root, stream, published, skip_missing_before)
     verify_starts = _verify_starts(state)
     outputs: list[StreamOutput] = []
     for item in stream:

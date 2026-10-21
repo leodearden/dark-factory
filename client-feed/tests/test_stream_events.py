@@ -101,7 +101,7 @@ def run(
     state: FeedState | None = None,
     published: frozenset[Identity] = frozenset(),
     first_seq: int = 1,
-    skip_unreadable_before: datetime | None = None,
+    skip_missing_before: datetime | None = None,
 ) -> StreamOutput:
     return stream_events(
         root,
@@ -110,7 +110,7 @@ def run(
         max_cases=100,
         published=published,
         stamp=Stamp(project_id=PROJECT, first_seq=first_seq),
-        skip_unreadable_before=skip_unreadable_before,
+        skip_missing_before=skip_missing_before,
     )
 
 
@@ -524,7 +524,7 @@ def test_a_merge_unknown_to_git_that_landed_after_the_cutoff_still_raises(landed
             landed.root,
             landing(60, UNKNOWN_SHA, 7, minutes=30),
             state=state_holding_task_7(),
-            skip_unreadable_before=at(30),
+            skip_missing_before=at(30),
         )
 
 
@@ -538,7 +538,7 @@ def test_a_merge_unknown_to_git_that_landed_before_the_cutoff_is_skipped_and_nam
     with caplog.at_level(logging.ERROR, logger='client_feed.stream_events'):
         output = run(
             landed.root, unknown, between, known,
-            state=state_holding_task_7(), skip_unreadable_before=at(31),
+            state=state_holding_task_7(), skip_missing_before=at(31),
         )
 
     after, merge = output.events
@@ -563,7 +563,7 @@ def test_a_merge_the_repository_holds_whose_git_is_killed_is_held_however_old_it
     with caplog.at_level(logging.ERROR, logger='client_feed.stream_events'), pytest.raises(GitError) as caught:
         run(
             landed.root, landing(60, landed.merge, 7, minutes=30),
-            state=state_holding_task_7(), skip_unreadable_before=at(31),
+            state=state_holding_task_7(), skip_missing_before=at(31),
         )
 
     assert caught.value.returncode == -signal.SIGKILL
@@ -580,7 +580,7 @@ def test_a_merge_git_cannot_be_spawned_for_is_held_however_old_it_is(
     with pytest.raises(GitError) as caught:
         run(
             landed.root, landing(60, landed.merge, 7, minutes=30),
-            state=state_holding_task_7(), skip_unreadable_before=at(31),
+            state=state_holding_task_7(), skip_missing_before=at(31),
         )
 
     assert caught.value.returncode is None

@@ -460,11 +460,15 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     not emitted, a merge run's legs are `not_recorded`, and `archive` is named in `degraded`
     (`client-feed/src/client_feed/stream_events.py::_archived`). A merge commit git cannot read holds
     the whole events batch: `events_id` does not advance, and `git` is named in every heartbeat.
-    The hold is bounded. Once the landing is more than `UNKNOWN_MERGE_GRACE` (one hour) old, and
-    only on a pass where git still reads main's head, it is skipped: no `merge_landed`, an ERROR
-    log naming the commit and the runs.db event id, and `skipped N landing(s) whose merge git
-    cannot read` under `git` (`client-feed/src/client_feed/publisher.py::_skip_unreadable_before`,
-    `client-feed/src/client_feed/stream_events.py::_stats`). The rule is stateless: a restart
+    The hold is bounded only for a commit the repository does not hold. Once the landing is more
+    than `UNKNOWN_MERGE_GRACE` (one hour) old, and only on a pass where git still reads main's
+    head, it is skipped when git, running, reports that the repository does not hold the commit
+    (`client-feed/src/client_feed/sources/git.py::has_commit`): no `merge_landed`, an ERROR log
+    naming the commit and the runs.db event id, and `skipped N landing(s) whose merge commit is not
+    in the repository` under `git` (`client-feed/src/client_feed/publisher.py::_skip_missing_before`,
+    `client-feed/src/client_feed/stream_events.py::_missing_before`). A timeout, a failed spawn, a
+    killed git or any other failure reading a commit the repository holds keeps holding the batch,
+    however old the landing. The rule is stateless: a restart
     neither resets nor extends it, and a broken repository never drops a landing. Git is read
     lazily, in landing order and before any archive, and only for landings not already in the
     uncommitted tail, so a held pass re-reads only the landings ahead of the one held
