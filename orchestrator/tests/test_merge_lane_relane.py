@@ -33,6 +33,7 @@ from _orch_helpers import wait_responsive
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeRequest, QueuedBranch
+from orchestrator.merge_lane.queue_store import MergeQueueStore
 from orchestrator.merge_lane.types import TrainCallbacks
 from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
@@ -48,6 +49,7 @@ _LANDS_WITHIN = 30.0
 
 @dataclasses.dataclass(frozen=True)
 class _Scene:
+    repo: Path
     git_ops: GitOps
     config: OrchestratorConfig
 
@@ -56,6 +58,7 @@ class _Scene:
 def scene(tmp_path: Path) -> _Scene:
     repo = seed_repo(tmp_path / 'repo', _SEED)
     return _Scene(
+        repo=repo,
         git_ops=GitOps(_GIT, repo),
         config=lane_scene_config(repo, _GIT, merge_train_coalesce_enabled=True),
     )
@@ -130,6 +133,17 @@ async def _until_parked(queue: asyncio.Queue[Any]) -> None:
     await asyncio.sleep(0.5)
 
 
+async def _main_landings(scene: _Scene) -> list[str]:
+    """Subjects of main's first-parent history: one per landing, so a member
+    that also merged on its own shows up as a ``Merge task/<member>`` line."""
+    proc = await asyncio.create_subprocess_exec(
+        'git', 'log', '--first-parent', '--format=%s', 'main',
+        cwd=scene.repo, stdout=asyncio.subprocess.PIPE,
+    )
+    out, _ = await proc.communicate()
+    return out.decode().splitlines()
+
+
 def _queued_lanes(lane: SpeculativeMergeWorker) -> list[tuple[str, str]]:
     return [
         (entry['task_id'], entry['lane'])
@@ -154,6 +168,24 @@ async def test_a_relaned_request_lands_ahead_of_the_halted_normal_lane(scene: _S
         assert not older.result.done()
         lane.unhalt_lane('normal')
         assert (await run.outcome(older, timeout=_LANDS_WITHIN)).status == 'done'
+
+
+async def test_a_relaned_solo_request_is_journaled_in_its_new_lane(
+    scene: _Scene, tmp_path: Path,
+) -> None:
+    journal = MergeQueueStore(tmp_path / 'merge-journal.json')
+    waiting = await _single(scene, 'journaled')
+    lane, queue = _halted_normal_lane(scene, [waiting], merge_store=journal)
+    lane.halt_lane('high', 'test: keep the moved request waiting')
+
+    async with running_lane(lane):
+        await wait_responsive(_until_parked(queue), label='the request is buffered')
+
+        lane.relane('high', request_id=waiting.request_id)
+
+        assert [(r.request_id, r.lane) for r in journal.load()] == [
+            (waiting.request_id, 'high'),
+        ]
 
 
 async def test_relaning_a_coalesced_member_moves_its_whole_train(scene: _Scene) -> None:
@@ -199,6 +231,9 @@ async def test_a_member_relaned_while_its_train_forms_takes_the_train_with_it(
         await wait_responsive(
             hooks.until_landed('r-a', 'r-b'), label='the train carrying r-a landed',
         )
+    landings = await _main_landings(scene)
+    assert 'Merge task/r-a into main' not in landings, landings
+    assert 'Merge task/r-b into main' in landings, landings
 
 
 async def test_a_request_the_merger_has_taken_is_refused(scene: _Scene) -> None:
