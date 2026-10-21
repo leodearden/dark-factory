@@ -5,7 +5,9 @@ ref to its node ids, and decision 14 makes completeness part of every answer: a 
 cannot all be read statically is incomplete, never clean. Collection mirrors pytest's DEFAULT
 rules only, so a project that overrides them is a known, fail-safe limit. A Test class's bases are
 resolved only where the module defines them, so test methods, marks, constructors and ``__test__``
-inherited from an imported base are all invisible.
+inherited from an imported base are all invisible. A ``pytestmark`` that cannot be read statically
+disables its carriers as UNRESOLVED, but a decorator naming no mark is taken for an ordinary
+decorator, so a skip applied by an imported decorator helper is invisible.
 """
 
 from __future__ import annotations
@@ -58,14 +60,19 @@ _VIRTUALENV_MARKERS = ('pyvenv.cfg', 'conda-meta/history')
 
 
 class DisablingMark(StrEnum):
-    """A pytest mark that statically keeps a carrier from running as a guard; values are pytest's names."""
+    """A pytest mark that statically keeps a carrier from running as a guard; values are pytest's names.
+
+    UNRESOLVED is a ``pytestmark`` reaching the carrier that cannot be read statically and so may skip it.
+    """
 
     SKIP = 'skip'
     SKIPIF = 'skipif'
     XFAIL = 'xfail'
+    UNRESOLVED = 'unresolved'
 
 
-_DISABLING_MARKS = frozenset(DisablingMark)
+_DISABLING_MARKS = frozenset({DisablingMark.SKIP, DisablingMark.SKIPIF, DisablingMark.XFAIL})
+_PYTESTMARK = 'pytestmark'
 
 
 class GapReason(StrEnum):
@@ -214,33 +221,79 @@ def _as_disabling(name: str | None) -> DisablingMark | None:
     return DisablingMark(name) if name in _DISABLING_MARKS else None
 
 
-@dataclass(frozen=True)
-class _DisablingSpellings:
-    """Every way a module spells a skip or xfail mark, so that no spelling of one leaves a carrier runnable.
+_Definition = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
 
-    Besides ``<x>.mark.NAME``, a mark is spelled on any *aliases* name of pytest's mark namespace,
-    or by a name *bound* to such a spelling anywhere in the module.
+
+def _scope_nodes(body: Sequence[ast.stmt]) -> Iterator[ast.AST]:
+    """Every node a scope *body* runs in that scope itself: nested definitions' and lambdas' bodies excluded."""
+    stack: list[ast.AST] = list(body)
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, _Definition | ast.Lambda):
+            stack.extend(ast.iter_child_nodes(node))
+
+
+def _binding_targets(statement: ast.stmt) -> list[ast.expr]:
+    if isinstance(statement, ast.Assign):
+        return statement.targets
+    if isinstance(statement, ast.AnnAssign):
+        return [statement.target]
+    return []
+
+
+def _pytestmark_is_static(body: Sequence[ast.stmt]) -> bool:
+    """Whether a scope names ``pytestmark`` only as the target of its direct-child plain or annotated bindings.
+
+    A binding under ``if``/``try``/``with``, an augmented one, an ``append``/``extend`` or any other use
+    leaves the value pytest reads unknowable statically.
+    """
+    direct_targets = {id(target) for statement in body for target in _binding_targets(statement)}
+    return all(
+        id(node) in direct_targets
+        for node in _scope_nodes(body)
+        if isinstance(node, ast.Name) and node.id == _PYTESTMARK
+    )
+
+
+@dataclass(frozen=True)
+class _MarkReader:
+    """Which marker a module's mark element names, through its aliases and its names bound to one mark.
+
+    A decorator naming no mark is taken for an ordinary decorator, so a skip spelled by an imported
+    helper there is invisible; a ``pytestmark`` element holds only marks, so one naming no known
+    marker there is UNRESOLVED.
     """
 
     aliases: frozenset[str]
-    bound: Mapping[str, DisablingMark]
+    bound: Mapping[str, str]
 
     @classmethod
-    def of_module(cls, nodes: Iterable[ast.AST], aliases: frozenset[str]) -> _DisablingSpellings:
-        bound: dict[str, DisablingMark] = {}
+    def of_module(cls, nodes: Iterable[ast.AST], aliases: frozenset[str]) -> _MarkReader:
+        bound: dict[str, str] = {}
         for node in nodes:
             if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
-                disabling = _as_disabling(_spelled_marker(node.value, aliases))
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                if disabling is not None:
-                    bound.update((target.id, disabling) for target in targets if isinstance(target, ast.Name))
+                marker = _spelled_marker(node.value, aliases)
+                if marker is not None:
+                    targets = _binding_targets(node)
+                    bound.update((target.id, marker) for target in targets if isinstance(target, ast.Name))
         return cls(aliases, MappingProxyType(bound))
 
-    def disabling(self, element: ast.expr) -> DisablingMark | None:
+    def _marker(self, element: ast.expr) -> str | None:
         spelled = element.func if isinstance(element, ast.Call) else element
         if isinstance(spelled, ast.Name):
             return self.bound.get(spelled.id)
-        return _as_disabling(_spelled_marker(spelled, self.aliases))
+        return _spelled_marker(spelled, self.aliases)
+
+    def decorator_disabling(self, decorators: Sequence[ast.expr]) -> frozenset[DisablingMark]:
+        return frozenset(filter(None, (_as_disabling(self._marker(decorator)) for decorator in decorators)))
+
+    def pytestmark_disabling(self, body: Sequence[ast.stmt]) -> frozenset[DisablingMark]:
+        markers = [self._marker(element) for element in pytestmark_elements(body)]
+        disabled_by = {_as_disabling(marker) for marker in markers}
+        if None in markers or not _pytestmark_is_static(body):
+            disabled_by.add(DisablingMark.UNRESOLVED)
+        return frozenset(filter(None, disabled_by))
 
 
 @dataclass(frozen=True)
@@ -250,13 +303,11 @@ class _ScopeMarks:
     defect_marks: tuple[ast.expr, ...] = ()
     disabled_by: frozenset[DisablingMark] = frozenset()
 
-    def with_elements(self, elements: Sequence[ast.expr], spellings: _DisablingSpellings) -> _ScopeMarks:
+    def with_elements(
+        self, elements: Sequence[ast.expr], disabled_by: frozenset[DisablingMark]
+    ) -> _ScopeMarks:
         defect_marks = tuple(element for element in elements if marker_name(element) == _DEFECT_MARKER)
-        disabled_by = frozenset(filter(None, map(spellings.disabling, elements)))
         return _ScopeMarks(self.defect_marks + defect_marks, self.disabled_by | disabled_by)
-
-
-_Definition = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
 
 
 def _winning_definitions(body: Sequence[ast.stmt]) -> list[_Definition]:
@@ -315,20 +366,21 @@ def _is_collected(lineage: tuple[ast.ClassDef, ...]) -> bool:
 
 
 def _lineage_marks(
-    lineage: tuple[ast.ClassDef, ...], scope: _ScopeMarks, spellings: _DisablingSpellings
+    lineage: tuple[ast.ClassDef, ...], scope: _ScopeMarks, reader: _MarkReader
 ) -> _ScopeMarks:
     """*scope* plus every lineage class's own marks: its pytestmark binding and its decorators."""
     for ancestor in lineage:
-        scope = scope.with_elements([*pytestmark_elements(ancestor.body), *ancestor.decorator_list], spellings)
+        disabled_by = reader.pytestmark_disabling(ancestor.body) | reader.decorator_disabling(ancestor.decorator_list)
+        scope = scope.with_elements([*pytestmark_elements(ancestor.body), *ancestor.decorator_list], disabled_by)
     return scope
 
 
 @dataclass(frozen=True)
 class _Module:
-    """What every scope of one module resolves against: its classes and its disabling-mark spellings."""
+    """What every scope of one module resolves against: its classes and its mark reader."""
 
     classes: Mapping[str, ast.ClassDef]
-    spellings: _DisablingSpellings
+    reader: _MarkReader
 
 
 @dataclass(frozen=True)
@@ -369,7 +421,8 @@ def _scope_items(
             yield from _class_items(definition, member.classes, scope, class_chain, module)
         elif definition.name.startswith(_TEST_FUNCTION_PREFIX):
             name = '::'.join((*class_chain, definition.name))
-            yield name, scope.with_elements(definition.decorator_list, module.spellings)
+            decorators = definition.decorator_list
+            yield name, scope.with_elements(decorators, module.reader.decorator_disabling(decorators))
 
 
 def _class_items(
@@ -386,15 +439,15 @@ def _class_items(
     if not _is_collected(lineage):
         return
     members = _members((ancestor.body for ancestor in lineage), module.classes)
-    scope = _lineage_marks(lineage, enclosing, module.spellings)
+    scope = _lineage_marks(lineage, enclosing, module.reader)
     yield from _scope_items(members, scope, (*class_chain, node.name), module)
 
 
-def _module_items(body: Sequence[ast.stmt], spellings: _DisablingSpellings) -> Iterator[_Item]:
+def _module_items(body: Sequence[ast.stmt], reader: _MarkReader) -> Iterator[_Item]:
     if not _test_flag((body,)):
         return iter(())
-    module = _Module(_classes(_winning_definitions(body)), spellings)
-    scope = _ScopeMarks().with_elements(pytestmark_elements(body), spellings)
+    module = _Module(_classes(_winning_definitions(body)), reader)
+    scope = _ScopeMarks().with_elements(pytestmark_elements(body), reader.pytestmark_disabling(body))
     return _scope_items(_members((body,), module.classes), scope, (), module)
 
 
@@ -433,8 +486,8 @@ def _enumerate_module(path: str, node_of: Callable[[str], NodeId], tree: ast.Mod
     aliases = _mark_namespace_aliases(nodes)
     marks = _defect_marks(nodes, aliases)
     readings = {id(mark): _read_ref(mark) for mark in marks}
-    spellings = _DisablingSpellings.of_module(nodes, aliases)
-    carriers, reached = _carriers(_module_items(tree.body, spellings), readings, node_of)
+    reader = _MarkReader.of_module(nodes, aliases)
+    carriers, reached = _carriers(_module_items(tree.body, reader), readings, node_of)
     gaps = tuple(reading for reading in readings.values() if isinstance(reading, EnumerationGap))
     return FileEnumeration(path, carriers, non_static=_non_static(marks, readings, reached), gaps=gaps)
 

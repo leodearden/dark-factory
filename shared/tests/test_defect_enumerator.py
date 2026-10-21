@@ -771,6 +771,85 @@ def test_a_name_bound_to_an_unrelated_mark_leaves_the_carrier_runnable():
     assert result.carriers == {REF_A: (_runnable('test_a'),)}
 
 
+_UNREADABLE_PYTESTMARKS = {
+    'conditional-binding': "if sys.platform == 'linux':\n    pytestmark = pytest.mark.skip",
+    'try-except-binding': 'try:\n    import numpy\nexcept ImportError:\n    pytestmark = pytest.mark.skip',
+    'augmented-binding': 'pytestmark = []\npytestmark += [pytest.mark.skip]',
+    'appended': 'pytestmark = []\npytestmark.append(pytest.mark.skip)',
+    'name-bound-to-a-list': 'SKIPS = [pytest.mark.skip]\npytestmark = SKIPS',
+    'imported-factory': 'from _fm_helpers import qdrant_skipif\npytestmark = [qdrant_skipif(), pytest.mark.slow]',
+    'imported-name': 'from helpers import SKIP_ON_CI\npytestmark = SKIP_ON_CI',
+}
+
+
+@pytest.mark.parametrize('pytestmark', _UNREADABLE_PYTESTMARKS.values(), ids=list(_UNREADABLE_PYTESTMARKS))
+def test_a_module_pytestmark_that_cannot_be_read_statically_disables_as_unresolved(pytestmark):
+    result = _enumerate(pytestmark + '\n' + textwrap.dedent(f'''
+        @pytest.mark.defect({REF_A!r})
+        def test_a():
+            pass
+    '''))
+    assert result.carriers == {REF_A: (Carrier(_node('test_a'), frozenset({DisablingMark.UNRESOLVED})),)}
+
+
+@pytest.mark.parametrize('pytestmark', _UNREADABLE_PYTESTMARKS.values(), ids=list(_UNREADABLE_PYTESTMARKS))
+def test_a_class_pytestmark_that_cannot_be_read_statically_disables_as_unresolved(pytestmark):
+    body = textwrap.indent(pytestmark, '    ')
+    result = _enumerate(f'class TestA:\n{body}\n' + textwrap.indent(textwrap.dedent(f'''
+        @pytest.mark.defect({REF_A!r})
+        def test_m(self):
+            pass
+    '''), '    '))
+    assert result.carriers == {REF_A: (Carrier(_node('TestA::test_m'), frozenset({DisablingMark.UNRESOLVED})),)}
+
+
+def test_a_statically_read_pytestmark_of_known_non_disabling_marks_leaves_the_carrier_runnable():
+    result = _enumerate(f'''
+        from pytest import mark
+        SLOW = pytest.mark.slow
+
+        def helper():
+            pytestmark = None
+            return pytestmark
+
+        pytestmark: list = [pytest.mark.timeout(5), mark.usefixtures('db'), SLOW]
+
+        @pytest.mark.defect({REF_A!r})
+        def test_a():
+            pass
+    ''')
+    assert result.carriers == {REF_A: (_runnable('test_a'),)}
+
+
+def test_an_unresolved_pytestmark_reaches_only_its_own_scope():
+    result = _enumerate(f'''
+        class TestA:
+            pytestmark = SKIPS
+
+            def test_m(self):
+                pass
+
+        @pytest.mark.defect({REF_A!r})
+        def test_a():
+            pass
+    ''')
+    assert result.carriers == {REF_A: (_runnable('test_a'),)}
+
+
+def test_a_decorator_naming_no_mark_is_an_ordinary_decorator_even_when_it_skips():
+    result = _enumerate(f'''
+        from _fm_helpers import qdrant_skipif
+        from unittest.mock import patch
+
+        @qdrant_skipif()
+        @patch('os.getcwd')
+        @pytest.mark.defect({REF_A!r})
+        def test_a(getcwd):
+            pass
+    ''')
+    assert result.carriers == {REF_A: (_runnable('test_a'),)}
+
+
 def test_disabling_marks_from_every_scope_accumulate():
     result = _enumerate(f'''
         @pytest.mark.skip
