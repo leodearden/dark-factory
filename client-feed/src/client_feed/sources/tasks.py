@@ -63,7 +63,10 @@ class SkippedTask:
 
 @dataclass(frozen=True)
 class TasksRead:
-    """The rows updated after a cursor; `cursor` is the greatest updated_at read, as the store spells it."""
+    """The rows updated after a cursor; `cursor` is the last projected row's updated_at, as the store spells it.
+
+    A skipped row never moves the cursor, so it is read again until a projected row passes it.
+    """
 
     rows: tuple[TaskRow, ...]
     skipped: tuple[SkippedTask, ...]
@@ -162,6 +165,20 @@ def _grouped(pairs: list[tuple[int, int]]) -> dict[int, tuple[int, ...]]:
     return grouped
 
 
+def _cursor(
+    rows: list[tuple[Any, ...]], projected: list[TaskRow | SkippedTask], since: str | None
+) -> str | None:
+    """The raw updated_at of the last row projected; a skipped row's value is not trusted to order."""
+    return next(
+        (
+            updated_at
+            for (_, _, _, updated_at, *_), item in zip(reversed(rows), reversed(projected))
+            if isinstance(item, TaskRow)
+        ),
+        since,
+    )
+
+
 def read_tasks(root: Path, *, since: str | None, escalations: OpenEscalations) -> TasksRead:
     """Every task of the pinned tag updated after `since`, projected to its allowlisted fields."""
     window = (TASK_TAG, since, since)
@@ -173,5 +190,5 @@ def read_tasks(root: Path, *, since: str | None, escalations: OpenEscalations) -
     return TasksRead(
         rows=tuple(item for item in projected if isinstance(item, TaskRow)),
         skipped=tuple(item for item in projected if isinstance(item, SkippedTask)),
-        cursor=rows[-1][3] if rows else since,
+        cursor=_cursor(rows, projected, since),
     )

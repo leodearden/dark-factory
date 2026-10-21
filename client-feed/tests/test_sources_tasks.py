@@ -131,11 +131,37 @@ class TestCursor:
         assert [row.task_id for row in read.rows] == [2, 3]
         assert read.cursor == LATER
 
-    def test_the_cursor_passes_an_unprojectable_row(self, root: Path, tasks: TasksDb) -> None:
+    @pytest.mark.parametrize(
+        ('status', 'updated_at'), [('archived', LATER), ('pending', 'yesterday')]
+    )
+    def test_a_skipped_row_never_moves_the_cursor(
+        self, root: Path, tasks: TasksDb, status: str, updated_at: str
+    ) -> None:
         tasks.add(1, updated_at=LATE)
-        tasks.add(2, status='archived', updated_at=LATER)
+        tasks.add(2, status=status, updated_at=updated_at)
+
+        first = read_all(root)
+        again = read_all(root, since=first.cursor)
+
+        assert first.cursor == LATE
+        assert (again.rows, again.cursor) == ((), LATE)
+        assert [skipped.task_id for skipped in again.skipped] == [2]
+
+    def test_a_later_projected_row_moves_the_cursor_past_a_skipped_one(
+        self, root: Path, tasks: TasksDb
+    ) -> None:
+        tasks.add(1, status='archived', updated_at=LATE)
+        tasks.add(2, updated_at=LATER)
 
         assert read_all(root).cursor == LATER
+
+    def test_only_skipped_rows_leave_the_cursor_where_it_was(
+        self, root: Path, tasks: TasksDb
+    ) -> None:
+        tasks.add(1, status='archived', updated_at=LATE)
+
+        assert read_all(root).cursor is None
+        assert read_all(root, since=SINCE).cursor == SINCE
 
     def test_nothing_new_leaves_the_cursor_where_it_was(self, root: Path, tasks: TasksDb) -> None:
         tasks.add(1, updated_at=EARLY)
