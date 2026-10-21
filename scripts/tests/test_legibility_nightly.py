@@ -30,6 +30,7 @@ import yaml
 from legibility import (
     account_pool,
     census_trigger,
+    check_trickle_health,
     codebook,
     digest,
     invariants,
@@ -4564,16 +4565,18 @@ _CHECK_TRICKLE_PROGRESS = (
 _FIXTURE_CLOCK_EPOCH = datetime(2026, 7, 1, tzinfo=UTC)
 
 
+def _fixture_clock_window_hours() -> int:
+    """A freshness window reaching back to the fixtures' fixed July 2026
+    clock, so a probe reads the streak's verdict, never the stale one."""
+    return int((datetime.now(UTC) - _FIXTURE_CLOCK_EPOCH).total_seconds() // 3600) + 48
+
+
 def _run_trickle_progress_probe(project_id: str, threshold: int):
     """The REAL progress probe by subprocess, over the conftest-isolated
-    state root. Its freshness window reaches back to the fixtures' fixed July
-    2026 clock, so the verdict read is never the stale-recorder one."""
-    window_hours = (
-        int((datetime.now(UTC) - _FIXTURE_CLOCK_EPOCH).total_seconds() // 3600) + 48
-    )
+    state root, at :func:`_fixture_clock_window_hours`."""
     return subprocess.run(
         [sys.executable, str(_CHECK_TRICKLE_PROGRESS), project_id,
-         str(threshold), str(window_hours)],
+         str(threshold), str(_fixture_clock_window_hours())],
         capture_output=True, text=True, timeout=30,
     )
 
@@ -4969,6 +4972,49 @@ class TestBarrenStreakEscalation:
         assert 'consecutive_barren_runs=5' in arguments['detail']
         assert 'check_trickle_progress.py testproj 5' in arguments['detail']
         assert runner.recorded()['barren_escalated'] is True
+
+
+class TestANonDefaultThresholdEndToEnd:
+    """BOUNDARY ROW 6: a nightly at ``max_barren_runs=5``, the real progress
+    probe and the health check agree through the recorded fact."""
+
+    @staticmethod
+    def _health_posts(runner) -> list:
+        posted = []
+        check_trickle_health.run_health_check(
+            project_id='testproj',
+            config_path=runner.config_path,
+            max_barren_runs=5,
+            max_age_hours=_fixture_clock_window_hours(),
+            liveness_runner=lambda project_id, **kwargs: (0, 'OK: ran'),
+            census_runner=lambda project_id, **kwargs: (0, 'OK: no fire'),
+            poster=lambda url, envelope: posted.append(envelope),
+        )
+        return posted
+
+    def test_five_barren_nights_escalate_once_and_the_health_check_stays_silent(
+        self, tmp_path,
+    ):
+        runner = _NightRunner(tmp_path, max_barren_runs=5)
+
+        nights = [runner.night(day, 'barren') for day in (13, 14, 15, 16, 17)]
+
+        assert [night.barren_escalated for night in nights] == [
+            False, False, False, False, True,
+        ]
+        assert len(_streak_escalations(runner.escalations)) == 1
+        assert runner.recorded()['barren_escalated'] is True
+        probe = _run_trickle_progress_probe('testproj', 5)
+        assert probe.returncode == 1, (
+            f'stdout={probe.stdout!r} stderr={probe.stderr!r}'
+        )
+        assert 'barren_escalated=True' in probe.stderr
+        assert self._health_posts(runner) == []
+
+        sixth = runner.night(18, 'barren')
+
+        assert sixth.barren_escalated is False
+        assert len(self._health_posts(runner)) == 1
 
 
 class TestADeferredNightIsRecordedAsDeferred:

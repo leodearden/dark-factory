@@ -85,8 +85,7 @@ class TestAggregateVerdict:
         assert result.liveness_ok is True
 
     def test_a_failing_liveness_probe_fails_the_aggregate(self):
-        """The mitigation ``nightly::_record_trickle_progress`` claims is
-        only real if this fails LOUD."""
+        """A unit that ran and failed fails the aggregate on its own."""
         result = _check(liveness_runner=_fails('ERROR: Result=failed'))
 
         assert result.exit_code == 1
@@ -327,16 +326,17 @@ def _write_project_config(tmp_path, *, project_id, escalation_port=8199):
     return config_path
 
 
-def _seed_state(project_id, *, outcomes, last_recorded_at=None):
+def _seed_state(project_id, *, outcomes, last_recorded_at=None, escalated_on=()):
     """Seed real state through the REAL writer, one night per entry, so the
     suppression rule is exercised against genuine recorder output.
 
     *last_recorded_at* is the stamp the LAST seeded night carries,
-    defaulting to now — which is every pre-existing caller's behaviour,
-    byte for byte. Passing an older stamp is how a FROZEN document (a
+    defaulting to now. Passing an older stamp is how a FROZEN document (a
     recorder that stopped) is seeded without hand-writing one: keeping the
     real writer in the loop is why these tests cannot drift from recorder
-    output."""
+    output. The nights whose positions are in *escalated_on* record
+    ``barren_escalated=True`` (the nightly's streak post landed); every
+    other one False."""
     counters = {
         'productive': (0, dict(selected_count=2)),
         'barren': (0, dict(budget_skipped=4)),
@@ -362,15 +362,14 @@ def _seed_state(project_id, *, outcomes, last_recorded_at=None):
                 ),
                 census=None,
             ),
-            barren_escalated=False,
+            barren_escalated=i in escalated_on,
         )
     return state
 
 
 class TestEscalation:
-    """POST iff the PROGRESS probe failed — except on the exact run where
-    the nightly's own edge-triggered barren-streak escalation already
-    fired.
+    """POST iff the PROGRESS probe failed — except when the fresh record
+    says the nightly's own barren-streak escalation landed for that night.
 
     The escalation predicate is deliberately NARROWER than the exit-code
     one: the exit code is a verdict an operator or predicate reads on
@@ -469,7 +468,7 @@ class TestEscalation:
     def test_a_census_failure_posts_on_the_nightly_barren_edge_night(
         self, tmp_path,
     ):
-        _seed_state('dark_factory', outcomes=['barren'] * 3)
+        _seed_state('dark_factory', outcomes=['barren'] * 3, escalated_on=(2,))
 
         result, envelopes = self._posted(
             tmp_path,
@@ -488,10 +487,10 @@ class TestEscalation:
         assert result.escalated is False
         assert envelopes == []
 
-    def test_silent_on_the_exact_run_the_nightly_escalated(self, tmp_path):
-        """``nightly::_escalate_barren_streak`` is EDGE-triggered by exact
-        equality and fired for this very run; posting here duplicates it."""
-        _seed_state('dark_factory', outcomes=['barren'] * 3)
+    def test_silent_when_the_record_says_the_nightly_escalated(self, tmp_path):
+        """The nightly posted the streak escalation for this very night and
+        recorded that it did; posting here duplicates it."""
+        _seed_state('dark_factory', outcomes=['barren'] * 3, escalated_on=(2,))
 
         result, envelopes = self._posted(
             tmp_path,
@@ -502,6 +501,22 @@ class TestEscalation:
         assert result.exit_code == 1
         assert result.escalated is False
         assert envelopes == []
+
+    def test_posts_when_the_record_says_the_nightly_did_not_escalate(
+        self, tmp_path
+    ):
+        """The nightly's post did not land, or a nightly at another
+        threshold never reached its edge: nothing has interrupted anyone."""
+        _seed_state('dark_factory', outcomes=['barren'] * 3)
+
+        result, envelopes = self._posted(
+            tmp_path,
+            progress_runner=_fails('ERROR: barren streak'),
+            max_barren_runs=3,
+        )
+
+        assert result.exit_code == 1
+        assert len(envelopes) == 1
 
     def test_a_frozen_threshold_document_does_not_suppress_forever(
         self, tmp_path
@@ -519,7 +534,7 @@ class TestEscalation:
         posting: the journal stays loud, and the only interrupt an
         operator actually receives is permanently suppressed."""
         _seed_state(
-            'dark_factory', outcomes=['barren'] * 3,
+            'dark_factory', outcomes=['barren'] * 3, escalated_on=(2,),
             last_recorded_at=datetime.now(UTC) - timedelta(days=30),
         )
 
@@ -531,26 +546,6 @@ class TestEscalation:
 
         assert result.exit_code == 1
         assert len(envelopes) == 1
-
-    def test_the_suppression_still_holds_for_a_fresh_threshold_document(
-        self, tmp_path
-    ):
-        """The behaviour the suppression EXISTS for, pinned alongside the
-        fix so the fix cannot be over-applied into the very double-alarm
-        with ``nightly::_escalate_barren_streak`` it was built to avoid."""
-        _seed_state(
-            'dark_factory', outcomes=['barren'] * 3,
-            last_recorded_at=datetime.now(UTC),
-        )
-
-        result, envelopes = self._posted(
-            tmp_path,
-            progress_runner=_fails('ERROR: barren streak'),
-            max_barren_runs=3,
-        )
-
-        assert result.exit_code == 1
-        assert envelopes == []
 
     @pytest.mark.parametrize('offset_hours, expected_envelopes', [
         pytest.param(71, 0, id='inside-the-window-suppressed'),
@@ -566,7 +561,7 @@ class TestEscalation:
         moment a record is stale enough for the progress probe to call it
         stale, it is also too stale to be evidence that anyone alarmed."""
         _seed_state(
-            'dark_factory', outcomes=['barren'] * 3,
+            'dark_factory', outcomes=['barren'] * 3, escalated_on=(2,),
             last_recorded_at=datetime.now(UTC) - timedelta(hours=offset_hours),
         )
 
@@ -582,11 +577,11 @@ class TestEscalation:
     def test_an_unparseable_recorded_at_is_post_worthy_not_suppression_grounds(
         self, tmp_path
     ):
-        """Consistent with the existing posture that ``missing`` and
+        """An unparseable ``recorded_at`` reads malformed, and ``missing`` and
         ``malformed`` are VERDICTS rather than suppression grounds: a
         document whose freshness cannot be assessed must never be treated
         as fresh."""
-        _seed_state('dark_factory', outcomes=['barren'] * 3)
+        _seed_state('dark_factory', outcomes=['barren'] * 3, escalated_on=(2,))
         path = trickle_state.trickle_state_path('dark_factory')
         doc = json.loads(path.read_text(encoding='utf-8'))
         doc['recorded_at'] = 'not-a-timestamp'
@@ -601,9 +596,9 @@ class TestEscalation:
         assert len(envelopes) == 1
 
     def test_posts_once_the_nightly_has_gone_silent(self, tmp_path):
-        """At ``> max_barren_runs`` the nightly is edge-triggered and
-        silent by design, so this probe takes over."""
-        _seed_state('dark_factory', outcomes=['barren'] * 4)
+        """The nightly escalates once per streak; night four records that it
+        did not, so this probe takes over."""
+        _seed_state('dark_factory', outcomes=['barren'] * 4, escalated_on=(2,))
 
         result, envelopes = self._posted(
             tmp_path,
@@ -629,6 +624,48 @@ class TestEscalation:
 
         assert result.exit_code == 1
         assert len(envelopes) == 1
+
+    @pytest.mark.parametrize(
+        ('escalated_on', 'expected_envelopes'),
+        [
+            pytest.param((4,), 0, id='nightly-at-5-escalated-tonight'),
+            pytest.param((2,), 1, id='nightly-at-3-escalated-two-nights-ago'),
+        ],
+    )
+    def test_a_non_default_threshold_reads_the_recorded_fact(
+        self, tmp_path, escalated_on, expected_envelopes
+    ):
+        """BOUNDARY ROW 6, probe half. The probe's threshold never decides
+        the suppression: re-deriving it from the CLI value stayed silent
+        on a night (streak == threshold) on which no nightly had posted."""
+        _seed_state('dark_factory', outcomes=['barren'] * 5, escalated_on=escalated_on)
+
+        _result, envelopes = self._posted(
+            tmp_path,
+            progress_runner=_fails('ERROR: barren streak'),
+            max_barren_runs=5,
+        )
+
+        assert len(envelopes) == expected_envelopes
+
+    def test_a_document_from_before_the_field_posts_and_says_so(self, tmp_path):
+        """BOUNDARY ROW 7. A fresh barren-at-threshold document written
+        before ``barren_escalated`` existed cannot tell whether the nightly
+        escalated, so it does not suppress, and the post says why."""
+        _seed_state('dark_factory', outcomes=['barren'] * 3, escalated_on=(2,))
+        path = trickle_state.trickle_state_path('dark_factory')
+        doc = json.loads(path.read_text(encoding='utf-8'))
+        del doc['barren_escalated']
+        path.write_text(json.dumps(doc), encoding='utf-8')
+
+        _result, envelopes = self._posted(
+            tmp_path,
+            progress_runner=_fails('ERROR: barren streak'),
+            max_barren_runs=3,
+        )
+
+        [(_url, envelope)] = envelopes
+        assert 'barren_escalated unrecorded' in envelope['params']['arguments']['detail']
 
     def test_a_missing_state_file_is_post_worthy_not_suppression_grounds(
         self, tmp_path
