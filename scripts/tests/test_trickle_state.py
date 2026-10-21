@@ -786,28 +786,51 @@ class TestTrickleStatePath:
         ), f'{result} must not live under the git-tracked docs/legibility/'
 
 
-def _record(project_id='dark_factory', *, day=1, hour=3, exit_code=0,
-            applied=0, commit_made=False, budget_suppressed=False,
-            capped=False, scheduled=False,
-            census: trickle_state.CensusObservation | None = None,
-            **counters):
-    """Call record_run with a derived-total counter set and an injected
+def _night(*, day=1, hour=3, exit_code=0, applied=0, commit_made=False,
+           budget_suppressed=False, capped=False, scheduled=False,
+           census: trickle_state.CensusObservation | None = None,
+           **counters) -> trickle_state.NightRun:
+    """One night's facts with a derived-total counter set and an injected
     clock (the module is deliberately clock-injectable — no time faking)."""
-    kw = _counters(**counters)
-    recorded_at = datetime(2026, 7, day, hour, 0, 0, tzinfo=UTC)
-    return trickle_state.record_run(
-        project_id,
+    return trickle_state.NightRun(
         target_date=date(2026, 7, day),
-        recorded_at=recorded_at,
+        recorded_at=datetime(2026, 7, day, hour, 0, 0, tzinfo=UTC),
         exit_code=exit_code,
+        counters=_counters(**counters),
+        census=census,
         applied=applied,
         commit_made=commit_made,
         budget_suppressed=budget_suppressed,
         capped=capped,
         scheduled=scheduled,
-        census=census,
-        **kw,
     )
+
+
+def _record(project_id='dark_factory', *, barren_escalated=False,
+            **night) -> TrickleState:
+    return trickle_state.record_run(
+        project_id, _night(**night), barren_escalated=barren_escalated
+    )
+
+
+def _path(project_id='dark_factory') -> Path:
+    return trickle_state.trickle_state_path(project_id)
+
+
+class TestNightRun:
+    def test_the_outcome_is_classify_runs_verdict(self):
+        assert _night(selected_count=1).outcome == RunOutcome.PRODUCTIVE
+        assert _night(budget_skipped=4).outcome == RunOutcome.BARREN
+        assert _night(exit_code=1, selected_count=6).outcome == RunOutcome.FAILED
+        assert _night(capped=True, selected_count=6).outcome == RunOutcome.DEFERRED
+        assert _night(zero_signal_dropped=3).outcome == RunOutcome.QUIET
+
+    def test_census_is_a_required_keyword(self):
+        """A defaulted ``census=None`` is how a future caller would silently
+        blind the census progress probe into a permanent OK."""
+        census = inspect.signature(trickle_state.NightRun).parameters['census']
+        assert census.kind is inspect.Parameter.KEYWORD_ONLY
+        assert census.default is inspect.Parameter.empty
 
 
 class TestRecordRun:
@@ -817,141 +840,274 @@ class TestRecordRun:
     def _state_root(self, tmp_path, monkeypatch):
         monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
 
-    def test_first_call_creates_parents_and_writes_every_field(self, tmp_path):
-        doc = _record(day=1, selected_count=2, zero_signal_dropped=4,
-                      applied=2, commit_made=True)
+    def test_first_call_creates_parents_and_writes_every_field(self):
+        state = _record(day=1, selected_count=2, zero_signal_dropped=4,
+                        applied=2, commit_made=True)
 
-        path = trickle_state.trickle_state_path('dark_factory')
-        assert path.is_file(), 'record_run must mkdir(parents=True)'
+        path = _path()
+        assert path.is_file(), 'record_run must create the parent directories'
+        assert json.loads(path.read_text()) == state.to_json()
 
-        on_disk = json.loads(path.read_text())
-        assert on_disk == doc
-
-        assert doc['schema_version'] == trickle_state.STATE_SCHEMA_VERSION
-        assert doc['project_id'] == 'dark_factory'
-        assert doc['target_date'] == '2026-07-01'
-        assert doc['recorded_at'] == '2026-07-01T03:00:00+00:00'
-        assert doc['exit_code'] == 0
-        assert doc['outcome'] == RunOutcome.PRODUCTIVE
-        assert doc['applied'] == 2
-        assert doc['commit_made'] is True
-        assert doc['budget_suppressed'] is False
-        assert doc['consecutive_barren_runs'] == 0
-        assert doc['consecutive_failed_runs'] == 0
-        assert doc['last_scheduled_target_date'] is None
-        assert doc['counters'] == {
-            'total_records': 6,
-            'zero_signal_dropped': 4,
-            'dedupe_collapsed': 0,
-            'below_sampling_cut': 0,
-            'budget_skipped': 0,
-            'selected_count': 2,
-        }
+        assert state.project_id == 'dark_factory'
+        assert state.target_date == date(2026, 7, 1)
+        assert state.recorded_at == datetime(2026, 7, 1, 3, tzinfo=UTC)
+        assert state.exit_code == 0
+        assert state.outcome == RunOutcome.PRODUCTIVE
+        assert state.applied == 2
+        assert state.commit_made is True
+        assert state.budget_suppressed is False
+        assert state.consecutive_barren_runs == 0
+        assert state.consecutive_failed_runs == 0
+        assert state.last_scheduled_target_date is None
+        assert state.counters == RunCounters(
+            total_records=6,
+            zero_signal_dropped=4,
+            dedupe_collapsed=0,
+            below_sampling_cut=0,
+            budget_skipped=0,
+            selected_count=2,
+        )
 
     def test_recorded_at_is_timezone_aware_utc_iso8601(self):
-        doc = _record(day=2, selected_count=1)
-        parsed = datetime.fromisoformat(doc['recorded_at'])
+        _record(day=2, selected_count=1)
+        parsed = datetime.fromisoformat(
+            json.loads(_path().read_text())['recorded_at']
+        )
         assert parsed.tzinfo is not None
         assert parsed.utcoffset() == timedelta(0)
 
     def test_barren_streak_increments(self):
-        assert _record(day=1, budget_skipped=4)['consecutive_barren_runs'] == 1
-        assert _record(day=2, budget_skipped=4)['consecutive_barren_runs'] == 2
-        assert _record(day=3, below_sampling_cut=3)['consecutive_barren_runs'] == 3
+        assert _record(day=1, budget_skipped=4).consecutive_barren_runs == 1
+        assert _record(day=2, budget_skipped=4).consecutive_barren_runs == 2
+        assert _record(day=3, below_sampling_cut=3).consecutive_barren_runs == 3
 
     def test_productive_run_resets_the_streak(self):
         _record(day=1, budget_skipped=4)
         _record(day=2, budget_skipped=4)
-        doc = _record(day=3, selected_count=1)
-        assert doc['outcome'] == RunOutcome.PRODUCTIVE
-        assert doc['consecutive_barren_runs'] == 0
+        state = _record(day=3, selected_count=1)
+        assert state.outcome == RunOutcome.PRODUCTIVE
+        assert state.consecutive_barren_runs == 0
 
     def test_quiet_run_also_resets_the_streak(self):
         """A legitimately quiet night is NOT evidence of breakage — PRD
         decision 7's guarantee expressed in the streak itself."""
         _record(day=1, budget_skipped=4)
         _record(day=2, budget_skipped=4)
-        doc = _record(day=3, zero_signal_dropped=5)
-        assert doc['outcome'] == RunOutcome.QUIET
-        assert doc['consecutive_barren_runs'] == 0
+        state = _record(day=3, zero_signal_dropped=5)
+        assert state.outcome == RunOutcome.QUIET
+        assert state.consecutive_barren_runs == 0
 
     def test_streak_rearms_after_a_reset(self):
         _record(day=1, budget_skipped=4)
         _record(day=2, selected_count=1)
-        assert _record(day=3, budget_skipped=4)['consecutive_barren_runs'] == 1
+        assert _record(day=3, budget_skipped=4).consecutive_barren_runs == 1
 
     def test_last_productive_at_is_stamped_and_carried_forward(self):
         """The field an operator reads to answer 'when did this pipeline
         last actually do anything'."""
         first = _record(day=1, zero_signal_dropped=3)
-        assert first['last_productive_at'] is None
+        assert first.last_productive_at is None
 
         prod = _record(day=2, selected_count=1)
-        assert prod['last_productive_at'] == prod['recorded_at']
-        stamp = prod['last_productive_at']
+        assert prod.last_productive_at == prod.recorded_at
+        stamp = prod.last_productive_at
 
-        assert _record(day=3, budget_skipped=4)['last_productive_at'] == stamp
-        assert _record(day=4, zero_signal_dropped=1)['last_productive_at'] == stamp
-        assert _record(day=5, budget_skipped=4)['last_productive_at'] == stamp
+        assert _record(day=3, budget_skipped=4).last_productive_at == stamp
+        assert _record(day=4, zero_signal_dropped=1).last_productive_at == stamp
+        assert _record(day=5, budget_skipped=4).last_productive_at == stamp
 
         newer = _record(day=6, selected_count=2)
-        assert newer['last_productive_at'] == newer['recorded_at'] != stamp
+        assert newer.last_productive_at == newer.recorded_at != stamp
 
-    def test_write_is_atomic_and_leaves_no_tmp_file(self):
+    def test_the_write_leaves_no_temp_residue(self):
         _record(day=1, selected_count=1)
-        state_dir = trickle_state.trickle_state_path('dark_factory').parent
-        assert [p.name for p in state_dir.iterdir()] == [
-            trickle_state.STATE_FILENAME
-        ]
-
-    def test_a_pre_seeded_tmp_sentinel_does_not_survive(self):
-        _record(day=1, selected_count=1)
-        state_dir = trickle_state.trickle_state_path('dark_factory').parent
-        sentinel = state_dir / (trickle_state.STATE_FILENAME + '.tmp')
-        sentinel.write_text('leftover from a crashed write')
-
         _record(day=2, selected_count=1)
-
-        assert not sentinel.exists(), (
-            'the tmp sibling must be os.replace()d onto the final path, not '
-            'left behind'
-        )
-        assert [p.name for p in state_dir.iterdir()] == [
+        assert [p.name for p in _path().parent.iterdir()] == [
             trickle_state.STATE_FILENAME
         ]
+
+    def test_a_fixed_name_tmp_sibling_neither_blocks_nor_is_consumed(self):
+        """The old writer staged every write through one fixed
+        ``<name>.tmp``, so two writers raced on it. The write now never
+        touches that name."""
+        _record(day=1, selected_count=1)
+        sentinel = _path().parent / (trickle_state.STATE_FILENAME + '.tmp')
+        sentinel.write_text('another writer is mid-write')
+
+        state = _record(day=2, budget_skipped=4)
+
+        assert sentinel.read_text() == 'another writer is mid-write'
+        assert trickle_state.load_state(_path()) == Ok(state)
 
     def test_corrupt_predecessor_degrades_to_under_reporting(self, caplog):
         """Losing streak history must degrade to UNDER-reporting, never to a
         crash inside the nightly run."""
         _record(day=1, budget_skipped=4)
         _record(day=2, budget_skipped=4)
-
-        path = trickle_state.trickle_state_path('dark_factory')
-        path.write_text('{corrupt')
+        _path().write_text('{corrupt')
 
         with caplog.at_level('WARNING'):
-            doc = _record(day=3, budget_skipped=4)
+            state = _record(day=3, budget_skipped=4)
 
-        assert doc['outcome'] == RunOutcome.BARREN
-        assert doc['consecutive_barren_runs'] == 1, (
+        assert state.outcome == RunOutcome.BARREN
+        assert state.consecutive_barren_runs == 1, (
             'a lost predecessor restarts the streak from this run alone'
         )
-        assert doc['last_productive_at'] is None
+        assert state.last_productive_at is None
         assert any(r.levelname == 'WARNING' for r in caplog.records)
 
     def test_round_trips_through_load_state(self):
-        doc = _record(day=1, budget_skipped=4, budget_suppressed=True)
-        status, loaded = trickle_state.load_state(
-            trickle_state.trickle_state_path('dark_factory')
-        )
-        assert status == 'ok'
-        assert loaded == doc
+        state = _record(day=1, budget_skipped=4, budget_suppressed=True)
+        assert trickle_state.load_state(_path()) == Ok(state)
 
     def test_distinct_projects_keep_independent_streaks(self):
         _record('dark_factory', day=1, budget_skipped=4)
         _record('dark_factory', day=2, budget_skipped=4)
         other = _record('reify', day=2, budget_skipped=4)
-        assert other['consecutive_barren_runs'] == 1
+        assert other.consecutive_barren_runs == 1
+
+
+class TestRecordRunBarrenEscalated:
+    """Whether the nightly escalated this night is recorded as a fact."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    @pytest.mark.parametrize('escalated', [True, False])
+    def test_the_flag_is_recorded_as_passed_and_round_trips(self, escalated):
+        state = _record(day=1, budget_skipped=4, barren_escalated=escalated)
+
+        assert state.barren_escalated is escalated
+        read = trickle_state.load_state(_path())
+        assert isinstance(read, Ok)
+        assert read.value.barren_escalated is escalated
+
+    def test_the_flag_has_no_default(self):
+        parameter = inspect.signature(trickle_state.record_run).parameters[
+            'barren_escalated'
+        ]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
+        with pytest.raises(TypeError):
+            trickle_state.record_run('dark_factory', _night())  # type: ignore[call-arg]
+
+
+class TestNextState:
+    """next_state(prior, project_id, run) is the pure fold record_run
+    writes, so the nightly can read tonight's state before recording it."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_it_is_the_state_record_run_then_writes(self):
+        _record(day=1, budget_skipped=4)
+        _record(day=2, budget_skipped=4)
+        run = _night(day=3, budget_skipped=4, scheduled=True)
+
+        projected = trickle_state.next_state(
+            trickle_state.read_prior('dark_factory'), 'dark_factory', run
+        )
+        recorded = trickle_state.record_run(
+            'dark_factory', run, barren_escalated=True
+        )
+
+        assert recorded == dataclasses.replace(projected, barren_escalated=True)
+        assert projected.consecutive_barren_runs == 3
+
+    def test_it_touches_no_file(self, tmp_path):
+        _record(day=1, budget_skipped=4)
+        before = {p.name: p.read_bytes() for p in _path().parent.iterdir()}
+
+        trickle_state.next_state(
+            trickle_state.read_prior('dark_factory'),
+            'dark_factory',
+            _night(day=2, exit_code=1),
+        )
+
+        assert {p.name: p.read_bytes() for p in _path().parent.iterdir()} == before
+
+    def test_from_no_prior_every_streak_starts_at_this_run(self):
+        barren = trickle_state.next_state(None, 'p', _night(budget_skipped=4))
+        failed = trickle_state.next_state(None, 'p', _night(exit_code=1))
+
+        assert (barren.consecutive_barren_runs, barren.consecutive_failed_runs) == (1, 0)
+        assert (failed.consecutive_barren_runs, failed.consecutive_failed_runs) == (0, 1)
+        assert barren.project_id == 'p'
+        assert barren.last_productive_at is None
+        assert barren.census_fire_streak is None
+        assert not _path('p').exists()
+
+
+class TestReadPrior:
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_a_readable_document_is_the_prior(self):
+        state = _record(day=1, selected_count=1)
+        assert trickle_state.read_prior('dark_factory') == state
+
+    def test_a_missing_document_is_no_prior(self):
+        assert trickle_state.read_prior('dark_factory') is None
+
+    def test_a_malformed_document_is_no_prior(self):
+        _record(day=1, selected_count=1)
+        _path().write_text('{corrupt')
+        assert trickle_state.read_prior('dark_factory') is None
+
+
+class TestBarrenStreakDue:
+    """The one barren-threshold predicate the nightly and the progress probe
+    share."""
+
+    @pytest.mark.parametrize('streak, threshold, due', [
+        (2, 3, False), (3, 3, True), (4, 3, True), (4, 5, False), (5, 5, True),
+    ])
+    def test_due_at_or_past_the_threshold(self, streak, threshold, due):
+        state = _state(consecutive_barren_runs=streak)
+        assert trickle_state.barren_streak_due(state, threshold) is due
+
+
+class TestBarrenRemedy:
+    """Each barren door has ONE remedy, spelled once."""
+
+    def test_every_door_has_exactly_one_remedy(self):
+        assert set(trickle_state.BARREN_REMEDIES) == set(trickle_state.BarrenDoor)
+        assert {door.value for door in trickle_state.BarrenDoor} == {
+            'budget_skipped', 'below_sampling_cut',
+        }
+
+    def test_the_remedies_are_read_only(self):
+        with pytest.raises(TypeError):
+            trickle_state.BARREN_REMEDIES[trickle_state.BarrenDoor.BUDGET] = 'x'  # type: ignore[index]
+
+    def test_the_budget_door_names_the_budget_key_only(self):
+        text = trickle_state.barren_remedy(_counters(budget_skipped=4))
+        assert text == trickle_state.BARREN_REMEDIES[trickle_state.BarrenDoor.BUDGET]
+        assert 'budgets.max_daily_digest_bytes' in text
+        assert 'sampling.top_fraction' not in text
+
+    def test_the_sampling_cut_door_names_the_sampling_keys_only(self):
+        text = trickle_state.barren_remedy(_counters(below_sampling_cut=3))
+        assert text == trickle_state.BARREN_REMEDIES[trickle_state.BarrenDoor.SAMPLING_CUT]
+        assert 'sampling.top_fraction' in text
+        assert 'sampling.per_stratum_min' in text
+        assert 'budgets.max_daily_digest_bytes' not in text
+
+    def test_both_doors_name_both_budget_first(self):
+        text = trickle_state.barren_remedy(
+            _counters(budget_skipped=4, below_sampling_cut=3)
+        )
+        assert text.index('budgets.max_daily_digest_bytes') < text.index(
+            'sampling.top_fraction'
+        )
+
+    def test_no_open_door_falls_back_to_the_counters(self):
+        assert 'inspect the recorded counters' in trickle_state.barren_remedy(
+            _counters(zero_signal_dropped=2)
+        )
 
 
 class TestRecordRunFailedStreak:
@@ -966,46 +1122,31 @@ class TestRecordRunFailedStreak:
         """Nothing is hidden by classifying ``failed``: the counters still
         say signal reached the digest stage, which is the question they
         answer."""
-        doc = _record(day=1, exit_code=1, selected_count=6)
+        state = _record(day=1, exit_code=1, selected_count=6)
 
-        assert doc['outcome'] == RunOutcome.FAILED
-        assert doc['exit_code'] == 1
-        assert doc['counters']['selected_count'] == 6
+        assert state.outcome == RunOutcome.FAILED
+        assert state.exit_code == 1
+        assert state.counters.selected_count == 6
 
     def test_a_failed_run_never_restamps_last_productive_at(self):
-        """The "forever green" scenario, at the writer. An operator reading
-        ``last_productive_at`` must see the last night that actually did
-        something, not the last night that merely started."""
+        """An operator reading ``last_productive_at`` must see the last
+        night that actually did something, not the last night that merely
+        started."""
         prod = _record(day=1, selected_count=2)
-        stamp = prod['last_productive_at']
-        assert stamp == prod['recorded_at']
+        stamp = prod.last_productive_at
+        assert stamp == prod.recorded_at
 
-        assert _record(day=2, exit_code=1, selected_count=6)[
-            'last_productive_at'] == stamp
-        assert _record(day=3, exit_code=1, selected_count=6)[
-            'last_productive_at'] == stamp
-
-    def test_a_capped_run_never_restamps_last_productive_at(self):
-        """A usage-cap DEFERRED night built digests and coded none of them,
-        so it reads productive while doing nothing."""
-        prod = _record(day=1, selected_count=2)
-        stamp = prod['last_productive_at']
-
-        capped = _record(day=2, capped=True, selected_count=6)
-
-        assert capped['outcome'] == RunOutcome.PRODUCTIVE
-        assert capped['last_productive_at'] == stamp
+        assert _record(day=2, exit_code=1, selected_count=6).last_productive_at == stamp
+        assert _record(day=3, exit_code=1, selected_count=6).last_productive_at == stamp
 
     def test_last_productive_at_stays_none_when_the_first_run_fails(self):
-        doc = _record(day=1, exit_code=1, selected_count=6)
-        assert doc['last_productive_at'] is None
-        assert _record(day=2, exit_code=1, selected_count=6)[
-            'last_productive_at'] is None
+        assert _record(day=1, exit_code=1, selected_count=6).last_productive_at is None
+        assert _record(day=2, exit_code=1, selected_count=6).last_productive_at is None
 
     def test_failed_streak_increments(self):
-        assert _record(day=1, exit_code=1)['consecutive_failed_runs'] == 1
-        assert _record(day=2, exit_code=2)['consecutive_failed_runs'] == 2
-        assert _record(day=3, exit_code=137)['consecutive_failed_runs'] == 3
+        assert _record(day=1, exit_code=1).consecutive_failed_runs == 1
+        assert _record(day=2, exit_code=2).consecutive_failed_runs == 2
+        assert _record(day=3, exit_code=137).consecutive_failed_runs == 3
 
     @pytest.mark.parametrize('resetter', [
         pytest.param(dict(selected_count=1), id='productive'),
@@ -1016,82 +1157,95 @@ class TestRecordRunFailedStreak:
         _record(day=1, exit_code=1)
         _record(day=2, exit_code=1)
 
-        doc = _record(day=3, **resetter)
-        assert doc['outcome'] != RunOutcome.FAILED
-        assert doc['consecutive_failed_runs'] == 0
+        state = _record(day=3, **resetter)
+        assert state.outcome != RunOutcome.FAILED
+        assert state.consecutive_failed_runs == 0
 
     def test_failed_streak_rearms_after_a_reset(self):
         _record(day=1, exit_code=1)
         _record(day=2, selected_count=1)
-        assert _record(day=3, exit_code=1)['consecutive_failed_runs'] == 1
+        assert _record(day=3, exit_code=1).consecutive_failed_runs == 1
 
     def test_a_failed_run_carries_the_barren_streak_forward(self):
-        """CARRY FORWARD, never reset and never increment. A run that
-        crashed is no evidence that signal started flowing again, so it
-        must not erase a real barren streak; and its counters describe an
-        unfinished night, so it must not attribute an absence the sampler
-        never observed either."""
-        assert _record(day=1, budget_skipped=4)['consecutive_barren_runs'] == 1
-        assert _record(day=2, budget_skipped=4)['consecutive_barren_runs'] == 2
+        """CARRY FORWARD, never reset and never increment: a crash is no
+        evidence that signal started flowing again, and its counters
+        describe an unfinished night."""
+        assert _record(day=1, budget_skipped=4).consecutive_barren_runs == 1
+        assert _record(day=2, budget_skipped=4).consecutive_barren_runs == 2
 
         crashed = _record(day=3, exit_code=1, selected_count=6)
-        assert crashed['outcome'] == RunOutcome.FAILED
-        assert crashed['consecutive_barren_runs'] == 2, (
-            'a crashed run is evidence about the RUN, not about whether '
-            'signal is flowing'
-        )
+        assert crashed.outcome == RunOutcome.FAILED
+        assert crashed.consecutive_barren_runs == 2
 
-        assert _record(day=4, budget_skipped=4)['consecutive_barren_runs'] == 3
+        assert _record(day=4, budget_skipped=4).consecutive_barren_runs == 3
 
-    def test_a_document_without_the_new_field_still_reads_ok(self, caplog):
-        """Backward compatibility with a pre-change document, which is what
-        every live state file is on the first post-deploy run. Mirrors the
-        existing degrade-to-under-reporting posture."""
-        path = trickle_state.trickle_state_path('dark_factory')
+    def test_a_pre_gamma_document_still_folds(self, caplog):
+        """Backward compatibility with the document every live state file
+        held on the first post-deploy run."""
+        path = _path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            'schema_version': trickle_state.STATE_SCHEMA_VERSION,
-            'project_id': 'dark_factory',
-            'outcome': RunOutcome.PRODUCTIVE,
-            'consecutive_barren_runs': 0,
-            'last_productive_at': '2026-07-01T03:00:00+00:00',
-        }))
+        path.write_text(json.dumps(_pre_gamma_doc(
+            outcome='productive',
+            consecutive_barren_runs=0,
+            last_productive_at='2026-07-01T03:00:00+00:00',
+        )))
 
         with caplog.at_level('WARNING'):
-            status, _ = trickle_state.load_state(path)
-            doc = _record(day=2, exit_code=1, selected_count=6)
+            state = _record(day=2, exit_code=1, selected_count=6)
 
-        assert status == 'ok', 'a missing additive field is not malformed'
-        assert not [r for r in caplog.records if r.levelname == 'WARNING']
-        assert doc['consecutive_failed_runs'] == 1
-
-    def test_schema_version_is_not_bumped_for_an_additive_field(self):
-        """Pins the no-bump decision so a later tidy-up bump has to argue
-        with a test. Bumping would make every live state file read
-        ``malformed`` on the first post-deploy probe — one guaranteed false
-        alarm per project, plus a reset streak — which is the degradation
-        this module exists to close."""
-        assert trickle_state.STATE_SCHEMA_VERSION == 1
-
-    def test_a_failed_document_round_trips_through_load_state(self):
-        doc = _record(day=1, exit_code=1, selected_count=6)
-        status, loaded = trickle_state.load_state(
-            trickle_state.trickle_state_path('dark_factory')
-        )
-        assert (status, loaded) == ('ok', doc)
+        assert not _warnings(caplog)
+        assert state.consecutive_failed_runs == 1
+        assert state.last_productive_at == _T0
 
     def test_failed_threshold_is_tighter_than_the_barren_one(self):
         """ONE failed night is already owned twice over — by the nightly's
         own per-run escalation and by ``check_trickle_liveness.sh``'s
-        ``Result != success`` gate — so firing at 1 would only duplicate
-        them. TWO consecutive is the PERSISTENT shape neither per-run
-        signal can express."""
+        ``Result != success`` gate. TWO consecutive is the PERSISTENT shape
+        neither per-run signal can express."""
         assert trickle_state.DEFAULT_MAX_FAILED_RUNS == 2
         assert (
             trickle_state.DEFAULT_MAX_FAILED_RUNS
             < trickle_state.DEFAULT_MAX_BARREN_RUNS
         )
 
+
+class TestRecordRunDeferred:
+    """A night the usage cap deferred observed nothing, so it moves neither
+    streak and owes its date a retry."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_productive_barren_then_capped_records_deferred(self):
+        """Boundary row 5, at the writer."""
+        prod = _record(day=1, selected_count=2, census=_fire())
+        _record(day=2, budget_skipped=4, census=_fire())
+
+        capped = _record(day=3, capped=True, selected_count=6, census=None)
+
+        assert capped.exit_code == 0
+        assert capped.outcome == RunOutcome.DEFERRED
+        assert capped.last_productive_at == prod.last_productive_at
+        assert capped.consecutive_barren_runs == 1
+        assert capped.consecutive_failed_runs == 0
+        assert capped.census_fired is None
+        assert capped.census_fire_streak is not None
+        assert capped.census_fire_streak.fires == 2
+        assert dict(capped.retry_backlog) == {_d(3): 1}
+
+    def test_a_deferred_night_carries_the_failed_streak_too(self):
+        _record(day=1, exit_code=1)
+        assert _record(day=2, capped=True).consecutive_failed_runs == 1
+        assert _record(day=3, exit_code=1).consecutive_failed_runs == 2
+
+    def test_a_deferred_night_is_never_barren_however_its_doors_read(self):
+        _record(day=1, budget_skipped=4)
+        _record(day=2, budget_skipped=4)
+        deferred = _record(day=3, capped=True, budget_skipped=4)
+        assert deferred.outcome == RunOutcome.DEFERRED
+        assert deferred.consecutive_barren_runs == 2
+        assert _record(day=4, budget_skipped=4).consecutive_barren_runs == 3
 
 
 def _fire(anchor: str | None = '2026-08-02', path=_CENSUS_STATE):
@@ -1119,28 +1273,28 @@ class TestRecordRunCensusFireStreak:
 
     def test_consecutive_fires_against_one_anchor_increment(self):
         for day, fires in ((1, 1), (2, 2), (3, 3)):
-            doc = _record(day=day, zero_signal_dropped=1, census=_fire())
-            assert doc['census_fired'] is True
-            assert doc['census_fire_streak'] == {
-                'fires': fires,
-                'last_census_at': '2026-08-02',
-                'census_state_path': _CENSUS_STATE,
-                'since': '2026-07-01',
-            }
+            state = _record(day=day, zero_signal_dropped=1, census=_fire())
+            assert state.census_fired is True
+            assert state.census_fire_streak == CensusFireStreak(
+                fires=fires,
+                last_census_at='2026-08-02',
+                census_state_path=_CENSUS_STATE,
+                since='2026-07-01',
+            )
 
     def test_a_no_fire_night_clears_the_streak(self):
         _record(day=1, census=_fire())
         _record(day=2, census=_fire())
 
-        doc = _record(day=3, census=_no_fire())
+        state = _record(day=3, census=_no_fire())
 
-        assert doc['census_fired'] is False
-        assert doc['census_fire_streak'] is None
+        assert state.census_fired is False
+        assert state.census_fire_streak is None
 
     def test_quiet_no_fire_nights_never_build_a_streak(self):
         for day in range(1, 7):
-            doc = _record(day=day, census=_no_fire())
-        assert doc['census_fire_streak'] is None
+            state = _record(day=day, census=_no_fire())
+        assert state.census_fire_streak is None
 
     def test_a_night_that_did_not_evaluate_the_trigger_carries_the_streak(self):
         _record(day=1, census=_fire())
@@ -1148,85 +1302,69 @@ class TestRecordRunCensusFireStreak:
 
         skipped = _record(day=3, exit_code=1, census=None)
 
-        assert skipped['census_fired'] is None
-        assert skipped['census_fire_streak'] == before['census_fire_streak']
+        assert skipped.census_fired is None
+        assert skipped.census_fire_streak == before.census_fire_streak
         resumed = _record(day=4, census=_fire())
-        assert resumed['census_fire_streak']['fires'] == 3
-        assert resumed['census_fire_streak']['since'] == '2026-07-01'
+        assert resumed.census_fire_streak is not None
+        assert resumed.census_fire_streak.fires == 3
+        assert resumed.census_fire_streak.since == '2026-07-01'
 
     def test_a_first_night_without_evaluation_records_no_streak(self):
-        doc = _record(day=1, census=None)
-        assert doc['census_fired'] is None
-        assert doc['census_fire_streak'] is None
+        state = _record(day=1, census=None)
+        assert state.census_fired is None
+        assert state.census_fire_streak is None
 
     def test_a_fire_against_a_moved_anchor_restarts_the_streak(self):
         _record(day=1, census=_fire(anchor='2026-08-02'))
         _record(day=2, census=_fire(anchor='2026-08-02'))
 
-        doc = _record(day=3, census=_fire(anchor='2026-09-24'))
+        state = _record(day=3, census=_fire(anchor='2026-09-24'))
 
-        assert doc['census_fire_streak'] == {
-            'fires': 1,
-            'last_census_at': '2026-09-24',
-            'census_state_path': _CENSUS_STATE,
-            'since': '2026-07-03',
-        }
+        assert state.census_fire_streak == CensusFireStreak(
+            fires=1,
+            last_census_at='2026-09-24',
+            census_state_path=_CENSUS_STATE,
+            since='2026-07-03',
+        )
 
     def test_a_fire_against_another_census_state_path_restarts_the_streak(self):
         _record(day=1, census=_fire())
         _record(day=2, census=_fire())
 
-        doc = _record(day=3, census=_fire(path='/q/census-state.json'))
+        state = _record(day=3, census=_fire(path='/q/census-state.json'))
 
-        assert doc['census_fire_streak']['fires'] == 1
-        assert doc['census_fire_streak']['census_state_path'] == (
-            '/q/census-state.json'
+        assert state.census_fire_streak == CensusFireStreak(
+            fires=1,
+            last_census_at='2026-08-02',
+            census_state_path='/q/census-state.json',
+            since='2026-07-03',
         )
-        assert doc['census_fire_streak']['since'] == '2026-07-03'
 
     def test_a_never_censused_anchor_still_builds_a_streak(self):
         _record(day=1, census=_fire(anchor=None))
-        doc = _record(day=2, census=_fire(anchor=None))
+        state = _record(day=2, census=_fire(anchor=None))
 
-        assert doc['census_fire_streak']['fires'] == 2
-        assert doc['census_fire_streak']['last_census_at'] is None
+        assert state.census_fire_streak is not None
+        assert state.census_fire_streak.fires == 2
+        assert state.census_fire_streak.last_census_at is None
 
     def test_a_predecessor_without_census_fields_starts_the_streak_at_one(
         self, caplog,
     ):
-        path = trickle_state.trickle_state_path('dark_factory')
+        path = _path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            'schema_version': trickle_state.STATE_SCHEMA_VERSION,
-            'project_id': 'dark_factory',
-            'outcome': RunOutcome.QUIET,
-            'consecutive_barren_runs': 0,
-            'consecutive_failed_runs': 0,
-            'last_productive_at': None,
-        }))
+        path.write_text(json.dumps(_pre_gamma_doc()))
 
         with caplog.at_level('WARNING'):
-            status, _ = trickle_state.load_state(path)
-            doc = _record(day=2, census=_fire())
+            state = _record(day=2, census=_fire())
 
-        assert status == 'ok'
-        assert not [r for r in caplog.records if r.levelname == 'WARNING']
-        assert doc['census_fire_streak']['fires'] == 1
-        assert trickle_state.STATE_SCHEMA_VERSION == 1
+        assert not _warnings(caplog)
+        assert state.census_fire_streak is not None
+        assert state.census_fire_streak.fires == 1
 
     def test_the_census_fields_round_trip_through_load_state(self):
-        doc = _record(day=1, census=_fire())
-        status, loaded = trickle_state.load_state(
-            trickle_state.trickle_state_path('dark_factory')
-        )
-        assert (status, loaded) == ('ok', doc)
-
-    def test_census_is_a_required_keyword(self):
-        """A defaulted ``census=None`` is how a future caller would silently
-        blind the census progress probe into a permanent OK."""
-        census = inspect.signature(trickle_state.record_run).parameters['census']
-        assert census.kind is inspect.Parameter.KEYWORD_ONLY
-        assert census.default is inspect.Parameter.empty
+        state = _record(day=1, census=_fire())
+        assert trickle_state.load_state(_path()) == Ok(state)
 
 
 class TestReadLastCensusAt:
@@ -1694,13 +1832,13 @@ def _warnings_naming(caplog, text):
     ]
 
 
-def _without_backlog(doc):
-    return {k: v for k, v in doc.items() if k != 'retry_backlog'}
+def _without_backlog(state: TrickleState) -> TrickleState:
+    return dataclasses.replace(state, retry_backlog={})
 
 
 class TestRecordRunRetryBacklog:
     """record_run folds each scheduled pass into the document's additive
-    ``retry_backlog`` ({ISO date: unfinished attempts})."""
+    ``retry_backlog`` ({date: unfinished attempts})."""
 
     @pytest.fixture(autouse=True)
     def _state_root(self, tmp_path, monkeypatch):
@@ -1710,26 +1848,26 @@ class TestRecordRunRetryBacklog:
         first = _record(day=1, exit_code=1, selected_count=6)
         again = _record(day=1, exit_code=1, selected_count=6)
 
-        assert first['retry_backlog'] == {'2026-07-01': 1}
-        assert again['retry_backlog'] == {'2026-07-01': 2}
+        assert dict(first.retry_backlog) == {_d(1): 1}
+        assert dict(again.retry_backlog) == {_d(1): 2}
 
     def test_a_capped_run_owes_its_date_and_records_capped(self):
         capped = _record(day=1, capped=True, zero_signal_dropped=2)
 
-        assert capped['exit_code'] == 0
-        assert capped['capped'] is True
-        assert capped['retry_backlog'] == {'2026-07-01': 1}
+        assert capped.exit_code == 0
+        assert capped.capped is True
+        assert dict(capped.retry_backlog) == {_d(1): 1}
 
     def test_a_normal_run_records_capped_false_and_owes_nothing(self):
-        doc = _record(day=1, selected_count=1)
+        state = _record(day=1, selected_count=1)
 
-        assert doc['capped'] is False
-        assert doc['retry_backlog'] == {}
+        assert state.capped is False
+        assert dict(state.retry_backlog) == {}
 
     def test_a_run_that_committed_never_owes_its_date(self):
-        doc = _record(day=1, exit_code=1, selected_count=6, commit_made=True)
+        state = _record(day=1, exit_code=1, selected_count=6, commit_made=True)
 
-        assert doc['retry_backlog'] == {}
+        assert dict(state.retry_backlog) == {}
 
     def test_a_finished_run_clears_its_own_date_and_carries_the_rest(self):
         _record(day=1, exit_code=1)
@@ -1738,39 +1876,45 @@ class TestRecordRunRetryBacklog:
         cleared = _record(day=1, selected_count=1)
         carried = _record(day=3, selected_count=1)
 
-        assert cleared['retry_backlog'] == {'2026-07-02': 1}
-        assert carried['retry_backlog'] == {'2026-07-02': 1}
+        assert dict(cleared.retry_backlog) == {_d(2): 1}
+        assert dict(carried.retry_backlog) == {_d(2): 1}
 
     def test_an_entry_past_the_window_is_pruned_with_one_warning(self, caplog):
         _record(day=1, exit_code=1)
 
         with caplog.at_level('WARNING'):
-            doc = _record(day=2 + trickle_state.RETRY_MAX_AGE_DAYS,
-                          selected_count=1)
+            state = _record(day=2 + trickle_state.RETRY_MAX_AGE_DAYS,
+                            selected_count=1)
 
-        assert doc['retry_backlog'] == {}
+        assert dict(state.retry_backlog) == {}
         assert len(_warnings_naming(caplog, '2026-07-01')) == 1
+
+    def test_next_state_folds_the_backlog_without_warning(self, caplog):
+        """The abandonment WARNING belongs to the write, so a nightly that
+        folds tonight's state before recording it logs it once."""
+        _record(day=1, exit_code=1)
+        run = _night(day=2 + trickle_state.RETRY_MAX_AGE_DAYS, selected_count=1)
+
+        with caplog.at_level('WARNING'):
+            projected = trickle_state.next_state(
+                trickle_state.read_prior('dark_factory'), 'dark_factory', run
+            )
+
+        assert dict(projected.retry_backlog) == {}
+        assert not _warnings(caplog)
 
     def test_a_document_without_a_backlog_reads_ok_and_starts_one(
         self, caplog
     ):
-        path = trickle_state.trickle_state_path('dark_factory')
+        path = _path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            'schema_version': trickle_state.STATE_SCHEMA_VERSION,
-            'project_id': 'dark_factory',
-            'outcome': RunOutcome.PRODUCTIVE,
-            'consecutive_barren_runs': 0,
-            'consecutive_failed_runs': 0,
-        }))
+        path.write_text(json.dumps(_pre_gamma_doc()))
 
         with caplog.at_level('WARNING'):
-            status, _ = trickle_state.load_state(path)
-            doc = _record(day=2, exit_code=1)
+            state = _record(day=2, exit_code=1)
 
-        assert status == 'ok'
-        assert not [r for r in caplog.records if r.levelname == 'WARNING']
-        assert doc['retry_backlog'] == {'2026-07-02': 1}
+        assert not _warnings(caplog)
+        assert dict(state.retry_backlog) == {_d(2): 1}
 
     @pytest.mark.parametrize('garbage', [
         pytest.param(['2026-07-01'], id='a-list'),
@@ -1778,17 +1922,17 @@ class TestRecordRunRetryBacklog:
         pytest.param('2026-07-01', id='a-string'),
     ])
     def test_a_garbage_backlog_is_dropped_never_raised(self, garbage):
-        doc = _record(day=1, selected_count=1)
-        path = trickle_state.trickle_state_path('dark_factory')
-        path.write_text(json.dumps({**doc, 'retry_backlog': garbage}))
+        state = _record(day=1, selected_count=1)
+        _path().write_text(json.dumps({**state.to_json(), 'retry_backlog': garbage}))
 
         after = _record(day=2, exit_code=1)
 
-        assert after['retry_backlog'] == {'2026-07-02': 1}
+        assert dict(after.retry_backlog) == {_d(2): 1}
+        assert after.consecutive_failed_runs == 1
 
 
 def _retry(project_id='dark_factory', *, day, recorded_day, exit_code=0,
-           capped=False, commit_made=False):
+           capped=False, commit_made=False) -> TrickleState | None:
     return trickle_state.record_retry(
         project_id,
         target_date=date(2026, 7, day),
@@ -1799,11 +1943,11 @@ def _retry(project_id='dark_factory', *, day, recorded_day, exit_code=0,
     )
 
 
-def _retried(**kwargs) -> dict:
+def _retried(**kwargs) -> TrickleState:
     """:func:`_retry` over a readable predecessor, so a document is written."""
-    doc = _retry(**kwargs)
-    assert doc is not None, 'record_retry wrote nothing'
-    return doc
+    state = _retry(**kwargs)
+    assert state is not None, 'record_retry wrote nothing'
+    return state
 
 
 class TestRecordRetry:
@@ -1816,14 +1960,13 @@ class TestRecordRetry:
 
     def test_a_finished_retry_clears_its_date_and_changes_nothing_else(self):
         _record(day=1, exit_code=1, selected_count=6)
-        scheduled = _record(day=2, selected_count=1)
+        scheduled = _record(day=2, selected_count=1, barren_escalated=True)
 
         retried = _retried(day=1, recorded_day=2)
 
-        path = trickle_state.trickle_state_path('dark_factory')
-        assert json.loads(path.read_text()) == retried
-        assert scheduled['retry_backlog'] == {'2026-07-01': 1}
-        assert retried['retry_backlog'] == {}
+        assert trickle_state.load_state(_path()) == Ok(retried)
+        assert dict(scheduled.retry_backlog) == {_d(1): 1}
+        assert dict(retried.retry_backlog) == {}
         assert _without_backlog(retried) == _without_backlog(scheduled)
 
     def test_an_unfinished_retry_counts_an_attempt(self):
@@ -1832,7 +1975,7 @@ class TestRecordRetry:
 
         retried = _retried(day=1, recorded_day=2, exit_code=1)
 
-        assert retried['retry_backlog'] == {'2026-07-01': 2}
+        assert dict(retried.retry_backlog) == {_d(1): 2}
         assert _without_backlog(retried) == _without_backlog(scheduled)
 
     def test_a_capped_retry_counts_an_attempt(self):
@@ -1841,7 +1984,21 @@ class TestRecordRetry:
 
         retried = _retried(day=1, recorded_day=2, capped=True)
 
-        assert retried['retry_backlog'] == {'2026-07-01': 2}
+        assert dict(retried.retry_backlog) == {_d(1): 2}
+
+    def test_an_unrecorded_barren_escalated_stays_unrecorded(self):
+        path = _path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_pre_gamma_doc(
+            retry_backlog={'2026-07-01': 1}
+        )))
+
+        retried = _retried(day=1, recorded_day=2)
+
+        assert retried.barren_escalated is None
+        read = trickle_state.load_state(path)
+        assert isinstance(read, Ok)
+        assert read.value.barren_escalated is None
 
     def test_the_attempt_bound_abandons_the_date_with_one_warning(
         self, caplog
@@ -1852,48 +2009,44 @@ class TestRecordRetry:
 
         with caplog.at_level('WARNING'):
             for night in range(unfinished):
-                doc = _retried(day=1, recorded_day=2 + night, exit_code=1)
+                state = _retried(day=1, recorded_day=2 + night, exit_code=1)
 
-        assert doc['retry_backlog'] == {}
+        assert dict(state.retry_backlog) == {}
         assert len(_warnings_naming(caplog, '2026-07-01')) == 1
 
     def test_with_no_predecessor_nothing_is_written(self, caplog):
-        path = trickle_state.trickle_state_path('dark_factory')
-
         with caplog.at_level('WARNING'):
-            doc = _retry(day=1, recorded_day=2)
+            state = _retry(day=1, recorded_day=2)
 
-        assert doc is None
-        assert not path.exists()
+        assert state is None
+        assert not _path().exists()
         assert len(_warnings_naming(caplog, '2026-07-01')) == 1
 
     def test_with_a_corrupt_predecessor_nothing_is_written(self, caplog):
-        path = trickle_state.trickle_state_path('dark_factory')
+        path = _path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b'{corrupt')
 
         with caplog.at_level('WARNING'):
-            doc = _retry(day=1, recorded_day=2)
+            state = _retry(day=1, recorded_day=2)
 
-        assert doc is None
+        assert state is None
         assert path.read_bytes() == b'{corrupt'
         assert len(_warnings_naming(caplog, '2026-07-01')) == 1
 
-    def test_the_write_is_atomic_and_leaves_no_tmp_file(self):
+    def test_the_write_leaves_no_temp_residue(self):
         _record(day=1, exit_code=1)
         _record(day=2, selected_count=1)
 
         _retry(day=1, recorded_day=2)
 
-        state_dir = trickle_state.trickle_state_path('dark_factory').parent
-        assert [p.name for p in state_dir.iterdir()] == [
+        assert [p.name for p in _path().parent.iterdir()] == [
             trickle_state.STATE_FILENAME
         ]
 
 
-def _rewrite_state(doc):
-    trickle_state.trickle_state_path('dark_factory').write_text(
-        json.dumps(doc))
+def _rewrite_state(doc: dict) -> None:
+    _path().write_text(json.dumps(doc))
 
 
 class TestRecordRunScheduleCursor:
@@ -1906,21 +2059,21 @@ class TestRecordRunScheduleCursor:
         monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
 
     def test_a_first_scheduled_run_sets_the_cursor_and_owes_nothing(self):
-        doc = _record(day=1, scheduled=True)
+        state = _record(day=1, scheduled=True)
 
-        assert doc['last_scheduled_target_date'] == '2026-07-01'
-        assert doc['retry_backlog'] == {}
+        assert state.last_scheduled_target_date == _d(1)
+        assert dict(state.retry_backlog) == {}
 
     def test_a_first_manual_run_leaves_no_cursor(self):
-        assert _record(day=1)['last_scheduled_target_date'] is None
+        assert _record(day=1).last_scheduled_target_date is None
 
     def test_a_scheduled_run_owes_the_dates_it_jumped_over(self):
         _record(day=1, scheduled=True)
 
-        doc = _record(day=4, scheduled=True, selected_count=1)
+        state = _record(day=4, scheduled=True, selected_count=1)
 
-        assert doc['retry_backlog'] == {'2026-07-02': 0, '2026-07-03': 0}
-        assert doc['last_scheduled_target_date'] == '2026-07-04'
+        assert dict(state.retry_backlog) == {_d(2): 0, _d(3): 0}
+        assert state.last_scheduled_target_date == _d(4)
 
     def test_a_post_midnight_catch_up_owes_the_skipped_date_once(self):
         _record(day=1, scheduled=True)
@@ -1928,8 +2081,8 @@ class TestRecordRunScheduleCursor:
         catch_up = _record(day=3, scheduled=True)
         again = _record(day=3, scheduled=True)
 
-        assert catch_up['retry_backlog'] == {'2026-07-02': 0}
-        assert again['retry_backlog'] == {'2026-07-02': 0}
+        assert dict(catch_up.retry_backlog) == {_d(2): 0}
+        assert dict(again.retry_backlog) == {_d(2): 0}
 
     def test_a_manual_backfill_never_reads_as_a_gap(self):
         _record(day=5, scheduled=True)
@@ -1937,80 +2090,82 @@ class TestRecordRunScheduleCursor:
         backfill = _record(day=1, selected_count=1)
         next_night = _record(day=6, scheduled=True)
 
-        assert backfill['last_scheduled_target_date'] == '2026-07-05'
-        assert backfill['target_date'] == '2026-07-01'
-        assert next_night['retry_backlog'] == {}
-        assert next_night['last_scheduled_target_date'] == '2026-07-06'
+        assert backfill.last_scheduled_target_date == _d(5)
+        assert backfill.target_date == _d(1)
+        assert dict(next_night.retry_backlog) == {}
+        assert next_night.last_scheduled_target_date == _d(6)
 
     def test_a_later_manual_run_never_moves_the_cursor(self):
         _record(day=1, scheduled=True)
         _record(day=9)
 
-        assert _record(day=2, scheduled=True)['retry_backlog'] == {}
+        assert dict(_record(day=2, scheduled=True).retry_backlog) == {}
 
     def test_an_owed_never_run_date_keeps_its_attempt_count(self):
         _record(day=1, scheduled=True)
         _record(day=2, exit_code=1)
 
-        doc = _record(day=3, scheduled=True)
+        state = _record(day=3, scheduled=True)
 
-        assert doc['retry_backlog'] == {'2026-07-02': 1}
+        assert dict(state.retry_backlog) == {_d(2): 1}
 
     def test_a_predecessor_without_a_cursor_owes_no_never_run_dates(self):
-        pre_6548 = _record(day=1, scheduled=True)
+        pre_6548 = _record(day=1, scheduled=True).to_json()
         del pre_6548['last_scheduled_target_date']
         _rewrite_state(pre_6548)
 
-        doc = _record(day=4, scheduled=True)
+        state = _record(day=4, scheduled=True)
 
-        assert doc['retry_backlog'] == {}
-        assert doc['last_scheduled_target_date'] == '2026-07-04'
+        assert dict(state.retry_backlog) == {}
+        assert state.last_scheduled_target_date == _d(4)
 
     @pytest.mark.parametrize('garbage', [
         pytest.param('yesterday', id='not-a-date'),
         pytest.param(7, id='an-int'),
         pytest.param(None, id='null'),
     ])
-    def test_a_garbage_cursor_is_treated_as_absent_never_raised(
-        self, garbage
-    ):
-        doc = _record(day=1, scheduled=True)
-        _rewrite_state({**doc, 'last_scheduled_target_date': garbage})
+    def test_a_garbage_cursor_owes_no_never_run_dates(self, garbage):
+        _rewrite_state({
+            **_record(day=1, scheduled=True).to_json(),
+            'last_scheduled_target_date': garbage,
+        })
 
-        doc = _record(day=4, scheduled=True)
+        state = _record(day=4, scheduled=True)
 
-        assert doc['retry_backlog'] == {}
-        assert doc['last_scheduled_target_date'] == '2026-07-04'
+        assert dict(state.retry_backlog) == {}
+        assert state.last_scheduled_target_date == _d(4)
 
     def test_a_gap_past_the_window_owes_its_in_window_dates_only(self):
         max_age = trickle_state.RETRY_MAX_AGE_DAYS
         last = 1 + max_age + 2
         _record(day=1, scheduled=True)
 
-        doc = _record(day=last, scheduled=True)
+        state = _record(day=last, scheduled=True)
 
-        assert doc['retry_backlog'] == {
-            _d(day).isoformat(): 0 for day in range(last - max_age, last)
+        assert dict(state.retry_backlog) == {
+            _d(day): 0 for day in range(last - max_age, last)
         }
 
     def test_a_gap_of_years_is_abandoned_with_one_summary_warning(
         self, caplog
     ):
-        doc = _record(day=1, scheduled=True)
-        _rewrite_state({**doc, 'last_scheduled_target_date': '2020-01-01'})
+        _rewrite_state({
+            **_record(day=1, scheduled=True).to_json(),
+            'last_scheduled_target_date': '2020-01-01',
+        })
         oldest_owed = _d(20) - timedelta(days=trickle_state.RETRY_MAX_AGE_DAYS)
         expired = (oldest_owed - date(2020, 1, 2)).days
 
         with caplog.at_level('WARNING'):
-            doc = _record(day=20, scheduled=True)
+            state = _record(day=20, scheduled=True)
 
-        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        warnings = _warnings(caplog)
         assert len(warnings) == 1
         message = warnings[0].getMessage()
         assert f'abandoning {expired} never-run date(s)' in message
         assert '2020-01-02..2026-07-12' in message
-        assert min(doc['retry_backlog']) == oldest_owed.isoformat()
-        assert len(doc['retry_backlog']) == trickle_state.RETRY_MAX_AGE_DAYS
+        assert min(state.retry_backlog) == oldest_owed
+        assert len(state.retry_backlog) == trickle_state.RETRY_MAX_AGE_DAYS
 
     def test_a_scheduled_run_behind_the_cursor_never_moves_it_back(self):
         _record(day=5, scheduled=True)
@@ -2018,9 +2173,9 @@ class TestRecordRunScheduleCursor:
         skewed = _record(day=3, scheduled=True)
         next_night = _record(day=6, scheduled=True)
 
-        assert skewed['last_scheduled_target_date'] == '2026-07-05'
-        assert next_night['retry_backlog'] == {}
-        assert next_night['last_scheduled_target_date'] == '2026-07-06'
+        assert skewed.last_scheduled_target_date == _d(5)
+        assert dict(next_night.retry_backlog) == {}
+        assert next_night.last_scheduled_target_date == _d(6)
 
     def test_a_retry_leaves_the_cursor_untouched(self):
         _record(day=1, scheduled=True)
@@ -2028,13 +2183,13 @@ class TestRecordRunScheduleCursor:
 
         retried = _retried(day=2, recorded_day=3)
 
-        assert retried['last_scheduled_target_date'] == '2026-07-03'
-        assert retried['retry_backlog'] == {}
+        assert retried.last_scheduled_target_date == _d(3)
+        assert dict(retried.retry_backlog) == {}
 
 
 class TestDueRetries:
-    """``due_retries(doc, *, today)`` — the reader the nightly calls, so the
-    backlog's field name and encoding stay inside trickle_state."""
+    """``due_retries(state, *, today)`` — the reader the nightly calls, so
+    the backlog's policy stays inside trickle_state."""
 
     @pytest.fixture(autouse=True)
     def _state_root(self, tmp_path, monkeypatch):
@@ -2042,29 +2197,26 @@ class TestDueRetries:
 
     def test_a_recorded_failed_night_is_due_after_a_productive_one(self):
         _record(day=1, exit_code=1, selected_count=6)
-        doc = _record(day=2, selected_count=1)
+        state = _record(day=2, selected_count=1)
 
-        assert trickle_state.due_retries(doc, today=_d(3)) == (_d(1),)
+        assert trickle_state.due_retries(state, today=_d(3)) == (_d(1),)
 
     def test_several_owed_dates_give_the_oldest_up_to_the_nightly_limit(self):
         _record(day=1, exit_code=1)
         _record(day=2, exit_code=1)
-        doc = _record(day=3, selected_count=1)
+        state = _record(day=3, selected_count=1)
 
-        due = trickle_state.due_retries(doc, today=_d(4))
+        due = trickle_state.due_retries(state, today=_d(4))
 
         assert due == (_d(1), _d(2))[:trickle_state.RETRIES_PER_NIGHT]
 
-    @pytest.mark.parametrize('doc', [
-        pytest.param(None, id='None'),
-        pytest.param(['2026-07-01'], id='not-a-dict'),
-        pytest.param({'outcome': RunOutcome.PRODUCTIVE}, id='no-backlog-key'),
-        pytest.param({'retry_backlog': 'garbage'}, id='garbage-backlog'),
-        pytest.param(
-            {'retry_backlog': {'2026-07-01': 1}}, id='outside-the-window'
-        ),
+    @pytest.mark.parametrize('backlog', [
+        pytest.param({}, id='empty'),
+        pytest.param({_d(1): 1}, id='outside-the-window'),
     ])
-    def test_nothing_is_due_from_what_owes_nothing_today(self, doc):
+    def test_nothing_is_due_from_what_owes_nothing_today(self, backlog):
         today = _d(1) + timedelta(days=trickle_state.RETRY_MAX_AGE_DAYS + 1)
 
-        assert trickle_state.due_retries(doc, today=today) == ()
+        state = _state(retry_backlog=backlog)
+
+        assert trickle_state.due_retries(state, today=today) == ()
