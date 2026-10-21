@@ -9,6 +9,7 @@ evidence are counted by the runner and never sent to the model.
 """
 from __future__ import annotations
 
+import copy
 import reprlib
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
@@ -614,4 +615,103 @@ def reply_instructions() -> str:
         f"replaces it; {refused}.\n"
         f"notes: verified is always false: {_NO_TOOLS}.\n"
         "Every observation, why, note, title, cause, claim and evidence is a non-empty string.\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Applying the document, and the standing count
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Refined:
+    """A run's codebook and verified clusters after its phase refinements."""
+
+    codebook: dict
+    clusters: tuple[dict, ...]
+    clusters_refined: int
+    entries_refined: int
+
+
+def _with_phases(record: dict, refinement: PhaseRefinement) -> dict:
+    return {**record, "origin_phase": refinement.origin_phase, "manifested_phase": refinement.manifested_phase}
+
+
+def _refined_cluster(cluster: Mapping[str, Any], refinement: PhaseRefinement) -> dict:
+    refined = copy.deepcopy(dict(cluster))
+    sightings = [_with_phases(sighting, refinement) for sighting in refined.get("sightings") or []]
+    return {**_with_phases(refined, refinement), "sightings": sightings}
+
+
+def apply_refinements(
+    cb: Mapping[str, Any],
+    document: Synthesis,
+    *,
+    clusters: Sequence[tuple[Mapping[str, Any], str | None]],
+    created: Collection[str],
+) -> Refined:
+    """*cb* and the run's *clusters*, each paired with the entry it was
+    placed at (None when unplaced), with *document*'s phase refinements
+    applied by the placed entry's finding key: a refined cluster takes the
+    refined phases, sightings included, and so does each entry in *created*,
+    the entries this run created. An entry that stood before the run keeps
+    its phases. Neither input is mutated."""
+    by_key = {refinement.key: refinement for refinement in document.phase_refinements}
+    result = copy.deepcopy(dict(cb))
+    entries: dict[str, dict] = {entry["id"]: entry for entry in result.get("entries") or []}
+    _require_entries(entries, (entry_id for _, entry_id in clusters if entry_id is not None), what="a placed cluster")
+    _require_entries(entries, created, what="a created entry")
+
+    def refinement_at(entry_id: str | None) -> PhaseRefinement | None:
+        key = None if entry_id is None else entries[entry_id].get("finding_key")
+        return by_key.get(key) if isinstance(key, str) else None
+
+    refined_clusters: list[dict] = []
+    clusters_refined = entries_refined = 0
+    for cluster, entry_id in clusters:
+        refinement = refinement_at(entry_id)
+        if refinement is None:
+            refined_clusters.append(copy.deepcopy(dict(cluster)))
+            continue
+        refined_clusters.append(_refined_cluster(cluster, refinement))
+        clusters_refined += 1
+    for entry_id in created:
+        refinement = refinement_at(entry_id)
+        if refinement is not None:
+            entries[entry_id].update(origin_phase=refinement.origin_phase, manifested_phase=refinement.manifested_phase)
+            entries_refined += 1
+    codebook.assert_no_deletion(dict(cb), result)
+    return Refined(result, tuple(refined_clusters), clusters_refined, entries_refined)
+
+
+CORRECTIONS_AGENT_CLASS = "census-synthesis"
+
+
+def corrections_record(document: Synthesis, *, run_id: str, date: str, project: str) -> dict | None:
+    """The §7.3 coding record carrying *document*'s corrections, or None when
+    it has none. Its session is *run_id*, so the merger's per-(session,
+    entry) dedup admits one correction per entry per run."""
+    if not document.corrections:
+        return None
+    return {
+        "session": run_id,
+        "date": date,
+        "project": project,
+        "agent_class": CORRECTIONS_AGENT_CLASS,
+        "corrections": [correction.to_record() for correction in document.corrections],
+    }
+
+
+_OPEN_STATUSES = frozenset({"open", "partially"})
+
+
+def standing_count(before: Mapping[str, Any], after: Mapping[str, Any]) -> int:
+    """The entries still open or partially open in *after* that stood in
+    *before* and gained no session: standing, no new evidence."""
+    standing = _by_id(before.get("entries") or [])
+    return sum(
+        1
+        for entry in after.get("entries") or []
+        if entry.get("status") in _OPEN_STATUSES
+        and entry["id"] in standing
+        and not _gained_sessions(standing[entry["id"]], entry)
     )
