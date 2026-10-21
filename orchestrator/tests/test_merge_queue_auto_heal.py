@@ -34,6 +34,7 @@ from orchestrator.merge_lane.worker import (
     MergeRequest,
 )
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.verify_categories import FailureCategory
 from orchestrator.workflow import (  # type: ignore[attr-defined]
     TaskWorkflow,
     WorkflowOutcome,
@@ -170,6 +171,16 @@ class TestIsAutoHealEligible:
     def test_none_category_is_not_eligible(self) -> None:
         from orchestrator.merge_lane.worker import is_auto_heal_eligible
         assert is_auto_heal_eligible(None, None) is False
+
+    @pytest.mark.parametrize(
+        'category',
+        [FailureCategory.LINT_ERROR, FailureCategory.TYPE_ERROR, FailureCategory.INFRA_ABORT],
+    )
+    def test_task_4843_categories_are_not_eligible(self, category: FailureCategory) -> None:
+        """The eligible set is hand-enumerated, so admitting any of these
+        (task 4843) must be a loud, deliberate edit."""
+        from orchestrator.merge_lane.worker import is_auto_heal_eligible
+        assert is_auto_heal_eligible(category.value, '') is False
 
 
 # ---------------------------------------------------------------------------
