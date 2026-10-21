@@ -66,11 +66,16 @@ def records() -> list[dict]:
 
 @pytest.fixture(
     scope='module',
-    params=[FIXTURE_PATH, DARK_FACTORY_FIXTURE_PATH],
-    ids=['reify', 'dark_factory'],
+    params=[
+        FIXTURE_PATH,
+        DARK_FACTORY_FIXTURE_PATH,
+        FIXTURE_PATH.with_name('write_triage_calibration_solar_challenge.jsonl'),
+        FIXTURE_PATH.with_name('write_triage_calibration_solar_challenge_platform.jsonl'),
+    ],
+    ids=['reify', 'dark_factory', 'solar_challenge', 'solar_challenge_platform'],
 )
 def fixture_records(request: pytest.FixtureRequest) -> list[dict]:
-    """Every committed curator fixture — the shape contract both must keep."""
+    """Every committed curator fixture — the shape contract each must keep."""
     return parse_jsonl_fixture(request.param)
 
 

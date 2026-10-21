@@ -2,7 +2,7 @@
 
 A project other than reify is calibrated on its OWN curator-labelled fixture
 and its cutoffs are written to their own config section, never pooled with
-reify's. This module pins the dark_factory fixture's contract (the R1
+reify's. This module pins every live-store fixture's contract (the R1
 provenance mapping and the R2 label rule), the project-config writer and
 its CLI flag, and the committed artifacts that bind config <-> report <->
 fixture.
@@ -20,6 +20,7 @@ import logging
 import sys
 import types
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,7 @@ from _fm_helpers import load_script_module
 from _jsonl_fixture import parse_jsonl_fixture
 
 from fused_memory.config.schema import FusedMemoryConfig, WriteTriageProjectCalibration
+from fused_memory.models.enums import MEM0_PRIMARY
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
 FIXTURES_DIR = Path(__file__).parent / 'fixtures'
@@ -36,6 +38,31 @@ DARK_FACTORY_FIXTURE_PATH = FIXTURES_DIR / 'write_triage_calibration_dark_factor
 
 TARGET_CATEGORIES = frozenset({'preferences_and_norms', 'observations_and_summaries'})
 LIVE_STORE_SOURCE = 'live_store_topic_scroll'
+
+
+@dataclass(frozen=True)
+class LiveStoreFixture:
+    """A per-project corpus read off its live store, and the categories it admits."""
+
+    project_id: str
+    path: Path
+    admitted_categories: frozenset[str]
+
+
+LIVE_STORE_FIXTURES = (
+    LiveStoreFixture('dark_factory', DARK_FACTORY_FIXTURE_PATH, TARGET_CATEGORIES),
+    LiveStoreFixture(
+        'solar_challenge',
+        FIXTURES_DIR / 'write_triage_calibration_solar_challenge.jsonl',
+        MEM0_PRIMARY,
+    ),
+    LiveStoreFixture(
+        'solar_challenge_platform',
+        FIXTURES_DIR / 'write_triage_calibration_solar_challenge_platform.jsonl',
+        MEM0_PRIMARY,
+    ),
+)
+CALIBRATION_FIXTURE_PATHS = (REIFY_FIXTURE_PATH, *(f.path for f in LIVE_STORE_FIXTURES))
 
 
 @functools.cache
@@ -48,12 +75,22 @@ def dark_factory_records() -> list[dict]:
     return parse_jsonl_fixture(DARK_FACTORY_FIXTURE_PATH)
 
 
+@pytest.fixture(scope='module', params=LIVE_STORE_FIXTURES, ids=lambda f: f.project_id)
+def live_store(request: pytest.FixtureRequest) -> LiveStoreFixture:
+    return request.param
+
+
+@pytest.fixture(scope='module')
+def live_records(live_store: LiveStoreFixture) -> list[dict]:
+    return parse_jsonl_fixture(live_store.path)
+
+
 def _canonicals_by_cluster(records: list[dict]) -> dict[str, dict]:
     return {r['cluster_id']: r for r in records if r['label'] == 'canonical'}
 
 
-class TestDarkFactoryFixtureContract:
-    """The dark_factory corpus is read from the live store's retain-and-tag topics.
+class TestLiveStoreFixtureContract:
+    """Each per-project corpus is read from its live store's retain-and-tag topics.
 
     R1: there is no transcript — the store record IS the artifact — and the
     adjudicating sitting is the canonical's author. R2: a label is read off
@@ -61,11 +98,11 @@ class TestDarkFactoryFixtureContract:
     """
 
     def test_every_record_was_read_from_the_live_store_with_no_transcript(
-        self, dark_factory_records: list[dict],
+        self, live_records: list[dict],
     ) -> None:
         bad = {
             r['memory_id']: (r['provenance'].get('source'), r['provenance'].get('transcript_line'))
-            for r in dark_factory_records
+            for r in live_records
             if r['provenance'].get('source') != LIVE_STORE_SOURCE
             or r['provenance'].get('transcript_line') is not None
         }
@@ -75,10 +112,10 @@ class TestDarkFactoryFixtureContract:
         )
 
     def test_every_record_names_its_topic_and_a_cluster_shares_one(
-        self, dark_factory_records: list[dict],
+        self, live_records: list[dict],
     ) -> None:
         topics: dict[str, set] = defaultdict(set)
-        for r in dark_factory_records:
+        for r in live_records:
             topic = r['provenance'].get('topic')
             assert isinstance(topic, str) and topic.strip(), (
                 f'{r["memory_id"]}: provenance.topic must be a non-empty str'
@@ -88,21 +125,21 @@ class TestDarkFactoryFixtureContract:
         assert not split, f'a cluster is one topic; these span several: {split}'
 
     def test_gate_id_is_the_adjudicating_sittings_agent_id(
-        self, dark_factory_records: list[dict],
+        self, live_records: list[dict],
     ) -> None:
-        canonicals = _canonicals_by_cluster(dark_factory_records)
+        canonicals = _canonicals_by_cluster(live_records)
         bad = {
             r['memory_id']: (r['provenance'].get('gate_id'), canonicals[r['cluster_id']]['agent_id'])
-            for r in dark_factory_records
+            for r in live_records
             if r['provenance'].get('gate_id') != canonicals[r['cluster_id']]['agent_id']
         }
         assert not bad, f'provenance.gate_id must equal the canonical agent_id; got {bad}'
 
     def test_every_peer_carries_the_ruling_that_decided_its_label(
-        self, dark_factory_records: list[dict],
+        self, live_records: list[dict],
     ) -> None:
         bad = [
-            r['memory_id'] for r in dark_factory_records
+            r['memory_id'] for r in live_records
             if r['label'] != 'canonical'
             and not (isinstance(r['provenance'].get('ruling'), str)
                      and r['provenance']['ruling'].strip())
@@ -110,32 +147,37 @@ class TestDarkFactoryFixtureContract:
         assert not bad, f'a non-canonical record must quote its ruling verbatim; got {bad}'
 
     def test_labels_are_only_those_the_r2_rule_can_produce(
-        self, dark_factory_records: list[dict],
+        self, live_records: list[dict],
     ) -> None:
-        labels = {r['label'] for r in dark_factory_records}
+        labels = {r['label'] for r in live_records}
         assert labels <= {'canonical', 'duplicate', 'distinct'}, (
             'R2 rules only duplicate vs distinct; pseudo_contradiction has no rule '
             f'in this corpus. Got {sorted(labels)}'
         )
 
-    def test_every_record_is_in_a_target_category(
-        self, dark_factory_records: list[dict],
+    def test_every_record_is_in_an_admitted_category(
+        self, live_store: LiveStoreFixture, live_records: list[dict],
     ) -> None:
-        off = {r['memory_id']: r['category'] for r in dark_factory_records
-               if r['category'] not in TARGET_CATEGORIES}
+        off = {r['memory_id']: r['category'] for r in live_records
+               if r['category'] not in live_store.admitted_categories}
         assert not off, f'off-category members are excluded and tallied; got {off}'
 
+    def test_the_corpus_shares_no_memory_with_any_other_calibration_fixture(
+        self, live_store: LiveStoreFixture, live_records: list[dict],
+    ) -> None:
+        own_ids = {r['memory_id'] for r in live_records}
+        shared = {
+            other.name: sorted(own_ids & {r['memory_id'] for r in parse_jsonl_fixture(other)})
+            for other in CALIBRATION_FIXTURE_PATHS if other != live_store.path
+        }
+        assert not any(shared.values()), f'calibration corpora must be disjoint (R3); shared: {shared}'
+
+
+class TestDarkFactoryFixtureScope:
     def test_both_target_categories_are_present(
         self, dark_factory_records: list[dict],
     ) -> None:
         assert {r['category'] for r in dark_factory_records} == TARGET_CATEGORIES
-
-    def test_the_corpus_shares_no_memory_with_the_reify_fixture(
-        self, dark_factory_records: list[dict],
-    ) -> None:
-        reify_ids = {r['memory_id'] for r in parse_jsonl_fixture(REIFY_FIXTURE_PATH)}
-        shared = sorted(reify_ids & {r['memory_id'] for r in dark_factory_records})
-        assert not shared, f'the two corpora must be disjoint (R3); shared: {shared}'
 
 
 # ---------------------------------------------------------------------------
