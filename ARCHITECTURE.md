@@ -358,16 +358,16 @@ fire-and-forget follow-up tasks via `submit_task` as they work.
 
 ### 3.3 Scheduler tick
 
-`Scheduler.acquire_next()` runs a **21-phase pipeline** every tick
+`Scheduler.acquire_next()` runs a **22-phase pipeline** every tick
 (`orchestrator/src/orchestrator/scheduler.py`, `_TICK_PHASE_ORDER`):
 
 ```
-backfill_dep_status → backfill_terminal_dep_records → drain_park_eviction →
-park_gc → stale_sweep → cooldown_gc → redispatch_stranded_blocked →
-external_dep_policy → delivered_check_gate → stamp_milestone →
-override_snapshot_gc → reserve_now → override_diff → compute_priorities →
-build_candidates → landed_outbox_gate → starvation → empty_candidate_gate →
-psi_gate → select_pins → select_scored
+backfill_dep_status → backfill_terminal_dep_records → stale_sweep →
+cooldown_gc → redispatch_stranded_blocked → external_dep_policy →
+delivered_check_gate → drain_park_eviction → park_gc → stamp_milestone →
+override_snapshot_gc → compute_priorities → reserve_now → override_diff →
+build_candidates → landed_outbox_gate → already_landed_gate → starvation →
+empty_candidate_gate → psi_gate → select_pins → select_scored
 ```
 
 The first phase that short-circuits ends the tick early; otherwise

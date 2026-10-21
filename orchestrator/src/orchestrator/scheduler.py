@@ -2233,6 +2233,7 @@ class Scheduler:
         'override_diff',
         'build_candidates',
         'landed_outbox_gate',
+        'already_landed_gate',
         'starvation',
         'empty_candidate_gate',
         'psi_gate',
@@ -7505,34 +7506,48 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_landed_outbox_gate(self, ctx: TickContext) -> object:
-        """Landed-outbox + already-landed consult-before-dispatch gate.
+        """Landed-outbox consult-before-dispatch gate.
 
-        Reads: ``ctx.candidates``. Writes: ``ctx.gated_ids``,
-        ``ctx.candidates`` (filtered). Consulted once per candidate here,
-        BEFORE the starvation watchdog / pin loop / scored loop, so a
-        single ``gated_ids`` set is honored by both dispatch paths. A
-        gated task's merge already landed on main and is being driven to
-        done inline by the injected hook. ``_consult_landed_outbox`` is a
-        TOTAL function (fails open per-candidate on hook error) — no outer
-        try/except needed here. Always continues.
+        Reads: ``ctx.candidates``. Writes: ``ctx.gated_ids``. Consulted
+        once per candidate here, BEFORE the starvation watchdog / pin loop
+        / scored loop, so a single ``gated_ids`` set is honored by both
+        dispatch paths. A gated task's merge already landed on main and is
+        being driven to done inline by the injected hook.
+        ``ctx.candidates`` is left unfiltered: ``_phase_already_landed_gate``
+        consults the same list and then filters by the union.
+        ``_consult_landed_outbox`` is a TOTAL function (fails open
+        per-candidate on hook error) — no outer try/except needed here.
+        Always continues.
         """
-        gated_ids = await self._consult_landed_outbox(
+        ctx.gated_ids = await self._consult_landed_outbox(
             [str(t.get('id', '')) for t in ctx.candidates]
         )
+        return _CONTINUE
+
+    async def _phase_already_landed_gate(self, ctx: TickContext) -> object:
+        """Already-landed consult-before-dispatch gate, then the gated filter.
+
+        Reads: ``ctx.candidates``, ``ctx.gated_ids``. Writes:
+        ``ctx.gated_ids`` (unioned), ``ctx.candidates`` (filtered).
+        Consults the same candidate list ``_phase_landed_outbox_gate`` saw,
+        outbox-gated candidates included, so splitting the two consults
+        into separate phases changes only their timing visibility in
+        ``scheduler_tick.phases``. ``_consult_already_landed`` is a TOTAL
+        function — no outer try/except needed here. Always continues.
+        """
         # Already-landed pre-dispatch gate (task 2313) — consulted immediately
-        # after the landed-outbox gate above and unioned into the SAME
-        # gated_ids set, so both the scored candidate filter below and the
-        # pin loop honor a single source of truth (mirrors the
-        # _consult_landed_outbox / gated_ids pattern verbatim). Catches
-        # out-of-band landings (ancestry / merge-marker / content-
-        # equivalence) that never passed through this orchestrator's own
-        # merge queue.
-        gated_ids |= await self._consult_already_landed(ctx.candidates)
-        if gated_ids:
+        # after the landed-outbox gate and unioned into the SAME gated_ids
+        # set, so both the scored candidate filter below and the pin loop
+        # honor a single source of truth (mirrors the _consult_landed_outbox
+        # / gated_ids pattern verbatim). Catches out-of-band landings
+        # (ancestry / merge-marker / content-equivalence) that never passed
+        # through this orchestrator's own merge queue.
+        ctx.gated_ids |= await self._consult_already_landed(ctx.candidates)
+        if ctx.gated_ids:
             ctx.candidates = [
-                t for t in ctx.candidates if str(t.get('id', '')) not in gated_ids
+                t for t in ctx.candidates
+                if str(t.get('id', '')) not in ctx.gated_ids
             ]
-        ctx.gated_ids = gated_ids
         return _CONTINUE
 
     async def _phase_starvation(self, ctx: TickContext) -> object:
