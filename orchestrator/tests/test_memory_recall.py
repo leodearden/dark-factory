@@ -24,7 +24,6 @@ from _briefing_helpers import (
     _result,
     recorded_search_text,
 )
-from shared.project_id import normalize_project_id
 
 from orchestrator.agents.memory_recall import (
     FOREIGN_PROJECT_TAG_KEYS,
@@ -293,15 +292,20 @@ class TestForeignTagKeysAndSpelling:
         filtered = _filter([_result('1', 'Fact.', metadata={'project_id': 'reify'})])
         assert (filtered.kept, filtered.dropped) == ((), 1)
 
-    @pytest.mark.parametrize(
-        'raw', ['Know-Live', 'know_live', 'dark--factory', 'Dark_Factory', '  dark_factory  ', 'df', 'reify'],
-    )
-    def test_own_project_is_fused_memorys_project_id_rule(self, raw):
+    @pytest.mark.parametrize(('raw', 'own'), [
+        ('Know-Live', False),
+        ('know_live', False),
+        ('dark--factory', False),
+        ('Dark_Factory', True),
+        ('  dark_factory  ', True),
+        ('df', False),
+        ('reify', False),
+    ])
+    def test_own_project_is_fused_memorys_project_id_rule(self, raw, own):
         filtered = filter_foreign_project_results(
             [_result('1', 'Fact.', metadata={'project_id': raw})], 'dark-factory',
         )
 
-        own = normalize_project_id(raw.strip()) == normalize_project_id('dark-factory')
         assert _ids(filtered.kept) == (['1'] if own else [])
 
     def test_non_string_tag_is_treated_as_untagged(self):
