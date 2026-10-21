@@ -201,25 +201,31 @@ def _run_probe(probe: pathlib.Path) -> subprocess.CompletedProcess[str]:
     ``sys.executable -m pytest`` rather than a bare ``pytest``: the interpreter
     running this guard is the one whose resolution is being asked about, so
     naming it explicitly removes any dependence on an ambient ``PATH``.
+
+    The child runs under a private ``--basetemp`` outside the repo, never in the
+    host's default temp root; why is
+    ``tests/scripts/test_pytest_per_test_timeout_policy.py::test_the_root_bound_probe_leaves_the_hosts_default_temp_root_untouched``.
     """
-    return subprocess.run(
-        [
-            sys.executable,
-            '-m',
-            'pytest',
-            str(probe),
-            '-q',
-            '-p',
-            'no:cacheprovider',
-            '-o',
-            'addopts=',
-        ],
-        capture_output=True,
-        text=True,
-        timeout=PROBE_SUBPROCESS_TIMEOUT_SECS,
-        cwd=str(REPO_ROOT),
-        check=False,
-    )
+    with tempfile.TemporaryDirectory(prefix='root-bound-probe-basetemp-') as basetemp:
+        return subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'pytest',
+                str(probe),
+                '-q',
+                '-p',
+                'no:cacheprovider',
+                '-o',
+                'addopts=',
+                f'--basetemp={basetemp}',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_SUBPROCESS_TIMEOUT_SECS,
+            cwd=str(REPO_ROOT),
+            check=False,
+        )
 
 
 @pytest.mark.timeout(120)
