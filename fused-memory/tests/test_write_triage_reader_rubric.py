@@ -1,8 +1,9 @@
 """Tests for write_triage_reader_rubric.py — the one definition of write-triage rubric v2.1.
 
 Reached only through the public surface: ``resolve_judgements`` (the verdict
-row contract and per-binary majority), ``derive`` (the derivation table) and
-``is_abstain`` (the one abstain word).
+row contract and per-binary resolution), ``derive`` (the derivation table),
+``quote_found`` and ``digest_visible`` (the evidence checks) and ``is_abstain``
+(the one abstain word).
 The script is loaded by path (``scripts/`` is not a package), lazily through
 ``_mod()``.
 """
@@ -158,10 +159,6 @@ class TestPerBinaryResolution:
         rows = [_row(conflict='YES', scope='SECONDARY'),
                 _row(rater='r2', conflict='YES', scope='CENTRAL')]
         assert _resolved(rows, 'scope') == _mod().Resolved.TIED
-
-    def test_digest_resolves_like_any_binary(self) -> None:
-        rows = [_row(home='YES', conflict='NO', loss='YES', digest='NO')]
-        assert _resolved(rows, 'digest') == _mod().Resolved.NO
 
     def test_a_derived_row_is_the_only_vote_on_the_binary_it_fixes(self) -> None:
         rows = [_row(rater='v1', role='derived', home='YES'),
@@ -505,7 +502,8 @@ class TestDecisiveness:
 class TestM1Hiddenness:
     @pytest.mark.parametrize(('outcome', 'vote', 'hidden'), [
         ('restated', {'conflict': 'YES', 'home': 'YES'}, True),
-        ('restated', _HOME_MORE, True),
+        ('restated', {**_HOME_MORE, 'digest': 'NO'}, True),
+        ('restated', {**_HOME_MORE, 'digest': 'YES'}, True),
         ('restated', _HOME_FLAT, False),
         ('restated', {'home': 'NO', 'conflict': 'NO'}, False),
         ('amended', {**_HOME_MORE, 'digest': 'NO'}, True),
@@ -523,13 +521,141 @@ class TestM1Hiddenness:
         result = _mod().derive('stored', {}, in_m1_band=True)
         assert _decided(result).m1_hidden is False
 
-    def test_digest_is_decisive_only_in_the_band(self) -> None:
-        in_band = _derive('amended', _HOME_MORE, in_m1_band=True)
+    @pytest.mark.parametrize('outcome', ['restated', 'amended', 'contested'])
+    def test_digest_is_decisive_only_in_the_band(self, outcome: str) -> None:
+        in_band = _derive(outcome, _HOME_MORE, in_m1_band=True)
         assert isinstance(in_band, _mod().Incomplete)
         assert [(g.target_id, g.binary, g.kind) for g in in_band.missing] == [
             ('p', 'digest', 'unrated'),
         ]
-        assert _decided(_derive('amended', _HOME_MORE)).m1_hidden is None
+        assert _decided(_derive(outcome, _HOME_MORE)).m1_hidden is None
+
+
+class TestTheCounterfactualM1:
+    @pytest.mark.parametrize(('outcome', 'vote', 'hidden', 'as_amended'), [
+        ('restated', {**_HOME_MORE, 'digest': 'YES'}, True, False),
+        ('restated', {**_HOME_MORE, 'digest': 'NO'}, True, True),
+        ('restated', {'home': 'YES', 'conflict': 'YES'}, True, True),
+        ('contested', {'home': 'YES', 'conflict': 'YES'}, False, True),
+        ('restated', _HOME_FLAT, False, False),
+        ('contested', _HOME_FLAT, False, False),
+        ('amended', {**_HOME_MORE, 'digest': 'NO'}, True, True),
+    ])
+    def test_a_band_attach_is_read_as_if_amended(
+        self, outcome: str, vote: dict[str, str], hidden: bool, as_amended: bool,
+    ) -> None:
+        result = _decided(_derive(outcome, vote, in_m1_band=True))
+        assert result.m1_hidden is hidden
+        assert result.m1_hidden_as_amended is as_amended
+
+    def test_is_none_outside_the_band(self) -> None:
+        assert _decided(_derive('restated', _HOME_FLAT)).m1_hidden_as_amended is None
+
+    def test_is_none_for_a_stored_write(self) -> None:
+        result = _decided(_mod().derive('stored', {}, in_m1_band=True))
+        assert result.m1_hidden_as_amended is None
+
+
+class TestConsumption:
+    @pytest.mark.parametrize(('outcome', 'vote', 'options', 'consumed'), [
+        ('contested', {'home': 'NO', 'conflict': 'YES'}, {}, {('p', 'conflict')}),
+        ('contested', _HOME_FLAT, {}, {('p', 'conflict'), ('p', 'home'), ('p', 'loss')}),
+        ('restated', {'home': 'NO', 'conflict': 'NO', 'loss': 'UNCLEAR'}, {},
+         {('p', 'conflict'), ('p', 'home')}),
+        ('amended', {**_HOME_MORE, 'digest': 'NO'}, {'in_m1_band': True},
+         {('p', 'conflict'), ('p', 'home'), ('p', 'loss'), ('p', 'digest')}),
+        ('amended', {**_HOME_MORE, 'digest': 'NO'}, {},
+         {('p', 'conflict'), ('p', 'home'), ('p', 'loss')}),
+    ])
+    def test_names_every_binary_the_derivation_read(
+        self, outcome: str, vote: dict[str, str], options: dict[str, Any],
+        consumed: set[tuple[str, str]],
+    ) -> None:
+        vote = {**vote, 'unclear_reason': 'never read'} if 'UNCLEAR' in vote.values() else vote
+        assert _decided(_derive(outcome, vote, **options)).consumed == consumed
+
+    def test_a_stored_write_names_every_earlier_record(self) -> None:
+        result = _decided(_mod().derive('stored', {
+            'e1': _judged('e1', {'conflict': 'YES'}),
+            'e2': _judged('e2', _HOME_FLAT),
+        }))
+        assert result.consumed == {
+            ('e1', 'conflict'), ('e2', 'conflict'), ('e2', 'home'), ('e2', 'loss'),
+        }
+
+
+class TestQuoteFound:
+    @pytest.mark.parametrize(('quote', 'text'), [
+        ('needle here', 'x needle here y'),
+        ('needle   here', 'x needle\nhere y'),
+        ('  needle here\n', 'x needle \t here y'),
+    ])
+    def test_finds_a_quote_up_to_whitespace(self, quote: str, text: str) -> None:
+        assert _mod().quote_found(quote, text)
+
+    @pytest.mark.parametrize('quote', ['the needle is here', 'Needle here', 'needle-here', '', '   '])
+    def test_does_not_find_a_paraphrase_a_case_change_or_an_empty_quote(self, quote: str) -> None:
+        assert not _mod().quote_found(quote, 'x needle here y')
+
+
+_TAIL_WORDS = ' '.join(f'w{index:03d}' for index in range(60))
+_LONG_CHILD = 'a' * 100 + ' needle here ' + _TAIL_WORDS
+"""A child cut at 240: 'w010' lies wholly before the cut, 'w025' straddles it, 'w040' lies after."""
+
+
+class TestDigestVisible:
+    def test_the_fixture_straddles_the_cut_where_it_says(self) -> None:
+        start = _LONG_CHILD.index('w025')
+        assert start < 240 < start + len('w025')
+        assert _LONG_CHILD.index('w040') > 240
+        assert _LONG_CHILD.index('w010') + len('w010') < 240
+
+    @pytest.mark.parametrize(('spans', 'visible'), [
+        (['needle here'], True),
+        (['needle   here', 'w010'], True),
+        (['w040'], False),
+        (['w025'], False),
+        (['w024 w025'], False),
+        (['needle here', 'w040'], False),
+    ])
+    def test_a_long_childs_spans_are_visible_only_before_the_cut(
+        self, spans: list[str], visible: bool,
+    ) -> None:
+        assert _mod().digest_visible(spans, _LONG_CHILD) is visible
+
+    @pytest.mark.parametrize('child', ['short text with a needle in it', 'b' * 236 + ' end'])
+    def test_a_child_of_240_characters_or_fewer_shows_every_span(self, child: str) -> None:
+        assert len(child) <= 240
+        assert _mod().digest_visible([child.split()[-1]], child)
+
+    def test_an_empty_span_list_is_refused(self) -> None:
+        with pytest.raises(ValueError, match='span'):
+            _mod().digest_visible([], _LONG_CHILD)
+
+
+class TestTheAllVisibleDigest:
+    def _digest(self, *answers: str) -> Any:
+        rows = [
+            _row(rater=f'r{index}', home='YES', conflict='NO', loss='YES', digest=answer,
+                 unclear_reason='spans not checked')
+            for index, answer in enumerate(answers)
+        ]
+        return _resolved(rows, 'digest')
+
+    @pytest.mark.parametrize(('answers', 'resolved'), [
+        (('YES', 'NO'), 'NO'),
+        (('NO', 'YES'), 'NO'),
+        (('YES', 'YES'), 'YES'),
+        (('NO',), 'NO'),
+        (('YES',), 'YES'),
+        (('UNCLEAR', 'YES'), 'YES'),
+        (('UNCLEAR', 'NO'), 'NO'),
+        (('UNCLEAR',), 'UNCLEAR'),
+    ])
+    def test_digest_is_yes_only_when_every_decided_vote_is_yes(
+        self, answers: tuple[str, ...], resolved: str,
+    ) -> None:
+        assert self._digest(*answers) == _mod().Resolved(resolved)
 
 
 class TestTheAbstainWord:
