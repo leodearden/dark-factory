@@ -144,6 +144,23 @@ def test_a_nested_session_leaves_the_hosts_default_temp_root_untouched(
     )
 
 
+@pytest.mark.parametrize(
+    'spelling', [('--basetemp={}',), ('--basetemp', '{}')], ids=['joined', 'separate'],
+)
+def test_a_basetemp_smuggled_through_targets_is_refused_before_any_session_starts(
+    tmp_path: Path, spelling: tuple[str, ...],
+) -> None:
+    smuggled = tmp_path / 'elsewhere'
+    targets = ('test_one.py', *(arg.format(smuggled) for arg in spelling))
+    root = tmp_path / 'smuggling'
+
+    with pytest.raises(ValueError, match='--basetemp') as refused:
+        run_nested_pytest(root, {'test_one.py': _TRIVIAL_TEST}, targets=targets)
+
+    assert targets[1] in str(refused.value)
+    assert not root.exists() and not smuggled.exists(), 'a session started anyway'
+
+
 def test_the_nested_cap_is_below_this_runs_per_test_timeout(
     pytestconfig: pytest.Config,
 ) -> None:
