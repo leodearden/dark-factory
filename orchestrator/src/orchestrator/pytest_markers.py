@@ -4,7 +4,8 @@ Shared by two consumers: the marker-deselection probe — static detection of
 "every file-scoped pytest target is marker-deselected" (task 3494) — and the
 serial-recovery addopts derivation (``verify_plan.py::governing_addopts``,
 task 5079), which both need "which config does pytest read, and what are its
-addopts" answered one way.
+addopts" answered one way.  A third reads only :func:`is_whole_tree_guard_module`:
+verify_plan's task-role guard-family enumeration and its census guard (task 7253).
 
 WHY STATIC, not a ``--collect-only`` probe.  This module's sole consumer is
 ``verify_plan._derive_module_runs``, and ``derive_verify_plan``'s docstring makes
@@ -246,6 +247,16 @@ def resolve_marker_expression(
     return _marker_expr_from_tokens(tokens)
 
 
+def _pytestmark_binding(body: Sequence[ast.stmt]) -> ast.expr | None:
+    """The value of the LAST ``pytestmark`` binding among *body*'s direct children, else None."""
+    value: ast.expr | None = None
+    for statement in body:
+        bound = pytestmark_value(statement)
+        if bound is not None:
+            value = bound
+    return value
+
+
 def _pytestmark_marker_names(body: Sequence[ast.stmt]) -> frozenset[str]:
     """Marker names the ``pytestmark`` binding in *body* names, else an empty set.
 
@@ -269,11 +280,7 @@ def _pytestmark_marker_names(body: Sequence[ast.stmt]) -> frozenset[str]:
     ``pytestmark`` more than once, the LAST binding wins, mirroring Python's
     own semantics.  The element grammar itself is ``shared.pytest_mark_grammar``.
     """
-    value: ast.expr | None = None
-    for statement in body:
-        bound = pytestmark_value(statement)
-        if bound is not None:
-            value = bound
+    value = _pytestmark_binding(body)
     if value is None:
         return frozenset()
 
@@ -329,6 +336,66 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
         return frozenset()
 
     return _pytestmark_marker_names(tree.body)
+
+
+#: The sanctioned spelling of the whole-tree-scan ceiling.  Its VALUE lives in
+#: ``orchestrator/tests/_orch_helpers.py``, which production must not import, so
+#: guard-family membership is decided by the NAME the mark is spelled with.
+WHOLE_TREE_SCAN_TIMEOUT_NAME = 'WHOLE_TREE_SCAN_TEST_TIMEOUT'
+
+
+def module_level_timeout_arguments(source: str | None) -> tuple[ast.expr, ...]:
+    """The seconds expression of every ``pytest.mark.timeout(...)`` in *source*'s module ``pytestmark``.
+
+    Read from the LAST module-level binding only (``tree.body``, never a class or
+    function body), in element order, unevaluated.  Both spellings pytest-timeout
+    accepts are read — positional ``timeout(N)`` and keyword ``timeout(timeout=N)``;
+    a call with neither pins nothing and is skipped.  ``None``, a ``SyntaxError``
+    or a ``ValueError`` yields ``()``.  Never raises.
+    """
+    if not source:
+        return ()
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return ()
+
+    value = _pytestmark_binding(tree.body)
+    if value is None:
+        return ()
+
+    arguments: list[ast.expr] = []
+    for element in mark_elements(value):
+        if not isinstance(element, ast.Call) or marker_name(element) != 'timeout':
+            continue
+        if element.args:
+            arguments.append(element.args[0])
+            continue
+        keyword_value = next(
+            (keyword.value for keyword in element.keywords if keyword.arg == 'timeout'), None,
+        )
+        if keyword_value is not None:
+            arguments.append(keyword_value)
+    return tuple(arguments)
+
+
+def is_whole_tree_guard_module(source: str | None) -> bool:
+    """True iff *source*'s module-level timeout mark is spelled via ``WHOLE_TREE_SCAN_TEST_TIMEOUT``.
+
+    THE ONE definition of the whole-tree guard family, consumed by
+    ``verify_plan``'s task-role enumeration and enforced complete by
+    ``orchestrator/tests/test_whole_tree_scan_timeout_guard.py``.  The bare name
+    and a dotted ``<module>.WHOLE_TREE_SCAN_TEST_TIMEOUT`` both count; a numeric
+    literal never does, whatever its value.  Never raises.
+    """
+    if not source or WHOLE_TREE_SCAN_TIMEOUT_NAME not in source:
+        return False
+    for argument in module_level_timeout_arguments(source):
+        if isinstance(argument, ast.Name) and argument.id == WHOLE_TREE_SCAN_TIMEOUT_NAME:
+            return True
+        if isinstance(argument, ast.Attribute) and argument.attr == WHOLE_TREE_SCAN_TIMEOUT_NAME:
+            return True
+    return False
 
 
 def _class_marker_names(node: ast.ClassDef) -> frozenset[str]:
