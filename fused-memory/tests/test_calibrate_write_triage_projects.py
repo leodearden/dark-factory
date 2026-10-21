@@ -20,58 +20,25 @@ import logging
 import sys
 import types
 from collections import defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import yaml
 from _fm_helpers import load_script_module
 from _jsonl_fixture import parse_jsonl_fixture
+from _write_triage_calibration_fixtures import (
+    CALIBRATION_FIXTURES,
+    DARK_FACTORY_ADMITTED_CATEGORIES,
+    DARK_FACTORY_FIXTURE_PATH,
+    LIVE_STORE_FIXTURES,
+    PACKAGE_ROOT,
+    LiveStoreFixture,
+)
 
 from fused_memory.config.schema import FusedMemoryConfig, WriteTriageProjectCalibration
-from fused_memory.models.enums import MEM0_PRIMARY
 
-PACKAGE_ROOT = Path(__file__).parent.parent
 SCRIPT_PATH = PACKAGE_ROOT / 'scripts' / 'calibrate_write_triage.py'
-FIXTURES_DIR = Path(__file__).parent / 'fixtures'
-REIFY_FIXTURE_PATH = FIXTURES_DIR / 'write_triage_calibration.jsonl'
-DARK_FACTORY_FIXTURE_PATH = FIXTURES_DIR / 'write_triage_calibration_dark_factory.jsonl'
-
-TARGET_CATEGORIES = frozenset({'preferences_and_norms', 'observations_and_summaries'})
 LIVE_STORE_SOURCE = 'live_store_topic_scroll'
-
-
-@dataclass(frozen=True)
-class LiveStoreFixture:
-    """A per-project corpus read off its live store, and the categories it admits."""
-
-    project_id: str
-    path: Path
-    admitted_categories: frozenset[str]
-
-    @property
-    def report_path(self) -> Path:
-        return PACKAGE_ROOT / 'calibration' / f'write_triage_calibration_report_{self.project_id}.json'
-
-    @property
-    def package_relative_path(self) -> str:
-        return self.path.relative_to(PACKAGE_ROOT).as_posix()
-
-
-LIVE_STORE_FIXTURES = (
-    LiveStoreFixture('dark_factory', DARK_FACTORY_FIXTURE_PATH, TARGET_CATEGORIES),
-    LiveStoreFixture(
-        'solar_challenge',
-        FIXTURES_DIR / 'write_triage_calibration_solar_challenge.jsonl',
-        MEM0_PRIMARY,
-    ),
-    LiveStoreFixture(
-        'solar_challenge_platform',
-        FIXTURES_DIR / 'write_triage_calibration_solar_challenge_platform.jsonl',
-        MEM0_PRIMARY,
-    ),
-)
-CALIBRATION_FIXTURE_PATHS = (REIFY_FIXTURE_PATH, *(f.path for f in LIVE_STORE_FIXTURES))
 
 
 @functools.cache
@@ -176,8 +143,8 @@ class TestLiveStoreFixtureContract:
     ) -> None:
         own_ids = {r['memory_id'] for r in live_records}
         shared = {
-            other.name: sorted(own_ids & {r['memory_id'] for r in parse_jsonl_fixture(other)})
-            for other in CALIBRATION_FIXTURE_PATHS if other != live_store.path
+            project: sorted(own_ids & {r['memory_id'] for r in parse_jsonl_fixture(other)})
+            for project, other in CALIBRATION_FIXTURES.items() if other != live_store.path
         }
         assert not any(shared.values()), f'calibration corpora must be disjoint (R3); shared: {shared}'
 
@@ -186,7 +153,7 @@ class TestDarkFactoryFixtureScope:
     def test_both_target_categories_are_present(
         self, dark_factory_records: list[dict],
     ) -> None:
-        assert {r['category'] for r in dark_factory_records} == TARGET_CATEGORIES
+        assert {r['category'] for r in dark_factory_records} == DARK_FACTORY_ADMITTED_CATEGORIES
 
 
 # ---------------------------------------------------------------------------
