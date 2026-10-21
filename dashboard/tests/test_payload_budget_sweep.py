@@ -18,7 +18,7 @@ The fleet is expensive to build, so the module runs in one xdist group.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 
 import pytest
 from _payload_fleet import open_fleet_client
@@ -34,36 +34,18 @@ from dashboard.payload_budgets import (
 
 pytestmark = pytest.mark.xdist_group('payload_fleet')
 
-_TASK_SUBSTRATE_REQUESTS: tuple[tuple[str, Mapping[str, str]], ...] = (
-    ('/api/v2/dashboard/tasks', {}),
-    ('/api/v2/dashboard/tasks', {'projection': 'census'}),
-    ('/api/v2/dashboard/tasks', {'terminal': 'dark-factory'}),
-    ('/api/v2/dashboard/scheduler', {}),
-    ('/api/v2/dashboard/orchestrators', {}),
-)
-
-_CORPUS_AND_ARTIFACT_REQUESTS: tuple[tuple[str, Mapping[str, str]], ...] = (
-    ('/api/v2/dashboard/escalations', {}),
-    ('/api/v2/dashboard/escalation-analytics', {}),
-    ('/api/v2/dashboard/invariants', {}),
-    ('/api/v2/dashboard/performance', {'window': 'all'}),
-    ('/api/v2/dashboard/merge-queue', {'window': 'all'}),
-    ('/api/v2/dashboard/memory-evals', {}),
-)
+_SWEPT: tuple[EndpointBudget, ...] = load_budget_table().endpoints
+"""Every budgeted request, so a new table entry (and, through completeness, a new route) is swept."""
 
 
-def _entry(path: str, query: Mapping[str, str]) -> EndpointBudget:
-    wanted = (path, tuple(sorted(query.items())))
-    for entry in load_budget_table().endpoints:
-        if entry.request_key == wanted:
-            return entry
-    raise LookupError(f'payload_budgets.json has no entry for {path} with query {dict(query)}')
-
-
-_SWEPT = tuple(
-    _entry(path, query)
-    for path, query in (*_TASK_SUBSTRATE_REQUESTS, *_CORPUS_AND_ARTIFACT_REQUESTS)
-)
+def test_the_sweep_covers_every_budgeted_request() -> None:
+    swept = {entry.request_key for entry in _SWEPT}
+    budgeted = {entry.request_key for entry in load_budget_table().endpoints}
+    assert swept, 'the sweep collected no request; it would pass by checking nothing'
+    assert swept == budgeted, (
+        f'the sweep covers {sorted(swept)} but payload_budgets.json budgets {sorted(budgeted)}; '
+        'sweep every entry of the table'
+    )
 
 
 @pytest.fixture(scope='module')
