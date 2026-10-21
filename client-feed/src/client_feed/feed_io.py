@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, TypedDict
+from typing import Any, Final, TypedDict
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -26,6 +26,7 @@ from client_feed.contract import (
     STATE_FILENAME,
     CommitSha,
     ContractViolation,
+    EventHeader,
     FeedEvent,
     FeedLine,
     FeedState,
@@ -62,6 +63,17 @@ class Envelope(TypedDict):
     at: datetime
     project_id: str
     feed_version: str
+
+
+_HEADER_FIELDS: Final = frozenset(EventHeader.model_fields)
+ENVELOPE_FIELDS: Final = _HEADER_FIELDS - {'type'}
+if Envelope.__required_keys__ != ENVELOPE_FIELDS:
+    raise TypeError(f'Envelope keys {sorted(Envelope.__required_keys__)} are not the envelope {sorted(ENVELOPE_FIELDS)}')
+
+
+def payload(event: FeedEvent) -> dict[str, Any]:
+    """What an event says: its fields other than its type and the envelope that places it in the feed."""
+    return {name: getattr(event, name) for name in type(event).model_fields if name not in _HEADER_FIELDS}
 
 
 class Stamp:

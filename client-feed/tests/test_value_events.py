@@ -97,7 +97,9 @@ def test_a_task_differing_from_the_state_is_upserted(changes: dict[str, object])
     ]
 
 
-def _waiting_change(before: WaitingOn | None, escalations: OpenEscalations) -> tuple[TaskUpserted, ...]:
+def _waiting_change(
+    before: WaitingOn | None, escalations: OpenEscalations | None
+) -> tuple[TaskUpserted, ...]:
     blocked = row(9, status=TaskStatus.BLOCKED, waiting_on=before)
     state = state_of(upserted(row(7), 4), upserted(blocked, 5))
     return task_events([row(7)], state=state, escalations=escalations, stamp=stamp(), now=NOW)
