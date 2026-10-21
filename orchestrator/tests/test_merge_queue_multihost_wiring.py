@@ -1229,23 +1229,29 @@ class TestRunDriftCheck:
         # Escalation must have been submitted
         assert eq.submit.called
 
+def _drift_gate_worker():
+    """A minimal SpeculativeMergeWorker-like mock carrying the land hook's drift attrs.
+
+    _escalation_queue / _event_store need no setup: a MagicMock worker already
+    answers those reads with MagicMocks.  Bare-worker (no project_root):
+    _drift_state_path is None, so the drift cadence uses the in-memory
+    _drift_land_count (task 2886 fix 1a None-safe fallback); the persisted-path
+    cadence + restart survival is covered by
+    test_merge_drift.py::TestDriftCheckCadencePersistence.  _drift_check_tasks
+    starts empty, because a bare MagicMock attribute is truthy and would read
+    as a drift check already in flight.
+    """
+    worker = MagicMock()
+    worker._drift_land_count = 0
+    worker._runner_quarantine = set()
+    worker._drift_check_tasks = set()
+    worker._drift_state_path = None
+    return worker
+
+
 @pytest.mark.asyncio
 class TestMaybeRunDriftCheck:
     """_maybe_run_drift_check cadence gate."""
-
-    def _make_worker(self, config):
-        """Build a minimal SpeculativeMergeWorker-like mock with drift attrs."""
-        worker = MagicMock()
-        worker._drift_land_count = 0
-        worker._runner_quarantine = set()
-        # _escalation_queue / _event_store need no setup: a MagicMock worker
-        # already answers those reads with MagicMocks.
-        # Bare-worker (no project_root): _drift_state_path is None, so the drift
-        # cadence uses the in-memory _drift_land_count (task 2886 fix 1a
-        # None-safe fallback).  The persisted-path cadence + restart survival
-        # is covered by test_merge_drift.py::TestDriftCheckCadencePersistence.
-        worker._drift_state_path = None
-        return worker
 
     async def test_no_trigger_when_no_enabled_runners(self, tmp_path):
         """_maybe_run_drift_check is a no-op when verify_runners is empty."""
@@ -1254,7 +1260,7 @@ class TestMaybeRunDriftCheck:
         config = _make_config(verify_runners=[])
         req = _make_merge_request(config, worktree=tmp_path)
         git_ops = _make_git_ops_mock()
-        worker = self._make_worker(config)
+        worker = _drift_gate_worker()
 
         with patch('asyncio.create_task') as mock_create_task:
             await _maybe_run_drift_check(worker, git_ops, req, 'sha1', verifier=PRODUCTION_VERIFIER)
@@ -1271,7 +1277,7 @@ class TestMaybeRunDriftCheck:
         )
         req = _make_merge_request(config, worktree=tmp_path)
         git_ops = _make_git_ops_mock()
-        worker = self._make_worker(config)
+        worker = _drift_gate_worker()
 
         with patch('asyncio.create_task') as mock_create_task:
             # First land (count=1): no trigger
@@ -1299,7 +1305,7 @@ class TestMaybeRunDriftCheck:
         config = _make_config(verify_runners=[_make_runner_cfg('r1')], drift_every_n=100)
         req = _make_merge_request(config, worktree=tmp_path)
         git_ops = _make_git_ops_mock()
-        worker = self._make_worker(config)
+        worker = _drift_gate_worker()
 
         with patch('asyncio.create_task'):
             await _maybe_run_drift_check(worker, git_ops, req, 'sha1', verifier=PRODUCTION_VERIFIER)
@@ -1323,16 +1329,6 @@ class TestDriftCheckTaskGCSafety:
     in the worker, the drift detective can be GC'd mid-run and a
     remote-PASS / local-FAIL divergence goes undetected.
     """
-
-    def _make_worker_with_tasks(self, config):
-        """_make_worker extended with _drift_check_tasks (additive)."""
-        worker = MagicMock()
-        worker._drift_land_count = 0
-        worker._runner_quarantine = set()
-        worker._drift_check_tasks = set()
-        # Bare-worker: _drift_state_path None → in-memory cadence (fix 1a).
-        worker._drift_state_path = None
-        return worker
 
     async def test_worker_init_has_drift_check_tasks_attr(self):
         """(a) SpeculativeMergeWorker.__init__ sets _drift_check_tasks = set()."""
@@ -1358,7 +1354,7 @@ class TestDriftCheckTaskGCSafety:
         )
         req = _make_merge_request(config, worktree=tmp_path)
         git_ops = _make_drift_git_ops(tmp_path)
-        worker = self._make_worker_with_tasks(config)
+        worker = _drift_gate_worker()
 
         gate = asyncio.Event()
         drift_tasks: list = []

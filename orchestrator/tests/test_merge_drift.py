@@ -39,6 +39,7 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.drift import (
     DriftCheckState,
     _load_drift_check_state,
+    _maybe_run_drift_check,
     _run_drift_check,
     _save_drift_check_state,
 )
@@ -268,12 +269,18 @@ async def test_maybe_run_drift_check_guards_against_non_positive_every_n(
     assert len(worker._drift_check_tasks) == 0, 'no drift-check task should be scheduled'
 
 
-def _build_drift_worker(state_path: Path) -> MagicMock:
+def _build_drift_worker(
+    state_path: Path,
+    *,
+    allocator: HostAllocator | None = None,
+    event_store: EventStore | None = None,
+) -> MagicMock:
     """A MagicMock SpeculativeMergeWorker wired for _maybe_run_drift_check.
 
     Fresh in-memory ``_drift_land_count=0`` (models the post-restart reset) but a
     caller-supplied ``_drift_state_path`` so the PERSISTED cadence can be shared
-    across simulated restarts (fix 1a).
+    across simulated restarts (fix 1a).  *allocator* and *event_store*, when
+    given, are what a spawned drift check acquires from and emits to.
 
     The private attributes below are the function-under-test's OWN parameter
     surface: ``_maybe_run_drift_check`` takes the worker and reads them, so a
@@ -284,7 +291,10 @@ def _build_drift_worker(state_path: Path) -> MagicMock:
     w._drift_land_count = 0
     w._drift_check_tasks = set()
     w._drift_state_path = state_path
-    w._ensure_host_allocator = MagicMock(return_value=MagicMock())
+    w._ensure_host_allocator = MagicMock(
+        return_value=MagicMock() if allocator is None else allocator,
+    )
+    w._event_store = event_store
     return w
 
 
@@ -1240,7 +1250,9 @@ class _DriftScene:
     event_store: _RecordingEventStore
 
     @classmethod
-    def build(cls, tmp_path: Path, *, remote_verify: AsyncMock | None = None) -> _DriftScene:
+    def build(
+        cls, tmp_path: Path, *, remote_verify: AsyncMock | None = None, **config: Any,
+    ) -> _DriftScene:
         git_ops = MagicMock()
         git_ops.create_ephemeral_verify_worktree = AsyncMock(return_value=tmp_path / '_throwaway')
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -1254,6 +1266,7 @@ class _DriftScene:
                  'df_checkout_path': '/df'},
             ],
             verify_env_probes=_LEVER_C_OFF,
+            **config,
         )
         remote = MagicMock()
         remote.name = 'laptop'
@@ -1468,3 +1481,88 @@ class TestDriftCheckDefersWhenAHostSlotIsBusy:
             'after 2 deferred' in message
             for message in _deferral_logs(caplog, logging.INFO)
         )
+
+
+# ---------------------------------------------------------------------------
+# task 6648: the land hook re-arms a deferred check and runs one at a time
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftCheckLandHookReArmsAndCoalesces:
+    """_maybe_run_drift_check: a deferral keeps the check owed; one check runs at a time."""
+
+    @staticmethod
+    def _lands(scene: _DriftScene, state_path: Path, verifier: FakeVerifier):
+        worker = _build_drift_worker(
+            state_path, allocator=scene.allocator, event_store=scene.event_store,
+        )
+
+        async def land(sha: str) -> asyncio.Task[None] | None:
+            return await _maybe_run_drift_check(
+                worker, scene.git_ops, scene.req, sha,
+                verifier=verifier, host_settle_secs=0,
+            )
+        return land
+
+    async def test_deferred_check_re_arms_at_the_next_landing(self, tmp_path: Path) -> None:
+        scene = _DriftScene.build(tmp_path, verify_drift_check_every_n_lands=3)
+        state_path = tmp_path / 'drift_check_state.json'
+        land = self._lands(scene, state_path, FakeVerifier())
+
+        assert await land('c1') is None
+        assert await land('c2') is None
+        merge_lease = scene.allocator.acquire_remote()
+        assert merge_lease is not None
+        deferred = await land('c3')
+        assert deferred is not None
+        await asyncio.wait_for(deferred, _WAIT_SECS)
+        assert _load_drift_check_state(state_path) == DriftCheckState(
+            land_count=3, consecutive_deferrals=1,
+        )
+
+        await scene.allocator.release(merge_lease)
+        re_armed = await land('c4')
+        assert re_armed is not None, 'a deferred check must fire at the next landing'
+        await asyncio.wait_for(re_armed, _WAIT_SECS)
+        assert scene.parity_events() == 1
+        assert _load_drift_check_state(state_path) == DriftCheckState(land_count=4)
+
+        assert await land('c5') is None
+
+    async def test_a_due_landing_while_a_check_is_in_flight_spawns_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _DriftScene.build(tmp_path, verify_drift_check_every_n_lands=1)
+        state_path = tmp_path / 'drift_check_state.json'
+        gate, entered = asyncio.Event(), asyncio.Event()
+        verifier = FakeVerifier(default=hangs_until(gate, entered=entered))
+        land = self._lands(scene, state_path, verifier)
+
+        first = await land('c1')
+        assert first is not None
+        try:
+            await asyncio.wait_for(entered.wait(), _WAIT_SECS)
+            assert await land('c2') is None
+        finally:
+            gate.set()
+            await asyncio.wait_for(first, _WAIT_SECS)
+        assert verifier.entered_count == 1
+        assert _load_drift_check_state(state_path) == DriftCheckState(land_count=2)
+
+    async def test_hook_returns_none_when_not_due_or_disabled(self, tmp_path: Path) -> None:
+        worker = _build_drift_worker(tmp_path / 'drift_check_state.json')
+        no_runners = MagicMock()
+        no_runners.config.enabled_verify_runners = []
+        disabled = MagicMock()
+        disabled.config.enabled_verify_runners = ['laptop']
+        disabled.config.verify_drift_check_every_n_lands = 0
+        off_cadence = MagicMock()
+        off_cadence.config.enabled_verify_runners = ['laptop']
+        off_cadence.config.verify_drift_check_every_n_lands = 3
+
+        for req in (no_runners, disabled, off_cadence):
+            spawned = await _maybe_run_drift_check(
+                worker, MagicMock(), req, 'sha', verifier=PRODUCTION_VERIFIER,
+            )
+            assert spawned is None
