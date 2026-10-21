@@ -71,7 +71,6 @@ class TestStartEscalationServerInjectsRegistry:
         h = _build_harness(mock_orch_config)
 
         # Set up attributes _start_escalation_server reads from config
-        mock_orch_config.escalation.queue_dir = str(tmp_path / 'esc')
         mock_orch_config.escalation.host = '127.0.0.1'
         mock_orch_config.escalation.port = 19999
         # _start_escalation_server wires review_checkpoint if not None
