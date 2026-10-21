@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import enum
 import fcntl
-import importlib
 import json
 import os
 import re
@@ -22,24 +21,16 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple, Protocol, TextIO
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / 'shared' / 'src'))
+
+from shared import mcp_post, task_statuses
+
 CHECKOUT_ROOT = Path(__file__).resolve().parents[4]
-_SHARED_SRC = str(CHECKOUT_ROOT / 'shared' / 'src')
-
-
-def _first_party(name: str) -> types.ModuleType:
-    """Import a stdlib-only module from this checkout's ``shared/src``, whatever the cwd."""
-    if _SHARED_SRC not in sys.path:
-        sys.path.insert(0, _SHARED_SRC)
-    return importlib.import_module(name)
-
-
-_task_statuses = _first_party('shared.task_statuses')
-_mcp_post = _first_party('shared.mcp_post')
 
 RETURN_SCHEMA = 'review-all-prd-return/1'
 PROGRAM_SCHEMA = 'review-all-program/1'
-NON_TERMINAL_STATUSES: tuple[str, ...] = tuple(sorted(str(s) for s in _task_statuses.ACTIVE))
-TERMINAL_STATUSES: tuple[str, ...] = tuple(sorted(str(s) for s in _task_statuses.TERMINAL))
+NON_TERMINAL_STATUSES: tuple[str, ...] = tuple(sorted(str(s) for s in task_statuses.ACTIVE))
+TERMINAL_STATUSES: tuple[str, ...] = tuple(sorted(str(s) for s in task_statuses.TERMINAL))
 
 
 @dataclass(frozen=True)
@@ -1091,7 +1082,7 @@ class _McpSession:
     def _post(self, message: Mapping[str, Any]) -> Mapping[str, Any]:
         request = urllib.request.Request(
             self._url, data=json.dumps(message).encode(), method='POST',
-            headers={**_mcp_post.MCP_POST_HEADERS, 'mcp-session-id': self._session_id},
+            headers={**mcp_post.MCP_POST_HEADERS, 'mcp-session-id': self._session_id},
         )
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
@@ -1123,7 +1114,7 @@ class _McpSession:
             self._handshake()
         self._request_id += 1
         reply = self._post(
-            _mcp_post.mcp_tool_call_payload(name, dict(arguments), request_id=self._request_id)
+            mcp_post.mcp_tool_call_payload(name, dict(arguments), request_id=self._request_id)
         )
         _raise_for_failure(name, reply, arguments)
         return _reply_payload(name, reply)
@@ -1813,9 +1804,9 @@ def _held_rejections(ret: PrdReturn, reads: _StoreReads) -> list[Rejection]:
         if row is None:
             rejections.append(_contradiction(field, f'task {held.task_id} is absent from the store'))
             continue
-        if row.status != _task_statuses.TaskStatus.DEFERRED:
+        if row.status != task_statuses.TaskStatus.DEFERRED:
             rejections.append(_contradiction(
-                field, f'task {held.task_id} is {row.status}, not {_task_statuses.TaskStatus.DEFERRED}'))
+                field, f'task {held.task_id} is {row.status}, not {task_statuses.TaskStatus.DEFERRED}'))
         wait = row.metadata.get(SEAM_WAIT_KEYS.key)
         if not isinstance(wait, Mapping):
             rejections.append(_contradiction(

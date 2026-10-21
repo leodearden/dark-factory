@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import functools
-import importlib
 import json
 import re
 import signal
@@ -30,11 +29,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-_SHARED_SRC = str(Path(__file__).resolve().parents[5] / 'shared' / 'src')
-if _SHARED_SRC not in sys.path:
-    sys.path.insert(0, _SHARED_SRC)
-_TASK_STATUSES = frozenset(s.value for s in importlib.import_module('shared.task_statuses').TaskStatus)
+sys.path.insert(0, str(Path(__file__).resolve().parents[5] / 'shared' / 'src'))
 
+from shared.task_statuses import TaskStatus
+
+_TASK_STATUSES = frozenset(s.value for s in TaskStatus)
 ENDPOINT_PATH = '/mcp'
 LIMIT_CAP = 100
 DEFAULT_LIMIT = 50
