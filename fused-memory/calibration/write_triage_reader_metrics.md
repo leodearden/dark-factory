@@ -1,9 +1,9 @@
-# Write-triage reader metrics (rubric v2) and the 3131 post-fix measurement
+# Write-triage reader metrics (rubric v2.1) and the 3131 post-fix measurement
 
 This document defines the metrics that judge write triage by what a later
 reader of the corpus meets, and the procedure that measures them for task
 3131's release. Raters answer the questions in
-`write_triage_rater_brief_v2.md`. `fused-memory/scripts/write_triage_reader_rubric.py`
+`write_triage_rater_brief_v2.md` (rater brief v2.1). `fused-memory/scripts/write_triage_reader_rubric.py`
 turns their answers into cells, and `fused-memory/scripts/score_write_triage_reader.py`
 turns cells into the figures below. The scorer reports and never gates: every
 gate on this page is applied by a person reading its report.
@@ -11,7 +11,8 @@ gate on this page is applied by a person reading its report.
 Design source: the seat B report and the decision memo,
 `/home/leo/src/dark-factory/data/write-triage-soak-2026-10-19/correctness-analysis-2026-10-19.md`
 §2 and §6 (gitignored, main checkout). Rulings 5a–5d and 5f are Leo's, of
-2026-10-19, recorded on task 7157.
+2026-10-19, recorded on task 7157. His rulings R1–R8 of 2026-10-21, recorded
+on task 7174, revise the brief and the rater protocol as rubric v2.1.
 
 ## 1. Why readers, not pairs
 
@@ -31,8 +32,12 @@ unevenly:
   contesting its parent (`grouped_read.py::is_contested_child`).
 
 So the same pair can be harmless as an amendment and harmful as a sighting.
-Rubric v2 asks raters facts about the two texts (HOME, LOSS, CONFLICT, SCOPE,
-DIGEST) and derives correctness from the outcome the write actually got.
+Rubric v2.1 asks raters facts about the two texts (HOME, CONFLICT, LOSS, SCOPE,
+action_changing), backed by verbatim quotes, and derives correctness from the
+outcome the write actually got. DIGEST, whether what LOSS points to is visible
+in an amendment's digest, is computed from the raters' loss spans
+(`fused-memory/scripts/write_triage_reader_rubric.py::digest_visible`), not
+asked.
 
 ## 2. Cells
 
@@ -66,32 +71,50 @@ left out.
 
 | Metric | Rule | Population and unit | Sample | Status |
 |---|---|---|---|---|
-| **M1** hidden information in the high-cosine band | the write's dispute or needed detail is not visible to a reader of the parent: CONFLICT, or HOME with LOSS for a restated write, or HOME with LOSS and DIGEST=NO for an amended one (`derive`, `Decided.m1_hidden`); contested and stored writes are visible | every write whose band-winner cosine was >= t_high when it was written (about 105 a week), whatever its outcome; unit = write | census | **gate: point estimate <= 0.15**, Wilson reported. Soak baseline 0.50 (v1 proxy) |
+| **M1** hidden information in the high-cosine band | the write's dispute or needed detail is not visible to a reader of the parent: CONFLICT, or HOME with LOSS for a restated write, or HOME with LOSS and DIGEST=NO for an amended one (`derive`, `Decided.m1_hidden`); contested and stored writes are visible. DIGEST is YES only when every LOSS-YES rater's spans all lie in the digest (`digest_visible`, resolved all-visible) | every write whose band-winner cosine was >= t_high when it was written (about 105 a week), whatever its outcome; unit = write | census | **gate: point estimate <= 0.15**, Wilson reported. Soak baseline 0.50 (v1 proxy) |
+| **M1 as amended** (counterfactual) | M1's rule with every band attach read as if it were amended: CONFLICT, or HOME with LOSS and DIGEST=NO (`Decided.m1_hidden_as_amended`) | M1's band writes that were attached; unit = write | shared with M1 | report-only |
 | **M2** ack truth per outcome | the outcome triage gave is correct, meaning no triage cell | attach and stored acks; unit = write, per outcome | 100 per outcome, stratified outcome × project | report-only |
 | **M3** hidden corrections | of the writes that dispute their parent or an earlier record (CONFLICT), the share that ended restated, amended, or stored with no mark on the record they dispute | every CONFLICT write; unit = write | >= 60 CONFLICT writes, drawn from the contested census, the M2 samples, and 150 stored writes rated against their nearest earlier records | **gate: bound unset — Leo sets it.** The critic's soak-equivalent after F3/F4 is >= ~0.06–0.07 |
 | **M4** wrong home | wrong_home over decided attaches, split direct vs via-sibling and same vs cross category | attaches; unit = write | shared with M2 | reported against 0.20 |
-| **M5** conflict-flag precision | contested writes with CONFLICT, split by SCOPE (central, secondary, unknown) | contested writes; unit = write | census or 100 | report-only |
+| **M5** conflict-flag precision | contested writes with CONFLICT, split by SCOPE (central, secondary, unknown) and by action_changing (yes, no, unknown) | contested writes; unit = write | census or 100 | report-only |
 | **M6** read-time drift | children whose triage cells differ when re-rated against the parent's text at attach time | children whose parent was edited after they attached; unit = write | census | report-only until the edit guard of ruling 5d lands |
 
 ## 4. Rater protocol
 
-- Two blind raters per item, given the brief verbatim, blind to outcome,
-  system and key files. Raters answer every binary; the brief says when SCOPE
-  and DIGEST apply.
+- Two blind raters per item, Opus primary and Opus second, on every item and
+  every basis. Both get the brief verbatim and are blind to outcome, system
+  and key files. Raters answer HOME and CONFLICT, plus the follow-ups the brief
+  conditions on them; DIGEST is computed, never asked.
+- Every `conflict_quote` side and every loss span is checked before scoring:
+  it must be a whitespace-normalised substring of the text its rater saw
+  (`fused-memory/scripts/write_triage_reader_rubric.py::quote_found`). A rater
+  whose quote or span is not found is asked the item again (the `reask`
+  subcommand of `fused-memory/scripts/build_write_triage_v2_soak_baseline.py`),
+  and the later round's line supersedes the earlier one.
 - Agreement is Cohen's kappa per binary between the primary and the second
-  rater, over the pairs both answered. A binary is good enough to score when
-  kappa >= `score_write_triage_reader.py::KAPPA_FLOOR` on at least
-  `::KAPPA_MIN_OVERLAP` overlap items. Below the floor, refine the brief and
-  re-rate before scoring; never score through it.
-- A third rater is asked only about decisive disagreements: a binary that is
-  tied and that the derivation needs. The scorer names them, refusing with
-  `score_write_triage_reader.py::IncompleteJudgementError` until each is
-  resolved. A tie on a binary the derivation never asks for is left as it is.
+  rater, over consumed answers only. An answer is consumed when both raters
+  gave it on a (record, binary) the derivation read
+  (`fused-memory/scripts/write_triage_reader_rubric.py::Decided`, its
+  `consumed` set), or on the SCOPE and action_changing that M5 splits a
+  contested conflict by. An answer nothing reads, such as LOSS on a pair
+  whose HOME resolved NO, is noise and is left out.
+- A binary of `fused-memory/scripts/score_write_triage_reader.py::KAPPA_FLOOR_BINARIES`
+  (home, conflict, loss) is good enough to score when its kappa is at least
+  `::KAPPA_FLOOR` on at least `::KAPPA_MIN_PAIRS` consumed pairs. Where a
+  binary has fewer consumed pairs, over-sample a stratum in which it is
+  consumed until it has them. Below the floor, refine the brief and re-rate
+  before scoring; never score through it.
+- SCOPE below the floor on its own is recorded and reported with
+  `escalate_info`, and does not block scoring. That is this session's
+  operational reading of the rulings, and Leo may veto it.
+- A third rater, also Opus, is asked only about decisive disagreements: a
+  binary that is tied and that the derivation needs. The scorer names them,
+  refusing with `fused-memory/scripts/score_write_triage_reader.py::IncompleteJudgementError`
+  until each is resolved. Third raters come in rounds, each round a new rater
+  id, because a resolved CONFLICT can open a tied LOSS. A tie on a binary the
+  derivation never asks for is left as it is.
 - UNCLEAR only where a truncation falls at the deciding point, with the point
   named. Such items are left out of every rate and counted.
-- Blind anchors, items whose answers are already known, are mixed into each
-  primary shard to detect drift between batches;
-  `build_write_triage_v2_soak_baseline.py::ANCHORS_PER_SHARD` sets how many.
 
 ## 5. Reconstructing write-time state
 
@@ -100,7 +123,8 @@ when the measurement is run.
 
 - **The write**: its text and metadata come from the write journal
   (`data/reconciliation/write_journal.db`, table `mem0_intents`) or from
-  Qdrant.
+  Qdrant. Its memory id is in the same journal: the `memory_ids` of its write
+  op's `write_ops.result_summary`. Open the journal read-only.
 - **Outcome**: from the child's metadata: `kind` (sighting or amendment),
   `parent_id`, and `x_contested`. A write with none of them was stored.
 - **Band**: the cosine to the band winner against the t_low and t_high in
@@ -169,12 +193,14 @@ record marked). The window opens when the last of them is live, runs at least
    parent was edited after attach. Record each stratum's population in a
    strata file.
 3. Build shards as `fused-memory/scripts/build_write_triage_v2_soak_baseline.py`
-   does: the brief verbatim, texts capped at 4,000 characters, the digest
-   rendered by production's `grouped_read.py::_digest`, opaque item ids and a
-   separate key.
-4. Rate per §4: two blind raters on every item, then a kappa check.
-5. Score with `score_write_triage_reader.py --strata`. For each gap a refusal
-   names, ask a third rater, then re-score until the scorer accepts the corpus.
+   does: the brief verbatim, texts capped at 4,000 characters, no digest,
+   opaque item ids, a separate key, and a record of the texts each rater saw.
+4. Rate per §4: two blind Opus raters on every item. Validate every quote and
+   span, and re-ask each rater whose evidence is not found until none is
+   left. Then check kappa over consumed answers.
+5. Score with `score_write_triage_reader.py --strata`. For the gaps a refusal
+   names, run a third round with a new rater, and repeat until the scorer
+   accepts the corpus.
 6. Read the release condition off the report and the window's logs.
 
 **Release condition** (memo §6, decision 8a). All of the following must hold:
