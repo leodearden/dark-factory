@@ -68,6 +68,7 @@ from escalation.models import (
     AGENT_FILABLE_LEVELS,
     BORN_AT_L2_SEVERITIES,
     KNOWN_SEVERITIES,
+    NOTE_TO_FILE_CLASS,
     RESOLUTION_CLASSES,
     STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
@@ -1786,7 +1787,7 @@ def create_server(
                 'production signal, the eval measurement is scored from the '
                 'cell result artifacts',
                 resolved_by='escalation-eval-lane-containment',
-                resolution_class='benign',
+                resolution_class=NOTE_TO_FILE_CLASS if esc.note_to_file else 'benign',
             )
             return {
                 'id': contained.id,

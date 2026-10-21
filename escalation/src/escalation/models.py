@@ -714,8 +714,10 @@ class Escalation:
     # `_COMPACT_ESCALATION_FIELDS` (server.py) — its readers load full records.
     project_id: str | None = None
     # NOTE TO FILE (plans/plan-deviation-recording-prd.md D2) — a filer-declared
-    # record that requests nothing: never pending, filed resolved with
-    # NOTE_TO_FILE_CLASS.  Zero migration via the from_dict filter.
+    # record that requests nothing: never pending (EscalationQueue.submit), and
+    # filed by EscalationQueue.submit_resolved, which refuses this flag without
+    # NOTE_TO_FILE_CLASS and that class without this flag.  Zero migration via
+    # the from_dict filter.
     note_to_file: bool = False
 
     def to_dict(self) -> dict:

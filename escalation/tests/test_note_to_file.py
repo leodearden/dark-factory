@@ -81,6 +81,32 @@ class TestQueueNeverWritesANotePending:
         assert [esc.id for esc in queue.get_pending()] == ['esc-5751-1']
 
 
+class TestFlagAndClassArePaired:
+    """note_to_file and NOTE_TO_FILE_CLASS are one fact: submit_resolved refuses
+    either without the other, naming both values, before anything is written."""
+
+    @pytest.mark.parametrize(
+        ('note_to_file', 'resolution_class'),
+        [(True, 'benign'), (True, None), (False, NOTE_TO_FILE_CLASS)],
+    )
+    def test_a_mismatched_pair_is_refused_before_writing(
+        self, queue: EscalationQueue, note_to_file: bool, resolution_class: str | None,
+    ):
+        resolved: list[Escalation] = []
+        queue.set_resolve_callback(resolved.append)
+        record = _note(note_to_file=note_to_file)
+
+        with pytest.raises(ValueError) as excinfo:
+            queue.submit_resolved(record, 'r', resolved_by='x', resolution_class=resolution_class)
+
+        message = str(excinfo.value)
+        assert f'note_to_file={note_to_file}' in message
+        assert repr(resolution_class) in message
+        assert record.status == 'pending'
+        assert list(queue.queue_dir.rglob('esc-*.json')) == []
+        assert resolved == []
+
+
 def _server(queue: EscalationQueue, *, status: str | None = 'in-progress') -> tuple[object, AsyncMock]:
     status_lookup = AsyncMock(return_value=status)
     server = create_server(
@@ -250,4 +276,5 @@ class TestEvalLaneStillWins:
         record = queue.get(result['id'])
         assert record is not None
         assert record.resolved_by == 'escalation-eval-lane-containment'
+        assert record.resolution_class == NOTE_TO_FILE_CLASS
         assert queue.get_pending() == []
