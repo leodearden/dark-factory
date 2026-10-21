@@ -25,19 +25,19 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from shared.project_layout import default_project_root, runs_db
+from shared.project_layout import runs_db
+
+from orchestrator.main_checkout_defaults import env_or_main_checkout
 
 logger = logging.getLogger(__name__)
 
-# runs.db is gitignored data that lives in the MAIN checkout, which
-# shared.project_layout.default_project_root returns even from a task worktree.
-# This env var overrides it.
+# Overrides the main checkout's runs.db; see
+# orchestrator/src/orchestrator/main_checkout_defaults.py::env_or_main_checkout.
 RUNS_DB_ENV_VAR = 'RESUME_AGE_RUNS_DB'
 
 # Trailing window BOTH terms are sampled over. Matches the 90-day retention
@@ -130,10 +130,10 @@ RESUME_AGE_SAFETY_FACTOR = 1.5
 def default_runs_db_path() -> Path:
     """Return the runs.db the live derived-bound guard measures.
 
-    ``$RESUME_AGE_RUNS_DB`` when set, else the main checkout's runs.db.
+    ``$RESUME_AGE_RUNS_DB`` when set, else the main checkout's runs.db. Raises
+    CheckoutRootError naming the env var when neither resolves.
     """
-    override = os.environ.get(RUNS_DB_ENV_VAR)
-    return Path(override) if override else runs_db(default_project_root())
+    return env_or_main_checkout(RUNS_DB_ENV_VAR, runs_db)
 
 
 @dataclass(frozen=True)

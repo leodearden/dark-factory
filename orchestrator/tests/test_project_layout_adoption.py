@@ -5,6 +5,8 @@ Contract: plans/review-all-s14-shared-leaves-prd.md (decisions 2, 3, 4; B2, B3).
 
 from __future__ import annotations
 
+import dataclasses
+import fcntl
 import json
 import os
 import sqlite3
@@ -30,8 +32,10 @@ from shared.cli_invoke import AgentResult
 from shared.project_id import project_id_for_root
 from shared.project_layout import (
     ESCALATION_QUEUE_RELPATH,
+    CheckoutRootError,
     default_project_root,
     escalation_queue_dir,
+    orchestrator_data_dir,
     park_eviction_requests_db,
     runs_db,
     scheduler_overrides_db,
@@ -40,22 +44,36 @@ from shared.project_layout import (
 
 from orchestrator import b3_gate, sandbox_soak
 from orchestrator import resume_age_bound as rab
+from orchestrator.cli import main as orchestrator_cli
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.config_census_ignore import read_task_statuses
 from orchestrator.evals.prompt_opt.__main__ import cli as prompt_opt_cli
 from orchestrator.evals.reviewer_trial.__main__ import cli as reviewer_trial_cli
 from orchestrator.flake_ledger import ledger_db_path
-from orchestrator.harness import Harness
+from orchestrator.harness import Harness, _acquire_project_lock
 from orchestrator.mcp import markup_sink
+from orchestrator.merge_lane.queue_store import PersistedMergeRequest
 
 
 @pytest.fixture
 def relocated_layout(monkeypatch) -> None:
-    """Move the layout, so a consumer that hand-spells a path is left behind."""
+    """Move the layout, so a consumer that hand-spells a path is left behind.
+
+    Only a consumer that looks the layout up at call time follows the move. A
+    by-name import of orchestrator_data_dir keeps the original function, so
+    TestHarnessDataFilesLiveInTheLayoutDir pins those sites unrelocated.
+    """
     monkeypatch.setattr(project_layout, 'ESCALATION_QUEUE_RELPATH', 'data/relocated-escalations')
     monkeypatch.setattr(
         project_layout, 'orchestrator_data_dir', lambda root: Path(root) / 'relocated-orchestrator',
     )
+
+
+@pytest.fixture
+def unreachable_main_checkout(monkeypatch, tmp_path) -> None:
+    """Place shared.project_layout in a checkout whose .git is a broken gitfile."""
+    (tmp_path / '.git').write_text('not a gitfile\n')
+    monkeypatch.setattr(project_layout, '__file__', str(tmp_path / 'project_layout.py'))
 
 
 def _load(monkeypatch, root: Path, body: dict) -> OrchestratorConfig:
@@ -164,6 +182,64 @@ class TestHarnessFollowsTheLayout:
         assert f'Escalation queue: {expected}' in captured['prompt']
 
 
+def _is_locked(lock_path: Path) -> bool:
+    with open(lock_path) as probe:
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(probe, fcntl.LOCK_UN)
+        return False
+
+
+def _build_harness(mock_orch_config) -> Harness:
+    mock_orch_config.max_concurrent_tasks = 2
+    mock_orch_config.fused_memory.project_id = 'test-project'
+    with patch('orchestrator.harness.McpLifecycle'), \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        return Harness(mock_orch_config)
+
+
+class TestHarnessDataFilesLiveInTheLayoutDir:
+    def test_the_project_lock_is_held_in_the_layout_dir(self, tmp_path):
+        held = _acquire_project_lock(tmp_path)
+        try:
+            assert _is_locked(orchestrator_data_dir(tmp_path) / 'orchestrator.lock')
+        finally:
+            held.close()
+
+    def test_the_merge_journal_is_read_from_the_layout_dir(self, mock_orch_config, tmp_path):
+        seeded = PersistedMergeRequest(
+            request_id='seed-1', task_id='T', branch='task/T',
+            worktree=str(tmp_path / 'wt'), pre_rebased=False, task_files=None,
+            snapshot_tip=None, generation=0, lane='merge', enqueued_at=0.0,
+        )
+        journal = orchestrator_data_dir(tmp_path) / 'merge_queue.json'
+        journal.parent.mkdir(parents=True)
+        journal.write_text(json.dumps({seeded.request_id: dataclasses.asdict(seeded)}))
+
+        h = _build_harness(mock_orch_config)
+
+        assert [r.request_id for r in h._merge_store.load()] == ['seed-1']
+
+    @pytest.mark.asyncio
+    async def test_the_offline_lane_lock_is_held_in_the_layout_dir(
+        self, mock_orch_config, tmp_path,
+    ):
+        h = _build_harness(mock_orch_config)
+        h.scheduler = MagicMock()
+        h.event_store = MagicMock()
+        h.config.git.offline_lane_enabled = True
+        h.config.git.persistent_offline_deep_worktree = True
+
+        await h._start_offline_lane()
+        try:
+            assert _is_locked(orchestrator_data_dir(tmp_path) / 'offline_lane.lock')
+        finally:
+            await h._stop_offline_lane()
+
+
 @pytest.mark.usefixtures('relocated_layout')
 def test_the_flake_ledger_lives_in_the_layout_runs_db(tmp_path):
     assert ledger_db_path(tmp_path) == runs_db(tmp_path)
@@ -263,3 +339,51 @@ class TestHomePathDefaultsDeriveFromTheMainCheckout:
 
         assert result.exit_code == 1, result.output
         assert f'runs.db not found at {runs_db(default_project_root())}' in result.output
+
+
+@pytest.mark.usefixtures('unreachable_main_checkout')
+class TestMainCheckoutDefaultsNameTheirOverrides:
+    def test_the_resume_age_bound_names_its_env_override(self, monkeypatch):
+        monkeypatch.delenv(rab.RUNS_DB_ENV_VAR, raising=False)
+        with pytest.raises(CheckoutRootError, match=rf'set \${rab.RUNS_DB_ENV_VAR}\b'):
+            rab.default_runs_db_path()
+
+    def test_an_env_override_needs_no_checkout(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(rab.RUNS_DB_ENV_VAR, str(tmp_path / 'elsewhere.db'))
+        assert rab.default_runs_db_path() == tmp_path / 'elsewhere.db'
+
+    @pytest.mark.parametrize(('cli', 'args', 'flag', 'env_var'), [
+        pytest.param(
+            prompt_opt_cli,
+            ['canary', '--deploy-at', '2026-06-15T00:00:00+00:00', '--project-id', 'dark_factory'],
+            '--runs-db', 'PROMPT_OPT_RUNS_DB', id='prompt-opt-canary',
+        ),
+        pytest.param(
+            prompt_opt_cli, ['build-curator-corpus'], '--db-path', 'CURATOR_TICKETS_DB',
+            id='prompt-opt-build-curator-corpus',
+        ),
+        pytest.param(
+            reviewer_trial_cli, ['mine'], '--runs-db', 'REVIEWER_TRIAL_RUNS_DB',
+            id='reviewer-trial-mine',
+        ),
+        pytest.param(
+            reviewer_trial_cli, ['campaign', '--results-dir', 'results'], '--config', None,
+            id='reviewer-trial-campaign',
+        ),
+        pytest.param(
+            orchestrator_cli, ['eval-sample', '--dry-run'], '--df-root', None, id='eval-sample',
+        ),
+    ])
+    def test_an_operator_command_answers_with_a_usage_error(
+        self, monkeypatch, cli, args, flag, env_var,
+    ):
+        if env_var is not None:
+            monkeypatch.delenv(env_var, raising=False)
+
+        result = CliRunner().invoke(cli, args)
+
+        assert result.exit_code == 2, result.output
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert f'pass {flag}' in result.output
+        if env_var is not None:
+            assert f'set ${env_var}' in result.output

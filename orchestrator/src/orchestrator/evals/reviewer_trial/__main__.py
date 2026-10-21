@@ -23,7 +23,7 @@ import sqlite3
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,6 +32,7 @@ import click
 from shared import project_layout
 
 from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.main_checkout_defaults import cli_default
 
 if TYPE_CHECKING:
     from .corpus import CorpusManifest
@@ -564,17 +565,6 @@ def corpus_audit(min_diffs: int) -> None:
 # Mine: FN-candidate mining + frontier labeling (task 2495 / PRD D-6)
 # ---------------------------------------------------------------------------
 
-def _env_or_main_checkout(env_var: str, derive: Callable[[Path], Path]) -> Path:
-    """``$env_var`` when set, else *derive* applied to the main checkout.
-
-    The mining sources are gitignored data that live in the MAIN checkout, not
-    a task worktree (see corpus/README.md "Regenerating / extending the
-    corpus"). Resolved per invocation, so importing this module never needs a checkout.
-    """
-    override = os.environ.get(env_var)
-    return Path(override) if override else derive(project_layout.default_project_root())
-
-
 _MINE_SPLIT_SEED = 'reviewer_trial-2495-fn-mining'
 
 _LANG_EXTENSIONS = {
@@ -702,11 +692,14 @@ def mine(
     after every successfully-labeled diff, so an interrupted run only loses
     whatever was still in flight.
     """
-    runs_db = runs_db or _env_or_main_checkout('REVIEWER_TRIAL_RUNS_DB', project_layout.runs_db)
-    escalations_dir = escalations_dir or _env_or_main_checkout(
-        'REVIEWER_TRIAL_ESCALATIONS_DIR', project_layout.escalation_queue_dir,
+    runs_db = runs_db or cli_default(
+        '--runs-db', project_layout.runs_db, env_var='REVIEWER_TRIAL_RUNS_DB',
     )
-    repo_path = repo_path or _env_or_main_checkout('REVIEWER_TRIAL_REPO_ROOT', Path)
+    escalations_dir = escalations_dir or cli_default(
+        '--escalations-dir', project_layout.escalation_queue_dir,
+        env_var='REVIEWER_TRIAL_ESCALATIONS_DIR',
+    )
+    repo_path = repo_path or cli_default('--repo-path', Path, env_var='REVIEWER_TRIAL_REPO_ROOT')
 
     async def _run() -> int:
         from .adjudication import AdjudicationLog
@@ -1218,7 +1211,7 @@ def campaign(
     """
     from orchestrator.config import PROJECT_CONFIG_FILENAME, default_price_table, load_config
 
-    config_path = config_path or project_layout.default_project_root() / PROJECT_CONFIG_FILENAME
+    config_path = config_path or cli_default('--config', lambda root: root / PROJECT_CONFIG_FILENAME)
 
     async def _run() -> int:
         from orchestrator.evals.runner import campaign_usage_gate

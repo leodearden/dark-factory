@@ -18,10 +18,11 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import click
 from dotenv import load_dotenv
-from shared.project_layout import default_project_root, tasks_db
+from shared.project_layout import tasks_db
 
 from orchestrator.config import ConfigRequiredError, OrchestratorConfig, load_config
 from orchestrator.config_census_ignore import audit_census_ignore_entries
+from orchestrator.main_checkout_defaults import cli_default
 from orchestrator.verify_cancel import (
     WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     WATCHDOG_KILL_GRACE_SECS,
@@ -1484,7 +1485,7 @@ def eval_sample_cmd(since: str, target_low: int, target_high: int, seed: int,
     asyncio.run(_run_eval_sample(
         since=since, target_low=target_low, target_high=target_high, seed=seed,
         cohort=cohort, dry_run=dry_run, tasks_dir=tasks_dir,
-        df_root=Path(df_root or default_project_root()), reify_root=Path(reify_root),
+        df_root=df_root or cli_default('--df-root', Path), reify_root=Path(reify_root),
         sampled_at=sampled_at,
     ))
 

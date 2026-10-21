@@ -35,10 +35,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
 import tempfile
-from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -51,6 +49,7 @@ from orchestrator.evals.prompt_opt.canary import (
     deploy_at_from_provenance,
     run_canary,
 )
+from orchestrator.main_checkout_defaults import cli_default
 
 LOG_FORMAT = '%(asctime)s %(levelname)-8s [%(name)s] %(message)s'
 
@@ -83,26 +82,9 @@ _AUDIT_CHECKS = (
 )
 
 
-
-def _env_or_main_checkout(env_var: str, derive: Callable[[Path], Path]) -> Path:
-    """``$env_var`` when set, else *derive* applied to the main checkout.
-
-    tickets.db and runs.db are gitignored data that live in the MAIN checkout,
-    not a task worktree (see corpus/README.md's "Regenerating / extending the
-    corpus"). Resolved per invocation, so importing this module never needs a checkout.
-    """
-    override = os.environ.get(env_var)
-    return Path(override) if override else derive(project_layout.default_project_root())
-
-
-def _default_tickets_db() -> Path:
-    return _env_or_main_checkout(
-        'CURATOR_TICKETS_DB', lambda root: root / 'data' / 'reconciliation' / 'tickets.db',
-    )
-
-
-def _default_canary_runs_db() -> Path:
-    return _env_or_main_checkout('PROMPT_OPT_RUNS_DB', project_layout.runs_db)
+def _fused_memory_default_tickets_db(root: Path) -> Path:
+    """Under fused-memory's default reconciliation.data_dir, a location shared.project_layout does not own."""
+    return root / 'data' / 'reconciliation' / 'tickets.db'
 
 
 # Documented PRD §9 calibration STARTING points -- both the window lengths
@@ -202,7 +184,9 @@ def build_curator_corpus_cmd(
     adjudication_log.jsonl under *out*'s directory. Prints an
     audit_curator_corpus PASS/FAIL summary and exits non-zero on FAIL.
     """
-    db_path = db_path or _default_tickets_db()
+    db_path = db_path or cli_default(
+        '--db-path', _fused_memory_default_tickets_db, env_var='CURATOR_TICKETS_DB',
+    )
 
     from .curator_corpus import (
         FrontierLabel,
@@ -344,7 +328,7 @@ def canary(
     feeds: pin -> watch this command -> unpin (T1
     PromptArtifactStore.unpin) on regress.
     """
-    runs_db = runs_db or _default_canary_runs_db()
+    runs_db = runs_db or cli_default('--runs-db', project_layout.runs_db, env_var='PROMPT_OPT_RUNS_DB')
 
     if deploy_at is None:
         if not (prompt_id and executor_model and harness_version):
