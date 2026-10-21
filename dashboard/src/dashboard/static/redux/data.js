@@ -165,7 +165,10 @@ window.DF_DATA = {
   //   Each rows Datum's value is a list of rows shaped {id, project, title,
   //   status, agent, started, loops, attempts, lane, phase, lane_state,
   //   runtime_offline, deps, meta_files, train, external_deps, prd,
-  //   claimant_run_id, heartbeat_at, stranded}.
+  //   claimant_run_id, heartbeat_at, stranded}, plus `deferral` on a deferred
+  //   row from a backend that emits it: dashboard/src/dashboard/data/
+  //   deferral_summary.py's {label, state, age_seconds, needs_human, detail},
+  //   or null when the row carries no record.
   //   `agent` is worktree PRESENCE (it stays truthy after the agent dies);
   //   `stranded` (task 3543) is the independent liveness verdict, computed
   //   server-side from the claim columns via shared.task_claimant.is_stranded.
