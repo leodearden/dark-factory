@@ -136,15 +136,17 @@ SILENT_FALLTHROUGH_ALLOWLIST = governed_exceptions(
     default_covers=12,
 )
 
+_UNARCHIVED_CONFIG_DIR_SITES = tuple(
+    site
+    for site in config_dir_archival_allowlist.AUDITED_SITES
+    if site['disposition'] != config_dir_archival_allowlist.ARCHIVED
+)
+
 CONFIG_DIR_ARCHIVAL_EXCEPTIONS = governed_exceptions(
     'shared.tests.config_dir_archival_allowlist.AUDITED_SITES',
     'A TaskConfigDir construction site whose dir is destroyed without its transcripts '
     'being archived first, either by design or as a recorded gap.',
-    _occurrence_keys(
-        (site['path'], site['qualname'])
-        for site in config_dir_archival_allowlist.AUDITED_SITES
-        if site['disposition'] != config_dir_archival_allowlist.ARCHIVED
-    ),
+    _occurrence_keys((site['path'], site['qualname']) for site in _UNARCHIVED_CONFIG_DIR_SITES),
     default=Policy('inv12-config-dir-unarchived-by-design'),
     default_covers=3,
     dispositions={
@@ -403,14 +405,9 @@ def test_config_dir_overrides_follow_the_allowlist_vocabulary() -> None:
         'The UNARCHIVED_BY_DESIGN sites are ratified, so CONFIG_DIR_ARCHIVAL_EXCEPTIONS '
         f'must borrow a Policy default, not {CONFIG_DIR_ARCHIVAL_EXCEPTIONS.default!r}.'
     )
-    dispositions = [
-        site['disposition']
-        for site in config_dir_archival_allowlist.AUDITED_SITES
-        if site['disposition'] != config_dir_archival_allowlist.ARCHIVED
-    ]
-    pairs = zip(dispositions, CONFIG_DIR_ARCHIVAL_EXCEPTIONS.keys, strict=True)
+    pairs = zip(_UNARCHIVED_CONFIG_DIR_SITES, CONFIG_DIR_ARCHIVAL_EXCEPTIONS.keys, strict=True)
     mismatches = [
-        mismatch for disposition, key in pairs if (mismatch := _config_dir_mismatch(disposition, key))
+        mismatch for site, key in pairs if (mismatch := _config_dir_mismatch(site['disposition'], key))
     ]
     assert not mismatches, (
         'Each config-dir override must match its allowlist row: none for UNARCHIVED_BY_DESIGN, '
