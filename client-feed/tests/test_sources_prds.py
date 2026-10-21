@@ -55,6 +55,19 @@ class TestSummarize:
 
         assert summary(markdown) == ('Real title', 'The excerpt.')
 
+    def test_a_line_with_an_info_string_does_not_close_a_fence(self) -> None:
+        markdown = '# T\n\n## Goal\n\n```\n```python\nnot the excerpt\n```\n\nThe excerpt.\n'
+
+        assert summary(markdown) == ('T', 'The excerpt.')
+
+    def test_a_shorter_run_does_not_close_a_fence_and_a_longer_one_does(self) -> None:
+        markdown = (
+            '````\n```\n# not a title\n```\n`````\n\n'
+            '# Real title\n\n## Goal\n\n~~~\n~~\nnot the excerpt\n~~~~\n\nThe excerpt.\n'
+        )
+
+        assert summary(markdown) == ('Real title', 'The excerpt.')
+
     def test_without_an_h1_the_title_is_the_path(self) -> None:
         assert summary('## Goal\n\nText.\n', 'plans/q-prd.md') == ('plans/q-prd.md', 'Text.')
 

@@ -11,7 +11,7 @@ from typing import Final
 from client_feed.redact import redact_paths
 from client_feed.sources.git import EntryKind, blob_reader, tree_entries
 
-_FENCES: Final = ('```', '~~~')
+_OPENING_FENCE: Final = re.compile(r'`{3,}|~{3,}')
 _HEADING: Final = re.compile(r' {0,3}(?P<marks>#{1,6})(?:[ \t]+(?P<text>.*))?')
 
 
@@ -30,23 +30,27 @@ class PrdsRead:
     absent: tuple[str, ...]
 
 
-def _fence(line: str) -> str | None:
-    stripped = line.lstrip()
-    return next((fence for fence in _FENCES if stripped.startswith(fence)), None)
+def _opening_fence(line: str) -> str | None:
+    """The run of three or more backticks or tildes that opens a fenced block on this line, if any."""
+    match = _OPENING_FENCE.match(line.strip())
+    return None if match is None else match[0]
+
+
+def _closes(line: str, fence: str) -> bool:
+    """CommonMark's closing fence: the opening's character, at least as many times, and nothing else."""
+    stripped = line.strip()
+    return len(stripped) >= len(fence) and stripped == fence[0] * len(stripped)
 
 
 def _unfenced(markdown: str) -> Iterator[str]:
     """Every line outside a fenced block; a whole block reads as one blank line, so it ends a paragraph."""
-    open_fence: str | None = None
+    fence: str | None = None
     for line in markdown.splitlines():
-        fence = _fence(line)
-        if open_fence is None and fence is not None:
-            open_fence = fence
-            yield ''
-        elif open_fence is None:
-            yield line
-        elif fence == open_fence:
-            open_fence = None
+        if fence is None:
+            fence = _opening_fence(line)
+            yield line if fence is None else ''
+        elif _closes(line, fence):
+            fence = None
 
 
 def _heading(line: str) -> tuple[int, str]:
