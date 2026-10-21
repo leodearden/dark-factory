@@ -18,6 +18,7 @@ follows precisely.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 from pathlib import Path
@@ -4134,20 +4135,16 @@ def _one_account_gate():
     )
 
 
-def _cap_retry_that_exhausts_after_one_attempt():
-    """Stands in for ``invoke_with_cap_retry`` running out of patience.
+def _real_cap_retry_with_no_cap_patience():
+    """The REAL ``invoke_with_cap_retry``, its public cap-wait bound set to zero.
 
-    It runs one attempt through the cell's own ``invoke_fn``, so
-    ``_timed_invoke`` banks that attempt's spend, then gives up the way the
-    shared wrapper does — without waiting out the inherited cap-wait bound.
+    The first cap hit exhausts the pool, so the gate, the retry loop and the
+    exhaustion path all run for real, in milliseconds rather than the
+    inherited bound.
     """
-    from shared.cli_invoke import AllAccountsCappedException
+    from shared.cli_invoke import invoke_with_cap_retry
 
-    async def fake(_gate, label, *, invoke_fn, **invoke_kwargs):
-        await invoke_fn(**invoke_kwargs)
-        raise AllAccountsCappedException(1, 0.0, label)
-
-    return AsyncMock(side_effect=fake)
+    return functools.partial(invoke_with_cap_retry, cap_wait_sanity_secs=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -4189,7 +4186,7 @@ class TestArchitectEvalCapPatience:
     async def test_fully_capped_pool_fails_loud_into_cap_tainted(self):
         with patch(
             'orchestrator.evals.runner.invoke_with_cap_retry',
-            _cap_retry_that_exhausts_after_one_attempt(),
+            _real_cap_retry_with_no_cap_patience(),
         ):
             result, _mocks = await _run_architect_eval_hermetic(
                 self._cfg(),
@@ -4198,9 +4195,9 @@ class TestArchitectEvalCapPatience:
                 arch_result=_cap_agent_result(),
             )
 
-        # It RETURNED. That is the requirement being pinned: when the wrapper
-        # gives up, the cell lands in the cap_tainted backstop rather than
-        # propagating the exhaustion out of the campaign.
+        # It RETURNED. That is the requirement being pinned: when the real
+        # wrapper gives up, the cell lands in the cap_tainted backstop rather
+        # than propagating the exhaustion out of the campaign.
         assert result.outcome == 'blocked'
 
         # …into the pre-existing backstop, unchanged: no scorable plan landed,
@@ -4220,7 +4217,7 @@ class TestArchitectEvalCapPatience:
 
         with patch(
             'orchestrator.evals.runner.invoke_with_cap_retry',
-            _cap_retry_that_exhausts_after_one_attempt(),
+            _real_cap_retry_with_no_cap_patience(),
         ):
             result, mocks = await _run_architect_eval_hermetic(
                 self._cfg(),
@@ -4984,7 +4981,7 @@ class TestArchitectEvalSpendSurvivesFailover:
         """
         with patch(
             'orchestrator.evals.runner.invoke_with_cap_retry',
-            _cap_retry_that_exhausts_after_one_attempt(),
+            _real_cap_retry_with_no_cap_patience(),
         ):
             result, mocks = await _run_architect_eval_hermetic(
                 self._cfg(),
