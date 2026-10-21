@@ -24,17 +24,21 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, hangs_until
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane.drift import _run_drift_check
 from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_runner import HostAllocator
 
 # Lever C explicitly OFF for the drift tests that are not about it (task 4537).
 #
@@ -1196,3 +1200,137 @@ class TestDriftCheckHoldsLaneLease:
             f'cleanup_merge_worktree, else the cleanup skips on our own lease '
             f'and leaks {wt}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 6648: each host lease is released when its own leg ends
+#
+# Slot state is read ONLY through HostAllocator.host_states(), the read the
+# heartbeat publishes as hosts[...].slot_state.  The local leg is parked
+# through the injected VerifyPort (FakeVerifier + hangs_until), so no module
+# name is patched.
+# ---------------------------------------------------------------------------
+
+_WAIT_SECS = 5.0
+_PASS = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+
+
+async def _until(predicate: Callable[[], bool]) -> None:
+    """Poll *predicate* until it holds, bounded so a RED run fails instead of hanging."""
+    async def _poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(_poll(), _WAIT_SECS)
+
+
+@dataclasses.dataclass
+class _DriftScene:
+    """``_run_drift_check`` over MagicMock git_ops and a REAL allocator with a 'laptop' double."""
+
+    git_ops: MagicMock
+    req: MagicMock
+    remote: MagicMock
+    allocator: HostAllocator
+    event_store: _RecordingEventStore
+
+    @classmethod
+    def build(cls, tmp_path: Path, *, remote_verify: AsyncMock | None = None) -> _DriftScene:
+        git_ops = MagicMock()
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(return_value=tmp_path / '_throwaway')
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        req = MagicMock()
+        req.task_id = 'task-6648-drift'
+        req.module_configs = []
+        req.config = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_runners=[  # type: ignore[arg-type]
+                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin',
+                 'df_checkout_path': '/df'},
+            ],
+            verify_env_probes=_LEVER_C_OFF,
+        )
+        remote = MagicMock()
+        remote.name = 'laptop'
+        remote.is_local = False
+        remote.run_merge_verify = remote_verify or AsyncMock(return_value=_PASS)
+        allocator = HostAllocator([remote], quarantine=set())
+        return cls(git_ops, req, remote, allocator, _RecordingEventStore())
+
+    def run(self, verifier: FakeVerifier, **options: Any) -> Coroutine[Any, Any, None]:
+        return _run_drift_check(
+            self.git_ops, self.req, 'drift-sha', None, self.event_store, set(),
+            verifier=verifier, allocator=self.allocator, **options,
+        )
+
+    def slot(self, name: str) -> str:
+        return next(h['slot_state'] for h in self.allocator.host_states() if h['name'] == name)
+
+    def parity_events(self) -> int:
+        return self.event_store.types().count(EventType.verdict_parity_ok)
+
+
+def _gated_remote(gate: asyncio.Event, entered: asyncio.Event) -> AsyncMock:
+    async def _body(*_args: Any, **_kwargs: Any) -> VerifyResult:
+        entered.set()
+        await gate.wait()
+        return _PASS
+    return AsyncMock(side_effect=_body)
+
+
+@pytest.mark.asyncio
+class TestDriftCheckReleasesEachLeaseAtItsLegsEnd:
+    """Each host slot frees the moment its own leg ends, and is released exactly once."""
+
+    async def test_laptop_slot_is_free_while_the_local_leg_still_runs(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _DriftScene.build(tmp_path)
+        local_gate, local_entered = asyncio.Event(), asyncio.Event()
+        verifier = FakeVerifier(default=hangs_until(local_gate, entered=local_entered))
+        drift = asyncio.create_task(scene.run(verifier))
+        try:
+            await asyncio.wait_for(local_entered.wait(), _WAIT_SECS)
+            await _until(lambda: scene.slot('laptop') == 'free')
+            assert scene.slot('local') == 'busy'
+        finally:
+            local_gate.set()
+            await asyncio.wait_for(drift, _WAIT_SECS)
+        assert (scene.slot('local'), scene.slot('laptop')) == ('free', 'free')
+        assert scene.parity_events() == 1
+
+    async def test_lease_released_at_leg_end_is_not_released_again_by_the_safety_net(
+        self, tmp_path: Path,
+    ) -> None:
+        # HostAllocator.release keys on slot STATE, not lease identity: a second
+        # release of the drift check's laptop lease would free (or un-PARK) the
+        # slot the merge lane has since taken.
+        scene = _DriftScene.build(tmp_path)
+        local_gate, local_entered = asyncio.Event(), asyncio.Event()
+        verifier = FakeVerifier(default=hangs_until(local_gate, entered=local_entered))
+        drift = asyncio.create_task(scene.run(verifier))
+        try:
+            await asyncio.wait_for(local_entered.wait(), _WAIT_SECS)
+            await _until(lambda: scene.slot('laptop') == 'free')
+            assert scene.allocator.acquire_remote() is not None
+        finally:
+            local_gate.set()
+            await asyncio.wait_for(drift, _WAIT_SECS)
+        assert scene.slot('laptop') == 'busy'
+
+    async def test_local_slot_is_free_while_the_remote_leg_still_runs(
+        self, tmp_path: Path,
+    ) -> None:
+        remote_gate, remote_entered = asyncio.Event(), asyncio.Event()
+        scene = _DriftScene.build(
+            tmp_path, remote_verify=_gated_remote(remote_gate, remote_entered),
+        )
+        drift = asyncio.create_task(scene.run(FakeVerifier()))
+        try:
+            await asyncio.wait_for(remote_entered.wait(), _WAIT_SECS)
+            await _until(lambda: scene.slot('local') == 'free')
+            assert scene.slot('laptop') == 'busy'
+        finally:
+            remote_gate.set()
+            await asyncio.wait_for(drift, _WAIT_SECS)
+        assert (scene.slot('local'), scene.slot('laptop')) == ('free', 'free')
+        assert scene.parity_events() == 1
