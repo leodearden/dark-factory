@@ -112,14 +112,15 @@ class NewFinding:
 class ReObservedFinding:
     """A keyed entry that gained a session this run: one that stood before
     it, or one promoted under the key of another instrument's finding,
-    *adopted_from* that instrument's run."""
+    *adopted_from* that instrument's run. *standing* is None when the entry
+    did not stand before this run, as an adopted one did not."""
 
     key: str
     entry_id: str
     title: str
     cause: str | None
     gained_sessions: tuple[str, ...]
-    standing: Standing
+    standing: Standing | None
     verdict: Judgement | None
     adopted_from: str | None
 
@@ -130,7 +131,7 @@ class ReObservedFinding:
             "title": self.title,
             "cause": self.cause,
             "gained_sessions": list(self.gained_sessions),
-            "standing": self.standing.to_record(),
+            "standing": None if self.standing is None else self.standing.to_record(),
             "verdict": _judgement_record(self.verdict),
             "adopted_from": self.adopted_from,
         }
@@ -140,10 +141,10 @@ def _by_id(records: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]
     return {record["id"]: record for record in records}
 
 
-def _require_entries(entries: Mapping[str, Any], named: Iterable[str], *, what: str) -> None:
+def _require_entries(entries: Mapping[str, Any], named: Iterable[str], *, where: str, what: str) -> None:
     unknown = sorted(set(named) - set(entries))
     if unknown:
-        raise ValueError(f"synthesis.Brief.of: {what} names no entry of the run's codebook: {unknown}")
+        raise ValueError(f"synthesis.{where}: {what} names no entry of the run's codebook: {unknown}")
 
 
 def _gained_sessions(standing: Mapping[str, Any] | None, entry: Mapping[str, Any]) -> tuple[str, ...]:
@@ -202,8 +203,8 @@ class Brief:
         standing_entries = _by_id(before.get("entries") or [])
         entries = _by_id(after.get("entries") or [])
         judgements = {adjudication.record_id: Judgement.of(adjudication.found) for adjudication in verdicts}
-        _require_entries(entries, judgements, what="a verdict")
-        _require_entries(entries, adopted, what="an adoption")
+        _require_entries(entries, judgements, where="Brief.of", what="a verdict")
+        _require_entries(entries, adopted, where="Brief.of", what="an adoption")
         new: list[NewFinding] = []
         re_observed: list[ReObservedFinding] = []
         unkeyed = 0
@@ -234,7 +235,7 @@ class Brief:
                     title=entry["title"],
                     cause=codebook.entry_field(after, entry, "cause"),
                     gained_sessions=gained,
-                    standing=Standing.of(standing or entry),
+                    standing=None if standing is None else Standing.of(standing),
                     verdict=judgements.get(entry_id),
                     adopted_from=adopted.get(entry_id),
                 ))
@@ -659,12 +660,13 @@ def apply_refinements(
     by_key = {refinement.key: refinement for refinement in document.phase_refinements}
     result = copy.deepcopy(dict(cb))
     entries: dict[str, dict] = {entry["id"]: entry for entry in result.get("entries") or []}
-    _require_entries(entries, (entry_id for _, entry_id in clusters if entry_id is not None), what="a placed cluster")
-    _require_entries(entries, created, what="a created entry")
+    placed = (entry_id for _, entry_id in clusters if entry_id is not None)
+    _require_entries(entries, placed, where="apply_refinements", what="a placed cluster")
+    _require_entries(entries, created, where="apply_refinements", what="a created entry")
 
     def refinement_at(entry_id: str | None) -> PhaseRefinement | None:
-        key = None if entry_id is None else entries[entry_id].get("finding_key")
-        return by_key.get(key) if isinstance(key, str) else None
+        identity = None if entry_id is None else census_findings.FindingIdentity.from_record(entries[entry_id])
+        return None if identity is None else by_key.get(identity.key)
 
     refined_clusters: list[dict] = []
     clusters_refined = entries_refined = 0

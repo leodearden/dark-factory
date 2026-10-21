@@ -195,6 +195,7 @@ def test_an_entry_promoted_under_another_instruments_key_is_re_observed_not_new(
     adopted = _re_observed(brief, _ADOPTED_ID)
 
     assert adopted.adopted_from == _EXTERNAL_RUN
+    assert adopted.standing is None
     assert adopted.gained_sessions == ("s-run-5",)
     assert adopted.verdict is not None and adopted.verdict.reason == "the review saw it too"
     assert _ADOPTED_ID not in {finding.entry_id for finding in brief.new}
@@ -250,7 +251,7 @@ def test_the_brief_record_round_trips_through_json():
 
 
 def test_a_verdict_naming_no_entry_of_the_run_is_refused():
-    with pytest.raises(ValueError, match="entry-missing"):
+    with pytest.raises(ValueError, match=r"Brief\.of: a verdict .*entry-missing"):
         _brief(verdicts=[census_findings.Adjudication("entry-missing", _NEW_FOUND, None)])
 
 
@@ -524,6 +525,18 @@ def test_no_refinement_leaves_the_codebook_and_clusters_equal():
     assert refined.codebook == _after()
     assert refined.clusters == (_cluster("new", "s-run-4"),)
     assert (refined.clusters_refined, refined.entries_refined) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("clusters", "created", "what"),
+    [
+        ([(_cluster("lost", "s-run-6"), "entry-missing")], (), "a placed cluster"),
+        ([], ("entry-missing",), "a created entry"),
+    ],
+)
+def test_refining_at_an_entry_the_codebook_lacks_is_refused_naming_apply_refinements(clusters, created, what):
+    with pytest.raises(ValueError, match=rf"apply_refinements: {what} .*entry-missing"):
+        synthesis.apply_refinements(_after(), synthesis.Synthesis(), clusters=clusters, created=created)
 
 
 def test_a_document_without_corrections_has_no_corrections_record():
