@@ -279,11 +279,6 @@ class FieldBytes:
     bytes: int
 
 
-def payload_bytes(obj: object) -> int:
-    """The wire size of *obj*, serialized exactly as Starlette's JSONResponse does."""
-    return len(_encoded(obj))
-
-
 def field_breakdown(
     payload: object, data_keyed_maps: Iterable[Sequence[str]] = (),
 ) -> tuple[FieldBytes, ...]:
@@ -343,6 +338,7 @@ def slack_violation(budget_bytes: int, measured_bytes: int) -> bool:
 
 
 def _encoded(value: object) -> bytes:
+    """*value* serialized exactly as Starlette's JSONResponse does, so leaf bytes are wire bytes."""
     return json.dumps(
         value, ensure_ascii=False, allow_nan=False, indent=None, separators=(',', ':'),
     ).encode('utf-8')

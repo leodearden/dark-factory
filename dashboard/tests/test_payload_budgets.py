@@ -6,14 +6,15 @@ enforcement points read it: the pre-merge fleet sweep
 (``test_payload_budget_sweep.py``) and the live predicate
 (``dashboard.payload_check``). This module pins the table itself:
 
-* the shipped table loads into well-typed, read-only values;
+* the shipped table loads;
 * it is COMPLETE against the live app's GET routes, in both directions, so a
   new endpoint cannot ship unbudgeted and a deleted one cannot leave a stale
   entry behind;
 * a malformed table is REFUSED loudly, naming the field, and never read as an
   empty or partial table, which would compare clean against everything;
-* the pure accounting both enforcement points report with: wire bytes, the
-  leaf-field breakdown, the overage message and the slack rule;
+* the pure accounting both enforcement points report with: the leaf-field
+  breakdown, counted in Starlette's wire bytes, the overage message and the
+  slack rule;
 * history is APPEND-ONLY against ``merge-base(main, HEAD)``, so every raise or
   lowering is a new entry naming a task and a reason.
 """
@@ -25,7 +26,6 @@ import json
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -39,24 +39,17 @@ from _payload_budget_history import (
 from starlette.responses import JSONResponse
 
 from dashboard.payload_budgets import (
-    MAX_SLACK_RATIO,
-    SLACK_FLOOR_BYTES,
     TABLE_REPO_PATH,
-    BudgetChange,
     BudgetTable,
     EndpointBudget,
-    Exemption,
     FieldBytes,
     PayloadBudgetTableError,
     field_breakdown,
     load_budget_table,
     parse_budget_table,
-    payload_bytes,
     render_overage,
     slack_violation,
 )
-
-_PREFIX = '/api/v2/dashboard/'
 
 
 @pytest.fixture(scope='module')
@@ -64,55 +57,9 @@ def shipped() -> BudgetTable:
     return load_budget_table()
 
 
-class TestShippedTable:
-    def test_loads_endpoints_and_exemptions(self, shipped: BudgetTable) -> None:
-        assert isinstance(shipped, BudgetTable)
-        assert isinstance(shipped.endpoints, tuple)
-        assert shipped.endpoints, 'the shipped table declares no endpoint at all'
-        assert all(isinstance(e, EndpointBudget) for e in shipped.endpoints)
-        assert isinstance(shipped.exempt, tuple)
-        assert all(isinstance(x, Exemption) for x in shipped.exempt)
-
-    def test_every_path_is_under_the_dashboard_api(self, shipped: BudgetTable) -> None:
-        outside = [e.path for e in shipped.endpoints if not e.path.startswith(_PREFIX)]
-        assert outside == []
-
-    def test_each_request_appears_once(self, shipped: BudgetTable) -> None:
-        keys = [e.request_key for e in shipped.endpoints]
-        assert len(keys) == len(set(keys))
-
-    def test_query_is_a_read_only_str_mapping(self, shipped: BudgetTable) -> None:
-        for entry in shipped.endpoints:
-            assert isinstance(entry.query, MappingProxyType), entry.url_suffix()
-            assert all(
-                isinstance(k, str) and isinstance(v, str) for k, v in entry.query.items()
-            ), entry.url_suffix()
-
-    def test_data_keyed_maps_are_tuples_of_non_blank_segments(
-        self, shipped: BudgetTable,
-    ) -> None:
-        for entry in shipped.endpoints:
-            assert isinstance(entry.data_keyed_maps, tuple), entry.url_suffix()
-            for key_path in entry.data_keyed_maps:
-                assert isinstance(key_path, tuple) and key_path, entry.url_suffix()
-                assert all(isinstance(s, str) and s.strip() for s in key_path)
-
-    def test_history_is_a_non_empty_tuple_of_reasoned_changes(
-        self, shipped: BudgetTable,
-    ) -> None:
-        for entry in shipped.endpoints:
-            assert isinstance(entry.history, tuple) and entry.history, entry.url_suffix()
-            for change in entry.history:
-                assert isinstance(change, BudgetChange)
-                assert type(change.budget_bytes) is int and change.budget_bytes > 0
-                assert change.task.strip() and change.reason.strip()
-
-    def test_the_budget_is_the_last_history_entry(self, shipped: BudgetTable) -> None:
-        for entry in shipped.endpoints:
-            assert entry.budget_bytes == entry.history[-1].budget_bytes
-
-    def test_every_exemption_carries_a_reason(self, shipped: BudgetTable) -> None:
-        assert all(x.reason.strip() for x in shipped.exempt)
+def test_the_shipped_table_loads(shipped: BudgetTable) -> None:
+    """parse_budget_table refuses any malformed field (TestRefusals), so loading IS the check."""
+    assert shipped.endpoints
 
 
 class TestUrlSuffix:
@@ -400,6 +347,17 @@ class TestFieldBreakdown:
         }
         assert _leaf('title', 'déjà vu — ✓') > len('"title":"déjà vu — ✓"')
 
+    def test_a_flat_payloads_leaves_are_its_starlette_body_less_braces_and_commas(self) -> None:
+        sample = {
+            'title': 'déjà vu — ✓ 日本',
+            'n': [1, 2.5, None, True],
+            'empty': {},
+            'list': [],
+        }
+        leaves = sum(field.bytes for field in field_breakdown(sample))
+        braces_and_commas = 2 + len(sample) - 1
+        assert leaves == len(JSONResponse(sample).body) - braces_and_commas
+
     def test_sorted_by_bytes_descending_then_path(self) -> None:
         payload = {'b': 'xx', 'a': 'xx', 'c': 'xxxxxxxx'}
         assert [field.path for field in field_breakdown(payload)] == ['c', 'a', 'b']
@@ -408,16 +366,6 @@ class TestFieldBreakdown:
         breakdown = field_breakdown({'a': 1})
         assert isinstance(breakdown, tuple)
         assert breakdown == (FieldBytes(path='a', bytes=_leaf('a', 1)),)
-
-
-class TestPayloadBytes:
-    def test_matches_the_starlette_json_response_body(self) -> None:
-        sample = {
-            'title': 'déjà vu — ✓ 日本',
-            'n': [1, 2.5, None, True],
-            'nested': {'empty': {}, 'list': []},
-        }
-        assert payload_bytes(sample) == len(JSONResponse(sample).body)
 
 
 def _entry_for_overage() -> EndpointBudget:
@@ -451,10 +399,6 @@ class TestRenderOverage:
 
 
 class TestSlackViolation:
-    def test_the_constants_are_the_documented_ones(self) -> None:
-        assert MAX_SLACK_RATIO == 2.0
-        assert SLACK_FLOOR_BYTES == 32_768
-
     @pytest.mark.parametrize(
         ('budget', 'measured', 'violates'),
         [

@@ -38,16 +38,6 @@ _SWEPT: tuple[EndpointBudget, ...] = load_budget_table().endpoints
 """Every budgeted request, so a new table entry (and, through completeness, a new route) is swept."""
 
 
-def test_the_sweep_covers_every_budgeted_request() -> None:
-    swept = {entry.request_key for entry in _SWEPT}
-    budgeted = {entry.request_key for entry in load_budget_table().endpoints}
-    assert swept, 'the sweep collected no request; it would pass by checking nothing'
-    assert swept == budgeted, (
-        f'the sweep covers {sorted(swept)} but payload_budgets.json budgets {sorted(budgeted)}; '
-        'sweep every entry of the table'
-    )
-
-
 @pytest.fixture(scope='module')
 def fleet_client() -> Iterator[TestClient]:
     with open_fleet_client() as client:
