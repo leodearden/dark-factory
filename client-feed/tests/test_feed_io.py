@@ -12,6 +12,7 @@ from _git_repo import make_repo
 
 from client_feed.contract import (
     FEED_VERSION,
+    ContractViolation,
     FactoryState,
     FeedEvent,
     Heartbeat,
@@ -421,3 +422,162 @@ def test_load_policy_and_the_writer_share_one_out_dir_check(
     assert policy_refusal.value.problem is problem
     assert writer_refusal.value.problem is problem
     assert writer_refusal.value.detail in str(policy_refusal.value)
+
+
+def _committed(out_dir: Path, *batches: Callable[[Stamp], list[FeedEvent]]) -> list[FeedEvent]:
+    """Each batch built with a fresh stamp and committed; every event written, in order."""
+    written: list[FeedEvent] = []
+    for batch in batches:
+        out = OutDir.open(out_dir, project_id=PROJECT)
+        events = batch(out.stamp())
+        out.commit(events, Cursor())
+        written.extend(events)
+    return written
+
+
+def first_batch(stamp: Stamp) -> list[FeedEvent]:
+    return [task(stamp, 7), factory(stamp), heartbeat(stamp)]
+
+
+def second_batch(stamp: Stamp) -> list[FeedEvent]:
+    return [task(stamp, 8, 1), heartbeat(stamp, 1)]
+
+
+def _files(out_dir: Path) -> dict[str, bytes]:
+    return {name: (out_dir / name).read_bytes() for name in sorted(os.listdir(out_dir))}
+
+
+def test_a_torn_final_line_is_cut_and_logged(
+    out_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _committed(out_dir, first_batch)
+    complete = (out_dir / 'feed.jsonl').read_bytes()
+    torn = b'{"seq":9,"at"'
+    with (out_dir / 'feed.jsonl').open('ab') as feed:
+        feed.write(torn)
+
+    with caplog.at_level('WARNING', logger='client_feed.feed_io'):
+        out = OutDir.open(out_dir, project_id=PROJECT)
+
+    assert (out_dir / 'feed.jsonl').read_bytes() == complete
+    assert out.next_seq == 4
+    assert [record.name for record in caplog.records] == ['client_feed.feed_io']
+    assert f'{len(torn)} bytes' in caplog.records[0].getMessage()
+    assert validate_out_dir(out_dir).ok
+
+
+def _uncommit_second_batch(out_dir: Path, *, stale_state: bool) -> list[FeedEvent]:
+    first = _committed(out_dir, first_batch)
+    saved = {name: (out_dir / name).read_bytes() for name in ('cursor.json', 'state.json')}
+    second = _committed(out_dir, second_batch)
+    (out_dir / 'cursor.json').write_bytes(saved['cursor.json'])
+    if stale_state:
+        (out_dir / 'state.json').write_bytes(saved['state.json'])
+    return first + second
+
+
+@pytest.mark.parametrize('stale_state', [False, True], ids=['current-state', 'stale-state'])
+def test_lines_past_the_cursor_are_the_uncommitted_tail(out_dir: Path, stale_state: bool) -> None:
+    written = _uncommit_second_batch(out_dir, stale_state=stale_state)
+
+    out = OutDir.open(out_dir, project_id=PROJECT)
+
+    assert out.uncommitted == tuple(written[3:])
+    assert out.state == fold(written, project_id=PROJECT)
+    assert out.cursor.through_seq == 3
+    assert out.next_seq == 6
+
+
+def test_a_deleted_state_is_refolded_from_the_feed(out_dir: Path) -> None:
+    written = _committed(out_dir, first_batch, second_batch)
+    (out_dir / 'state.json').unlink()
+
+    out = OutDir.open(out_dir, project_id=PROJECT)
+
+    assert out.state == fold(feed_lines(out_dir), project_id=PROJECT)
+    assert out.state == fold(written, project_id=PROJECT)
+    assert out.uncommitted == ()
+
+
+def test_a_deleted_cursor_makes_the_whole_feed_uncommitted(out_dir: Path) -> None:
+    written = _committed(out_dir, first_batch, second_batch)
+    (out_dir / 'cursor.json').unlink()
+
+    out = OutDir.open(out_dir, project_id=PROJECT)
+
+    assert out.cursor == Cursor()
+    assert out.uncommitted == tuple(written)
+    assert out.state == fold(written, project_id=PROJECT)
+    assert out.next_seq == 6
+
+
+def _cursor_beyond_the_feed(out_dir: Path) -> tuple[str, ...]:
+    size = (out_dir / 'feed.jsonl').stat().st_size
+    (out_dir / 'cursor.json').write_text(Cursor(through_seq=5, feed_bytes=size + 10).model_dump_json())
+    return (f'feed_bytes {size + 10}', str(size))
+
+
+def _cursor_behind_its_seq(out_dir: Path) -> tuple[str, ...]:
+    size = (out_dir / 'feed.jsonl').stat().st_size
+    (out_dir / 'cursor.json').write_text(Cursor(through_seq=4, feed_bytes=size).model_dump_json())
+    return ('through_seq 4', 'seq 5')
+
+
+def _cursor_mid_line(out_dir: Path) -> tuple[str, ...]:
+    size = (out_dir / 'feed.jsonl').stat().st_size
+    (out_dir / 'cursor.json').write_text(Cursor(through_seq=5, feed_bytes=size - 3).model_dump_json())
+    return (f'feed_bytes {size - 3}',)
+
+
+@pytest.mark.parametrize(
+    'misplace', [_cursor_beyond_the_feed, _cursor_behind_its_seq, _cursor_mid_line],
+    ids=['beyond-the-feed', 'seq-mismatch', 'mid-line'],
+)
+def test_a_cursor_ahead_of_the_feed_is_refused_untouched(
+    out_dir: Path, misplace: Callable[[Path], tuple[str, ...]]
+) -> None:
+    _committed(out_dir, first_batch, second_batch)
+    named = misplace(out_dir)
+    before = _files(out_dir)
+
+    with pytest.raises(FeedIoError) as caught:
+        OutDir.open(out_dir, project_id=PROJECT)
+
+    assert caught.value.problem is FeedIoProblem.CURSOR_AHEAD
+    assert caught.value.name == 'cursor.json'
+    for value in named:
+        assert value in str(caught.value)
+    assert _files(out_dir) == before
+
+
+def test_a_malformed_complete_line_in_the_tail_is_refused_untouched(out_dir: Path) -> None:
+    _committed(out_dir, first_batch)
+    with (out_dir / 'feed.jsonl').open('ab') as feed:
+        feed.write(b'{"seq": 4, "not": "a feed line"}\n')
+    before = _files(out_dir)
+
+    with pytest.raises(ContractViolation):
+        OutDir.open(out_dir, project_id=PROJECT)
+
+    assert _files(out_dir) == before
+
+
+def test_a_state_of_another_project_is_refused_untouched(out_dir: Path) -> None:
+    _committed(out_dir, first_batch)
+    (out_dir / 'state.json').write_text(fold([], project_id='other').model_dump_json())
+    before = _files(out_dir)
+
+    with pytest.raises(ProjectMismatch):
+        OutDir.open(out_dir, project_id=PROJECT)
+
+    assert _files(out_dir) == before
+
+
+def test_leftover_temp_files_of_an_interrupted_write_are_removed(out_dir: Path) -> None:
+    _committed(out_dir, first_batch)
+    (out_dir / '.state.json.k3j_x9.tmp').write_text('{"half": ')
+    (out_dir / '.cursor.json.a1b2c3.tmp').write_text('')
+
+    OutDir.open(out_dir, project_id=PROJECT)
+
+    assert tuple(sorted(os.listdir(out_dir))) == WRITTEN
