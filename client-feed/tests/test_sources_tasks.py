@@ -7,6 +7,11 @@ from pathlib import Path
 
 import pytest
 from _stores import RunsDb, TasksDb
+from shared.project_layout import tasks_db
+
+from client_feed.contract import Source, TaskStatus, WaitingOn
+from client_feed.sources.events import OpenEscalations, read_open_escalations
+from client_feed.sources.store import StoreProblem, StoreReadError
 from client_feed.sources.tasks import (
     SkippedTask,
     TaskRow,
@@ -15,11 +20,6 @@ from client_feed.sources.tasks import (
     read_tasks,
     waiting_on,
 )
-from shared.project_layout import tasks_db
-
-from client_feed.contract import Source, TaskStatus, WaitingOn
-from client_feed.sources.events import OpenEscalations, read_open_escalations
-from client_feed.sources.store import StoreProblem, StoreReadError
 
 SHA = 'd' * 40
 NO_ESCALATIONS = OpenEscalations(by_task={})
