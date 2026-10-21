@@ -1000,7 +1000,7 @@ async def triage_write(
             memory_service, decision, results,
             content=content, project_id=project_id, judged=judged,
         )
-    except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
+    except Exception as exc:  # C1: nothing escapes this path.
         _record_fail_open(counter, project_id, exc, stage='attach_guard')
         return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
 
