@@ -21,8 +21,8 @@ from escalation.server import create_server
 from escalation.sha_citations import MAX_CITED_SHAS_RESOLVED
 
 try:
-    from orchestrator.config import GitConfig  # type: ignore[reportMissingImports]
-    from orchestrator.git_ops import GitOps  # type: ignore[reportMissingImports]
+    from orchestrator.config import GitConfig
+    from orchestrator.git_ops import GitOps
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
