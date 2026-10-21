@@ -12,16 +12,19 @@ The decision is made by an LLM against a layered corpus of existing tasks (revie
 anchor + module-lock pool + embedding neighbors + dependency neighbors). See
 docs/reify-task-fragmentation-report-2026-04-11.txt for the motivating analysis.
 
-The curator is best-effort: any failure (embedder, Qdrant, LLM, taskmaster) degrades
-to ``action="create"`` so task creation is never blocked. The one exception is an
-account pool that cannot serve — every account capped past the cap-retry patience,
-or none admissible at call start: that yields ``action="defer"``
-(:meth:`CuratorDecision.deferred`) for each LLM-bound candidate, which the
-interceptor parks for a later attempt instead of creating anything un-deduped.
+When the curator cannot judge a candidate it returns ``action="defer"``
+(:meth:`CuratorDecision.deferred`, with a
+:class:`~fused_memory.middleware.curation_deferral.DeferReason`) rather than creating
+anything un-deduped: its account pool cannot serve, its corpus assembly fails, its LLM
+call fails, or its zero-output breaker is open. The interceptor parks a deferred
+submission and retries it until it gets a verdict, so task creation is never blocked
+and never silently skips dedupe. A response that arrives but cannot be used still
+degrades to ``action="create"``, marked ``degraded``.
 
 A timed-out LLM call is classified from its own transcript when the curator is gated
-(task 3995): a pre-turn stall (0 assistant turns) degrades to create and files a ZOT
-escalation that folds into one record per project; a run killed with progress returns
+(task 3995): a pre-turn stall (0 assistant turns) is the one outage that still creates,
+marked ``degraded_by_zot``, and files a ZOT escalation that folds into one record per
+project; a run killed with progress returns
 a verdict the CLI accepted (its ``structured_output`` attachment) if the transcript
 holds one, else escalates with its real turn count and tool sequence; any non-schema
 tool use logs a loud WARNING. A schema-tool denial is always escalated, never salvaged.
@@ -175,8 +178,8 @@ def exception_summary(exc: BaseException) -> str:
 # operator-curated YAML registry; the model must never be able to emit either.
 # 'refuse' in particular means "this candidate's premise is dead — create
 # NOTHING", which is deliberately distinct from 'drop' ("fold into existing
-# target task N", which requires a target). 'defer' — "the pool could not serve,
-# judge this again later" — is built only by CuratorDecision.deferred.
+# target task N", which requires a target). 'defer' — "the curator could not
+# judge this, judge it again later" — is built only by CuratorDecision.deferred.
 Action = Literal['drop', 'combine', 'create', 'route_deterministic', 'refuse', 'defer']
 
 _STATUS_RANK = {
@@ -1819,9 +1822,13 @@ class TaskCurator:
     ) -> CuratorDecision:
         """Render a drop/combine/create decision for a candidate task.
 
-        Best-effort: any internal failure returns a ``create`` decision with the
-        failure reason in ``justification``, except an account pool that cannot
-        serve, which returns :meth:`CuratorDecision.deferred`. Never raises.
+        When the candidate cannot be judged — the account pool cannot serve, the
+        corpus cannot be assembled, the LLM call fails, or the zero-output
+        breaker is open — this returns :meth:`CuratorDecision.deferred`. A
+        zero-output hang on this candidate's own call is the one outage that
+        creates (``degraded_by_zot``), and an unusable response degrades to a
+        ``create``. A failed LLM call is reported to the escalator, which
+        re-raises :class:`CuratorFailureError` when no orchestrator is running.
 
         *prepared* hands over a corpus the caller already assembled, so it is
         not assembled twice.  :meth:`curate_batch_prepared`'s size-1
@@ -1895,19 +1902,15 @@ class TaskCurator:
         now = time.monotonic()
         if self._zero_output_breaker_open(now):
             logger.warning(
-                'task_curator: zero-output-breaker open — short-circuiting '
-                'curator LLM call for candidate %r (consecutive ZOTs=%d)',
+                'task_curator: zero-output-breaker open — deferring curation '
+                'for candidate %r (consecutive ZOTs=%d)',
                 candidate.title,
                 self._consecutive_zero_output_timeouts,
             )
-            return await self._degraded_create(
-                justification='zero-output-breaker-open',
+            return CuratorDecision.deferred(
+                DeferReason.ZERO_OUTPUT_BREAKER_OPEN,
                 pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-                start=start,
-                candidate=candidate,
-                project_id=project_id,
-                project_root=project_root,
-                degraded_by_zot=True,
+                latency_ms=int((time.monotonic() - start) * 1000),
             )
 
         if prepared is not None and prepared.corpus_error is None:
@@ -1921,22 +1924,16 @@ class TaskCurator:
                 )
             except Exception as exc:
                 logger.warning(
-                    'task_curator: corpus assembly failed, falling through to create: %s',
+                    'task_curator: corpus assembly failed, deferring curation of %r: %s',
+                    candidate.title,
                     exc,
                     exc_info=True,
                 )
-                decision = await self._degraded_create(
-                    justification=f'corpus-failed: {exception_summary(exc)}',
-                    pool_sizes={
-                        'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
-                    },
-                    start=start,
-                    candidate=candidate,
-                    project_id=project_id,
-                    project_root=project_root,
+                return CuratorDecision.deferred(
+                    DeferReason.CORPUS_FAILED,
+                    pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                    latency_ms=int((time.monotonic() - start) * 1000),
                 )
-                self._store_cache(payload_hash, decision)
-                return decision
 
         # Render the LLM call. A genuine LLM failure raises
         # CuratorFailureError; route it through the escalator if one was
@@ -1994,33 +1991,36 @@ class TaskCurator:
                     tools_used=exc.tools_used,
                 )
             else:
-                logger.warning(
-                    'task_curator: LLM failure with no escalator wired — '
-                    'falling through to create: %s',
-                    exc,
-                )
+                logger.warning('task_curator: LLM failure with no escalator wired: %s', exc)
             if exc.zero_output_timeout:
                 # Capture a fresh timestamp so the cooldown window is measured
                 # from when the failure was observed, not from before the
                 # (potentially 180s) hung LLM call started.
                 self._record_zero_output_timeout(time.monotonic())
-            decision = await self._degraded_create(
-                justification='llm-error-escalated',
-                pool_sizes=pool_sizes,
-                start=start,
-                candidate=candidate,
-                project_id=project_id,
-                project_root=project_root,
-                degraded_by_zot=exc.zero_output_timeout,
-                zot_escalation_id=zot_escalation_id if exc.zero_output_timeout else None,
-            )
+                decision = await self._degraded_create(
+                    justification='llm-error-escalated',
+                    pool_sizes=pool_sizes,
+                    start=start,
+                    candidate=candidate,
+                    project_id=project_id,
+                    project_root=project_root,
+                    degraded_by_zot=True,
+                    zot_escalation_id=zot_escalation_id,
+                )
+            else:
+                logger.warning(
+                    'task_curator: LLM call failed, deferring curation of %r', candidate.title,
+                )
+                decision = CuratorDecision.deferred(
+                    DeferReason.LLM_FAILED,
+                    pool_sizes=pool_sizes,
+                    latency_ms=int((time.monotonic() - start) * 1000),
+                )
         except Exception as exc:
-            # An exception class nobody anticipated: degrade AND report, like
-            # the named arms. A silent create here is indistinguishable
-            # downstream from a healthy one.
+            # An exception class nobody anticipated: defer AND report, like
+            # the named arms.
             logger.warning(
-                'task_curator: LLM call failed with unexpected %s, '
-                'falling through to create: %s',
+                'task_curator: LLM call failed with unexpected %s, deferring curation: %s',
                 type(exc).__name__,
                 exc,
                 exc_info=True,
@@ -2037,13 +2037,10 @@ class TaskCurator:
                     subtype=f'unexpected-exception:{type(exc).__name__}',
                     pool_sizes=pool_sizes,
                 )
-            decision = await self._degraded_create(
-                justification=f'llm-failed: {exception_summary(exc)}',
+            decision = CuratorDecision.deferred(
+                DeferReason.LLM_FAILED,
                 pool_sizes=pool_sizes,
-                start=start,
-                candidate=candidate,
-                project_id=project_id,
-                project_root=project_root,
+                latency_ms=int((time.monotonic() - start) * 1000),
             )
 
         self._store_cache(payload_hash, decision)

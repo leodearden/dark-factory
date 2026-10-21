@@ -28,6 +28,7 @@ from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir, reset_sweep_once
 from shared.usage_gate import UsageGate
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
+from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
@@ -681,7 +682,7 @@ class TestCuratorTranscriptSalvage:
 
         decision = await _curate(curator, invoke)
 
-        assert decision.action == 'create'
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
         assert _reported_failure(escalator)['subtype'] == 'error_timeout_killed_with_progress'
 
     @pytest.mark.asyncio
@@ -695,7 +696,7 @@ class TestCuratorTranscriptSalvage:
         with patch(_EVIDENCE_READ, return_value=salvageable):
             decision = await _curate(curator, invoke)
 
-        assert decision.action == 'create'
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
         escalator.report_failure.assert_awaited_once()
 
 
@@ -860,7 +861,7 @@ class TestSalvageRequiresAKilledRunWithAnAcceptedVerdict:
         with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
             decision = await _curate(curator, invoke)
 
-        assert decision.action == 'create'
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
         report = _reported_failure(escalator)
         assert report['schema_tool_denied'] is failure.schema_tool_denied
         assert report['subtype'] == failure.subtype
@@ -914,7 +915,7 @@ class TestGatedSchemaToolDenialEscalates:
 
         decision = await _curate(curator, invoke)
 
-        assert decision.action == 'create'
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
         assert _reported_failure(escalator)['schema_tool_denied'] is True
 
     @pytest.mark.asyncio
@@ -929,6 +930,6 @@ class TestGatedSchemaToolDenialEscalates:
 
         decisions = [await _curate(curator, invoke, title) for title in 'ABCD']
 
-        assert decisions[1].action == 'create'
+        assert decisions[1].defer_reason is DeferReason.LLM_FAILED
         assert invoke.await_count == 3
-        assert decisions[3].justification == 'zero-output-breaker-open'
+        assert decisions[3].defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
