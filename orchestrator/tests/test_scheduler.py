@@ -13547,9 +13547,9 @@ class TestConsultAlreadyLanded:
 
         await scheduler._consult_already_landed([candidate])
 
-        gate.assert_awaited_once()
-        assert gate.await_args.kwargs['task'] is candidate
-        assert gate.await_args.kwargs['tick_view'] is None
+        (call,) = gate.await_args_list
+        assert call.kwargs['task'] is candidate
+        assert call.kwargs['tick_view'] is None
 
     async def test_a_raising_reader_fails_open_to_per_candidate_reads(self, caplog):
         caplog.set_level('WARNING')
@@ -13622,9 +13622,9 @@ class TestAcquireNextAlreadyLandedGate:
 
         assert result is None, 'a gated task must not be dispatched this tick'
         assert 'Z' not in scheduler._dispatched
-        gate.assert_awaited_once()
-        assert gate.await_args.args == ('Z',)
-        assert gate.await_args.kwargs['task']['id'] == 'Z'
+        (call,) = gate.await_args_list
+        assert call.args == ('Z',)
+        assert call.kwargs['task']['id'] == 'Z'
 
     async def test_gate_false_dispatches_normally(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
@@ -13639,9 +13639,9 @@ class TestAcquireNextAlreadyLandedGate:
         assert result is not None
         assert result.task_id == 'Z'
         assert 'Z' in scheduler._dispatched
-        gate.assert_awaited_once()
-        assert gate.await_args.args == ('Z',)
-        assert gate.await_args.kwargs['task']['id'] == 'Z'
+        (call,) = gate.await_args_list
+        assert call.args == ('Z',)
+        assert call.kwargs['task']['id'] == 'Z'
 
     async def test_gated_pinned_candidate_is_not_dispatched(self, tmp_path):
         """Pin-loop parity: a gated PINNED candidate must also be skipped."""

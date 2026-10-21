@@ -11,7 +11,7 @@ import random
 import re
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -43,6 +43,7 @@ from shared.task_statuses import TaskStatus
 from shared.task_submit import SubmitFailed, SubmitOutcome, parse_submit_task_result
 
 from orchestrator import git_ops
+from orchestrator.already_landed_tick_view import AlreadyLandedGate, AlreadyLandedTickView
 from orchestrator.anchor_coverage_gate import AnchorCoverageGate
 from orchestrator.config import (
     DEFAULT_TIER,
@@ -688,6 +689,7 @@ class SchedulerCallbacks:
     on_warm_base_promote_l2: Callable[..., Any] | None = None
     on_warm_base_resolve: Callable[..., Any] | None = None
     suppress_blocked_write: Callable[[str], bool] | None = None
+    read_already_landed_tick_view: Callable[[], Awaitable[AlreadyLandedTickView]] | None = None
 
 
 def _render_retry_cap_report(
@@ -2775,11 +2777,12 @@ class Scheduler:
         # / merge-marker / content-equivalence) rather than this
         # orchestrator's own merge queue, so it also catches OUT-OF-BAND
         # landings (sibling direct-merge, prior run, squash/rebase/manual).
-        # Signature: (task_id: str) -> bool (async). True means the task is
+        # Signature: (task_id: str, *, task=None, tick_view=None) -> bool
+        # (async; AlreadyLandedGate). True means the task is
         # already fully landed on main and has been driven to done inline by
         # the hook's own routine, so acquire_next() must NOT dispatch it this
         # tick. Default None so bare-Scheduler unit tests are unaffected.
-        self._already_landed_gate: Callable[[str], Any] | None = None
+        self._already_landed_gate: AlreadyLandedGate | None = None
         # --- Snapshot write throttle (task 1332) ---
         # Test-injectable override for the _write_snapshot_best_effort write
         # target (task 2418).  None (default) preserves current behavior: the
@@ -6209,9 +6212,15 @@ class Scheduler:
         candidate alone (treated as not-gated) and can neither abort the
         tick nor stop the remaining candidates from being consulted
         (PROPERTY 1).
+
+        The per-tick view is read once per consult and may be ``None``, in
+        which case the gate does its own per-candidate reads.
         """
         if self._already_landed_gate is None:
             return set()
+        if not candidates:
+            return set()
+        tick_view = await self._read_already_landed_tick_view()
         gated: set[str] = set()
         for t in candidates:
             if self.is_deterministic(t):
@@ -6221,7 +6230,9 @@ class Scheduler:
                 continue
             tid = str(t.get('id', ''))
             try:
-                gated_now = await self._already_landed_gate(tid)
+                gated_now = await self._already_landed_gate(
+                    tid, task=t, tick_view=tick_view,
+                )
             except Exception:
                 logger.warning(
                     'Already-landed dispatch gate raised for task_id=%s — '
@@ -6235,6 +6246,21 @@ class Scheduler:
             if gated_now:
                 gated.add(tid)
         return gated
+
+    async def _read_already_landed_tick_view(self) -> AlreadyLandedTickView | None:
+        reader = self._callbacks.read_already_landed_tick_view
+        if reader is None:
+            return None
+        try:
+            return await reader()
+        except Exception:
+            logger.warning(
+                'Already-landed tick view read raised — failing open (the '
+                'gate does its own per-candidate reads this tick) so a git '
+                'hiccup can NEVER abort the tick (PROPERTY 1)',
+                exc_info=True,
+            )
+            return None
 
     # ---- acquire_next tick phases (W10-β) ----
     #
