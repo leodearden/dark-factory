@@ -329,11 +329,6 @@ _ALLOWED_RENAMERS = {
         'writer of the legibility pipeline\'s canonical registry, and '
         'byte-stable given byte-stable input so a no-change night commits '
         'nothing — a migration must not perturb either property.',
-    ('scripts/legibility/trickle_state.py', '_write_state'):
-        'Out of task 3223 enumerated scope; left alone deliberately. '
-        'Same-directory mkstemp + os.replace of the trickle-state document the '
-        'function also returns; ordinary write path with no seam of its own. '
-        'The writer is shared by record_run and record_retry (task 5678).',
     ('scripts/migrate_transcript_archive_gunzip.py', 'gunzip_one'):
         'PRE-REPLACE SEAM, and the same one already recorded above for shared '
         'transcript_archive._archive_one — cited rather than re-argued. It '

@@ -28,6 +28,7 @@ from pathlib import Path
 # package context): see check_trickle_progress.py's identical shim.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import state_docs
 import trickle_state
 
 USAGE = 'usage: check_census_progress.py <project_id> [max_unadvanced_fires]'
@@ -119,26 +120,26 @@ def main(argv: list[str]) -> int:
     project_id, threshold = parsed
 
     path = trickle_state.trickle_state_path(project_id)
-    status, doc = trickle_state.load_state(path)
-    if status == 'missing':
+    read = trickle_state.load_state(path)
+    if isinstance(read, state_docs.Missing):
         return _fail(
             f'legibility trickle for {project_id} has never recorded a run '
             f'(no state file at {path}), so census progress cannot be '
             f"assessed; the recorder's health is check_trickle_progress.py's "
             f'verdict.'
         )
-    if status != 'ok' or doc is None:
+    if not isinstance(read, state_docs.Ok):
         return _fail(
             f'legibility trickle state for {project_id} is unreadable/corrupt '
             f'at {path}, so census progress cannot be assessed; see '
             f'check_trickle_progress.py.'
         )
 
-    streak = trickle_state.read_census_fire_streak(doc)
+    streak = read.value.census_fire_streak
     if streak is None or streak.fires < threshold:
         print(
             f'OK: census trigger for {project_id}: census_fired='
-            f'{doc.get("census_fired")}, '
+            f'{read.value.census_fired}, '
             f'fires={0 if streak is None else streak.fires} '
             f'(threshold {threshold}).'
         )

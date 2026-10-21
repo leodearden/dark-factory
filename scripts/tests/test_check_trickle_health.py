@@ -343,7 +343,7 @@ def _seed_state(project_id, *, outcomes, last_recorded_at=None):
         'failed': (1, dict(selected_count=1)),
     }
     now = last_recorded_at if last_recorded_at is not None else datetime.now(UTC)
-    doc = None
+    state = None
     for i, outcome in enumerate(outcomes):
         exit_code, extra = counters[outcome]
         full = dict(
@@ -351,26 +351,20 @@ def _seed_state(project_id, *, outcomes, last_recorded_at=None):
             budget_skipped=0, selected_count=0,
         )
         full.update(extra)
-        doc = trickle_state.record_run(
+        state = trickle_state.record_run(
             project_id,
-            target_date=date(2026, 7, 1),
-            recorded_at=now - timedelta(days=(len(outcomes) - 1 - i)),
-            exit_code=exit_code,
-            total_records=sum(full.values()),
-            # Passed explicitly, not left to record_run's defaults: without
-            # them pyright matches this `**full` spread (a dict[str, int])
-            # against the bool-typed `commit_made`/`budget_suppressed`/`capped`/
-            # `scheduled` parameters and errors. Mirrors
-            # `test_trickle_state.py::_record`, which spreads a counter dict
-            # the same way and stays type-clean for exactly this reason.
-            commit_made=False,
-            budget_suppressed=False,
-            capped=False,
-            scheduled=False,
-            census=None,
-            **full,
+            trickle_state.NightRun(
+                target_date=date(2026, 7, 1),
+                recorded_at=now - timedelta(days=(len(outcomes) - 1 - i)),
+                exit_code=exit_code,
+                counters=trickle_state.RunCounters(
+                    total_records=sum(full.values()), **full
+                ),
+                census=None,
+            ),
+            barren_escalated=False,
         )
-    return doc
+    return state
 
 
 class TestEscalation:
@@ -960,15 +954,21 @@ class TestTheDefaultRunnersReallyExecute:
         for day in (1, 2, 3):
             trickle_state.record_run(
                 'dark_factory',
-                target_date=date(2026, 9, day),
-                recorded_at=datetime.now(UTC),
-                exit_code=0, total_records=0, zero_signal_dropped=0,
-                dedupe_collapsed=0, below_sampling_cut=0, budget_skipped=0,
-                selected_count=0,
-                census=trickle_state.CensusObservation(
-                    fired=True, last_census_at='2026-08-02',
-                    census_state_path=str(census_state),
+                trickle_state.NightRun(
+                    target_date=date(2026, 9, day),
+                    recorded_at=datetime.now(UTC),
+                    exit_code=0,
+                    counters=trickle_state.RunCounters(
+                        total_records=0, zero_signal_dropped=0,
+                        dedupe_collapsed=0, below_sampling_cut=0,
+                        budget_skipped=0, selected_count=0,
+                    ),
+                    census=trickle_state.CensusObservation(
+                        fired=True, last_census_at='2026-08-02',
+                        census_state_path=str(census_state),
+                    ),
                 ),
+                barren_escalated=False,
             )
 
         returncode, output = check_trickle_health._default_census_runner(

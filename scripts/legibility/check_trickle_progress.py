@@ -64,7 +64,8 @@ from pathlib import Path
 # predicate at DISPATCH time, not at test time.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import trickle_state  # noqa: E402  (must follow the sys.path shim above)
+import state_docs  # noqa: E402  (must follow the sys.path shim above)
+import trickle_state  # noqa: E402
 
 USAGE = (
     'usage: check_trickle_progress.py <project_id> <max_barren_runs> '
@@ -98,11 +99,11 @@ def main(argv: list[str]) -> int:
         return 1
 
     path = trickle_state.trickle_state_path(project_id)
-    status, doc = trickle_state.load_state(path)
+    read = trickle_state.load_state(path)
 
     # 1. Never recorded a run at all. Distinct from a barren streak: the
     #    recorder itself has never fired for this project.
-    if status == 'missing':
+    if isinstance(read, state_docs.Missing):
         print(
             f'ERROR: legibility trickle for {project_id} has never recorded '
             f'a run (no state file at {path}). Either the nightly pipeline '
@@ -114,7 +115,7 @@ def main(argv: list[str]) -> int:
 
     # 2. Recorded, but the record cannot be read. Fail loud rather than
     #    guessing at a verdict from a document we do not understand.
-    if status != 'ok' or doc is None:
+    if not isinstance(read, state_docs.Ok):
         print(
             f'ERROR: legibility trickle state for {project_id} is '
             f'unreadable/corrupt at {path}. The pipeline may be healthy; the '
@@ -133,16 +134,8 @@ def main(argv: list[str]) -> int:
     #    readings of "fresh". The VERDICTS stay here: `None` means
     #    freshness cannot be assessed, and what that is worth is each
     #    caller's decision, not the helper's.
-    age_hours = trickle_state.recorded_age_hours(doc)
-
-    if age_hours is None:
-        print(
-            f'ERROR: legibility trickle state for {project_id} has an '
-            f'unparseable recorded_at {doc.get("recorded_at")!r} at {path}; '
-            f'freshness cannot be assessed.',
-            file=sys.stderr,
-        )
-        return 1
+    state = read.value
+    age_hours = trickle_state.recorded_age_hours(state)
 
     if age_hours > max_age_hours:
         print(
@@ -154,12 +147,14 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
-    streak = doc.get('consecutive_barren_runs')
-    streak = streak if isinstance(streak, int) else 0
-    outcome = doc.get('outcome')
-    counters = doc.get('counters') or {}
-    budget_skipped = counters.get('budget_skipped') or 0
-    below_sampling_cut = counters.get('below_sampling_cut') or 0
+    streak = state.consecutive_barren_runs
+    outcome = state.outcome
+    budget_skipped = state.counters.budget_skipped
+    below_sampling_cut = state.counters.below_sampling_cut
+    last_productive_at = (
+        None if state.last_productive_at is None
+        else state.last_productive_at.isoformat()
+    )
 
     # 4. Failed streak: the run did not COMPLETE, for max_failed_runs
     #    consecutive runs.
@@ -171,8 +166,7 @@ def main(argv: list[str]) -> int:
     #    failed runs rather than advancing it — so a barren streak read
     #    during a failure window is stale by construction. Report the
     #    failure first.
-    failed_streak = doc.get('consecutive_failed_runs')
-    failed_streak = failed_streak if isinstance(failed_streak, int) else 0
+    failed_streak = state.consecutive_failed_runs
 
     if failed_streak >= max_failed_runs:
         # WHERE the pipeline broke is CONDITIONAL on the recorded counter,
@@ -186,7 +180,7 @@ def main(argv: list[str]) -> int:
         # (selected_count=0)", a sentence contradicting itself inside its
         # own parenthesis, in the one verdict whose whole job is to steer
         # the remedy.
-        selected_count = counters.get('selected_count') or 0
+        selected_count = state.counters.selected_count
         if selected_count > 0:
             flow = (
                 f'Signal DID reach the digest stage '
@@ -212,10 +206,10 @@ def main(argv: list[str]) -> int:
             f'ERROR: legibility trickle for {project_id} has not COMPLETED '
             f'for {failed_streak} consecutive runs (threshold '
             f'{max_failed_runs}); last recorded exit_code='
-            f'{doc.get("exit_code")}. {flow} Remedy: read '
+            f'{state.exit_code}. {flow} Remedy: read '
             f'journalctl --user -u legibility-trickle@{project_id} --since '
             f"'{failed_streak + 1} days ago'. "
-            f'last_productive_at={doc.get("last_productive_at")}. '
+            f'last_productive_at={last_productive_at}. '
             f'State file: {path}',
             file=sys.stderr,
         )
@@ -240,7 +234,7 @@ def main(argv: list[str]) -> int:
     #    a "barren" run, and a closing sentence telling the operator that
     #    the state the writer produces by design is impossible.
     if streak >= max_barren_runs:
-        if outcome == trickle_state.OUTCOME_BARREN:
+        if outcome == trickle_state.RunOutcome.BARREN:
             # Door-SPECIFIC remedy. SampleResult's docstring is explicit
             # that the two doors have different fixes: raising the byte
             # budget recovers a budget_skipped record and does nothing
@@ -285,7 +279,7 @@ def main(argv: list[str]) -> int:
                 f'ERROR: legibility trickle for {project_id} is carrying a '
                 f'barren streak of {streak} runs forward (threshold '
                 f'{max_barren_runs}) under a last recorded outcome of '
-                f'{outcome!r}: the barren streak is UNRESOLVED, and the '
+                f'{outcome.value!r}: the barren streak is UNRESOLVED, and the '
                 f'recorded doors (below_sampling_cut={below_sampling_cut} '
                 f'budget_skipped={budget_skipped}) describe that '
                 f'{outcome} run rather than the barren ones, so no '
@@ -296,7 +290,7 @@ def main(argv: list[str]) -> int:
                 f'this probe once a run has COMPLETED and re-observed the '
                 f'sampling/budget doors. consecutive_failed_runs='
                 f'{failed_streak} (threshold {max_failed_runs}). '
-                f'last_productive_at={doc.get("last_productive_at")}. '
+                f'last_productive_at={last_productive_at}. '
                 f'State file: {path}'
             )
 
@@ -313,7 +307,7 @@ def main(argv: list[str]) -> int:
         f'(threshold {max_barren_runs}), '
         f'consecutive_failed_runs={failed_streak} '
         f'(threshold {max_failed_runs}), '
-        f'last_productive_at={doc.get("last_productive_at")}.'
+        f'last_productive_at={last_productive_at}.'
     )
     return 0
 

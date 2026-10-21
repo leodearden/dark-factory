@@ -23,7 +23,6 @@ import subprocess
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 from legibility import trickle_state
 
@@ -114,15 +113,12 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
     monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / "state"))
     stamp = recorded_at or datetime.now(UTC)
 
-    doc = None
+    state = None
     for i, outcome in enumerate(outcomes):
         # Space earlier runs a day apart, ending on `stamp`.
         at = stamp - timedelta(days=(len(outcomes) - 1 - i))
         entry_exit_code, counters = _SEED_OUTCOMES[outcome]
-        # Annotated: without it the counter values infer as a narrow union
-        # that pyright then checks positionally against record_run's later
-        # keyword parameters when splatted as **full.
-        full: dict[str, Any] = dict(
+        full: dict[str, int] = dict(
             zero_signal_dropped=0, dedupe_collapsed=0, below_sampling_cut=0,
             budget_skipped=0, selected_count=0,
         )
@@ -130,15 +126,18 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
         # conservation identity by construction.
         full.update(counters)
         full["total_records"] = sum(full.values())
-        doc = trickle_state.record_run(
+        state = trickle_state.record_run(
             project_id,
-            target_date=at.date() if hasattr(at, "date") else date(2026, 7, 1),
-            recorded_at=at,
-            exit_code=entry_exit_code,
-            census=None,
-            **full,
+            trickle_state.NightRun(
+                target_date=at.date(),
+                recorded_at=at,
+                exit_code=entry_exit_code,
+                counters=trickle_state.RunCounters(**full),
+                census=None,
+            ),
+            barren_escalated=False,
         )
-    return doc
+    return state
 
 
 def _assert_no_git(git_marker):
@@ -188,12 +187,17 @@ def test_probe_reads_the_path_the_writer_wrote_under_a_divergent_environment(
     monkeypatch.setenv("HOME", str(tmp_path / "writer-home"))
     trickle_state.record_run(
         "dark_factory",
-        target_date=date(2026, 7, 1),
-        recorded_at=datetime.now(UTC),
-        exit_code=0,
-        total_records=2, zero_signal_dropped=0, dedupe_collapsed=0,
-        below_sampling_cut=0, budget_skipped=0, selected_count=2,
-        census=None,
+        trickle_state.NightRun(
+            target_date=date(2026, 7, 1),
+            recorded_at=datetime.now(UTC),
+            exit_code=0,
+            counters=trickle_state.RunCounters(
+                total_records=2, zero_signal_dropped=0, dedupe_collapsed=0,
+                below_sampling_cut=0, budget_skipped=0, selected_count=2,
+            ),
+            census=None,
+        ),
+        barren_escalated=False,
     )
 
     # Asserted, not assumed: both sides must land on ONE tmp root. That is

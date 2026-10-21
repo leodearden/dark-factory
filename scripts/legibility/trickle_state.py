@@ -42,7 +42,6 @@ that let a suppressed night read like a quiet one for 14 nights
 """
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import json
 import logging
@@ -698,224 +697,242 @@ def due_retries(state: TrickleState, *, today: date) -> tuple[date, ...]:
 
 
 # ---------------------------------------------------------------------------
-# record_run — the writer
+# Barren policy — the threshold predicate and each door's remedy
 # ---------------------------------------------------------------------------
 
-def record_run(
-    project_id: str,
-    *,
-    target_date: date,
-    recorded_at: datetime,
-    exit_code: int,
-    total_records: int,
-    zero_signal_dropped: int,
-    dedupe_collapsed: int,
-    below_sampling_cut: int,
-    budget_skipped: int,
-    selected_count: int,
-    applied: int = 0,
-    commit_made: bool = False,
-    budget_suppressed: bool = False,
-    capped: bool = False,
-    scheduled: bool = False,
-    census: CensusObservation | None,
-) -> dict:
-    """Classify this run, fold it into the running streak, and write the
-    state file atomically. Returns the document it wrote.
+def barren_streak_due(state: TrickleState, max_runs: int) -> bool:
+    """Whether *state*'s barren streak has reached *max_runs*: the one
+    threshold predicate the nightly's escalation and the progress probe's
+    verdict are both built from."""
+    return state.consecutive_barren_runs >= max_runs
 
-    The run is also folded into ``retry_backlog`` by
-    :func:`fold_retry_backlog`, so a date whose pass did not finish stays
-    owed a run.
 
-    A *scheduled* pass advances ``last_scheduled_target_date`` to its
-    target, never backwards, and owes, with 0 attempts, the
-    :func:`never_run_dates` since the previous scheduled pass. A manual
-    pass neither moves that cursor nor owes them, because it rewrites
-    ``target_date`` (the backfill case).
+class BarrenDoor(StrEnum):
+    """A counter only real, distinct, non-duplicate signal leaves by; a
+    barren night has at least one open."""
 
-    ``recorded_at`` is an INJECTED parameter, not a ``datetime.now()``
-    inside this function, so the whole module stays clock-injectable and
-    streak/freshness tests need no time faking — mirroring
-    ``nightly.run_nightly``'s existing ``now=`` seam and
-    ``census_trigger.evaluate_census_step``'s clock seam.
+    BUDGET = 'budget_skipped'
+    SAMPLING_CUT = 'below_sampling_cut'
 
-    Streak semantics: ``consecutive_barren_runs`` is the previous value
-    plus one when this run is barren, and 0 otherwise. BOTH ``productive``
-    and ``quiet`` reset it — a legitimately quiet night is not evidence of
-    breakage, which is PRD decision 7's no-false-alarm guarantee expressed
-    in the streak rather than only in the classifier.
 
-    ``failed`` is the exception: it neither increments nor resets
-    ``consecutive_barren_runs``, it CARRIES IT FORWARD. A crashed run is
-    evidence about the RUN, not about whether signal is flowing.
-    Resetting would let a permanently broken pipeline erase a real barren
-    streak — the same silent-degradation shape one layer up; incrementing
-    would attribute an absence the sampler never observed, since the run
-    did not finish and its counters describe an unfinished night.
+BARREN_REMEDIES: Mapping[BarrenDoor, str] = MappingProxyType({
+    BarrenDoor.BUDGET: (
+        'raise budgets.max_daily_digest_bytes (candidates competed for '
+        'budget and were ALL discarded on it)'
+    ),
+    BarrenDoor.SAMPLING_CUT: (
+        'raise sampling.top_fraction or sampling.per_stratum_min (these '
+        'records ranked below their stratum cut and never competed for '
+        'budget, so a bigger byte budget will not recover them)'
+    ),
+})
+"""The one spelling of each door's remedy. They differ because a bigger
+byte budget recovers a budget-skipped record and never a sampling-cut one
+(``sampling.SampleResult``)."""
 
-    ``failed`` gets its OWN counter rather than being folded into the
-    barren one because the two have genuinely DIFFERENT remedies — the
-    same reason ``SampleResult`` keeps ``budget_skipped`` and
-    ``below_sampling_cut`` separate. Barren means "fix the budget or
-    sampling config"; failed means "read ``journalctl --user -u
-    legibility-trickle@<project>``".
+_NO_OPEN_DOOR_REMEDY = (
+    'inspect the recorded counters: no door counter is set, which should be '
+    'impossible for a barren run'
+)
 
-    ``scripts/legibility/nightly.py::_escalate_barren_streak`` is
-    UNAFFECTED by either. It returns early unless ``outcome ==
-    OUTCOME_BARREN``, so a failed run cannot fire it; and it gates on
-    EXACT equality with the threshold, which a carried-forward streak
-    still passes through at most once, so the carry-forward cannot
-    double-fire it either.
 
-    ``last_productive_at`` is stamped with ``recorded_at`` on a productive
-    run that :func:`finished` and carried forward UNCHANGED otherwise. It is
-    the field an operator reads to answer "when did this pipeline last
-    actually do anything", so a *capped* night, which built its digests and
-    coded none of them, still reads ``productive`` but is not stamped.
-
-    ``census_fire_streak`` counts consecutive FIREs against one unchanged
-    anchor (:class:`CensusObservation`): a FIRE with the streak's anchor and
-    path increments it, any other FIRE restarts it at 1, a NO-FIRE clears
-    it, and ``census=None`` (the trigger was not evaluated: the night failed
-    or was capped first) carries it forward, as ``failed`` carries the
-    barren streak. ``census`` is REQUIRED with no default, for the reason
-    :func:`classify_run` gives for ``exit_code``: a defaulted ``None`` would
-    silently blind ``check_census_progress.py`` into a permanent OK.
-
-    A ``missing`` or ``malformed`` predecessor simply starts the streak at
-    this run (and drops ``last_productive_at``): losing streak history
-    degrades to UNDER-reporting, never to a crash inside the nightly run.
-
-    The write is atomic: the payload goes to a ``.tmp`` sibling in the
-    SAME directory and is then ``os.replace``d onto the final path.
-    Same-directory is required — ``os.replace`` is only atomic within one
-    filesystem — and the tmp file is removed on any failure, so a crashed
-    write can never leave a partial document that ``load_state`` would
-    report as ``malformed``.
-    """
-    path = trickle_state_path(project_id)
-
-    read = load_state(path)
-    prev_status = 'ok' if isinstance(read, state_docs.Ok) else 'missing'
-    prev = read.value.to_json() if isinstance(read, state_docs.Ok) else None
-    prev_streak = 0
-    prev_failed = 0
-    last_productive_at = None
-    if prev_status == 'ok' and prev is not None:
-        raw_streak = prev.get('consecutive_barren_runs')
-        if isinstance(raw_streak, int) and raw_streak >= 0:
-            prev_streak = raw_streak
-        raw_failed = prev.get('consecutive_failed_runs')
-        if isinstance(raw_failed, int) and raw_failed >= 0:
-            prev_failed = raw_failed
-        raw_last = prev.get('last_productive_at')
-        if isinstance(raw_last, str):
-            last_productive_at = raw_last
-
-    outcome = classify_run(
-        exit_code=exit_code,
-        counters=RunCounters(
-            total_records=total_records,
-            zero_signal_dropped=zero_signal_dropped,
-            dedupe_collapsed=dedupe_collapsed,
-            below_sampling_cut=below_sampling_cut,
-            budget_skipped=budget_skipped,
-            selected_count=selected_count,
-        ),
-        capped=capped,
-    )
-
-    recorded_at_iso = recorded_at.isoformat()
-    if outcome == RunOutcome.PRODUCTIVE and finished(exit_code=exit_code, capped=capped):
-        last_productive_at = recorded_at_iso
-
-    cursor, never_run = _schedule_cursor(
-        project_id,
-        prev,
-        target_date=target_date,
-        today=recorded_at.date(),
-        scheduled=scheduled,
-    )
-
-    census_streak = _fold_census_fire_streak(
-        _parse_census_fire_streak(
-            None if prev is None else prev.get('census_fire_streak')
-        ),
-        census,
-        target_date,
-    )
-
-    doc = {
-        'schema_version': STATE_SCHEMA_VERSION,
-        'project_id': project_id,
-        'target_date': target_date.isoformat(),
-        'recorded_at': recorded_at_iso,
-        'exit_code': exit_code,
-        'outcome': outcome,
-        'applied': applied,
-        'commit_made': bool(commit_made),
-        'budget_suppressed': bool(budget_suppressed),
-        'capped': bool(capped),
-        'consecutive_barren_runs': (
-            prev_streak + 1 if outcome == RunOutcome.BARREN
-            else prev_streak if outcome == RunOutcome.FAILED
-            else 0
-        ),
-        'consecutive_failed_runs': (
-            prev_failed + 1 if outcome == RunOutcome.FAILED else 0
-        ),
-        'last_productive_at': last_productive_at,
-        'last_scheduled_target_date': cursor.isoformat() if cursor else None,
-        'census_fired': None if census is None else census.fired,
-        'census_fire_streak': (
-            None if census_streak is None
-            else dataclasses.asdict(census_streak)
-        ),
-        'counters': {
-            'total_records': total_records,
-            'zero_signal_dropped': zero_signal_dropped,
-            'dedupe_collapsed': dedupe_collapsed,
-            'below_sampling_cut': below_sampling_cut,
-            'budget_skipped': budget_skipped,
-            'selected_count': selected_count,
-        },
-        'retry_backlog': _next_retry_backlog(
-            project_id,
-            prev,
-            target_date=target_date,
-            recorded_at=recorded_at,
-            exit_code=exit_code,
-            capped=capped,
-            commit_made=commit_made,
-            never_run=never_run,
-        ),
+def barren_remedy(counters: RunCounters) -> str:
+    """The remedies of the doors *counters* shows open, budget first."""
+    door_counts = {
+        BarrenDoor.BUDGET: counters.budget_skipped,
+        BarrenDoor.SAMPLING_CUT: counters.below_sampling_cut,
     }
+    remedies = [BARREN_REMEDIES[door] for door, count in door_counts.items() if count > 0]
+    return '; '.join(remedies) or _NO_OPEN_DOOR_REMEDY
 
-    _write_state(path, doc)
-    return doc
+
+# ---------------------------------------------------------------------------
+# The writer
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class NightRun:
+    """One pass's facts, as the nightly hands them to :func:`record_run`.
+
+    ``census`` has no default: ``None`` means the census trigger was not
+    evaluated, and a defaulted ``None`` would silently blind
+    ``check_census_progress.py`` into a permanent OK."""
+
+    target_date: date
+    recorded_at: datetime
+    exit_code: int
+    counters: RunCounters
+    census: CensusObservation | None
+    applied: int = 0
+    commit_made: bool = False
+    budget_suppressed: bool = False
+    capped: bool = False
+    scheduled: bool = False
+
+    @property
+    def outcome(self) -> RunOutcome:
+        return classify_run(
+            exit_code=self.exit_code, counters=self.counters, capped=self.capped
+        )
+
+
+def read_prior(project_id: str) -> TrickleState | None:
+    """The recorded state for *project_id*, or ``None`` when it is missing
+    or malformed: a lost predecessor restarts the streaks at the next night,
+    which under-reports rather than crashing the nightly run."""
+    match load_state(trickle_state_path(project_id)):
+        case state_docs.Ok(value=state):
+            return state
+        case _:
+            return None
+
+
+class _NightFold(NamedTuple):
+    """A folded night, and what its folds abandoned for the writer to log."""
+
+    state: TrickleState
+    prior_cursor: date | None
+    never_run: NeverRun
+    abandoned: dict[date, int]
+
+
+def next_state(
+    prior: TrickleState | None, project_id: str, run: NightRun
+) -> TrickleState:
+    """The state recording *run* after *prior* would write. Pure: it reads
+    and writes nothing and logs nothing. ``barren_escalated`` is False here;
+    :func:`record_run` records the real value.
+
+    ==========  =============  =============  ======================
+    outcome     barren streak  failed streak  last_productive_at
+    ==========  =============  =============  ======================
+    productive  reset          reset          stamped with recorded_at
+    quiet       reset          reset          carried
+    barren      +1             reset          carried
+    failed      carried        +1             carried
+    deferred    carried        carried        carried
+    ==========  =============  =============  ======================
+
+    A failed night is evidence about the run, not about signal; a deferred
+    night coded nothing, so it observed neither. Moving a streak on either
+    would let a crash or cap weather erase a real streak or fake one.
+
+    A census FIRE against the streak's anchor and path increments
+    ``census_fire_streak``, any other FIRE restarts it at 1, a NO-FIRE
+    clears it and ``census=None`` carries it. A scheduled pass advances
+    ``last_scheduled_target_date`` (never backwards) and owes, with 0
+    attempts, the :func:`never_run_dates` since the previous scheduled pass;
+    a manual pass moves neither. A pass that :func:`owes_retry` enters or
+    counts its date in ``retry_backlog`` (:func:`fold_retry_backlog`)."""
+    return _fold_night(prior, project_id, run).state
+
+
+def _fold_night(
+    prior: TrickleState | None, project_id: str, run: NightRun
+) -> _NightFold:
+    outcome = run.outcome
+    today = run.recorded_at.date()
+    barren_streak, failed_streak = _fold_streaks(prior, outcome)
+    prior_cursor = None if prior is None else prior.last_scheduled_target_date
+    cursor, never_run = _schedule_cursor(
+        prior_cursor, target_date=run.target_date, today=today, scheduled=run.scheduled
+    )
+    retry = fold_retry_backlog(
+        {} if prior is None else prior.retry_backlog,
+        target_date=run.target_date,
+        owes_retry=owes_retry(
+            exit_code=run.exit_code, capped=run.capped, commit_made=run.commit_made
+        ),
+        today=today,
+        never_run=never_run.owed,
+    )
+    state = TrickleState(
+        project_id=project_id,
+        target_date=run.target_date,
+        recorded_at=run.recorded_at,
+        exit_code=run.exit_code,
+        outcome=outcome,
+        applied=run.applied,
+        commit_made=run.commit_made,
+        budget_suppressed=run.budget_suppressed,
+        capped=run.capped,
+        consecutive_barren_runs=barren_streak,
+        consecutive_failed_runs=failed_streak,
+        last_productive_at=(
+            run.recorded_at if outcome == RunOutcome.PRODUCTIVE
+            else None if prior is None
+            else prior.last_productive_at
+        ),
+        last_scheduled_target_date=cursor,
+        census_fired=None if run.census is None else run.census.fired,
+        census_fire_streak=_fold_census_fire_streak(
+            None if prior is None else prior.census_fire_streak,
+            run.census,
+            run.target_date,
+        ),
+        counters=run.counters,
+        retry_backlog=retry.backlog,
+        barren_escalated=False,
+    )
+    return _NightFold(state, prior_cursor, never_run, retry.abandoned)
+
+
+def _fold_streaks(
+    prior: TrickleState | None, outcome: RunOutcome
+) -> tuple[int, int]:
+    """``(consecutive_barren_runs, consecutive_failed_runs)`` after a night
+    with *outcome*."""
+    barren = 0 if prior is None else prior.consecutive_barren_runs
+    failed = 0 if prior is None else prior.consecutive_failed_runs
+    match outcome:
+        case RunOutcome.BARREN:
+            return barren + 1, 0
+        case RunOutcome.FAILED:
+            return barren, failed + 1
+        case RunOutcome.DEFERRED:
+            return barren, failed
+        case _:
+            return 0, 0
 
 
 def _schedule_cursor(
-    project_id: str,
-    prev: dict | None,
+    prior_cursor: date | None,
     *,
     target_date: date,
     today: date,
     scheduled: bool,
-) -> tuple[date | None, tuple[date, ...]]:
+) -> tuple[date | None, NeverRun]:
     """The schedule cursor to record, and the never-run dates this pass owes."""
-    prev_cursor = (
-        None if prev is None
-        else _parse_iso_date(prev.get('last_scheduled_target_date'))
-    )
+    nothing_owed = NeverRun(owed=(), expired=0)
     if not scheduled:
-        return prev_cursor, ()
-    if prev_cursor is None:
-        return target_date, ()
-    gap = never_run_dates(prev_cursor, target_date=target_date, today=today)
-    if gap.expired:
-        _warn_expired_never_run(project_id, prev_cursor, gap.expired)
-    return max(prev_cursor, target_date), gap.owed
+        return prior_cursor, nothing_owed
+    if prior_cursor is None:
+        return target_date, nothing_owed
+    return (
+        max(prior_cursor, target_date),
+        never_run_dates(prior_cursor, target_date=target_date, today=today),
+    )
+
+
+def record_run(
+    project_id: str, run: NightRun, *, barren_escalated: bool
+) -> TrickleState:
+    """Fold *run* into the recorded predecessor (:func:`next_state`), record
+    *barren_escalated* — whether the nightly escalated this night's barren
+    streak — write the document atomically and return it.
+
+    *barren_escalated* has no default: it is the fact the health probe reads
+    instead of re-deriving the nightly's threshold. The WARNINGs for owed
+    dates the folds abandon are logged here, once per write. An ``OSError``
+    from the write propagates."""
+    fold = _fold_night(read_prior(project_id), project_id, run)
+    today = run.recorded_at.date()
+    if fold.prior_cursor is not None and fold.never_run.expired:
+        _warn_expired_never_run(project_id, fold.prior_cursor, fold.never_run.expired)
+    _warn_abandoned_retries(project_id, fold.abandoned, today=today)
+    state = dataclasses.replace(fold.state, barren_escalated=barren_escalated)
+    state_docs.write_state(trickle_state_path(project_id), state)
+    return state
 
 
 def _warn_expired_never_run(
@@ -934,74 +951,10 @@ def _warn_expired_never_run(
     )
 
 
-def record_retry(
-    project_id: str,
-    *,
-    target_date: date,
-    recorded_at: datetime,
-    exit_code: int,
-    capped: bool,
-    commit_made: bool,
-) -> dict | None:
-    """Fold one RETRY pass of *target_date* into the recorded backlog.
-    Returns the document it wrote, or ``None`` when it wrote nothing.
-
-    A retry pass rewrites ONLY ``retry_backlog``, so the health record, and
-    the ``recorded_at`` freshness both probes read, keep describing the
-    scheduled night. With no readable predecessor there is no backlog to
-    fold into: it logs one WARNING and writes nothing."""
-    path = trickle_state_path(project_id)
-    read = load_state(path)
-    status = type(read).__name__
-    prev = read.value.to_json() if isinstance(read, state_docs.Ok) else None
-    if prev is None:
-        logger.warning(
-            'trickle state: cannot record retry of %s for project=%s: no '
-            'readable trickle state (%s)',
-            target_date.isoformat(),
-            project_id,
-            status,
-        )
-        return None
-
-    doc = {
-        **prev,
-        'retry_backlog': _next_retry_backlog(
-            project_id,
-            prev,
-            target_date=target_date,
-            recorded_at=recorded_at,
-            exit_code=exit_code,
-            capped=capped,
-            commit_made=commit_made,
-        ),
-    }
-    _write_state(path, doc)
-    return doc
-
-
-def _next_retry_backlog(
-    project_id: str,
-    prev: dict | None,
-    *,
-    target_date: date,
-    recorded_at: datetime,
-    exit_code: int,
-    capped: bool,
-    commit_made: bool,
-    never_run: tuple[date, ...] = (),
-) -> dict[str, int]:
-    today = recorded_at.date()
-    fold = fold_retry_backlog(
-        parse_retry_backlog(None if prev is None else prev.get('retry_backlog')),
-        target_date=target_date,
-        owes_retry=owes_retry(
-            exit_code=exit_code, capped=capped, commit_made=commit_made
-        ),
-        today=today,
-        never_run=never_run,
-    )
-    for owed, attempts in sorted(fold.abandoned.items()):
+def _warn_abandoned_retries(
+    project_id: str, abandoned: Mapping[date, int], *, today: date
+) -> None:
+    for owed, attempts in sorted(abandoned.items()):
         logger.warning(
             'trickle retry backlog: abandoning %s for project=%s after %d '
             'unfinished attempt(s), age %d day(s) (limits: %d attempts, %d '
@@ -1013,21 +966,49 @@ def _next_retry_backlog(
             RETRY_MAX_ATTEMPTS,
             RETRY_MAX_AGE_DAYS,
         )
-    return _serialize_retry_backlog(fold.backlog)
 
 
-def _write_state(path: Path, doc: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(path.name + '.tmp')
-    try:
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(doc, f, indent=2, sort_keys=True)
-            f.write('\n')
-        os.replace(tmp_path, path)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp_path.unlink()
-        raise
+def record_retry(
+    project_id: str,
+    *,
+    target_date: date,
+    recorded_at: datetime,
+    exit_code: int,
+    capped: bool,
+    commit_made: bool,
+) -> TrickleState | None:
+    """Fold one RETRY pass of *target_date* into the recorded backlog.
+    Returns the state it wrote, or ``None`` when it wrote nothing.
+
+    A retry pass rewrites ONLY ``retry_backlog``, so the health record, and
+    the ``recorded_at`` freshness both probes read, keep describing the
+    scheduled night. With no readable predecessor there is no backlog to
+    fold into: it logs one WARNING and writes nothing."""
+    path = trickle_state_path(project_id)
+    read = load_state(path)
+    if not isinstance(read, state_docs.Ok):
+        logger.warning(
+            'trickle state: cannot record retry of %s for project=%s: no '
+            'readable trickle state (%s)',
+            target_date.isoformat(),
+            project_id,
+            type(read).__name__.lower(),
+        )
+        return None
+
+    today = recorded_at.date()
+    fold = fold_retry_backlog(
+        read.value.retry_backlog,
+        target_date=target_date,
+        owes_retry=owes_retry(
+            exit_code=exit_code, capped=capped, commit_made=commit_made
+        ),
+        today=today,
+    )
+    _warn_abandoned_retries(project_id, fold.abandoned, today=today)
+    state = dataclasses.replace(read.value, retry_backlog=fold.backlog)
+    state_docs.write_state(path, state)
+    return state
 
 
 DEFAULT_MAX_BARREN_RUNS = 3

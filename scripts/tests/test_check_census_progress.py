@@ -95,22 +95,27 @@ def _seed(tmp_path, monkeypatch, *, nights, anchor: str | None = "2026-08-02",
     path = census_state_path or _census_state_path(tmp_path)
     stamp = recorded_at or datetime.now(UTC)
 
-    doc = None
+    state = None
     for i, night in enumerate(nights):
         exit_code, fired = _NIGHTS[night]
         census = None if fired is None else trickle_state.CensusObservation(
             fired=fired, last_census_at=anchor, census_state_path=str(path),
         )
-        doc = trickle_state.record_run(
+        state = trickle_state.record_run(
             project_id,
-            target_date=_FIRST_NIGHT + timedelta(days=i),
-            recorded_at=stamp - timedelta(days=len(nights) - 1 - i),
-            exit_code=exit_code,
-            total_records=1, zero_signal_dropped=1, dedupe_collapsed=0,
-            below_sampling_cut=0, budget_skipped=0, selected_count=0,
-            census=census,
+            trickle_state.NightRun(
+                target_date=_FIRST_NIGHT + timedelta(days=i),
+                recorded_at=stamp - timedelta(days=len(nights) - 1 - i),
+                exit_code=exit_code,
+                counters=trickle_state.RunCounters(
+                    total_records=1, zero_signal_dropped=1, dedupe_collapsed=0,
+                    below_sampling_cut=0, budget_skipped=0, selected_count=0,
+                ),
+                census=census,
+            ),
+            barren_escalated=False,
         )
-    return doc
+    return state
 
 
 def _assert_no_git(git_marker):

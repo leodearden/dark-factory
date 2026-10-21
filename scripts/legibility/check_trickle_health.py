@@ -484,7 +484,10 @@ def post_health_finding(
 
 
 def _should_escalate(
-    progress_ok: bool, doc, max_barren_runs: int, max_age_hours: int,
+    progress_ok: bool,
+    state: trickle_state.TrickleState | None,
+    max_barren_runs: int,
+    max_age_hours: int,
 ) -> bool:
     """Decide whether this invocation POSTS, as opposed to merely exiting
     non-zero. Narrower than the exit-code predicate, deliberately.
@@ -525,23 +528,20 @@ def _should_escalate(
     the nightly's edge-trigger by construction.
 
     ``missing``/``malformed`` are POST-WORTHY verdicts, not suppression
-    grounds — that is the recorder itself having stopped. An absent or
-    unparseable ``recorded_at`` (``age is None``) takes the same posture
-    and does NOT suppress: a record whose freshness cannot be assessed is
-    never evidence that anyone alarmed.
+    grounds — that is the recorder itself having stopped. An unparseable
+    ``recorded_at`` reads malformed, so it takes the same posture.
 
     This reads three FIELDS off the recorded document. It does not
     re-derive either probe's verdict, so INV-5 stays intact."""
     if progress_ok:
         return False
-    if not isinstance(doc, dict):
+    if state is None:
         return True
-    if doc.get('outcome') != trickle_state.OUTCOME_BARREN:
+    if state.outcome != trickle_state.RunOutcome.BARREN:
         return True
-    if doc.get('consecutive_barren_runs') != max_barren_runs:
+    if state.consecutive_barren_runs != max_barren_runs:
         return True
-    age = trickle_state.recorded_age_hours(doc)
-    return age is None or age > max_age_hours
+    return trickle_state.recorded_age_hours(state) > max_age_hours
 
 
 def _load_config(*, config_path, project_id):
@@ -576,12 +576,10 @@ def _load_and_decide(
     project_id: str, progress_ok: bool, max_barren_runs: int,
     max_age_hours: int,
 ) -> bool:
-    """Read the recorded doc and apply :func:`_should_escalate` to it."""
-    _status, doc = trickle_state.load_state(
-        trickle_state.trickle_state_path(project_id)
-    )
+    """Read the recorded state and apply :func:`_should_escalate` to it."""
     return _should_escalate(
-        progress_ok, doc, max_barren_runs, max_age_hours,
+        progress_ok, trickle_state.read_prior(project_id), max_barren_runs,
+        max_age_hours,
     )
 
 

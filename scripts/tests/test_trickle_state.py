@@ -36,6 +36,7 @@ import tempfile
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 import pytest
 from legibility import trickle_state
@@ -286,7 +287,7 @@ _T0 = datetime(2026, 7, 1, 3, 0, 0, tzinfo=UTC)
 
 def _state(**overrides) -> TrickleState:
     """A fully populated TrickleState: every optional field set."""
-    fields = dict(
+    fields: dict[str, Any] = dict(
         project_id='dark_factory',
         target_date=date(2026, 7, 1),
         recorded_at=_T0,
@@ -389,7 +390,9 @@ class TestTrickleStateCodec:
             'census_state_path': _CENSUS_STATE,
             'since': '2026-06-30',
         }
-        assert doc['counters']['selected_count'] == 2
+        assert doc['counters'] == _counters(
+            selected_count=2, zero_signal_dropped=4
+        ).to_json()
         assert doc['barren_escalated'] is True
 
     def test_the_backlog_is_read_only(self):

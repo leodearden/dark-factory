@@ -1097,18 +1097,18 @@ def _record_trickle_progress(
     records only its backlog fold: no streak escalation, no ``retry_due``.
     """
     recorded_at = now if now is not None else datetime.now(UTC)
-    doc = _record_run_state(
+    state = _record_run_state(
         cfg.project_id, sample, target_date, result,
         census=census, recorder=recorder, retry_recorder=retry_recorder,
         now=recorded_at, pass_kind=pass_kind,
     )
     if pass_kind is PassKind.RETRY:
         return
-    _escalate_barren_streak(cfg, doc, target_date, result, poster=poster)
-    if isinstance(doc, dict) and trickle_state.finished(
+    _escalate_barren_streak(cfg, state, target_date, result, poster=poster)
+    if state is not None and trickle_state.finished(
         exit_code=result.exit_code, capped=result.capped,
     ):
-        result.retry_due = trickle_state.due_retries(doc, today=recorded_at.date())
+        result.retry_due = trickle_state.due_retries(state, today=recorded_at.date())
 
 
 def _record_run_state(
@@ -1122,9 +1122,9 @@ def _record_run_state(
     retry_recorder,
     now: datetime | None,
     pass_kind: PassKind,
-) -> dict | None:
+) -> trickle_state.TrickleState | None:
     """Record one night through *recorder* (default
-    :func:`trickle_state.record_run`) and return the document it wrote, or
+    :func:`trickle_state.record_run`) and return the state it wrote, or
     ``None`` when the write failed. A ``PassKind.RETRY`` pass is recorded
     through *retry_recorder* (default :func:`trickle_state.record_retry`)
     instead.
@@ -1151,24 +1151,26 @@ def _record_run_state(
                 commit_made=result.commit_made,
             )
         record = recorder if recorder is not None else trickle_state.record_run
-        return record(
-            project_id,
+        run = trickle_state.NightRun(
             target_date=target_date,
             recorded_at=recorded_at,
             exit_code=result.exit_code,
-            total_records=sample.total_records,
-            zero_signal_dropped=sample.zero_signal_dropped,
-            dedupe_collapsed=sample.dedupe_collapsed,
-            below_sampling_cut=sample.below_sampling_cut,
-            budget_skipped=sample.budget_skipped,
-            selected_count=len(sample.selected),
+            counters=trickle_state.RunCounters(
+                total_records=sample.total_records,
+                zero_signal_dropped=sample.zero_signal_dropped,
+                dedupe_collapsed=sample.dedupe_collapsed,
+                below_sampling_cut=sample.below_sampling_cut,
+                budget_skipped=sample.budget_skipped,
+                selected_count=len(sample.selected),
+            ),
+            census=census,
             applied=result.applied,
             commit_made=result.commit_made,
             budget_suppressed=result.budget_suppressed,
             capped=result.capped,
             scheduled=pass_kind is PassKind.SCHEDULED,
-            census=census,
         )
+        return record(project_id, run, barren_escalated=False)
     except Exception as exc:  # noqa: BLE001 — deliberately total
         logger.warning(
             'legibility trickle: could not record run state for project=%s '
@@ -1181,7 +1183,7 @@ def _record_run_state(
 
 def _escalate_barren_streak(
     cfg: LegibilityConfig,
-    doc,
+    state: trickle_state.TrickleState | None,
     target_date: date,
     result: NightlyResult,
     *,
@@ -1232,36 +1234,17 @@ def _escalate_barren_streak(
     invert ``check_trickle_liveness.sh`` into the permanent false alarm
     this paragraph refuses.
     """
-    if not isinstance(doc, dict):
+    if state is None or state.outcome != trickle_state.RunOutcome.BARREN:
         return
-    if doc.get('outcome') != trickle_state.OUTCOME_BARREN:
-        return
-    if doc.get('consecutive_barren_runs') != trickle_state.DEFAULT_MAX_BARREN_RUNS:
+    if state.consecutive_barren_runs != trickle_state.DEFAULT_MAX_BARREN_RUNS:
         return
 
-    counters = doc.get('counters') or {}
-    budget_skipped = counters.get('budget_skipped') or 0
-    below_sampling_cut = counters.get('below_sampling_cut') or 0
-
-    # DOOR-SPECIFIC remedy. SampleResult's docstring (sampling.py) is
-    # explicit that the two doors have different fixes: raising the byte
-    # budget recovers a budget_skipped record and does nothing whatever for
-    # a below_sampling_cut one. Never conflate them.
-    remedies = []
-    if budget_skipped > 0:
-        remedies.append(
-            'raise budgets.max_daily_digest_bytes (candidates competed for '
-            'budget and were ALL discarded on it)'
-        )
-    if below_sampling_cut > 0:
-        remedies.append(
-            'raise sampling.top_fraction or sampling.per_stratum_min (these '
-            'records ranked below their stratum cut and never competed for '
-            'budget, so a bigger byte budget will not recover them)'
-        )
-    remedy = '; '.join(remedies) or (
-        'inspect the recorded counters: no door counter is set, which should '
-        'be impossible for a barren run'
+    budget_skipped = state.counters.budget_skipped
+    below_sampling_cut = state.counters.below_sampling_cut
+    remedy = trickle_state.barren_remedy(state.counters)
+    last_productive_at = (
+        None if state.last_productive_at is None
+        else state.last_productive_at.isoformat()
     )
 
     summary = (
@@ -1271,10 +1254,10 @@ def _escalate_barren_streak(
     detail = (
         f'project={cfg.project_id} date={target_date.isoformat()} '
         f'outcome=barren consecutive_barren_runs='
-        f'{doc.get("consecutive_barren_runs")} '
+        f'{state.consecutive_barren_runs} '
         f'below_sampling_cut={below_sampling_cut} '
         f'budget_skipped={budget_skipped} '
-        f'last_productive_at={doc.get("last_productive_at")}. '
+        f'last_productive_at={last_productive_at}. '
         f'Real confusion signal reached the sampling/budget stage on each of '
         f'those runs and NOTHING was digested -- three consecutive means '
         f'persistent config state, not a run of bad luck. Remedy: {remedy}. '
