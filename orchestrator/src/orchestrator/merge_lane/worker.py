@@ -12067,8 +12067,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         retired its own request id, and it moves its whole train
         (``via_train``).  Moving to ``'normal'`` demotes.
 
-        Only ``req.lane`` changes here, plus its journal record so a restart
-        keeps it.  The lane buffers belong to ``_merger_task``, and the
+        Only ``req.lane`` changes here, plus a solo request's journal record
+        so a restart keeps it (a train is never journaled; the durable lane is
+        the caller's ``metadata.merge_lane`` write, see
+        :class:`RelaneOutcome`).  The lane buffers belong to ``_merger_task``, and the
         coalescing pass holds a view of them across awaits, so the move
         itself is the owner's: :meth:`_rebucket_relaned_requests` runs at the
         top of :meth:`_pop_next_pickable`, and the merger is woken to reach
@@ -12101,7 +12103,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'merge_queue: relane: store.record failed for %s',
                     target.request_id, exc_info=True,
                 )
-        via_train = target.train_id if isinstance(target, GroupMergeRequest) else None
+        is_train = isinstance(target, GroupMergeRequest)
+        via_train = target.train_id if is_train else None
+        task_ids = tuple(target.member_task_ids) if is_train else (target.task_id,)
         logger.info(
             'merge_queue: relane: %s (task %s, train %s) %s -> %s',
             target.request_id, target.task_id, via_train, from_lane, lane,
@@ -12109,7 +12113,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._signal_resume()
         return RelaneOutcome(
             relaned=True, lane=lane, request_id=target.request_id,
-            from_lane=from_lane, via_train=via_train,
+            from_lane=from_lane, via_train=via_train, task_ids=task_ids,
         )
 
     def _relane_refusal(
@@ -12138,7 +12142,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         into that lane's buffer, at its aging position (task 5246).
 
         Runs on ``_merger_task``, the buffers' owner, so it never lands inside
-        an await that holds a view of them (the coalescing pass does).
+        an await that holds a view of them (the coalescing pass does).  The
+        aging position, not the tail, because a moved request has no arrival
+        slot in its new lane: placing it by first submission (the key
+        :meth:`_pop_next_pickable` orders conflicting requests by) means a
+        promoted old fix is not queued behind younger high-lane work.
         """
         for lane in MERGE_LANES:
             buf = self._lane_buffers[lane]
