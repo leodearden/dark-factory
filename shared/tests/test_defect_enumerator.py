@@ -510,6 +510,143 @@ def test_a_test_class_whose_visible_lineage_allows_collection_carries(header):
     assert result.carriers == {REF_A: (_runnable('TestA::test_m'),)}
 
 
+_BASE_PYTESTMARK_SKIP = f'''
+    class Base:
+        pytestmark = pytest.mark.skip
+
+    class TestD(Base):
+        @pytest.mark.defect({REF_A!r})
+        def test_o(self):
+            pass
+'''
+
+_INHERITED_CASES = {
+    'base-pytestmark-skip': (
+        _BASE_PYTESTMARK_SKIP,
+        {REF_A: (Carrier(_node('TestD::test_o'), frozenset({DisablingMark.SKIP})),)},
+        [],
+    ),
+    'base-decorator-skip': (
+        f'''
+        @pytest.mark.skip
+        class Base:
+            pass
+
+        class TestD(Base):
+            @pytest.mark.defect({REF_A!r})
+            def test_o(self):
+                pass
+        ''',
+        {REF_A: (Carrier(_node('TestD::test_o'), frozenset({DisablingMark.SKIP})),)},
+        [],
+    ),
+    'marked-method-from-a-non-test-mixin': (
+        f'''
+        class Mixin:
+            @pytest.mark.defect({REF_A!r})
+            def test_m(self):
+                pass
+
+        class TestA(Mixin):
+            pass
+        ''',
+        {REF_A: (_runnable('TestA::test_m'),)},
+        [],
+    ),
+    'test-subclass-of-a-test-class': (
+        f'''
+        class TestB:
+            @pytest.mark.defect({REF_A!r})
+            def test_n(self):
+                pass
+
+        @pytest.mark.xfail
+        class TestC(TestB):
+            pass
+        ''',
+        {REF_A: (_runnable('TestB::test_n'), Carrier(_node('TestC::test_n'), frozenset({DisablingMark.XFAIL})))},
+        [],
+    ),
+    'defect-mark-on-a-base-class': (
+        f'''
+        @pytest.mark.defect({REF_A!r})
+        class Base:
+            pass
+
+        class TestE(Base):
+            def test_e(self):
+                pass
+        ''',
+        {REF_A: (_runnable('TestE::test_e'),)},
+        [],
+    ),
+    'subclass-override-wins': (
+        f'''
+        class TestB:
+            @pytest.mark.defect({REF_A!r})
+            def test_n(self):
+                pass
+
+        class TestC(TestB):
+            def test_n(self):
+                pass
+        ''',
+        {REF_A: (_runnable('TestB::test_n'),)},
+        [],
+    ),
+    'diamond-follows-the-mro': (
+        f'''
+        class A:
+            @pytest.mark.defect({REF_A!r})
+            def test_q(self):
+                pass
+
+        class B(A):
+            pass
+
+        class C(A):
+            @pytest.mark.defect({REF_B!r})
+            def test_q(self):
+                pass
+
+        class TestD(B, C):
+            pass
+        ''',
+        {REF_B: (_runnable('TestD::test_q'),)},
+        [REF_A],
+    ),
+    'inherited-nested-test-class': (
+        f'''
+        class Base:
+            class TestInner:
+                @pytest.mark.defect({REF_A!r})
+                def test_x(self):
+                    pass
+
+        class TestSub(Base):
+            pass
+        ''',
+        {REF_A: (_runnable('TestSub::TestInner::test_x'),)},
+        [],
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ('source', 'expected', 'expected_non_static'), _INHERITED_CASES.values(), ids=list(_INHERITED_CASES)
+)
+def test_a_test_class_inherits_test_methods_and_marks_from_its_local_bases(source, expected, expected_non_static):
+    result = _enumerate(source)
+    assert result.complete is True
+    assert result.carriers == expected
+    assert sorted(mark.ref for mark in result.non_static) == expected_non_static
+
+
+def test_a_carrier_skipped_only_through_a_base_pytestmark_leaves_its_ref_unrunnable():
+    result = _enumerate(_BASE_PYTESTMARK_SKIP)
+    assert REF_A not in TreeEnumeration((result,)).runnable_refs
+
+
 @pytest.mark.parametrize('value', ['False', 'SOME_FLAG'])
 def test_a_module_whose_test_flag_is_not_a_truthy_constant_carries_nothing(value):
     result = _enumerate(f'''
