@@ -1,8 +1,10 @@
-"""One publisher pass: each source read as its own unit, its events built in a fixed order, a heartbeat last."""
+"""The publisher: one pass reads each source as its own unit and appends its events in a fixed order, a heartbeat last."""
 
 from __future__ import annotations
 
+import itertools
 import logging
+import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -54,6 +56,7 @@ from client_feed.value_events import (
 )
 
 EVENTS_BATCH: Final = 1000
+TASKS_RESCAN_PASSES: Final = 60
 
 _NO_ESCALATIONS: Final = OpenEscalations(by_task=MappingProxyType({}))
 _SOURCE_ERRORS: Final = (StoreReadError, GitError, ArchiveReadError)
@@ -301,3 +304,33 @@ def run_pass(
     return PassReport(
         appended=len(events), watermark_seq=out.state.watermark_seq, degraded=heartbeat.degraded
     )
+
+
+def _open(policy: Policy) -> OutDir:
+    return OutDir.open(policy.out_dir, project_id=policy.project_id)
+
+
+def snapshot(policy: Policy, *, now: datetime) -> PassReport:
+    """One pass over every source, every task re-read."""
+    return run_pass(policy, _open(policy), now=now, rescan_tasks=True)
+
+
+def publish(policy: Policy, *, stop: threading.Event, clock: Callable[[], datetime]) -> None:
+    """A pass every interval_seconds until `stop` is set; a pass in progress always completes.
+
+    Every TASKS_RESCAN_PASSES-th pass, the first included, re-reads every task, so a row committed
+    behind the tasks cursor is still published.
+    """
+    out = _open(policy)
+    for passes in itertools.count():
+        if stop.is_set():
+            return
+        report = run_pass(
+            policy, out, now=clock(), rescan_tasks=passes % TASKS_RESCAN_PASSES == 0
+        )
+        _log.log(
+            logging.INFO if report.appended > 1 else logging.DEBUG,
+            'pass %d appended %d lines through seq %d',
+            passes, report.appended, report.watermark_seq,
+        )
+        stop.wait(policy.interval_seconds)
