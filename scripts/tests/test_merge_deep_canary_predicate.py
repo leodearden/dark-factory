@@ -10,12 +10,17 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 
 _PREDICATE = Path(__file__).resolve().parents[1] / 'merge-deep-canary-predicate.sh'
 _PREDICATE_TIMEOUT = cli_timeout_from_env('MERGE_DEEP_CANARY_PREDICATE_CLI_TIMEOUT_SECS')
 
 _ABSENT = object()
+
+_AS_OF = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
+_NOW_ARGS = ('--now', str(_AS_OF.timestamp()), '--window-days', '7')
+_CUTOFF = _AS_OF - timedelta(days=7)
 
 
 def _run(db_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -62,6 +67,17 @@ def _recent(i: int) -> datetime:
     return datetime.now(UTC) - timedelta(minutes=i + 1)
 
 
+def _seed_inside(conn, verify_ts: datetime, finalized_ts: datetime | None = None):
+    _seed_verify(conn, verify_ts, passed=True, duration_ms=600_000)
+    _seed_finalized(conn, finalized_ts or verify_ts + timedelta(minutes=1), landed_via_chain=2)
+
+
+def _seed_intruder(conn, verify_ts: datetime, finalized_ts: datetime | None = None):
+    """A row that, once admitted, makes the run HOLD on every leg."""
+    _seed_verify(conn, verify_ts, passed=False, duration_ms=9_000_000)
+    _seed_finalized(conn, finalized_ts or verify_ts + timedelta(minutes=1), landed_via_chain=5)
+
+
 class TestVerifyP90ReadsThePayloadDuration:
     def test_p90_comes_from_the_merge_verify_payload(self, runs_db_path, runs_db):
         for k in range(1, 11):
@@ -97,3 +113,63 @@ class TestVerifyP90ReadsThePayloadDuration:
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
         assert _metric(result.stdout, 'verify_p90_secs') == 300.0
+
+
+class TestWindowEdges:
+    def test_boundary_day_rows_split_at_the_cutoff_hour(self, runs_db_path, runs_db):
+        _seed_inside(runs_db, _CUTOFF + timedelta(hours=2))
+        _seed_intruder(runs_db, _CUTOFF - timedelta(hours=2))
+
+        result = _run(runs_db_path, *_NOW_ARGS)
+
+        assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
+        assert _n_deep(result.stdout) == 1
+        assert _metric(result.stdout, 'deep_fail_rate') == 0.0
+        assert _metric(result.stdout, 'items_per_verify') == 2.0
+        assert _metric(result.stdout, 'verify_p90_secs') == 600.0
+
+    def test_window_is_half_open_at_the_cutoff_and_closed_at_now(self, runs_db_path, runs_db):
+        _seed_intruder(runs_db, _CUTOFF, finalized_ts=_CUTOFF)
+        _seed_inside(runs_db, _AS_OF, finalized_ts=_AS_OF)
+
+        result = _run(runs_db_path, *_NOW_ARGS)
+
+        assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
+        assert _n_deep(result.stdout) == 1
+
+    def test_rows_after_now_are_outside_the_window(self, runs_db_path, runs_db):
+        _seed_inside(runs_db, _AS_OF - timedelta(hours=1))
+        _seed_intruder(runs_db, _AS_OF + timedelta(hours=1))
+
+        result = _run(runs_db_path, *_NOW_ARGS)
+
+        assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
+        assert _n_deep(result.stdout) == 1
+
+    def test_default_now_is_the_wall_clock(self, runs_db_path, runs_db):
+        now = datetime.now(UTC)
+        _seed_inside(runs_db, now - timedelta(days=6))
+        _seed_intruder(runs_db, now - timedelta(days=8))
+
+        result = _run(runs_db_path, '--window-days', '7')
+
+        assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
+        assert _n_deep(result.stdout) == 1
+
+
+class TestUsageFaultsExitTwo:
+    @pytest.mark.parametrize(('flag', 'value'), [
+        ('--now', 'yesterday'),
+        ('--now', 'nan'),
+        ('--now', 'inf'),
+        ('--window-days', 'seven'),
+        ('--window-days', '0'),
+        ('--window-days', '-3'),
+        ('--deep-fail-rate-max', 'loose'),
+        ('--verify-p90-max-secs', 'nan'),
+    ])
+    def test_malformed_numeric_flag_is_a_usage_fault(self, runs_db_path, flag, value):
+        result = _run(runs_db_path, flag, value)
+
+        assert result.returncode == 2, f'{result.stdout=} {result.stderr=}'
+        assert flag in result.stderr
