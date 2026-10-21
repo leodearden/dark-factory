@@ -22,6 +22,7 @@ mirroring task β's test_merge_gates.py:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -172,6 +173,55 @@ class TestDriftCheckStatePersistence:
         data = json.loads(path.read_text())
         assert 'land_count' in data
         assert data['land_count'] == 3
+
+    # -- task 6648: a due check that could not get its host slots is deferred --
+
+    def test_drift_check_state_defaults_no_deferrals(self) -> None:
+        from orchestrator.merge_lane.drift import DriftCheckState
+
+        assert DriftCheckState().consecutive_deferrals == 0
+
+    def test_load_old_format_file_keeps_land_count_and_no_deferrals(
+        self, tmp_path: Path,
+    ) -> None:
+        # A state file written before deferrals existed must not reset the cadence.
+        from orchestrator.merge_lane.drift import DriftCheckState, _load_drift_check_state
+
+        path = tmp_path / 'drift.json'
+        path.write_text('{"land_count": 7}')
+        assert _load_drift_check_state(path) == DriftCheckState(
+            land_count=7, consecutive_deferrals=0,
+        )
+
+    def test_round_trip_preserves_consecutive_deferrals(self, tmp_path: Path) -> None:
+        from orchestrator.merge_lane.drift import (
+            DriftCheckState,
+            _load_drift_check_state,
+            _save_drift_check_state,
+        )
+
+        path = tmp_path / 'drift.json'
+        original = DriftCheckState(land_count=12, consecutive_deferrals=3)
+        _save_drift_check_state(path, original)
+        assert _load_drift_check_state(path) == original
+
+    def test_due_on_cadence_multiple_or_after_a_deferral(self) -> None:
+        from orchestrator.merge_lane.drift import DriftCheckState
+
+        assert DriftCheckState(land_count=6).is_due(3) is True
+        assert DriftCheckState(land_count=7).is_due(3) is False
+        assert DriftCheckState(land_count=7, consecutive_deferrals=1).is_due(3) is True
+
+    def test_transitions_return_new_values(self) -> None:
+        from orchestrator.merge_lane.drift import DriftCheckState
+
+        original = DriftCheckState(land_count=4, consecutive_deferrals=2)
+        assert original.after_land() == DriftCheckState(land_count=5, consecutive_deferrals=2)
+        assert original.after_deferral() == DriftCheckState(land_count=4, consecutive_deferrals=3)
+        assert original.after_start() == DriftCheckState(land_count=4, consecutive_deferrals=0)
+        assert original == DriftCheckState(land_count=4, consecutive_deferrals=2)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            original.land_count = 9  # type: ignore[misc]
 
 
 @pytest.mark.asyncio
