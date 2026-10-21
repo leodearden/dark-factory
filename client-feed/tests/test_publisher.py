@@ -1,6 +1,7 @@
 """One publisher pass: every source read as its own unit, the events built in a fixed order, a heartbeat last."""
 
 import logging
+import os
 import shutil
 import threading
 from collections import Counter
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import pytest
 from _archive_files import junit_xml, passed, red, write_junit, write_plan, write_summary
-from _git_repo import Repo, make_repo
+from _git_repo import Repo, make_repo, path_with_git_killed_on
 from _stores import RunsDb, TasksDb
 from shared.project_layout import runs_db, tasks_db
 
@@ -458,7 +459,7 @@ def errors_of(caplog: pytest.LogCaptureFixture) -> str:
     )
 
 
-def test_a_merge_git_cannot_read_is_skipped_once_it_landed_longer_ago_than_the_grace(
+def test_a_merge_missing_from_the_repository_is_skipped_once_it_landed_longer_ago_than_the_grace(
     project: Project, caplog: pytest.LogCaptureFixture
 ) -> None:
     unknown_id = project.runs.emit(
@@ -474,13 +475,42 @@ def test_a_merge_git_cannot_read_is_skipped_once_it_landed_longer_ago_than_the_g
         report = run_pass(project.policy, out, now=past_the_grace)
 
     assert report.degraded == (
-        Degradation(source=Source.GIT, reason='skipped 1 landing whose merge git cannot read'),
+        Degradation(
+            source=Source.GIT, reason='skipped 1 landing whose merge commit is not in the repository'
+        ),
     )
     assert [line.commit for line in feed(project) if isinstance(line, MergeLanded)] == [project.merge]
     assert {'task_phase', 'verify_run', 'test_results'} <= types_of(feed(project))
     assert stored_cursor(project).events_id == unknown_id
     assert UNKNOWN_SHA in errors_of(caplog)
     assert run_pass(project.policy, out, now=past_the_grace).degraded == ()
+    assert_valid(project)
+
+
+def test_a_merge_git_fails_to_read_is_held_however_old_it_is(
+    project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_path = os.environ['PATH']
+    monkeypatch.setenv('PATH', path_with_git_killed_on(tmp_path / 'bin', 'diff-tree'))
+    out = project.open()
+    a_month_on = NOW + timedelta(days=30)
+
+    held = run_pass(project.policy, out, now=a_month_on)
+
+    (degradation,) = held.degraded
+    assert degradation.source is Source.GIT
+    assert 'diff-tree' in degradation.reason
+    assert not degradation.reason.startswith('skipped')
+    assert 'merge_landed' not in types_of(feed(project))
+    assert stored_cursor(project).events_id == 0
+    assert_valid(project)
+
+    monkeypatch.setenv('PATH', real_path)
+    delivered = run_pass(project.policy, out, now=a_month_on)
+
+    assert [line.commit for line in feed(project) if isinstance(line, MergeLanded)] == [project.merge]
+    assert stored_cursor(project).events_id >= project.last_stream_id
+    assert not any(degradation.reason.startswith('skipped') for degradation in delivered.degraded)
     assert_valid(project)
 
 

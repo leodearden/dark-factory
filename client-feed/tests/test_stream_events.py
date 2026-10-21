@@ -1,6 +1,7 @@
 """Each runs.db stream row becomes its feed events once: phases, verify windows and merge verdicts, and landed merges."""
 
 import logging
+import signal
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,7 +20,7 @@ from _archive_files import (
     write_plan,
     write_summary,
 )
-from _git_repo import make_repo
+from _git_repo import make_repo, path_with_git_killed_on
 from _stores import RunsDb
 from shared.project_layout import runs_db
 
@@ -545,10 +546,44 @@ def test_a_merge_unknown_to_git_that_landed_before_the_cutoff_is_skipped_and_nam
     assert isinstance(merge, MergeLanded) and merge.commit == landed.merge
     (degradation,) = output.degraded
     assert degradation.source is Source.GIT
-    assert degradation.reason.startswith('skipped 1 landing whose merge git cannot read')
+    assert degradation.reason.startswith(
+        'skipped 1 landing whose merge commit is not in the repository'
+    )
     errors = [record.getMessage() for record in caplog.records if record.levelno == logging.ERROR]
     assert len(errors) == 1
     assert UNKNOWN_SHA in errors[0] and 'event 60' in errors[0]
+    assert 'the repository does not hold that commit' in errors[0]
+
+
+def test_a_merge_the_repository_holds_whose_git_is_killed_is_held_however_old_it_is(
+    landed: Landed, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv('PATH', path_with_git_killed_on(tmp_path / 'bin', 'diff-tree'))
+
+    with caplog.at_level(logging.ERROR, logger='client_feed.stream_events'), pytest.raises(GitError) as caught:
+        run(
+            landed.root, landing(60, landed.merge, 7, minutes=30),
+            state=state_holding_task_7(), skip_unreadable_before=at(31),
+        )
+
+    assert caught.value.returncode == -signal.SIGKILL
+    assert not [record for record in caplog.records if record.levelno == logging.ERROR]
+
+
+def test_a_merge_git_cannot_be_spawned_for_is_held_however_old_it_is(
+    landed: Landed, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    no_git = tmp_path / 'no-git'
+    no_git.mkdir()
+    monkeypatch.setenv('PATH', str(no_git))
+
+    with pytest.raises(GitError) as caught:
+        run(
+            landed.root, landing(60, landed.merge, 7, minutes=30),
+            state=state_holding_task_7(), skip_unreadable_before=at(31),
+        )
+
+    assert caught.value.returncode is None
 
 
 def test_an_unreadable_runs_db_raises(landed: Landed) -> None:
