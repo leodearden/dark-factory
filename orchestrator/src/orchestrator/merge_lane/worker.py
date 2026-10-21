@@ -12429,8 +12429,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         speculative item whose ``base_sha`` points at it has a BROKEN chain
         (see :meth:`_chain_dead_link`).  Called at every invalidation site
         (head-failure cascade, dispatch chain-invalidation discard,
-        RUNNER_UNAVAILABLE re-merge) so a built-awaiting-host straggler that the
-        cascade missed is still caught at its next dispatch.
+        RUNNER_UNAVAILABLE re-merge, rebased landing) so a built-awaiting-host
+        straggler that the cascade missed is still caught at its next dispatch.
 
         Bounded FIFO (cap ``self._dead_base_commits_cap``): past the cap the
         oldest recorded commit is evicted from BOTH the membership set and the
@@ -21634,6 +21634,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         advanced = True
                         return True
+                    # INV-3 (task 6273): the rebase superseded current_sha; it will never be on main.
+                    self._record_dead_base(current_sha)
                     # ι=1894: count this as a merge retry — main advanced under the
                     # request, so a fresh re-verify is required.  Both cas_failed and
                     # rebased_pending_reverify are included in retries_per_landing (see
