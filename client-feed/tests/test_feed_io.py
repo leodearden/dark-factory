@@ -2,10 +2,13 @@
 
 import os
 import stat
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import yaml
+from _git_repo import make_repo
 
 from client_feed.contract import (
     FEED_VERSION,
@@ -21,6 +24,7 @@ from client_feed.contract import (
 )
 from client_feed.feed_io import Cursor, FeedIoError, FeedIoProblem, OutDir, Stamp
 from client_feed.fold import ProjectMismatch, fold
+from client_feed.policy import OutDirRefused, PolicyError, PolicyProblem, load_policy
 from client_feed.validate import validate_out_dir
 
 PROJECT = 'acme'
@@ -257,3 +261,163 @@ def test_a_commit_leaves_only_the_three_files(out_dir: Path) -> None:
     out.commit([heartbeat(out.stamp(), 1)], Cursor())
 
     assert tuple(sorted(os.listdir(out_dir))) == WRITTEN
+
+
+def _contents(directory: Path) -> dict[str, str | bytes]:
+    """Every entry under `directory`: a symlink as its target text, a file as its bytes."""
+    return {
+        str(path.relative_to(directory)): (
+            f'-> {os.readlink(path)}' if path.is_symlink() else path.read_bytes()
+        )
+        for path in sorted(directory.rglob('*'))
+        if path.is_symlink() or path.is_file()
+    }
+
+
+def _refused_out_dir(path: Path) -> OutDirRefused:
+    with pytest.raises(OutDirRefused) as caught:
+        OutDir.open(path, project_id=PROJECT)
+    assert str(path) in str(caught.value)
+    return caught.value
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root owns every directory it could be refused')
+def test_an_out_dir_owned_by_another_user_is_refused() -> None:
+    assert _refused_out_dir(Path('/')).problem is PolicyProblem.OUT_DIR_NOT_OWNED
+
+
+def test_an_out_dir_that_is_a_symlink_is_refused(tmp_path: Path, out_dir: Path) -> None:
+    link = tmp_path / 'linked-out'
+    link.symlink_to(out_dir)
+
+    assert _refused_out_dir(link).problem is PolicyProblem.OUT_DIR_UNUSABLE
+    assert _contents(out_dir) == {}
+
+
+def test_a_missing_out_dir_is_refused(tmp_path: Path) -> None:
+    missing = tmp_path / 'absent'
+
+    assert _refused_out_dir(missing).problem is PolicyProblem.OUT_DIR_UNUSABLE
+    assert not missing.exists()
+
+
+@pytest.fixture
+def outside(tmp_path: Path) -> Path:
+    path = tmp_path / 'elsewhere' / 'target.txt'
+    path.parent.mkdir()
+    path.write_text('not the publisher\'s\n')
+    return path
+
+
+def _assert_symlink_refusal(caught: pytest.ExceptionInfo[FeedIoError], name: str) -> None:
+    assert caught.value.problem is FeedIoProblem.SYMLINK
+    assert caught.value.name == name
+    assert name in str(caught.value)
+    assert 'symlink' in str(caught.value)
+
+
+def test_a_symlinked_feed_is_refused_and_its_target_unchanged(
+    tmp_path: Path, out_dir: Path, outside: Path
+) -> None:
+    (out_dir / 'feed.jsonl').symlink_to(outside)
+    before = _contents(tmp_path)
+
+    with pytest.raises(FeedIoError) as caught:
+        out = OutDir.open(out_dir, project_id=PROJECT)
+        out.commit(three_events(out), Cursor())
+
+    _assert_symlink_refusal(caught, 'feed.jsonl')
+    assert _contents(tmp_path) == before
+
+
+@pytest.mark.parametrize('name', ['state.json', 'cursor.json'])
+def test_a_symlinked_state_or_cursor_is_refused_at_open(
+    tmp_path: Path, out_dir: Path, outside: Path, name: str
+) -> None:
+    out = OutDir.open(out_dir, project_id=PROJECT)
+    out.commit(three_events(out), Cursor())
+    (out_dir / name).unlink()
+    (out_dir / name).symlink_to(outside)
+    before = _contents(tmp_path)
+
+    with pytest.raises(FeedIoError) as caught:
+        OutDir.open(out_dir, project_id=PROJECT)
+
+    _assert_symlink_refusal(caught, name)
+    assert _contents(tmp_path) == before
+
+
+def test_a_symlink_planted_after_open_is_refused_not_replaced(
+    out_dir: Path, outside: Path
+) -> None:
+    out = OutDir.open(out_dir, project_id=PROJECT)
+    out.commit(three_events(out), Cursor())
+    (out_dir / 'state.json').unlink()
+    (out_dir / 'state.json').symlink_to(outside)
+    target_before = outside.read_bytes()
+
+    with pytest.raises(FeedIoError) as caught:
+        out.commit([heartbeat(out.stamp(), 1)], Cursor())
+
+    _assert_symlink_refusal(caught, 'state.json')
+    assert (out_dir / 'state.json').is_symlink()
+    assert os.readlink(out_dir / 'state.json') == str(outside)
+    assert outside.read_bytes() == target_before
+    assert not any(name.endswith('.tmp') for name in os.listdir(out_dir))
+
+
+def _policy_config(tmp_path: Path, out_dir: Path) -> Path:
+    root = tmp_path / 'root'
+    repo = make_repo(root)
+    repo.write('src/a.py', 'a = 1\n')
+    repo.commit('one', when=EPOCH)
+    config = tmp_path / 'policy.yaml'
+    config.write_text(
+        yaml.safe_dump(
+            {
+                'project_id': PROJECT,
+                'project_root': str(root),
+                'out_dir': str(out_dir),
+                'in_dir': str(tmp_path / 'in'),
+                'visible_globs': ['src/**'],
+            }
+        )
+    )
+    return config
+
+
+def _linked_out(tmp_path: Path) -> Path:
+    real = tmp_path / 'real-out'
+    real.mkdir()
+    link = tmp_path / 'linked-out'
+    link.symlink_to(real)
+    return link
+
+
+@pytest.mark.parametrize(
+    ('out_dir_of', 'problem'),
+    [
+        pytest.param(
+            lambda tmp_path: Path('/'),
+            PolicyProblem.OUT_DIR_NOT_OWNED,
+            marks=pytest.mark.skipif(os.geteuid() == 0, reason='root owns every directory'),
+            id='not-owned',
+        ),
+        pytest.param(_linked_out, PolicyProblem.OUT_DIR_UNUSABLE, id='symlink'),
+        pytest.param(lambda tmp_path: tmp_path / 'absent', PolicyProblem.OUT_DIR_UNUSABLE, id='missing'),
+    ],
+)
+def test_load_policy_and_the_writer_share_one_out_dir_check(
+    tmp_path: Path, out_dir_of: Callable[[Path], Path], problem: PolicyProblem
+) -> None:
+    out_dir = out_dir_of(tmp_path)
+    config = _policy_config(tmp_path, out_dir)
+
+    with pytest.raises(PolicyError) as policy_refusal:
+        load_policy(config)
+    with pytest.raises(OutDirRefused) as writer_refusal:
+        OutDir.open(out_dir, project_id=PROJECT)
+
+    assert policy_refusal.value.problem is problem
+    assert writer_refusal.value.problem is problem
+    assert writer_refusal.value.detail in str(policy_refusal.value)
