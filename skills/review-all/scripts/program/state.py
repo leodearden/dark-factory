@@ -6,6 +6,7 @@ The design-time statement is ``plans/review-all-program-tooling-prd.md`` §4
 from __future__ import annotations
 
 import enum
+import fcntl
 import importlib
 import json
 import os
@@ -14,6 +15,7 @@ import sys
 import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple
 
@@ -764,3 +766,186 @@ def fused_memory_url(
             "mcpServers['fused-memory'].url"
         )
     return url
+
+
+def now_utc() -> str:
+    """The one clock for ``at`` and ``measured_at``: ISO-8601 UTC, second precision."""
+    return datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+@dataclass(frozen=True)
+class ItemRef:
+    """A design question of one stream, written ``<stream>:<question id>``."""
+
+    stream: str
+    question: str
+
+    @classmethod
+    def parse(cls, text: str) -> ItemRef:
+        parts = text.split(':') if isinstance(text, str) else []
+        if len(parts) != 2 or not all(parts):
+            raise StateError(f'item ref {text!r} is not <stream>:<question id>')
+        return cls(parts[0], parts[1])
+
+    def __str__(self) -> str:
+        return f'{self.stream}:{self.question}'
+
+
+_EntryCheck = Callable[[Sequence[Mapping[str, Any]], Mapping[str, Any]], None]
+
+
+def _check_fields(spec: LedgerOpSpec, line: Mapping[str, Any], what: str) -> None:
+    missing = sorted(spec.required - set(line))
+    if missing:
+        raise LedgerRefused(f'{what} lacks {", ".join(missing)}')
+    extra = sorted(set(line) - spec.required - spec.optional)
+    if extra:
+        raise LedgerRefused(f'{what} carries fields it does not take: {", ".join(extra)}')
+    for field, allowed in spec.enums.items():
+        value = line[field]
+        if not isinstance(value, str) or value not in allowed:
+            raise LedgerRefused(f'{what}: {field} {value!r} is not one of {sorted(allowed)}')
+
+
+def _parse_jsonl(text: str, path: Path) -> list[Mapping[str, Any]]:
+    lines = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        try:
+            line = json.loads(raw)
+        except ValueError as bad:
+            raise LedgerRefused(f'{path} line {number} is not JSON: {bad}') from bad
+        if not isinstance(line, dict):
+            raise LedgerRefused(f'{path} line {number} is not a JSON object: {raw!r}')
+        lines.append(line)
+    return lines
+
+
+def _accept_each(
+    prior: Sequence[Mapping[str, Any]], lines: Sequence[Mapping[str, Any]],
+    check_entry: _EntryCheck, where: Callable[[int], str],
+) -> None:
+    """Check each line against everything before it; a refusal names the line by *where*."""
+    accepted = list(prior)
+    for number, line in enumerate(lines, 1):
+        try:
+            if not isinstance(line, Mapping):
+                raise LedgerRefused(f'expected a JSON object, got {line!r}')
+            check_entry(accepted, line)
+        except LedgerRefused as refused:
+            raise LedgerRefused(f'{where(number)}: {refused}') from None
+        accepted.append(line)
+
+
+def _read_checked(path: Path, check_entry: _EntryCheck) -> tuple[Mapping[str, Any], ...]:
+    lines = _parse_jsonl(path.read_text(encoding='utf-8'), path) if path.exists() else []
+    _accept_each((), lines, check_entry, lambda number: f'{path} line {number}')
+    return tuple(_frozen(line) for line in lines)
+
+
+def _locked_append(
+    path: Path, lines: Sequence[Mapping[str, Any]], check_entry: _EntryCheck,
+) -> None:
+    """Append *lines* under an exclusive flock, all or nothing, after checking file and batch.
+
+    ``a+`` gives O_APPEND, so an existing line can never be rewritten.
+    """
+    with path.open('a+', encoding='utf-8') as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.seek(0)
+            existing = _parse_jsonl(handle.read(), path)
+            _accept_each((), existing, check_entry, lambda number: f'{path} line {number}')
+            _accept_each(existing, lines, check_entry, lambda number: f'appended line {number}')
+            handle.write(''.join(json.dumps(line) + '\n' for line in lines))
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def check_ledger_line(line: Mapping[str, Any]) -> None:
+    """Refuse a ledger line its op does not describe (LEDGER_OPS plus the common fields)."""
+    op = line.get('op')
+    spec = LEDGER_OPS.get(op) if isinstance(op, str) else None
+    if spec is None:
+        raise LedgerRefused(f'unknown ledger op {op!r} (known: {", ".join(LEDGER_OPS)})')
+    with_common = replace(spec, required=spec.required | LEDGER_COMMON_FIELDS)
+    _check_fields(with_common, line, f'{op} line')
+    seq = line['seq']
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        raise LedgerRefused(f'{op} line: seq must be an int, got {seq!r}')
+
+
+def next_seq(existing: Sequence[Mapping[str, Any]]) -> int:
+    return len(existing) + 1
+
+
+def _check_ledger_entry(prior: Sequence[Mapping[str, Any]], line: Mapping[str, Any]) -> None:
+    check_ledger_line(line)
+    if line['seq'] != next_seq(prior):
+        raise LedgerRefused(f'{line["op"]} line: expected seq {next_seq(prior)}, got {line["seq"]}')
+
+
+def append_ledger(home: Home, lines: Sequence[Mapping[str, Any]]) -> None:
+    """Append ledger lines whose seqs continue the file densely; refuses the whole batch otherwise."""
+    _locked_append(home.ledger, lines, _check_ledger_entry)
+
+
+def read_ledger(home: Home) -> tuple[Mapping[str, Any], ...]:
+    return _read_checked(home.ledger, _check_ledger_entry)
+
+
+RULING_FIELDS = _ledger_op(
+    ('id', 'ruled_by', 'date', 'stream', 'item', 'question', 'ruling', 'options',
+     'consequence', 'keys', 'source', 'supersedes'),
+    ('answers', 'reask'),
+    ruled_by=RuledBy,
+)
+
+
+def next_ruling_id(rulings: Sequence[Mapping[str, Any]], ruled_by: RuledBy | str) -> str:
+    """``D<n>`` for a human ruling, ``L<n>`` for a lead's; one counter across both prefixes."""
+    prefix = 'D' if RuledBy(ruled_by) is RuledBy.HUMAN else 'L'
+    return f'{prefix}{len(rulings) + 1}'
+
+
+def _check_answers(answers: Any) -> None:
+    if not isinstance(answers, list | tuple):
+        raise LedgerRefused(f'answers must be a list of <stream>:<question id>, got {answers!r}')
+    for entry in answers:
+        try:
+            ItemRef.parse(entry)
+        except StateError as bad:
+            raise LedgerRefused(f'answers entry: {bad}') from None
+
+
+def check_ruling_line(line: Mapping[str, Any]) -> None:
+    what = f'ruling {line.get("id")!r}'
+    _check_fields(RULING_FIELDS, line, what)
+    if line['ruled_by'] == RuledBy.HUMAN:
+        for field in ('options', 'consequence'):
+            if not line[field]:
+                raise LedgerRefused(f'{what}: a human ruling needs a non-empty {field}')
+    if 'answers' in line:
+        _check_answers(line['answers'])
+    if not isinstance(line.get('reask', False), bool):
+        raise LedgerRefused(f'{what}: reask must be a bool, got {line["reask"]!r}')
+
+
+def _check_ruling_entry(prior: Sequence[Mapping[str, Any]], line: Mapping[str, Any]) -> None:
+    check_ruling_line(line)
+    expected = next_ruling_id(prior, line['ruled_by'])
+    if line['id'] != expected:
+        raise LedgerRefused(f'expected id {expected!r}, got {line["id"]!r}')
+    supersedes = line['supersedes']
+    if supersedes is not None and supersedes not in {r['id'] for r in prior}:
+        raise LedgerRefused(f'ruling {line["id"]!r} supersedes {supersedes!r}, which is no earlier ruling')
+
+
+def append_rulings(home: Home, lines: Sequence[Mapping[str, Any]]) -> None:
+    """Append rulings whose ids are next_ruling_id in turn; refuses the whole batch otherwise."""
+    _locked_append(home.rulings, lines, _check_ruling_entry)
+
+
+def read_rulings(home: Home) -> tuple[Mapping[str, Any], ...]:
+    return _read_checked(home.rulings, _check_ruling_entry)
