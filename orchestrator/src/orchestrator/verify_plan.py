@@ -744,21 +744,6 @@ def _derive_module_runs(
     ``test_workflow_resume_on_progress.py`` — a DIFFERENT consumer of
     ``workflow.py`` — was structurally invisible and reached a debugger.
 
-    WHAT the floor runs (Leo's ruling on gate 5702, 2026-10-20, task 7253):
-    the 3294 floor ran the owning module's full suite, and is now NARROWED to
-    the touched collectable tests plus the module's whole-tree guard family —
-    the tests whose module-level ``pytestmark`` is
-    ``timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)``
-    (``orchestrator.pytest_markers.is_whole_tree_guard_module``, kept complete
-    by ``orchestrator/tests/test_whole_tree_scan_timeout_guard.py``) — because
-    the merge gate re-runs the full suite and the only measured out-of-scope
-    catch at task role was a guard test. Monotonicity still holds: a
-    co-committed test only ADDS a target. The full-suite floor survives as the
-    fallback for a module with no family, or whose narrowed selection its own
-    ``-m`` deselects entirely. Whether to re-widen is decided once the
-    verify-result cache is live at task role (tasks 5653/5657); restoring the
-    full suite is the one function :func:`_task_role_production_pytest_run`.
-
     The predicate covers SOURCE ∪ STRUCTURAL, never SOURCE alone, because
     :func:`classify_file` returns STRUCTURAL for a Protocol/TypedDict-defining
     production file only when content is read — and content is read only when
@@ -877,10 +862,10 @@ def _derive_module_runs(
     #   2. TEST_DATA touched     -> FULL_SUITE (D1: consumed by tests we can't
     #      enumerate from the path alone)
     #   3. role='task' AND a production (SOURCE ∪ STRUCTURAL) file touched
-    #      -> the task-3294 floor as narrowed by gate 5702: FILE_SCOPED to the
-    #      touched tests plus the module's whole-tree guard family, else the
-    #      FULL_SUITE fallback. It sits HERE, above arm 4, so that coverage is
-    #      monotone in the diff: co-committing a test only adds a target.
+    #      -> FILE_SCOPED to the touched tests plus the module's whole-tree
+    #      guard family, else the FULL_SUITE floor. It sits HERE, above arm 4,
+    #      so that coverage is monotone in the diff: co-committing a test only
+    #      adds a target.
     #   4a. collectable tests, ALL provably deselected by the module's own `-m`
     #      -> FULL_SUITE, the task-3494 arm. It sits BELOW arms 1-3 so those
     #      never reach it (arm 3 runs the same probe over its own selection),
@@ -987,6 +972,7 @@ def _task_role_production_pytest_run(
     FILE_SCOPED to *collectable_tests* plus *guard_family* (touched first,
     deduplicated), else the task-3294 full-suite floor when there is no family
     or the module's own ``-m`` would deselect the whole narrowed selection.
+    Why it is narrowed, and when to re-widen it: ``docs/task-role-pytest-floor.md``.
     """
     if not guard_family:
         return _task_3294_floor_run(
