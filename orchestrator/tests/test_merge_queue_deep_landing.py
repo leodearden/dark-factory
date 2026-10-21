@@ -1439,6 +1439,42 @@ class TestStaleCasAbortLeavesTheRestAlone:
             'the halt must not also render a per-link blocked outcome'
         )
 
+    async def test_an_operator_cancelled_link_stops_the_walk_unlanded(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Task 5248: a link an operator cancelled while the head verified.
+
+        It is still lane-buffered, so ``cancel_request`` accepts it; the walk
+        must stop AT it, because its own tree and every later link's contain it.
+        """
+        from orchestrator.merge_lane import OperatorMergeCancel
+
+        s = await _prefix_scene_upto_finalize(
+            git_repo, tmp_path, monkeypatch, db_name='delta-cancel.db',
+        )
+        worker, reqs = s['worker'], s['reqs']
+        cancelled = reqs['103']
+        assert worker.cancel_request(cancelled.request_id).cancelled
+
+        assert await worker._finalize_inflight(s['entry']) is True
+        await asyncio.sleep(0)
+
+        assert [c[0] for c in s['adv']] == [s['head_mc'], s['chain'].links[0][1]]
+        for tid in ('101', '102'):
+            assert reqs[tid].result.result().status == 'done', f'task {tid} must land'
+        for _tid, link_sha in s['chain'].links[1:]:
+            rc, _, _ = await _run(
+                ['git', 'merge-base', '--is-ancestor', link_sha, 'main'], cwd=git_repo,
+            )
+            assert rc != 0, f'{link_sha[:8]} landed past the cancelled link'
+        with pytest.raises(asyncio.CancelledError) as error:
+            cancelled.result.result()
+        assert OperatorMergeCancel.carried_by(error.value) == (
+            OperatorMergeCancel(cancelled.request_id)
+        )
+        assert not reqs['104'].result.done(), 'a link past the cancel stays queued'
+        assert _state_of(worker, reqs['104'].request_id) == 'queued'
+
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)
@@ -3647,45 +3683,3 @@ class TestDeepLandingEndToEnd:
             scene.worker, await _rev_parse(git_repo, 'main'),
             list(scene.reqs.values()),
         )
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)
-@pytest.mark.usefixtures('_within_spawn_budget')
-class TestAnOperatorCancelledLinkNeverLands:
-    """Task 5248: a chain link an operator cancelled while the head verified.
-
-    It is still lane-buffered, so ``cancel_request`` accepts it; the walk must
-    then stop AT it, because its own tree and every later link's contain it.
-    """
-
-    async def test_the_walk_lands_up_to_the_cancelled_link_and_stops(
-        self, git_repo: Path, tmp_path: Path, monkeypatch,
-    ) -> None:
-        from orchestrator.merge_lane import OperatorMergeCancel
-
-        s = await _prefix_scene_upto_finalize(
-            git_repo, tmp_path, monkeypatch, db_name='delta-cancel.db',
-        )
-        worker, reqs = s['worker'], s['reqs']
-        cancelled = reqs['103']
-        assert worker.cancel_request(cancelled.request_id).cancelled
-
-        assert await worker._finalize_inflight(s['entry']) is True
-        await asyncio.sleep(0)
-
-        assert [c[0] for c in s['adv']] == [s['head_mc'], s['chain'].links[0][1]]
-        for tid in ('101', '102'):
-            assert reqs[tid].result.result().status == 'done', f'task {tid} must land'
-        for _tid, link_sha in s['chain'].links[1:]:
-            rc, _, _ = await _run(
-                ['git', 'merge-base', '--is-ancestor', link_sha, 'main'], cwd=git_repo,
-            )
-            assert rc != 0, f'{link_sha[:8]} landed past the cancelled link'
-        with pytest.raises(asyncio.CancelledError) as error:
-            cancelled.result.result()
-        assert OperatorMergeCancel.carried_by(error.value) == (
-            OperatorMergeCancel(cancelled.request_id)
-        )
-        assert not reqs['104'].result.done(), 'a link past the cancel stays queued'
-        assert _state_of(worker, reqs['104'].request_id) == 'queued'
