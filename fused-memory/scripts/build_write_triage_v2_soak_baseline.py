@@ -31,7 +31,7 @@ import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -96,7 +96,6 @@ _SCOPE_BY_DISPUTE: Mapping[str, StrEnum] = MappingProxyType({
 DERIVATION_MIN_COMPARED = 20
 DERIVATION_MIN_AGREEMENT = 0.90
 _CHECKED_ROLES = frozenset({Role.PRIMARY, Role.SECOND})
-_SUMMARY_KEYS = ('derived', 'rated', 'n_compared', 'agree')
 
 
 @dataclass(frozen=True)
@@ -386,75 +385,105 @@ def _capped(text: str) -> str:
     return text[:TEXT_CAP] + f'…[truncated, {len(text)} chars total]'
 
 
+def validate_rating(answer: Mapping[str, Any], child_text: str, parent_text: str) -> list[str]:
+    """Each piece of *answer*'s evidence not copied from the texts its rater saw; [] when none.
+
+    Quotes and spans are matched by ``quote_found``. A rater never gives DIGEST:
+    assembly computes it from the loss spans (R3).
+    """
+    problems = []
+    if Binary.DIGEST in answer:
+        problems.append(f'digest {answer[Binary.DIGEST]!r} is given; digest is computed from loss_spans')
+    quote = answer.get('conflict_quote')
+    if isinstance(quote, Mapping):
+        for side, text, shown_as in (('parent', parent_text, 'PARENT'), ('child', child_text, 'CHILD')):
+            if not _found(quote.get(side), text):
+                problems.append(f'conflict_quote.{side} {quote.get(side)!r} is not in {shown_as}')
+    for span in answer.get('loss_spans') or ():
+        if not _found(span, child_text):
+            problems.append(f'loss_spans {span!r} is not in CHILD')
+    return problems
+
+
+def _found(quote: object, text: str) -> bool:
+    return isinstance(quote, str) and _rubric.quote_found(quote, text)
+
+
+def effective_ratings(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Each rater's highest-``round`` line on each pair and basis, without its ``round``.
+
+    A re-ask round supersedes the rater's earlier line; two lines of one round are refused.
+    """
+    latest: dict[tuple[str, str, str, str], Mapping[str, Any]] = {}
+    for row in rows:
+        identity = (row['entry_id'], row['target_id'], row['basis'], row['rater'])
+        earlier = latest.get(identity)
+        if earlier is not None and earlier['round'] == row['round']:
+            raise ValueError(f'rater line {identity} appears twice in round {row["round"]}')
+        if earlier is None or row['round'] > earlier['round']:
+            latest[identity] = row
+    return [{key: value for key, value in row.items() if key != 'round'} for row in latest.values()]
+
+
 @dataclass(frozen=True)
 class Assembly:
-    """The committed verdict corpus, and how the rated answers compare with the v1 labels."""
+    """The committed verdict corpus, and the per-row check that decided which v1 rows it holds."""
 
     verdicts: list[dict[str, Any]]
-    derivation: dict[str, dict[str, int]]
+    derivation: dict[str, Any]
 
 
 def assemble(
-    determined: Mapping[tuple[str, str], Mapping[_rubric.Binary, StrEnum]],
+    adjudications: Mapping[tuple[str, str], Mapping[str, Any] | None],
     rated_rows: Iterable[Mapping[str, Any]],
+    child_texts: Mapping[str, str],
 ) -> Assembly:
-    """One family of votes per binary: v1's where it fixes the binary, the raters' elsewhere.
+    """Derived rows from the held v1 rows, and every rater answer kept whole.
 
-    Each pair gets one ``derived`` row carrying its v1-fixed binaries. A rated
-    current-basis row keeps only the binaries v1 left open (a follow-up stays
-    only with the binary it follows); its answers on v1-fixed binaries are
-    counted against v1 in the derivation summary and never reach the corpus.
-    An attach-time row keeps every answer.
+    *adjudications* maps each (entry, target) pair to its soak adjudication, or
+    None for an extension item; *child_texts* maps each entry to its full CHILD.
+    A current-basis rater answer on a binary its pair's derived row fixes is
+    marked ``non_consumed``, and every LOSS YES row gets DIGEST from ``digest_visible``.
     """
-    verdicts = [
-        _derived_row(entry_id, target_id, answers)
-        for (entry_id, target_id), answers in sorted(determined.items()) if answers
-    ]
-    summary = {binary: Counter[str]() for binary in Binary}
-    for answers in determined.values():
-        for binary in answers:
-            summary[Binary(binary)]['derived'] += 1
-    for row in rated_rows:
-        if row['basis'] == Basis.ATTACH_TIME:
-            verdicts.append(dict(row))
-            continue
-        fixed = determined.get((row['entry_id'], row['target_id']), {})
-        kept = _open_answers(row, fixed)
-        for binary in Binary:
-            if binary in kept:
-                summary[binary]['rated'] += 1
-            elif binary in row and binary in fixed and not _rubric.is_abstain(row[binary]):
-                summary[binary]['n_compared'] += 1
-                summary[binary]['agree'] += row[binary] == fixed[binary]
-        if kept:
-            verdicts.append(_kept_row(row, kept))
+    rated = list(rated_rows)
+    check = derivation_check(adjudications, rated)
+    held = held_rows(check)
+    fixed = {
+        pair: determined for pair, adjudication in adjudications.items()
+        if adjudication is not None and (determined := v1_determined(adjudication, held))
+    }
+    verdicts = [_derived_row(entry_id, target_id, answers)
+                for (entry_id, target_id), answers in fixed.items()]
+    verdicts += [_assembled_rater_row(row, fixed, child_texts) for row in rated]
     return Assembly(
         verdicts=sorted(verdicts, key=_verdict_order),
         derivation={
-            str(binary): {key: counts[key] for key in _SUMMARY_KEYS}
-            for binary, counts in summary.items()
+            'check': {
+                'min_compared': DERIVATION_MIN_COMPARED,
+                'min_agreement': DERIVATION_MIN_AGREEMENT,
+                'roles': sorted(map(str, _CHECKED_ROLES)),
+            },
+            'rows': {name: {**asdict(row_check), 'binary': str(row_check.binary)}
+                     for name, row_check in check.items()},
+            'held_rows': sorted(held),
         },
     )
 
 
-def _open_answers(row: Mapping[str, Any], fixed: Mapping[Any, StrEnum]) -> dict[str, str]:
-    kept = {
-        str(binary): row[binary] for binary in Binary
-        if binary in row and binary not in fixed and binary not in _rubric.FOLLOW_UPS
-    }
-    for follow_up, needs in _rubric.FOLLOW_UPS.items():
-        if follow_up in row and all(asked_after in kept for asked_after in needs):
-            kept[str(follow_up)] = row[follow_up]
-    return kept
-
-
-def _kept_row(row: Mapping[str, Any], kept: Mapping[str, str]) -> dict[str, Any]:
-    identity = {key: row[key] for key in ('entry_id', 'target_id', 'basis', 'rater', 'role', 'batch')}
-    if 'reason' in row:
-        identity['reason'] = row['reason']
-    if any(map(_rubric.is_abstain, kept.values())) and 'unclear_reason' in row:
-        identity['unclear_reason'] = row['unclear_reason']
-    return {**identity, **kept}
+def _assembled_rater_row(
+    row: Mapping[str, Any],
+    fixed: Mapping[tuple[str, str], Mapping[_rubric.Binary, StrEnum]],
+    child_texts: Mapping[str, str],
+) -> dict[str, Any]:
+    assembled = dict(row)
+    if row['basis'] == Basis.CURRENT:
+        derived = fixed.get((row['entry_id'], row['target_id']), {})
+        if non_consumed := sorted(str(binary) for binary in derived if binary in row):
+            assembled['non_consumed'] = non_consumed
+    if row.get(Binary.LOSS) == Answer.YES:
+        visible = _rubric.digest_visible(row['loss_spans'], child_texts[row['entry_id']])
+        assembled[str(Binary.DIGEST)] = str(Answer.YES if visible else Answer.NO)
+    return assembled
 
 
 def _verdict_order(row: Mapping[str, Any]) -> tuple[str, str, str, str]:
@@ -468,7 +497,7 @@ def _verdict_order(row: Mapping[str, Any]) -> tuple[str, str, str, str]:
 @dataclass(frozen=True)
 class _SoakItem:
     item: Mapping[str, Any]
-    determined: Mapping[_rubric.Binary, StrEnum]
+    adjudication: Mapping[str, Any] | None
     child_text: str
     parent_text: str
     child_created_at: str
@@ -507,7 +536,7 @@ def _load_bundle(bundle: Path) -> list[_SoakItem]:
                 parent_category=text.get('parent_category'),
                 child_metadata=metadata.get(intent, {}),
             ),
-            determined=v1_determined(adjudication),
+            adjudication=adjudication,
             child_text=text.get('child_text') or '',
             parent_text=text.get('parent_text') or '',
             child_created_at=adjudication['created_at'],
@@ -626,11 +655,18 @@ def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _assembled(soak: Sequence[_SoakItem], rated_rows: Iterable[Mapping[str, Any]]) -> Assembly:
+    return assemble(
+        {soaked.pair: soaked.adjudication for soaked in soak}, rated_rows,
+        {soaked.item['entry_id']: soaked.child_text for soaked in soak},
+    )
+
+
 def _third_command(args: argparse.Namespace) -> dict[str, Any]:
     soak = _load_bundle(args.bundle)
     scratch = _Scratch(args.scratch)
     key = scratch.load_key()
-    assembly = assemble({soaked.pair: soaked.determined for soaked in soak}, scratch.ratings(key))
+    assembly = _assembled(soak, scratch.ratings(key))
     tied = set(decisive_ties([soaked.item for soaked in soak], assembly.verdicts))
     name = f'third_{sum(spec["role"] == Role.THIRD for spec in key["shards"].values()):02d}'
     entries = [soaked.entry(Basis.CURRENT) for soaked in soak if soaked.pair in tied]
@@ -644,14 +680,14 @@ def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
     soak = _load_bundle(args.bundle)
     scratch = _Scratch(args.scratch)
     key = scratch.load_key()
-    assembly = assemble({soaked.pair: soaked.determined for soaked in soak}, scratch.ratings(key))
+    assembly = _assembled(soak, scratch.ratings(key))
     out: Path = args.out_dir
     out.mkdir(parents=True, exist_ok=True)
     _write_jsonl(out / 'write_triage_v2_soak_items.jsonl', [soaked.item for soaked in soak])
     _write_jsonl(out / 'write_triage_v2_soak_verdicts.jsonl', assembly.verdicts)
     _write_json(out / 'write_triage_v2_soak_strata.json', dict(STRATA))
     _write_json(out / 'write_triage_v2_soak_derivation.json', {
-        'by_binary': assembly.derivation,
+        **assembly.derivation,
         **rating_volume(list(key['items'].values())),
         'attach_time_unrecoverable': sorted(key['attach_time_unrecoverable']),
         'shards': {name: {'rater': spec['rater'], 'items': len(spec['items'])}
