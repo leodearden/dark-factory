@@ -1,6 +1,10 @@
 """The vocabulary and policy for a task submission the curator could not judge.
 
-Why it was deferred (:class:`DeferReason`), when it is retried
+The curator defers a submission when its account pool, its LLM call or its
+corpus is unavailable, when its zero-output breaker is open, or when it raised
+instead of deciding. Why it was deferred (:class:`DeferReason`), how loudly a
+backlog of such deferrals escalates and what restores curation for it
+(:func:`backlog_severity`, :func:`backlog_remediation`), when it is retried
 (:class:`CurationRetryPolicy`; a deferral has no terminal bound, it waits for a
 verdict), and how a create that no curator verdict judged is marked
 (:func:`dedupe_skipped_marker`). The bottom layer of the
@@ -26,14 +30,62 @@ if TYPE_CHECKING:
 class DeferReason(StrEnum):
     ALL_ACCOUNTS_CAPPED = 'all-accounts-capped'
     ACCOUNTS_AUTH_FAILED = 'accounts-auth-failed'
+    LLM_FAILED = 'llm-failed'
+    CORPUS_FAILED = 'corpus-failed'
+    ZERO_OUTPUT_BREAKER_OPEN = 'zero-output-breaker-open'
+    CURATOR_RAISED = 'curator-raised'
 
 
 def backlog_severity(reason: DeferReason) -> Literal['info', 'blocking']:
     match reason:
-        case DeferReason.ALL_ACCOUNTS_CAPPED:
+        case DeferReason.ALL_ACCOUNTS_CAPPED | DeferReason.ZERO_OUTPUT_BREAKER_OPEN:
             return 'info'
-        case DeferReason.ACCOUNTS_AUTH_FAILED:
+        case (
+            DeferReason.ACCOUNTS_AUTH_FAILED
+            | DeferReason.LLM_FAILED
+            | DeferReason.CORPUS_FAILED
+            | DeferReason.CURATOR_RAISED
+        ):
             return 'blocking'
+        case _:
+            assert_never(reason)
+
+
+def backlog_remediation(reason: DeferReason) -> str:
+    match reason:
+        case DeferReason.ALL_ACCOUNTS_CAPPED:
+            return (
+                'Every curator account is usage-capped; curation resumes by itself '
+                'once an account cap resets.'
+            )
+        case DeferReason.ACCOUNTS_AUTH_FAILED:
+            return (
+                "Every curator account failed authentication; restore the accounts' "
+                'credentials to resume curation.'
+            )
+        case DeferReason.LLM_FAILED:
+            return (
+                "The curator's LLM call is failing; read the curator_failure escalations "
+                'and the fused-memory log for the failing subtype or exception (for example '
+                'the claude binary missing from the service PATH). A submission the curator '
+                'can never judge may be withdrawn with cancel_ticket.'
+            )
+        case DeferReason.CORPUS_FAILED:
+            return (
+                "The curator could not assemble its candidate corpus; Qdrant, the embedder "
+                'or the task backend is failing.'
+            )
+        case DeferReason.ZERO_OUTPUT_BREAKER_OPEN:
+            return (
+                "The curator's zero-output breaker is open and closes by itself after "
+                'zero_output_breaker_cooldown_seconds; the hangs that opened it fold into '
+                'the curator_zero_output_hang record.'
+            )
+        case DeferReason.CURATOR_RAISED:
+            return (
+                'The curator raised instead of deciding, which is a code defect; read the '
+                'traceback logged by the fused-memory ticket worker.'
+            )
         case _:
             assert_never(reason)
 

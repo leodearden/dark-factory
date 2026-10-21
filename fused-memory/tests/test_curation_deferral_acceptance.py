@@ -467,8 +467,12 @@ async def test_one_backlog_escalation_per_outage(server, tmp_path):
                 assert await _resolve(interceptor, ticket_id) == _parked_answer(_group_reason(title))
 
     pending = pending_per_group()
-    assert {reason: len(records) for reason, records in pending.items()} == {
+    parked_reasons = {DeferReason.ALL_ACCOUNTS_CAPPED, DeferReason.ACCOUNTS_AUTH_FAILED}
+    assert {reason: len(pending[reason]) for reason in parked_reasons} == {
         DeferReason.ALL_ACCOUNTS_CAPPED: 1, DeferReason.ACCOUNTS_AUTH_FAILED: 1,
+    }
+    assert {reason: records for reason, records in pending.items() if reason not in parked_reasons} == {
+        reason: [] for reason in DeferReason if reason not in parked_reasons
     }
     [capped], [auth_failed] = pending[DeferReason.ALL_ACCOUNTS_CAPPED], pending[DeferReason.ACCOUNTS_AUTH_FAILED]
     assert (capped.severity, auth_failed.severity) == ('info', 'blocking')
