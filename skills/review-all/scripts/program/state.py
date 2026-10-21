@@ -1285,3 +1285,458 @@ class StoreView(Protocol):
 
 def open_reader(program: Program, environ: Mapping[str, str] = os.environ) -> StoreReader:
     return StoreReader(fused_memory_url(environ), program.project_root)
+
+
+NOTES_CAP = 600
+
+
+@dataclass(frozen=True)
+class Session:
+    kind: SessionKind
+    title: str
+
+
+@dataclass(frozen=True)
+class OpenQuestion:
+    id: str
+    question: str
+    options: tuple[str, ...]
+    recommendation: str
+    needs_human: bool
+    source: QuestionSource
+    lead_rulable: bool = False
+
+
+@dataclass(frozen=True)
+class SessionRuling:
+    id: str
+    question: str
+    ruling: str
+    options: tuple[str, ...]
+    consequence: str
+
+
+@dataclass(frozen=True)
+class SeamDependency:
+    stream: str
+    contract: str
+
+
+@dataclass(frozen=True)
+class Xref:
+    to: str | int
+    text: str
+
+
+@dataclass(frozen=True)
+class LeadAction:
+    op: LeadActionOp
+    task: int
+    text: str
+    needs_human: bool
+    target: Any = None
+
+
+@dataclass(frozen=True)
+class Filed:
+    label: str
+    task_id: int
+    priority: Priority
+    keys: tuple[str, ...]
+    gate_dep: bool
+    adopted: bool
+
+
+@dataclass(frozen=True)
+class Held:
+    label: str
+    task_id: int
+    waits_on: str
+    contract: str
+    release_owner: str
+
+
+@dataclass(frozen=True)
+class Released:
+    task_id: int
+    onto: tuple[int, ...]
+    contract_as_delivered: str
+
+
+@dataclass(frozen=True)
+class CommitPlanning:
+    committed: tuple[int, ...]
+    excluded: tuple[int, ...]
+    stamping_errors: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class OtherFiled:
+    task_id: int
+    why: str
+
+
+@dataclass(frozen=True)
+class Move:
+    from_path: str
+    to_path: str | None
+    symbols: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PrdReturn:
+    """One parsed return block; the keys its pass lacks are None or empty."""
+
+    schema: str
+    run_id: str
+    stream: str
+    pass_: Pass
+    session: Session
+    item: str | None = None
+    prd_path: str | None = None
+    manifest_path: str | None = None
+    sidecar_path: str | None = None
+    commits: tuple[str, ...] = ()
+    open_questions: tuple[OpenQuestion, ...] = ()
+    rulings_in_session: tuple[SessionRuling, ...] = ()
+    seam_dependencies: tuple[SeamDependency, ...] = ()
+    xrefs: tuple[Xref, ...] = ()
+    lead_actions: tuple[LeadAction, ...] = ()
+    notes: str | None = None
+    touches: tuple[str, ...] = ()
+    filed: tuple[Filed, ...] = ()
+    held: tuple[Held, ...] = ()
+    released: tuple[Released, ...] = ()
+    commit_planning: CommitPlanning | None = None
+    other_filed: tuple[OtherFiled, ...] = ()
+    moves: tuple[Move, ...] = ()
+
+
+@dataclass(frozen=True)
+class PassKeys:
+    required: frozenset[str]
+    optional: frozenset[str]
+    non_empty: frozenset[str] = frozenset()
+
+
+_COMMON_RETURN_KEYS = frozenset({'schema', 'run_id', 'stream', 'pass', 'session'})
+_AUTHOR_OPTIONAL_KEYS = frozenset({
+    'manifest_path', 'sidecar_path', 'commits', 'open_questions', 'rulings_in_session',
+    'seam_dependencies', 'xrefs', 'lead_actions', 'notes',
+})
+RETURN_KEYS: Mapping[Pass, PassKeys] = types.MappingProxyType({
+    Pass.AUTHOR: PassKeys(_COMMON_RETURN_KEYS | {'prd_path', 'touches'}, _AUTHOR_OPTIONAL_KEYS),
+    Pass.DECOMPOSE: PassKeys(
+        _COMMON_RETURN_KEYS | {'prd_path', 'filed', 'moves'},
+        _AUTHOR_OPTIONAL_KEYS | {'held', 'released', 'commit_planning', 'other_filed'},
+    ),
+    Pass.INVESTIGATE: PassKeys(
+        _COMMON_RETURN_KEYS | {'item', 'rulings_in_session'}, frozenset({'notes'}),
+        non_empty=frozenset({'rulings_in_session'}),
+    ),
+})
+
+
+class TargetKind(enum.StrEnum):
+    IDS = 'ids'
+    KEYS = 'keys'
+    PATH = 'path'
+    NONE = 'none'
+
+
+LEAD_ACTION_TARGETS: Mapping[LeadActionOp, TargetKind] = types.MappingProxyType({
+    LeadActionOp.CANCEL: TargetKind.IDS,
+    LeadActionOp.EDGE: TargetKind.IDS,
+    LeadActionOp.RELEASE: TargetKind.IDS,
+    LeadActionOp.STAMP: TargetKind.KEYS,
+    LeadActionOp.REPATH: TargetKind.PATH,
+    LeadActionOp.NOTE: TargetKind.NONE,
+    LeadActionOp.AMEND: TargetKind.NONE,
+})
+
+
+@dataclass(frozen=True)
+class Rejection:
+    field: str
+    kind: RejectionClass
+    reason: str
+
+    def __str__(self) -> str:
+        return f'{self.kind}: {self.field}: {self.reason}'
+
+
+@dataclass(frozen=True)
+class ReturnCheck:
+    rejections: tuple[Rejection, ...]
+    value: PrdReturn | None
+    measured_at: str | None
+
+    @property
+    def ok(self) -> bool:
+        return not self.rejections
+
+
+class _Invalid:
+    """The result of a field check that recorded a rejection."""
+
+
+_INVALID = _Invalid()
+_FieldCheck = Callable[[Any, str, list[Rejection]], Any]
+
+
+def _reject(rejections: list[Rejection], field: str, reason: str) -> _Invalid:
+    rejections.append(Rejection(field, RejectionClass.FORM, reason))
+    return _INVALID
+
+
+def _is_repo_relative(path: Any) -> bool:
+    """A non-empty POSIX path that is not absolute and has no '..' segment."""
+    if not isinstance(path, str) or not path or '\\' in path:
+        return False
+    posix = PurePosixPath(path)
+    return not posix.is_absolute() and '..' not in posix.parts
+
+
+def _of_type(kind: type, described: str) -> _FieldCheck:
+    def check(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        if isinstance(value, kind) and (kind is bool or not isinstance(value, bool)):
+            return value
+        return _reject(rejections, field, f'expected {described}, got {value!r}')
+    return check
+
+
+_TEXT = _of_type(str, 'a string')
+_BOOL = _of_type(bool, 'a bool')
+_INT = _of_type(int, 'an integer')
+
+
+def _vocabulary(vocabulary: type[enum.StrEnum]) -> _FieldCheck:
+    def check(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        if isinstance(value, str) and value in _values(vocabulary):
+            return vocabulary(value)
+        return _reject(rejections, field, f'{value!r} is not one of {sorted(_values(vocabulary))}')
+    return check
+
+
+def _member(allowed: Iterable[Any], described: str) -> _FieldCheck:
+    allowed = frozenset(allowed)
+
+    def check(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        if isinstance(value, str | int) and not isinstance(value, bool) and value in allowed:
+            return value
+        return _reject(rejections, field, f'{value!r} is not {described}')
+    return check
+
+
+def _repo_path(value: Any, field: str, rejections: list[Rejection]) -> Any:
+    if _is_repo_relative(value):
+        return value
+    return _reject(rejections, field, f'{value!r} is not a repo-relative POSIX path')
+
+
+def _nullable(check: _FieldCheck) -> _FieldCheck:
+    def nullable(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        return None if value is None else check(value, field, rejections)
+    return nullable
+
+
+def _list_of(check: _FieldCheck) -> _FieldCheck:
+    def items(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        if not isinstance(value, list):
+            return _reject(rejections, field, f'expected a list, got {value!r}')
+        parsed = tuple(check(item, f'{field}[{i}]', rejections) for i, item in enumerate(value))
+        return _INVALID if any(item is _INVALID for item in parsed) else parsed
+    return items
+
+
+def _record(
+    build: Callable[[dict[str, Any]], Any], required: Mapping[str, _FieldCheck],
+    optional: Mapping[str, _FieldCheck] = types.MappingProxyType({}),
+) -> _FieldCheck:
+    """An object with exactly these fields, each checked at ``<field>.<name>``, then *build* it."""
+    def record(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        if not isinstance(value, Mapping):
+            return _reject(rejections, field, f'expected an object, got {value!r}')
+        found = len(rejections)
+        for name in sorted(set(value) - set(required) - set(optional)):
+            _reject(rejections, f'{field}.{name}', 'is not a field of this entry')
+        for name in sorted(set(required) - set(value)):
+            _reject(rejections, f'{field}.{name}', 'is required')
+        checks = {**required, **optional}
+        parsed = {n: checks[n](value[n], f'{field}.{n}', rejections) for n in checks if n in value}
+        return _INVALID if len(rejections) > found else build(parsed)
+    return record
+
+
+_TEXTS = _list_of(_TEXT)
+
+
+def _unchecked(value: Any, field: str, rejections: list[Rejection]) -> Any:
+    return value
+
+
+def _capped_notes(value: Any, field: str, rejections: list[Rejection]) -> Any:
+    if _TEXT(value, field, rejections) is _INVALID:
+        return _INVALID
+    if len(value) > NOTES_CAP:
+        return _reject(rejections, field, f'{len(value)} characters is over the {NOTES_CAP} cap')
+    return value
+
+
+def _no_commits(value: Any, field: str, rejections: list[Rejection]) -> Any:
+    if value != []:
+        return _reject(rejections, field, f'seats and sessions never commit; expected [], got {value!r}')
+    return ()
+
+
+def _ids_target(value: Any, field: str, rejections: list[Rejection]) -> Any:
+    ids = [value] if isinstance(value, int) and not isinstance(value, bool) else value
+    return _list_of(_INT)(ids, field, rejections)
+
+
+def _no_target(value: Any, field: str, rejections: list[Rejection]) -> Any:
+    return None if value is None else _reject(rejections, field, f'takes no target, got {value!r}')
+
+
+_TARGET_CHECKS: Mapping[TargetKind, _FieldCheck] = types.MappingProxyType({
+    TargetKind.IDS: _ids_target,
+    TargetKind.KEYS: _TEXTS,
+    TargetKind.PATH: _repo_path,
+    TargetKind.NONE: _no_target,
+})
+
+_LEAD_ACTION_FIELDS = _record(
+    lambda f: LeadAction(**f),
+    {'op': _vocabulary(LeadActionOp), 'task': _INT, 'text': _TEXT, 'needs_human': _BOOL},
+    {'target': _unchecked},
+)
+
+
+def _lead_action(value: Any, field: str, rejections: list[Rejection]) -> Any:
+    action = _LEAD_ACTION_FIELDS(value, field, rejections)
+    if action is _INVALID:
+        return _INVALID
+    target = _TARGET_CHECKS[LEAD_ACTION_TARGETS[action.op]](
+        action.target, f'{field}.target', rejections,
+    )
+    return _INVALID if target is _INVALID else replace(action, target=target)
+
+
+def _return_checks(program: Program) -> Mapping[str, _FieldCheck]:
+    """The check for every top-level return key; RETURN_KEYS decides which a pass may carry."""
+    stream_id = _member(program.stream_ids, f'a stream of {program.run_id}')
+    return {
+        'schema': _member({RETURN_SCHEMA}, f'{RETURN_SCHEMA!r}'),
+        'run_id': _member({program.run_id}, f'this program\'s run_id {program.run_id!r}'),
+        'stream': stream_id,
+        'pass': _vocabulary(Pass),
+        'session': _record(lambda f: Session(**f),
+                           {'kind': _vocabulary(SessionKind), 'title': _TEXT}),
+        'item': _TEXT,
+        'prd_path': _repo_path,
+        'manifest_path': _repo_path,
+        'sidecar_path': _repo_path,
+        'commits': _no_commits,
+        'open_questions': _list_of(_record(
+            lambda f: OpenQuestion(**f),
+            {'id': _TEXT, 'question': _TEXT, 'options': _TEXTS, 'recommendation': _TEXT,
+             'needs_human': _BOOL, 'source': _vocabulary(QuestionSource)},
+            {'lead_rulable': _BOOL},
+        )),
+        'rulings_in_session': _list_of(_record(
+            lambda f: SessionRuling(**f),
+            {'id': _TEXT, 'question': _TEXT, 'ruling': _TEXT, 'options': _TEXTS,
+             'consequence': _TEXT},
+        )),
+        'seam_dependencies': _list_of(_record(
+            lambda f: SeamDependency(**f), {'stream': stream_id, 'contract': _TEXT},
+        )),
+        'xrefs': _list_of(_record(
+            lambda f: Xref(**f),
+            {'to': _xref_target(program), 'text': _TEXT},
+        )),
+        'lead_actions': _list_of(_lead_action),
+        'notes': _capped_notes,
+        'touches': _list_of(_repo_path),
+        'filed': _list_of(_record(
+            lambda f: Filed(**f),
+            {'label': _TEXT, 'task_id': _INT, 'priority': _vocabulary(Priority),
+             'keys': _TEXTS, 'gate_dep': _BOOL, 'adopted': _BOOL},
+        )),
+        'held': _list_of(_record(
+            lambda f: Held(**f),
+            {'label': _TEXT, 'task_id': _INT, 'waits_on': stream_id, 'contract': _TEXT,
+             'release_owner': _TEXT},
+        )),
+        'released': _list_of(_record(
+            lambda f: Released(**f),
+            {'task_id': _INT, 'onto': _list_of(_INT), 'contract_as_delivered': _TEXT},
+        )),
+        'commit_planning': _record(
+            lambda f: CommitPlanning(**f),
+            {'committed': _list_of(_INT), 'excluded': _list_of(_INT),
+             'stamping_errors': _list_of(_unchecked)},
+        ),
+        'other_filed': _list_of(_record(
+            lambda f: OtherFiled(**f), {'task_id': _INT, 'why': _TEXT},
+        )),
+        'moves': _list_of(_record(
+            lambda f: Move(from_path=f['from'], to_path=f['to'], symbols=f['symbols']),
+            {'from': _repo_path, 'to': _nullable(_repo_path), 'symbols': _TEXTS},
+        )),
+    }
+
+
+def _xref_target(program: Program) -> _FieldCheck:
+    streams = _member({*program.stream_ids, 'program'}, 'a stream id, "program" or a task id')
+
+    def check(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return streams(value, field, rejections)
+    return check
+
+
+def _key_set_rejections(data: Mapping[str, Any], pass_: Pass) -> list[Rejection]:
+    keys = RETURN_KEYS[pass_]
+    rejections: list[Rejection] = []
+    for key in sorted(set(data) - keys.required - keys.optional):
+        _reject(rejections, key, f'is not a key of a {pass_} return, even when empty')
+    for key in sorted(keys.required - set(data)):
+        _reject(rejections, key, f'is required on a {pass_} return')
+    for key in sorted(keys.non_empty & set(data)):
+        if data[key] == []:
+            _reject(rejections, key, f'must not be empty on a {pass_} return')
+    return rejections
+
+
+def _check_form(data: Any, program: Program) -> tuple[list[Rejection], PrdReturn | None]:
+    """Every form rejection of one parsed return, else the typed PrdReturn."""
+    if not isinstance(data, Mapping):
+        return [Rejection('<file>', RejectionClass.FORM, 'is not a JSON object')], None
+    checks = _return_checks(program)
+    rejections: list[Rejection] = []
+    pass_ = checks['pass'](data.get('pass'), 'pass', rejections)
+    if pass_ is _INVALID:
+        return rejections, None
+    rejections += _key_set_rejections(data, pass_)
+    parsed = {key: checks[key](data[key], key, rejections) for key in data if key in checks}
+    if rejections:
+        return rejections, None
+    fields = {('pass_' if key == 'pass' else key): value for key, value in parsed.items()}
+    return [], PrdReturn(**fields)
+
+
+def validate_return(
+    text: str, *, program: Program, ledger: Sequence[Mapping[str, Any]], store: StoreView,
+) -> ReturnCheck:
+    """Validate one return block: form first; a form-valid return is then checked against the store."""
+    try:
+        data = json.loads(text)
+    except ValueError as bad:
+        return ReturnCheck((Rejection('<file>', RejectionClass.FORM, f'does not parse: {bad}'),),
+                           None, None)
+    rejections, value = _check_form(data, program)
+    if value is None:
+        return ReturnCheck(tuple(rejections), None, None)
+    return ReturnCheck((), value, None)
