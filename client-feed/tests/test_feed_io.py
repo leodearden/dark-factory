@@ -23,7 +23,14 @@ from client_feed.contract import (
     parse_state,
     split_jsonl,
 )
-from client_feed.feed_io import Cursor, FeedIoError, FeedIoProblem, OutDir, Stamp
+from client_feed.feed_io import (
+    Cursor,
+    FeedIoError,
+    FeedIoProblem,
+    OutDir,
+    Stamp,
+    read_feed_lines,
+)
 from client_feed.fold import ProjectMismatch, fold
 from client_feed.policy import OutDirRefused, PolicyError, PolicyProblem, load_policy
 from client_feed.validate import validate_out_dir
@@ -581,3 +588,80 @@ def test_leftover_temp_files_of_an_interrupted_write_are_removed(out_dir: Path) 
     OutDir.open(out_dir, project_id=PROJECT)
 
     assert tuple(sorted(os.listdir(out_dir))) == WRITTEN
+
+
+def _old_major_feed(out_dir: Path, *, cursor: bool = True, state: bool = True) -> bytes:
+    """A feed of major 0 with its state and cursor beside it, as a FEED_VERSION '0.9' writer left them."""
+    lines = [
+        raw_heartbeat(seq).model_copy(update={'feed_version': '0.9'}).model_dump_json()
+        for seq in (1, 2)
+    ]
+    data = ''.join(f'{line}\n' for line in lines).encode()
+    (out_dir / 'feed.jsonl').write_bytes(data)
+    os.chmod(out_dir / 'feed.jsonl', 0o600)
+    if state:
+        (out_dir / 'state.json').write_text('{"feed_version": "0.9", "watermark_seq": 2}')
+    if cursor:
+        (out_dir / 'cursor.json').write_text(
+            Cursor(through_seq=2, feed_bytes=len(data), events_id=40).model_dump_json()
+        )
+    return data
+
+
+def _assert_fresh(out: OutDir) -> None:
+    assert out.state == fold([], project_id=PROJECT)
+    assert out.cursor == Cursor()
+    assert out.uncommitted == ()
+    assert out.next_seq == 1
+
+
+@pytest.mark.parametrize(
+    ('cursor', 'state'),
+    [(True, True), (False, True), (False, False)],
+    ids=['whole', 'cursor-already-removed', 'cursor-and-state-already-removed'],
+)
+def test_a_feed_of_another_major_is_rotated_aside(
+    out_dir: Path, cursor: bool, state: bool
+) -> None:
+    old = _old_major_feed(out_dir, cursor=cursor, state=state)
+
+    out = OutDir.open(out_dir, project_id=PROJECT)
+
+    _assert_fresh(out)
+    assert sorted(os.listdir(out_dir)) == ['feed.0.jsonl']
+    assert (out_dir / 'feed.0.jsonl').read_bytes() == old
+    assert (out_dir / 'feed.0.jsonl').stat().st_mode & 0o777 == 0o640
+    out.commit(three_events(out), Cursor())
+    assert [line.seq for line in feed_lines(out_dir)] == [1, 2, 3]
+    assert validate_out_dir(out_dir).ok
+
+
+@pytest.mark.parametrize('as_symlink', [False, True], ids=['file', 'symlink'])
+def test_an_existing_rotation_target_is_refused_untouched(
+    out_dir: Path, outside: Path, as_symlink: bool
+) -> None:
+    _old_major_feed(out_dir)
+    target = out_dir / 'feed.0.jsonl'
+    if as_symlink:
+        target.symlink_to(outside)
+    else:
+        target.write_text('an earlier rotation\n')
+    before = _contents(out_dir.parent)
+
+    with pytest.raises(FeedIoError) as caught:
+        OutDir.open(out_dir, project_id=PROJECT)
+
+    assert caught.value.problem is FeedIoProblem.ROTATION_TARGET_EXISTS
+    assert caught.value.name == 'feed.0.jsonl'
+    assert 'feed.0.jsonl' in str(caught.value)
+    assert _contents(out_dir.parent) == before
+
+
+def test_read_feed_lines_reads_complete_lines_only_and_writes_nothing(out_dir: Path) -> None:
+    written = _committed(out_dir, first_batch)
+    with (out_dir / 'feed.jsonl').open('ab') as feed:
+        feed.write(b'{"seq": 4, "at": "2026-')
+    before = _files(out_dir)
+
+    assert read_feed_lines(out_dir) == tuple(written)
+    assert _files(out_dir) == before
