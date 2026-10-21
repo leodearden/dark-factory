@@ -2355,11 +2355,10 @@ def create_server(
         the capability and legality problems first.  None of the four mutates
         the record, so the ordering is an error-reporting precedence only.
 
-        NOTE: the ``target_status`` values above are not yet written by
-        resolve_issue — this call changes only the escalation record; the
-        task-status effects described in the table earlier in this docstring
-        remain owned by the orchestrator harness. Wiring the harness to
-        consume Table B directly is a separate, out-of-scope follow-up.
+        NOTE: resolve_issue itself writes no task status — this call changes
+        only the escalation record. The orchestrator harness applies the
+        ``target_status`` values above. Table B's consumers are listed in the
+        ``escalation/src/escalation/action_effects.py`` module docstring.
         """
         if terminate is not None:
             return {

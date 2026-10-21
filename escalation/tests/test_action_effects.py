@@ -3,9 +3,9 @@
 Table B is the escalation-resolution-intent authority — PRD
 ``plans/task-status-authority-prd.md`` contract C5 / decisions D1, D2
 (finding 10.0). These tests pin the behaviour-preserving
-``(action, level, category) -> TaskEffect`` mapping BEFORE
-``resolve_issue`` is wired to consult it (that wiring is step-4 of this
-task's plan).
+``(action, level, category) -> TaskEffect`` mapping that
+``escalation.server.resolve_issue`` (legality) and the orchestrator harness
+(dispatch) both consume.
 """
 
 from __future__ import annotations
@@ -27,9 +27,8 @@ from escalation.action_effects import (
     effect_for,
 )
 
-# Behaviour-preserving mapping transcribed from
-# orchestrator/src/orchestrator/harness.py:8259-8325 (_ACTION_TARGETS /
-# _on_escalation_resolved) — the source of truth Table B mirrors verbatim.
+# Table B's expected target statuses, written out independently of
+# ACTION_EFFECTS so that an edit to the table must also edit this pin.
 _EXPECTED_TARGET_STATUS: dict[str, str | None] = {
     'resume': 'pending',
     'restart': 'pending',
