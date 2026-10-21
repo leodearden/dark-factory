@@ -100,86 +100,55 @@ class TestDriftCheckStatePersistence:
     _load_shadow_compare_state/_save_shadow_compare_state (fail-safe JSON), the
     same contract asserted by
     test_merge_queue_warm_cold_shadow.py::TestShadowCompareStatePersistence.
-
-    RED (pre-impl): DriftCheckState / _load_drift_check_state /
-    _save_drift_check_state do not exist yet in orchestrator.merge_lane.drift.
     """
 
     def test_drift_check_state_defaults_land_count_zero(self) -> None:
-        from orchestrator.merge_lane.drift import DriftCheckState
-
         assert DriftCheckState().land_count == 0
 
     def test_load_returns_default_when_file_missing(self, tmp_path: Path) -> None:
-        from orchestrator.merge_lane.drift import DriftCheckState, _load_drift_check_state
-
         state = _load_drift_check_state(tmp_path / 'nonexistent.json')
         assert state == DriftCheckState(land_count=0)
 
     def test_load_returns_default_on_corrupt_json(self, tmp_path: Path) -> None:
-        from orchestrator.merge_lane.drift import DriftCheckState, _load_drift_check_state
-
         path = tmp_path / 'drift.json'
         path.write_text('{ not valid json !!!')
         assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
 
     def test_load_returns_default_on_empty_json_object(self, tmp_path: Path) -> None:
         # Missing keys → fail-safe default (mirror shadow's empty-object test).
-        from orchestrator.merge_lane.drift import DriftCheckState, _load_drift_check_state
-
         path = tmp_path / 'drift.json'
         path.write_text('{}')
         assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
 
     def test_load_returns_default_on_wrong_typed_key(self, tmp_path: Path) -> None:
         # int("not-an-int") raises ValueError → fail-safe default.
-        from orchestrator.merge_lane.drift import DriftCheckState, _load_drift_check_state
-
         path = tmp_path / 'drift.json'
         path.write_text('{"land_count": "not-an-int"}')
         assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
 
     def test_load_returns_default_on_null_key(self, tmp_path: Path) -> None:
         # int(None) raises TypeError → fail-safe default.
-        from orchestrator.merge_lane.drift import DriftCheckState, _load_drift_check_state
-
         path = tmp_path / 'drift.json'
         path.write_text('{"land_count": null}')
         assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
 
     def test_round_trip_preserves_count(self, tmp_path: Path) -> None:
-        from orchestrator.merge_lane.drift import (
-            DriftCheckState,
-            _load_drift_check_state,
-            _save_drift_check_state,
-        )
-
         path = tmp_path / 'drift.json'
         _save_drift_check_state(path, DriftCheckState(land_count=19))
         assert _load_drift_check_state(path).land_count == 19
 
     def test_round_trip_count_zero(self, tmp_path: Path) -> None:
-        from orchestrator.merge_lane.drift import (
-            DriftCheckState,
-            _load_drift_check_state,
-            _save_drift_check_state,
-        )
-
         path = tmp_path / 'drift.json'
         original = DriftCheckState(land_count=0)
         _save_drift_check_state(path, original)
         assert _load_drift_check_state(path) == original
 
     def test_save_creates_parent_dirs(self, tmp_path: Path) -> None:
-        from orchestrator.merge_lane.drift import DriftCheckState, _save_drift_check_state
-
         path = tmp_path / 'a' / 'b' / 'c' / 'drift.json'
         _save_drift_check_state(path, DriftCheckState(land_count=5))
         assert path.exists()
 
     def test_save_writes_valid_json(self, tmp_path: Path) -> None:
-        from orchestrator.merge_lane.drift import DriftCheckState, _save_drift_check_state
-
         path = tmp_path / 'drift.json'
         _save_drift_check_state(path, DriftCheckState(land_count=3))
         data = json.loads(path.read_text())
@@ -189,16 +158,12 @@ class TestDriftCheckStatePersistence:
     # -- task 6648: a due check that could not get its host slots is deferred --
 
     def test_drift_check_state_defaults_no_deferrals(self) -> None:
-        from orchestrator.merge_lane.drift import DriftCheckState
-
         assert DriftCheckState().consecutive_deferrals == 0
 
     def test_load_old_format_file_keeps_land_count_and_no_deferrals(
         self, tmp_path: Path,
     ) -> None:
         # A state file written before deferrals existed must not reset the cadence.
-        from orchestrator.merge_lane.drift import DriftCheckState, _load_drift_check_state
-
         path = tmp_path / 'drift.json'
         path.write_text('{"land_count": 7}')
         assert _load_drift_check_state(path) == DriftCheckState(
@@ -206,27 +171,17 @@ class TestDriftCheckStatePersistence:
         )
 
     def test_round_trip_preserves_consecutive_deferrals(self, tmp_path: Path) -> None:
-        from orchestrator.merge_lane.drift import (
-            DriftCheckState,
-            _load_drift_check_state,
-            _save_drift_check_state,
-        )
-
         path = tmp_path / 'drift.json'
         original = DriftCheckState(land_count=12, consecutive_deferrals=3)
         _save_drift_check_state(path, original)
         assert _load_drift_check_state(path) == original
 
     def test_due_on_cadence_multiple_or_after_a_deferral(self) -> None:
-        from orchestrator.merge_lane.drift import DriftCheckState
-
         assert DriftCheckState(land_count=6).is_due(3) is True
         assert DriftCheckState(land_count=7).is_due(3) is False
         assert DriftCheckState(land_count=7, consecutive_deferrals=1).is_due(3) is True
 
     def test_transitions_return_new_values(self) -> None:
-        from orchestrator.merge_lane.drift import DriftCheckState
-
         original = DriftCheckState(land_count=4, consecutive_deferrals=2)
         assert original.after_land() == DriftCheckState(land_count=5, consecutive_deferrals=2)
         assert original.after_deferral() == DriftCheckState(land_count=4, consecutive_deferrals=3)
