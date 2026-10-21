@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from pathlib import Path
 
 import httpx
 
@@ -156,6 +157,21 @@ class CannedMCP:
             'error': f'No tasks found for ID(s): {task_id}',
             'error_type': 'TaskNotFoundError',
         }
+
+
+class ByRoot:
+    """One canned substrate per project root, routed by the read's ``project_root``.
+
+    Keyed by the root's directory name, which is the project label the
+    dashboard derives for it.
+    """
+
+    def __init__(self, by_label: Mapping[str, CannedMCP]) -> None:
+        self._by_label = by_label
+
+    async def __call__(self, client, url, tool, args, **kwargs):
+        substrate = self._by_label[Path(args['project_root']).name]
+        return await substrate(client, url, tool, args, **kwargs)
 
 
 def _raw_row(task_id, status, **overrides) -> dict:

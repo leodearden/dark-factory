@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import httpx
-from _canned_mcp import CannedMCP, _raw_row
+from _canned_mcp import ByRoot, CannedMCP, _raw_row
 from _dt_helpers import make_fixed_datetime_cls
 from escalation.archive import archive_dir_for_date
 from escalation.models import Escalation
@@ -222,17 +222,6 @@ def _heal(substrate: CannedMCP) -> None:
     substrate.fail_when = lambda call: False
 
 
-class _ByRoot:
-    """One canned substrate per project root, routed by the read's ``project_root``."""
-
-    def __init__(self, by_label: Mapping[str, CannedMCP]) -> None:
-        self._by_label = by_label
-
-    async def __call__(self, client, url, tool, args, **kwargs):
-        substrate = self._by_label[Path(args['project_root']).name]
-        return await substrate(client, url, tool, args, **kwargs)
-
-
 def _get(client: TestClient, path: str, **params: str) -> dict[str, Any]:
     resp = client.get(path, params=params)
     assert resp.status_code == 200, resp.text
@@ -263,7 +252,7 @@ def _canned_roots(
 
     try:
         with (
-            patch('dashboard.data.tasks.mcp_tool_call', new=_ByRoot(substrates)),
+            patch('dashboard.data.tasks.mcp_tool_call', new=ByRoot(substrates)),
             patch('dashboard.data.active_tasks.fetch_task_runtime', new=AsyncMock(return_value={})),
             patch.object(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0),
         ):
