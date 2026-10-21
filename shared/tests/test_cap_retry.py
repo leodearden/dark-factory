@@ -3016,7 +3016,7 @@ class TestNonPoolBackendCapWait:
         assert got.success is True
         assert mock_sleep.await_count == 1
         real_delta = (reset_at - now_local).total_seconds()
-        assert abs(mock_sleep.await_args.args[0] - real_delta) <= 120
+        assert abs(mock_sleep.await_args_list[0].args[0] - real_delta) <= 120
         assert [c['oauth_token'] for c in cli.calls] == ['fake-token-a', 'fake-token-a']
         assert cli.calls[1]['prompt'] == 'review this'
         assert not cli.calls[1].get('resume_session_id')
