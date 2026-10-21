@@ -29,6 +29,12 @@ from pydantic_settings import (
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+from shared.project_id import project_id_for_root
+from shared.project_layout import (
+    ESCALATION_QUEUE_RELPATH,
+    park_eviction_requests_db,
+    scheduler_overrides_db,
+)
 from shared.task_metadata import KNOWN_ROLE_NAMES
 
 from orchestrator.agents.review_briefing import ReviewBriefing
@@ -1483,7 +1489,13 @@ class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
     url: str = Field(default='http://localhost:8002')
-    project_id: str = Field(default='dark_factory')
+    project_id: str = Field(
+        default='',
+        description=(
+            'Empty means derived from project_root by OrchestratorConfig '
+            '(shared.project_id.project_id_for_root); a declared value wins.'
+        ),
+    )
     config_path: str = Field(default='fused-memory/config/config.yaml')
     server_command: list[str] = Field(
         default_factory=lambda: [
@@ -1516,11 +1528,28 @@ class SandboxConfig(BaseModel):
 
 
 class EscalationConfig(BaseModel):
-    """Escalation MCP server configuration."""
+    """Escalation MCP server configuration.
 
-    queue_dir: str = Field(default='data/escalations')
+    ``queue_dir`` is kept only so existing yamls load; the queue is always
+    ``shared.project_layout.escalation_queue_dir(project_root)``.
+    """
+
+    queue_dir: str = Field(default=ESCALATION_QUEUE_RELPATH)
     port: int = Field(default=8100)
     host: str = Field(default='127.0.0.1')
+
+    @field_validator('queue_dir', mode='after')
+    @classmethod
+    def _refuse_a_non_layout_queue_dir(cls, v: str) -> str:
+        if posixpath.normpath(v) == ESCALATION_QUEUE_RELPATH:
+            return ESCALATION_QUEUE_RELPATH
+        raise ValueError(
+            f'escalation.queue_dir {v!r} is not the layout value '
+            f'{ESCALATION_QUEUE_RELPATH!r}: every package reads the escalation queue '
+            f'at shared.project_layout.escalation_queue_dir(project_root), so another '
+            f'value would split the queue; remove the key or set it to '
+            f'{ESCALATION_QUEUE_RELPATH!r}.'
+        )
 
 
 from shared.config_models import AccountConfig, UsageCapConfig  # noqa: F401, E402
@@ -5573,6 +5602,23 @@ class OrchestratorConfig(BaseSettings):
         return self
 
     @model_validator(mode='after')
+    def _derive_fused_memory_project_id(self) -> 'OrchestratorConfig':
+        """Fill an empty ``fused_memory.project_id`` from ``project_root``.
+
+        Same sentinel idiom as ``_default_verify_admission_slots_dir``. The
+        submodel is replaced by a copy, never mutated, so an instance shared
+        with another config keeps its own id.
+        """
+        if not self.fused_memory.project_id:
+            derived = project_id_for_root(self.project_root)
+            object.__setattr__(
+                self,
+                'fused_memory',
+                self.fused_memory.model_copy(update={'project_id': derived}),
+            )
+        return self
+
+    @model_validator(mode='after')
     def _validate_clock_stop_markers(self) -> 'OrchestratorConfig':
         """When clock-stop is enabled, the three marker strings must be non-empty,
         mutually distinct, AND pairwise non-substrings.  No-op when disabled so
@@ -5840,7 +5886,7 @@ class OrchestratorConfig(BaseSettings):
         Stored separately from runs.db so reify cycles and set_task_status
         writes cannot wipe override rows.
         """
-        return self.project_root / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+        return scheduler_overrides_db(self.project_root)
 
     @property
     def park_eviction_requests_db_path(self) -> Path:
@@ -5849,7 +5895,7 @@ class OrchestratorConfig(BaseSettings):
         Stored in a dedicated file isolated from the overrides schema to
         keep the operator eviction lever narrow-blast-radius (PRD D3).
         """
-        return self.project_root / 'data' / 'orchestrator' / 'park_eviction_requests.db'
+        return park_eviction_requests_db(self.project_root)
 
     model_config = SettingsConfigDict(
         env_prefix='ORCH_',
