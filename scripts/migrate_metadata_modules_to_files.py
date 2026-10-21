@@ -169,7 +169,7 @@ class FusedMemoryClient:
         if self._client is not None:
             await self._client.aclose()
 
-    async def _post(self, payload: dict) -> dict:
+    async def _post(self, payload: dict, *, timeout: float | None = None) -> dict:
         assert self._client is not None
         headers = {
             'Content-Type': 'application/json',
@@ -177,7 +177,12 @@ class FusedMemoryClient:
             'mcp-session-id': self._session_id or '',
         }
         from shared.mcp_post import mcp_endpoint_url  # local: E402-safe
-        resp = await self._client.post(mcp_endpoint_url(self._url), json=payload, headers=headers)
+        resp = await self._client.post(
+            mcp_endpoint_url(self._url),
+            json=payload,
+            headers=headers,
+            timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
+        )
         resp.raise_for_status()
         # 202 Accepted (notifications) returns no body.
         if resp.status_code == 202 or not resp.content:
@@ -207,13 +212,18 @@ class FusedMemoryClient:
             'params': {},
         })
 
-    async def call_tool(self, name: str, arguments: dict) -> dict:
+    async def call_tool(self, name: str, arguments: dict, *, timeout: float | None = None) -> dict:
+        """Call tool *name* with *arguments*.
+
+        *timeout* is seconds for this call only. None means the client's
+        :data:`DEFAULT_CALL_TIMEOUT_S`, not httpx's "no timeout".
+        """
         result = await self._post({
             'jsonrpc': '2.0',
             'id': uuid.uuid4().hex,
             'method': 'tools/call',
             'params': {'name': name, 'arguments': arguments},
-        })
+        }, timeout=timeout)
         if 'error' in result:
             raise RuntimeError(f'{name} failed: {result["error"]}')
         # MCP tools/call returns content list; structuredContent is the parsed dict
