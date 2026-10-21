@@ -16,6 +16,12 @@ import pytest
 import yaml
 from _escalation_server_capture import create_server_kwargs
 from _orch_helpers import _init_harness_state_for_test
+from _sandbox_soak_fixtures import (
+    build_events_db,
+    build_tasks_db,
+    commit_probe_report,
+    init_repo_on_main,
+)
 from click.testing import CliRunner
 from escalation.queue import EscalationQueue
 from pydantic import ValidationError
@@ -30,14 +36,6 @@ from shared.project_layout import (
     runs_db,
     scheduler_overrides_db,
     tasks_db,
-)
-from test_sandbox_soak import (
-    PROBE_REPORT_PATH,
-    _build_events_db,
-    _build_tasks_db,
-    _git,
-    _init_repo_on_main,
-    _write_report,
 )
 
 from orchestrator import b3_gate, sandbox_soak
@@ -179,14 +177,12 @@ class TestOperatorToolsFollowTheLayout:
 
     def test_the_sandbox_soak_defaults_read_the_layout_stores(self, tmp_path, capsys):
         repo = tmp_path / 'repo'
-        _init_repo_on_main(repo)
-        _write_report(repo)
-        _git(repo, 'add', PROBE_REPORT_PATH)
-        _git(repo, 'commit', '-q', '-m', 'add probe report')
+        init_repo_on_main(repo)
+        commit_probe_report(repo)
         runs_db(repo).parent.mkdir(parents=True)
-        _build_events_db(runs_db(repo))
+        build_events_db(runs_db(repo))
         tasks_db(repo).parent.mkdir(parents=True)
-        _build_tasks_db(tasks_db(repo), [(1, 'done'), (2, 'done'), (3, 'done')])
+        build_tasks_db(tasks_db(repo), [(1, 'done'), (2, 'done'), (3, 'done')])
 
         rc = sandbox_soak.main(['--repo-root', str(repo), '--min-done', '3'])
 
