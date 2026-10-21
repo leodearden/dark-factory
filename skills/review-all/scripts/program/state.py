@@ -9,8 +9,8 @@ import enum
 import importlib
 import sys
 import types
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -464,3 +464,169 @@ def parse_program(data: Mapping[str, Any]) -> Program:
         streams=tuple(s for s in streams if s is not None),
         **{k: _frozen(v) for k, v in sections.items()},
     )
+
+
+@dataclass(frozen=True)
+class TaskRow:
+    """One task as the store reports it; metadata is a read-only copy."""
+
+    task_id: int
+    title: str
+    status: str
+    priority: str
+    updated_at: str
+    metadata: Mapping[str, Any]
+    dependencies: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'metadata', types.MappingProxyType(dict(self.metadata)))
+        object.__setattr__(self, 'dependencies', tuple(self.dependencies))
+
+
+@dataclass(frozen=True)
+class StreamView:
+    """A stream row after the ledger's amendments, with its status and authored PRD path."""
+
+    id: str
+    keys: tuple[str, ...]
+    deps: tuple[str, ...]
+    deletable: bool
+    mode: StreamMode
+    remedy: str
+    status: StreamStatus | None
+    prd_path: str | None
+    authored: bool
+
+
+@dataclass(frozen=True)
+class _AmendRule:
+    changes: frozenset[AmendChange]
+    convert: Callable[[Any], Any]
+
+
+def _checked(kind: type) -> Callable[[Any], Any]:
+    def convert(value: Any) -> Any:
+        if not isinstance(value, kind):
+            raise ValueError(f'expected {kind.__name__}, got {value!r}')
+        return value
+    return convert
+
+
+_LIST_CHANGES = frozenset({AmendChange.ADD, AmendChange.REMOVE})
+_SCALAR_CHANGES = frozenset({AmendChange.SET})
+_AMEND_RULES: Mapping[str, _AmendRule] = types.MappingProxyType({
+    StreamField.KEYS: _AmendRule(_LIST_CHANGES, _checked(str)),
+    StreamField.DEPS: _AmendRule(_LIST_CHANGES, _checked(str)),
+    StreamField.DELETABLE: _AmendRule(_SCALAR_CHANGES, _checked(bool)),
+    StreamField.MODE: _AmendRule(_SCALAR_CHANGES, StreamMode),
+    StreamField.REMEDY: _AmendRule(_SCALAR_CHANGES, _checked(str)),
+})
+
+
+def _amended(current: Any, change: str, value: Any) -> Any:
+    if change == AmendChange.ADD:
+        return current if value in current else (*current, value)
+    if change == AmendChange.REMOVE:
+        return tuple(item for item in current if item != value)
+    return value
+
+
+def _apply_amendment(view: StreamView, line: Mapping[str, Any]) -> StreamView:
+    field, change = line.get('field'), line.get('change')
+    rule = _AMEND_RULES.get(str(field))
+    if rule is None or change not in rule.changes:
+        allowed = sorted(rule.changes) if rule else sorted(_AMEND_RULES)
+        raise StateError(
+            f'ledger seq {line.get("seq")}: amend_stream field {field!r} does not take '
+            f'change {change!r} (allowed: {", ".join(allowed)})'
+        )
+    try:
+        value = rule.convert(line.get('value'))
+    except ValueError as bad:
+        raise StateError(f'ledger seq {line.get("seq")}: amend_stream {field} value: {bad}') from bad
+    return replace(view, **{str(field): _amended(getattr(view, str(field)), str(change), value)})
+
+
+def _apply_status(view: StreamView, line: Mapping[str, Any]) -> StreamView:
+    try:
+        status = StreamStatus(line.get('status'))
+    except ValueError as bad:
+        raise StateError(f'ledger seq {line.get("seq")}: stream_status {bad}') from bad
+    return replace(
+        view,
+        status=status,
+        prd_path=line.get('prd_path', view.prd_path),
+        authored=view.authored or status is StreamStatus.AUTHORED,
+    )
+
+
+_STREAM_FOLDS: Mapping[str, Callable[[StreamView, Mapping[str, Any]], StreamView]] = (
+    types.MappingProxyType({
+        LedgerOp.STREAM_STATUS: _apply_status,
+        LedgerOp.AMEND_STREAM: _apply_amendment,
+    })
+)
+
+
+def _initial_view(stream: Stream) -> StreamView:
+    return StreamView(
+        id=stream.id, keys=stream.keys, deps=stream.deps, deletable=stream.deletable,
+        mode=stream.mode, remedy=stream.remedy, status=None, prd_path=None, authored=False,
+    )
+
+
+def _check_view_deps(views: Mapping[str, StreamView]) -> None:
+    for view in views.values():
+        unknown = [dep for dep in view.deps if dep not in views]
+        if unknown:
+            raise StateError(f'stream {view.id} depends on {unknown}, which name no stream')
+
+
+def stream_views(program: Program, ledger: Iterable[Mapping[str, Any]]) -> Mapping[str, StreamView]:
+    """Each stream's row after the ledger's ``stream_status`` and ``amend_stream`` lines, in seq order.
+
+    The single home of a stream's keys and deps after amendments.
+    """
+    views = {stream.id: _initial_view(stream) for stream in program.streams}
+    for line in sorted(ledger, key=lambda entry: entry['seq']):
+        fold = _STREAM_FOLDS.get(line.get('op', ''))
+        if fold is None:
+            continue
+        stream_id = line.get('stream')
+        if stream_id not in views:
+            raise StateError(f'ledger seq {line["seq"]}: {line["op"]} names no stream {stream_id!r}')
+        views[stream_id] = fold(views[stream_id], line)
+    _check_view_deps(views)
+    return types.MappingProxyType(views)
+
+
+def waves(views: Mapping[str, StreamView]) -> Mapping[str, int]:
+    """Each stream's wave, 1 + the max of its upstream streams' waves; never stored."""
+    return types.MappingProxyType(_wave_numbers({v.id: v.deps for v in views.values()}))
+
+
+UNSTREAMED = 'unstreamed'
+
+
+def _finding_keys(metadata: Mapping[str, Any]) -> tuple[str, ...]:
+    keys = metadata.get('x_finding_key')
+    if isinstance(keys, str):
+        return (keys,)
+    if isinstance(keys, list | tuple):
+        return tuple(k for k in keys if isinstance(k, str))
+    return ()
+
+
+def stream_of(row: TaskRow, views: Mapping[str, StreamView]) -> str:
+    """The stream a program task belongs to: its prd_path, else its finding keys, else UNSTREAMED."""
+    prd_path = row.metadata.get('prd_path')
+    for view in views.values():
+        if prd_path is not None and view.prd_path == prd_path:
+            return view.id
+    keys = _finding_keys(row.metadata)
+    hits = sorted({view.id for view in views.values() if set(keys) & set(view.keys)})
+    if len(hits) > 1:
+        raise AmbiguousStream(
+            f'task {row.task_id}: finding keys {list(keys)} belong to streams {", ".join(hits)}'
+        )
+    return hits[0] if hits else UNSTREAMED
