@@ -1,8 +1,10 @@
-"""Each runs.db stream row becomes its feed events: phases as task_phase, verify windows and merge verdicts as verify_run."""
+"""Each runs.db stream row becomes its feed events once: phases, verify windows and merge verdicts, and landed merges."""
 
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from _archive_files import (
     SECRET_CMD,
     SECRET_HINT,
@@ -16,15 +18,23 @@ from _archive_files import (
     write_plan,
     write_summary,
 )
+from _git_repo import make_repo
+from _stores import RunsDb
+from shared.project_layout import runs_db
 
 from client_feed.contract import (
     FEED_VERSION,
     NOT_RECORDED,
     CaseCounts,
     CaseOutcome,
+    FeedEvent,
     FeedState,
+    MergeLanded,
+    ReviewCounts,
     Source,
     TaskPhase,
+    TaskStatus,
+    TaskUpserted,
     VerifyKind,
     VerifyLeg,
     VerifyRun,
@@ -32,8 +42,10 @@ from client_feed.contract import (
 )
 from client_feed.feed_io import Stamp
 from client_feed.fold import fold
-from client_feed.sources.events import PhaseChange, StreamEvent, VerifyVerdict
-from client_feed.stream_events import StreamOutput, stream_events
+from client_feed.sources.events import LandedCommit, PhaseChange, StreamEvent, VerifyVerdict
+from client_feed.sources.git import GitError, merge_stats
+from client_feed.sources.store import StoreReadError
+from client_feed.stream_events import Identity, StreamOutput, identity, stream_events
 
 PROJECT = 'acme'
 BASE = datetime(2026, 10, 1, 10, 0, tzinfo=UTC)
@@ -82,15 +94,19 @@ def empty_state() -> FeedState:
 
 
 def run(
-    root: Path, *stream: StreamEvent, state: FeedState | None = None, max_cases: int = 100
+    root: Path,
+    *stream: StreamEvent,
+    state: FeedState | None = None,
+    published: frozenset[Identity] = frozenset(),
+    first_seq: int = 1,
 ) -> StreamOutput:
     return stream_events(
         root,
         stream,
         state=empty_state() if state is None else state,
-        max_cases=max_cases,
-        published=frozenset(),
-        stamp=Stamp(project_id=PROJECT, first_seq=1),
+        max_cases=100,
+        published=published,
+        stamp=Stamp(project_id=PROJECT, first_seq=first_seq),
     )
 
 
@@ -302,3 +318,190 @@ def test_a_malformed_junit_leaves_a_merge_run_with_no_legs(tmp_path: Path) -> No
     assert (verify.run_key, verify.passed, verify.legs) == ('merge-50', True, NOT_RECORDED)
     assert results_of(output) == []
     assert [degradation.source for degradation in output.degraded] == [Source.ARCHIVE]
+
+
+TITLE = 'Ship the widget'
+
+
+@dataclass(frozen=True)
+class Landed:
+    root: Path
+    runs: RunsDb
+    merge: str
+
+
+@pytest.fixture
+def landed(tmp_path: Path) -> Landed:
+    """A root whose main holds `Merge task/7 into main`, with an empty runs.db."""
+    repo = make_repo(tmp_path / 'root')
+    repo.write('README.md', 'hello\n')
+    repo.commit('Initial', when=at(-60))
+    repo.branch('task/7')
+    repo.checkout('task/7')
+    repo.write('src/widget.py', 'a = 1\nb = 2\nc = 3\n')
+    repo.write('README.md', 'hello widget\n')
+    repo.commit('Add the widget', when=at(-30))
+    repo.checkout('main')
+    merge = repo.merge_no_ff('task/7', 'Merge task/7 into main', when=at(-20))
+    return Landed(root=repo.root, runs=RunsDb.create(repo.root), merge=merge)
+
+
+def state_holding_task_7() -> FeedState:
+    task = TaskUpserted(
+        seq=1,
+        at=at(-60),
+        project_id=PROJECT,
+        feed_version=FEED_VERSION,
+        task_id=TASK_ID,
+        title=TITLE,
+        status=TaskStatus.DONE,
+        waiting_on=None,
+        updated_at=at(-60),
+        depends_on=(),
+        prd_path=None,
+        prd_task_label=None,
+        landed_commit=None,
+    )
+    return fold([task], project_id=PROJECT)
+
+
+def landing(event_id: int, commit: str, *task_ids: int, minutes: float = 30) -> LandedCommit:
+    return LandedCommit(event_id=event_id, at=at(minutes), commit=commit, task_ids=task_ids)
+
+
+def review(cycle: int, blocking: int, suggestions: int, by_category: dict[str, int]) -> dict:
+    """The keys of the orchestrator's review_outcome.py::review_completed_payload that the counts read."""
+    return {
+        'cycle': cycle,
+        'blocking_count': blocking,
+        'suggestion_count': suggestions,
+        'by_category': by_category,
+    }
+
+
+def merges(output: StreamOutput) -> list[MergeLanded]:
+    return [event for event in output.events if isinstance(event, MergeLanded)]
+
+
+def test_a_landed_merge_carries_its_titles_its_stats_and_its_last_review(landed: Landed) -> None:
+    landed.runs.emit(
+        'review_completed', at=at(-40), task_id=7, phase='review',
+        data=review(1, 2, 1, {'correctness': 2, 'style': 1}),
+    )
+    landed.runs.emit(
+        'review_completed', at=at(-35), task_id=7, phase='review',
+        data=review(2, 0, 3, {'style': 3}),
+    )
+    commit = landing(60, landed.merge, 7)
+
+    output = run(landed.root, commit, state=state_holding_task_7())
+
+    assert output == StreamOutput(
+        events=(
+            MergeLanded(
+                seq=1,
+                at=commit.at,
+                project_id=PROJECT,
+                feed_version=FEED_VERSION,
+                commit=landed.merge,
+                task_ids=(7,),
+                titles=(TITLE,),
+                **asdict(merge_stats(landed.root, landed.merge)),
+                review=ReviewCounts(
+                    cycles=2, blocking_count=0, suggestion_count=3, by_category={'style': 3}
+                ),
+            ),
+        ),
+        degraded=(),
+    )
+
+
+def test_a_merge_with_no_review_row_has_its_review_not_recorded(landed: Landed) -> None:
+    (merge,) = merges(run(landed.root, landing(60, landed.merge, 7), state=state_holding_task_7()))
+
+    assert merge.review == NOT_RECORDED
+
+
+def test_a_train_landing_has_its_review_not_recorded(landed: Landed) -> None:
+    landed.runs.emit('review_completed', at=at(-35), task_id=7, data=review(1, 0, 0, {}))
+
+    (merge,) = merges(run(landed.root, landing(60, landed.merge, 7, 8), state=state_holding_task_7()))
+
+    assert (merge.task_ids, merge.review) == ((7, 8), NOT_RECORDED)
+
+
+def test_a_task_the_state_does_not_hold_is_titled_empty(landed: Landed) -> None:
+    (merge,) = merges(run(landed.root, landing(60, landed.merge, 9), state=state_holding_task_7()))
+
+    assert (merge.task_ids, merge.titles) == ((9,), ('',))
+
+
+def test_two_landings_of_one_commit_are_one_merge_landed_at_the_first(landed: Landed) -> None:
+    first = landing(60, landed.merge, 7, minutes=30)
+    between = phase(61, 31, 'review', entered=True, task_id=9)
+    second = landing(62, landed.merge, 8, 7, minutes=32)
+
+    output = run(landed.root, first, between, second, state=state_holding_task_7())
+
+    merge, after = output.events
+    assert isinstance(merge, MergeLanded)
+    assert (merge.seq, merge.at, merge.task_ids, merge.titles) == (1, first.at, (7, 8), (TITLE, ''))
+    assert after == task_phase(2, between)
+
+
+def identities(*events: FeedEvent) -> frozenset[Identity]:
+    keys = [identity(event) for event in events]
+    assert None not in keys
+    return frozenset(key for key in keys if key is not None)
+
+
+def test_identity_names_stream_events_only(landed: Landed) -> None:
+    write_summary(landed.root, at(9), category='passed', commands=GREEN)
+    write_junit(landed.root, at(9), junit_xml(passed('test_a')))
+    stream = (verify_enter(20, 0), verify_exit(21, 10), landing(60, landed.merge, 7))
+    enter, exit_, verify, results, merge = run(landed.root, *stream).events
+    renumbered = run(landed.root, *stream, first_seq=50).events
+
+    assert len(identities(enter, exit_, verify, results, merge)) == 5
+    assert [identity(event) for event in renumbered] == [
+        identity(event) for event in (enter, exit_, verify, results, merge)
+    ]
+    assert identity(state_holding_task_7().tasks[TASK_ID]) is None
+
+
+def test_an_event_already_published_is_not_emitted_again(landed: Landed) -> None:
+    write_summary(landed.root, at(9), category='passed', commands=GREEN)
+    stream = (
+        verify_enter(20, 0),
+        verify_exit(21, 10),
+        landing(60, landed.merge, 7),
+        phase(63, 31, 'review', entered=True),
+    )
+    enter, exit_, verify, merge, review_entry = run(
+        landed.root, *stream, state=state_holding_task_7()
+    ).events
+
+    again = run(
+        landed.root,
+        *stream,
+        state=state_holding_task_7(),
+        published=identities(enter, verify, merge),
+        first_seq=100,
+    )
+
+    assert [identity(event) for event in again.events] == [identity(exit_), identity(review_entry)]
+    seqs = [event.seq for event in again.events]
+    assert seqs == sorted(set(seqs))
+    assert seqs[0] >= 100
+
+
+def test_a_merge_commit_unknown_to_git_raises(landed: Landed) -> None:
+    with pytest.raises(GitError):
+        run(landed.root, landing(60, 'e' * 40, 7), state=state_holding_task_7())
+
+
+def test_an_unreadable_runs_db_raises(landed: Landed) -> None:
+    runs_db(landed.root).write_bytes(b'this is not a sqlite database at all' * 100)
+
+    with pytest.raises(StoreReadError):
+        run(landed.root, landing(60, landed.merge, 7), state=state_holding_task_7())
