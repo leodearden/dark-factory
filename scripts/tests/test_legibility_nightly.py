@@ -57,7 +57,7 @@ from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 def _isolate_trickle_state(tmp_path, monkeypatch):
     """Point the legibility state root at tmp_path for EVERY test here.
 
-    ``run_nightly`` records run state through ``trickle_state.record_run``
+    ``run_nightly`` records run state through ``trickle_state.write_night``
     on every exit path (task 3340), so without this an ordinary test run
     would write real state files for the fixture's synthetic
     ``project_id=testproj`` into the operator's real
@@ -1601,7 +1601,7 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
 # fail-safe arm logged "tasks-landed: no status_fetcher configured" instead of
 # a delta: condition (b) could not fire AT ALL. Every OTHER seam in
 # run_nightly already resolves None to its real implementation (committer ->
-# unlanded.commit_only, recorder -> trickle_state.record_run, poster ->
+# unlanded.commit_only, recorder -> trickle_state.write_night, poster ->
 # _default_poster); status_fetcher alone resolved to nothing, which is how
 # three prior repairs of this exact code (2953, 3291, 4085) each left the
 # wiring loop open.
@@ -3791,23 +3791,40 @@ def test_configure_logging_env_var_still_wins_over_an_unknown_default_level(monk
 # task 3340 step-9/10: run_nightly records trickle run state on EVERY path
 # ---------------------------------------------------------------------------
 
-def _recorder_spy(delegate=trickle_state.record_run):
-    """A ``recorder=`` (or ``retry_recorder=``) seam spy that DELEGATES to
-    the real *delegate*, so the assertions below run against real
+def _recorder_spy():
+    """A ``recorder=`` seam spy that DELEGATES to the real
+    ``trickle_state.write_night``, so the assertions below run against real
     classifier + streak output rather than a mock that could drift from it.
-    Returns (fn, calls) where each call is (facts, returned_doc): *facts*
-    flattens the call's arguments, a NightRun's fields included, and
-    *returned_doc* is the JSON document of the state it returned."""
+    Returns (fn, calls) where each call is (facts, returned_doc): *facts* is
+    the folded NightRun's fields with ``project_id`` and
+    ``barren_escalated``, and *returned_doc* is the JSON document written."""
     calls = []
 
-    def _record(project_id, *args, **kwargs):
-        state = delegate(project_id, *args, **kwargs)
-        facts = dict(kwargs, project_id=project_id)
-        for run in args:
-            facts.update(
-                {field.name: getattr(run, field.name) for field in dataclasses.fields(run)}
-            )
-        calls.append((facts, None if state is None else state.to_json()))
+    def _record(night, *, barren_escalated):
+        state = trickle_state.write_night(night, barren_escalated=barren_escalated)
+        facts = {
+            field.name: getattr(night.run, field.name)
+            for field in dataclasses.fields(night.run)
+        }
+        facts.update(project_id=night.state.project_id, barren_escalated=barren_escalated)
+        calls.append((facts, state.to_json()))
+        return state
+
+    return _record, calls
+
+
+def _retry_recorder_spy():
+    """The ``retry_recorder=`` counterpart of :func:`_recorder_spy`,
+    delegating to the real ``trickle_state.record_retry``; *facts* is its
+    keyword arguments with ``project_id``, and *returned_doc* is ``None``
+    when it wrote nothing."""
+    calls = []
+
+    def _record(project_id, **kwargs):
+        state = trickle_state.record_retry(project_id, **kwargs)
+        calls.append(
+            (dict(kwargs, project_id=project_id), None if state is None else state.to_json())
+        )
         return state
 
     return _record, calls
@@ -4254,7 +4271,7 @@ class TestRunNightlyRecordsTrickleState:
     def test_a_raising_recorder_never_breaks_the_run(self, tmp_path, caplog):
         """Observability must never become a new failure mode — mirroring
         post_escalation's established best-effort contract."""
-        def _raising_recorder(project_id, run, *, barren_escalated):
+        def _raising_recorder(night, *, barren_escalated):
             raise OSError('synthetic state-write failure')
 
         with caplog.at_level('WARNING', logger='legibility.nightly'):
@@ -4269,27 +4286,24 @@ class TestRunNightlyRecordsTrickleState:
     def test_the_recorder_receives_the_night_and_the_escalation_fact(self, tmp_path):
         received = []
 
-        def _record(project_id, run, *, barren_escalated):
-            received.append((project_id, run, barren_escalated))
-            return trickle_state.record_run(
-                project_id, run, barren_escalated=barren_escalated,
-            )
+        def _record(night, *, barren_escalated):
+            received.append((night, barren_escalated))
+            return trickle_state.write_night(night, barren_escalated=barren_escalated)
 
         _run_e2e_nightly(tmp_path, recorder=_record)
 
-        [(project_id, run, barren_escalated)] = received
-        assert project_id == 'testproj'
-        assert isinstance(run, trickle_state.NightRun)
-        assert run.outcome == trickle_state.RunOutcome.PRODUCTIVE
+        [(night, barren_escalated)] = received
+        assert isinstance(night, trickle_state.NightFold)
+        assert night.state.project_id == 'testproj'
+        assert night.run.outcome == trickle_state.RunOutcome.PRODUCTIVE
+        assert night.state.outcome == trickle_state.RunOutcome.PRODUCTIVE
         assert barren_escalated is False
 
     def test_the_state_the_recorder_returns_schedules_the_retries(self, tmp_path):
         owed = date(2026, 7, 12)
 
-        def _record_owing(project_id, run, *, barren_escalated):
-            state = trickle_state.record_run(
-                project_id, run, barren_escalated=barren_escalated,
-            )
+        def _record_owing(night, *, barren_escalated):
+            state = trickle_state.write_night(night, barren_escalated=barren_escalated)
             return dataclasses.replace(state, retry_backlog={owed: 1})
 
         result, _repo = _run_e2e_nightly(tmp_path, recorder=_record_owing)
@@ -4926,6 +4940,24 @@ class TestBarrenStreakEscalation:
         assert seen['consecutive_barren_runs'] == 2
         assert runner.recorded()['consecutive_barren_runs'] == 3
 
+    def test_the_night_written_is_the_one_the_escalation_decided_on(self, tmp_path):
+        """The record is lost between the decision and the write: the night
+        written still carries the streak the escalation was posted for."""
+        def _lose_the_record_mid_post(envelope):
+            if _is_streak_escalation(envelope):
+                trickle_state.trickle_state_path('testproj').unlink()
+
+        runner = _NightRunner(tmp_path, on_post=_lose_the_record_mid_post)
+        for day in (13, 14):
+            runner.night(day, 'barren')
+
+        third = runner.night(15, 'barren')
+
+        assert third.barren_escalated is True
+        doc = runner.recorded()
+        assert doc['consecutive_barren_runs'] == 3
+        assert doc['barren_escalated'] is True
+
     def test_a_streak_post_that_fails_records_not_escalated(self, tmp_path):
         def _server_down_for_the_streak(envelope):
             if _is_streak_escalation(envelope):
@@ -5242,7 +5274,7 @@ class TestRetryPass:
     def test_a_retry_records_through_the_retry_recorder_seam(self, tmp_path):
         runner, _before = _owed_after_storm_then_productive(tmp_path)
         recorder, recorded = _recorder_spy()
-        retry_recorder, retried = _recorder_spy(trickle_state.record_retry)
+        retry_recorder, retried = _retry_recorder_spy()
 
         runner.retry(13, on_night=14, recorder=recorder, retry_recorder=retry_recorder)
 
@@ -5258,7 +5290,7 @@ class TestRetryPass:
         _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
         monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
         recorder, recorded = _recorder_spy()
-        retry_recorder, retried = _recorder_spy(trickle_state.record_retry)
+        retry_recorder, retried = _retry_recorder_spy()
 
         with pytest.raises(FileNotFoundError):
             nightly.run_nightly(
@@ -5519,7 +5551,7 @@ class TestNeverRunDates:
     def test_a_multi_night_outage_is_retried_one_date_per_night(self, tmp_path):
         runner = _NightRunner(tmp_path)
         runner.scheduled_night(13, 'productive')
-        retry_recorder, retried = _recorder_spy(trickle_state.record_retry)
+        retry_recorder, retried = _retry_recorder_spy()
 
         results = runner.scheduled_night(16, 'productive', retry_recorder=retry_recorder)
 
@@ -6233,14 +6265,14 @@ def test_barren_streak_journals_once_at_warning(tmp_path, caplog):
     touch `result.exit_code`, so it stays out of `journalctl -p err`."""
     cfg = _cfg_for(tmp_path)
     posted = []
-    state = trickle_state.next_state(
+    state = trickle_state.fold_night(
         dataclasses.replace(
-            trickle_state.next_state(None, 'testproj', _barren_night(14)),
+            trickle_state.fold_night(None, 'testproj', _barren_night(14)).state,
             consecutive_barren_runs=trickle_state.DEFAULT_MAX_BARREN_RUNS - 1,
         ),
         'testproj',
         _barren_night(15),
-    )
+    ).state
 
     with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
         escalated = nightly._escalate_barren_streak(

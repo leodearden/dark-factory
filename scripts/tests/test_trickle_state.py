@@ -992,42 +992,64 @@ class TestRecordRunBarrenEscalated:
         assert isinstance(read, Ok)
         assert read.value.barren_escalated is escalated
 
-    def test_the_flag_has_no_default(self):
-        parameter = inspect.signature(trickle_state.record_run).parameters[
-            'barren_escalated'
-        ]
+    @pytest.mark.parametrize(
+        'writer', [trickle_state.record_run, trickle_state.write_night]
+    )
+    def test_the_flag_has_no_default(self, writer):
+        parameter = inspect.signature(writer).parameters['barren_escalated']
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
         assert parameter.default is inspect.Parameter.empty
 
 
-class TestNextState:
-    """next_state(prior, project_id, run) is the pure fold record_run
-    writes, so the nightly can read tonight's state before recording it."""
+class TestFoldNight:
+    """fold_night(prior, project_id, run) is the pure fold write_night
+    writes, so the nightly decides on the very state it then records."""
 
     @pytest.fixture(autouse=True)
     def _state_root(self, tmp_path, monkeypatch):
         monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
 
-    def test_it_is_the_state_record_run_then_writes(self):
+    def test_write_night_writes_the_folded_state(self):
         _record(day=1, budget_skipped=4)
         _record(day=2, budget_skipped=4)
-        run = _night(day=3, budget_skipped=4, scheduled=True)
-
-        projected = trickle_state.next_state(
-            trickle_state.read_prior('dark_factory'), 'dark_factory', run
-        )
-        recorded = trickle_state.record_run(
-            'dark_factory', run, barren_escalated=True
+        night = trickle_state.fold_night(
+            trickle_state.read_prior('dark_factory'),
+            'dark_factory',
+            _night(day=3, budget_skipped=4, scheduled=True),
         )
 
-        assert recorded == dataclasses.replace(projected, barren_escalated=True)
-        assert projected.consecutive_barren_runs == 3
+        written = trickle_state.write_night(night, barren_escalated=True)
+
+        assert written == dataclasses.replace(night.state, barren_escalated=True)
+        assert night.state.consecutive_barren_runs == 3
+        assert trickle_state.read_prior('dark_factory') == written
+
+    def test_record_run_is_write_night_of_the_fold_over_the_record(self):
+        _record(day=1, budget_skipped=4)
+        run = _night(day=2, budget_skipped=4, scheduled=True)
+        expected = dataclasses.replace(
+            trickle_state.fold_night(
+                trickle_state.read_prior('dark_factory'), 'dark_factory', run
+            ).state,
+            barren_escalated=True,
+        )
+
+        assert trickle_state.record_run('dark_factory', run, barren_escalated=True) == expected
+
+    def test_it_carries_its_inputs(self):
+        prior = _record(day=1, budget_skipped=4)
+        run = _night(day=2, exit_code=1)
+
+        night = trickle_state.fold_night(prior, 'dark_factory', run)
+
+        assert night.prior is prior
+        assert night.run is run
 
     def test_it_touches_no_file(self, tmp_path):
         _record(day=1, budget_skipped=4)
         before = {p.name: p.read_bytes() for p in _path().parent.iterdir()}
 
-        trickle_state.next_state(
+        trickle_state.fold_night(
             trickle_state.read_prior('dark_factory'),
             'dark_factory',
             _night(day=2, exit_code=1),
@@ -1036,8 +1058,8 @@ class TestNextState:
         assert {p.name: p.read_bytes() for p in _path().parent.iterdir()} == before
 
     def test_from_no_prior_every_streak_starts_at_this_run(self):
-        barren = trickle_state.next_state(None, 'p', _night(budget_skipped=4))
-        failed = trickle_state.next_state(None, 'p', _night(exit_code=1))
+        barren = trickle_state.fold_night(None, 'p', _night(budget_skipped=4)).state
+        failed = trickle_state.fold_night(None, 'p', _night(exit_code=1)).state
 
         assert (barren.consecutive_barren_runs, barren.consecutive_failed_runs) == (1, 0)
         assert (failed.consecutive_barren_runs, failed.consecutive_failed_runs) == (0, 1)
@@ -1895,19 +1917,25 @@ class TestRecordRunRetryBacklog:
         assert dict(state.retry_backlog) == {}
         assert len(_warnings_naming(caplog, '2026-07-01')) == 1
 
-    def test_next_state_folds_the_backlog_without_warning(self, caplog):
+    def test_the_fold_abandons_silently_and_its_write_warns_once(self, caplog):
         """The abandonment WARNING belongs to the write, so a nightly that
         folds tonight's state before recording it logs it once."""
         _record(day=1, exit_code=1)
         run = _night(day=2 + trickle_state.RETRY_MAX_AGE_DAYS, selected_count=1)
 
         with caplog.at_level('WARNING'):
-            projected = trickle_state.next_state(
+            night = trickle_state.fold_night(
                 trickle_state.read_prior('dark_factory'), 'dark_factory', run
             )
 
-        assert dict(projected.retry_backlog) == {}
+        assert dict(night.state.retry_backlog) == {}
+        assert dict(night.abandoned) == {_d(1): 1}
         assert not _warnings(caplog)
+
+        with caplog.at_level('WARNING'):
+            trickle_state.write_night(night, barren_escalated=False)
+
+        assert len(_warnings_naming(caplog, '2026-07-01')) == 1
 
     def test_a_document_without_a_backlog_reads_ok_and_starts_one(
         self, caplog

@@ -1038,9 +1038,9 @@ def _record_trickle_progress(
     """Record this pass in ``trickle-state.json``, best-effort.
 
     A ``PassKind.RETRY`` pass folds only its date into the retry backlog.
-    Any other pass is folded over the recorded predecessor first, so the
-    barren-streak escalation is decided and posted BEFORE the night is
-    written, and the record carries whether it landed. A finished pass then
+    Any other pass is folded once over the recorded predecessor; the
+    barren-streak escalation is decided on that fold and posted BEFORE the
+    same fold is written, and the record carries whether it landed. A finished pass then
     takes the owed dates to retry next from the state it recorded. Sets
     ``result.barren_escalated`` and ``result.retry_due``; *census* is the
     night's census-trigger observation, ``None`` when it was not evaluated.
@@ -1054,16 +1054,18 @@ def _record_trickle_progress(
             sample, target_date, result,
             census=census, recorded_at=recorded_at, pass_kind=pass_kind,
         )
-        prior = trickle_state.read_prior(cfg.project_id)
-        night = trickle_state.next_state(prior, cfg.project_id, run)
+        night = trickle_state.fold_night(
+            trickle_state.read_prior(cfg.project_id), cfg.project_id, run
+        )
         result.barren_escalated = (
-            _barren_streak_reached(prior, night, max_barren_runs)
+            _barren_streak_reached(night, max_barren_runs)
             and _escalate_barren_streak(
-                cfg, night, target_date, max_barren_runs=max_barren_runs, poster=poster,
+                cfg, night.state, target_date,
+                max_barren_runs=max_barren_runs, poster=poster,
             )
         )
-        record = recorder if recorder is not None else trickle_state.record_run
-        recorded = record(cfg.project_id, run, barren_escalated=result.barren_escalated)
+        record = recorder if recorder is not None else trickle_state.write_night
+        recorded = record(night, barren_escalated=result.barren_escalated)
         if trickle_state.finished(exit_code=result.exit_code, capped=result.capped):
             result.retry_due = trickle_state.due_retries(recorded, today=recorded_at.date())
 
@@ -1089,8 +1091,11 @@ def _record_unloaded_night(
             _nothing_sampled(), target_date, result,
             census=None, recorded_at=recorded_at, pass_kind=pass_kind,
         )
-        record = recorder if recorder is not None else trickle_state.record_run
-        record(project_id, run, barren_escalated=False)
+        record = recorder if recorder is not None else trickle_state.write_night
+        record(
+            trickle_state.fold_night(trickle_state.read_prior(project_id), project_id, run),
+            barren_escalated=False,
+        )
 
 
 @contextlib.contextmanager
@@ -1158,11 +1163,7 @@ def _night_run(
     )
 
 
-def _barren_streak_reached(
-    prior: trickle_state.TrickleState | None,
-    night: trickle_state.TrickleState,
-    max_runs: int,
-) -> bool:
+def _barren_streak_reached(night: trickle_state.NightFold, max_runs: int) -> bool:
     """Whether *night* is the barren night on which its streak first reaches
     *max_runs*: the nightly's re-arm policy, and the one place it lives.
 
@@ -1170,10 +1171,12 @@ def _barren_streak_reached(
     the streak. Re-firing every night past the threshold would revive task
     3270's alarm fatigue; a one-shot latch would leave whoever missed the
     single escalation in silence, which 3270 rejected as worse."""
-    already_due = prior is not None and trickle_state.barren_streak_due(prior, max_runs)
+    already_due = (
+        night.prior is not None and trickle_state.barren_streak_due(night.prior, max_runs)
+    )
     return (
-        night.outcome == trickle_state.RunOutcome.BARREN
-        and trickle_state.barren_streak_due(night, max_runs)
+        night.state.outcome == trickle_state.RunOutcome.BARREN
+        and trickle_state.barren_streak_due(night.state, max_runs)
         and not already_due
     )
 
@@ -1269,9 +1272,10 @@ def run_nightly(
     and account pool, task 6042), not "no invoker". The runner is opened
     inside the recorded ``try`` and closed on every exit path.
 
-    *recorder* (default :func:`trickle_state.record_run`) is the run-state
-    seam: ``recorder(project_id, night_run, *, barren_escalated)`` returns
-    the :class:`trickle_state.TrickleState` it wrote. It is called exactly
+    *recorder* (default :func:`trickle_state.write_night`) is the run-state
+    seam: ``recorder(night_fold, *, barren_escalated)`` writes the
+    :class:`trickle_state.NightFold` the barren escalation was decided on and
+    returns the :class:`trickle_state.TrickleState` it wrote. It is called exactly
     once per pass but a retry, from a ``finally`` spanning every exit path,
     so the progress probe (``check_trickle_progress.py``) can tell every
     outcome apart, a barren night from a quiet one included — the
@@ -1422,7 +1426,7 @@ def _run_configured_nightly(
         # journal 2026-08-10/11/12), leaving condition (b) tasks-landed unable to
         # fire at all. Every OTHER seam here already resolves None to its real
         # implementation (committer -> unlanded.commit_only above, recorder ->
-        # trickle_state.record_run, poster -> _default_poster); status_fetcher
+        # trickle_state.write_night, poster -> _default_poster); status_fetcher
         # alone resolved to nothing, and that asymmetry is how three prior repairs
         # of this same code (2953's 406 fix, 3291's baseline fix, 4085's fail-safe
         # arms) each left the wiring loop open.

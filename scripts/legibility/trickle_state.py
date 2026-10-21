@@ -474,7 +474,7 @@ def _serialize_retry_backlog(backlog: Mapping[date, int]) -> dict[str, int]:
 
 @dataclasses.dataclass(frozen=True)
 class CensusObservation:
-    """One night's census-trigger fact, as :func:`record_run` receives it.
+    """One night's census-trigger fact, as a :class:`NightRun` carries it.
 
     ``last_census_at`` is the census-state value the trigger was evaluated
     against, read BEFORE any launch: the launch is synchronous, so a census
@@ -752,7 +752,7 @@ def barren_remedy(counters: RunCounters) -> str:
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class NightRun:
-    """One pass's facts, as the nightly hands them to :func:`record_run`.
+    """One pass's facts, as the nightly hands them to :func:`fold_night`.
 
     ``census`` has no default: ``None`` means the census trigger was not
     evaluated, and a defaulted ``None`` would silently blind
@@ -787,21 +787,26 @@ def read_prior(project_id: str) -> TrickleState | None:
             return None
 
 
-class _NightFold(NamedTuple):
-    """A folded night, and what its folds abandoned for the writer to log."""
+@dataclasses.dataclass(frozen=True)
+class NightFold:
+    """*run* folded over its recorded *prior* by :func:`fold_night`: the
+    ``state`` the night writes, and the owed dates the fold abandoned for
+    :func:`write_night` to log. The one fold of a night, so whatever is
+    decided from ``state`` is what gets written."""
 
+    prior: TrickleState | None
+    run: NightRun
     state: TrickleState
-    prior_cursor: date | None
     never_run: NeverRun
-    abandoned: dict[date, int]
+    abandoned: Mapping[date, int]
 
 
-def next_state(
+def fold_night(
     prior: TrickleState | None, project_id: str, run: NightRun
-) -> TrickleState:
-    """The state recording *run* after *prior* would write. Pure: it reads
-    and writes nothing and logs nothing. ``barren_escalated`` is False here;
-    :func:`record_run` records the real value.
+) -> NightFold:
+    """Fold *run* over *prior*. Pure: it reads and writes nothing and logs
+    nothing. ``state.barren_escalated`` is False here; :func:`write_night`
+    records the real value.
 
     ==========  =============  =============  ======================
     outcome     barren streak  failed streak  last_productive_at
@@ -824,18 +829,14 @@ def next_state(
     attempts, the :func:`never_run_dates` since the previous scheduled pass;
     a manual pass moves neither. A pass that :func:`owes_retry` enters or
     counts its date in ``retry_backlog`` (:func:`fold_retry_backlog`)."""
-    return _fold_night(prior, project_id, run).state
-
-
-def _fold_night(
-    prior: TrickleState | None, project_id: str, run: NightRun
-) -> _NightFold:
     outcome = run.outcome
     today = run.recorded_at.date()
     barren_streak, failed_streak = _fold_streaks(prior, outcome)
-    prior_cursor = None if prior is None else prior.last_scheduled_target_date
     cursor, never_run = _schedule_cursor(
-        prior_cursor, target_date=run.target_date, today=today, scheduled=run.scheduled
+        None if prior is None else prior.last_scheduled_target_date,
+        target_date=run.target_date,
+        today=today,
+        scheduled=run.scheduled,
     )
     retry = fold_retry_backlog(
         {} if prior is None else prior.retry_backlog,
@@ -874,7 +875,7 @@ def _fold_night(
         retry_backlog=retry.backlog,
         barren_escalated=False,
     )
-    return _NightFold(state, prior_cursor, never_run, retry.abandoned)
+    return NightFold(prior, run, state, never_run, MappingProxyType(retry.abandoned))
 
 
 def _fold_streaks(
@@ -914,25 +915,35 @@ def _schedule_cursor(
     )
 
 
-def record_run(
-    project_id: str, run: NightRun, *, barren_escalated: bool
-) -> TrickleState:
-    """Fold *run* into the recorded predecessor (:func:`next_state`), record
-    *barren_escalated* — whether the nightly escalated this night's barren
-    streak — write the document atomically and return it.
+def write_night(night: NightFold, *, barren_escalated: bool) -> TrickleState:
+    """Record *night* with *barren_escalated* — whether the nightly
+    escalated its barren streak — write the document atomically and return
+    it.
 
     *barren_escalated* has no default: it is the fact the health probe reads
     instead of re-deriving the nightly's threshold. The WARNINGs for owed
-    dates the folds abandon are logged here, once per write. An ``OSError``
+    dates the fold abandoned are logged here, once per write. An ``OSError``
     from the write propagates."""
-    fold = _fold_night(read_prior(project_id), project_id, run)
-    today = run.recorded_at.date()
-    if fold.prior_cursor is not None and fold.never_run.expired:
-        _warn_expired_never_run(project_id, fold.prior_cursor, fold.never_run.expired)
-    _warn_abandoned_retries(project_id, fold.abandoned, today=today)
-    state = dataclasses.replace(fold.state, barren_escalated=barren_escalated)
-    state_docs.write_state(trickle_state_path(project_id), state)
+    state = dataclasses.replace(night.state, barren_escalated=barren_escalated)
+    prior_cursor = None if night.prior is None else night.prior.last_scheduled_target_date
+    if prior_cursor is not None and night.never_run.expired:
+        _warn_expired_never_run(state.project_id, prior_cursor, night.never_run.expired)
+    _warn_abandoned_retries(
+        state.project_id, night.abandoned, today=state.recorded_at.date()
+    )
+    state_docs.write_state(trickle_state_path(state.project_id), state)
     return state
+
+
+def record_run(
+    project_id: str, run: NightRun, *, barren_escalated: bool
+) -> TrickleState:
+    """Fold *run* over the recorded predecessor and write it: :func:`write_night`
+    of :func:`fold_night`, for a writer with nothing to decide in between."""
+    return write_night(
+        fold_night(read_prior(project_id), project_id, run),
+        barren_escalated=barren_escalated,
+    )
 
 
 def _warn_expired_never_run(
