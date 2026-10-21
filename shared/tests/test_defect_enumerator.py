@@ -193,6 +193,39 @@ def test_a_literal_outside_the_ref_grammar_is_a_malformed_ref_gap():
     assert result.gaps == (EnumerationGap(GapReason.MALFORMED_REF, 3),)
 
 
+_ALIASED_SPELLINGS = {
+    'from-pytest-import-mark': ('from pytest import mark', 'mark.defect'),
+    'from-pytest-import-mark-as': ('from pytest import mark as m', 'm.defect'),
+    'import-pytest-as': ('import pytest as pt', 'pt.mark.defect'),
+    'mark-namespace-assigned': ('MARK = pytest.mark', 'MARK.defect'),
+}
+
+
+@pytest.mark.parametrize(('binding', 'spelling'), _ALIASED_SPELLINGS.values(), ids=list(_ALIASED_SPELLINGS))
+def test_a_defect_mark_spelled_through_an_alias_is_an_unreadable_ref_gap(binding, spelling):
+    result = _enumerate(f'''
+        {binding}
+
+        @{spelling}({REF_A!r})
+        def test_a():
+            pass
+    ''')
+    assert result.carriers == {}
+    assert result.non_static == ()
+    assert result.gaps == (EnumerationGap(GapReason.UNREADABLE_REF, 3),)
+
+
+def test_an_alias_of_pytest_and_an_unrelated_defect_attribute_leave_the_file_complete():
+    result = _enumerate('''
+        import pytest as pt
+
+        def test_a(report):
+            with pt.raises(ValueError):
+                report.defect
+    ''')
+    assert result.complete is True
+
+
 def test_readable_carriers_survive_beside_an_unreadable_mark():
     result = _enumerate(f'''
         @pytest.mark.defect(SOME_NAME)
@@ -379,6 +412,115 @@ def test_a_test_class_with_its_own_constructor_carries_nothing(constructor):
     ''')
     assert result.carriers == {}
     assert result.non_static == (NonStaticMark(REF_A, 5),)
+
+
+_MARKED_METHOD = f'''
+            @pytest.mark.defect({REF_A!r})
+            def test_m(self):
+                pass
+'''
+
+_UNCOLLECTED_CLASSES = {
+    'own-false-test-flag': '''
+        class TestA:
+            __test__ = False
+    ''',
+    'own-non-constant-test-flag': '''
+        class TestA:
+            __test__ = SOME_FLAG
+    ''',
+    'inherited-false-test-flag': '''
+        class Base:
+            __test__ = False
+
+        class TestA(Base):
+    ''',
+    'constructor-two-local-bases-up': '''
+        class Base:
+            def __init__(self):
+                pass
+
+        class Middle(Base):
+            pass
+
+        class TestA(Middle):
+    ''',
+    'new-from-a-local-base': '''
+        class Base:
+            def __new__(cls):
+                pass
+
+        class TestA(Base):
+    ''',
+}
+
+
+@pytest.mark.parametrize('header', _UNCOLLECTED_CLASSES.values(), ids=list(_UNCOLLECTED_CLASSES))
+def test_a_test_class_pytest_refuses_through_its_flag_or_a_local_base_carries_nothing(header):
+    result = _enumerate(header + _MARKED_METHOD)
+    assert result.complete is True
+    assert result.carriers == {}
+    assert [mark.ref for mark in result.non_static] == [REF_A]
+
+
+def test_a_nested_test_class_resolves_its_base_in_the_enclosing_class_body():
+    result = _enumerate(f'''
+        class TestOuter:
+            class Base:
+                def __init__(self):
+                    pass
+
+            class TestInner(Base):
+                @pytest.mark.defect({REF_A!r})
+                def test_m(self):
+                    pass
+    ''')
+    assert result.carriers == {}
+    assert result.non_static == (NonStaticMark(REF_A, 7),)
+
+
+_COLLECTED_CLASSES = {
+    'flag-overridden-by-the-class': '''
+        class Base:
+            __test__ = False
+
+        class TestA(Base):
+            __test__ = True
+    ''',
+    'cyclic-local-bases': '''
+        class Left(Right):
+            pass
+
+        class Right(Left):
+            pass
+
+        class TestA(Left):
+    ''',
+    'bases-the-module-does-not-define': '''
+        from harness import Base
+
+        class TestA(Base, unittest.TestCase):
+    ''',
+}
+
+
+@pytest.mark.parametrize('header', _COLLECTED_CLASSES.values(), ids=list(_COLLECTED_CLASSES))
+def test_a_test_class_whose_visible_lineage_allows_collection_carries(header):
+    result = _enumerate(header + _MARKED_METHOD)
+    assert result.carriers == {REF_A: (_runnable('TestA::test_m'),)}
+
+
+@pytest.mark.parametrize('value', ['False', 'SOME_FLAG'])
+def test_a_module_whose_test_flag_is_not_a_truthy_constant_carries_nothing(value):
+    result = _enumerate(f'''
+        __test__ = {value}
+
+        @pytest.mark.defect({REF_A!r})
+        def test_a():
+            pass
+    ''')
+    assert result.carriers == {}
+    assert result.non_static == (NonStaticMark(REF_A, 3),)
 
 
 def test_a_test_function_inside_an_if_carries_nothing():
@@ -649,6 +791,16 @@ def test_enumerate_tree_prunes_pytests_default_norecursedirs_at_any_depth(tmp_pa
     assert [file.path for file in tree.files] == ['pkg/tests/test_x.py']
 
 
+@pytest.mark.parametrize('marker', ['pyvenv.cfg', 'conda-meta/history'])
+def test_enumerate_tree_prunes_a_virtualenv_whatever_its_name(tmp_path, marker):
+    _write(tmp_path, 'pkg/tests/test_x.py')
+    _write(tmp_path, 'env/lib/site-packages/vendored/test_broken.py', 'def test_a(:\n')
+    _write(tmp_path, f'env/{marker}', '')
+    tree = enumerate_tree(tmp_path, module_root_of=_dot_root)
+    assert [file.path for file in tree.files] == ['pkg/tests/test_x.py']
+    assert tree.complete is True
+
+
 def test_enumerate_tree_returns_files_sorted_by_tree_relative_path(tmp_path):
     for relative in ('b/test_b.py', 'a/test_a.py', 'a/z/test_c.py', 'a/test_d.py'):
         _write(tmp_path, relative)
@@ -675,6 +827,23 @@ def test_an_unreadable_test_file_is_an_unreadable_file_gap_and_the_walk_continue
         _file('a/test_ok.py', _MARKED),
     )
     assert tree.incomplete_files == ('a/test_gone.py',)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root lists a mode-000 directory')
+def test_an_unlistable_subdirectory_is_an_unlistable_directory_gap_and_the_walk_continues(tmp_path):
+    _write(tmp_path, 'a/test_ok.py')
+    _write(tmp_path, 'b/locked/test_hidden.py')
+    locked = tmp_path / 'b' / 'locked'
+    locked.chmod(0)
+    try:
+        tree = enumerate_tree(tmp_path, module_root_of=_dot_root)
+    finally:
+        locked.chmod(0o755)
+    assert tree.files == (
+        _file('a/test_ok.py', _MARKED),
+        FileEnumeration('b/locked', {}, gaps=(EnumerationGap(GapReason.UNLISTABLE_DIRECTORY, None),)),
+    )
+    assert tree.incomplete_files == ('b/locked',)
 
 
 def test_enumerate_tree_refuses_a_root_it_cannot_list(tmp_path):

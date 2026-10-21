@@ -11,6 +11,7 @@ from shared.pytest_mark_grammar import (
     marker_name,
     pytestmark_elements,
     pytestmark_value,
+    scope_binding,
 )
 
 
@@ -107,3 +108,24 @@ def test_pytestmark_elements_ignores_a_later_valueless_annotation():
 ])
 def test_pytestmark_elements_is_empty_without_a_direct_child_binding(source):
     assert pytestmark_elements(_body(source)) == []
+
+
+@pytest.mark.parametrize(('source', 'expected'), [
+    ('__test__ = False\n', False),
+    ('__test__ = True\n__test__ = False\n', False),
+    ('__test__: bool = True\n', True),
+    ('__test__ = False\n__test__: bool\n', False),
+])
+def test_scope_binding_reads_the_last_direct_child_binding_of_the_name_asked_for(source, expected):
+    value = scope_binding(_body(source), '__test__')
+    assert isinstance(value, ast.Constant)
+    assert value.value is expected
+
+
+@pytest.mark.parametrize('source', [
+    'if True:\n    __test__ = False\n',
+    'pytestmark = pytest.mark.slow\n',
+    '',
+])
+def test_scope_binding_is_none_without_a_direct_child_binding_of_that_name(source):
+    assert scope_binding(_body(source), '__test__') is None

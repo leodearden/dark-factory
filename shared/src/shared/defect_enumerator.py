@@ -3,7 +3,9 @@
 plans/defect-tests-prd.md decision 8 makes this static scan the authoritative binding of a defect
 ref to its node ids, and decision 14 makes completeness part of every answer: a file whose refs
 cannot all be read statically is incomplete, never clean. Collection mirrors pytest's DEFAULT
-rules only, so a project that overrides them is a known, fail-safe limit.
+rules only, so a project that overrides them is a known, fail-safe limit. A Test class's bases are
+read only where the module itself defines them: a constructor or ``__test__`` inherited from an
+imported base is invisible, so such a class still reads as collected.
 """
 
 from __future__ import annotations
@@ -14,16 +16,17 @@ import os
 import posixpath
 import sys
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from fnmatch import fnmatchcase
+from functools import cached_property
 from pathlib import Path
 from types import MappingProxyType
 
 from shared.cli_boundary import LoudArgumentParser, run_cli
 from shared.defects import MalformedDefectRef, NodeId, parse_ref
-from shared.pytest_mark_grammar import marker_name, pytestmark_elements
+from shared.pytest_mark_grammar import marker_name, pytestmark_elements, scope_binding
 
 __all__ = [
     'Carrier',
@@ -40,14 +43,18 @@ __all__ = [
 ]
 
 _DEFECT_MARKER = 'defect'
+_MARK_NAMESPACE = 'mark'
 _CONSTRUCTORS = frozenset({'__init__', '__new__'})
+_TEST_FLAG = '__test__'
 
 # pytest 9.0.3's defaults: python_files, python_functions and python_classes (_pytest/python.py),
-# and norecursedirs (_pytest/main.py). All matching is case-sensitive.
+# and norecursedirs and the never-collected virtualenvs of _in_venv (_pytest/main.py). All
+# matching is case-sensitive.
 _PYTHON_FILES = ('test_*.py', '*_test.py')
 _TEST_FUNCTION_PREFIX = 'test'
 _TEST_CLASS_PREFIX = 'Test'
 _NORECURSE_DIRS = ('*.egg', '.*', '_darcs', 'build', 'CVS', 'dist', 'node_modules', 'venv', '{arch}')
+_VIRTUALENV_MARKERS = ('pyvenv.cfg', 'conda-meta/history')
 
 
 class DisablingMark(StrEnum):
@@ -62,10 +69,13 @@ _DISABLING_MARKS = frozenset(DisablingMark)
 
 
 class GapReason(StrEnum):
+    """Why a tree entry's refs are unseen; UNLISTABLE_DIRECTORY's entry is a directory, not a file."""
+
     SYNTAX_ERROR = 'syntax_error'
     UNREADABLE_REF = 'unreadable_ref'
     MALFORMED_REF = 'malformed_ref'
     UNREADABLE_FILE = 'unreadable_file'
+    UNLISTABLE_DIRECTORY = 'unlistable_directory'
 
 
 @dataclass(frozen=True)
@@ -142,7 +152,9 @@ def _module_relative(path: str, module_root: str) -> str:
 
 
 def _read_ref(mark: ast.expr) -> str | EnumerationGap:
-    """The ref one defect mark names: exactly one positional str literal, no keywords, in the grammar."""
+    """The ref one defect mark names: ``pytest.mark.defect``, one positional str literal, no keywords, in the grammar."""
+    if marker_name(mark) != _DEFECT_MARKER:
+        return EnumerationGap(GapReason.UNREADABLE_REF, mark.lineno)
     if not (isinstance(mark, ast.Call) and len(mark.args) == 1 and not mark.keywords):
         return EnumerationGap(GapReason.UNREADABLE_REF, mark.lineno)
     argument = mark.args[0]
@@ -154,15 +166,44 @@ def _read_ref(mark: ast.expr) -> str | EnumerationGap:
         return EnumerationGap(GapReason.MALFORMED_REF, mark.lineno)
 
 
+def _is_mark_namespace(node: ast.expr) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == _MARK_NAMESPACE
+
+
+def _mark_namespace_aliases(nodes: Iterable[ast.AST]) -> frozenset[str]:
+    """Names bound to pytest's mark namespace by ``from pytest import mark`` or ``NAME = <x>.mark``."""
+    aliases: set[str] = set()
+    for node in nodes:
+        if isinstance(node, ast.ImportFrom) and node.module == 'pytest':
+            aliases.update(alias.asname or alias.name for alias in node.names if alias.name == _MARK_NAMESPACE)
+        elif isinstance(node, ast.Assign) and _is_mark_namespace(node.value):
+            aliases.update(target.id for target in node.targets if isinstance(target, ast.Name))
+    return frozenset(aliases)
+
+
+def _is_defect_spelling(node: ast.Attribute, aliases: frozenset[str]) -> bool:
+    """Whether *node* names the defect marker: ``<x>.mark.defect``, or ``defect`` on an *aliases* name."""
+    if node.attr != _DEFECT_MARKER:
+        return False
+    owner = node.value
+    return _is_mark_namespace(owner) or (isinstance(owner, ast.Name) and owner.id in aliases)
+
+
 def _defect_marks(tree: ast.Module) -> list[ast.expr]:
-    """Every defect-mark expression in *tree*, by position: each ``defect(...)`` call and each bare mark."""
-    found = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.Call | ast.Attribute) and marker_name(node) == _DEFECT_MARKER
-    ]
-    called = {id(node.func) for node in found if isinstance(node, ast.Call)}
-    marks = [node for node in found if id(node) not in called]
-    return sorted(marks, key=lambda mark: (mark.lineno, mark.col_offset))
+    """Every defect-mark expression in *tree*, by position: each spelling's call, or the bare spelling.
+
+    Spellings through an alias of pytest or its mark namespace are included, so that
+    :func:`_read_ref` makes each one a gap rather than letting it vanish.
+    """
+    nodes = list(ast.walk(tree))
+    aliases = _mark_namespace_aliases(nodes)
+    marks: dict[int, ast.expr] = {
+        id(node): node for node in nodes if isinstance(node, ast.Attribute) and _is_defect_spelling(node, aliases)
+    }
+    for node in nodes:
+        if isinstance(node, ast.Call) and id(node.func) in marks:
+            marks[id(node.func)] = node
+    return sorted(marks.values(), key=lambda mark: (mark.lineno, mark.col_offset))
 
 
 @dataclass(frozen=True)
@@ -191,27 +232,71 @@ def _winning_definitions(body: Sequence[ast.stmt]) -> list[_Definition]:
     return list(definitions.values())
 
 
-def _is_test_class(node: ast.ClassDef) -> bool:
-    if not node.name.startswith(_TEST_CLASS_PREFIX):
-        return False
-    return not any(
+def _classes(definitions: Iterable[_Definition]) -> dict[str, ast.ClassDef]:
+    return {definition.name: definition for definition in definitions if isinstance(definition, ast.ClassDef)}
+
+
+def _lineage(
+    node: ast.ClassDef, classes: Mapping[str, ast.ClassDef], visiting: frozenset[str]
+) -> Iterator[ast.ClassDef]:
+    """*node*, then each base *classes* defines, depth-first: the static stand-in for its MRO."""
+    yield node
+    for base in node.bases:
+        if isinstance(base, ast.Name) and base.id not in visiting and base.id in classes:
+            yield from _lineage(classes[base.id], classes, visiting | {base.id})
+
+
+def _defines_constructor(node: ast.ClassDef) -> bool:
+    return any(
         isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef) and statement.name in _CONSTRUCTORS
         for statement in node.body
     )
 
 
+def _test_flag(bodies: Iterable[Sequence[ast.stmt]]) -> bool:
+    """pytest's ``__test__``: the first of *bodies* to bind it decides, and only a truthy constant collects."""
+    for body in bodies:
+        value = scope_binding(body, _TEST_FLAG)
+        if value is not None:
+            return isinstance(value, ast.Constant) and bool(value.value)
+    return True
+
+
+def _is_test_class(node: ast.ClassDef, classes: Mapping[str, ast.ClassDef]) -> bool:
+    if not node.name.startswith(_TEST_CLASS_PREFIX):
+        return False
+    lineage = tuple(_lineage(node, classes, frozenset({node.name})))
+    if any(_defines_constructor(ancestor) for ancestor in lineage):
+        return False
+    return _test_flag(ancestor.body for ancestor in lineage)
+
+
 def _test_items(
-    body: Sequence[ast.stmt], inherited: _ScopeMarks, class_chain: tuple[str, ...]
+    body: Sequence[ast.stmt],
+    inherited: _ScopeMarks,
+    class_chain: tuple[str, ...],
+    module_classes: Mapping[str, ast.ClassDef],
 ) -> Iterator[tuple[str, _ScopeMarks]]:
-    """Each item pytest's default collection takes from a scope *body*, named, with the marks reaching it."""
+    """Each item pytest's default collection takes from a scope *body*, named, with the marks reaching it.
+
+    A class's bases resolve among the classes its own scope and the module define.
+    """
     scope = inherited.with_elements(pytestmark_elements(body))
-    for definition in _winning_definitions(body):
+    definitions = _winning_definitions(body)
+    visible = {**module_classes, **_classes(definitions)}
+    for definition in definitions:
         marks = scope.with_elements(definition.decorator_list)
         if isinstance(definition, ast.ClassDef):
-            if _is_test_class(definition):
-                yield from _test_items(definition.body, marks, (*class_chain, definition.name))
+            if _is_test_class(definition, visible):
+                yield from _test_items(definition.body, marks, (*class_chain, definition.name), module_classes)
         elif definition.name.startswith(_TEST_FUNCTION_PREFIX):
             yield '::'.join((*class_chain, definition.name)), marks
+
+
+def _module_items(body: Sequence[ast.stmt]) -> Iterator[tuple[str, _ScopeMarks]]:
+    if not _test_flag((body,)):
+        return iter(())
+    return _test_items(body, _ScopeMarks(), (), _classes(_winning_definitions(body)))
 
 
 _Reading = str | EnumerationGap
@@ -247,7 +332,7 @@ def _non_static(
 def _enumerate_module(path: str, node_of: Callable[[str], NodeId], tree: ast.Module) -> FileEnumeration:
     marks = _defect_marks(tree)
     readings = {id(mark): _read_ref(mark) for mark in marks}
-    carriers, reached = _carriers(_test_items(tree.body, _ScopeMarks(), ()), readings, node_of)
+    carriers, reached = _carriers(_module_items(tree.body), readings, node_of)
     gaps = tuple(reading for reading in readings.values() if isinstance(reading, EnumerationGap))
     return FileEnumeration(path, carriers, non_static=_non_static(marks, readings, reached), gaps=gaps)
 
@@ -284,7 +369,7 @@ class TreeEnumeration:
             raise ValueError(f'TreeEnumeration holds more than one enumeration of {duplicated}')
         object.__setattr__(self, 'files', tuple(sorted(self.files, key=lambda file: file.path)))
 
-    @property
+    @cached_property
     def carriers(self) -> Mapping[str, tuple[Carrier, ...]]:
         """Every file's carriers merged per ref: refs sorted, carriers in path then source order."""
         merged: dict[str, list[Carrier]] = {}
@@ -293,18 +378,19 @@ class TreeEnumeration:
                 merged.setdefault(ref, []).extend(carriers)
         return MappingProxyType({ref: tuple(merged[ref]) for ref in sorted(merged)})
 
-    @property
+    @cached_property
     def runnable_refs(self) -> frozenset[str]:
         return frozenset(
             ref for ref, carriers in self.carriers.items() if any(carrier.runnable for carrier in carriers)
         )
 
-    @property
+    @cached_property
     def non_static_refs(self) -> frozenset[str]:
         return frozenset(mark.ref for file in self.files for mark in file.non_static)
 
-    @property
+    @cached_property
     def incomplete_files(self) -> tuple[str, ...]:
+        """The path of every incomplete entry, an unlistable directory's included."""
         return tuple(file.path for file in self.files if not file.complete)
 
     @property
@@ -318,22 +404,37 @@ def is_test_file(path: str) -> bool:
     return any(fnmatchcase(name, pattern) for pattern in _PYTHON_FILES)
 
 
-def _is_norecurse(directory_name: str) -> bool:
-    return any(fnmatchcase(directory_name, pattern) for pattern in _NORECURSE_DIRS)
+def _is_virtualenv(directory: Path) -> bool:
+    try:
+        return any((directory / marker).is_file() for marker in _VIRTUALENV_MARKERS)
+    except OSError:
+        return False
 
 
-def _refuse_unlistable(error: OSError) -> None:
-    raise error
+def _is_pruned(directory: Path) -> bool:
+    return any(fnmatchcase(directory.name, pattern) for pattern in _NORECURSE_DIRS) or _is_virtualenv(directory)
 
 
-def _test_file_paths(root: Path) -> list[str]:
-    """Tree-relative POSIX paths of every test file under *root*, sorted; an unlistable directory raises."""
-    paths: list[str] = []
-    for directory, directory_names, file_names in os.walk(root, onerror=_refuse_unlistable, followlinks=False):
-        directory_names[:] = [name for name in directory_names if not _is_norecurse(name)]
-        relative = Path(directory).relative_to(root)
-        paths.extend((relative / name).as_posix() for name in file_names if is_test_file(name))
-    return sorted(paths)
+def _walk(root: Path) -> tuple[list[str], list[str]]:
+    """Tree-relative POSIX paths of every test file under *root*, and of every subdirectory it cannot list.
+
+    Both are sorted. Only an unlistable *root* raises.
+    """
+    test_files: list[str] = []
+    unlistable: list[str] = []
+
+    def note_unlistable(error: OSError) -> None:
+        directory = Path(error.filename).relative_to(root)
+        if directory == Path():
+            raise error
+        unlistable.append(directory.as_posix())
+
+    for directory, directory_names, file_names in os.walk(root, onerror=note_unlistable, followlinks=False):
+        current = Path(directory)
+        directory_names[:] = [name for name in directory_names if not _is_pruned(current / name)]
+        relative = current.relative_to(root)
+        test_files.extend((relative / name).as_posix() for name in file_names if is_test_file(name))
+    return sorted(test_files), sorted(unlistable)
 
 
 def _enumerate_file(root: Path, path: str, module_root: str) -> FileEnumeration:
@@ -344,15 +445,20 @@ def _enumerate_file(root: Path, path: str, module_root: str) -> FileEnumeration:
     return enumerate_source(path, source, module_root=module_root)
 
 
+def _unlistable_directory(path: str) -> FileEnumeration:
+    return FileEnumeration(path, {}, gaps=(EnumerationGap(GapReason.UNLISTABLE_DIRECTORY, None),))
+
+
 def enumerate_tree(root: Path, *, module_root_of: Callable[[str], str]) -> TreeEnumeration:
     """Enumerate every test file pytest's default rules would collect under *root*.
 
     *module_root_of* maps each tree-relative path to the module root that qualifies its NodeIds.
-    A file that cannot be read is an UNREADABLE_FILE gap, so the walk always covers the rest.
+    A file that cannot be read is an UNREADABLE_FILE gap and a subdirectory that cannot be listed
+    an UNLISTABLE_DIRECTORY one, so the walk always covers the rest; only an unlistable *root* raises.
     """
-    return TreeEnumeration(tuple(
-        _enumerate_file(root, path, module_root_of(path)) for path in _test_file_paths(root)
-    ))
+    test_files, unlistable = _walk(root)
+    files = (_enumerate_file(root, path, module_root_of(path)) for path in test_files)
+    return TreeEnumeration((*files, *map(_unlistable_directory, unlistable)))
 
 
 def _directory(value: str) -> Path:

@@ -1,15 +1,25 @@
-"""The static AST grammar of pytest marks: ``pytest.mark.NAME`` elements and ``pytestmark`` bindings."""
+"""The static AST grammar pytest reads: ``pytest.mark.NAME`` elements and scope bindings like ``pytestmark``."""
 
 from __future__ import annotations
 
 import ast
 from collections.abc import Sequence
 
-__all__ = ['mark_elements', 'marker_name', 'pytestmark_elements', 'pytestmark_value']
+__all__ = ['mark_elements', 'marker_name', 'pytestmark_elements', 'pytestmark_value', 'scope_binding']
 
 
-def _is_pytestmark_target(node: ast.expr) -> bool:
-    return isinstance(node, ast.Name) and node.id == 'pytestmark'
+def _is_name(node: ast.expr, name: str) -> bool:
+    return isinstance(node, ast.Name) and node.id == name
+
+
+def _bound_value(statement: ast.stmt, name: str) -> ast.expr | None:
+    if isinstance(statement, ast.Assign):
+        if any(_is_name(target, name) for target in statement.targets):
+            return statement.value
+        return None
+    if isinstance(statement, ast.AnnAssign) and _is_name(statement.target, name):
+        return statement.value
+    return None
 
 
 def pytestmark_value(statement: ast.stmt) -> ast.expr | None:
@@ -19,13 +29,23 @@ def pytestmark_value(statement: ast.stmt) -> ast.expr | None:
     ``pytestmark: list = ...`` spellings; an annotation with no value binds
     nothing.
     """
-    if isinstance(statement, ast.Assign):
-        if any(_is_pytestmark_target(target) for target in statement.targets):
-            return statement.value
-        return None
-    if isinstance(statement, ast.AnnAssign) and _is_pytestmark_target(statement.target):
-        return statement.value
-    return None
+    return _bound_value(statement, 'pytestmark')
+
+
+def scope_binding(body: Sequence[ast.stmt], name: str) -> ast.expr | None:
+    """The value the binding of *name* that wins in a scope *body* gives it, else None.
+
+    Only DIRECT children of *body* bind the scope's *name* — one bound inside
+    an ``if`` does not — and the LAST binding wins, as in Python itself. Both
+    the plain and the annotated spelling bind; an annotation with no value
+    binds nothing.
+    """
+    value: ast.expr | None = None
+    for statement in body:
+        bound = _bound_value(statement, name)
+        if bound is not None:
+            value = bound
+    return value
 
 
 def marker_name(element: ast.expr) -> str | None:
@@ -57,15 +77,9 @@ def mark_elements(value: ast.expr) -> list[ast.expr]:
 
 
 def pytestmark_elements(body: Sequence[ast.stmt]) -> list[ast.expr]:
-    """The mark elements of the ``pytestmark`` binding that wins in a scope *body*.
+    """The mark elements of the ``pytestmark`` binding that wins in a scope *body*, by :func:`scope_binding`.
 
-    Only DIRECT children of *body* bind the scope's ``pytestmark`` — one bound
-    inside an ``if`` does not — and the LAST binding wins, as in Python itself.
     No binding yields an empty list.
     """
-    value: ast.expr | None = None
-    for statement in body:
-        bound = pytestmark_value(statement)
-        if bound is not None:
-            value = bound
+    value = scope_binding(body, 'pytestmark')
     return mark_elements(value) if value is not None else []
