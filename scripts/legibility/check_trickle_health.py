@@ -46,7 +46,7 @@ from pathlib import Path
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import state_docs, trickle_state  # noqa: E402
+from legibility import trickle_state  # noqa: E402
 
 logger = logging.getLogger('legibility.check_trickle_health')
 
@@ -552,17 +552,16 @@ def _decide_post(
     threshold is never re-derived here."""
     if progress_ok:
         return _PostDecision(post=False)
-    match trickle_state.load_state(trickle_state.trickle_state_path(project_id)):
-        case state_docs.Ok(value=state) if state.barren_escalated is None:
-            return _PostDecision(post=True, note=_UNRECORDED_NOTE)
-        case state_docs.Ok(value=state):
-            nightly_posted = (
-                state.barren_escalated
-                and trickle_state.recorded_age_hours(state) <= max_age_hours
-            )
-            return _PostDecision(post=not nightly_posted)
-        case _:
-            return _PostDecision(post=True)
+    state = trickle_state.read_prior(project_id)
+    if state is None:
+        return _PostDecision(post=True)
+    if state.barren_escalated is None:
+        return _PostDecision(post=True, note=_UNRECORDED_NOTE)
+    nightly_posted = (
+        state.barren_escalated
+        and trickle_state.recorded_age_hours(state) <= max_age_hours
+    )
+    return _PostDecision(post=not nightly_posted)
 
 
 def build_parser() -> argparse.ArgumentParser:

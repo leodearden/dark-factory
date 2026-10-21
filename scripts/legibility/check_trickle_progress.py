@@ -68,8 +68,8 @@ from pathlib import Path
 # predicate at DISPATCH time, not at test time.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import state_docs  # noqa: E402  (must follow the sys.path shim above)
-import trickle_state  # noqa: E402
+import state_docs
+import trickle_state
 
 USAGE = (
     'usage: check_trickle_progress.py <project_id> <max_barren_runs> '

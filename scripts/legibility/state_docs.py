@@ -23,12 +23,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Generic, Protocol, TypeVar
 
-# Bind `shared` to the SAME checkout as this script, as account_pool.py does.
-_SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
-if str(_SHARED_SRC) not in sys.path:
-    sys.path.insert(0, str(_SHARED_SRC))
+# Bind `shared` to the SAME checkout as this script.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'shared' / 'src'))
 
-from shared.safe_io import atomic_write_text, load_json_or_warn  # noqa: E402
+from shared.safe_io import atomic_write_text, load_json_or_warn
 
 logger = logging.getLogger(__name__)
 

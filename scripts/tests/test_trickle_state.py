@@ -35,6 +35,7 @@ import pwd
 import shutil
 import subprocess
 import tempfile
+from collections.abc import MutableMapping
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -266,8 +267,9 @@ class TestDeferredOutcome:
         ) == RunOutcome.FAILED
 
     def test_capped_is_a_required_keyword(self):
-        with pytest.raises(TypeError):
-            classify_run(exit_code=0, counters=_counters())  # type: ignore[call-arg]
+        parameter = inspect.signature(classify_run).parameters['capped']
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
 
 
 class TestRunCounters:
@@ -398,13 +400,15 @@ class TestTrickleStateCodec:
         assert doc['barren_escalated'] is True
 
     def test_the_backlog_is_read_only(self):
-        state = _state()
-        with pytest.raises(TypeError):
-            state.retry_backlog[date(2026, 7, 2)] = 1  # type: ignore[index]
+        assert not isinstance(_state().retry_backlog, MutableMapping)
 
-    def test_the_state_is_frozen(self):
+    @pytest.mark.parametrize(
+        'field', [field.name for field in dataclasses.fields(TrickleState)],
+    )
+    def test_the_state_is_frozen(self, field):
+        state = _state()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            _state().consecutive_barren_runs = 9  # type: ignore[misc]
+            setattr(state, field, getattr(state, field))
 
 
 class TestLoadState:
@@ -994,8 +998,6 @@ class TestRecordRunBarrenEscalated:
         ]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
         assert parameter.default is inspect.Parameter.empty
-        with pytest.raises(TypeError):
-            trickle_state.record_run('dark_factory', _night())  # type: ignore[call-arg]
 
 
 class TestNextState:
@@ -1085,8 +1087,7 @@ class TestBarrenRemedy:
         }
 
     def test_the_remedies_are_read_only(self):
-        with pytest.raises(TypeError):
-            trickle_state.BARREN_REMEDIES[trickle_state.BarrenDoor.BUDGET] = 'x'  # type: ignore[index]
+        assert not isinstance(trickle_state.BARREN_REMEDIES, MutableMapping)
 
     def test_the_budget_door_names_the_budget_key_only(self):
         text = trickle_state.barren_remedy(_counters(budget_skipped=4))
