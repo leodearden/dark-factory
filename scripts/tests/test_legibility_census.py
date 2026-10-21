@@ -48,6 +48,7 @@ from legibility import (
     session_ledger,
     session_runner,
     similarity,
+    synthesis,
     task_store,
     trickle_state,
     unlanded,
@@ -6820,7 +6821,7 @@ def test_main_hands_run_census_one_runners_invokers_for_the_census_stages(
     assert runner.calls[-1] == (specs[0].name, "haiku")
     kwargs["verify_fn"]([{"title": "x"}], model="sonnet")
     assert runner.calls[-1] == (specs[1].name, "sonnet")
-    kwargs["synthesize_fn"]([{"title": "x"}], model="fable")
+    kwargs["synthesize_fn"](_synthesis_brief(), model="fable")
     assert runner.calls[-1] == (specs[2].name, "fable")
 
 
@@ -8789,56 +8790,59 @@ def test_verify_prompt_embeds_the_quality_definition_and_asks_for_the_c4_verdict
     assert str(tmp_path) in prompt
 
 
-def test_synthesis_prompt_embeds_the_quality_definition_and_the_verdicts(tmp_path):
-    root = _tree_with_guide(tmp_path)
-    found = verdict.parse_verdict(
-        {
-            "verified": True,
-            "reason": "r",
-            "anchor": "docs/guide.md",
-            "tags": ["h2"],
-            "severity": "low",
-            "severity_reason": "contained",
-            "route": "structural",
-        },
-        title=_REMEDIATED_TITLE,
-        project_root=root,
+def _synthesis_brief() -> synthesis.Brief:
+    """A brief holding one new finding: the entry a run promoted from session s-1."""
+    anchor = "orchestrator/x.py::f"
+    identity = census_findings.FindingIdentity.mint("orchestrator", anchor, ("h2", verdict.KIND_TAG))
+    sighting = {
+        "date": "2026-10-21", "project": "dark_factory", "session": "s-1",
+        "origin_phase": "implement", "manifested_phase": "verify",
+    }
+    entry = {
+        "id": "entry-cand-20261021-1", "title": _REMEDIATED_TITLE, "severity": "low", "status": "open",
+        "origin_phase": "implement", "manifested_phase": "verify", "sightings": [sighting],
+        **identity.to_fields(),
+    }
+    found = verdict.Verdict(
+        verified=True, reason="r", anchor=anchor, tags=identity.tags, severity="low",
+        severity_reason="contained", route=verdict.Route.STRUCTURAL, remediation=None,
     )
-    fake_invoke = _make_fake_invoke(default="Synthesis prose.")
-
-    mod._build_default_synthesize_fn(fake_invoke)(
-        [{"title": _REMEDIATED_TITLE, "verdict": found}], model="fable",
+    return synthesis.Brief.of(
+        run_id="census-dark_factory-20261021",
+        before={"version": 2, "entries": []},
+        after={"version": 2, "entries": [entry]},
+        verdicts=[census_findings.Adjudication(entry["id"], found, None)],
+        adopted={},
+        run_sessions={"s-1"},
+        counts={"confirmed": 1},
     )
-    prompt = fake_invoke.calls[0]["prompt"]
 
+
+def test_synthesis_prompt_embeds_the_quality_definition_the_c6_reply_and_the_brief():
+    brief = _synthesis_brief()
+    fake_invoke = _make_fake_invoke(default="the raw reply")
+
+    reply = mod._build_default_synthesize_fn(fake_invoke)(brief, model="fable")
+
+    [call] = fake_invoke.calls
+    prompt = call["prompt"]
+    assert (reply, call["model"]) == ("the raw reply", "fable")
     assert _quality_block_of(prompt) == code_quality.guidance()
-    assert '"anchor": "docs/guide.md"' in prompt
-    assert '"severity": "low"' in prompt
+    assert synthesis.reply_instructions() in prompt
+    assert json.dumps(brief.to_record()) in prompt
+    assert "no tools" in prompt
+    assert "Proposed codebook changes" not in prompt
 
 
-def test_synthesis_prompt_names_the_not_applied_proposals_heading(tmp_path):
-    root = _tree_with_guide(tmp_path)
-    found = verdict.parse_verdict(
-        {
-            "verified": True,
-            "reason": "r",
-            "anchor": "docs/guide.md",
-            "tags": ["h2"],
-            "severity": "low",
-            "severity_reason": "contained",
-            "route": "structural",
-        },
-        title=_REMEDIATED_TITLE,
-        project_root=root,
+def test_the_default_synthesize_fn_leaves_the_empty_brief_skip_to_run_census():
+    empty = synthesis.Brief.of(
+        run_id="census-dark_factory-20261021", before={"version": 2, "entries": []},
+        after={"version": 2, "entries": []}, verdicts=[], adopted={}, run_sessions=(), counts={},
     )
-    fake_invoke = _make_fake_invoke(default="Synthesis prose.")
+    fake_invoke = _make_fake_invoke(default="the raw reply")
 
-    mod._build_default_synthesize_fn(fake_invoke)(
-        [{"title": _REMEDIATED_TITLE, "verdict": found}], model="fable",
-    )
-    prompt = fake_invoke.calls[0]["prompt"]
-
-    assert mod.SYNTHESIS_PROPOSALS_HEADING in prompt
+    assert mod._build_default_synthesize_fn(fake_invoke)(empty, model="fable") == "the raw reply"
+    assert len(fake_invoke.calls) == 1
 
 
 # ---------------------------------------------------------------------------
