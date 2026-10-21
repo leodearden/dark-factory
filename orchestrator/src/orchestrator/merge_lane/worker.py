@@ -170,11 +170,14 @@ from orchestrator.merge_lane.types import (
     ItemLifecycleState,
     MainHealthAutoHealRegistry,
     MergeBounceRegistry,
+    MergeCancelRefusal,
+    MergeCancelVerdict,
     MergeDispatchResult,
     MergedOk,
     MergeOutcome,
     MergeReadyPredicate,
     MergeRequest,
+    OperatorMergeCancel,
     OutcomeKind,
     QueuedBranch,
     RealMergeItem,
@@ -4565,6 +4568,28 @@ async def enqueue_merge_request(
     req.result.add_done_callback(_on_finalized)
     await queue.put(req)
     _emit_merge_queued(event_store, req, queue_depth=queue.qsize(), source=source)
+
+
+_FINALIZE_WINDOW_STATES = frozenset({
+    ItemLifecycleState.GATE_REVERIFY, ItemLifecycleState.FINALIZING,
+})
+"""The states ``SpeculativeMergeWorker._finalize_inflight`` moves a request
+through.  Its CAS loop consults the cancel only on a halt result, so a cancel
+there could abandon a merge that still lands."""
+
+
+def _train_cancel_refusal(req: MergeRequest) -> MergeCancelRefusal | None:
+    """TRAIN SEAM: every train is refused, on Leo's 2026-10-21 ruling on task 5248.
+
+    Neither a whole-train cancel nor a member eject is safe yet:
+    ``_do_train_merge`` has no abandonment checkpoint, and a train dropped
+    before its merge never reaches ``SpeculativeMergeWorker._unwind_coalesce_train``,
+    so its members would stay merge-deferred on their stacked tips.  The
+    follow-up task that makes either safe replaces this function and nothing else.
+    """
+    if isinstance(req, GroupMergeRequest):
+        return MergeCancelRefusal.TRAIN_CANCEL_UNSUPPORTED
+    return None
 
 
 _MERGE_CANCEL_RETIRE_REASON = 'merge_cancel_retire'
@@ -14058,6 +14083,54 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 started_ts=self._phase_started.get(rid, now),
             ))
         return found
+
+    def cancel_request(self, request_id: str) -> MergeCancelVerdict:
+        """Cancel the live request *request_id* for an operator, whoever awaits it.
+
+        Cancels the request's result future with an :class:`OperatorMergeCancel`
+        message; every phase's ``_request_abandoned`` checkpoint then drops the
+        request and reaps what it holds, including a running verify.  Refuses a
+        request in its finalize window or a train (:func:`_train_cancel_refusal`).
+        Synchronous, so the merger and verifier cannot move the request between
+        the lookup and the cancel.
+        """
+        found = self._live_request(request_id)
+        if found is None:
+            return MergeCancelVerdict(request_id, MergeCancelRefusal.NOT_LIVE)
+        req, state = found
+        refusal = _train_cancel_refusal(req)
+        if refusal is None and state in _FINALIZE_WINDOW_STATES:
+            refusal = MergeCancelRefusal.FINALIZE_WINDOW
+        if refusal is None:
+            req.result.cancel(OperatorMergeCancel(request_id))
+        return MergeCancelVerdict(
+            request_id, refusal, task_id=req.task_id, branch=req.branch.bare_id,
+        )
+
+    def _live_request(
+        self, request_id: str,
+    ) -> tuple[MergeRequest, ItemLifecycleState] | None:
+        """The undecided request this lane holds under *request_id*, and its state."""
+        live = self._live_items.get(request_id)
+        state = self._lifecycle.current(request_id)
+        if live is not None and state is not None:
+            req = _request_of(live)
+        else:
+            req = next(
+                (r for r in self._queued_arrivals() if r.request_id == request_id), None,
+            )
+            state = ItemLifecycleState.QUEUED
+        if req is None or req.result.done():
+            return None
+        return req, state
+
+    def _queued_arrivals(self) -> list[MergeRequest]:
+        """The requests still in the external queue, which the registry has not seen."""
+        return [
+            _q_req
+            for _q_req in self._queue._queue  # type: ignore[attr-defined]
+            if _q_req is not None
+        ]
 
     def _decided_predispatch_ids(self, arrivals: Sequence[MergeRequest]) -> frozenset[str]:
         """Ids of the requests waiting for the merger whose outcome is already decided.

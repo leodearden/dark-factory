@@ -706,6 +706,51 @@ class MergeDispatchResult:
     live worker snapshot entry.  Set on a C3 reject; None otherwise."""
 
 
+class MergeCancelRefusal(StrEnum):
+    """Why ``MergeLane.cancel_request`` left a live request alone (task 5248)."""
+
+    NOT_LIVE = 'not_live'
+    """The lane holds no undecided request under that id."""
+    FINALIZE_WINDOW = 'finalize_window'
+    """The request is landing; a cancel could abandon a merge that still lands."""
+    TRAIN_CANCEL_UNSUPPORTED = 'train_cancel_unsupported'
+    """The request is a merge train; see ``worker.py::_train_cancel_refusal``."""
+
+
+@dataclass(frozen=True)
+class MergeCancelVerdict:
+    """What ``MergeLane.cancel_request`` did with one request id.
+
+    *task_id*/*branch* name the request the lane found, so the caller can
+    retire it by branch; both are None when nothing was found.
+    """
+
+    request_id: str
+    refusal: MergeCancelRefusal | None
+    task_id: str | None = None
+    branch: str | None = None
+
+    @property
+    def cancelled(self) -> bool:
+        return self.refusal is None
+
+
+@dataclass(frozen=True)
+class OperatorMergeCancel:
+    """The message an operator's cancel puts on a request's result future.
+
+    ``Future.cancel(msg)`` hands it to whoever awaits the future, inside the
+    ``CancelledError`` they get, which is how a TaskWorkflow tells an
+    operator's cancel of its merge from its own cancellation.
+    """
+
+    request_id: str
+
+    @classmethod
+    def carried_by(cls, error: asyncio.CancelledError) -> OperatorMergeCancel | None:
+        return next((arg for arg in error.args if isinstance(arg, cls)), None)
+
+
 @dataclass
 class WaiterRecord:
     """Server-side durable-intent waiter record keyed by request_id.

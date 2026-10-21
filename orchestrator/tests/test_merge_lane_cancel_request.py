@@ -1,0 +1,255 @@
+"""``MergeLane.cancel_request``: an operator's cancel of a live request by id (task 5248).
+
+An operator holding only a request id from ``get_merge_queue``/``merge_status``
+must be able to cancel it whether it is queued or verifying, with no caller
+blocked on its future; a request that is landing, or a train, is refused.
+Every scene runs a real lane over a tmp repo, and reads the outcome back off
+the lane's public census, the request's own future, and main.
+"""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+from _merge_lane_fakes import (
+    FakeVerifier,
+    hangs_until,
+    lane_state,
+    make_lane,
+    running_lane,
+)
+
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane import (
+    GroupMergeRequest,
+    MergeCancelRefusal,
+    MergeRequest,
+    OperatorMergeCancel,
+    QueuedBranch,
+)
+from orchestrator.verify import VerifyResult
+
+pytestmark = pytest.mark.asyncio
+
+_SCENE_TIMEOUT = 30.0
+
+
+async def _setup_repo(repo: Path) -> None:
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_setup_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def git_config() -> GitConfig:
+    return GitConfig(
+        main_branch='main', branch_prefix='task/', remote='origin',
+        worktree_dir='.worktrees', push_after_advance=False,
+    )
+
+
+@pytest.fixture
+def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
+    return GitOps(git_config, git_repo)
+
+
+@pytest.fixture
+def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
+    return OrchestratorConfig(project_root=git_repo, git=git_config)
+
+
+def _request(task_id: str, worktree: Path, config: OrchestratorConfig) -> MergeRequest:
+    return MergeRequest(
+        task_id=task_id,
+        branch=QueuedBranch.parse(task_id, config.git.branch_prefix),
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+    )
+
+
+async def _branch(git_ops: GitOps, task_id: str) -> Path:
+    worktree = (await git_ops.create_worktree(task_id)).path
+    (worktree / f'{task_id}.py').write_text('x = 1\n')
+    await git_ops.commit(worktree, f'Add {task_id}')
+    return worktree
+
+
+async def _until(predicate: Any, what: str) -> None:
+    async def _poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+    try:
+        await asyncio.wait_for(_poll(), _SCENE_TIMEOUT)
+    except TimeoutError:
+        raise AssertionError(f'timed out waiting for {what}') from None
+
+
+def _operator_cancel_on(request: MergeRequest) -> OperatorMergeCancel | None:
+    assert request.result.cancelled(), 'the request future must be cancelled'
+    try:
+        request.result.result()
+    except asyncio.CancelledError as cancelled:
+        return OperatorMergeCancel.carried_by(cancelled)
+    raise AssertionError('a cancelled future must raise CancelledError')
+
+
+class _CancelRecordingVerifier(FakeVerifier):
+    """A ``FakeVerifier`` that also records each verify torn down mid-run."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.torn_down: list[str | None] = []
+
+    async def run_scoped(self, worktree: Path, config: Any, module_configs: list[Any],
+                         task_files: list[str] | None = None, **options: Any) -> VerifyResult:
+        try:
+            return await super().run_scoped(
+                worktree, config, module_configs, task_files, **options,
+            )
+        except asyncio.CancelledError:
+            self.torn_down.append(options.get('task_id'))
+            raise
+
+
+class TestCancellable:
+    async def test_a_queued_request_is_cancelled_and_never_merged(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        verifier = FakeVerifier()
+        lane = make_lane(git_ops, queue, verifier=verifier)
+        cancelled = _request('cq', await _branch(git_ops, 'cq'), config)
+        survivor = _request('sv', await _branch(git_ops, 'sv'), config)
+        await queue.put(cancelled)
+
+        verdict = lane.cancel_request(cancelled.request_id)
+
+        assert verdict.cancelled
+        assert (verdict.task_id, verdict.branch) == ('cq', 'cq')
+        assert _operator_cancel_on(cancelled) == OperatorMergeCancel(cancelled.request_id)
+        assert lane_state(lane, cancelled.request_id) is None
+        async with running_lane(lane) as run:
+            await queue.put(survivor)
+            assert (await run.outcome(survivor)).status == 'done'
+        assert verifier.verified == ['sv']
+        assert not (Path(config.project_root) / 'cq.py').exists()
+
+    async def test_a_verifying_request_is_cancelled_and_its_verify_torn_down(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        verifier = _CancelRecordingVerifier(default=hangs_until(asyncio.Event()))
+        lane = make_lane(git_ops, queue, verifier=verifier)
+        request = _request('cv', await _branch(git_ops, 'cv'), config)
+        main_before = await git_ops.get_main_sha()
+
+        async with running_lane(lane):
+            await queue.put(request)
+            await asyncio.wait_for(verifier.await_entry(), _SCENE_TIMEOUT)
+            assert lane_state(lane, request.request_id) == 'verifying'
+
+            verdict = lane.cancel_request(request.request_id)
+
+            assert verdict.cancelled
+            await _until(lambda: verifier.torn_down == ['cv'], 'the verify teardown')
+            await _until(
+                lambda: not lane.snapshot()['owned_merge_worktrees'],
+                'the merge worktree reap',
+            )
+        assert _operator_cancel_on(request) == OperatorMergeCancel(request.request_id)
+        assert lane_state(lane, request.request_id) is None
+        assert await git_ops.get_main_sha() == main_before
+
+
+class TestRefused:
+    async def test_a_landing_request_is_refused_and_still_lands(
+        self, git_ops: GitOps, config: OrchestratorConfig, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        lane = make_lane(git_ops, queue)
+        request = _request('fw', await _branch(git_ops, 'fw'), config)
+        advancing, release = asyncio.Event(), asyncio.Event()
+        advance_main = git_ops.advance_main
+
+        async def _held_advance(*args: Any, **kwargs: Any) -> Any:
+            advancing.set()
+            await release.wait()
+            return await advance_main(*args, **kwargs)
+
+        monkeypatch.setattr(git_ops, 'advance_main', _held_advance)
+        async with running_lane(lane) as run:
+            await queue.put(request)
+            await asyncio.wait_for(advancing.wait(), _SCENE_TIMEOUT)
+            assert lane_state(lane, request.request_id) == 'finalizing'
+
+            verdict = lane.cancel_request(request.request_id)
+
+            assert verdict.refusal is MergeCancelRefusal.FINALIZE_WINDOW
+            assert not request.result.done()
+            release.set()
+            assert (await run.outcome(request)).status == 'done'
+
+    async def test_a_train_is_refused(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        lane = make_lane(git_ops, queue)
+        tip = await _branch(git_ops, 'tip')
+        train = GroupMergeRequest(
+            task_id='tip',
+            branch=QueuedBranch.parse('tip', config.git.branch_prefix),
+            worktree=tip,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=asyncio.get_running_loop().create_future(),
+            train_id='train-1',
+            member_task_ids=['root', 'tip'],
+            tip_branch=QueuedBranch.parse('tip', config.git.branch_prefix),
+            tip_task_id='tip',
+            status_check=AsyncMock(return_value={}),
+            mark_member_done=AsyncMock(),
+        )
+        await queue.put(train)
+
+        verdict = lane.cancel_request(train.request_id)
+
+        assert verdict.refusal is MergeCancelRefusal.TRAIN_CANCEL_UNSUPPORTED
+        assert not train.result.done()
+
+    async def test_an_unknown_or_decided_request_is_not_live(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        lane = make_lane(git_ops, queue)
+        request = _request('dc', await _branch(git_ops, 'dc'), config)
+        await queue.put(request)
+        assert lane.cancel_request(request.request_id).cancelled
+
+        again = lane.cancel_request(request.request_id)
+        unknown = lane.cancel_request('mr-unknown')
+
+        assert again.refusal is MergeCancelRefusal.NOT_LIVE
+        assert unknown.refusal is MergeCancelRefusal.NOT_LIVE
+        assert (unknown.task_id, unknown.branch) == (None, None)
