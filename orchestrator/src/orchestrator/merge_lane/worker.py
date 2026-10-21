@@ -4584,8 +4584,8 @@ def _train_cancel_refusal(req: MergeRequest) -> MergeCancelRefusal | None:
     Neither a whole-train cancel nor a member eject is safe yet:
     ``_do_train_merge`` has no abandonment checkpoint, and a train dropped
     before its merge never reaches ``SpeculativeMergeWorker._unwind_coalesce_train``,
-    so its members would stay merge-deferred on their stacked tips.  The
-    follow-up task that makes either safe replaces this function and nothing else.
+    so its members would stay merge-deferred on their stacked tips.  Task 7309,
+    which makes both safe, replaces this function and nothing else.
     """
     if isinstance(req, GroupMergeRequest):
         return MergeCancelRefusal.TRAIN_CANCEL_UNSUPPORTED
