@@ -10,13 +10,14 @@ evidence are counted by the runner and never sent to the model.
 from __future__ import annotations
 
 import copy
+import enum
 import reprlib
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
-from legibility import census_findings, codebook, coder, verdict
+from legibility import census_findings, codebook, coder, report_text, verdict
 
 
 @dataclass(frozen=True)
@@ -715,3 +716,182 @@ def standing_count(before: Mapping[str, Any], after: Mapping[str, Any]) -> int:
         and entry["id"] in standing
         and not _gained_sessions(standing[entry["id"]], entry)
     )
+
+
+# ---------------------------------------------------------------------------
+# The run record's synthesis value and the report's ## Synthesis section
+# ---------------------------------------------------------------------------
+
+class Outcome(enum.StrEnum):
+    OK = "ok"
+    UNAVAILABLE = "unavailable"
+    SKIPPED = "skipped"
+
+
+@dataclass(frozen=True)
+class Applied:
+    """What the run applied of an accepted document."""
+
+    clusters_refined: int = 0
+    entries_refined: int = 0
+    corrections_applied: int = 0
+    correction_skipped: int = 0
+    skipped_unknown_entry: int = 0
+
+    @classmethod
+    def of(cls, refined: Refined, counts: codebook.MergeCounts) -> Applied:
+        return cls(
+            clusters_refined=refined.clusters_refined,
+            entries_refined=refined.entries_refined,
+            corrections_applied=counts.corrections_applied,
+            correction_skipped=counts.correction_skipped,
+            skipped_unknown_entry=counts.skipped_unknown_entry,
+        )
+
+    def to_record(self) -> dict[str, int]:
+        return {
+            "clusters_refined": self.clusters_refined,
+            "entries_refined": self.entries_refined,
+            "corrections_applied": self.corrections_applied,
+            "correction_skipped": self.correction_skipped,
+            "skipped_unknown_entry": self.skipped_unknown_entry,
+        }
+
+
+@dataclass(frozen=True)
+class SynthesisReport:
+    """One run's synthesis: its brief, the document accepted or why none was
+    (*result* None when the brief was empty and no call was made), what was
+    applied of it, and the standing count, which the model never sees."""
+
+    brief: Brief
+    result: Synthesis | Unavailable | None
+    applied: Applied
+    standing: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.result, Synthesis) and self.applied != Applied():
+            raise ValueError(f"SynthesisReport: nothing is applied without a document, got {self.applied!r}")
+
+    @property
+    def outcome(self) -> Outcome:
+        if self.result is None:
+            return Outcome.SKIPPED
+        return Outcome.UNAVAILABLE if isinstance(self.result, Unavailable) else Outcome.OK
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "outcome": self.outcome.value,
+            "calls": 0 if self.result is None else 1,
+            "reason": self.result.reason if isinstance(self.result, Unavailable) else None,
+            "brief": self.brief.to_record(),
+            "document": self.result.to_record() if isinstance(self.result, Synthesis) else None,
+            "applied": self.applied.to_record(),
+            "standing": self.standing,
+        }
+
+
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _applied_line(record: Mapping[str, Any]) -> str:
+    outcome = Outcome(record["outcome"])
+    if outcome is Outcome.SKIPPED:
+        return "- applied: nothing; no synthesis call was made, since nothing was new or re-observed this run"
+    if outcome is Outcome.UNAVAILABLE:
+        return f"- applied: nothing; synthesis unavailable: {_one_line(record['reason'])}"
+    applied = record["applied"]
+    refinements = len(record["document"]["phase_refinements"])
+    skipped = applied["correction_skipped"] + applied["skipped_unknown_entry"]
+    return (
+        f"- applied: {refinements} phase refinement(s) to {applied['clusters_refined']} cluster(s) and "
+        f"{applied['entries_refined']} new entr(ies); {applied['corrections_applied']} correction(s) applied, "
+        f"{skipped} skipped"
+    )
+
+
+def _count_lines(record: Mapping[str, Any]) -> list[str]:
+    brief = record["brief"]
+    invariants = ", ".join(f"{slug} {count}" for slug, count in brief["invariant_counts"].items()) or "none"
+    return [
+        f"- standing, no new evidence: {record['standing']}",
+        f"- invariant violations this run: {invariants}",
+        f"- unkeyed entries re-observed: {brief['unkeyed_re_observed']}",
+    ]
+
+
+def _block(heading: str, lines: Sequence[str]) -> list[str]:
+    return ["", f"### {heading}", "", *(lines or ["_none this run._"])]
+
+
+def _finding(finding: Mapping[str, Any]) -> str:
+    return f"- {finding['key']} {report_text.quoted_title(finding['title'])}"
+
+
+def _new_lines(brief: Mapping[str, Any], document: Mapping[str, Any] | None) -> list[str]:
+    if document is None:
+        return [_finding(finding) for finding in brief["new"]]
+    observations = {item["key"]: item["observation"] for item in document["new"]}
+    return [
+        f"{_finding(finding)}: {_one_line(observations.get(finding['key'], 'no observation stated'))}"
+        for finding in brief["new"]
+    ]
+
+
+def _change(change: Mapping[str, Any]) -> str:
+    return f"{change['field']} {change['from']} → {change['to']} ({_one_line(change['why'])})"
+
+
+def _re_observed_lines(brief: Mapping[str, Any], document: Mapping[str, Any] | None) -> list[str]:
+    changes = {item["key"]: item["changed"] for item in (document or {}).get("re_observed", [])}
+    lines = []
+    for finding in brief["re_observed"]:
+        adopted = f"adopted from {finding['adopted_from']}; " if finding["adopted_from"] else ""
+        line = f"{_finding(finding)} ({adopted}gained {', '.join(finding['gained_sessions'])})"
+        if document is not None:
+            changed = changes.get(finding["key"])
+            line += ": " + ("; ".join(_change(change) for change in changed) if changed else "no change stated")
+        lines.append(line)
+    return lines
+
+
+def _correction_line(correction: Mapping[str, Any]) -> str:
+    written = ", ".join(
+        f"{name} {report_text.quoted_title(correction[name])}" for name in _CORRECTION_WRITES if name in correction
+    )
+    return f"- {correction['entry_id']}: {written} ({_one_line(correction['note'])})"
+
+
+def _document_blocks(document: Mapping[str, Any]) -> list[str]:
+    blocks = (
+        ("Phase Refinements", [
+            f"- {item['key']}: origin {item['origin_phase']}, manifested {item['manifested_phase']} "
+            f"({_one_line(item['why'])})"
+            for item in document["phase_refinements"]
+        ]),
+        ("Corrections", [_correction_line(item) for item in document["corrections"]]),
+        ("Notes", [
+            f"- unverified: {_one_line(item['claim'])} (evidence: {_one_line(item['evidence'])})"
+            for item in document["notes"]
+        ]),
+    )
+    return [line for heading, lines in blocks if lines for line in _block(heading, lines)]
+
+
+def report_lines(record: Mapping[str, Any]) -> list[str]:
+    """The report's ``## Synthesis`` section, rendered from the run record's
+    ``synthesis`` value (:meth:`SynthesisReport.to_record`) alone. Its New and
+    Re-observed lines come from the brief, so they render whether or not a
+    document was accepted; the document only annotates them. No leading
+    blank line: the census embeds it straight after the matrix."""
+    brief, document = record["brief"], record["document"]
+    return [
+        "## Synthesis",
+        "",
+        _applied_line(record),
+        *_count_lines(record),
+        *_block("New", _new_lines(brief, document)),
+        *_block("Re-observed", _re_observed_lines(brief, document)),
+        *([] if document is None else _document_blocks(document)),
+    ]
