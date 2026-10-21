@@ -18,7 +18,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from dashboard.payload_check import check_endpoints, main, parse_args
 
 from dashboard.payload_budgets import (
     TABLE_PATH,
@@ -28,6 +27,7 @@ from dashboard.payload_budgets import (
     parse_budget_table,
     render_overage,
 )
+from dashboard.payload_check import check_endpoints, main, parse_args
 
 BASE_URL = 'http://dashboard.invalid:8080'
 REPO_ROOT = Path(__file__).resolve().parents[2]
