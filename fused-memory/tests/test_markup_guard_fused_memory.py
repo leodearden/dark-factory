@@ -1700,3 +1700,109 @@ class TestPreservationIsUnconditional:
         assert payload['escalation_id'] is None
         assert 'NOTHING WAS PRESERVED' in payload['hint']
         mock_service.add_memory.assert_not_awaited()
+
+
+class TestPreservationFailuresAreReadable:
+    """INV-4: a payload no tier could hold is counted where an operator looks.
+
+    ``get_status.markup_residue`` reports the floor's own loss count. The floor
+    is the last tier, so a failed floor write IS a lost payload; a fallback to
+    the floor is not a loss and is not counted.
+    """
+
+    @staticmethod
+    def _server(
+        spool: MarkupResidueSpool | None, known_projects: dict[str, str] | None = None
+    ) -> tuple[Any, AsyncMock]:
+        mock_service = AsyncMock()
+        mock_service.get_status = AsyncMock(side_effect=lambda **_: {'mem0': {'ok': True}})
+        if spool is None:
+            return create_mcp_server(mock_service), mock_service
+        server = create_mcp_server(mock_service, markup_residue_spool=spool)
+        install_markup_guard(
+            server,
+            policy=RepairPolicy.REJECT_WITH_REPAIR,
+            known_projects=known_projects or {'some_other_project': '/elsewhere'},
+            residue_floor=spool.preserve,
+        )
+        return server, mock_service
+
+    @staticmethod
+    async def _status(server) -> dict[str, Any]:
+        return await server._tool_manager.call_tool('get_status', {})
+
+    @staticmethod
+    async def _refuse_add_memory(server) -> dict:
+        with pytest.raises(ToolError) as exc_info:
+            await server._tool_manager.call_tool(
+                'add_memory',
+                {'content': _CLEAN_CONTENT + closer_for('invoke'), 'project_id': _PROJECT_ID},
+            )
+        payload = _payload(exc_info)
+        assert payload['error_type'] == 'mcp_markup_unrepairable', payload
+        return payload
+
+    @staticmethod
+    def _unwritable_spool(tmp_path) -> MarkupResidueSpool:
+        blocker = tmp_path / 'not-a-directory'
+        blocker.write_text('occupied')
+        return MarkupResidueSpool(blocker / 'spool')
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_server_asserts_nothing_was_lost(self, tmp_path):
+        spool = MarkupResidueSpool(tmp_path / 'spool')
+        server, _ = self._server(spool)
+
+        status = await self._status(server)
+
+        assert status['markup_residue']['preservation_failures'] == 0
+        assert status['markup_residue']['spool_dir'] == str(tmp_path / 'spool')
+
+    @pytest.mark.asyncio
+    async def test_a_payload_no_tier_held_is_counted(self, tmp_path):
+        server, mock_service = self._server(self._unwritable_spool(tmp_path))
+
+        payload = await self._refuse_add_memory(server)
+        status = await self._status(server)
+
+        assert payload['escalation_id'] is None
+        residue = status['markup_residue']
+        assert residue['preservation_failures'] == 1
+        assert residue['last_failure']['tool'] == 'add_memory'
+        assert residue['last_failure']['field'] == 'content'
+        mock_service.add_memory.assert_not_awaited()
+
+    @pytest.mark.parametrize('tier', ['queue', 'floor'])
+    @pytest.mark.asyncio
+    async def test_a_preserved_payload_is_not_counted(self, tmp_path, tier):
+        """The counter measures losses, not fallbacks."""
+        spool = MarkupResidueSpool(tmp_path / 'spool')
+        known_projects = (
+            {_PROJECT_ID: str(tmp_path)} if tier == 'queue' else {'some_other_project': '/x'}
+        )
+        server, _ = self._server(spool, known_projects)
+
+        payload = await self._refuse_add_memory(server)
+        status = await self._status(server)
+
+        assert payload['escalation_id'] is not None
+        assert (tmp_path / 'spool').exists() is (tier == 'floor')
+        assert status['markup_residue']['preservation_failures'] == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unwired_server_omits_the_field(self):
+        """Unwired is not zero: a zero would assert something nobody measured."""
+        server, _ = self._server(None)
+
+        status = await self._status(server)
+
+        assert 'markup_residue' not in status
+
+    @pytest.mark.asyncio
+    async def test_the_field_is_top_level_not_under_queue(self, tmp_path):
+        server, _ = self._server(MarkupResidueSpool(tmp_path / 'spool'))
+
+        status = await self._status(server)
+
+        assert 'markup_residue' in status
+        assert 'markup_residue' not in status['queue']
