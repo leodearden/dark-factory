@@ -69,13 +69,20 @@ set -euo pipefail
 #   - Stage B: poll the heartbeat with the unit's requested_ts. verifying (a
 #     merge verify is still inside its own deadline) is awaited WITHOUT the busy
 #     grace, up to ORCH_DRAIN_VERIFY_MAX_WAIT_SECS counted from this unit's own
-#     request; idle (acknowledged, halted, nothing in flight) resumes; overdue
+#     request, and never past the sweep-wide ceiling below; idle (acknowledged, halted, nothing in flight) resumes; overdue
 #     (every in-flight verify is past its own command timeout, so it is about to
 #     be killed regardless) restarts at once; refused (the unit examined the
 #     request and declined it) drops that unit back to the merge-idle gate
 #     above. A unit still running pre-5371 code cannot see the request, and
 #     keeps the merge-idle gate unchanged. Until a unit acknowledges, its
 #     request reads busy, so each unit's first poll usually defers once.
+# SWEEP-WIDE CEILING: per-unit caps add up, and a sweep that outlives the
+# fleet lease (ORCH_FLEET_LEASE_MAX_AGE_SECS, 14400) lets a second sweep start.
+# So ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS, counted from the first unit's drain
+# request, bounds all verify-awaiting together: once it is spent, the unit
+# being awaited is restarted at once and every later unit gets no drain
+# request, i.e. the merge-idle gate above. A killed verify is the accepted
+# price; a lapsed lease is not.
 # What the halt protects is per unit by construction: no new merge starts on a
 # unit between its request and its restart. drain_check.py classifies one
 # unit's OWN verifies, wherever they run, and a restart kills only that unit's
@@ -121,6 +128,11 @@ set -euo pipefail
 #                                         it is restarted anyway (default:
 #                                         11400 = 10800, the longest configured
 #                                         merge-verify command timeout, + 600)
+#   ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS sweep-wide ceiling on verify-awaiting,
+#                                         counted from the first unit's drain
+#                                         request (default: 11400 = the 14400
+#                                         lease max-age less 3000s for the
+#                                         units still to restart after it)
 
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
 VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
@@ -247,10 +259,15 @@ DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"
 DRAIN_UNKNOWN_GRACE_SECS="${ORCH_DRAIN_UNKNOWN_GRACE_SECS:-120}"
 DRAIN_POLL_TRACE_FILE="${ORCH_DRAIN_POLL_TRACE_FILE:-}"
 DRAIN_VERIFY_MAX_WAIT_SECS="${ORCH_DRAIN_VERIFY_MAX_WAIT_SECS:-11400}"
+DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS="${ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS:-11400}"
 # Sweep state written by drain_request_write and read by drain_check_verdict:
 # the requested_ts this sweep wrote for each unit (cleared for a unit that
 # refuses it).
 declare -A DRAIN_REQUESTED_TS=()
+# The sweep-wide ceiling's clock: $SECONDS when the first unit's drain gate
+# began, and whether drain_sweep_ceiling_spent has already announced the trip.
+DRAIN_SWEEP_STARTED_AT=""
+DRAIN_SWEEP_CEILING_SPENT=0
 # Return channel for drain_await_fresh -- never declare 'local' anywhere
 # (full contract and incident rationale live in drain_await_fresh's own
 # docstring, task 3852).
@@ -617,6 +634,21 @@ _drain_validate_verdict() {
     esac
 }
 
+drain_sweep_ceiling_spent() {
+    # $1 = the unit the sweep is on.  True once DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS
+    # has passed since the first unit's drain gate began; the first true answer
+    # prints the one line that names where it tripped.
+    if [[ $DRAIN_SWEEP_CEILING_SPENT -eq 1 ]]; then
+        return 0
+    fi
+    if [[ $((SECONDS - DRAIN_SWEEP_STARTED_AT)) -lt $DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS ]]; then
+        return 1
+    fi
+    DRAIN_SWEEP_CEILING_SPENT=1
+    echo "sweep-wide drain verify-wait ceiling of ${DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS}s spent after $((SECONDS - DRAIN_SWEEP_STARTED_AT))s, at ${1}; later units get no drain request and use the merge-idle gate"
+    return 0
+}
+
 drain_gate() {
     # $1 = unit name.  Only called when --drain was passed.  Asks $1 to stop
     # admitting merges (Stage A), then blocks (poll-and-recheck) until it is
@@ -647,7 +679,9 @@ drain_gate() {
     # - verifying (a merge verify is still inside its own deadline) waits
     #   WITHOUT the busy grace -- killing the verify is exactly what the grace
     #   would do -- bounded instead by DRAIN_VERIFY_MAX_WAIT_SECS from this
-    #   unit's request.
+    #   unit's request and by the sweep-wide ceiling.
+    # Once the sweep-wide ceiling is spent, no request is written, so every
+    # verdict is the merge-idle gate's.
     #
     # A unit that goes stale/absent while waiting is not held for the rest of
     # the wait: a dead unit isn't merging, so it drops into the same bounded
@@ -655,13 +689,18 @@ drain_gate() {
     # printed only when the waiting verdict changes.
     local unit="$1"
     local verdict announced="" busy_start="" requested_at
-    # A request that cannot be written leaves the unit on the merge-idle gate
-    # (no requested_ts recorded) -- loudly, never by aborting a fleet redeploy
-    # over the drain's own plumbing.
-    if drain_request_write "$unit"; then
-        echo "requested a merge-admission drain on ${unit}"
-    else
-        echo "WARNING: could not write a drain request for ${unit} under ${FLEET_DIR}; using the merge-idle gate for it" >&2
+    if [[ -z "$DRAIN_SWEEP_STARTED_AT" ]]; then
+        DRAIN_SWEEP_STARTED_AT=$SECONDS
+    fi
+    if ! drain_sweep_ceiling_spent "$unit"; then
+        # A request that cannot be written leaves the unit on the merge-idle
+        # gate (no requested_ts recorded) -- loudly, never by aborting a fleet
+        # redeploy over the drain's own plumbing.
+        if drain_request_write "$unit"; then
+            echo "requested a merge-admission drain on ${unit}"
+        else
+            echo "WARNING: could not write a drain request for ${unit} under ${FLEET_DIR}; using the merge-idle gate for it" >&2
+        fi
     fi
     requested_at=$SECONDS
     drain_await_fresh "$unit"
@@ -707,6 +746,10 @@ drain_gate() {
                 if [[ "$announced" != "verifying" ]]; then
                     echo "awaiting in-flight merge verify on ${unit}"
                     announced="verifying"
+                fi
+                if drain_sweep_ceiling_spent "$unit"; then
+                    echo "force-restarting ${unit}: sweep-wide drain verify-wait ceiling spent"
+                    return 0
                 fi
                 if [[ $((SECONDS - requested_at)) -ge $DRAIN_VERIFY_MAX_WAIT_SECS ]]; then
                     echo "force-restarting ${unit}: drain verify-wait cap of ${DRAIN_VERIFY_MAX_WAIT_SECS}s exceeded"
