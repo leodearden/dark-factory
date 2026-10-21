@@ -2,6 +2,7 @@
 
 import logging
 import shutil
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -442,4 +443,113 @@ def test_an_unusable_git_directory_is_named_git_and_the_heartbeat_has_no_head(
     assert 'task_upserted' in published
     assert not published & {'branch_snapshot', 'tree_snapshot'}
     assert stored_cursor(project).head is None
+    assert_valid(project)
+
+
+@dataclass(frozen=True)
+class Landing:
+    merge: str
+    last_event_id: int
+
+
+def land_task_9(project: Project) -> Landing:
+    """`Merge task/9 into main` in git, with the merge verify and the landing runs.db records after it."""
+    merge = project.repo.merge_no_ff('task/9', 'Merge task/9 into main', when=at(35))
+    project.runs.emit(
+        'merge_verify', at=at(39), task_id=9, phase='merge',
+        data={'passed': True, 'duration_ms': 60_000, 'merge_sha': merge},
+    )
+    landed = project.runs.emit(
+        'merge_finalized', at=at(40), task_id=9, phase='merge', data={'state': 'done', 'merge_sha': merge}
+    )
+    return Landing(merge=merge, last_event_id=landed)
+
+
+def committed_files(project: Project) -> dict[str, bytes]:
+    return {name: (project.out_dir / name).read_bytes() for name in (CURSOR_FILENAME, 'state.json')}
+
+
+def restore(project: Project, files: dict[str, bytes]) -> None:
+    for name, data in files.items():
+        (project.out_dir / name).write_bytes(data)
+
+
+def cut_feed(project: Project, *, lines_kept: int, torn: bool) -> None:
+    """The feed as a kill left it: its first `lines_kept` lines, and half of the next when the append was torn."""
+    path = project.out_dir / 'feed.jsonl'
+    texts = path.read_bytes().split(b'\n')
+    kept = b''.join(text + b'\n' for text in texts[:lines_kept])
+    path.write_bytes(kept + (texts[lines_kept][: len(texts[lines_kept]) // 2] if torn else b''))
+
+
+def crashed_in_pass_2(project: Project, *, cut_after_merge: bool) -> Landing:
+    """Pass 1 committed; pass 2 appended over a second landing, then was killed before state.json was replaced."""
+    out = project.open()
+    run_pass(project.policy, out, now=NOW)
+    landing = land_task_9(project)
+    before_pass_2 = committed_files(project)
+    run_pass(project.policy, out, now=NOW)
+    lines = feed(project)
+    landed_at = next(
+        index for index, line in enumerate(lines)
+        if isinstance(line, MergeLanded) and line.commit == landing.merge
+    )
+    assert landed_at + 1 < len(lines)
+    restore(project, before_pass_2)
+    if cut_after_merge:
+        cut_feed(project, lines_kept=landed_at + 1, torn=True)
+    return landing
+
+
+def assert_recovered(project: Project, landing: Landing) -> None:
+    lines = feed(project)
+    seqs = [line.seq for line in lines]
+    assert seqs == sorted(set(seqs))
+    assert_valid(project)
+    merges = Counter(line.commit for line in lines if isinstance(line, MergeLanded))
+    assert merges == {project.merge: 1, landing.merge: 1}
+    verify_runs = Counter(line.run_key for line in lines if isinstance(line, VerifyRun))
+    assert len(verify_runs) == 2 and set(verify_runs.values()) == {1}
+    cursor = stored_cursor(project)
+    assert cursor.through_seq == lines[-1].seq
+    assert cursor.feed_bytes == (project.out_dir / 'feed.jsonl').stat().st_size
+    assert cursor.events_id == landing.last_event_id
+    assert cursor.head == project.repo.rev('main') == landing.merge
+
+
+def test_a_kill_mid_append_cuts_the_torn_line_and_republishes_nothing_twice(
+    project: Project, caplog: pytest.LogCaptureFixture
+) -> None:
+    landing = crashed_in_pass_2(project, cut_after_merge=True)
+
+    with caplog.at_level(logging.WARNING, logger='client_feed.feed_io'):
+        out = project.open()
+    run_pass(project.policy, out, now=NOW)
+
+    assert any(
+        record.name == 'client_feed.feed_io' and 'torn' in record.getMessage()
+        for record in caplog.records
+    )
+    assert_recovered(project, landing)
+
+
+def test_a_batch_appended_whole_whose_cursor_was_never_written_is_not_republished(
+    project: Project,
+) -> None:
+    landing = crashed_in_pass_2(project, cut_after_merge=False)
+
+    run_pass(project.policy, project.open(), now=NOW)
+
+    assert_recovered(project, landing)
+
+
+def test_a_restart_without_a_crash_reemits_nothing_but_a_heartbeat(project: Project) -> None:
+    run_pass(project.policy, project.open(), now=NOW)
+    first = feed(project)
+
+    run_pass(project.policy, project.open(), now=NOW)
+
+    (heartbeat,) = feed(project)[len(first) :]
+    assert isinstance(heartbeat, Heartbeat)
+    assert heartbeat.watermark_seq == first[-1].seq
     assert_valid(project)
