@@ -1,4 +1,4 @@
-"""Tests for score_write_triage_reader.py — the rubric v2 reader-consequence scorer.
+"""Tests for score_write_triage_reader.py — the rubric v2.1 reader-consequence scorer.
 
 Reached only through the public surface: ``score_reader``, its refusal
 ``IncompleteJudgementError``, ``render_markdown`` and the ``main`` CLI. The
@@ -53,22 +53,30 @@ def _item(
 
 def _vote(
     entry: str, target: str, *, rater: str = 'opus', role: str = 'primary',
-    basis: str = 'current', **answers: str,
+    basis: str = 'current', **answers: Any,
 ) -> dict[str, Any]:
-    return {
+    """A verdict row; a rater row's YES conflict and YES loss carry default evidence."""
+    row = {
         'entry_id': entry, 'target_id': target, 'basis': basis, 'rater': rater,
         'role': role, 'batch': 'b1', **answers,
     }
+    if role != 'derived':
+        if answers.get('conflict') == 'YES':
+            row.setdefault('conflict_quote', {'parent': 'the record says A', 'child': 'it says B'})
+        if answers.get('loss') == 'YES':
+            row.setdefault('loss_spans', ['a detail the reader needs'])
+    return row
 
 
 def _corpus() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     items = [
-        # triage {} / status quo {duplicate_clutter}; M1 not hidden; drifted at attach time
+        # triage {} / status quo {duplicate_clutter}; M1 not hidden, nor as amended;
+        # drifted at attach time
         _item('R1', 'restated', 'P1', band='restated', via_sibling=False, cross_category=False,
               parent_edited_after_attach=True),
-        # {hidden_detail} / {}; M1 hidden
+        # {hidden_detail} / {}; M1 hidden, but its digest shows it as amended
         _item('R2', 'restated', 'P2', band='restated', via_sibling=True, cross_category=False),
-        # {hidden_conflict, wrong_home} / {orphaned_conflict}; M1 hidden
+        # {hidden_conflict, wrong_home} / {orphaned_conflict}; M1 hidden, and as amended
         _item('R3', 'restated', 'P3', band='restated', project='reify', via_sibling=False,
               cross_category=True),
         # {wrong_home} / {}; band unknown
@@ -78,13 +86,13 @@ def _corpus() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
               parent_edited_after_attach=True),
         # {digest_conflict} / {orphaned_conflict}
         _item('A2', 'amended', 'P6', via_sibling=False, cross_category=True),
-        # {} / {orphaned_conflict}; central
+        # {} / {orphaned_conflict}; central, action-changing
         _item('C1', 'contested', 'P7', via_sibling=False, cross_category=False),
-        # {} / {orphaned_conflict}; secondary, ¬HOME (ruling 5b)
+        # {} / {orphaned_conflict}; secondary, not action-changing, ¬HOME (ruling 5b)
         _item('C2', 'contested', 'P8', project='reify', via_sibling=True, cross_category=False),
         # {false_conflict, wrong_home} / {}
         _item('C3', 'contested', 'P9', via_sibling=False, cross_category=False),
-        # {attached_supersession} / {orphaned_conflict}; scope unknown
+        # {attached_supersession} / {orphaned_conflict}; scope and action-changing unknown
         _item('C4', 'contested', 'P10', via_sibling=False, cross_category=False,
               supersedes_target=True),
         # decisive UNCLEAR: the status quo needs LOSS
@@ -99,13 +107,13 @@ def _corpus() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     verdicts = [
         _vote('R1', 'P1', **_FLAT),
         _vote('R1', 'P1', basis='attach_time', **_MORE),
-        _vote('R2', 'P2', **_MORE),
+        _vote('R2', 'P2', **_MORE, digest='YES'),
         _vote('R3', 'P3', home='NO', conflict='YES', scope='CENTRAL'),
         _vote('R4', 'P4', home='NO', conflict='NO'),
         _vote('A1', 'P5', **_MORE),
         _vote('A2', 'P6', home='YES', conflict='YES', scope='SECONDARY'),
-        _vote('C1', 'P7', conflict='YES', scope='CENTRAL'),
-        _vote('C2', 'P8', home='NO', conflict='YES', scope='SECONDARY'),
+        _vote('C1', 'P7', conflict='YES', scope='CENTRAL', action_changing='YES'),
+        _vote('C2', 'P8', home='NO', conflict='YES', scope='SECONDARY', action_changing='NO'),
         _vote('C3', 'P9', home='NO', conflict='NO'),
         _vote('C4', 'P10', conflict='YES'),
         _vote('C5', 'P11', home='YES', conflict='NO', loss='UNCLEAR',
@@ -165,7 +173,7 @@ class TestTheItemRowContract:
 class TestTheReport:
     def test_states_its_rubric_rules_and_weights(self) -> None:
         report = _report()
-        assert report['rubric'] == 'v2'
+        assert report['rubric'] == 'v2.1'
         assert set(report['cell_rules']) == {
             'hidden_detail', 'hidden_conflict', 'digest_conflict', 'wrong_home',
             'false_conflict', 'duplicate_clutter', 'orphaned_conflict', 'attached_supersession',
@@ -206,6 +214,9 @@ class TestTheReport:
     def test_m1_hidden_information_in_the_restated_band(self) -> None:
         assert _report()['metrics']['m1'] == {**_block(2, 3), 'band_unknown': 1}
 
+    def test_m1_counterfactual_reads_every_band_attach_as_amended(self) -> None:
+        assert _report()['metrics']['m1_as_amended'] == _block(1, 3)
+
     def test_m2_ack_truth_per_outcome(self) -> None:
         m2 = _report()['metrics']['m2']
         assert m2['restated'] == {
@@ -243,10 +254,11 @@ class TestTheReport:
             },
         }
 
-    def test_m5_conflict_flag_precision_with_its_scope_split(self) -> None:
+    def test_m5_conflict_flag_precision_with_its_scope_and_action_changing_splits(self) -> None:
         assert _report()['metrics']['m5'] == {
             **_block(3, 4, unclear=1),
             'by_scope': {'central': 1, 'secondary': 1, 'unknown': 1},
+            'by_action_changing': {'yes': 1, 'no': 1, 'unknown': 1},
         }
 
     def test_m6_read_time_drift(self) -> None:
@@ -319,7 +331,7 @@ class TestStrata:
         # M3's domain is the CONFLICT writes. Every restated one is hidden and no
         # contested one is, so only the restated sample's share of CONFLICT
         # writes can move the rate; the interval must not collapse to a point.
-        conflict = {'home': 'YES', 'loss': 'NO', 'conflict': 'YES', 'scope': 'CENTRAL'}
+        conflict = {'home': 'YES', 'conflict': 'YES', 'scope': 'CENTRAL'}
         items = [_item(f'R{n}', 'restated', f'P{n}') for n in range(1, 5)]
         items += [_item(f'C{n}', 'contested', f'Q{n}') for n in range(1, 5)]
         verdicts = [_vote('R1', 'P1', **conflict), _vote('R2', 'P2', **conflict),
@@ -345,43 +357,135 @@ class TestStrata:
             _mod().score_reader(items, verdicts, strata={**_STRATA, 'c': 4})
 
 
+def _rated(
+    entry: str, outcome: str, *votes: tuple[str, dict[str, Any]], band: str = 'judge',
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """One item read against parent 'P', and one current-basis vote per (role, answers)."""
+    return _item(entry, outcome, 'P', band=band), [
+        _vote(entry, 'P', rater=role, role=role, **answers) for role, answers in votes
+    ]
+
+
+def _by_binary(*rated: tuple[dict[str, Any], list[dict[str, Any]]]) -> dict[str, Any]:
+    items = [item for item, _ in rated]
+    verdicts = [vote for _, votes in rated for vote in votes]
+    return _mod().score_reader(items, verdicts)['kappa']['by_binary']
+
+
+def _agreement(n: int, kappa: float | None, floor_met: bool = False) -> dict[str, Any]:
+    return {'n_consumed': n, 'kappa': kappa, 'floor_met': floor_met}
+
+
+_KEPT = {'home': 'YES', 'conflict': 'NO', 'loss': 'NO'}
+_STRAY = {'home': 'NO', 'conflict': 'NO'}
+
+
 class TestKappa:
-    def _contested(self, home_pairs: list[tuple[str, str]], **extra: Any) -> dict[str, Any]:
-        items, verdicts = [], []
-        for index, (first, second) in enumerate(home_pairs):
-            entry = f'K{index:03d}'
-            items.append(_item(entry, 'contested', 'P'))
-            verdicts.append(_vote(entry, 'P', home=first, conflict='YES', **extra))
-            verdicts.append(_vote(entry, 'P', rater='sonnet', role='second', home=second,
-                                  conflict='YES', **extra))
-        return _mod().score_reader(items, verdicts)['kappa']
-
-    def test_kappa_between_primary_and_second_per_binary(self) -> None:
-        kappa = self._contested([('YES', 'YES'), ('NO', 'NO'), ('YES', 'NO'), ('NO', 'YES')])
+    def test_states_the_floor_its_pairs_and_the_binaries_it_applies_to(self) -> None:
+        kappa = _report()['kappa']
+        assert set(kappa) == {'floor', 'min_pairs', 'floor_binaries', 'by_binary'}
         assert kappa['floor'] == 0.70
-        assert kappa['min_overlap'] == 60
-        assert kappa['by_binary']['home'] == {'n_overlap': 4, 'kappa': 0.0, 'floor_met': False}
-        assert kappa['by_binary']['conflict'] == {
-            'n_overlap': 4, 'kappa': None, 'floor_met': False,
+        assert kappa['min_pairs'] == 60
+        assert kappa['floor_binaries'] == ['home', 'conflict', 'loss']
+        assert set(kappa['by_binary']) == {
+            'home', 'loss', 'conflict', 'scope', 'action_changing', 'digest',
         }
-        assert kappa['by_binary']['loss'] == {'n_overlap': 0, 'kappa': None, 'floor_met': False}
 
-    def test_scope_kappa_reads_central_and_secondary(self) -> None:
-        items, verdicts = [], []
-        for index, (first, second) in enumerate(
-            [('CENTRAL', 'CENTRAL'), ('SECONDARY', 'SECONDARY'), ('CENTRAL', 'SECONDARY')],
-        ):
-            entry = f'K{index}'
-            items.append(_item(entry, 'contested', 'P'))
-            verdicts.append(_vote(entry, 'P', conflict='YES', scope=first))
-            verdicts.append(_vote(entry, 'P', rater='sonnet', role='second', conflict='YES',
-                                  scope=second))
-        scope = _mod().score_reader(items, verdicts)['kappa']['by_binary']['scope']
-        assert scope == {'n_overlap': 3, 'kappa': 0.4, 'floor_met': False}
+    def test_an_upheld_contest_counts_toward_conflict_and_never_home(self) -> None:
+        homes = [('YES', 'YES'), ('NO', 'NO'), ('YES', 'NO'), ('NO', 'YES')]
+        by_binary = _by_binary(*(
+            _rated(f'K{index}', 'contested', ('primary', {'home': first, 'conflict': 'YES'}),
+                   ('second', {'home': second, 'conflict': 'YES'}))
+            for index, (first, second) in enumerate(homes)
+        ))
+        assert by_binary['home'] == _agreement(0, None)
+        assert by_binary['conflict'] == _agreement(4, None)
 
-    def test_the_floor_needs_both_agreement_and_overlap(self) -> None:
-        kappa = self._contested([('YES', 'YES')] * 30 + [('NO', 'NO')] * 30)
-        assert kappa['by_binary']['home'] == {'n_overlap': 60, 'kappa': 1.0, 'floor_met': True}
+    def test_a_rejected_contest_counts_toward_home(self) -> None:
+        by_binary = _by_binary(
+            _rated('K0', 'contested', ('primary', _KEPT), ('second', _KEPT)),
+            _rated('K1', 'contested', ('primary', _STRAY), ('second', _STRAY)),
+            _rated('K2', 'contested', ('primary', _KEPT), ('second', _STRAY), ('third', _KEPT)),
+            _rated('K3', 'contested', ('primary', _STRAY), ('second', _KEPT), ('third', _STRAY)),
+        )
+        assert by_binary['home'] == _agreement(4, 0.0)
+        assert by_binary['conflict'] == _agreement(4, None)
+        # K2 reads LOSS, but its second rater said HOME NO and so gave none; K3 never reads it.
+        assert by_binary['loss'] == _agreement(1, None)
+
+    def test_a_loss_pair_counts_only_where_the_derivation_reads_loss(self) -> None:
+        more = {'home': 'YES', 'conflict': 'NO', 'loss': 'YES'}
+        by_binary = _by_binary(
+            _rated('L0', 'restated', ('primary', more), ('second', more)),
+            _rated('L1', 'restated', ('primary', _KEPT), ('second', _KEPT)),
+            _rated('L2', 'restated', ('primary', _STRAY), ('second', _STRAY)),
+        )
+        assert by_binary['loss'] == _agreement(2, 1.0)
+        assert by_binary['home'] == _agreement(3, 1.0)
+
+    def test_a_non_consumed_answer_never_counts(self) -> None:
+        upheld = {'conflict': 'YES', 'scope': 'CENTRAL', 'non_consumed': ['conflict']}
+        by_binary = _by_binary(
+            _rated('N0', 'contested', ('derived', {'conflict': 'YES'}), ('primary', upheld),
+                   ('second', upheld)),
+            _rated('N1', 'contested', ('primary', {'conflict': 'YES'}),
+                   ('second', {'conflict': 'YES'})),
+        )
+        assert by_binary['conflict'] == _agreement(1, None)
+        assert by_binary['scope'] == _agreement(1, None)
+
+    def test_a_third_raters_vote_never_counts(self) -> None:
+        upheld = {'conflict': 'YES'}
+        by_binary = _by_binary(_rated('T0', 'contested', ('primary', upheld), ('third', upheld)))
+        assert by_binary['conflict'] == _agreement(0, None)
+
+    def test_scope_and_action_changing_count_on_upheld_contests_only(self) -> None:
+        def upheld(scope: str, changing: str) -> dict[str, str]:
+            return {'conflict': 'YES', 'scope': scope, 'action_changing': changing}
+
+        splits = [
+            (('CENTRAL', 'YES'), ('CENTRAL', 'YES')),
+            (('SECONDARY', 'NO'), ('SECONDARY', 'NO')),
+            (('CENTRAL', 'YES'), ('SECONDARY', 'NO')),
+        ]
+        rated = [
+            _rated(f'K{index}', 'contested', ('primary', upheld(*first)),
+                   ('second', upheld(*second)))
+            for index, (first, second) in enumerate(splits)
+        ]
+        restated = {'home': 'YES', **upheld('CENTRAL', 'YES')}
+        rated.append(_rated('R0', 'restated', ('primary', restated), ('second', restated)))
+        by_binary = _by_binary(*rated)
+        assert by_binary['scope'] == _agreement(3, 0.4)
+        assert by_binary['action_changing'] == _agreement(3, 0.4)
+
+    def test_digest_counts_where_the_derivation_read_it(self) -> None:
+        visible = {'home': 'YES', 'conflict': 'NO', 'loss': 'YES', 'digest': 'YES'}
+        by_binary = _by_binary(
+            _rated('D0', 'restated', ('primary', visible), ('second', visible), band='restated'),
+            _rated('D1', 'amended', ('primary', visible), ('second', visible)),
+        )
+        assert by_binary['digest'] == _agreement(1, None)
+
+    @pytest.mark.parametrize(('agreeing', 'split', 'kappa', 'floor_met'), [
+        (60, 0, 1.0, True),
+        (59, 0, 1.0, False),
+        (40, 20, 0.4, False),
+    ])
+    def test_the_floor_needs_both_agreement_and_pairs(
+        self, agreeing: int, split: int, kappa: float, floor_met: bool,
+    ) -> None:
+        answers = [_KEPT, _STRAY] * (agreeing // 2) + [_KEPT] * (agreeing % 2)
+        rated = [
+            _rated(f'K{index:03d}', 'contested', ('primary', vote), ('second', vote))
+            for index, vote in enumerate(answers)
+        ]
+        rated += [
+            _rated(f'S{index:03d}', 'contested', ('primary', _KEPT), ('second', _STRAY),
+                   ('third', _STRAY))
+            for index in range(split)
+        ]
+        assert _by_binary(*rated)['home'] == _agreement(agreeing + split, kappa, floor_met)
 
 
 class TestRefusal:
@@ -521,6 +625,7 @@ class TestRenderMarkdown:
         metrics = report['metrics']
         blocks = {
             'M1': metrics['m1'],
+            'M1 as amended': metrics['m1_as_amended'],
             **{f'M2 {outcome}': block for outcome, block in metrics['m2'].items()},
             'M3': metrics['m3'],
             'M4': metrics['m4'],
@@ -566,10 +671,12 @@ class TestRenderMarkdown:
     def test_has_the_kappa_table(self) -> None:
         report = _weighted_report()
         rows = _table_rows(_mod().render_markdown(report))
+        assert rows['binary'] == ['n consumed', 'kappa', 'floor met', 'floor applies']
         for binary, block in report['kappa']['by_binary'].items():
             assert rows[binary] == [
-                str(block['n_overlap']), _shown(block['kappa']),
+                str(block['n_consumed']), _shown(block['kappa']),
                 'yes' if block['floor_met'] else 'no',
+                'yes' if binary in report['kappa']['floor_binaries'] else 'no',
             ]
 
 
