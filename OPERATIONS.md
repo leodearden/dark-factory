@@ -1756,10 +1756,10 @@ restart:
   the correction below for why that cap does not currently hold,
   delegating the actual restart to
   `scripts/restart-all-orchestrators.sh --drain` — a two-stage drain (task
-  5371, see [Reading a drain](#reading-a-drain)) that halts merge admission
-  fleet-wide and holds each unit's restart while a merge verify is in flight
-  on any host, until it ends or passes its own deadline (a sweep-wide cap
-  bounds the wait). Units still on pre-5371 code, and units that refuse the request, keep
+  5371, see [Reading a drain](#reading-a-drain)) that, unit by unit as the
+  sweep reaches it, halts that unit's merge admission and holds its restart
+  while one of its merge verifies is in flight on any host, until it ends or
+  passes its own deadline (a per-unit cap bounds the wait). Units still on pre-5371 code, and units that refuse the request, keep
   the legacy merge-idle gate: defer while busy, then force-restart after
   `ORCH_RESTART_FORCE_FIRE_AFTER_SECS` (10 minutes since 2026-08-26, 75
   minutes before that). The script stamps the clock only
@@ -1859,11 +1859,14 @@ inside one 8-hour window.** Two corrections measured 2026-08-24/25:
   the one exit no trap can catch — costs at most one delayed window rather
   than wedging the fleet.
 
-  **Still not guaranteed.** The 14400s bound is derived from the common
+  **Still not guaranteed.** The 14400s bound was derived from the common
   long `--drain` sweep (~13,300s: the whole 11400s
   `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` verify-wait cap, plus 7 x (30s verify +
   120s grace) and 7 x 120s unknown-grace); it was 7200s while the worst sweep
-  was one busy unit burning the 600s-to-4500s busy grace. Units on the legacy
+  was one busy unit burning the 600s-to-4500s busy grace. Since task 7297 the
+  cap counts per unit from that unit's own request, so verify waits on
+  different units now add up instead of overlapping: two units each awaiting
+  a long verify can overrun the bound on their own. Units on the legacy
   merge-idle gate (pre-5371 code, or a refused request) still add up to the
   600s busy grace each, so two of them on top of a capped verify wait overrun
   it. A sweep that overruns it loses its lease
@@ -1876,30 +1879,43 @@ inside one 8-hour window.** Two corrections measured 2026-08-24/25:
 
 ### Reading a drain
 
-`--drain` (task 5371) runs in two stages. **Stage A**, fleet-wide and up
-front: the script writes `data/fleet/<unit>.drain.json` for every unit. Each
-unit's 15 s merge-heartbeat service honours the request only for its own
-systemd `INVOCATION_ID`, a live sweep pid, and an age within
-`orchestrator_restart_lease_max_age_secs`; it then halts merge *admission* (no
-new merges or verify dispatches) without aborting in-flight verifies. The cost:
-a unit late in the order (dark-factory is restarted last) keeps its lane halted
-until its turn. **Stage B**, per unit: the script classifies the heartbeat
+`--drain` (task 5371) runs in two stages, both per unit, when the sweep
+reaches that unit (task 7297; until then every unit was halted up front, and
+on 2026-10-20 dark-factory, restarted last, sat with its lane halted for
+2 h 13 m while the sweep awaited reify). **Stage A**: the script writes
+`data/fleet/<unit>.drain.json`. The unit's 15 s merge-heartbeat service
+honours the request only for its own systemd `INVOCATION_ID`, a live sweep
+pid, and an age within `orchestrator_restart_lease_max_age_secs`; it then
+halts merge *admission* (no new merges or verify dispatches) without aborting
+in-flight verifies. Every unit later in the order keeps admitting merges
+meanwhile. **Stage B**: the script classifies the heartbeat
 (`scripts/drain_check.py::classify`) as one of
 
 - `idle` — acknowledged, halted, nothing in flight: restart.
 - `verifying` — a merge verify is inside its own deadline: wait, with no busy
-  grace, until it finishes, goes `overdue`, or the sweep-wide cap
-  `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` (default 11400, counted once from Stage A)
-  expires.
+  grace, until it finishes, goes `overdue`, or the cap
+  `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` (default 11400, counted from this unit's
+  own request) expires.
 - `overdue` — every in-flight verify is past its own command timeout: restart
   at once.
 - `busy` / `refused` — not acknowledged yet, or the unit declined the request:
-  the legacy merge-idle gate with the 600 s force-fire. A unit still on
-  pre-5371 code never acknowledges, so it stays on this gate.
+  the legacy merge-idle gate with the 600 s force-fire. A fresh request is
+  usually still unacknowledged at the first poll, so a `deferring restart …
+  mid-merge` line followed one poll later by `awaiting` or `resuming` is
+  normal. A unit still on pre-5371 code never acknowledges, so it stays on
+  this gate.
 - `stale` / `absent` — the unchanged unknown-grace handling.
 
 The **first** sweep after this lands still runs against old-code units, so the
 first drained restart where the new behaviour applies is the second one.
+
+The halt only ever protected the unit being restarted: `classify` reads that
+unit's own `verifies_in_flight`, and a restart kills only that unit's
+verifies. No unit's restart waits on another unit's verify on a shared host
+(the laptop), before task 7297 or since. In a unit's journal, `Merge
+admission halted: fleet restart drain requested_ts=…` comes shortly before its
+own `Stopping` line, and its `fleet_drain` event's `waited_secs` covers only
+its own wait.
 
 **Where to read it:**
 
