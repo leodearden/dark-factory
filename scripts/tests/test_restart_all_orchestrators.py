@@ -2149,9 +2149,10 @@ def test_every_exit_after_acquisition_is_covered_by_the_release_trap():
 
 
 # ---------------------------------------------------------------------------
-# task 5371: the two-stage fleet drain. Stage A writes a drain request for every
-# unit up front; Stage B (drain_gate) awaits in-flight merge verifies rather
-# than burning the busy grace and killing them.
+# task 5371: the two-stage fleet drain, per unit since task 7297. When the sweep
+# reaches a unit it writes that unit's drain request (Stage A), then drain_gate
+# awaits its in-flight merge verifies (Stage B) rather than burning the busy
+# grace and killing them.
 # ---------------------------------------------------------------------------
 
 # The spec's own example epoch; `_install_fixed_epoch` makes the sweep stamp it.
@@ -2193,10 +2194,12 @@ def _drain_observations(state):
     ]
 
 
-def test_stage_a_writes_every_units_request_before_the_first_restart(tmp_path):
+def test_a_units_request_is_written_only_when_the_sweep_reaches_it(tmp_path):
     """The request is the contract orchestrator.fleet_drain reads: exactly the
     keys unit/invocation_id/sweep_pid/requested_ts, as str/str/int/int, at
-    <fleet_dir>/<unit>.drain.json -- for EVERY unit, before ANY restart.
+    <fleet_dir>/<unit>.drain.json -- written when the sweep reaches that unit,
+    so at each restart the sweep holds that unit's request and no other
+    (task 7297: a unit later in the order keeps admitting merges meanwhile).
 
     The units hold legacy (pre-5371) heartbeats, so the gate ignores the
     requests and only their presence is under test.
@@ -2225,10 +2228,6 @@ def test_stage_a_writes_every_units_request_before_the_first_restart(tmp_path):
     sweep_pid = next(
         o["lease"]["pid"] for o in state["lease_observations"] if o["lease"] is not None
     )
-    restarts = _drain_observations(state)
-    assert [unit for unit, _ in restarts] == [UNIT_R, UNIT_S], (
-        f"ordered_units puts SELF_UNIT last; got {restarts!r}"
-    )
 
     def expected(unit, invocation_id):
         return {
@@ -2238,24 +2237,163 @@ def test_stage_a_writes_every_units_request_before_the_first_restart(tmp_path):
             "requested_ts": _REQUESTED_TS,
         }
 
-    _, held_at_first_restart = restarts[0]
-    assert held_at_first_restart == {
-        f"{UNIT_R}.drain.json": expected(UNIT_R, _INVOCATION_R),
-        f"{UNIT_S}.drain.json": expected(UNIT_S, _INVOCATION_S),
-    }, f"Stage A must have written EVERY unit's request first; got {held_at_first_restart!r}"
-    for body in held_at_first_restart.values():
-        assert [type(body[k]) for k in ("unit", "invocation_id", "sweep_pid", "requested_ts")] == [
-            str, str, int, int,
-        ], body
-
-    _, held_at_second_restart = restarts[1]
-    assert held_at_second_restart == {
-        f"{UNIT_S}.drain.json": expected(UNIT_S, _INVOCATION_S),
-    }, (
-        f"a unit's request is removed right after its own restart, so only the "
-        f"last unit's remains; got {held_at_second_restart!r}"
+    assert _drain_observations(state) == [
+        (UNIT_R, {f"{UNIT_R}.drain.json": expected(UNIT_R, _INVOCATION_R)}),
+        (UNIT_S, {f"{UNIT_S}.drain.json": expected(UNIT_S, _INVOCATION_S)}),
+    ], (
+        "each unit's request must be written when the sweep reaches it and "
+        "removed right after its own restart"
     )
+    for _, held in _drain_observations(state):
+        for body in held.values():
+            assert [type(body[k]) for k in ("unit", "invocation_id", "sweep_pid", "requested_ts")] == [
+                str, str, int, int,
+            ], body
     assert not list(fleet_dir.glob("*.drain.json")), "the sweep must leave no request behind"
+
+
+UNIT_SELF = synthetic_unit("dark-factory")
+
+
+@contextlib.contextmanager
+def _drain_requests_seen_at_gate_poll(fleet_dir, trace_path, poll):
+    """Yield a list that receives the names of the drain requests on disk at
+    the moment the gate's ledger first records `poll`, a (verdict, unit) pair.
+
+    The ledger is appended after the poll read the heartbeat and before the
+    gate acts on it, so the snapshot is taken while the sweep is still in that
+    unit's gate -- see _rewrites_on_gate_polls for why the ledger, not a clock.
+    """
+    seen = []
+    stop = threading.Event()
+
+    def _watch():
+        while not stop.is_set():
+            if poll in read_drain_poll_trace(trace_path, complete_only=True):
+                seen.append(sorted(p.name for p in Path(fleet_dir).glob("*.drain.json")))
+                return
+            stop.wait(_REWRITE_WATCH_INTERVAL_SECS)
+
+    watcher = threading.Thread(target=_watch, daemon=True)
+    watcher.start()
+    try:
+        yield seen
+    finally:
+        stop.set()
+        watcher.join(timeout=5)
+
+
+def _three_unit_drain_sweep(tmp_path, heartbeats):
+    """Fake systemctl over [UNIT_R, UNIT_S, UNIT_SELF] with SELF_UNIT=UNIT_SELF,
+    the sweep order of the 2026-10-20 incident (reify, a later project,
+    dark-factory last). `heartbeats` maps each unit to `_write_heartbeat`
+    overrides. Returns (bin_dir, state_path, fleet_dir, trace_path, env)."""
+    fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
+    units = [UNIT_R, UNIT_S, UNIT_SELF]
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=units,
+        units={unit: {"scenario": "fresh"} for unit in units},
+    )
+    _install_fixed_epoch(bin_dir, _REQUESTED_TS)
+    for unit in units:
+        _write_heartbeat(fleet_dir, unit, **heartbeats[unit])
+    env = {
+        "SELF_UNIT": UNIT_SELF,
+        "RESTART_VERIFY_TIMEOUT": "5",
+        "ORCH_DRAIN_POLL_INTERVAL_SECS": str(_DRAIN_POLL_INTERVAL_SECS),
+        "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
+    }
+    return bin_dir, state_path, fleet_dir, trace_path, env
+
+
+def test_a_later_units_admission_is_not_halted_while_an_earlier_units_verify_is_awaited(
+    tmp_path,
+):
+    """Task 7297, the 2026-10-20 incident: the sweep waited 8009 s on reify's
+    verify while dark-factory, later in the order, sat with its merge admission
+    halted the whole time. Now a unit's request -- what halts its admission --
+    exists only from the moment the sweep reaches it until its restart."""
+    awaited_polls = 3
+    bin_dir, state_path, fleet_dir, trace_path, env = _three_unit_drain_sweep(
+        tmp_path,
+        {
+            UNIT_R: _hb_drain([_verifying_entry(deadline_in=3600)]),
+            UNIT_S: _hb_drain([]),
+            UNIT_SELF: _hb_drain([]),
+        },
+    )
+
+    with (
+        _drain_requests_seen_at_gate_poll(
+            fleet_dir, trace_path, ("verifying", UNIT_R),
+        ) as seen_while_awaiting,
+        _rewrites_on_gate_polls(
+            fleet_dir, UNIT_R, trace_path,
+            [_Rewrite(after="verifying", to=_hb_drain([]), polls=awaited_polls)],
+        ),
+    ):
+        result = _run_script(
+            bin_dir, state_path, fleet_dir, "--drain", env=env,
+            timeout=_DRAIN_SPAWN_TIMEOUT_SECS,
+        )
+
+    polls = read_drain_poll_trace(trace_path)
+    context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == 0, context
+    assert polls == (
+        [("verifying", UNIT_R)] * (len(polls) - 3)
+        + [("idle", UNIT_R), ("idle", UNIT_S), ("idle", UNIT_SELF)]
+    ) and len(polls) - 3 >= awaited_polls, (
+        f"the sweep must await {UNIT_R}'s verify, then find the later units "
+        f"drained at their first poll. {context}"
+    )
+    assert seen_while_awaiting == [[f"{UNIT_R}.drain.json"]], (
+        f"while the sweep awaits {UNIT_R}, only {UNIT_R}'s request may exist; "
+        f"got {seen_while_awaiting!r}. {context}"
+    )
+    held_at_each_restart = [
+        (unit, sorted(held)) for unit, held in _drain_observations(_load_state(state_path))
+    ]
+    assert held_at_each_restart == [
+        (unit, [f"{unit}.drain.json"]) for unit in (UNIT_R, UNIT_S, UNIT_SELF)
+    ], f"each unit must hold exactly its own request at its restart. {context}"
+    assert not list(fleet_dir.glob("*.drain.json")), (
+        f"the sweep must release every request it wrote. {context}"
+    )
+
+
+def test_each_units_verify_wait_cap_counts_from_its_own_request(tmp_path):
+    """Two units whose verifies never end: each is force-restarted by the cap,
+    and the second gets the cap's full wait from ITS request rather than
+    whatever is left of a sweep-wide clock the first unit already used up."""
+    cap_secs = 3
+    bin_dir, state_path, fleet_dir, trace_path, env = _three_unit_drain_sweep(
+        tmp_path,
+        {
+            UNIT_R: _hb_drain([_verifying_entry(deadline_in=3600)]),
+            UNIT_S: _hb_drain([_verifying_entry(deadline_in=3600)]),
+            UNIT_SELF: _hb_drain([]),
+        },
+    )
+    env["ORCH_DRAIN_VERIFY_MAX_WAIT_SECS"] = str(cap_secs)
+
+    result = _run_script(bin_dir, state_path, fleet_dir, "--drain", env=env, timeout=30)
+
+    polls = read_drain_poll_trace(trace_path)
+    context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == 0, context
+    for unit in (UNIT_R, UNIT_S):
+        assert (
+            f"force-restarting {unit}: drain verify-wait cap of {cap_secs}s exceeded"
+            in result.stdout
+        ), context
+        assert polls.count(("verifying", unit)) >= 2, (
+            f"{unit} must be polled again after its first verifying read: its "
+            f"cap starts at its own request. One poll means the clock was "
+            f"already spent when the sweep reached it. {context}"
+        )
+    assert polls[-1] == ("idle", UNIT_SELF), context
 
 
 def test_the_orchestrator_honours_the_request_this_script_writes(tmp_path):
@@ -2456,33 +2594,44 @@ def test_a_failed_restart_still_removes_that_units_request(tmp_path):
 
 def test_sigterm_mid_sweep_removes_its_own_requests_and_leaves_another_sweeps(tmp_path):
     """The EXIT trap removes every request carrying this sweep's pid, and none
-    carrying another's -- the same guard lease_release applies to the lease."""
+    carrying another's -- the same guard lease_release applies to the lease.
+
+    The foreign request names UNIT_S, a unit this sweep has not reached yet
+    when it is signalled: it never wrote a request of its own there (task
+    7297), so the other sweep's must survive untouched."""
     fleet_dir = tmp_path / "fleet"
     lease_path = tmp_path / "lease.json"
     bin_dir, state_path = _make_fake_systemctl(
-        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+        tmp_path, running_units=[UNIT_R, UNIT_S],
+        units={UNIT_R: {"scenario": "fresh"}, UNIT_S: {"scenario": "fresh"}},
     )
     _install_fixed_epoch(bin_dir, _REQUESTED_TS)
     # Parked on a verify that never ends, so there is a sweep to signal.
     _write_heartbeat(fleet_dir, UNIT_R, **_hb_drain([_verifying_entry(deadline_in=3600)]))
-    foreign = fleet_dir / f"{synthetic_unit('other')}.drain.json"
+    foreign = fleet_dir / f"{UNIT_S}.drain.json"
     foreign_body = {
-        "unit": synthetic_unit("other"), "invocation_id": _INVOCATION_S,
+        "unit": UNIT_S, "invocation_id": _INVOCATION_S,
         "sweep_pid": 1, "requested_ts": _REQUESTED_TS,
     }
     foreign.write_text(json.dumps(foreign_body))
     own = fleet_dir / f"{UNIT_R}.drain.json"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
 
     with _sweep_in_background(
         bin_dir, state_path, fleet_dir, lease_path, "--drain",
-        env={"RESTART_VERIFY_TIMEOUT": "5", "ORCH_DRAIN_POLL_INTERVAL_SECS": "1"},
+        env={
+            "SELF_UNIT": UNIT_S,
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
+        },
     ) as (proc, pgid):
         deadline = time.monotonic() + load_scaled_grace(
             10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
         )
-        while not own.exists():
-            assert proc.poll() is None, "the sweep exited before Stage A wrote its request"
-            assert time.monotonic() < deadline, f"no request appeared at {own}"
+        while ("verifying", UNIT_R) not in read_drain_poll_trace(trace_path, complete_only=True):
+            assert proc.poll() is None, f"the sweep exited before it awaited {UNIT_R}"
+            assert time.monotonic() < deadline, f"the sweep never polled {UNIT_R} verifying"
             time.sleep(0.05)
         os.killpg(pgid, signal.SIGTERM)
         stdout, stderr = proc.communicate(timeout=30)
