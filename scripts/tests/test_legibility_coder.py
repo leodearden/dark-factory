@@ -622,15 +622,16 @@ def test_code_digest_malformed_frontmatter_is_never_labelled_capped():
 # ---------------------------------------------------------------------------
 # task 4736: the EXIT-0 banner, and the guard that bounds where it is scanned
 #
-# The CLI does not always exit non-zero when it declines to answer -- it can
-# print the banner and exit 0, at which point the "reply" is prose that
-# parse_coder_output cannot turn into a verdict.  That is the second scan
-# site, and it is reached ONLY after the parse has already failed.
+# A banner that reaches code_digest as a reply is prose that parse_coder_output
+# cannot turn into a verdict.  A real usage cap never arrives that way (task
+# 6213: the runner's gate sees it as a failed result), so this scan only LABELS
+# a digest that is already failing.  It is reached ONLY after the parse has
+# already failed.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
 def test_code_digest_exit_zero_cap_banner_is_labelled_capped(message):
-    """A banner that arrives as a successful-looking reply is still a cap.
+    """A banner that arrives as a successful-looking reply is labelled a cap.
 
     Every corpus message is plain prose, so parse_coder_output cannot parse
     it -- the same premise the census side already pins in
@@ -725,28 +726,6 @@ def test_code_digest_a_verdict_QUOTING_cap_text_is_never_read_as_a_banner():
         "a parsed verdict must end up either coded or explicitly rejected, "
         "never quietly dropped"
     )
-
-
-@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
-def test_the_trickle_stage_offers_every_real_banner_to_the_pool(message):
-    """The runner puts a successful reply to the gate's strict cap detector
-    only when the stage cannot use it, so an exit-0 banner rotates the account
-    rather than leaving it AVAILABLE for the next digest (task 5637). That
-    route holds only while every real banner is unusable: a corpus entry that
-    parsed would turn this red rather than silently lose it."""
-    assert mod.TRICKLE_CODER_STAGE.is_usable_reply(message) is False
-
-
-def test_the_trickle_stage_never_offers_a_verdict_quoting_a_banner():
-    verdict = json.dumps({
-        "matches": [{
-            "cluster_id": "usage-limit-stall",
-            "evidence_quote": REAL_CLI_CAP_HIT_MESSAGES[0],
-        }],
-        "candidates": [],
-    })
-
-    assert mod.TRICKLE_CODER_STAGE.is_usable_reply(verdict) is True
 
 
 def test_code_digest_ordinary_garbage_stays_an_unlabelled_parse_failure():
