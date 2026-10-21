@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
+from _orch_helpers import wait_responsive
 
 from orchestrator import task_verify_dispatch
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
@@ -711,7 +712,7 @@ def _pending_tasks() -> set[asyncio.Task[Any]]:
 async def _cancel_mid_verify(h: _Harness, started: asyncio.Event) -> None:
     before = _pending_tasks()
     call = asyncio.create_task(h.call())
-    await asyncio.wait_for(started.wait(), timeout=30)
+    await wait_responsive(started.wait(), label='remote verify started')
 
     call.cancel()
     with pytest.raises(asyncio.CancelledError):
