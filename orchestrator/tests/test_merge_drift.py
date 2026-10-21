@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,12 @@ from _merge_lane_fakes import FakeVerifier, hangs_until
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_lane.drift import _run_drift_check
+from orchestrator.merge_lane.drift import (
+    DriftCheckState,
+    _load_drift_check_state,
+    _run_drift_check,
+    _save_drift_check_state,
+)
 from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator
@@ -1334,3 +1340,131 @@ class TestDriftCheckReleasesEachLeaseAtItsLegsEnd:
             await asyncio.wait_for(drift, _WAIT_SECS)
         assert (scene.slot('local'), scene.slot('laptop')) == ('free', 'free')
         assert scene.parity_events() == 1
+
+
+# ---------------------------------------------------------------------------
+# task 6648: a check that cannot get both host slots defers, visibly
+# ---------------------------------------------------------------------------
+
+
+def _deferrals(scene: _DriftScene) -> list[dict]:
+    return scene.event_store.data_for(EventType.drift_check_deferred)
+
+
+def _deferral_logs(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == level and 'deferred' in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+class TestDriftCheckDefersWhenAHostSlotIsBusy:
+    """A due check whose slots stay busy takes nothing, runs nothing, and stays owed."""
+
+    async def test_busy_remote_defers_without_running_either_leg(self, tmp_path: Path) -> None:
+        scene = _DriftScene.build(tmp_path)
+        assert scene.allocator.acquire_remote() is not None
+        verifier = FakeVerifier()
+        state_path = tmp_path / 'drift_check_state.json'
+
+        await scene.run(verifier, state_path=state_path, host_settle_secs=0)
+
+        scene.remote.run_merge_verify.assert_not_awaited()
+        assert verifier.entered_count == 0
+        (deferral,) = _deferrals(scene)
+        assert deferral['merge_sha'] == 'drift-sha'
+        assert deferral['consecutive_deferrals'] == 1
+        assert deferral['hosts'] == scene.allocator.host_states()
+        assert {h['name']: h['slot_state'] for h in deferral['hosts']}['laptop'] == 'busy'
+        assert _load_drift_check_state(state_path).consecutive_deferrals == 1
+        assert (scene.slot('local'), scene.slot('laptop')) == ('free', 'busy')
+        scene.git_ops.cleanup_merge_worktree.assert_awaited_once()
+
+    async def test_both_slots_busy_defers_and_leaves_both_holders_untouched(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _DriftScene.build(tmp_path)
+        assert scene.allocator.acquire_remote() is not None
+        assert scene.allocator.acquire_local(lambda: MagicMock()) is not None
+
+        await scene.run(
+            FakeVerifier(), state_path=tmp_path / 'drift_check_state.json', host_settle_secs=0,
+        )
+
+        assert len(_deferrals(scene)) == 1
+        assert (scene.slot('local'), scene.slot('laptop')) == ('busy', 'busy')
+
+    async def test_busy_local_rolls_back_the_remote_it_acquired(self, tmp_path: Path) -> None:
+        scene = _DriftScene.build(tmp_path)
+        assert scene.allocator.acquire_local(lambda: MagicMock()) is not None
+
+        await scene.run(
+            FakeVerifier(), state_path=tmp_path / 'drift_check_state.json', host_settle_secs=0,
+        )
+
+        assert len(_deferrals(scene)) == 1
+        assert (scene.slot('local'), scene.slot('laptop')) == ('busy', 'free')
+
+    async def test_slot_freed_within_the_settle_window_lets_the_check_run(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _DriftScene.build(tmp_path)
+        merge_lease = scene.allocator.acquire_remote()
+        assert merge_lease is not None
+        state_path = tmp_path / 'drift_check_state.json'
+
+        async def _merge_lands_shortly() -> None:
+            await asyncio.sleep(0.05)
+            await scene.allocator.release(merge_lease)
+
+        freer = asyncio.create_task(_merge_lands_shortly())
+        await asyncio.wait_for(
+            scene.run(
+                FakeVerifier(), state_path=state_path,
+                host_settle_secs=5, host_poll_secs=0.01,
+            ),
+            2 * _WAIT_SECS,
+        )
+        await freer
+
+        assert scene.parity_events() == 1
+        assert _deferrals(scene) == []
+        assert _load_drift_check_state(state_path).consecutive_deferrals == 0
+
+    async def test_consecutive_deferrals_log_info_once_and_emit_every_time(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        scene = _DriftScene.build(tmp_path)
+        assert scene.allocator.acquire_remote() is not None
+        state_path = tmp_path / 'drift_check_state.json'
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            for _ in range(2):
+                await scene.run(FakeVerifier(), state_path=state_path, host_settle_secs=0)
+
+        assert [d['consecutive_deferrals'] for d in _deferrals(scene)] == [1, 2]
+        assert len(_deferral_logs(caplog, logging.INFO)) == 1
+        assert len(_deferral_logs(caplog, logging.DEBUG)) == 1, (
+            'the repeat deferral must still be logged, at DEBUG -- without it the '
+            'INFO-once assertion above could pass on a capture that saw nothing'
+        )
+
+    async def test_a_check_that_runs_after_deferrals_clears_the_counter(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        scene = _DriftScene.build(tmp_path)
+        state_path = tmp_path / 'drift_check_state.json'
+        _save_drift_check_state(
+            state_path, DriftCheckState(land_count=5, consecutive_deferrals=2),
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
+            await scene.run(FakeVerifier(), state_path=state_path, host_settle_secs=0)
+
+        assert scene.parity_events() == 1
+        assert _load_drift_check_state(state_path) == DriftCheckState(land_count=5)
+        assert any(
+            'after 2 deferred' in message
+            for message in _deferral_logs(caplog, logging.INFO)
+        )
