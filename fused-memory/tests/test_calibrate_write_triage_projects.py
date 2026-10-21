@@ -31,7 +31,8 @@ from _jsonl_fixture import parse_jsonl_fixture
 from fused_memory.config.schema import FusedMemoryConfig, WriteTriageProjectCalibration
 from fused_memory.models.enums import MEM0_PRIMARY
 
-SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
+PACKAGE_ROOT = Path(__file__).parent.parent
+SCRIPT_PATH = PACKAGE_ROOT / 'scripts' / 'calibrate_write_triage.py'
 FIXTURES_DIR = Path(__file__).parent / 'fixtures'
 REIFY_FIXTURE_PATH = FIXTURES_DIR / 'write_triage_calibration.jsonl'
 DARK_FACTORY_FIXTURE_PATH = FIXTURES_DIR / 'write_triage_calibration_dark_factory.jsonl'
@@ -47,6 +48,14 @@ class LiveStoreFixture:
     project_id: str
     path: Path
     admitted_categories: frozenset[str]
+
+    @property
+    def report_path(self) -> Path:
+        return PACKAGE_ROOT / 'calibration' / f'write_triage_calibration_report_{self.project_id}.json'
+
+    @property
+    def package_relative_path(self) -> str:
+        return self.path.relative_to(PACKAGE_ROOT).as_posix()
 
 
 LIVE_STORE_FIXTURES = (
@@ -503,16 +512,14 @@ class TestWriteProjectConfigHelper:
 # The committed artifacts: config <-> report <-> fixture, no network
 # ---------------------------------------------------------------------------
 
-PACKAGE_ROOT = Path(__file__).parent.parent
 CONFIG_PATH = PACKAGE_ROOT / 'config' / 'config.yaml'
-DF_REPORT_PATH = PACKAGE_ROOT / 'calibration' / 'write_triage_calibration_report_dark_factory.json'
-DF_FIXTURE_REL = 'tests/fixtures/write_triage_calibration_dark_factory.jsonl'
 
 
 @functools.cache
-def _df_report() -> dict:
-    assert DF_REPORT_PATH.exists(), f'report missing: {DF_REPORT_PATH}'
-    return json.loads(DF_REPORT_PATH.read_text())
+def _committed_report(project_id: str) -> dict:
+    path = next(f.report_path for f in LIVE_STORE_FIXTURES if f.project_id == project_id)
+    assert path.exists(), f'report missing: {path}'
+    return json.loads(path.read_text())
 
 
 @functools.cache
@@ -536,61 +543,83 @@ def _max_negative(entry: dict) -> float:
     return max(measured)
 
 
-class TestCommittedDarkFactoryCalibration:
-    def test_the_report_pair_is_committed(self) -> None:
-        assert DF_REPORT_PATH.exists()
-        assert DF_REPORT_PATH.with_suffix('.md').exists()
+def _category_outcome_defect(entry: dict) -> str | None:
+    """Why *entry* is neither a separating cutoff nor a measured refusal, else None."""
+    if entry['t_high'] is not None:
+        if not 0.0 <= entry['t_high'] <= 1.0:
+            return f't_high {entry["t_high"]} is not a cosine'
+        if entry['t_high'] <= _max_negative(entry):
+            return 'a derived cutoff must admit no in-category negative'
+        return None
+    if entry['t_low'] is not None:
+        return 'a refused category must leave t_low None too'
+    code, _, detail = str(entry['reason']).partition(':')
+    refusals = {
+        _mod().REASON_EMPTY_CLASS, _mod().REASON_NOT_SEPARABLE, _mod().REASON_INSUFFICIENT_PAIRS,
+    }
+    if code not in refusals:
+        return f'unknown refusal {entry["reason"]!r}'
+    if not detail.strip():
+        return 'a refusal must state what was measured'
+    return None
 
-    def test_provenance_names_the_dark_factory_corpus(self) -> None:
-        provenance = _df_report()['provenance']
-        assert provenance['project_id'] == 'dark_factory'
-        assert provenance['fixture_path'] == DF_FIXTURE_REL
+
+def _pair_counts_by_category(records: list[dict]) -> dict[str, dict[str, int]]:
+    buckets = _mod().partition_pairs_by_category(records)['by_category']
+    return {
+        category: {cls.removesuffix('_pairs'): len(pairs) for cls, pairs in bucket.items()}
+        for category, bucket in buckets.items()
+    }
+
+
+class TestCommittedLiveStoreCalibration:
+    def test_the_report_pair_is_committed(self, live_store: LiveStoreFixture) -> None:
+        assert live_store.report_path.exists()
+        assert live_store.report_path.with_suffix('.md').exists()
+
+    def test_provenance_names_the_projects_own_corpus(self, live_store: LiveStoreFixture) -> None:
+        provenance = _committed_report(live_store.project_id)['provenance']
+        assert provenance['project_id'] == live_store.project_id
+        assert provenance['fixture_path'] == live_store.package_relative_path
         assert provenance['retrieval_mode'] == 'production'
 
     def test_the_record_count_is_the_committed_fixtures(
-        self, dark_factory_records: list[dict],
+        self, live_store: LiveStoreFixture, live_records: list[dict],
     ) -> None:
-        assert _df_report()['provenance']['record_count'] == len(dark_factory_records)
+        report = _committed_report(live_store.project_id)
+        assert report['provenance']['record_count'] == len(live_records)
 
     def test_the_pair_counts_are_recomputed_from_the_committed_fixture(
-        self, dark_factory_records: list[dict],
+        self, live_store: LiveStoreFixture, live_records: list[dict],
     ) -> None:
         """A fixture edit without a re-run fails here."""
-        buckets = _mod().partition_pairs_by_category(dark_factory_records)['by_category']
-        recomputed = {
-            category: {cls.removesuffix('_pairs'): len(pairs) for cls, pairs in bucket.items()}
-            for category, bucket in buckets.items()
-        }
-        assert _df_report()['provenance']['per_category_pair_counts'] == recomputed
+        report = _committed_report(live_store.project_id)
+        assert report['provenance']['per_category_pair_counts'] == _pair_counts_by_category(
+            live_records,
+        )
 
-    def test_both_target_categories_have_an_outcome(self) -> None:
-        assert set(_df_report()['per_category']) >= TARGET_CATEGORIES
-
-    @pytest.mark.parametrize('category', sorted(TARGET_CATEGORIES))
-    def test_a_category_derives_a_separating_cutoff_or_states_a_measured_refusal(
-        self, category: str,
+    def test_every_admitted_category_that_forms_pairs_has_a_measured_outcome(
+        self, live_store: LiveStoreFixture, live_records: list[dict],
     ) -> None:
-        entry = _df_report()['per_category'][category]
-        if entry['t_high'] is not None:
-            assert 0.0 <= entry['t_high'] <= 1.0
-            assert entry['t_high'] > _max_negative(entry), (
-                'a derived cutoff admits no in-category negative'
-            )
-            return
-        assert entry['t_low'] is None
-        code, _, detail = str(entry['reason']).partition(':')
-        assert code in {
-            _mod().REASON_EMPTY_CLASS, _mod().REASON_NOT_SEPARABLE,
-            _mod().REASON_INSUFFICIENT_PAIRS,
-        }, entry['reason']
-        assert detail.strip(), 'a refusal must state what was measured'
+        per_category = _committed_report(live_store.project_id)['per_category']
+        forming = {
+            category for category, counts in _pair_counts_by_category(live_records).items()
+            if category in live_store.admitted_categories and any(counts.values())
+        }
+        assert forming, 'a fixture that forms no pair calibrates nothing'
+        missing = sorted(forming - set(per_category))
+        assert not missing, f'categories with pairs but no outcome: {missing}'
+        defects = {c: _category_outcome_defect(per_category[c]) for c in sorted(forming)}
+        assert not any(defects.values()), defects
 
-    def test_the_corpus_is_isolated_from_the_pooled_report_of_record(self) -> None:
+    def test_the_corpus_is_isolated_from_the_pooled_report_of_record(
+        self, live_store: LiveStoreFixture,
+    ) -> None:
         pooled_named = _shipped_config()['write_triage']['calibration_report_path']
-        assert (PACKAGE_ROOT / pooled_named).resolve() != DF_REPORT_PATH.resolve()
+        assert (PACKAGE_ROOT / pooled_named).resolve() != live_store.report_path.resolve()
         pooled = _pooled_report()['provenance']
         assert pooled['project_id'] == 'reify'
-        assert pooled['fixture_path'] != _df_report()['provenance']['fixture_path']
+        assert pooled['fixture_path'] != live_store.package_relative_path
 
 
 class TestCommittedProjectCalibrationsAreTraceable:
@@ -617,16 +646,18 @@ class TestCommittedProjectCalibrationsAreTraceable:
     def test_no_entry_shadows_the_pooled_corpus_of_record(self) -> None:
         assert _pooled_report()['provenance']['project_id'] not in _project_entries()
 
-    def test_the_dark_factory_entry_exists_exactly_when_a_cutoff_was_derived(self) -> None:
-        derived = _mod().derived_category_cutoffs(_df_report())
-        assert ('dark_factory' in _project_entries()) == bool(derived)
+    def test_a_project_entry_exists_exactly_when_a_cutoff_was_derived(
+        self, live_store: LiveStoreFixture,
+    ) -> None:
+        derived = _mod().derived_category_cutoffs(_committed_report(live_store.project_id))
+        assert (live_store.project_id in _project_entries()) == bool(derived)
 
-    def test_rewriting_the_shipped_entry_is_a_byte_for_byte_no_op(self) -> None:
-        entry = _project_entries().get('dark_factory')
-        if entry is None:
-            pytest.skip('no dark_factory entry: both categories refused')
+    def test_rewriting_every_shipped_entry_is_a_byte_for_byte_no_op(self) -> None:
         shipped = CONFIG_PATH.read_text()
-        assert _mod().write_project_calibration_block(
-            shipped, 'dark_factory', entry['calibration_report_path'],
-            entry['t_high_by_category'],
-        ) == shipped
+        changed = [
+            project for project, entry in _project_entries().items()
+            if _mod().write_project_calibration_block(
+                shipped, project, entry['calibration_report_path'], entry['t_high_by_category'],
+            ) != shipped
+        ]
+        assert not changed, f'a rewrite of these shipped entries changes config.yaml: {changed}'

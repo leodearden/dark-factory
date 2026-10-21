@@ -455,7 +455,7 @@ Recorded rather than silently resolved:
 This file is a **point-in-time snapshot** of a live, still-accreting store.
 Re-extracting it is a new fixture revision, not a refresh. It changes the
 pair counts that
-`test_calibrate_write_triage_projects.py::TestCommittedDarkFactoryCalibration`
+`test_calibrate_write_triage_projects.py::TestCommittedLiveStoreCalibration`
 recomputes from this file, so it forces a re-run of the dark_factory
 calibration and a re-commit of its report and config entry.
 
