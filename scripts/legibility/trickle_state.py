@@ -29,7 +29,8 @@ wrapper, no project venv, bare ``#!/usr/bin/env python3``. Meanwhile
 ``nightly.py`` and ``legibility.config`` both pull in PyYAML. A stray
 third-party import HERE would break the predicate at DISPATCH time, not
 at test time — i.e. it would fail in exactly the silent way this module
-exists to prevent. Same reason ``DEFAULT_MAX_BARREN_RUNS`` is a module
+exists to prevent. ``state_docs`` and the ``shared.safe_io`` it imports
+are under the same constraint. Same reason ``DEFAULT_MAX_BARREN_RUNS`` is a module
 constant rather than a ``legibility.yaml`` field: reading that config
 would drag pydantic + PyYAML onto the predicate path.
 
@@ -50,8 +51,18 @@ import pwd
 import tempfile
 from collections.abc import Iterable, Mapping
 from datetime import UTC, date, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import NamedTuple
+
+# Import state_docs by the same spelling this module was imported by, so a
+# caller matching on Missing / Malformed / Ok sees the classes this module
+# returns: one source file loaded as two modules has two copies of each.
+if __package__:
+    from . import state_docs
+else:
+    import state_docs
 
 logger = logging.getLogger(__name__)
 
@@ -59,20 +70,16 @@ STATE_FILENAME = 'trickle-state.json'
 """Basename of the per-project run-state file."""
 
 STATE_SCHEMA_VERSION = 1
-"""Version of the recorded document's shape. :func:`load_state` treats any
-OTHER value as ``malformed`` rather than guessing at unknown fields — a
-reader that silently accepts a shape it does not understand is exactly the
-silent-degradation mode this module exists to close.
+"""Version of the recorded document's shape. :func:`load_state` reads any
+OTHER value as malformed rather than guessing at unknown fields.
 
-DELIBERATELY NOT BUMPED for ``consecutive_failed_runs`` (task 4514). That
-field is ADDITIVE and every reader fetches it via ``.get()`` with a 0
-fallback, so no reader can MIS-READ a document that lacks it. Bumping
-would make every live state file on every project read ``malformed`` on
-the first post-deploy probe — one guaranteed false alarm per project,
-plus a reset streak — which is precisely the degradation this module
-exists to close. ``capped`` and ``retry_backlog`` (task 5678), and
-``last_scheduled_target_date`` (task 6548), are further additive fields
-under the same rule.
+Fields added after the first writer are ADDITIVE and do not bump it:
+``consecutive_failed_runs``, ``capped``, ``retry_backlog``,
+``last_scheduled_target_date``, ``census_fired``, ``census_fire_streak``
+and ``barren_escalated``. :meth:`TrickleState.from_json` reads an absent one
+as its default, and an absent ``barren_escalated`` as ``None``
+(unrecorded). Bumping for such a field would make every live state file
+read malformed on the first post-deploy probe.
 
 THE RULE FOR THE NEXT PERSON: bump only for a change that would make an
 OLD reader MIS-READ a NEW document. Adding a field an old reader ignores
@@ -80,124 +87,94 @@ is not that; changing the meaning or type of an existing field is."""
 
 
 # ---------------------------------------------------------------------------
-# Outcome vocabulary
+# Outcome vocabulary and the classifier
 # ---------------------------------------------------------------------------
 
-OUTCOME_PRODUCTIVE = 'productive'
-"""Digests were built: ``selected > 0``."""
+class RunOutcome(StrEnum):
+    """What one recorded night was, as :func:`classify_run` derives it."""
 
-OUTCOME_QUIET = 'quiet'
-"""Nothing was digested and nothing reached the sampling/budget stage — a
-legitimately quiet or dormant night. NEVER an alarm."""
+    PRODUCTIVE = 'productive'
+    """Digests were built: ``selected_count > 0``."""
 
-OUTCOME_BARREN = 'barren'
-"""Nothing was digested even though real, distinct, non-duplicate signal
-DID reach the sampling/budget stage. This is the absence mode that looks
-identical to a quiet night from outside the pipeline."""
+    QUIET = 'quiet'
+    """Nothing reached the sampling or budget stage: a legitimately quiet or
+    dormant night. Never an alarm."""
 
-OUTCOME_FAILED = 'failed'
-"""The run did not COMPLETE (``exit_code != 0``), whatever the sampler
-counters say.
+    BARREN = 'barren'
+    """Real, distinct, non-duplicate signal reached the sampling or budget
+    stage and nothing was digested: the absence that looks quiet from
+    outside the pipeline."""
 
-Signal may well have flowed IN — the 2026-08-18 reify run selected six
-digests — but the pipeline broke downstream, so those counters describe a
-night whose work was never finished. The counters are still recorded, so
-the "was signal flowing" question stays answerable.
+    FAILED = 'failed'
+    """The run did not complete (``exit_code != 0``). Its counters are still
+    recorded, so whether signal flowed in stays answerable."""
 
-THE VOCABULARY HOLE THIS CLOSES. Without a fourth outcome, a permanently
-broken coder samples > 0, storms, exits 1, and records ``productive`` /
-streak 0 / a fresh ``last_productive_at`` EVERY NIGHT FOREVER, while
-``check_trickle_progress.py`` prints "OK: last run was productive 0h ago"
-indefinitely. That is the 2026-07-16..29 silent-degradation shape (task
-3270) entering through a different door."""
+    DEFERRED = 'deferred'
+    """The usage cap deferred the night's coding (``coder.is_cap_deferral``),
+    so it observed neither whether signal flows nor whether the pipeline
+    finishes."""
 
 
-# ---------------------------------------------------------------------------
-# classify_run — the three-valued absence classifier
-# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class RunCounters:
+    """One night's :class:`sampling.SampleResult` counters, each a
+    non-negative int."""
+
+    total_records: int
+    zero_signal_dropped: int
+    dedupe_collapsed: int
+    below_sampling_cut: int
+    budget_skipped: int
+    selected_count: int
+
+    def __post_init__(self) -> None:
+        for field in dataclasses.fields(self):
+            state_docs.as_count(field.name, getattr(self, field.name))
+
+    @classmethod
+    def from_json(cls, raw: object) -> RunCounters:
+        doc = state_docs.json_object(raw, 'counters')
+        return cls(**{
+            field.name: state_docs.required(doc, field.name, state_docs.as_count)
+            for field in dataclasses.fields(cls)
+        })
+
+    def to_json(self) -> dict[str, int]:
+        return dataclasses.asdict(self)
+
 
 def classify_run(
-    *,
-    exit_code: int,
-    total_records: int,
-    zero_signal_dropped: int,
-    dedupe_collapsed: int,
-    below_sampling_cut: int,
-    budget_skipped: int,
-    selected_count: int,
-) -> str:
-    """Classify one nightly trickle run as failed / productive / barren /
-    quiet.
+    *, exit_code: int, counters: RunCounters, capped: bool
+) -> RunOutcome:
+    """Classify one night; the first matching branch wins.
 
-    DERIVED FROM, not tuned against, :class:`sampling.SampleResult`'s
-    conservation identity::
+    1. ``exit_code != 0``                         -> FAILED, whatever else is
+       true: selected digests prove signal arrived, not that the night
+       finished.
+    2. ``capped``                                 -> DEFERRED.
+    3. ``selected_count > 0``                     -> PRODUCTIVE, including a
+       night that also skipped records on budget (the budget working).
+    4. ``budget_skipped + below_sampling_cut > 0`` -> BARREN: only real,
+       distinct, non-duplicate signal leaves by either door.
+    5. otherwise                                  -> QUIET.
 
-        total_records == zero_signal_dropped + dedupe_collapsed
-                         + below_sampling_cut + budget_skipped
-                         + len(selected)
+    Branch 5 never hides a barren night. By SampleResult's conservation
+    identity ``total_records == zero_signal_dropped + dedupe_collapsed +
+    below_sampling_cut + budget_skipped + selected_count``, reaching it means
+    every record left by the zero-signal or dedupe door, or none was
+    enumerated: the genuinely quiet night PRD decision 7 protects.
 
-    Four branches:
-
-    1. ``exit_code != 0``                                    -> failed.
-       The run did not finish. See below for why this is read FIRST.
-    2. ``selected_count > 0``                                -> productive.
-       Digests were built. This deliberately INCLUDES a night that also
-       skipped records on budget: a partially-truncated night is the byte
-       budget working as designed, never an absence.
-    3. ``(budget_skipped + below_sampling_cut) > 0``          -> barren.
-       Both are doors that only records with real, distinct,
-       non-duplicate signal can leave by, so reaching this branch proves
-       genuine signal existed and NOTHING was digested. The two doors are
-       kept separate in the recorded counters because they have DIFFERENT
-       remedies (``budgets.max_daily_digest_bytes`` vs
-       ``sampling.top_fraction``/``per_stratum_min`` — SampleResult's own
-       docstring is explicit that conflating them is wrong), but for the
-       PRESENCE question they are one signal: real signal in, nothing out.
-    4. otherwise                                             -> quiet.
-
-    WHY ``failed`` TAKES PRIORITY. ``selected_count > 0`` proves signal
-    reached the digest stage; it does NOT prove the night FINISHED. When
-    both are true the operator needs to know the run BROKE — the counters
-    still answer "was signal flowing", and they are recorded either way,
-    so nothing is hidden by reading the exit code first.
-
-    ``exit_code`` IS A REQUIRED KEYWORD-ONLY PARAMETER WITH NO DEFAULT,
-    deliberately. A defaulted ``0`` is exactly how a future caller would
-    silently reintroduce the hole this branch closes, so the parameter is
-    impossible to forget.
-
-    ``exit_code`` is READ here and NEVER WRITTEN. Writing
-    ``result.exit_code`` from an observability path is the
-    permanent-false-alarm inversion ``scripts/legibility/nightly.py::
-    _escalate_barren_streak`` refuses in writing.
-
-    WHY BRANCH 4 IS PROVABLY SAFE — the no-false-alarm guarantee, and it
-    is UNWEAKENED BY CONSTRUCTION by the new first branch, which is gated
-    purely on ``exit_code != 0``: a night that exited 0 reaches the
-    remaining three branches untouched. Reaching the ``else`` means
-    ``selected_count == 0`` and both cut counters are 0, so by the
-    identity ``total_records == zero_signal_dropped + dedupe_collapsed``:
-    every enumerated record left by the zero-signal or dedupe door, or
-    nothing was enumerated at all. That is EXACTLY the "genuinely quiet
-    night" PRD decision 7 protects, so a quiet or dormant project can
-    never be classified barren. This is a proof from the invariant, not a
-    threshold someone picked — which is what lets a progress probe exist
-    without re-opening decision 7's false-alarm objection.
-
-    ``total_records`` and ``zero_signal_dropped`` are accepted (and
-    RECORDED by :func:`record_run`) but deliberately NOT consulted by the
-    branch logic — they are what an operator reads to understand the shape
-    of a night, and the identity above is what makes the classification
-    auditable after the fact. Do not "simplify" them out of the signature
-    or out of the recorded state.
-    """
+    Every parameter is a required keyword, so a caller cannot silently
+    default ``exit_code`` to 0 or ``capped`` to False."""
     if exit_code != 0:
-        return OUTCOME_FAILED
-    if selected_count > 0:
-        return OUTCOME_PRODUCTIVE
-    if (budget_skipped + below_sampling_cut) > 0:
-        return OUTCOME_BARREN
-    return OUTCOME_QUIET
+        return RunOutcome.FAILED
+    if capped:
+        return RunOutcome.DEFERRED
+    if counters.selected_count > 0:
+        return RunOutcome.PRODUCTIVE
+    if (counters.budget_skipped + counters.below_sampling_cut) > 0:
+        return RunOutcome.BARREN
+    return RunOutcome.QUIET
 
 
 # ---------------------------------------------------------------------------
@@ -327,102 +304,6 @@ def trickle_state_path(project_id: str) -> Path:
     entry.
     """
     return project_state_dir(project_id) / STATE_FILENAME
-
-
-# ---------------------------------------------------------------------------
-# load_state — three-valued reader (mirrors census_trigger.load_census_state)
-# ---------------------------------------------------------------------------
-
-def load_state(path: str | Path) -> tuple[str, dict | None]:
-    """Read a trickle run-state file. Three-valued, never raises.
-
-    - path does not exist -> ``("missing", None)``, NO warning logged. A
-      project that has never recorded a run is a normal, expected state,
-      not a degradation.
-    - unreadable / invalid JSON / non-dict top level / unknown
-      ``schema_version`` -> ``("malformed", None)`` + exactly ONE WARNING.
-      An unknown schema version is malformed rather than best-effort
-      parsed: a reader that silently accepts a shape it does not
-      understand reintroduces exactly the silent degradation this module
-      exists to close.
-    - otherwise -> ``("ok", data)``.
-
-    Shape AND vocabulary mirror the sibling reader in this same package,
-    :func:`census_trigger.load_census_state` (census_trigger.py:239),
-    VERBATIM — same tuple shape, same literal status strings
-    (``'malformed'``, never ``'invalid'``), same fail-safe posture — so
-    the two state readers in ``scripts/legibility/`` cannot drift into two
-    vocabularies for one concept.
-    """
-    path = Path(path)
-    if not path.exists():
-        return 'missing', None
-
-    try:
-        with open(path, encoding='utf-8') as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning('trickle state at %s is malformed: %s', path, exc)
-        return 'malformed', None
-
-    if not isinstance(data, dict):
-        logger.warning(
-            'trickle state at %s is malformed: expected a JSON object, got %s',
-            path,
-            type(data).__name__,
-        )
-        return 'malformed', None
-
-    schema_version = data.get('schema_version')
-    if schema_version != STATE_SCHEMA_VERSION:
-        logger.warning(
-            'trickle state at %s is malformed: unknown schema_version %r '
-            '(this module writes %d)',
-            path,
-            schema_version,
-            STATE_SCHEMA_VERSION,
-        )
-        return 'malformed', None
-
-    return 'ok', data
-
-
-# ---------------------------------------------------------------------------
-# recorded_age_hours — the freshness reading BOTH probes share
-# ---------------------------------------------------------------------------
-
-def recorded_age_hours(doc) -> float | None:
-    """Hours elapsed since *doc*'s ``recorded_at``, or ``None``.
-
-    ``None`` means FRESHNESS CANNOT BE ASSESSED — deliberately not "old"
-    and deliberately not "fresh". Each caller decides what that means,
-    which is precisely what lets the two callers below disagree about it
-    without either re-deriving the arithmetic:
-
-    - ``check_trickle_progress.py`` reports its own distinct
-      unparseable-``recorded_at`` verdict, separate from its stale one,
-      because that file's contract is that every failure verdict names its
-      OWN remedy;
-    - ``check_trickle_health.py::_should_escalate`` treats it as
-      post-worthy, matching the posture it already takes toward
-      ``missing``/``malformed`` — a record whose freshness cannot be
-      established must never be trusted to prove someone else already
-      alarmed.
-
-    A NAIVE ``recorded_at`` is read as UTC, which is what the progress
-    probe's staleness branch did before this helper existed.
-
-    Stdlib-only, like the rest of this module: it is on the
-    bare-``python3`` predicate path (see the module docstring)."""
-    if not isinstance(doc, dict):
-        return None
-    try:
-        stamp = datetime.fromisoformat(str(doc.get('recorded_at')))
-    except (TypeError, ValueError):
-        return None
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=UTC)
-    return (datetime.now(UTC) - stamp).total_seconds() / 3600.0
 
 
 # ---------------------------------------------------------------------------
@@ -583,15 +464,6 @@ def select_due_retries(
     return tuple(due[:limit])
 
 
-def due_retries(doc, *, today: date) -> tuple[date, ...]:
-    """The owed dates a recorded document makes due now, per :func:`select_due_retries`."""
-    if not isinstance(doc, dict):
-        return ()
-    return select_due_retries(
-        parse_retry_backlog(doc.get('retry_backlog')), today=today
-    )
-
-
 def _serialize_retry_backlog(backlog: Mapping[date, int]) -> dict[str, int]:
     return {owed.isoformat(): backlog[owed] for owed in sorted(backlog)}
 
@@ -627,13 +499,10 @@ class CensusFireStreak:
     since: str
 
 
-def read_census_fire_streak(doc) -> CensusFireStreak | None:
-    """The ONE parser of a recorded ``census_fire_streak`` object, shared by
-    :func:`record_run`'s fold and ``check_census_progress.py``.
-
-    ``None`` for an absent, null or unusable streak. ``fires`` must be a
-    real int (not a bool) of at least 1."""
-    raw = doc.get('census_fire_streak') if isinstance(doc, dict) else None
+def _parse_census_fire_streak(raw: object) -> CensusFireStreak | None:
+    """The recorded ``census_fire_streak`` object, or ``None`` when absent,
+    null or unusable: a damaged streak under-reports rather than making the
+    whole document malformed. ``fires`` must be a real int of at least 1."""
     if not isinstance(raw, dict):
         return None
     fires = raw.get('fires')
@@ -693,6 +562,139 @@ def _fold_census_fire_streak(
         census_state_path=census.census_state_path,
         since=target_date.isoformat(),
     )
+
+
+# ---------------------------------------------------------------------------
+# The recorded document
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class TrickleState:
+    """One recorded night, as ``trickle-state.json`` holds it.
+
+    :meth:`from_json` and :meth:`to_json` are the document's only codec.
+    ``barren_escalated`` is ``None`` for a document written before the
+    field existed: UNRECORDED, which a reader must not take for False."""
+
+    project_id: str
+    target_date: date
+    recorded_at: datetime
+    exit_code: int
+    outcome: RunOutcome
+    applied: int
+    commit_made: bool
+    budget_suppressed: bool
+    capped: bool
+    consecutive_barren_runs: int
+    consecutive_failed_runs: int
+    last_productive_at: datetime | None
+    last_scheduled_target_date: date | None
+    census_fired: bool | None
+    census_fire_streak: CensusFireStreak | None
+    counters: RunCounters
+    retry_backlog: Mapping[date, int]
+    barren_escalated: bool | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'retry_backlog', MappingProxyType(dict(self.retry_backlog))
+        )
+
+    @classmethod
+    def from_json(cls, raw: object) -> TrickleState:
+        """Strict about every field present; an absent additive field takes
+        its default (see :data:`STATE_SCHEMA_VERSION`). The census streak
+        and the retry backlog keep their under-reporting parses."""
+        doc = state_docs.json_object(raw, 'trickle state')
+        version = state_docs.required(doc, 'schema_version', state_docs.as_int)
+        if version != STATE_SCHEMA_VERSION:
+            raise ValueError(
+                f'schema_version: unknown version {version!r} (this module '
+                f'writes {STATE_SCHEMA_VERSION})'
+            )
+        required, defaulted = state_docs.required, state_docs.defaulted
+        return cls(
+            project_id=required(doc, 'project_id', state_docs.as_str),
+            target_date=required(doc, 'target_date', state_docs.as_date),
+            recorded_at=required(doc, 'recorded_at', state_docs.as_datetime),
+            exit_code=required(doc, 'exit_code', state_docs.as_int),
+            outcome=required(doc, 'outcome', state_docs.as_member(RunOutcome)),
+            applied=required(doc, 'applied', state_docs.as_count),
+            commit_made=required(doc, 'commit_made', state_docs.as_bool),
+            budget_suppressed=required(doc, 'budget_suppressed', state_docs.as_bool),
+            capped=defaulted(doc, 'capped', state_docs.as_bool, False),
+            consecutive_barren_runs=required(
+                doc, 'consecutive_barren_runs', state_docs.as_count
+            ),
+            consecutive_failed_runs=defaulted(
+                doc, 'consecutive_failed_runs', state_docs.as_count, 0
+            ),
+            last_productive_at=defaulted(
+                doc, 'last_productive_at', state_docs.as_datetime, None
+            ),
+            last_scheduled_target_date=defaulted(
+                doc, 'last_scheduled_target_date', state_docs.as_date, None
+            ),
+            census_fired=defaulted(doc, 'census_fired', state_docs.as_bool, None),
+            census_fire_streak=_parse_census_fire_streak(
+                doc.get('census_fire_streak')
+            ),
+            counters=RunCounters.from_json(doc.get('counters')),
+            retry_backlog=parse_retry_backlog(doc.get('retry_backlog')),
+            barren_escalated=defaulted(
+                doc, 'barren_escalated', state_docs.as_bool, None
+            ),
+        )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            'schema_version': STATE_SCHEMA_VERSION,
+            'project_id': self.project_id,
+            'target_date': self.target_date.isoformat(),
+            'recorded_at': self.recorded_at.isoformat(),
+            'exit_code': self.exit_code,
+            'outcome': self.outcome.value,
+            'applied': self.applied,
+            'commit_made': self.commit_made,
+            'budget_suppressed': self.budget_suppressed,
+            'capped': self.capped,
+            'consecutive_barren_runs': self.consecutive_barren_runs,
+            'consecutive_failed_runs': self.consecutive_failed_runs,
+            'last_productive_at': _isoformat_or_none(self.last_productive_at),
+            'last_scheduled_target_date': _isoformat_or_none(
+                self.last_scheduled_target_date
+            ),
+            'census_fired': self.census_fired,
+            'census_fire_streak': (
+                None if self.census_fire_streak is None
+                else dataclasses.asdict(self.census_fire_streak)
+            ),
+            'counters': self.counters.to_json(),
+            'retry_backlog': _serialize_retry_backlog(self.retry_backlog),
+            'barren_escalated': self.barren_escalated,
+        }
+
+
+def _isoformat_or_none(value: date | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def load_state(path: str | Path) -> state_docs.StateRead[TrickleState]:
+    """Read a trickle run-state file: Missing, Malformed (with the reason,
+    one WARNING) or Ok. Never raises."""
+    return state_docs.read_state(Path(path), TrickleState.from_json)
+
+
+def recorded_age_hours(state: TrickleState, now: datetime | None = None) -> float:
+    """Hours since *state* was recorded, against *now* (the wall clock by
+    default): the one freshness reading both probes share."""
+    current = datetime.now(UTC) if now is None else now
+    return (current - state.recorded_at).total_seconds() / 3600.0
+
+
+def due_retries(state: TrickleState, *, today: date) -> tuple[date, ...]:
+    """The owed dates *state* makes due now, per :func:`select_due_retries`."""
+    return select_due_retries(state.retry_backlog, today=today)
 
 
 # ---------------------------------------------------------------------------
@@ -793,7 +795,9 @@ def record_run(
     """
     path = trickle_state_path(project_id)
 
-    prev_status, prev = load_state(path)
+    read = load_state(path)
+    prev_status = 'ok' if isinstance(read, state_docs.Ok) else 'missing'
+    prev = read.value.to_json() if isinstance(read, state_docs.Ok) else None
     prev_streak = 0
     prev_failed = 0
     last_productive_at = None
@@ -810,16 +814,19 @@ def record_run(
 
     outcome = classify_run(
         exit_code=exit_code,
-        total_records=total_records,
-        zero_signal_dropped=zero_signal_dropped,
-        dedupe_collapsed=dedupe_collapsed,
-        below_sampling_cut=below_sampling_cut,
-        budget_skipped=budget_skipped,
-        selected_count=selected_count,
+        counters=RunCounters(
+            total_records=total_records,
+            zero_signal_dropped=zero_signal_dropped,
+            dedupe_collapsed=dedupe_collapsed,
+            below_sampling_cut=below_sampling_cut,
+            budget_skipped=budget_skipped,
+            selected_count=selected_count,
+        ),
+        capped=capped,
     )
 
     recorded_at_iso = recorded_at.isoformat()
-    if outcome == OUTCOME_PRODUCTIVE and finished(exit_code=exit_code, capped=capped):
+    if outcome == RunOutcome.PRODUCTIVE and finished(exit_code=exit_code, capped=capped):
         last_productive_at = recorded_at_iso
 
     cursor, never_run = _schedule_cursor(
@@ -831,7 +838,11 @@ def record_run(
     )
 
     census_streak = _fold_census_fire_streak(
-        read_census_fire_streak(prev), census, target_date,
+        _parse_census_fire_streak(
+            None if prev is None else prev.get('census_fire_streak')
+        ),
+        census,
+        target_date,
     )
 
     doc = {
@@ -846,12 +857,12 @@ def record_run(
         'budget_suppressed': bool(budget_suppressed),
         'capped': bool(capped),
         'consecutive_barren_runs': (
-            prev_streak + 1 if outcome == OUTCOME_BARREN
-            else prev_streak if outcome == OUTCOME_FAILED
+            prev_streak + 1 if outcome == RunOutcome.BARREN
+            else prev_streak if outcome == RunOutcome.FAILED
             else 0
         ),
         'consecutive_failed_runs': (
-            prev_failed + 1 if outcome == OUTCOME_FAILED else 0
+            prev_failed + 1 if outcome == RunOutcome.FAILED else 0
         ),
         'last_productive_at': last_productive_at,
         'last_scheduled_target_date': cursor.isoformat() if cursor else None,
@@ -940,7 +951,9 @@ def record_retry(
     scheduled night. With no readable predecessor there is no backlog to
     fold into: it logs one WARNING and writes nothing."""
     path = trickle_state_path(project_id)
-    status, prev = load_state(path)
+    read = load_state(path)
+    status = type(read).__name__
+    prev = read.value.to_json() if isinstance(read, state_docs.Ok) else None
     if prev is None:
         logger.warning(
             'trickle state: cannot record retry of %s for project=%s: no '
