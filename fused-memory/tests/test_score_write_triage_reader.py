@@ -16,6 +16,7 @@ import math
 import subprocess
 import sys
 import types
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -756,14 +757,22 @@ def _rescored_baseline() -> dict[str, Any]:
     return _mod().score_reader(items, verdicts, strata=strata)
 
 
+@functools.cache
+def _committed_derivation() -> dict[str, Any]:
+    return json.loads(_calibration('derivation.json').read_text())
+
+
+RETIRED_V1_ROWS = ('extends_home_yes', 'corrects_not_action_changing_conflict_no')
+
+
 @pytest.mark.xdist_group('committed_v2_soak_baseline')
 class TestTheCommittedSoakBaseline:
-    """The committed v2 soak baseline cannot drift from its committed inputs.
+    """The committed v2.1 soak baseline cannot drift from its committed inputs.
 
     Built by ``scripts/build_write_triage_v2_soak_baseline.py`` from the
-    gitignored 2026-10-19 soak bundle. The invariants below are fixed by the
-    soak's v1 labels whatever the new ratings say. The class runs on one xdist
-    worker, so the cached re-scoring is paid once per run.
+    gitignored 2026-10-19 soak bundle, with every item rated by an Opus primary
+    and an Opus second. The invariants below hold whatever the ratings say. The
+    class runs on one xdist worker, so the cached re-scoring is paid once per run.
     """
 
     def test_rescoring_the_inputs_reproduces_the_report(self) -> None:
@@ -774,24 +783,58 @@ class TestTheCommittedSoakBaseline:
         committed = json.loads(_calibration('baseline.json').read_text())
         assert _calibration('baseline.md').read_text() == _mod().render_markdown(committed)
 
-    def test_holds_the_soaks_553_adjudicated_attaches(self) -> None:
-        population = _rescored_baseline()['population']
-        assert population['n_items'] == 553
-        assert population['by_outcome'] == {
-            'amended': 40, 'contested': 473, 'restated': 40, 'stored': 0,
+    def test_holds_the_553_adjudicated_attaches_and_the_extended_samples(self) -> None:
+        sample = _committed_derivation()['sample']
+        assert {stratum: counts['adjudicated'] for stratum, counts in sample.items()} == {
+            'restated-sample': 40, 'amended-sample': 40, 'contested-census': 473,
         }
+        extension = {stratum: counts['extension'] for stratum, counts in sample.items()}
+        report = _rescored_baseline()
+        assert report['rubric'] == 'v2.1'
+        assert report['population']['n_items'] == 553 + sum(extension.values())
+        assert report['population']['by_outcome'] == {
+            'amended': 40 + extension['amended-sample'], 'contested': 473,
+            'restated': 40 + extension['restated-sample'], 'stored': 0,
+        }
+        for stratum in ('restated-sample', 'amended-sample'):
+            assert sum(sample[stratum].values()) >= 100, stratum
         assert sum(_committed_inputs()[2].values()) == 1822
 
-    def test_every_v1_action_changing_correction_is_a_flagged_conflict(self) -> None:
+    def test_every_pair_and_basis_has_one_primary_and_one_second_rater(self) -> None:
         items, verdicts, _ = _committed_inputs()
-        contested = {item['entry_id'] for item in items if item['outcome'] == 'contested'}
-        derived_conflicts = {
-            row['entry_id'] for row in verdicts
-            if row['role'] == 'derived' and row.get('conflict') == 'YES'
-            and row['entry_id'] in contested
+        roles: defaultdict[tuple[str, str, str], Counter[str]] = defaultdict(Counter)
+        for row in verdicts:
+            roles[row['entry_id'], row['target_id'], row['basis']][row['role']] += 1
+        assert {(entry, target) for entry, target, basis in roles if basis == 'current'} == {
+            (item['entry_id'], item['target_id']) for item in items
         }
-        assert len(derived_conflicts) == 225
-        assert _rescored_baseline()['metrics']['m5']['hits'] >= 225
+        assert {
+            pair: dict(counted) for pair, counted in roles.items()
+            if counted['primary'] != 1 or counted['second'] != 1
+        } == {}
 
-    def test_counts_the_13_parents_edited_after_attach(self) -> None:
-        assert _rescored_baseline()['metrics']['m6']['parent_edited'] == 13
+    def test_the_derivation_check_holds_only_rows_that_pass_it(self) -> None:
+        derivation = _committed_derivation()
+        rows = derivation['rows']
+        assert set(derivation['held_rows']) == {name for name, row in rows.items() if row['held']}
+        for name in derivation['held_rows']:
+            assert rows[name]['n_compared'] >= 20, name
+            assert rows[name]['agree'] >= 0.90 * rows[name]['n_compared'], name
+        for name in RETIRED_V1_ROWS:
+            assert (rows[name]['retired'], rows[name]['held']) == (True, False), name
+
+    def test_only_a_held_rows_binary_is_non_consumed(self) -> None:
+        derivation = _committed_derivation()
+        held_binaries = {derivation['rows'][name]['binary'] for name in derivation['held_rows']}
+        non_consumed = {
+            binary for row in _committed_inputs()[1] for binary in row.get('non_consumed', ())
+        }
+        assert non_consumed <= held_binaries
+
+    def test_reports_m1_as_amended_and_the_kappa_floor_binaries(self) -> None:
+        report = _rescored_baseline()
+        assert 'm1_as_amended' in report['metrics']
+        assert report['kappa']['floor_binaries'] == ['home', 'conflict', 'loss']
+
+    def test_counts_at_least_the_13_parents_edited_after_attach(self) -> None:
+        assert _rescored_baseline()['metrics']['m6']['parent_edited'] >= 13
