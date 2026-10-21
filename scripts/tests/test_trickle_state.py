@@ -32,6 +32,8 @@ import inspect
 import json
 import os
 import pwd
+import shutil
+import subprocess
 import tempfile
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
@@ -2223,3 +2225,130 @@ class TestDueRetries:
         state = _state(retry_backlog=backlog)
 
         assert trickle_state.due_retries(state, today=today) == ()
+
+
+# ---------------------------------------------------------------------------
+# Acceptance contract: the bare-python3 predicate path, and a live
+# pre-gamma document
+# ---------------------------------------------------------------------------
+
+_LEGIBILITY_DIR = Path(__file__).resolve().parent.parent / 'legibility'
+
+# Byte for byte what the writer at faa374ec6c (before barren_escalated)
+# wrote after four scheduled nights: failed, productive, barren, barren.
+_BASE_WRITER_DOCUMENT = '''{
+  "applied": 0,
+  "budget_suppressed": true,
+  "capped": false,
+  "census_fire_streak": {
+    "census_state_path": "/srv/proj/docs/legibility/census-state.json",
+    "fires": 3,
+    "last_census_at": "2026-08-02",
+    "since": "2026-09-11"
+  },
+  "census_fired": true,
+  "commit_made": false,
+  "consecutive_barren_runs": 2,
+  "consecutive_failed_runs": 0,
+  "counters": {
+    "below_sampling_cut": 0,
+    "budget_skipped": 4,
+    "dedupe_collapsed": 0,
+    "selected_count": 0,
+    "total_records": 4,
+    "zero_signal_dropped": 0
+  },
+  "exit_code": 0,
+  "last_productive_at": "2026-09-12T03:00:00+00:00",
+  "last_scheduled_target_date": "2026-09-13",
+  "outcome": "barren",
+  "project_id": "pre_gamma",
+  "recorded_at": "2026-09-14T03:00:00+00:00",
+  "retry_backlog": {
+    "2026-09-10": 1
+  },
+  "schema_version": 1,
+  "target_date": "2026-09-13"
+}
+'''
+
+
+def _path_without_virtualenvs() -> str:
+    """The inherited PATH minus every virtualenv's bin directory."""
+    return os.pathsep.join(
+        entry for entry in os.environ.get('PATH', '').split(os.pathsep)
+        if entry and not (Path(entry).parent / 'pyvenv.cfg').exists()
+    )
+
+
+def _bare_python_env() -> dict[str, str]:
+    env = {
+        key: value for key, value in os.environ.items()
+        if key not in ('VIRTUAL_ENV', 'PYTHONPATH', 'PYTHONHOME')
+    }
+    env['PATH'] = _path_without_virtualenvs()
+    return env
+
+
+class TestAcceptanceContract:
+    def test_both_predicates_run_under_bare_python3_with_no_venv(self):
+        """A bound predicate is EXEC'd with bare ``python3``: no venv, no
+        package context. Run here under ``-I -S`` with every virtualenv off
+        PATH; ``-S`` also drops the system site-packages, which can carry
+        PyYAML, so trickle_state -> state_docs -> shared.safe_io must import
+        with the stdlib alone."""
+        if shutil.which('python3', path=_path_without_virtualenvs()) is None:
+            pytest.skip('no python3 outside a virtualenv on this host')
+        trickle_state.record_run(
+            'bare_python',
+            dataclasses.replace(_night(selected_count=2), recorded_at=datetime.now(UTC)),
+            barren_escalated=False,
+        )
+
+        for script, args in (
+            ('check_trickle_progress.py', ['bare_python', '3']),
+            ('check_census_progress.py', ['bare_python']),
+        ):
+            done = subprocess.run(
+                ['/usr/bin/env', 'python3', '-I', '-S', str(_LEGIBILITY_DIR / script),
+                 *args],
+                env=_bare_python_env(), capture_output=True, text=True, timeout=60,
+            )
+            assert done.returncode == 0, (
+                f'{script}: stdout={done.stdout!r} stderr={done.stderr!r}'
+            )
+            assert done.stdout.startswith('OK:'), done.stdout
+
+    def test_a_live_pre_gamma_document_loads_and_folds_into_a_gamma_one(self):
+        path = trickle_state.trickle_state_path('pre_gamma')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_BASE_WRITER_DOCUMENT, encoding='utf-8')
+
+        read = trickle_state.load_state(path)
+        assert isinstance(read, Ok)
+        assert read.value.barren_escalated is None
+        assert read.value.consecutive_barren_runs == 2
+
+        state = trickle_state.record_run(
+            'pre_gamma',
+            trickle_state.NightRun(
+                target_date=date(2026, 9, 14),
+                recorded_at=datetime(2026, 9, 15, 3, 0, tzinfo=UTC),
+                exit_code=0,
+                counters=_counters(budget_skipped=4),
+                census=None,
+                budget_suppressed=True,
+                scheduled=True,
+            ),
+            barren_escalated=True,
+        )
+
+        assert state.outcome == RunOutcome.BARREN
+        assert state.consecutive_barren_runs == 3
+        assert state.barren_escalated is True
+        assert state.last_productive_at == datetime(2026, 9, 12, 3, 0, tzinfo=UTC)
+        assert state.census_fire_streak == read.value.census_fire_streak
+        assert dict(state.retry_backlog) == {date(2026, 9, 10): 1}
+        written = json.loads(path.read_text(encoding='utf-8'))
+        assert written['barren_escalated'] is True
+        assert trickle_state.load_state(path) == Ok(state)
