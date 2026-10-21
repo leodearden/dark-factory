@@ -1,0 +1,4339 @@
+{
+  "provenance": {
+    "evidence_dir": "/home/leo/src/dark-factory/data/write-triage-soak-2026-10-19",
+    "evidence_files": {
+      "duplicates/records.jsonl": "347e0392561ba5643290ff24ada491dbc4fc85ee9671980879c506e28106a84b",
+      "team/A/attaches_axes.json": "09c5c8f16cdfa9890f673f49d72b981ad68dff44f38765a084d8dc7e9e49cc44"
+    },
+    "pooled_bands": {
+      "t_high": 0.8868282526657318,
+      "t_low": 0.5229672433064231
+    },
+    "judge_candidate_count": 5,
+    "attach_guard": {
+      "min_parent_cosine": 0.6,
+      "hoist_max_cosine_gap": 0.05
+    },
+    "project_reports": {
+      "solar_challenge": "calibration/write_triage_calibration_report_solar_challenge.json",
+      "solar_challenge_platform": "calibration/write_triage_calibration_report_solar_challenge_platform.json"
+    },
+    "groups": {
+      "solar": [
+        "scoping_intake",
+        "solar_challenge",
+        "solar_challenge_platform"
+      ],
+      "dark_factory_reify": [
+        "dark_factory",
+        "reify"
+      ]
+    },
+    "population": {
+      "writes": 3354,
+      "attached": 1817,
+      "excluded": {
+        "no_triage_cosine": {
+          "count": 6,
+          "memory_ids": [
+            "b6b9d450-457b-4632-8fa6-de0ce1a8ea17",
+            "bcd2d36f-0e1e-44bf-893c-984f0151aa14",
+            "c71616ac-0fdf-4815-b96c-dd42ee249bfa",
+            "95a00908-8611-4dc3-a67f-c1fc04a2a489",
+            "61fe3b21-af0c-4358-b5b8-4711d9cb56d3",
+            "092c0560-ac75-40fe-a634-e35bacd973f3"
+          ]
+        },
+        "caller_declared_child": {
+          "count": 47,
+          "memory_ids": [
+            "f649f6a4-1b9d-463b-bdbe-7bf8f5146872",
+            "8b6fb1bf-5876-4857-bf2e-46c90bdc940a",
+            "7420efff-5812-44a2-a957-75c0e6e89e51",
+            "c3b4970e-6b0f-4cb1-b50e-88c1096b12e8",
+            "d7d5649c-36a8-4145-bf33-8d967d6aefa7",
+            "ab97d4a7-7f4e-43ab-8132-c6bb6bc865f2",
+            "db2ebc76-e0e4-4a26-b8ac-022efdcc543b",
+            "80324dc9-80a0-456f-9b18-57a9c6a8d9fd",
+            "a3408c1d-3308-4b44-9c1b-dda7b276fa5f",
+            "b124937d-3f4e-4c8f-b1ba-0786cbcbf4d2",
+            "1f10c9c3-86eb-43d3-b5bc-17c7c256154c",
+            "1588e2e3-025e-4df0-b2ec-f72180bf80ce",
+            "93d81c26-1d27-4bd1-81bc-8c537089d4f8",
+            "43593332-a4b0-4a5d-87cf-45659208f5b9",
+            "5fb6fa27-148a-4c80-bb41-3de0b71ba156",
+            "9d96d9e7-09dd-4f24-aa6f-e64e6b6d9552",
+            "625fb2a5-6d7c-4890-9648-c6081e7dd160",
+            "6b28a161-db26-4fee-a623-1df993146ab3",
+            "4a991bd3-b82a-48a1-94ff-a0e7378cc624",
+            "d3365658-b00e-44ef-a757-593e446b5bee",
+            "3b6c243c-d088-4141-82bf-610e60cfa3cb",
+            "58701e39-de3f-4570-963b-4f042d9ba307",
+            "c2df7549-5dcd-4585-93f9-237e08b9627e",
+            "bc8949e1-ca26-45d3-aa7d-21599feedc6a",
+            "8089f321-8682-4b4d-826e-566e52a5b620",
+            "54d1331f-3ee7-4506-8173-daf4b2b6a94a",
+            "b814ff42-4890-4450-bcbd-8b939fbff173",
+            "dfccdcf7-f540-4a23-80e1-926fbf8ee087",
+            "611ce649-95bf-4f3e-83e9-afbf6a71fe16",
+            "5a853b44-4a00-4fd1-b85e-8fc603c1ea56",
+            "2b2c5ec4-a33a-4e81-bb1a-bad0f19a6d08",
+            "c6415139-5c07-4598-8031-48b5e40a0c88",
+            "6b31f70d-3dc9-4eab-bc63-2b1da258877b",
+            "1f84d0ac-b3da-408e-a771-cf94c30f0e04",
+            "cb4f666d-4a72-4521-be85-0e824ed027c5",
+            "9977031d-47fc-4cdc-b0c7-201f2efcc1ce",
+            "46763cbd-9128-49d8-953a-ed333e036fef",
+            "2f9ec4b5-1e8a-48cd-9e50-85e237311712",
+            "112aa832-038a-47d5-9808-f117ab1d9a39",
+            "119a3ff7-7510-4e20-b3b4-ca5ab9a4ee7a",
+            "6b0683b7-d061-4187-886a-37b2c8e609c6",
+            "d88f7fa9-7bd6-4730-a5ba-69bbf61d616b",
+            "2d7cffdb-1c4a-49bc-bb6c-294dc2df9693",
+            "b202aac2-84f4-4652-9b1d-762efd3a4d0b",
+            "1967bbbf-2d32-4647-930b-7912b01c6e98",
+            "3a0b4263-7d57-415e-8bdc-b6a95d2a6711",
+            "9ff40fa1-fc8c-4867-b914-8cbfff919c46"
+          ]
+        }
+      }
+    }
+  },
+  "census_fidelity": {
+    "solar": {
+      "k": 97,
+      "n": 230,
+      "rate": 0.4217,
+      "wilson95": [
+        0.3597,
+        0.4863
+      ]
+    },
+    "dark_factory_reify": {
+      "k": 54,
+      "n": 239,
+      "rate": 0.2259,
+      "wilson95": [
+        0.1775,
+        0.2831
+      ]
+    },
+    "dark_factory": {
+      "k": 33,
+      "n": 124,
+      "rate": 0.2661,
+      "wilson95": [
+        0.1962,
+        0.3501
+      ]
+    },
+    "reify": {
+      "k": 21,
+      "n": 115,
+      "rate": 0.1826,
+      "wilson95": [
+        0.1227,
+        0.2631
+      ]
+    },
+    "scoping_intake": {
+      "k": 0,
+      "n": 2,
+      "rate": 0.0,
+      "wilson95": [
+        0.0,
+        0.6576
+      ]
+    },
+    "solar_challenge": {
+      "k": 59,
+      "n": 131,
+      "rate": 0.4504,
+      "wilson95": [
+        0.3678,
+        0.5358
+      ]
+    },
+    "solar_challenge_platform": {
+      "k": 38,
+      "n": 97,
+      "rate": 0.3918,
+      "wilson95": [
+        0.3005,
+        0.4912
+      ]
+    }
+  },
+  "origin_tables": {
+    "band": {
+      "solar": {
+        "judge": {
+          "contested": {
+            "attaches": 229,
+            "misfile": {
+              "k": 97,
+              "n": 229,
+              "rate": 0.4236,
+              "wilson95": [
+                0.3614,
+                0.4883
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 590,
+            "misfile": {
+              "k": 6,
+              "n": 19,
+              "rate": 0.3158,
+              "wilson95": [
+                0.1536,
+                0.5399
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 3,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "restated": {
+          "contested": {
+            "attaches": 1,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 80,
+            "misfile": {
+              "k": 6,
+              "n": 26,
+              "rate": 0.2308,
+              "wilson95": [
+                0.1103,
+                0.4205
+              ]
+            }
+          }
+        }
+      },
+      "dark_factory_reify": {
+        "judge": {
+          "contested": {
+            "attaches": 240,
+            "misfile": {
+              "k": 54,
+              "n": 239,
+              "rate": 0.2259,
+              "wilson95": [
+                0.1775,
+                0.2831
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 632,
+            "misfile": {
+              "k": 7,
+              "n": 21,
+              "rate": 0.3333,
+              "wilson95": [
+                0.1719,
+                0.5463
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 4,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          }
+        },
+        "restated": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 1,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 37,
+            "misfile": {
+              "k": 3,
+              "n": 12,
+              "rate": 0.25,
+              "wilson95": [
+                0.0889,
+                0.5323
+              ]
+            }
+          }
+        }
+      },
+      "dark_factory": {
+        "judge": {
+          "contested": {
+            "attaches": 124,
+            "misfile": {
+              "k": 33,
+              "n": 124,
+              "rate": 0.2661,
+              "wilson95": [
+                0.1962,
+                0.3501
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 297,
+            "misfile": {
+              "k": 3,
+              "n": 10,
+              "rate": 0.3,
+              "wilson95": [
+                0.1078,
+                0.6032
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 1,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          }
+        },
+        "restated": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 1,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 18,
+            "misfile": {
+              "k": 2,
+              "n": 5,
+              "rate": 0.4,
+              "wilson95": [
+                0.1176,
+                0.7693
+              ]
+            }
+          }
+        }
+      },
+      "reify": {
+        "judge": {
+          "contested": {
+            "attaches": 116,
+            "misfile": {
+              "k": 21,
+              "n": 115,
+              "rate": 0.1826,
+              "wilson95": [
+                0.1227,
+                0.2631
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 335,
+            "misfile": {
+              "k": 4,
+              "n": 11,
+              "rate": 0.3636,
+              "wilson95": [
+                0.1517,
+                0.6462
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 3,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "restated": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 19,
+            "misfile": {
+              "k": 1,
+              "n": 7,
+              "rate": 0.1429,
+              "wilson95": [
+                0.0257,
+                0.5131
+              ]
+            }
+          }
+        }
+      },
+      "scoping_intake": {
+        "judge": {
+          "contested": {
+            "attaches": 2,
+            "misfile": {
+              "k": 0,
+              "n": 2,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 17,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "solar_challenge": {
+        "judge": {
+          "contested": {
+            "attaches": 130,
+            "misfile": {
+              "k": 59,
+              "n": 130,
+              "rate": 0.4538,
+              "wilson95": [
+                0.3708,
+                0.5395
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 339,
+            "misfile": {
+              "k": 3,
+              "n": 11,
+              "rate": 0.2727,
+              "wilson95": [
+                0.0975,
+                0.5657
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 2,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "restated": {
+          "contested": {
+            "attaches": 1,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 64,
+            "misfile": {
+              "k": 3,
+              "n": 21,
+              "rate": 0.1429,
+              "wilson95": [
+                0.0498,
+                0.3464
+              ]
+            }
+          }
+        }
+      },
+      "solar_challenge_platform": {
+        "judge": {
+          "contested": {
+            "attaches": 97,
+            "misfile": {
+              "k": 38,
+              "n": 97,
+              "rate": 0.3918,
+              "wilson95": [
+                0.3005,
+                0.4912
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 234,
+            "misfile": {
+              "k": 3,
+              "n": 8,
+              "rate": 0.375,
+              "wilson95": [
+                0.1368,
+                0.6943
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 1,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "restated": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 16,
+            "misfile": {
+              "k": 3,
+              "n": 5,
+              "rate": 0.6,
+              "wilson95": [
+                0.2307,
+                0.8824
+              ]
+            }
+          }
+        }
+      }
+    },
+    "hoist": {
+      "solar": {
+        "direct": {
+          "contested": {
+            "attaches": 200,
+            "misfile": {
+              "k": 67,
+              "n": 200,
+              "rate": 0.335,
+              "wilson95": [
+                0.2732,
+                0.403
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 477,
+            "misfile": {
+              "k": 3,
+              "n": 16,
+              "rate": 0.1875,
+              "wilson95": [
+                0.0659,
+                0.4301
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 42,
+            "misfile": {
+              "k": 4,
+              "n": 11,
+              "rate": 0.3636,
+              "wilson95": [
+                0.1517,
+                0.6462
+              ]
+            }
+          }
+        },
+        "via_child": {
+          "contested": {
+            "attaches": 30,
+            "misfile": {
+              "k": 30,
+              "n": 30,
+              "rate": 1.0,
+              "wilson95": [
+                0.8865,
+                1.0
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 113,
+            "misfile": {
+              "k": 3,
+              "n": 3,
+              "rate": 1.0,
+              "wilson95": [
+                0.4385,
+                1.0
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 41,
+            "misfile": {
+              "k": 2,
+              "n": 15,
+              "rate": 0.1333,
+              "wilson95": [
+                0.0374,
+                0.3788
+              ]
+            }
+          }
+        }
+      },
+      "dark_factory_reify": {
+        "direct": {
+          "contested": {
+            "attaches": 225,
+            "misfile": {
+              "k": 44,
+              "n": 224,
+              "rate": 0.1964,
+              "wilson95": [
+                0.1497,
+                0.2534
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 560,
+            "misfile": {
+              "k": 5,
+              "n": 19,
+              "rate": 0.2632,
+              "wilson95": [
+                0.1181,
+                0.4879
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 23,
+            "misfile": {
+              "k": 2,
+              "n": 8,
+              "rate": 0.25,
+              "wilson95": [
+                0.0715,
+                0.5907
+              ]
+            }
+          }
+        },
+        "via_child": {
+          "contested": {
+            "attaches": 15,
+            "misfile": {
+              "k": 10,
+              "n": 15,
+              "rate": 0.6667,
+              "wilson95": [
+                0.4171,
+                0.8482
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 73,
+            "misfile": {
+              "k": 2,
+              "n": 2,
+              "rate": 1.0,
+              "wilson95": [
+                0.3424,
+                1.0
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 18,
+            "misfile": {
+              "k": 1,
+              "n": 5,
+              "rate": 0.2,
+              "wilson95": [
+                0.0362,
+                0.6245
+              ]
+            }
+          }
+        }
+      },
+      "dark_factory": {
+        "direct": {
+          "contested": {
+            "attaches": 115,
+            "misfile": {
+              "k": 28,
+              "n": 115,
+              "rate": 0.2435,
+              "wilson95": [
+                0.1742,
+                0.3294
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 270,
+            "misfile": {
+              "k": 2,
+              "n": 9,
+              "rate": 0.2222,
+              "wilson95": [
+                0.0632,
+                0.5474
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 9,
+            "misfile": {
+              "k": 2,
+              "n": 3,
+              "rate": 0.6667,
+              "wilson95": [
+                0.2077,
+                0.9385
+              ]
+            }
+          }
+        },
+        "via_child": {
+          "contested": {
+            "attaches": 9,
+            "misfile": {
+              "k": 5,
+              "n": 9,
+              "rate": 0.5556,
+              "wilson95": [
+                0.2666,
+                0.8112
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 28,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 10,
+            "misfile": {
+              "k": 0,
+              "n": 3,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.5615
+              ]
+            }
+          }
+        }
+      },
+      "reify": {
+        "direct": {
+          "contested": {
+            "attaches": 110,
+            "misfile": {
+              "k": 16,
+              "n": 109,
+              "rate": 0.1468,
+              "wilson95": [
+                0.0924,
+                0.2252
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 290,
+            "misfile": {
+              "k": 3,
+              "n": 10,
+              "rate": 0.3,
+              "wilson95": [
+                0.1078,
+                0.6032
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 14,
+            "misfile": {
+              "k": 0,
+              "n": 5,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.4345
+              ]
+            }
+          }
+        },
+        "via_child": {
+          "contested": {
+            "attaches": 6,
+            "misfile": {
+              "k": 5,
+              "n": 6,
+              "rate": 0.8333,
+              "wilson95": [
+                0.4365,
+                0.9699
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 45,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 8,
+            "misfile": {
+              "k": 1,
+              "n": 2,
+              "rate": 0.5,
+              "wilson95": [
+                0.0945,
+                0.9055
+              ]
+            }
+          }
+        }
+      },
+      "scoping_intake": {
+        "direct": {
+          "contested": {
+            "attaches": 2,
+            "misfile": {
+              "k": 0,
+              "n": 2,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 16,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "via_child": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 1,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "solar_challenge": {
+        "direct": {
+          "contested": {
+            "attaches": 110,
+            "misfile": {
+              "k": 38,
+              "n": 110,
+              "rate": 0.3455,
+              "wilson95": [
+                0.2632,
+                0.4382
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 249,
+            "misfile": {
+              "k": 0,
+              "n": 8,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.3244
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 30,
+            "misfile": {
+              "k": 2,
+              "n": 7,
+              "rate": 0.2857,
+              "wilson95": [
+                0.0822,
+                0.6411
+              ]
+            }
+          }
+        },
+        "via_child": {
+          "contested": {
+            "attaches": 21,
+            "misfile": {
+              "k": 21,
+              "n": 21,
+              "rate": 1.0,
+              "wilson95": [
+                0.8454,
+                1.0
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 90,
+            "misfile": {
+              "k": 3,
+              "n": 3,
+              "rate": 1.0,
+              "wilson95": [
+                0.4385,
+                1.0
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 36,
+            "misfile": {
+              "k": 1,
+              "n": 14,
+              "rate": 0.0714,
+              "wilson95": [
+                0.0127,
+                0.3147
+              ]
+            }
+          }
+        }
+      },
+      "solar_challenge_platform": {
+        "direct": {
+          "contested": {
+            "attaches": 88,
+            "misfile": {
+              "k": 29,
+              "n": 88,
+              "rate": 0.3295,
+              "wilson95": [
+                0.2403,
+                0.4331
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 212,
+            "misfile": {
+              "k": 3,
+              "n": 8,
+              "rate": 0.375,
+              "wilson95": [
+                0.1368,
+                0.6943
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 12,
+            "misfile": {
+              "k": 2,
+              "n": 4,
+              "rate": 0.5,
+              "wilson95": [
+                0.15,
+                0.85
+              ]
+            }
+          }
+        },
+        "via_child": {
+          "contested": {
+            "attaches": 9,
+            "misfile": {
+              "k": 9,
+              "n": 9,
+              "rate": 1.0,
+              "wilson95": [
+                0.7008,
+                1.0
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 22,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 5,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          }
+        }
+      }
+    },
+    "retarget": {
+      "solar": {
+        "kept": {
+          "contested": {
+            "attaches": 138,
+            "misfile": {
+              "k": 48,
+              "n": 138,
+              "rate": 0.3478,
+              "wilson95": [
+                0.2735,
+                0.4304
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 363,
+            "misfile": {
+              "k": 4,
+              "n": 13,
+              "rate": 0.3077,
+              "wilson95": [
+                0.1268,
+                0.5763
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 83,
+            "misfile": {
+              "k": 6,
+              "n": 26,
+              "rate": 0.2308,
+              "wilson95": [
+                0.1103,
+                0.4205
+              ]
+            }
+          }
+        },
+        "moved": {
+          "contested": {
+            "attaches": 92,
+            "misfile": {
+              "k": 49,
+              "n": 92,
+              "rate": 0.5326,
+              "wilson95": [
+                0.4314,
+                0.6312
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 227,
+            "misfile": {
+              "k": 2,
+              "n": 6,
+              "rate": 0.3333,
+              "wilson95": [
+                0.0968,
+                0.7
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "dark_factory_reify": {
+        "kept": {
+          "contested": {
+            "attaches": 121,
+            "misfile": {
+              "k": 24,
+              "n": 120,
+              "rate": 0.2,
+              "wilson95": [
+                0.1382,
+                0.2804
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 357,
+            "misfile": {
+              "k": 6,
+              "n": 17,
+              "rate": 0.3529,
+              "wilson95": [
+                0.1731,
+                0.587
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 40,
+            "misfile": {
+              "k": 3,
+              "n": 13,
+              "rate": 0.2308,
+              "wilson95": [
+                0.0818,
+                0.5026
+              ]
+            }
+          }
+        },
+        "moved": {
+          "contested": {
+            "attaches": 119,
+            "misfile": {
+              "k": 30,
+              "n": 119,
+              "rate": 0.2521,
+              "wilson95": [
+                0.1827,
+                0.337
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 276,
+            "misfile": {
+              "k": 1,
+              "n": 4,
+              "rate": 0.25,
+              "wilson95": [
+                0.0456,
+                0.6994
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 1,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "dark_factory": {
+        "kept": {
+          "contested": {
+            "attaches": 59,
+            "misfile": {
+              "k": 14,
+              "n": 59,
+              "rate": 0.2373,
+              "wilson95": [
+                0.1469,
+                0.3598
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 180,
+            "misfile": {
+              "k": 3,
+              "n": 8,
+              "rate": 0.375,
+              "wilson95": [
+                0.1368,
+                0.6943
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 19,
+            "misfile": {
+              "k": 2,
+              "n": 6,
+              "rate": 0.3333,
+              "wilson95": [
+                0.0968,
+                0.7
+              ]
+            }
+          }
+        },
+        "moved": {
+          "contested": {
+            "attaches": 65,
+            "misfile": {
+              "k": 19,
+              "n": 65,
+              "rate": 0.2923,
+              "wilson95": [
+                0.1958,
+                0.412
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 118,
+            "misfile": {
+              "k": 0,
+              "n": 2,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "reify": {
+        "kept": {
+          "contested": {
+            "attaches": 62,
+            "misfile": {
+              "k": 10,
+              "n": 61,
+              "rate": 0.1639,
+              "wilson95": [
+                0.0916,
+                0.2761
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 177,
+            "misfile": {
+              "k": 3,
+              "n": 9,
+              "rate": 0.3333,
+              "wilson95": [
+                0.1206,
+                0.6458
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 21,
+            "misfile": {
+              "k": 1,
+              "n": 7,
+              "rate": 0.1429,
+              "wilson95": [
+                0.0257,
+                0.5131
+              ]
+            }
+          }
+        },
+        "moved": {
+          "contested": {
+            "attaches": 54,
+            "misfile": {
+              "k": 11,
+              "n": 54,
+              "rate": 0.2037,
+              "wilson95": [
+                0.1177,
+                0.329
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 158,
+            "misfile": {
+              "k": 1,
+              "n": 2,
+              "rate": 0.5,
+              "wilson95": [
+                0.0945,
+                0.9055
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 1,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "scoping_intake": {
+        "kept": {
+          "contested": {
+            "attaches": 2,
+            "misfile": {
+              "k": 0,
+              "n": 2,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 9,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "moved": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 8,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "solar_challenge": {
+        "kept": {
+          "contested": {
+            "attaches": 79,
+            "misfile": {
+              "k": 29,
+              "n": 79,
+              "rate": 0.3671,
+              "wilson95": [
+                0.2693,
+                0.4772
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 209,
+            "misfile": {
+              "k": 2,
+              "n": 6,
+              "rate": 0.3333,
+              "wilson95": [
+                0.0968,
+                0.7
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 66,
+            "misfile": {
+              "k": 3,
+              "n": 21,
+              "rate": 0.1429,
+              "wilson95": [
+                0.0498,
+                0.3464
+              ]
+            }
+          }
+        },
+        "moved": {
+          "contested": {
+            "attaches": 52,
+            "misfile": {
+              "k": 30,
+              "n": 52,
+              "rate": 0.5769,
+              "wilson95": [
+                0.4419,
+                0.7013
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 130,
+            "misfile": {
+              "k": 1,
+              "n": 5,
+              "rate": 0.2,
+              "wilson95": [
+                0.0362,
+                0.6245
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "solar_challenge_platform": {
+        "kept": {
+          "contested": {
+            "attaches": 57,
+            "misfile": {
+              "k": 19,
+              "n": 57,
+              "rate": 0.3333,
+              "wilson95": [
+                0.2249,
+                0.4628
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 145,
+            "misfile": {
+              "k": 2,
+              "n": 7,
+              "rate": 0.2857,
+              "wilson95": [
+                0.0822,
+                0.6411
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 17,
+            "misfile": {
+              "k": 3,
+              "n": 5,
+              "rate": 0.6,
+              "wilson95": [
+                0.2307,
+                0.8824
+              ]
+            }
+          }
+        },
+        "moved": {
+          "contested": {
+            "attaches": 40,
+            "misfile": {
+              "k": 19,
+              "n": 40,
+              "rate": 0.475,
+              "wilson95": [
+                0.3294,
+                0.625
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 89,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      }
+    },
+    "record_class": {
+      "solar": {
+        "completion_ledger": {
+          "contested": {
+            "attaches": 14,
+            "misfile": {
+              "k": 9,
+              "n": 14,
+              "rate": 0.6429,
+              "wilson95": [
+                0.3876,
+                0.8366
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 22,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 20,
+            "misfile": {
+              "k": 5,
+              "n": 6,
+              "rate": 0.8333,
+              "wilson95": [
+                0.4365,
+                0.9699
+              ]
+            }
+          }
+        },
+        "task_stamped": {
+          "contested": {
+            "attaches": 123,
+            "misfile": {
+              "k": 43,
+              "n": 123,
+              "rate": 0.3496,
+              "wilson95": [
+                0.271,
+                0.4373
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 261,
+            "misfile": {
+              "k": 1,
+              "n": 6,
+              "rate": 0.1667,
+              "wilson95": [
+                0.0301,
+                0.5635
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 37,
+            "misfile": {
+              "k": 1,
+              "n": 12,
+              "rate": 0.0833,
+              "wilson95": [
+                0.0149,
+                0.3539
+              ]
+            }
+          }
+        },
+        "untasked": {
+          "contested": {
+            "attaches": 93,
+            "misfile": {
+              "k": 45,
+              "n": 93,
+              "rate": 0.4839,
+              "wilson95": [
+                0.385,
+                0.584
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 307,
+            "misfile": {
+              "k": 5,
+              "n": 13,
+              "rate": 0.3846,
+              "wilson95": [
+                0.1771,
+                0.6448
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 26,
+            "misfile": {
+              "k": 0,
+              "n": 8,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.3244
+              ]
+            }
+          }
+        }
+      },
+      "dark_factory_reify": {
+        "completion_ledger": {
+          "contested": {
+            "attaches": 24,
+            "misfile": {
+              "k": 13,
+              "n": 24,
+              "rate": 0.5417,
+              "wilson95": [
+                0.3507,
+                0.7211
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 30,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 10,
+            "misfile": {
+              "k": 2,
+              "n": 3,
+              "rate": 0.6667,
+              "wilson95": [
+                0.2077,
+                0.9385
+              ]
+            }
+          }
+        },
+        "task_stamped": {
+          "contested": {
+            "attaches": 134,
+            "misfile": {
+              "k": 21,
+              "n": 133,
+              "rate": 0.1579,
+              "wilson95": [
+                0.1057,
+                0.2293
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 315,
+            "misfile": {
+              "k": 2,
+              "n": 8,
+              "rate": 0.25,
+              "wilson95": [
+                0.0715,
+                0.5907
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 24,
+            "misfile": {
+              "k": 1,
+              "n": 9,
+              "rate": 0.1111,
+              "wilson95": [
+                0.0199,
+                0.435
+              ]
+            }
+          }
+        },
+        "untasked": {
+          "contested": {
+            "attaches": 82,
+            "misfile": {
+              "k": 20,
+              "n": 82,
+              "rate": 0.2439,
+              "wilson95": [
+                0.1638,
+                0.3469
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 288,
+            "misfile": {
+              "k": 5,
+              "n": 13,
+              "rate": 0.3846,
+              "wilson95": [
+                0.1771,
+                0.6448
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 7,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          }
+        }
+      },
+      "dark_factory": {
+        "completion_ledger": {
+          "contested": {
+            "attaches": 19,
+            "misfile": {
+              "k": 11,
+              "n": 19,
+              "rate": 0.5789,
+              "wilson95": [
+                0.3628,
+                0.7686
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 24,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 9,
+            "misfile": {
+              "k": 2,
+              "n": 3,
+              "rate": 0.6667,
+              "wilson95": [
+                0.2077,
+                0.9385
+              ]
+            }
+          }
+        },
+        "task_stamped": {
+          "contested": {
+            "attaches": 65,
+            "misfile": {
+              "k": 11,
+              "n": 65,
+              "rate": 0.1692,
+              "wilson95": [
+                0.0972,
+                0.2782
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 145,
+            "misfile": {
+              "k": 1,
+              "n": 2,
+              "rate": 0.5,
+              "wilson95": [
+                0.0945,
+                0.9055
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 5,
+            "misfile": {
+              "k": 0,
+              "n": 2,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            }
+          }
+        },
+        "untasked": {
+          "contested": {
+            "attaches": 40,
+            "misfile": {
+              "k": 11,
+              "n": 40,
+              "rate": 0.275,
+              "wilson95": [
+                0.1611,
+                0.4284
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 129,
+            "misfile": {
+              "k": 2,
+              "n": 8,
+              "rate": 0.25,
+              "wilson95": [
+                0.0715,
+                0.5907
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 5,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          }
+        }
+      },
+      "reify": {
+        "completion_ledger": {
+          "contested": {
+            "attaches": 5,
+            "misfile": {
+              "k": 2,
+              "n": 5,
+              "rate": 0.4,
+              "wilson95": [
+                0.1176,
+                0.7693
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 6,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 1,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "task_stamped": {
+          "contested": {
+            "attaches": 69,
+            "misfile": {
+              "k": 10,
+              "n": 68,
+              "rate": 0.1471,
+              "wilson95": [
+                0.0819,
+                0.25
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 170,
+            "misfile": {
+              "k": 1,
+              "n": 6,
+              "rate": 0.1667,
+              "wilson95": [
+                0.0301,
+                0.5635
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 19,
+            "misfile": {
+              "k": 1,
+              "n": 7,
+              "rate": 0.1429,
+              "wilson95": [
+                0.0257,
+                0.5131
+              ]
+            }
+          }
+        },
+        "untasked": {
+          "contested": {
+            "attaches": 42,
+            "misfile": {
+              "k": 9,
+              "n": 42,
+              "rate": 0.2143,
+              "wilson95": [
+                0.1171,
+                0.3594
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 159,
+            "misfile": {
+              "k": 3,
+              "n": 5,
+              "rate": 0.6,
+              "wilson95": [
+                0.2307,
+                0.8824
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 2,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "scoping_intake": {
+        "untasked": {
+          "contested": {
+            "attaches": 2,
+            "misfile": {
+              "k": 0,
+              "n": 2,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 17,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "solar_challenge": {
+        "completion_ledger": {
+          "contested": {
+            "attaches": 6,
+            "misfile": {
+              "k": 4,
+              "n": 6,
+              "rate": 0.6667,
+              "wilson95": [
+                0.3,
+                0.9032
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 9,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 14,
+            "misfile": {
+              "k": 3,
+              "n": 3,
+              "rate": 1.0,
+              "wilson95": [
+                0.4385,
+                1.0
+              ]
+            }
+          }
+        },
+        "task_stamped": {
+          "contested": {
+            "attaches": 68,
+            "misfile": {
+              "k": 24,
+              "n": 68,
+              "rate": 0.3529,
+              "wilson95": [
+                0.25,
+                0.4716
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 136,
+            "misfile": {
+              "k": 1,
+              "n": 4,
+              "rate": 0.25,
+              "wilson95": [
+                0.0456,
+                0.6994
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 29,
+            "misfile": {
+              "k": 0,
+              "n": 10,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.2775
+              ]
+            }
+          }
+        },
+        "untasked": {
+          "contested": {
+            "attaches": 57,
+            "misfile": {
+              "k": 31,
+              "n": 57,
+              "rate": 0.5439,
+              "wilson95": [
+                0.4159,
+                0.6663
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 194,
+            "misfile": {
+              "k": 2,
+              "n": 7,
+              "rate": 0.2857,
+              "wilson95": [
+                0.0822,
+                0.6411
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 23,
+            "misfile": {
+              "k": 0,
+              "n": 8,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.3244
+              ]
+            }
+          }
+        }
+      },
+      "solar_challenge_platform": {
+        "completion_ledger": {
+          "contested": {
+            "attaches": 8,
+            "misfile": {
+              "k": 5,
+              "n": 8,
+              "rate": 0.625,
+              "wilson95": [
+                0.3057,
+                0.8632
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 13,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 6,
+            "misfile": {
+              "k": 2,
+              "n": 3,
+              "rate": 0.6667,
+              "wilson95": [
+                0.2077,
+                0.9385
+              ]
+            }
+          }
+        },
+        "task_stamped": {
+          "contested": {
+            "attaches": 55,
+            "misfile": {
+              "k": 19,
+              "n": 55,
+              "rate": 0.3455,
+              "wilson95": [
+                0.2336,
+                0.4775
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 125,
+            "misfile": {
+              "k": 0,
+              "n": 2,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 8,
+            "misfile": {
+              "k": 1,
+              "n": 2,
+              "rate": 0.5,
+              "wilson95": [
+                0.0945,
+                0.9055
+              ]
+            }
+          }
+        },
+        "untasked": {
+          "contested": {
+            "attaches": 34,
+            "misfile": {
+              "k": 14,
+              "n": 34,
+              "rate": 0.4118,
+              "wilson95": [
+                0.2637,
+                0.5778
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 96,
+            "misfile": {
+              "k": 3,
+              "n": 6,
+              "rate": 0.5,
+              "wilson95": [
+                0.1876,
+                0.8124
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 3,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      }
+    },
+    "cos_parent": {
+      "solar": {
+        "0.65_to_0.75": {
+          "contested": {
+            "attaches": 90,
+            "misfile": {
+              "k": 39,
+              "n": 90,
+              "rate": 0.4333,
+              "wilson95": [
+                0.3358,
+                0.5364
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 245,
+            "misfile": {
+              "k": 5,
+              "n": 12,
+              "rate": 0.4167,
+              "wilson95": [
+                0.1933,
+                0.6805
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 11,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          }
+        },
+        "0.75_to_t_high": {
+          "contested": {
+            "attaches": 88,
+            "misfile": {
+              "k": 18,
+              "n": 88,
+              "rate": 0.2045,
+              "wilson95": [
+                0.1335,
+                0.3003
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 232,
+            "misfile": {
+              "k": 0,
+              "n": 6,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.3903
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 27,
+            "misfile": {
+              "k": 1,
+              "n": 8,
+              "rate": 0.125,
+              "wilson95": [
+                0.0224,
+                0.4709
+              ]
+            }
+          }
+        },
+        "at_or_above_t_high": {
+          "contested": {
+            "attaches": 1,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 44,
+            "misfile": {
+              "k": 4,
+              "n": 16,
+              "rate": 0.25,
+              "wilson95": [
+                0.1018,
+                0.495
+              ]
+            }
+          }
+        },
+        "below_t_low": {
+          "contested": {
+            "attaches": 5,
+            "misfile": {
+              "k": 5,
+              "n": 5,
+              "rate": 1.0,
+              "wilson95": [
+                0.5655,
+                1.0
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 25,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "t_low_to_0.65": {
+          "contested": {
+            "attaches": 46,
+            "misfile": {
+              "k": 35,
+              "n": 46,
+              "rate": 0.7609,
+              "wilson95": [
+                0.6206,
+                0.8609
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 88,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 1,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          }
+        }
+      },
+      "dark_factory_reify": {
+        "0.65_to_0.75": {
+          "contested": {
+            "attaches": 99,
+            "misfile": {
+              "k": 23,
+              "n": 99,
+              "rate": 0.2323,
+              "wilson95": [
+                0.1601,
+                0.3246
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 263,
+            "misfile": {
+              "k": 3,
+              "n": 6,
+              "rate": 0.5,
+              "wilson95": [
+                0.1876,
+                0.8124
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 6,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          }
+        },
+        "0.75_to_t_high": {
+          "contested": {
+            "attaches": 112,
+            "misfile": {
+              "k": 14,
+              "n": 112,
+              "rate": 0.125,
+              "wilson95": [
+                0.0759,
+                0.1989
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 293,
+            "misfile": {
+              "k": 2,
+              "n": 13,
+              "rate": 0.1538,
+              "wilson95": [
+                0.0433,
+                0.4224
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 15,
+            "misfile": {
+              "k": 0,
+              "n": 4,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.4899
+              ]
+            }
+          }
+        },
+        "at_or_above_t_high": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 19,
+            "misfile": {
+              "k": 2,
+              "n": 7,
+              "rate": 0.2857,
+              "wilson95": [
+                0.0822,
+                0.6411
+              ]
+            }
+          }
+        },
+        "below_t_low": {
+          "contested": {
+            "attaches": 2,
+            "misfile": {
+              "k": 2,
+              "n": 2,
+              "rate": 1.0,
+              "wilson95": [
+                0.3424,
+                1.0
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 11,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "t_low_to_0.65": {
+          "contested": {
+            "attaches": 27,
+            "misfile": {
+              "k": 15,
+              "n": 26,
+              "rate": 0.5769,
+              "wilson95": [
+                0.3895,
+                0.7446
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 66,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 1,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          }
+        }
+      },
+      "dark_factory": {
+        "0.65_to_0.75": {
+          "contested": {
+            "attaches": 49,
+            "misfile": {
+              "k": 15,
+              "n": 49,
+              "rate": 0.3061,
+              "wilson95": [
+                0.1952,
+                0.4453
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 135,
+            "misfile": {
+              "k": 1,
+              "n": 3,
+              "rate": 0.3333,
+              "wilson95": [
+                0.0615,
+                0.7923
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 4,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          }
+        },
+        "0.75_to_t_high": {
+          "contested": {
+            "attaches": 58,
+            "misfile": {
+              "k": 8,
+              "n": 58,
+              "rate": 0.1379,
+              "wilson95": [
+                0.0716,
+                0.2493
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 133,
+            "misfile": {
+              "k": 1,
+              "n": 6,
+              "rate": 0.1667,
+              "wilson95": [
+                0.0301,
+                0.5635
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 7,
+            "misfile": {
+              "k": 0,
+              "n": 3,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.5615
+              ]
+            }
+          }
+        },
+        "at_or_above_t_high": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 8,
+            "misfile": {
+              "k": 2,
+              "n": 2,
+              "rate": 1.0,
+              "wilson95": [
+                0.3424,
+                1.0
+              ]
+            }
+          }
+        },
+        "below_t_low": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 3,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "t_low_to_0.65": {
+          "contested": {
+            "attaches": 17,
+            "misfile": {
+              "k": 10,
+              "n": 17,
+              "rate": 0.5882,
+              "wilson95": [
+                0.3601,
+                0.7839
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 27,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "reify": {
+        "0.65_to_0.75": {
+          "contested": {
+            "attaches": 50,
+            "misfile": {
+              "k": 8,
+              "n": 50,
+              "rate": 0.16,
+              "wilson95": [
+                0.0834,
+                0.2851
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 128,
+            "misfile": {
+              "k": 2,
+              "n": 3,
+              "rate": 0.6667,
+              "wilson95": [
+                0.2077,
+                0.9385
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 2,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "0.75_to_t_high": {
+          "contested": {
+            "attaches": 54,
+            "misfile": {
+              "k": 6,
+              "n": 54,
+              "rate": 0.1111,
+              "wilson95": [
+                0.0519,
+                0.2219
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 160,
+            "misfile": {
+              "k": 1,
+              "n": 7,
+              "rate": 0.1429,
+              "wilson95": [
+                0.0257,
+                0.5131
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 8,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          }
+        },
+        "at_or_above_t_high": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 11,
+            "misfile": {
+              "k": 0,
+              "n": 5,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.4345
+              ]
+            }
+          }
+        },
+        "below_t_low": {
+          "contested": {
+            "attaches": 2,
+            "misfile": {
+              "k": 2,
+              "n": 2,
+              "rate": 1.0,
+              "wilson95": [
+                0.3424,
+                1.0
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 8,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "t_low_to_0.65": {
+          "contested": {
+            "attaches": 10,
+            "misfile": {
+              "k": 5,
+              "n": 9,
+              "rate": 0.5556,
+              "wilson95": [
+                0.2666,
+                0.8112
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 39,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 1,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          }
+        }
+      },
+      "scoping_intake": {
+        "0.65_to_0.75": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 9,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "0.75_to_t_high": {
+          "contested": {
+            "attaches": 2,
+            "misfile": {
+              "k": 0,
+              "n": 2,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 3,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "t_low_to_0.65": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 5,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "solar_challenge": {
+        "0.65_to_0.75": {
+          "contested": {
+            "attaches": 48,
+            "misfile": {
+              "k": 24,
+              "n": 48,
+              "rate": 0.5,
+              "wilson95": [
+                0.3639,
+                0.6361
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 131,
+            "misfile": {
+              "k": 2,
+              "n": 7,
+              "rate": 0.2857,
+              "wilson95": [
+                0.0822,
+                0.6411
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 8,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          }
+        },
+        "0.75_to_t_high": {
+          "contested": {
+            "attaches": 51,
+            "misfile": {
+              "k": 8,
+              "n": 51,
+              "rate": 0.1569,
+              "wilson95": [
+                0.0817,
+                0.2801
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 135,
+            "misfile": {
+              "k": 0,
+              "n": 3,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.5615
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 25,
+            "misfile": {
+              "k": 1,
+              "n": 8,
+              "rate": 0.125,
+              "wilson95": [
+                0.0224,
+                0.4709
+              ]
+            }
+          }
+        },
+        "at_or_above_t_high": {
+          "contested": {
+            "attaches": 1,
+            "misfile": {
+              "k": 0,
+              "n": 1,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.7935
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 33,
+            "misfile": {
+              "k": 2,
+              "n": 12,
+              "rate": 0.1667,
+              "wilson95": [
+                0.047,
+                0.448
+              ]
+            }
+          }
+        },
+        "below_t_low": {
+          "contested": {
+            "attaches": 4,
+            "misfile": {
+              "k": 4,
+              "n": 4,
+              "rate": 1.0,
+              "wilson95": [
+                0.5101,
+                1.0
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 22,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "t_low_to_0.65": {
+          "contested": {
+            "attaches": 27,
+            "misfile": {
+              "k": 23,
+              "n": 27,
+              "rate": 0.8519,
+              "wilson95": [
+                0.6752,
+                0.9408
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 51,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        }
+      },
+      "solar_challenge_platform": {
+        "0.65_to_0.75": {
+          "contested": {
+            "attaches": 42,
+            "misfile": {
+              "k": 15,
+              "n": 42,
+              "rate": 0.3571,
+              "wilson95": [
+                0.2299,
+                0.5083
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 105,
+            "misfile": {
+              "k": 3,
+              "n": 5,
+              "rate": 0.6,
+              "wilson95": [
+                0.2307,
+                0.8824
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 3,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "0.75_to_t_high": {
+          "contested": {
+            "attaches": 35,
+            "misfile": {
+              "k": 10,
+              "n": 35,
+              "rate": 0.2857,
+              "wilson95": [
+                0.1633,
+                0.4506
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 94,
+            "misfile": {
+              "k": 0,
+              "n": 3,
+              "rate": 0.0,
+              "wilson95": [
+                0.0,
+                0.5615
+              ]
+            }
+          },
+          "restated": {
+            "attaches": 2,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "at_or_above_t_high": {
+          "contested": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "amended": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 11,
+            "misfile": {
+              "k": 2,
+              "n": 4,
+              "rate": 0.5,
+              "wilson95": [
+                0.15,
+                0.85
+              ]
+            }
+          }
+        },
+        "below_t_low": {
+          "contested": {
+            "attaches": 1,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 3,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 0,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          }
+        },
+        "t_low_to_0.65": {
+          "contested": {
+            "attaches": 19,
+            "misfile": {
+              "k": 12,
+              "n": 19,
+              "rate": 0.6316,
+              "wilson95": [
+                0.4104,
+                0.8085
+              ]
+            }
+          },
+          "amended": {
+            "attaches": 32,
+            "misfile": {
+              "k": 0,
+              "n": 0,
+              "rate": null,
+              "wilson95": null
+            }
+          },
+          "restated": {
+            "attaches": 1,
+            "misfile": {
+              "k": 1,
+              "n": 1,
+              "rate": 1.0,
+              "wilson95": [
+                0.2065,
+                1.0
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "guard_residual": {
+    "solar": {
+      "contested": {
+        "attaches": 230,
+        "removed": 63,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 24,
+          "hoist_cosine_gap": 54
+        },
+        "rated_misfiles_removed": 48,
+        "rated_non_misfiles_removed": 15,
+        "misfile_before": {
+          "k": 97,
+          "n": 230,
+          "rate": 0.4217,
+          "wilson95": [
+            0.3597,
+            0.4863
+          ]
+        },
+        "misfile_after": {
+          "k": 49,
+          "n": 167,
+          "rate": 0.2934,
+          "wilson95": [
+            0.2296,
+            0.3665
+          ]
+        }
+      },
+      "amended": {
+        "attaches": 590,
+        "removed": 172,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 67,
+          "hoist_cosine_gap": 163
+        },
+        "rated_misfiles_removed": 2,
+        "rated_non_misfiles_removed": 1,
+        "misfile_before": {
+          "k": 6,
+          "n": 19,
+          "rate": 0.3158,
+          "wilson95": [
+            0.1536,
+            0.5399
+          ]
+        },
+        "misfile_after": {
+          "k": 4,
+          "n": 16,
+          "rate": 0.25,
+          "wilson95": [
+            0.1018,
+            0.495
+          ]
+        }
+      },
+      "restated": {
+        "attaches": 83,
+        "removed": 0,
+        "removed_by_reason": {},
+        "rated_misfiles_removed": 0,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 6,
+          "n": 26,
+          "rate": 0.2308,
+          "wilson95": [
+            0.1103,
+            0.4205
+          ]
+        },
+        "misfile_after": {
+          "k": 6,
+          "n": 26,
+          "rate": 0.2308,
+          "wilson95": [
+            0.1103,
+            0.4205
+          ]
+        }
+      }
+    },
+    "dark_factory_reify": {
+      "contested": {
+        "attaches": 240,
+        "removed": 27,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 8,
+          "hoist_cosine_gap": 26
+        },
+        "rated_misfiles_removed": 15,
+        "rated_non_misfiles_removed": 12,
+        "misfile_before": {
+          "k": 54,
+          "n": 239,
+          "rate": 0.2259,
+          "wilson95": [
+            0.1775,
+            0.2831
+          ]
+        },
+        "misfile_after": {
+          "k": 39,
+          "n": 212,
+          "rate": 0.184,
+          "wilson95": [
+            0.1376,
+            0.2416
+          ]
+        }
+      },
+      "amended": {
+        "attaches": 633,
+        "removed": 106,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 34,
+          "hoist_cosine_gap": 99
+        },
+        "rated_misfiles_removed": 4,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 7,
+          "n": 21,
+          "rate": 0.3333,
+          "wilson95": [
+            0.1719,
+            0.5463
+          ]
+        },
+        "misfile_after": {
+          "k": 3,
+          "n": 17,
+          "rate": 0.1765,
+          "wilson95": [
+            0.0619,
+            0.4103
+          ]
+        }
+      },
+      "restated": {
+        "attaches": 41,
+        "removed": 1,
+        "removed_by_reason": {
+          "hoist_cosine_gap": 1
+        },
+        "rated_misfiles_removed": 0,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 3,
+          "n": 13,
+          "rate": 0.2308,
+          "wilson95": [
+            0.0818,
+            0.5026
+          ]
+        },
+        "misfile_after": {
+          "k": 3,
+          "n": 13,
+          "rate": 0.2308,
+          "wilson95": [
+            0.0818,
+            0.5026
+          ]
+        }
+      }
+    },
+    "dark_factory": {
+      "contested": {
+        "attaches": 124,
+        "removed": 15,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 4,
+          "hoist_cosine_gap": 14
+        },
+        "rated_misfiles_removed": 8,
+        "rated_non_misfiles_removed": 7,
+        "misfile_before": {
+          "k": 33,
+          "n": 124,
+          "rate": 0.2661,
+          "wilson95": [
+            0.1962,
+            0.3501
+          ]
+        },
+        "misfile_after": {
+          "k": 25,
+          "n": 109,
+          "rate": 0.2294,
+          "wilson95": [
+            0.1605,
+            0.3167
+          ]
+        }
+      },
+      "amended": {
+        "attaches": 298,
+        "removed": 51,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 16,
+          "hoist_cosine_gap": 46
+        },
+        "rated_misfiles_removed": 1,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 3,
+          "n": 10,
+          "rate": 0.3,
+          "wilson95": [
+            0.1078,
+            0.6032
+          ]
+        },
+        "misfile_after": {
+          "k": 2,
+          "n": 9,
+          "rate": 0.2222,
+          "wilson95": [
+            0.0632,
+            0.5474
+          ]
+        }
+      },
+      "restated": {
+        "attaches": 19,
+        "removed": 0,
+        "removed_by_reason": {},
+        "rated_misfiles_removed": 0,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 2,
+          "n": 6,
+          "rate": 0.3333,
+          "wilson95": [
+            0.0968,
+            0.7
+          ]
+        },
+        "misfile_after": {
+          "k": 2,
+          "n": 6,
+          "rate": 0.3333,
+          "wilson95": [
+            0.0968,
+            0.7
+          ]
+        }
+      }
+    },
+    "reify": {
+      "contested": {
+        "attaches": 116,
+        "removed": 12,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 4,
+          "hoist_cosine_gap": 12
+        },
+        "rated_misfiles_removed": 7,
+        "rated_non_misfiles_removed": 5,
+        "misfile_before": {
+          "k": 21,
+          "n": 115,
+          "rate": 0.1826,
+          "wilson95": [
+            0.1227,
+            0.2631
+          ]
+        },
+        "misfile_after": {
+          "k": 14,
+          "n": 103,
+          "rate": 0.1359,
+          "wilson95": [
+            0.0827,
+            0.2153
+          ]
+        }
+      },
+      "amended": {
+        "attaches": 335,
+        "removed": 55,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 18,
+          "hoist_cosine_gap": 53
+        },
+        "rated_misfiles_removed": 3,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 4,
+          "n": 11,
+          "rate": 0.3636,
+          "wilson95": [
+            0.1517,
+            0.6462
+          ]
+        },
+        "misfile_after": {
+          "k": 1,
+          "n": 8,
+          "rate": 0.125,
+          "wilson95": [
+            0.0224,
+            0.4709
+          ]
+        }
+      },
+      "restated": {
+        "attaches": 22,
+        "removed": 1,
+        "removed_by_reason": {
+          "hoist_cosine_gap": 1
+        },
+        "rated_misfiles_removed": 0,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 1,
+          "n": 7,
+          "rate": 0.1429,
+          "wilson95": [
+            0.0257,
+            0.5131
+          ]
+        },
+        "misfile_after": {
+          "k": 1,
+          "n": 7,
+          "rate": 0.1429,
+          "wilson95": [
+            0.0257,
+            0.5131
+          ]
+        }
+      }
+    },
+    "scoping_intake": {
+      "contested": {
+        "attaches": 2,
+        "removed": 0,
+        "removed_by_reason": {},
+        "rated_misfiles_removed": 0,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 0,
+          "n": 2,
+          "rate": 0.0,
+          "wilson95": [
+            0.0,
+            0.6576
+          ]
+        },
+        "misfile_after": {
+          "k": 0,
+          "n": 2,
+          "rate": 0.0,
+          "wilson95": [
+            0.0,
+            0.6576
+          ]
+        }
+      },
+      "amended": {
+        "attaches": 17,
+        "removed": 4,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 2,
+          "hoist_cosine_gap": 2
+        },
+        "rated_misfiles_removed": 0,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 0,
+          "n": 0,
+          "rate": null,
+          "wilson95": null
+        },
+        "misfile_after": {
+          "k": 0,
+          "n": 0,
+          "rate": null,
+          "wilson95": null
+        }
+      },
+      "restated": {
+        "attaches": 0,
+        "removed": 0,
+        "removed_by_reason": {},
+        "rated_misfiles_removed": 0,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 0,
+          "n": 0,
+          "rate": null,
+          "wilson95": null
+        },
+        "misfile_after": {
+          "k": 0,
+          "n": 0,
+          "rate": null,
+          "wilson95": null
+        }
+      }
+    },
+    "solar_challenge": {
+      "contested": {
+        "attaches": 131,
+        "removed": 41,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 15,
+          "hoist_cosine_gap": 35
+        },
+        "rated_misfiles_removed": 30,
+        "rated_non_misfiles_removed": 11,
+        "misfile_before": {
+          "k": 59,
+          "n": 131,
+          "rate": 0.4504,
+          "wilson95": [
+            0.3678,
+            0.5358
+          ]
+        },
+        "misfile_after": {
+          "k": 29,
+          "n": 90,
+          "rate": 0.3222,
+          "wilson95": [
+            0.2347,
+            0.4243
+          ]
+        }
+      },
+      "amended": {
+        "attaches": 339,
+        "removed": 120,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 49,
+          "hoist_cosine_gap": 118
+        },
+        "rated_misfiles_removed": 2,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 3,
+          "n": 11,
+          "rate": 0.2727,
+          "wilson95": [
+            0.0975,
+            0.5657
+          ]
+        },
+        "misfile_after": {
+          "k": 1,
+          "n": 9,
+          "rate": 0.1111,
+          "wilson95": [
+            0.0199,
+            0.435
+          ]
+        }
+      },
+      "restated": {
+        "attaches": 66,
+        "removed": 0,
+        "removed_by_reason": {},
+        "rated_misfiles_removed": 0,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 3,
+          "n": 21,
+          "rate": 0.1429,
+          "wilson95": [
+            0.0498,
+            0.3464
+          ]
+        },
+        "misfile_after": {
+          "k": 3,
+          "n": 21,
+          "rate": 0.1429,
+          "wilson95": [
+            0.0498,
+            0.3464
+          ]
+        }
+      }
+    },
+    "solar_challenge_platform": {
+      "contested": {
+        "attaches": 97,
+        "removed": 22,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 9,
+          "hoist_cosine_gap": 19
+        },
+        "rated_misfiles_removed": 18,
+        "rated_non_misfiles_removed": 4,
+        "misfile_before": {
+          "k": 38,
+          "n": 97,
+          "rate": 0.3918,
+          "wilson95": [
+            0.3005,
+            0.4912
+          ]
+        },
+        "misfile_after": {
+          "k": 20,
+          "n": 75,
+          "rate": 0.2667,
+          "wilson95": [
+            0.1798,
+            0.3763
+          ]
+        }
+      },
+      "amended": {
+        "attaches": 234,
+        "removed": 48,
+        "removed_by_reason": {
+          "below_min_parent_cosine": 16,
+          "hoist_cosine_gap": 43
+        },
+        "rated_misfiles_removed": 0,
+        "rated_non_misfiles_removed": 1,
+        "misfile_before": {
+          "k": 3,
+          "n": 8,
+          "rate": 0.375,
+          "wilson95": [
+            0.1368,
+            0.6943
+          ]
+        },
+        "misfile_after": {
+          "k": 3,
+          "n": 7,
+          "rate": 0.4286,
+          "wilson95": [
+            0.1582,
+            0.7495
+          ]
+        }
+      },
+      "restated": {
+        "attaches": 17,
+        "removed": 0,
+        "removed_by_reason": {},
+        "rated_misfiles_removed": 0,
+        "rated_non_misfiles_removed": 0,
+        "misfile_before": {
+          "k": 3,
+          "n": 5,
+          "rate": 0.6,
+          "wilson95": [
+            0.2307,
+            0.8824
+          ]
+        },
+        "misfile_after": {
+          "k": 3,
+          "n": 5,
+          "rate": 0.6,
+          "wilson95": [
+            0.2307,
+            0.8824
+          ]
+        }
+      }
+    }
+  },
+  "replay": {
+    "solar_challenge": {
+      "project": {
+        "edges": {
+          "default": {
+            "t_high": {
+              "value": 0.8868282526657318,
+              "source": "pooled_fallback"
+            },
+            "t_low": {
+              "value": 0.5229672433064231,
+              "source": "pooled_fallback"
+            }
+          },
+          "by_category": {}
+        },
+        "matrix": {
+          "restated": {
+            "restated": 65,
+            "judge": 0,
+            "stored": 0
+          },
+          "judge": {
+            "restated": 0,
+            "judge": 848,
+            "stored": 0
+          },
+          "stored": {
+            "restated": 0,
+            "judge": 0,
+            "stored": 1
+          }
+        },
+        "into_stored": {
+          "movers": 0,
+          "rated_misfiles_removed": 0,
+          "rated_non_misfiles_lost": 0,
+          "unrated": 0
+        },
+        "other_moves": []
+      },
+      "project_category": {
+        "edges": {
+          "default": {
+            "t_high": {
+              "value": 0.8868282526657318,
+              "source": "pooled_fallback"
+            },
+            "t_low": {
+              "value": 0.5229672433064231,
+              "source": "pooled_fallback"
+            }
+          },
+          "by_category": {
+            "observations_and_summaries": {
+              "t_high": {
+                "value": 0.8868282526657318,
+                "source": "pooled_fallback"
+              },
+              "t_low": {
+                "value": 0.5229672433064231,
+                "source": "pooled_fallback"
+              }
+            },
+            "preferences_and_norms": {
+              "t_high": {
+                "value": 0.8868282526657318,
+                "source": "pooled_fallback"
+              },
+              "t_low": {
+                "value": 0.5229672433064231,
+                "source": "pooled_fallback"
+              }
+            },
+            "procedural_knowledge": {
+              "t_high": {
+                "value": 0.8868282526657318,
+                "source": "pooled_fallback"
+              },
+              "t_low": {
+                "value": 0.5229672433064231,
+                "source": "pooled_fallback"
+              }
+            }
+          }
+        },
+        "matrix": {
+          "restated": {
+            "restated": 65,
+            "judge": 0,
+            "stored": 0
+          },
+          "judge": {
+            "restated": 0,
+            "judge": 848,
+            "stored": 0
+          },
+          "stored": {
+            "restated": 0,
+            "judge": 0,
+            "stored": 1
+          }
+        },
+        "into_stored": {
+          "movers": 0,
+          "rated_misfiles_removed": 0,
+          "rated_non_misfiles_lost": 0,
+          "unrated": 0
+        },
+        "other_moves": []
+      }
+    },
+    "solar_challenge_platform": {
+      "project": {
+        "edges": {
+          "default": {
+            "t_high": {
+              "value": 0.8868282526657318,
+              "source": "pooled_fallback"
+            },
+            "t_low": {
+              "value": 0.5229672433064231,
+              "source": "pooled_fallback"
+            }
+          },
+          "by_category": {}
+        },
+        "matrix": {
+          "restated": {
+            "restated": 16,
+            "judge": 0,
+            "stored": 0
+          },
+          "judge": {
+            "restated": 0,
+            "judge": 643,
+            "stored": 0
+          },
+          "stored": {
+            "restated": 0,
+            "judge": 0,
+            "stored": 2
+          }
+        },
+        "into_stored": {
+          "movers": 0,
+          "rated_misfiles_removed": 0,
+          "rated_non_misfiles_lost": 0,
+          "unrated": 0
+        },
+        "other_moves": []
+      },
+      "project_category": {
+        "edges": {
+          "default": {
+            "t_high": {
+              "value": 0.8868282526657318,
+              "source": "pooled_fallback"
+            },
+            "t_low": {
+              "value": 0.5229672433064231,
+              "source": "pooled_fallback"
+            }
+          },
+          "by_category": {
+            "observations_and_summaries": {
+              "t_high": {
+                "value": 0.8868282526657318,
+                "source": "pooled_fallback"
+              },
+              "t_low": {
+                "value": 0.5229672433064231,
+                "source": "pooled_fallback"
+              }
+            },
+            "procedural_knowledge": {
+              "t_high": {
+                "value": 0.8868282526657318,
+                "source": "pooled_fallback"
+              },
+              "t_low": {
+                "value": 0.5229672433064231,
+                "source": "pooled_fallback"
+              }
+            },
+            "preferences_and_norms": {
+              "t_high": {
+                "value": 0.8868282526657318,
+                "source": "pooled_fallback"
+              },
+              "t_low": {
+                "value": 0.5229672433064231,
+                "source": "pooled_fallback"
+              }
+            }
+          }
+        },
+        "matrix": {
+          "restated": {
+            "restated": 16,
+            "judge": 0,
+            "stored": 0
+          },
+          "judge": {
+            "restated": 0,
+            "judge": 643,
+            "stored": 0
+          },
+          "stored": {
+            "restated": 0,
+            "judge": 0,
+            "stored": 2
+          }
+        },
+        "into_stored": {
+          "movers": 0,
+          "rated_misfiles_removed": 0,
+          "rated_non_misfiles_lost": 0,
+          "unrated": 0
+        },
+        "other_moves": []
+      }
+    }
+  }
+}
