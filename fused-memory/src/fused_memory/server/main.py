@@ -1037,6 +1037,7 @@ async def run_server():
         curator_usage_gate=curator_usage_gate,
         known_projects=_known_projects_map,
         topic_cluster_store=topic_cluster_store,
+        markup_residue_spool=markup_residue_spool,
     )
 
     # Both ToolManager.call_tool wrappers, in the ONE order that works. The

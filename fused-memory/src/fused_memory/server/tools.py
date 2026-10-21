@@ -253,6 +253,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
+    from fused_memory.server.markup_residue_spool import MarkupResidueSpool
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
@@ -1348,6 +1349,7 @@ def create_mcp_server(
     known_projects: dict[str, str] | None = None,
     topic_cluster_store: TopicClusterStore | None = None,
     id_resolver: IdResolver | None = None,
+    markup_residue_spool: MarkupResidueSpool | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
@@ -7742,6 +7744,11 @@ def create_mcp_server(
         ``queue`` is the durable-write-queue subsystem, and conflating it with
         reconciliation state is the exact mis-triage task 2920 fixed.
 
+        A top-level ``markup_residue`` field is present when the markup guard's
+        residue floor is wired (task 4809). A non-zero
+        ``preservation_failures`` counts refused payloads this process could
+        not preserve anywhere; ``spool_dir`` is the floor to inspect.
+
         Args:
             project_id: Get stats for a specific project (optional)
         """
@@ -7814,6 +7821,15 @@ def create_mcp_server(
         # exact mis-triage task 2920 fixed.
         if write_journal is not None and isinstance(result, dict) and 'error' not in result:
             result['journal_drops'] = write_journal.journal_drop_stats()
+
+        # task 4809 (INV-4): refused payloads the markup guard lost. Top-level
+        # and present-when-wired for the same reasons as `journal_drops`.
+        if (
+            markup_residue_spool is not None
+            and isinstance(result, dict)
+            and 'error' not in result
+        ):
+            result['markup_residue'] = markup_residue_spool.status()
 
         return result
 
