@@ -124,6 +124,7 @@ from legibility import (  # noqa: E402
     session_ledger,
     session_runner,
     similarity,
+    synthesis,
     task_store,
     unlanded,
 )
@@ -3681,36 +3682,31 @@ def _verify_prompt(cluster: dict, *, project_root: str, quality_block: str) -> s
     )
 
 
-def _verdict_as_json(value):
-    """``json.dumps`` hook rendering a cluster's Verdict as its record."""
-    if isinstance(value, verdict_mod.Verdict):
-        return value.to_record()
-    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
-
-
-def _synthesis_prompt(verified: list, *, quality_block: str) -> str:
-    """Prompt for the real Fable synthesize_fn: cluster + write prose for
-    the dated census report from the VERIFIED findings only, citing the
-    heuristics of *quality_block* (``code_quality.guidance``) each finding's
-    verdict tags."""
+def _synthesis_prompt(brief: synthesis.Brief, *, quality_block: str) -> str:
+    """Prompt for the real Fable synthesize_fn: observations on this run's new
+    and re-observed findings (*brief*), as the C6 document ``synthesis.parse``
+    validates, judged against *quality_block* (``code_quality.guidance``)."""
     return (
         "You are the periodic-census synthesis writer for the dark-factory "
-        "agent-confusion codebook (plans/confusion-reduction-prd.md "
-        "section 5.7). Cluster the VERIFIED confusion findings below and "
-        "write clear, factual prose for a dated census report -- "
-        "observations only, never a diagnosis that was not itself "
-        "verified.\n\n"
-        "Your prose is embedded verbatim in the report and is never parsed: "
-        "nothing you write is applied to the codebook "
-        "(docs/legibility/confusion-codebook.yaml). Put any codebook change "
-        "you propose under a heading reading exactly "
-        f"'{SYNTHESIS_PROPOSALS_HEADING}', and never describe such proposals "
-        "as inputs to the merger.\n\n"
-        "Each cluster's verdict tags name the heuristics of the quality "
-        "definition below that its finding rests on; cite those heuristics "
-        "by name where the prose discusses the finding.\n\n"
+        "agent-confusion codebook (plans/census-incremental-prd.md C6). You have "
+        "no tools: everything you need is in this message.\n\n"
+        "The brief below holds only this run's findings: the new ones this run "
+        "promoted, and the re_observed ones that gained a session this run. Write "
+        "observations only, never a diagnosis that was not itself verified, and "
+        "never narrate history or earlier reports: the runner renders the standing "
+        "findings and every count itself.\n\n"
+        "new: an observation on a new finding. re_observed: what this run's "
+        "evidence changes about a finding, if anything. phase_refinements: a "
+        "judged finding's origin and manifested phase, where the brief's evidence "
+        "places them better than its stamp; they are applied to the matrix and to "
+        "the entries this run created. corrections: a standing re-observed entry "
+        "whose title or cause this run's evidence refutes; they are applied to the "
+        "codebook. notes: anything else a reader should weigh, never verified.\n\n"
+        "A new finding's tags name the heuristics of the quality definition below "
+        "that it rests on; cite those heuristics by name.\n\n"
         + _QUALITY_DEFINITION_MARKER + quality_block
-        + "\n=== VERIFIED CLUSTERS ===\n" + json.dumps(verified, default=_verdict_as_json)
+        + "\n=== RESPONSE ===\n" + synthesis.reply_instructions()
+        + "\n=== BRIEF ===\n" + json.dumps(brief.to_record())
     )
 
 
@@ -4049,16 +4045,13 @@ def _build_default_verify_fn(
 
 
 def _build_default_synthesize_fn(invoke):
-    """Build the real ``synthesize_fn(verified, *, model)`` seam: one
-    Fable call via *invoke* clustering + writing prose for the verified
-    findings. An empty *verified* list is handled without a model call --
-    there is nothing to synthesize."""
+    """Build the real ``synthesize_fn(brief, *, model) -> str`` seam: one
+    Fable call via *invoke*, its raw reply left for ``synthesis.parse``. It
+    always calls: run_census makes no call for an empty brief."""
     quality_block = code_quality.guidance()
 
-    def _synthesize_fn(verified, *, model):
-        if not verified:
-            return "No novel, verified confusion clusters this census."
-        return invoke(_synthesis_prompt(verified, quality_block=quality_block), model)
+    def _synthesize_fn(brief: synthesis.Brief, *, model: str) -> str:
+        return invoke(_synthesis_prompt(brief, quality_block=quality_block), model)
 
     return _synthesize_fn
 
