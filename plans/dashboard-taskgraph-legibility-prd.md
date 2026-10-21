@@ -265,6 +265,17 @@ rows, delivered upstream by δ.
 2. **Payload growth from done-member inclusion.** Always-on per decision 7.
    **Suggested resolution:** if `/api/v2/dashboard/tasks` exceeds ~1 MB in
    practice, add a `?prd_members=` opt-out then. Decide if observed.
+
+   *Note, 2026-10-21 (task 5824).* The ~1 MB trigger was crossed and nothing
+   observed it. The endpoint measured 16.6 MB on 2026-09-20 and 17.4 MB on
+   2026-09-23. Task 5815 then cut it to about 4.4 MB (4,351,859 bytes on
+   2026-10-15). The done-member inclusion this question is about is retired:
+   `dashboard/src/dashboard/api/tasks.py::api_tasks` documents that the live-PRD
+   terminal-member exemption is gone and that terminal rows travel only on a
+   `?terminal=` request. The trigger is no longer prose. Every request has a
+   mechanized budget in `dashboard/src/dashboard/payload_budgets.json`,
+   enforced pre-merge by a fixture sweep and live by a daily predicate
+   (`OPERATIONS.md`, "Payload budgets").
 3. **Focus-mode affordance placement** (button in detail panel vs
    double-click vs both). **Suggested resolution:** button in the detail
    panel + double-click shortcut. Decide during γ.
