@@ -238,6 +238,11 @@ class EventType(StrEnum):
     #   - merge_shadow's warm/cold compare emits a wholly different
     #     {merge_commit, shadow_compare, warm_test_count, cold_test_count}.
     verdict_parity_ok = 'verdict_parity_ok'
+    # A due drift check could not acquire both host slots within its settle
+    # window, so it ran nothing and re-arms for the next landing.  Producer:
+    # merge_lane/drift.py::_run_drift_check.  Payload {merge_sha,
+    # consecutive_deferrals, hosts}, hosts being HostAllocator.host_states().
+    drift_check_deferred = 'drift_check_deferred'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence
     # and local-infra-inconclusive outcomes their own auditable types.
