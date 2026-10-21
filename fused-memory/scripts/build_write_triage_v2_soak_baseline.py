@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Build the rubric v2 baseline over the 2026-10-19 soak's 553 adjudicated attaches.
+"""Build the rubric v2.1 baseline over the 2026-10-19 soak's attaches.
 
 One-shot. It reads the gitignored soak bundle
-(``data/write-triage-soak-2026-10-19/correctness/`` in the main checkout)
-read-only, and never writes inside it. The v1 ratings there already fix some
-of rubric v2's binaries; :func:`v1_determined` is the one statement of which
-ones. Items whose correctness the v1 labels leave open are rated blind under
-``calibration/write_triage_rater_brief_v2.md``.
+(``data/write-triage-soak-2026-10-19/correctness/`` in the main checkout),
+the write journal and mem0's history, all read-only, and never writes inside
+the bundle. Every item is rated blind by two raters under
+``calibration/write_triage_rater_brief_v2.md``; a v1 label fixes a binary only
+through a row :func:`derivation_check` holds.
 
 Subcommands, run from ``fused-memory/``:
 
-- ``shards``: write the primary shards over every item, a seeded
-  second-rater overlap, attach-time shards for parents edited after attach,
-  ``key.json`` and ``rater_prompt.md`` into ``--scratch``.
+- ``shards``: extend the restated and amended samples (R8), then write a
+  primary and a second shard set over every pair, attach-time pairs in their
+  own shards, plus ``key.json``, ``texts.json`` and ``rater_prompt.md`` into
+  ``--scratch``. A re-run shards only what is not yet keyed.
 - ``third``: after the first ratings, write a shard holding exactly the pairs
   whose decisive binaries are tied, for a third rater.
 - ``assemble``: map the ratings back through the key and write the committed
@@ -38,7 +39,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
-from fused_memory.server.grouped_read import _digest
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -62,12 +62,11 @@ Role = _rubric.Role
 
 BRIEF_PATH = _SCRIPTS.parent / 'calibration' / 'write_triage_rater_brief_v2.md'
 TEXT_CAP = 4000
-PRIMARY_SHARD_SIZE = 45
-ANCHORS_PER_SHARD = 5
-SECOND_OVERLAP = 80
-SECOND_SHARD_SIZE = 40
+SHARD_SIZE = 40
+SAMPLE_TOTAL = 100
+"""How many restated and how many amended attaches the extended sample holds (R8)."""
 RATER_MODELS: Mapping[str, str] = MappingProxyType({
-    Role.PRIMARY: 'opus', Role.SECOND: 'sonnet', Role.THIRD: 'opus',
+    Role.PRIMARY: 'opus', Role.SECOND: 'opus', Role.THIRD: 'opus',
 })
 DERIVED_RATER = 'v1-soak-2026-10-19'
 DERIVED_BATCH = 'soak-2026-10-19-adjudications'
@@ -250,28 +249,29 @@ def held_rows(check: Mapping[str, RowCheck]) -> frozenset[str]:
 
 
 def item_row(
-    adjudication: Mapping[str, Any],
+    attach: Mapping[str, Any],
     *,
+    child_memory_id: str,
     high_band: bool | None,
+    via_sibling: bool | None,
     parent_category: str | None,
-    child_metadata: Mapping[str, Any],
+    parent_edited_after_attach: bool,
 ) -> dict[str, Any]:
-    """The scorer's item row for one soak attach (``score_write_triage_reader.py::ReaderItem``)."""
-    parent_id = adjudication['parent_id']
+    """The scorer's item row (``score_write_triage_reader.py::ReaderItem``) for one soak attach record."""
+    meta = attach['meta']
+    parent_id = meta['parent_id']
     return {
-        'entry_id': adjudication['child_memory_id'],
-        'outcome': adjudication['outcome'],
+        'entry_id': child_memory_id,
+        'outcome': attach['outcome'],
         'target_id': parent_id,
         'earlier_ids': [],
         'band': _BAND_BY_HIGH[high_band],
-        'project': adjudication['project'],
-        'stratum': STRATUM_BY_OUTCOME[adjudication['outcome']],
-        'via_sibling': adjudication.get('likely_via_sibling'),
-        'cross_category': (
-            None if parent_category is None else adjudication['category'] != parent_category
-        ),
-        'parent_edited_after_attach': adjudication.get('parent_edited_after_attach'),
-        'supersedes_target': parent_id in (child_metadata.get('supersedes') or []),
+        'project': attach['project'],
+        'stratum': STRATUM_BY_OUTCOME[attach['outcome']],
+        'via_sibling': via_sibling,
+        'cross_category': None if parent_category is None else attach['category'] != parent_category,
+        'parent_edited_after_attach': parent_edited_after_attach,
+        'supersedes_target': parent_id in (meta.get('supersedes') or []),
         'superseded_marks': [],
     }
 
@@ -324,9 +324,7 @@ def attach_time_text(
     the parent was not edited after it; None when that UPDATE kept no old text.
     """
     child_at = datetime.fromisoformat(child_created_at)
-    uri = f'{Path(history_db).resolve().as_uri()}?mode=ro'
-    with closing(sqlite3.connect(uri, uri=True)) as connection:
-        connection.execute('PRAGMA temp_store=MEMORY')
+    with _read_only(history_db) as connection:
         edits = connection.execute(
             "SELECT old_memory, updated_at FROM history WHERE memory_id = ? AND event = 'UPDATE'",
             (parent_id,),
@@ -338,6 +336,28 @@ def attach_time_text(
     if not later:
         return current_text
     return min(later, key=lambda edit: edit[0])[1]
+
+
+def _read_only(database: Path) -> closing[sqlite3.Connection]:
+    connection = sqlite3.connect(f'{Path(database).resolve().as_uri()}?mode=ro', uri=True)
+    connection.execute('PRAGMA temp_store=MEMORY')
+    return closing(connection)
+
+
+def extend_sample(
+    population: Iterable[str], sampled: Iterable[str], total: int, *, seed: int | str,
+) -> list[str]:
+    """The ids to add so that *total* of *population* are sampled, in draw order.
+
+    A seeded permutation of the unsampled ids, cut to length, so a larger
+    *total* extends a smaller one's draw. Sampled ids outside *population* do not count.
+    """
+    members = frozenset(population)
+    if total > len(members):
+        raise ValueError(f'a sample of {total} exceeds the population of {len(members)}')
+    already = members & frozenset(sampled)
+    unsampled = sorted(members - already)
+    return random.Random(seed).sample(unsampled, len(unsampled))[:max(0, total - len(already))]
 
 
 @dataclass(frozen=True)
@@ -360,8 +380,26 @@ class Shard:
     key: Mapping[str, Mapping[str, str]]
 
 
+def _entry_order(entry: ShardEntry) -> tuple[str, str, str]:
+    return (entry.entry_id, entry.target_id, entry.basis)
+
+
+def plan_shards(
+    entries: Iterable[ShardEntry], *, role: str, prefix: str, seed: int | str, first_index: int,
+) -> list[tuple[str, list[ShardEntry]]]:
+    """*entries* in a seeded per-role order, dealt into named shards of at most :data:`SHARD_SIZE`.
+
+    Shards are named ``<prefix><role>_<NN>``, numbered from *first_index*.
+    """
+    ordered = sorted(entries, key=_entry_order)
+    random.Random(f'{seed}:{prefix}{role}').shuffle(ordered)
+    count = math.ceil(len(ordered) / SHARD_SIZE)
+    return [(f'{prefix}{role}_{first_index + index:02d}', ordered[index::count])
+            for index in range(count)]
+
+
 def shard(entries: Sequence[ShardEntry], *, name: str) -> Shard:
-    """Render *entries*, in order, in the soak's shard layout plus the reader's child digest."""
+    """Render *entries*, in order, in the soak's shard layout."""
     lines: list[str] = []
     key: dict[str, Mapping[str, str]] = {}
     for index, entry in enumerate(entries):
@@ -373,7 +411,6 @@ def shard(entries: Sequence[ShardEntry], *, name: str) -> Shard:
             f'=== ITEM id={item_id} | project={entry.project} | basis={entry.basis}',
             '--- PARENT:', _capped(entry.parent_text),
             '--- CHILD:', _capped(entry.child_text),
-            '--- CHILD DIGEST:', _digest(entry.child_text),
             '',
         ]
     return Shard(text='\n'.join(lines) + '\n', key=MappingProxyType(key))
@@ -514,34 +551,129 @@ class _SoakItem:
         )
 
 
+class _Unrecoverable(ValueError):
+    """A drawn attach whose child id or current parent text no read-only source holds."""
+
+
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text())
 
 
-def _load_bundle(bundle: Path) -> list[_SoakItem]:
-    adjudications = [
-        json.loads(line) for line in (bundle / 'adjudications.jsonl').read_text().splitlines()
-        if line.strip()
-    ]
-    texts = {row['child_memory_id']: row for row in _read_json(bundle / 'items_all.json')}
-    hoist = _read_json(bundle / 'hoist.json')
-    metadata = {row['intent_id']: row.get('meta') or {} for row in _read_json(bundle / 'attaches_soak.json')}
-    soak = []
-    for adjudication in adjudications:
-        text = texts[adjudication['child_memory_id']]
-        intent = adjudication['child_intent_id']
-        soak.append(_SoakItem(
+@dataclass(frozen=True)
+class _SoakBundle:
+    """The read-only soak bundle: the triage attaches, their parents and hoist flags, and the v1 adjudications.
+
+    Every map is keyed by the attach's intent id, except *parents*, keyed by parent id.
+    """
+
+    attaches: Mapping[str, Mapping[str, Any]]
+    adjudications: Mapping[str, Mapping[str, Any]]
+    parents: Mapping[str, Sequence[Mapping[str, Any]]]
+    hoist: Mapping[str, Mapping[str, Any]]
+    edited: frozenset[str]
+
+    @classmethod
+    def read(cls, directory: Path) -> _SoakBundle:
+        adjudications = [
+            json.loads(line) for line in (directory / 'adjudications.jsonl').read_text().splitlines()
+            if line.strip()
+        ]
+        return cls(
+            attaches={row['intent_id']: row for row in _read_json(directory / 'attaches_soak.json')
+                      if row.get('triage_sig')},
+            adjudications={row['child_intent_id']: row for row in adjudications},
+            parents=_read_json(directory / 'parents.json'),
+            hoist=_read_json(directory / 'hoist.json'),
+            edited=frozenset(_read_json(directory / 'parent_edited_after_attach.json')),
+        )
+
+    def population(self, outcome: str) -> frozenset[str]:
+        return frozenset(intent for intent, row in self.attaches.items() if row['outcome'] == outcome)
+
+    def item(self, intent: str, child_memory_id: str) -> _SoakItem:
+        """The one way a soak item is built, adjudicated or extension, against its parent's current text."""
+        attach = self.attaches[intent]
+        parent_id = attach['meta']['parent_id']
+        hits = self.parents.get(parent_id) or []
+        payload = hits[0]['payload'] if hits else {}
+        if not payload.get('data'):
+            raise _Unrecoverable(f'the bundle holds no current text for parent {parent_id}')
+        hoisted = self.hoist.get(intent, {})
+        return _SoakItem(
             item=item_row(
-                adjudication, high_band=hoist.get(intent, {}).get('high_band'),
-                parent_category=text.get('parent_category'),
-                child_metadata=metadata.get(intent, {}),
+                attach, child_memory_id=child_memory_id, high_band=hoisted.get('high_band'),
+                via_sibling=hoisted.get('likely_via_sibling'),
+                parent_category=payload.get('category'),
+                parent_edited_after_attach=intent in self.edited,
             ),
-            adjudication=adjudication,
-            child_text=text.get('child_text') or '',
-            parent_text=text.get('parent_text') or '',
-            child_created_at=adjudication['created_at'],
-        ))
-    return sorted(soak, key=lambda soaked: soaked.item['entry_id'])
+            adjudication=self.adjudications.get(intent),
+            child_text=attach['content'],
+            parent_text=payload['data'],
+            child_created_at=attach['created_at'],
+        )
+
+    def keyed_items(self, key: Mapping[str, Any]) -> list[_SoakItem]:
+        """Every adjudicated item and every recoverable extension item *key* records, by entry id."""
+        unrecoverable = {row['intent_id'] for row in key['unrecoverable']}
+        children = {intent: row['child_memory_id'] for intent, row in self.adjudications.items()}
+        children |= {
+            intent: record['child_memory_id'] for intent, record in key['extension'].items()
+            if intent not in unrecoverable
+        }
+        soak = [self.item(intent, child_memory_id) for intent, child_memory_id in children.items()]
+        return sorted(soak, key=lambda soaked: soaked.item['entry_id'])
+
+
+def _journal_child_id(journal: sqlite3.Connection, write_op_id: str) -> str:
+    row = journal.execute('SELECT result_summary FROM write_ops WHERE id = ?',
+                          (write_op_id,)).fetchone()
+    if row is None:
+        raise _Unrecoverable(f'the write journal holds no write op {write_op_id}')
+    memory_ids = json.loads(row[0] or '{}').get('memory_ids') or []
+    if len(memory_ids) != 1:
+        raise _Unrecoverable(f'write op {write_op_id} names {len(memory_ids)} memory ids, not one')
+    return memory_ids[0]
+
+
+def _draw_extension(
+    bundle: _SoakBundle, totals: Mapping[str, int], seed: int, journal_db: Path,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
+    """Each drawn intent id's outcome and child id, and the drawn attaches no source rebuilds.
+
+    An unrecoverable attach is recorded with its reason, never replaced by another draw.
+    """
+    extension: dict[str, dict[str, Any]] = {}
+    unrecoverable: list[dict[str, str]] = []
+    with _read_only(journal_db) as journal:
+        for outcome, total in totals.items():
+            drawn = extend_sample(bundle.population(outcome), bundle.adjudications, total,
+                                  seed=f'{seed}:{outcome}')
+            for intent in drawn:
+                child_memory_id: str | None = None
+                try:
+                    child_memory_id = _journal_child_id(journal, bundle.attaches[intent]['write_op_id'])
+                    bundle.item(intent, child_memory_id)
+                except _Unrecoverable as exc:
+                    unrecoverable.append({'intent_id': intent, 'outcome': outcome, 'reason': str(exc)})
+                extension[intent] = {'outcome': outcome, 'child_memory_id': child_memory_id}
+    return extension, sorted(unrecoverable, key=lambda row: row['intent_id'])
+
+
+def _rating_entries(soak: Sequence[_SoakItem], history_db: Path) -> tuple[list[ShardEntry], list[str]]:
+    """Each item's current pair, its attach-time pair when its parent was edited after attach,
+    and the entries whose attach-time text history does not keep."""
+    entries = [soaked.entry(Basis.CURRENT) for soaked in soak]
+    unrecoverable = []
+    for soaked in soak:
+        if not soaked.item['parent_edited_after_attach']:
+            continue
+        text = attach_time_text(history_db, soaked.item['target_id'],
+                                soaked.child_created_at, soaked.parent_text)
+        if text is None:
+            unrecoverable.append(soaked.item['entry_id'])
+        else:
+            entries.append(soaked.entry(Basis.ATTACH_TIME, text))
+    return entries, sorted(unrecoverable)
 
 
 def _refuse_inside(parser: argparse.ArgumentParser, scratch: Path, bundle: Path) -> None:
@@ -550,8 +682,17 @@ def _refuse_inside(parser: argparse.ArgumentParser, scratch: Path, bundle: Path)
         parser.error(f'--scratch {scratch} is inside the read-only --bundle {bundle}')
 
 
+def _keyed_order(item: Mapping[str, str]) -> tuple[str, str, str]:
+    """A key item's pair and basis, ordered as :func:`_entry_order` orders a shard entry."""
+    return (item['entry_id'], item['target_id'], item['basis'])
+
+
+_SHARD_PREFIX: Mapping[str, str] = MappingProxyType({Basis.CURRENT: '', Basis.ATTACH_TIME: 'attach_'})
+_DOUBLE_RATED = (Role.PRIMARY, Role.SECOND)
+
+
 class _Scratch:
-    """The scratch directory: shards, the key, the rater prompt and the ratings."""
+    """The scratch directory: shards, the key, the texts raters saw, the rater prompt and the ratings."""
 
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -559,23 +700,46 @@ class _Scratch:
 
     def load_key(self) -> dict[str, Any]:
         if not self.key_path.exists():
-            return {'shards': {}, 'items': {}, 'attach_time_unrecoverable': []}
+            return {'shards': {}, 'items': {}, 'extension': {}, 'unrecoverable': [],
+                    'attach_time_unrecoverable': []}
         return _read_json(self.key_path)
 
-    def write_shard(self, key: dict[str, Any], name: str, role: str, entries: Sequence[ShardEntry],
-                    anchors: frozenset[tuple[str, str]] = frozenset()) -> None:
+    def add_shards(self, key: dict[str, Any], entries: Sequence[ShardEntry], *, seed: int) -> list[str]:
+        """Shard each entry not yet keyed under each double-rating role; the new shards' names."""
+        keyed = {
+            (spec['role'], _keyed_order(key['items'][item]))
+            for spec in key['shards'].values() for item in spec['items']
+        }
+        added = []
+        for basis, prefix in _SHARD_PREFIX.items():
+            for role in _DOUBLE_RATED:
+                pending = [entry for entry in entries
+                           if entry.basis == basis and (role, _entry_order(entry)) not in keyed]
+                first = sum(name.startswith(f'{prefix}{role}_') for name in key['shards'])
+                for name, members in plan_shards(pending, role=role, prefix=prefix, seed=seed,
+                                                 first_index=first):
+                    self.write_shard(key, name, role, members)
+                    added.append(name)
+        return added
+
+    def write_shard(self, key: dict[str, Any], name: str, role: str,
+                    entries: Sequence[ShardEntry]) -> None:
         rendered = shard(entries, name=name)
         (self.root / 'shards').mkdir(parents=True, exist_ok=True)
         (self.root / 'shards' / f'{name}.txt').write_text(rendered.text)
-        key['shards'][name] = {'role': role, 'rater': f'{RATER_MODELS[role]}-{role}',
+        key['shards'][name] = {'role': role, 'rater': f'{RATER_MODELS[role]}-{role}', 'round': 0,
                                'items': sorted(rendered.key)}
-        for item_id, pair in rendered.key.items():
-            key['items'][item_id] = {
-                **pair, 'anchor': (pair['entry_id'], pair['target_id']) in anchors,
-            }
+        key['items'].update({item_id: dict(pair) for item_id, pair in rendered.key.items()})
 
     def save_key(self, key: Mapping[str, Any]) -> None:
-        self.key_path.write_text(json.dumps(key, indent=2, sort_keys=True) + '\n')
+        _write_json(self.key_path, key)
+
+    def save_texts(self, entries: Iterable[ShardEntry]) -> None:
+        _write_json(self.root / 'texts.json', [
+            {'entry_id': entry.entry_id, 'target_id': entry.target_id, 'basis': entry.basis,
+             'child_text': entry.child_text, 'parent_text': entry.parent_text}
+            for entry in sorted(entries, key=_entry_order)
+        ])
 
     def ratings(self, key: Mapping[str, Any]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -600,7 +764,6 @@ class _Scratch:
             seen[item_id] += 1
             row = {**items[item_id], 'rater': spec['rater'], 'role': spec['role'], 'batch': name,
                    **answer}
-            row.pop('anchor', None)
             try:
                 _rubric.resolve_judgements([row])
             except ValueError as exc:
@@ -613,45 +776,29 @@ class _Scratch:
 
 
 def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
-    soak = _load_bundle(args.bundle)
+    bundle = _SoakBundle.read(args.bundle)
     scratch = _Scratch(args.scratch)
-    key: dict[str, Any] = {'shards': {}, 'items': {}, 'attach_time_unrecoverable': []}
-    rng = random.Random(args.seed)
-    needed = list(soak)
-    settled: list[_SoakItem] = []
-    rng.shuffle(needed)
-    count = math.ceil(len(needed) / PRIMARY_SHARD_SIZE)
-    anchors = rng.sample(settled, min(len(settled), ANCHORS_PER_SHARD * count))
-    anchor_pairs = frozenset(soaked.pair for soaked in anchors)
-    for index in range(count):
-        members = needed[index::count] + anchors[index::count]
-        rng.shuffle(members)
-        scratch.write_shard(key, f'primary_{index:02d}', Role.PRIMARY,
-                            [soaked.entry(Basis.CURRENT) for soaked in members], anchor_pairs)
-    overlap = rng.sample(needed, min(SECOND_OVERLAP, len(needed)))
-    for index in range(math.ceil(len(overlap) / SECOND_SHARD_SIZE)):
-        members = overlap[index * SECOND_SHARD_SIZE:(index + 1) * SECOND_SHARD_SIZE]
-        scratch.write_shard(key, f'second_{index:02d}', Role.SECOND,
-                            [soaked.entry(Basis.CURRENT) for soaked in members])
-    attach_time = []
-    for soaked in soak:
-        if not soaked.item['parent_edited_after_attach']:
-            continue
-        text = attach_time_text(args.history_db, soaked.item['target_id'],
-                                soaked.child_created_at, soaked.parent_text)
-        if text is None:
-            key['attach_time_unrecoverable'].append(soaked.item['entry_id'])
-        else:
-            attach_time.append(soaked.entry(Basis.ATTACH_TIME, text))
-    if attach_time:
-        scratch.write_shard(key, 'attach_00', Role.PRIMARY, attach_time)
+    key = scratch.load_key()
+    totals = {OUTCOME_RESTATED: args.restated_total, OUTCOME_AMENDED: args.amended_total}
+    extension, unrecoverable = _draw_extension(bundle, totals, args.seed, args.journal_db)
+    dropped = sorted(set(key['extension']) - set(extension))
+    if dropped:
+        raise ValueError(f'this extension drops intent ids already keyed: {dropped};'
+                         ' re-run with totals at least as large as before')
+    key['extension'], key['unrecoverable'] = extension, unrecoverable
+    soak = bundle.keyed_items(key)
+    entries, key['attach_time_unrecoverable'] = _rating_entries(soak, args.history_db)
+    added = scratch.add_shards(key, entries, seed=args.seed)
     scratch.save_key(key)
+    scratch.save_texts(entries)
     (args.scratch / 'rater_prompt.md').write_text(_rater_prompt())
     return {
-        'items': len(soak), 'needs_rating': len(needed), 'anchors': len(anchors),
-        'second_overlap': len(overlap), 'attach_time': len(attach_time),
+        'items': len(soak),
+        'extension': Counter(record['outcome'] for record in extension.values()),
+        'unrecoverable': len(unrecoverable),
+        'attach_time': sum(entry.basis == Basis.ATTACH_TIME for entry in entries),
         'attach_time_unrecoverable': key['attach_time_unrecoverable'],
-        'shards': {name: len(spec['items']) for name, spec in key['shards'].items()},
+        'new_shards': {name: len(key['shards'][name]['items']) for name in added},
     }
 
 
@@ -663,9 +810,9 @@ def _assembled(soak: Sequence[_SoakItem], rated_rows: Iterable[Mapping[str, Any]
 
 
 def _third_command(args: argparse.Namespace) -> dict[str, Any]:
-    soak = _load_bundle(args.bundle)
     scratch = _Scratch(args.scratch)
     key = scratch.load_key()
+    soak = _SoakBundle.read(args.bundle).keyed_items(key)
     assembly = _assembled(soak, scratch.ratings(key))
     tied = set(decisive_ties([soaked.item for soaked in soak], assembly.verdicts))
     name = f'third_{sum(spec["role"] == Role.THIRD for spec in key["shards"].values()):02d}'
@@ -677,9 +824,9 @@ def _third_command(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
-    soak = _load_bundle(args.bundle)
     scratch = _Scratch(args.scratch)
     key = scratch.load_key()
+    soak = _SoakBundle.read(args.bundle).keyed_items(key)
     assembly = _assembled(soak, scratch.ratings(key))
     out: Path = args.out_dir
     out.mkdir(parents=True, exist_ok=True)
@@ -739,13 +886,22 @@ def _rater_prompt() -> str:
         '## Output',
         '',
         'Each shard item starts with `=== ITEM id=<id> | project=<project> | basis=<basis>`'
-        ' and shows PARENT, CHILD and CHILD DIGEST. Write one JSON object per line, in item'
-        ' order, to the output file you are given:'
-        ' `{"id": "<item id>", "home": "YES|NO|UNCLEAR", "loss": "YES|NO|UNCLEAR",'
-        ' "conflict": "YES|NO|UNCLEAR", "scope": "CENTRAL|SECONDARY|UNCLEAR",'
-        ' "digest": "YES|NO|UNCLEAR", "unclear_reason": "...", "reason": "<one sentence'
-        ' naming both claims>"}`. Give `scope` only when `conflict` is YES, `digest` only'
-        ' when `loss` is YES, and `unclear_reason` only with an UNCLEAR answer.',
+        ' and shows PARENT and CHILD. Write one JSON object per line, in item order, to the'
+        ' output file you are given:'
+        ' `{"id": "<item id>", "home": "YES|NO|UNCLEAR", "conflict": "YES|NO|UNCLEAR",'
+        ' "scope": "CENTRAL|SECONDARY|UNCLEAR", "action_changing": "YES|NO|UNCLEAR",'
+        ' "conflict_quote": {"parent": "<words from PARENT>", "child": "<words from CHILD>"},'
+        ' "loss": "YES|NO|UNCLEAR", "loss_spans": ["<words from CHILD>", ...],'
+        ' "unclear_reason": "...", "reason": "<one sentence naming both claims>"}`.',
+        '',
+        '- Give `scope`, `action_changing` and `conflict_quote` when, and only when,'
+        ' `conflict` is YES.',
+        '- Give `loss` when, and only when, `home` is YES and `conflict` is NO; give'
+        ' `loss_spans` when, and only when, `loss` is YES.',
+        '- Give `unclear_reason` with any UNCLEAR answer.',
+        '- Copy `conflict_quote.parent` verbatim from PARENT, and `conflict_quote.child` and'
+        ' every `loss_spans` entry verbatim from CHILD. A quote or span not found in the text'
+        ' shown is sent back to you to answer again.',
         '',
         'Append to the file after every batch of about 10 items, so partial progress'
         ' survives. Every item in the shard gets exactly one line. When done, reply with'
@@ -762,9 +918,16 @@ def _build_parser() -> argparse.ArgumentParser:
         command.add_argument('--bundle', type=Path, required=True, metavar='DIR',
                              help="the soak bundle's correctness/ directory (read-only)")
         command.add_argument('--scratch', type=Path, required=True, metavar='DIR')
-    commands.choices['shards'].add_argument('--history-db', type=Path, required=True,
-                                            metavar='PATH', help="mem0's history.db")
-    commands.choices['shards'].add_argument('--seed', type=int, default=7157)
+    shards = commands.choices['shards']
+    shards.add_argument('--history-db', type=Path, required=True, metavar='PATH',
+                        help="mem0's history.db (read-only)")
+    shards.add_argument('--journal-db', type=Path, required=True, metavar='PATH',
+                        help="the reconciliation write journal (read-only)")
+    shards.add_argument('--seed', type=int, default=7174)
+    shards.add_argument('--restated-total', type=int, default=SAMPLE_TOTAL, metavar='N',
+                        help='how many restated attaches the extended sample holds')
+    shards.add_argument('--amended-total', type=int, default=SAMPLE_TOTAL, metavar='N',
+                        help='how many amended attaches the extended sample holds')
     commands.choices['assemble'].add_argument('--out-dir', type=Path, required=True, metavar='DIR')
     return parser
 
@@ -775,6 +938,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _refuse_inside(parser, args.scratch, args.bundle)
     if args.command == 'shards':
         args.history_db = args.history_db.expanduser()
+        args.journal_db = args.journal_db.expanduser()
         summary = _shards_command(args)
     elif args.command == 'third':
         summary = _third_command(args)

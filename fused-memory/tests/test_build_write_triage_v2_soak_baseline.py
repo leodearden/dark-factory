@@ -816,7 +816,7 @@ class TestTheShardsCommand:
         for keyed in _keyed(key):
             roles = sorted(key['shards'][name]['role'] for name in _shards_holding(key, keyed))
             assert roles == ['primary', 'second'], keyed
-        for name, spec in key['shards'].items():
+        for spec in key['shards'].values():
             assert spec == {'role': spec['role'], 'rater': f'opus-{spec["role"]}', 'round': 0,
                             'items': spec['items']}
 
