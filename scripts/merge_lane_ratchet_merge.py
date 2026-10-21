@@ -193,6 +193,8 @@ def _merge_path_list(path: str, base: list, ours: list, theirs: list) -> list:
     """
     if not all(isinstance(item, str) for item in (*base, *ours, *theirs)):
         raise MergeRefused(f'{path}: not a list of paths')
+    if any(len(set(image)) != len(image) for image in (base, ours, theirs)):
+        raise MergeRefused(f'{path}: an image lists one path twice')
     removed = (set(base) - set(ours)) | (set(base) - set(theirs))
     ours_runs, theirs_runs = _insertions(base, ours), _insertions(base, theirs)
     for anchor in ours_runs.keys() & theirs_runs.keys():
