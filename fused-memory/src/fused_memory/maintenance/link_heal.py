@@ -9,6 +9,10 @@ stamped such a record's contest too, which is why row 0 outranks row 2. The
 kinds and the contested key are imported from ``server/grouped_read.py`` and
 never respelled.
 
+Row 2 protects a hand-declared contest only; a contest stamped by write triage
+(``TRIAGE_CONTESTED_METADATA_KEY``) is adjudicated and healed by detach only
+(PRD H1, amended 2026-10-12).
+
 A verdict reaches the table only as a :class:`LinkBasis`. The committed
 hand-link corpus is one source of them (:func:`load_corpus_bases`); the link
 adjudicator is the other, and plugs in by producing the same rows.
@@ -33,7 +37,10 @@ from fused_memory.maintenance.link_heal_store import (
     MetadataChange,
     StoreReadFailed,
 )
-from fused_memory.memory_metadata import is_orchestrator_completion_record
+from fused_memory.memory_metadata import (
+    TRIAGE_CONTESTED_METADATA_KEY,
+    is_orchestrator_completion_record,
+)
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     CHILD_KINDS,
@@ -46,7 +53,7 @@ KIND_KEY = 'kind'
 PEER_KIND = 'peer'
 
 #: The record keys a heal reads and writes, in the order changes name them.
-LINK_KEYS = (PARENT_ID_KEY, KIND_KEY, CONTESTED_METADATA_KEY)
+LINK_KEYS = (PARENT_ID_KEY, KIND_KEY, CONTESTED_METADATA_KEY, TRIAGE_CONTESTED_METADATA_KEY)
 
 
 class Verdict(StrEnum):
@@ -139,6 +146,7 @@ class LinkImage:
     parent_id: str | None
     kind: Any = None
     contested: Any = None
+    contested_by_triage: Any = None
 
     @classmethod
     def from_metadata(cls, meta: Mapping[str, Any]) -> LinkImage:
@@ -146,12 +154,22 @@ class LinkImage:
             parent_id=link_parent_id(meta),
             kind=meta.get(KIND_KEY),
             contested=meta.get(CONTESTED_METADATA_KEY),
+            contested_by_triage=meta.get(TRIAGE_CONTESTED_METADATA_KEY),
         )
 
     def as_dict(self) -> dict[str, Any]:
         """The present keys only."""
-        values = (self.parent_id, self.kind, self.contested)
+        values = (self.parent_id, self.kind, self.contested, self.contested_by_triage)
         return {key: value for key, value in zip(LINK_KEYS, values, strict=True) if value is not None}
+
+    @property
+    def triage_stamped_contest(self) -> bool:
+        """Contested by write triage: only an exactly-True marker counts."""
+        return bool(self.contested) and self.contested_by_triage is True
+
+    @property
+    def hand_declared_contest(self) -> bool:
+        return bool(self.contested) and not self.triage_stamped_contest
 
 
 def apply_change(image: LinkImage, change: MetadataChange) -> LinkImage:
@@ -176,16 +194,12 @@ _WRITE_TARGETS: Mapping[HealAction, tuple[str | None, bool]] = MappingProxyType(
 def change_for(action: HealAction, pre_image: LinkImage) -> MetadataChange:
     """The one write *action* makes on a record showing *pre_image*.
 
-    A detach deletes every link key the record carries, except a kind outside
-    the child kinds: an agent-invented kind such as ``extension`` stays.
+    A detach deletes ``parent_id`` and every other link key the record carries,
+    except a ``kind`` outside the child kinds: an agent-invented kind such as
+    ``extension`` stays.
     """
     if action is HealAction.DETACH:
-        keys = [PARENT_ID_KEY]
-        if kind_class(pre_image.kind) in _CHILD_KIND_CLASSES:
-            keys.append(KIND_KEY)
-        if pre_image.contested is not None:
-            keys.append(CONTESTED_METADATA_KEY)
-        return MetadataChange.delete_only(keys)
+        return MetadataChange.delete_only(_detached_keys(pre_image))
     kind, contest = _WRITE_TARGETS[action]
     patch: dict[str, Any] = {}
     if kind is not None:
@@ -193,6 +207,13 @@ def change_for(action: HealAction, pre_image: LinkImage) -> MetadataChange:
     if contest:
         patch[CONTESTED_METADATA_KEY] = True
     return MetadataChange.patch_only(patch)
+
+
+def _detached_keys(pre_image: LinkImage) -> list[str]:
+    deleted = {PARENT_ID_KEY, *pre_image.as_dict()}
+    if kind_class(pre_image.kind) not in _CHILD_KIND_CLASSES:
+        deleted.discard(KIND_KEY)
+    return [key for key in LINK_KEYS if key in deleted]
 
 
 def post_image_for(action: HealAction, pre_image: LinkImage) -> LinkImage:
@@ -406,7 +427,7 @@ def _deterministic_row(state: LinkState, basis: LinkBasis | None) -> Decision | 
         return Decision(HealAction.DETACH, BasisSource.COMPLETION_RECORD)
     if basis is not None and is_stale(state, basis):
         return Decision(Report.STALE_RATING)
-    if state.link.contested:
+    if state.link.hand_declared_contest:
         return Decision(Report.CONTESTED_REPORTED)
     if state.parent_presence is ParentPresence.ABSENT:
         return Decision(HealAction.DETACH, BasisSource.DETERMINISTIC)
@@ -417,11 +438,17 @@ def _deterministic_row(state: LinkState, basis: LinkBasis | None) -> Decision | 
     return None
 
 
+_NON_DETACH_HEALS = frozenset(HealAction) - {HealAction.DETACH}
+
+
 def _verdict_row(state: LinkState, verdict: Verdict) -> HealAction | Report:
     kind = kind_class(state.link.kind)
     if kind is KindClass.HALF_LINK and state.has_children and verdict in BELONGS_VERDICTS:
         return Report.HAS_CHILDREN
-    return verdict_outcome(kind, verdict)
+    outcome = verdict_outcome(kind, verdict)
+    if state.link.triage_stamped_contest and outcome in _NON_DETACH_HEALS:
+        return Report.NO_ACTION
+    return outcome
 
 
 def verdict_outcome(kind: KindClass, verdict: Verdict) -> HealAction | Report:
@@ -534,6 +561,7 @@ class StaleField(StrEnum):
     PARENT_ID = PARENT_ID_KEY
     KIND = KIND_KEY
     CONTESTED = CONTESTED_METADATA_KEY
+    CONTESTED_BY_TRIAGE = TRIAGE_CONTESTED_METADATA_KEY
     CHILD_SHA256 = 'child_sha256'
     PARENT = 'parent'
     PARENT_SHA256 = 'parent_sha256'

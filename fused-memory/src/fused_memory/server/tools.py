@@ -43,6 +43,7 @@ from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
+from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
 from fused_memory.middleware.deferral_gate import StatusWriteScope
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
@@ -4017,6 +4018,9 @@ def create_mcp_server(
             # allow_near_duplicate is a write-time-only control flag for the
             # guard above; it must never be persisted into stored metadata.
             cleaned_meta.pop('allow_near_duplicate', None)
+            # Only the contested attach below may write this, so no caller can
+            # make a hand-declared contest look triage-written.
+            cleaned_meta.pop(TRIAGE_CONTESTED_METADATA_KEY, None)
         # An ATTACH outcome reroutes this same write into a child of the memory
         # it restates: same content, same category, same agent, plus the parent
         # link. It does NOT touch the canonical — triage issues no
@@ -4073,10 +4077,11 @@ def create_mcp_server(
             _triage_fail_open_counter.record(project=project_id)
         write_meta = cleaned_meta
         if attached_to is not None:
-            # Every key written here is an ATTACH_OWNED_KEY, and overwriting
-            # them is safe ONLY because `caller_owns_attach_keys` force-stored
-            # every write that carried any one of them — so none can be
-            # present here. Adding a key to this dict without adding it to
+            # Every key written here is an ATTACH_OWNED_KEY (the triage-contest
+            # marker excepted: TestOnlyTriageWritesTheTriageContestMarker), and
+            # overwriting them is safe ONLY because `caller_owns_attach_keys`
+            # force-stored every write that carried any one of them — so none
+            # can be present here. Adding a key to this dict without adding it to
             # ATTACH_OWNED_KEYS re-opens the loss for that key; the gate suite
             # pins the two sets against each other for exactly that reason,
             # unioned across the outcomes because they no longer write the
@@ -4111,6 +4116,8 @@ def create_mcp_server(
                 # this one. The canonical it contradicts is left exactly as it
                 # was, and nothing is scheduled to settle the disagreement.
                 write_meta[CONTESTED_METADATA_KEY] = True
+                # Read by link-heal's H1 row 2: a contest triage made is healable.
+                write_meta[TRIAGE_CONTESTED_METADATA_KEY] = True
         try:
             result = await memory_service.add_memory(
                 content=content,
