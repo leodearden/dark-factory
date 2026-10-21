@@ -47,8 +47,54 @@ def _adjudication(
     }
 
 
-def _determined(row: dict[str, Any]) -> dict[str, str]:
-    return {str(binary): str(answer) for binary, answer in _mod().v1_determined(row).items()}
+CANDIDATE_ROWS = {
+    'related_unrelated_home_no': 'home',
+    'same_subsumed_home_yes': 'home',
+    'same_subsumed_unrelated_conflict_no': 'conflict',
+    'corrects_action_changing_conflict_yes': 'conflict',
+    'corrects_action_changing_scope': 'scope',
+    'corrects_noise_conflict_no': 'conflict',
+    'no_new_detail_loss_no': 'loss',
+}
+RETIRED_ROWS = {
+    'extends_home_yes': 'home',
+    'corrects_not_action_changing_conflict_no': 'conflict',
+}
+
+
+def _determined(row: dict[str, Any], held: frozenset[str] | None = None) -> dict[str, str]:
+    builder = _mod()
+    determined = builder.v1_determined(row) if held is None else builder.v1_determined(row, held=held)
+    return {str(binary): str(answer) for binary, answer in determined.items()}
+
+
+class TestV1Rows:
+    def test_names_each_candidate_and_retired_row_with_its_binary(self) -> None:
+        builder = _mod()
+        assert {row.name: str(row.binary) for row in builder.V1_ROWS} == CANDIDATE_ROWS
+        assert {row.name: str(row.binary) for row in builder.RETIRED_V1_ROWS} == RETIRED_ROWS
+
+    @pytest.mark.parametrize(('row', 'fixed'), [
+        (_adjudication('EXTENDS'), {'extends_home_yes': 'YES'}),
+        (_adjudication('CORRECTS', dispute='one_detail', action_changing=False),
+         {'corrects_not_action_changing_conflict_no': 'NO'}),
+        (_adjudication('CORRECTS', dispute='genuine_correction', action_changing=True,
+                       new_detail=False),
+         {'corrects_action_changing_conflict_yes': 'YES',
+          'corrects_action_changing_scope': 'CENTRAL', 'no_new_detail_loss_no': 'NO'}),
+        (_adjudication('UNRELATED', new_detail=False),
+         {'related_unrelated_home_no': 'NO', 'same_subsumed_unrelated_conflict_no': 'NO',
+          'no_new_detail_loss_no': 'NO'}),
+        (_adjudication('UNCLEAR', new_detail=False), {}),
+    ])
+    def test_each_row_fixes_one_answer_for_the_adjudications_it_applies_to(
+        self, row: dict[str, Any], fixed: dict[str, str],
+    ) -> None:
+        builder = _mod()
+        assert {
+            v1.name: str(answer) for v1 in (*builder.V1_ROWS, *builder.RETIRED_V1_ROWS)
+            if (answer := v1.fixed(row)) is not None
+        } == fixed
 
 
 class TestV1Determined:
@@ -56,22 +102,134 @@ class TestV1Determined:
         (_adjudication('SAME', new_detail=False), {'home': 'YES', 'loss': 'NO', 'conflict': 'NO'}),
         (_adjudication('SAME'), {'home': 'YES', 'conflict': 'NO'}),
         (_adjudication('SUBSUMED'), {'home': 'YES', 'conflict': 'NO'}),
-        (_adjudication('EXTENDS'), {'home': 'YES'}),
+        (_adjudication('EXTENDS'), {}),
         (_adjudication('RELATED'), {'home': 'NO'}),
         (_adjudication('UNRELATED'), {'home': 'NO', 'conflict': 'NO'}),
         (_adjudication('CORRECTS', dispute='genuine_correction', action_changing=True),
          {'conflict': 'YES', 'scope': 'CENTRAL'}),
         (_adjudication('CORRECTS', dispute='one_detail', action_changing=True),
          {'conflict': 'YES', 'scope': 'SECONDARY'}),
-        (_adjudication('CORRECTS', dispute='genuine_correction', action_changing=False),
-         {'conflict': 'NO'}),
+        (_adjudication('CORRECTS', dispute='genuine_correction', action_changing=False), {}),
         (_adjudication('CORRECTS', dispute='noise', action_changing=True), {'conflict': 'NO'}),
+        (_adjudication('CORRECTS', dispute='one_detail', action_changing=False, new_detail=False),
+         {}),
+        (_adjudication('RELATED', new_detail=False), {'home': 'NO'}),
         (_adjudication('UNCLEAR', new_detail=False), {}),
     ])
-    def test_follows_the_derivation_table(
+    def test_applies_every_candidate_row_by_default(
         self, row: dict[str, Any], expected: dict[str, str],
     ) -> None:
         assert _determined(row) == expected
+
+    def test_a_loss_answer_without_home_yes_is_pruned(self) -> None:
+        held = frozenset(CANDIDATE_ROWS) - {'same_subsumed_home_yes'}
+        assert _determined(_adjudication('SAME', new_detail=False), held) == {'conflict': 'NO'}
+
+    def test_a_scope_answer_without_conflict_yes_is_pruned(self) -> None:
+        held = frozenset(CANDIDATE_ROWS) - {'corrects_action_changing_conflict_yes'}
+        row = _adjudication('CORRECTS', dispute='genuine_correction', action_changing=True)
+        assert _determined(row, held) == {}
+
+    def test_an_unknown_v1_word_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="'MAYBE'"):
+            _mod().v1_determined(_adjudication('MAYBE'))
+
+
+def _rated(entry: str, *, role: str = 'primary', basis: str = 'current', **answers: str) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        'entry_id': entry, 'target_id': 'p1', 'basis': basis, 'rater': f'opus-{role}',
+        'role': role, 'batch': f'{role}_00', 'reason': 'two claims', **answers,
+    }
+    if answers.get('conflict') == 'YES':
+        row['conflict_quote'] = {'parent': 'parent line', 'child': 'child line'}
+    if answers.get('loss') == 'YES':
+        row['loss_spans'] = ['child line']
+    if 'UNCLEAR' in answers.values():
+        row['unclear_reason'] = 'cannot tell'
+    return row
+
+
+def _check(word: str, answers: list[dict[str, str]], **adjudication: Any) -> Any:
+    adjudications = {
+        (f'c{index}', 'p1'): _adjudication(word, child_memory_id=f'c{index}', **adjudication)
+        for index in range(len(answers))
+    }
+    rows = [_rated(f'c{index}', **answer) for index, answer in enumerate(answers)]
+    return _mod().derivation_check(adjudications, rows)
+
+
+def _measured(check: Any) -> tuple[int, int, int, bool]:
+    return (check.n_items, check.n_compared, check.agree, check.held)
+
+
+class TestDerivationCheck:
+    def test_the_thresholds(self) -> None:
+        builder = _mod()
+        assert builder.DERIVATION_MIN_COMPARED == 20
+        assert builder.DERIVATION_MIN_AGREEMENT == 0.90
+
+    @pytest.mark.parametrize(('n_compared', 'agree', 'held'), [
+        (20, 18, True), (19, 19, False), (20, 17, False),
+    ])
+    def test_a_row_holds_at_enough_compared_answers_and_agreement(
+        self, n_compared: int, agree: int, held: bool,
+    ) -> None:
+        answers = [{'home': 'NO'}] * agree + [{'home': 'YES'}] * (n_compared - agree)
+        check = _check('RELATED', answers)['related_unrelated_home_no']
+        assert str(check.binary) == 'home'
+        assert _measured(check) == (n_compared, n_compared, agree, held)
+
+    def test_counts_only_primary_and_second_answers_on_the_current_basis(self) -> None:
+        adjudications = {
+            (f'c{index}', 'p1'): _adjudication('RELATED', child_memory_id=f'c{index}')
+            for index in range(11)
+        }
+        rows = []
+        for index in range(10):
+            rows += [
+                _rated(f'c{index}', role='primary', home='NO'),
+                _rated(f'c{index}', role='second', home='NO'),
+                _rated(f'c{index}', role='third', home='YES'),
+                _rated(f'c{index}', role='primary', basis='attach_time', home='YES'),
+            ]
+        rows.append(_rated('c10', role='primary', home='UNCLEAR'))
+        builder = _mod()
+        checks = builder.derivation_check(adjudications, rows)
+        assert _measured(checks['related_unrelated_home_no']) == (11, 20, 20, True)
+        assert builder.held_rows(checks) == frozenset({'related_unrelated_home_no'})
+
+    def test_a_retired_row_is_measured_and_never_held(self) -> None:
+        check = _check('EXTENDS', [{'home': 'YES'}] * 20)['extends_home_yes']
+        assert _measured(check) == (20, 20, 20, False)
+        assert check.retired is True
+
+    @pytest.mark.parametrize(('dispute', 'fixed', 'other'), [
+        ('genuine_correction', 'CENTRAL', 'SECONDARY'), ('one_detail', 'SECONDARY', 'CENTRAL'),
+    ])
+    def test_the_scope_row_compares_central_and_secondary(
+        self, dispute: str, fixed: str, other: str,
+    ) -> None:
+        answers = ([{'conflict': 'YES', 'scope': fixed}] * 18
+                   + [{'conflict': 'YES', 'scope': other}] * 2)
+        checks = _check('CORRECTS', answers, dispute=dispute, action_changing=True)
+        assert str(checks['corrects_action_changing_scope'].binary) == 'scope'
+        assert _measured(checks['corrects_action_changing_scope']) == (20, 20, 18, True)
+        assert _measured(checks['corrects_action_changing_conflict_yes']) == (20, 20, 20, True)
+
+    def test_the_loss_row_compares_only_the_loss_answers_raters_gave(self) -> None:
+        answers = ([{'home': 'YES', 'conflict': 'NO', 'loss': 'NO'}] * 10
+                   + [{'home': 'YES', 'conflict': 'NO', 'loss': 'YES'}] * 5
+                   + [{'home': 'NO'}] * 5)
+        checks = _check('SAME', answers, new_detail=False)
+        assert _measured(checks['no_new_detail_loss_no']) == (20, 15, 10, False)
+        assert _measured(checks['same_subsumed_home_yes']) == (20, 20, 15, False)
+        assert _measured(checks['same_subsumed_unrelated_conflict_no']) == (20, 15, 15, False)
+
+    def test_reports_every_candidate_and_retired_row(self) -> None:
+        checks = _mod().derivation_check({}, [])
+        assert set(checks) == set(CANDIDATE_ROWS) | set(RETIRED_ROWS)
+        assert {name for name, check in checks.items() if check.retired} == set(RETIRED_ROWS)
+        assert all(_measured(check) == (0, 0, 0, False) for check in checks.values())
 
 
 def _item(**overrides: Any) -> dict[str, Any]:
@@ -82,24 +240,6 @@ def _item(**overrides: Any) -> dict[str, Any]:
         'supersedes_target': False, 'superseded_marks': [],
     }
     return {**row, **overrides}
-
-
-class TestNeedsRating:
-    @pytest.mark.parametrize(('item', 'row', 'needed'), [
-        (_item(), _adjudication('CORRECTS', dispute='genuine_correction', action_changing=True),
-         False),
-        (_item(outcome='restated', band='restated', stratum='restated-sample'),
-         _adjudication('SAME', outcome='restated', new_detail=False), False),
-        (_item(outcome='restated', band='restated', stratum='restated-sample'),
-         _adjudication('EXTENDS', outcome='restated'), True),
-        (_item(), _adjudication('RELATED'), True),
-        (_item(), _adjudication('UNCLEAR'), True),
-    ])
-    def test_is_true_exactly_when_the_v1_labels_leave_a_decisive_binary_open(
-        self, item: dict[str, Any], row: dict[str, Any], needed: bool,
-    ) -> None:
-        builder = _mod()
-        assert builder.needs_rating(item, builder.v1_determined(row)) is needed
 
 
 def _history_db(path: Path, rows: list[tuple[str, str | None, str, str, str]]) -> Path:
