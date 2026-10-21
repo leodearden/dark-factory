@@ -94,6 +94,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -103,6 +104,7 @@ from shared.mcp_markup_middleware import (
     MarkupGuardMiddleware,
     RepairPolicy,
 )
+from shared.toolcall_markup import scan_parameter_values
 
 from fused_memory.server.markup_tripwire import (
     _MARKUP_STORM_THRESHOLD,
@@ -200,6 +202,56 @@ def _resolve_project_root(project: Any, known_projects: dict[str, str] | None) -
     if known_projects:
         return known_projects.get(project)
     return None
+
+
+#: The pseudo-parameters a refused payload may name its own project with.
+_ROUTING_PARAMETERS = ('project_id', 'project_root')
+
+#: Prefixed to a re-derived residue copy's ``suggested_action``, so the
+#: operator reading the queue knows how the record got there.
+_REDERIVED_PROVENANCE = (
+    'UNVERIFIED ROUTING: this record was placed in this queue by scanning the '
+    "refused payload's own residue for its project, checked only against the "
+    'project registry. Believe it for queue placement, never for the write. '
+)
+
+
+def _rederive_project(
+    record: Mapping[str, Any], known_projects: dict[str, str] | None
+) -> str | None:
+    """The queue root a refused payload names for itself, else ``None``.
+
+    add_memory declares ``content`` before ``project_id``, so a leak in
+    ``content`` eats the routing key and the middleware's ``project`` is
+    ``None``. The id usually survives inside ``raw_value``. Every scanned token
+    goes through :func:`_resolve_project_root`, so a re-derived root is one the
+    registry vouches for. Two different roots are ambiguous and yield ``None``.
+    """
+    scanned = scan_parameter_values(record.get('raw_value'), _ROUTING_PARAMETERS)
+    roots = {
+        root: token
+        for token in scanned.values()
+        if (root := _resolve_project_root(token, known_projects)) is not None
+    }
+    if len(roots) != 1:
+        return None
+    [(root, token)] = roots.items()
+    logger.warning(
+        'markup_guard_residue: %s.%s carried no resolvable project, so its '
+        'queue was re-derived from the refused payload: scanned %r -> '
+        'project_root=%r (unverified provenance)',
+        record.get('tool'), record.get('field'), token, root,
+    )
+    return root
+
+
+def _with_rederived_provenance(record: Mapping[str, Any]) -> dict[str, Any]:
+    """A shallow copy of *record* whose ``suggested_action`` states how it was
+    routed. ``project`` is left as the identity actually resolved."""
+    return {
+        **record,
+        'suggested_action': _REDERIVED_PROVENANCE + str(record.get('suggested_action') or ''),
+    }
 
 
 @dataclass
@@ -311,6 +363,11 @@ def install_markup_guard(
         queued record already holds it.
         """
         project_root = _resolve_project_root(record.get('project'), known_projects)
+        filed = record
+        if project_root is None:
+            project_root = _rederive_project(record, known_projects)
+            if project_root is not None:
+                filed = _with_rederived_provenance(record)
         escalation_id = None
         if project_root is not None:
             # Purely additive, same as the storm branch below: the refusal is
@@ -318,7 +375,7 @@ def install_markup_guard(
             # never to raise, so this guards only against a defect in it.
             try:
                 escalation_id = emit_markup_residue_escalation(
-                    project_root, record, anchor_task_id=_RESIDUE_ANCHOR_TASK_ID
+                    project_root, filed, anchor_task_id=_RESIDUE_ANCHOR_TASK_ID
                 )
             except Exception:
                 logger.exception(
