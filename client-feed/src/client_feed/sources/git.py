@@ -120,12 +120,19 @@ def repository_toplevel(root: Path) -> Path:
     return Path(os.fsdecode(completed.stdout.rstrip(b'\n')))
 
 
+def _peeled_commit(root: Path, rev: str) -> str | None:
+    completed = _run(root, 'rev-parse', '--verify', '-q', f'{rev}^{{commit}}', ok_returncodes=(0, 1))
+    return completed.stdout.decode().strip() if completed.returncode == 0 else None
+
+
 def main_head(root: Path) -> str | None:
     """refs/heads/main's commit, or None before main's first commit."""
-    completed = _run(
-        root, 'rev-parse', '--verify', '-q', f'{_MAIN_REF}^{{commit}}', ok_returncodes=(0, 1)
-    )
-    return completed.stdout.decode().strip() if completed.returncode == 0 else None
+    return _peeled_commit(root, _MAIN_REF)
+
+
+def has_commit(root: Path, commit: str) -> bool:
+    """Whether the repository holds `commit` as a commit object; a GitError, never False, when git cannot answer."""
+    return _peeled_commit(root, _require_sha(commit)) is not None
 
 
 class EntryKind(StrEnum):
