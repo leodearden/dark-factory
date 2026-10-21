@@ -384,8 +384,6 @@ async def _run_drift_check(
     wt = None
     held = _HeldHostLeases(allocator)
     try:
-        # β decision 5: both hosts come through the allocator so slot
-        # accounting is respected (≤1 verify-merge per host at any time).
         leases = await _acquire_drift_hosts(
             allocator, settle_secs=host_settle_secs, poll_secs=host_poll_secs,
         )
@@ -445,9 +443,7 @@ async def _run_drift_check(
         # verify body and closes before the finally.  If cleanup ran while we
         # still held the lease, `remove_merge_worktree_guarded`'s NON-BLOCKING
         # acquire would fail against OURSELVES, return 'skipped_lease_held',
-        # and leak the very tree the finally exists to remove.  The host-SLOT
-        # leases (`held`) are orthogonal to this lane flock: each is released
-        # as its own leg ends, with the finally as the safety net.
+        # and leak the very tree the finally exists to remove.
         async with git_ops.merge_verify_lease(lane_dir=wt):
             # FULL-GATE drift spec (task 2886 fix 1b, PRD §8δ): the drift check
             # re-dispatches this spec to BOTH the local trust-anchor and the
@@ -509,22 +505,18 @@ async def _run_drift_check(
             await git_ops.cleanup_merge_worktree(wt)
 
 
-def _advance_land_count(worker: SpeculativeMergeWorker) -> DriftCheckState:
-    """Count this landing, persisted when the worker has a state path.
+def _advance_land_count(path: Path | None, in_memory_count: int) -> DriftCheckState:
+    """The state with this landing counted, persisted to *path* when there is one.
 
     The persisted DriftCheckState (task 2886 fix 1a) survives the ~8h fleet
     redeploy that reset the in-memory counter before it ever reached every_n.
-    A bare-harness worker (no ``_drift_state_path``) counts in memory only, so
-    it cannot carry a deferral.  ``worker._drift_land_count`` is kept in
-    lockstep either way.
+    With no *path* (a bare-harness worker) the landing is counted onto
+    *in_memory_count* alone, so no deferral can be carried.
     """
-    path = worker._drift_state_path
     if path is None:
-        state = DriftCheckState(land_count=worker._drift_land_count).after_land()
-    else:
-        state = _load_drift_check_state(path).after_land()
-        _save_drift_check_state(path, state)
-    worker._drift_land_count = state.land_count
+        return DriftCheckState(land_count=in_memory_count).after_land()
+    state = _load_drift_check_state(path).after_land()
+    _save_drift_check_state(path, state)
     return state
 
 
@@ -594,7 +586,9 @@ async def _maybe_run_drift_check(
         # every_n > 0 guard in _safety_valve_due (merge_liveness.py).
         return None
 
-    if not _advance_land_count(worker).is_due(every_n):
+    state = _advance_land_count(worker._drift_state_path, worker._drift_land_count)
+    worker._drift_land_count = state.land_count
+    if not state.is_due(every_n):
         return None
     if worker._drift_check_tasks:
         logger.debug(
