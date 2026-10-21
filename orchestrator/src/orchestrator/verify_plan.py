@@ -962,13 +962,15 @@ def _whole_tree_guard_family(
 ) -> tuple[str, ...]:
     """*prefix*'s collectable tests that :func:`is_whole_tree_guard_module` admits, sorted.
 
+    Only a listed file whose content marks it a guard is classified, so a
+    touched test outside the family is classified once, by the diff alone.
     ``()`` when no *list_pkg_tests* seam was supplied: nothing can be enumerated.
     """
     if list_pkg_tests is None:
         return ()
     return tuple(sorted(
         path for path in list_pkg_tests(prefix)
-        if _is_collectable_test_file(path) and is_whole_tree_guard_module(worktree_reader(path))
+        if is_whole_tree_guard_module(worktree_reader(path)) and _is_collectable_test_file(path)
     ))
 
 
@@ -1434,9 +1436,10 @@ def derive_verify_plan(
     Module-config branch (*module_configs* non-empty): each ModuleConfig is
     scoped independently via :func:`_derive_module_runs`. *list_pkg_tests*
     (same contract as :func:`reverse_dependent_test_targets`' seam: a module
-    prefix to its worktree-root-relative collectable test files) is how the
-    task-role floor enumerates a module's whole-tree guard family; without it
-    that floor stays the owning-module full suite.
+    prefix to the worktree-root-relative ``.py`` files under its tests tree,
+    collectable or not) is how the task-role floor enumerates a module's
+    whole-tree guard family; without it that floor stays the owning-module
+    full suite.
 
     Fallback branch (*module_configs* empty): a single synthetic
     ``'__fallback__'`` module is derived from *config*'s global commands via
@@ -1557,9 +1560,10 @@ def reverse_dependent_test_targets(
     of how many of ITS depended-upon packages fired or how many of THEIR
     files changed.
 
-    Via the injected *list_pkg_tests* (a dependent's collectable test files)
-    and *read_content* (that file's text) callables, keeps only the test
-    files that actually import one of the triggering packages. A dependent
+    Via the injected *list_pkg_tests* (the ``.py`` files under a dependent's
+    tests tree) and *read_content* (that file's text) callables, keeps only
+    the collectable test files that actually import one of the triggering
+    packages. A dependent
     with no importing test files is omitted entirely — never an empty-list
     entry. Both the outer list (by dependent name) and each inner file list
     are sorted for deterministic output.
@@ -1583,7 +1587,7 @@ def reverse_dependent_test_targets(
         import_names = [_package_import_name(pkg) for pkg in dependent_triggers[dependent]]
         coupled = sorted(
             f for f in list_pkg_tests(dependent)
-            if _imports_any(read_content(f), import_names)
+            if _is_collectable_test_file(f) and _imports_any(read_content(f), import_names)
         )
         if coupled:
             result.append((dependent, coupled))

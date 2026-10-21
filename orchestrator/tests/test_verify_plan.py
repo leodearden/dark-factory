@@ -1051,6 +1051,19 @@ class TestDeriveVerifyPlanTaskRoleGuardFamily:
         assert run.scope_kind is ScopeKind.FILE_SCOPED
         assert run.scoped_targets == (new_scanner, *_GUARD_FAMILY)
 
+    def test_a_marked_file_pytest_cannot_collect_is_not_in_the_family(self):
+        reader, list_pkg_tests = _guard_family_seams({
+            'orchestrator/tests/conftest.py': _GUARD_MARK_SOURCE,
+            'orchestrator/tests/guard_data.py': _GUARD_MARK_SOURCE,
+        })
+        plan = derive_verify_plan(
+            SOURCE_ONLY_DIFF, [self._MC], None, reader, role='task',
+            list_pkg_tests=list_pkg_tests,
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scoped_targets == _GUARD_FAMILY
+
     def test_a_touched_guard_module_is_listed_once(self):
         reader, list_pkg_tests = _guard_family_seams()
         plan = derive_verify_plan(
@@ -2367,6 +2380,24 @@ class TestReverseDependentTestTargets:
             'escalation': ['escalation/tests/test_server.py'],
         })
         read_content = _fake_read_content({
+            'escalation/tests/test_server.py': _ESCALATION_TEST_SERVER_CONTENT,
+        })
+
+        result = reverse_dependent_test_targets(
+            existing_files, reverse_dep_map, list_pkg_tests, read_content,
+        )
+
+        assert result == [('escalation', ['escalation/tests/test_server.py'])]
+
+    def test_an_importing_file_pytest_cannot_collect_is_dropped(self):
+        """(e) the seam lists every test-tree .py file; only collectable ones are targets."""
+        existing_files = ['orchestrator/src/orchestrator/merge_queue.py']
+        reverse_dep_map = {'orchestrator': frozenset({'escalation'})}
+        list_pkg_tests = _fake_list_pkg_tests({
+            'escalation': ['escalation/tests/conftest.py', 'escalation/tests/test_server.py'],
+        })
+        read_content = _fake_read_content({
+            'escalation/tests/conftest.py': _ESCALATION_TEST_SERVER_CONTENT,
             'escalation/tests/test_server.py': _ESCALATION_TEST_SERVER_CONTENT,
         })
 

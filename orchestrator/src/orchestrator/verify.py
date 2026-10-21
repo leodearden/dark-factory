@@ -8206,17 +8206,17 @@ def _worktree_reader(
 def _worktree_pkg_test_lister(worktree: Path) -> Callable[[str], list[str]]:
     """Build a ``verify_plan`` ``list_pkg_tests`` seam bound to *worktree*.
 
-    Maps a module prefix to the collectable ``.py`` files under
-    ``worktree/<pkg>/tests`` as worktree-relative POSIX paths. Consumed by the
-    reverse-dependency widening and by ``derive_verify_plan``'s task-role
-    whole-tree guard-family enumeration.
+    Maps a module prefix to every ``.py`` file under ``worktree/<pkg>/tests``
+    as worktree-relative POSIX paths. Which of them pytest can collect is the
+    consumer's decision, made in ``verify_plan``: the reverse-dependency
+    widening and ``derive_verify_plan``'s task-role whole-tree guard-family
+    enumeration.
     """
     def _list(pkg: str) -> list[str]:
         tests_dir = worktree / pkg / 'tests'
         if not tests_dir.is_dir():
             return []
-        rel_paths = (p.relative_to(worktree).as_posix() for p in tests_dir.rglob('*.py'))
-        return [p for p in rel_paths if verify_plan._is_collectable_test_file(p)]
+        return [p.relative_to(worktree).as_posix() for p in tests_dir.rglob('*.py')]
     return _list
 
 
@@ -8553,11 +8553,9 @@ def _reverse_dependency_module_configs(
 
     Thin impure wrapper around the pure
     :func:`verify_plan.reverse_dependent_test_targets`: builds its
-    ``list_pkg_tests`` seam via :func:`_worktree_pkg_test_lister` (rglobs
-    ``worktree/<pkg>/tests`` for ``.py`` files, mapped to worktree-relative
-    POSIX paths, filtered to genuinely pytest-collectable files via
-    ``verify_plan._is_collectable_test_file`` — mirrors how
-    ``derive_verify_plan`` selects collectable tests) and a
+    ``list_pkg_tests`` seam via :func:`_worktree_pkg_test_lister` (every
+    ``.py`` file under ``worktree/<pkg>/tests``, mapped to worktree-relative
+    POSIX paths; the pure function keeps only the collectable ones) and a
     ``read_content`` reader via :func:`_worktree_reader` (threaded with the
     caller's *content_cache*, so a file already read elsewhere this attempt
     is not read from disk twice).

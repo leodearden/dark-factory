@@ -630,14 +630,9 @@ class TestDeleteTheTwinInvariant:
         """The module-config execution path does not independently re-classify:
         classify_file runs exactly once per distinct touched .py file — proof
         there is no second (hand-mirrored) decision tree consuming it.
-
-        The touched test sits outside ``mymod/tests/`` so the task-role
-        guard-family enumeration (task 7253), which classifies the package's
-        listed test files to enumerate them, has nothing to list: the count
-        then measures the diff's own classification alone.
         """
-        (tmp_path / 'mymod').mkdir(parents=True)
-        (tmp_path / 'mymod' / 'test_thing.py').write_text('def test_thing(): pass\n')
+        (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
+        (tmp_path / 'mymod' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
         (tmp_path / 'mymod' / 'helpers.py').write_text('def helper():\n    return 1\n')
 
         config = OrchestratorConfig(project_root=tmp_path)
@@ -649,7 +644,7 @@ class TestDeleteTheTwinInvariant:
                 type_check_command='uv run --directory mymod pyright',
             ),
         ]
-        task_files = ['mymod/test_thing.py', 'mymod/helpers.py']
+        task_files = ['mymod/tests/test_thing.py', 'mymod/helpers.py']
 
         calls: list[str] = []
         real_classify_file = verify_plan.classify_file
@@ -667,7 +662,8 @@ class TestDeleteTheTwinInvariant:
                 tmp_path, config, module_configs, task_files=task_files,
             )
 
-        assert len(calls) == len(set(calls)) == len(task_files), (
+        diff_calls = [path for path in calls if path in task_files]
+        assert len(diff_calls) == len(set(diff_calls)) == len(task_files), (
             f'classify_file must run exactly once per distinct touched .py file '
             f'on the module-config path — no independent re-classification by a '
             f'second (hand-mirrored) decision tree: calls={calls!r}'
