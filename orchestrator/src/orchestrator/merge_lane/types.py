@@ -749,7 +749,9 @@ class MergeCancelVerdict:
     *task_id*/*branch* name the request the lane found, so the caller can
     retire it by branch, *state* is the ``snapshot()`` wire state it was in,
     and *awaited_by_workflow* is the request's own flag; all are empty when
-    nothing was found.
+    nothing was found.  *lane_disposes_worktree* is True when the lane is still
+    re-verifying in the request's merge worktree and disposes of it itself once
+    that returns, so the caller must not reap it.
     """
 
     request_id: str
@@ -758,6 +760,7 @@ class MergeCancelVerdict:
     branch: str | None = None
     state: str | None = None
     awaited_by_workflow: bool = False
+    lane_disposes_worktree: bool = False
 
     @property
     def cancelled(self) -> bool:

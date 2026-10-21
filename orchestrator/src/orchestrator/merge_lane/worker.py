@@ -4629,6 +4629,7 @@ async def retire_cancelled_merge_request(
     git_ops: _RetireWorktreeP | None,
     event_store: EventStore | None,
     yields: int = 3,
+    reap_worktree: bool = True,
 ) -> str | None:
     """Fully retire a just-cancelled live merge entry before ``merge_cancel`` returns.
 
@@ -4651,7 +4652,9 @@ async def retire_cancelled_merge_request(
        ``remove_merge_worktree_guarded(reason='merge_cancel_retire')`` and a
        ``worktree_reaped`` event is emitted — mirroring the C3 REPLACE arm.  A
        live-leased tree is SKIPPED (never yanked); the reaper collects true
-       leaks later (PRD D4).
+       leaks later (PRD D4).  *reap_worktree* False skips this step for a
+       request whose lane still works in its tree and disposes of it itself
+       (``MergeCancelVerdict.lane_disposes_worktree``).
 
     3. **Sticky result cleared (yield-then-forget).**  The loop is YIELDED
        (bounded ``await asyncio.sleep(0)`` loop; the worktree await also
@@ -4693,7 +4696,7 @@ async def retire_cancelled_merge_request(
         # cancel itself succeeded.  Log loudly (loud-over-silent) and fall
         # through so step (3) always clears the sticky result; the reaper
         # collects any worktree left behind by the failed reap later (PRD D4).
-        if git_ops is not None:
+        if git_ops is not None and reap_worktree:
             try:
                 wt = await git_ops.find_inflight_merge_worktree(branch)
                 if wt is not None:
@@ -10096,6 +10099,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # The candidates the coalescing pass is stacking across its awaits;
         # cancel_request refuses them (see _train_cancel_refusal).
         self._coalescing_ids: frozenset[str] = frozenset()
+        # The chain link _land_chain_prefix is landing across its awaits; still
+        # LANE_BUFFERED to the registry, so cancel_request refuses it by id.
+        self._landing_link_ids: frozenset[str] = frozenset()
         # The most recent request whose merge commit was handed to the verifier
         # and has NOT yet been finalized (verified + CAS-advanced).  Read ONLY by
         # _await_unadvanced_predecessor, which parks a train behind it — see that
@@ -14105,7 +14111,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return MergeCancelVerdict(request_id, MergeCancelRefusal.NOT_LIVE)
         req, state = found
         refusal = _train_cancel_refusal(req, self._coalescing_ids)
-        if refusal is None and state in _FINALIZE_WINDOW_STATES:
+        if refusal is None and (
+            state in _FINALIZE_WINDOW_STATES or request_id in self._landing_link_ids
+        ):
             refusal = MergeCancelRefusal.FINALIZE_WINDOW
         if refusal is None:
             req.result.cancel(OperatorMergeCancel(request_id))
@@ -14113,6 +14121,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             request_id, refusal, task_id=req.task_id, branch=req.branch.bare_id,
             state=_REGISTRY_STATE_TO_WIRE[state],
             awaited_by_workflow=req.awaited_by_workflow,
+            lane_disposes_worktree=state is ItemLifecycleState.GATE_REVERIFY,
         )
 
     def _live_request(
@@ -20736,6 +20745,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # abort arm below therefore restores ONLY while this is False.
             link_resolved = False
 
+            self._landing_link_ids = frozenset({link_req.request_id})
             try:
                 # `merge_commit^2` is the branch tip build_chain's `--no-ff` merge
                 # incorporated — the same derivation _finalize_advanced_merge
@@ -20921,6 +20931,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if not link_resolved:
                     self._restore_chain_link_request(_lane, _idx, link_req)
                 break
+            finally:
+                self._landing_link_ids = frozenset()
 
         logger.info(
             'deep chain walk: landed %d of %d chained link(s) on top of %s',

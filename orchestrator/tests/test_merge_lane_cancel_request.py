@@ -10,6 +10,7 @@ the lane's public census, the request's own future, and main.
 from __future__ import annotations
 
 import asyncio
+import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -24,6 +25,8 @@ from _merge_lane_fakes import (
     make_lane,
     running_lane,
 )
+from escalation.queue import EscalationQueue
+from escalation.server import create_server
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import AdvanceOutcome, GitOps
@@ -36,6 +39,7 @@ from orchestrator.merge_lane import (
     QueuedBranch,
     WaiterRecord,
 )
+from orchestrator.merge_lane.queue_store import MergeQueueStore
 from orchestrator.merge_lane.types import TrainCallbacks
 from orchestrator.verify import VerifyResult
 
@@ -83,11 +87,47 @@ def _request(
     )
 
 
-async def _branch(git_ops: GitOps, task_id: str) -> Path:
+async def _branch(git_ops: GitOps, task_id: str, filename: str | None = None) -> Path:
     worktree = (await git_ops.create_worktree(task_id)).path
-    (worktree / f'{task_id}.py').write_text('x = 1\n')
+    (worktree / (filename or f'{task_id}.py')).write_text(f'{task_id} = 1\n')
     await git_ops.commit(worktree, f'Add {task_id}')
     return worktree
+
+
+def _coalescing_lane(git_ops: GitOps, queue: asyncio.Queue[Any], **kwargs: Any) -> Any:
+    return make_lane(git_ops, queue, train_callback_factory=lambda _train_id: (
+        TrainCallbacks(
+            status_check=AsyncMock(return_value={}), mark_member_done=AsyncMock(),
+            redrive_member=AsyncMock(),
+        )
+    ), **kwargs)
+
+
+async def _merge_cancel(server, request_id: str) -> dict[str, Any]:
+    tool = await server.get_tool('merge_cancel')
+    return await tool.fn(request_id=request_id)
+
+
+def _main_moved_under_it(advances: list[Any]) -> Any:
+    async def _advance(*args: Any, **kwargs: Any) -> AdvanceOutcome:
+        advances.append(args)
+        return AdvanceOutcome(
+            'rebased_pending_reverify',
+            advanced_sha='ab' * 20, rebased_from='ba' * 20, rebased_onto='cd' * 20,
+        )
+
+    return _advance
+
+
+def _held_reverify(reverifying: asyncio.Event, release: asyncio.Event) -> Any:
+    async def _reverify(*args: Any, **kwargs: Any) -> VerifyResult:
+        reverifying.set()
+        await release.wait()
+        return VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='',
+        )
+
+    return _reverify
 
 
 async def _until(predicate: Any, what: str) -> None:
@@ -187,24 +227,10 @@ class TestCancellable:
         main_before = await git_ops.get_main_sha()
         advances: list[Any] = []
         reverifying, release = asyncio.Event(), asyncio.Event()
-
-        async def _main_moved_under_it(*args: Any, **kwargs: Any) -> AdvanceOutcome:
-            advances.append(args)
-            return AdvanceOutcome(
-                'rebased_pending_reverify',
-                advanced_sha='ab' * 20, rebased_from='ba' * 20, rebased_onto='cd' * 20,
-            )
-
-        async def _held_reverify(*args: Any, **kwargs: Any) -> VerifyResult:
-            reverifying.set()
-            await release.wait()
-            return VerifyResult(
-                passed=True, test_output='', lint_output='', type_output='', summary='',
-            )
-
-        monkeypatch.setattr(git_ops, 'advance_main', _main_moved_under_it)
+        monkeypatch.setattr(git_ops, 'advance_main', _main_moved_under_it(advances))
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker.run_scoped_verification', _held_reverify,
+            'orchestrator.merge_lane.worker.run_scoped_verification',
+            _held_reverify(reverifying, release),
         )
         async with running_lane(lane):
             await queue.put(request)
@@ -221,6 +247,44 @@ class TestCancellable:
         assert _operator_cancel_on(request) == OperatorMergeCancel(request.request_id)
         assert len(advances) == 1, 'a cancelled request must not CAS again'
         assert await git_ops.get_main_sha() == main_before
+
+    async def test_a_gate_reverify_cancel_leaves_the_merge_worktree_to_the_lane(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        lane = make_lane(git_ops, queue)
+        request = _request('gk', await _branch(git_ops, 'gk'), config)
+        reverifying, release = asyncio.Event(), asyncio.Event()
+        monkeypatch.setattr(git_ops, 'advance_main', _main_moved_under_it([]))
+        monkeypatch.setattr(
+            'orchestrator.merge_lane.worker.run_scoped_verification',
+            _held_reverify(reverifying, release),
+        )
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            orch_config=config,
+            harness=types.SimpleNamespace(
+                _merge_worker=lane, _merge_store=MergeQueueStore(tmp_path / 'mq.json'),
+                git_ops=git_ops,
+            ),
+        )
+        async with running_lane(lane):
+            await queue.put(request)
+            await asyncio.wait_for(reverifying.wait(), _SCENE_TIMEOUT)
+            [entry] = [
+                e for e in lane.snapshot()['entries']
+                if e['request_id'] == request.request_id
+            ]
+            tree = Path(entry['worktree'])
+
+            response = await _merge_cancel(server, request.request_id)
+
+            assert response['cancelled'] is True
+            assert tree.exists(), 'the re-verify still runs in this tree'
+            release.set()
+            await _until(lambda: lane_state(lane, request.request_id) is None, 'the drop')
+            await _until(lambda: not tree.exists(), 'the lane disposing of its tree')
 
 
 class TestRefused:
@@ -364,3 +428,52 @@ class TestAttachedWaiters:
         registry.release('br', detach_waiters=True)
 
         assert self._carried(peer) == OperatorMergeCancel('mr-primary')
+
+
+class TestCoalescingReleasesItsSingles:
+    """A single the coalescing pass did not absorb is cancellable again after it."""
+
+    async def test_a_single_left_unselected_is_cancellable(
+        self, git_ops: GitOps, git_repo: Path, git_config: GitConfig,
+    ) -> None:
+        config = lane_scene_config(git_repo, git_config, merge_train_coalesce_enabled=True)
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        verifier = FakeVerifier(default=hangs_until(asyncio.Event()))
+        lane = _coalescing_lane(git_ops, queue, verifier=verifier)
+        first, second = [
+            _request(name, await _branch(git_ops, name, 'same.py'), config,
+                     awaited_by_workflow=True)
+            for name in ('un-a', 'un-b')
+        ]
+        for request in (first, second):
+            queue.put_nowait(request)
+        async with running_lane(lane):
+            await asyncio.wait_for(verifier.await_entry(), _SCENE_TIMEOUT)
+
+            verdict = lane.cancel_request(second.request_id)
+
+        assert verdict.cancelled, verdict
+
+    async def test_a_single_is_cancellable_after_a_pass_that_raised(
+        self, git_ops: GitOps, git_repo: Path, git_config: GitConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Driven by the pass itself: an exception out of it ends the merger, so a
+        running lane cannot host this scene."""
+        config = lane_scene_config(git_repo, git_config, merge_train_coalesce_enabled=True)
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        lane = _coalescing_lane(git_ops, queue)
+        first, second = [
+            _request(name, await _branch(git_ops, name), config, awaited_by_workflow=True)
+            for name in ('rs-a', 'rs-b')
+        ]
+        for request in (first, second):
+            queue.put_nowait(request)
+        monkeypatch.setattr(
+            git_ops, 'stack_train_branches', AsyncMock(side_effect=RuntimeError('stack')),
+        )
+
+        with pytest.raises(RuntimeError):
+            await lane._maybe_coalesce_waiting_singles()
+
+        assert lane.cancel_request(first.request_id).cancelled

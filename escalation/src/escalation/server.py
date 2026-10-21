@@ -5271,6 +5271,7 @@ def create_server(
             retention=_get_terminal_retention(harness),
             git_ops=getattr(harness, 'git_ops', None),
             event_store=event_store,
+            reap_worktree=not verdict.lane_disposes_worktree,
         )
         if not workflow_awaits and verdict.task_id is not None:
             await _escalate_workflowless_cancel(verdict.task_id, request_id, verdict.branch)
@@ -5288,8 +5289,9 @@ def create_server(
             category='merge_cancelled_by_operator',
             summary=(
                 f'Merge request {request_id} for task {task_id} cancelled by an '
-                'operator (merge_cancel); no workflow awaited it, so the branch '
-                'was not merged and nothing will resubmit it'
+                'operator (merge_cancel); no workflow awaited it and the branch '
+                'was not merged. A later workflow for this task may resubmit; '
+                'block the task to stop it'
             ),
             detail=(
                 f'request_id={request_id} branch={branch} task_id={task_id}. The '

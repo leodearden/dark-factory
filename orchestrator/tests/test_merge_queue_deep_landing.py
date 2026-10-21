@@ -1475,6 +1475,32 @@ class TestStaleCasAbortLeavesTheRestAlone:
         assert not reqs['104'].result.done(), 'a link past the cancel stays queued'
         assert _state_of(worker, reqs['104'].request_id) == 'queued'
 
+    async def test_a_link_already_landing_refuses_an_operator_cancel(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Task 5248: link 102 is mid-CAS while the registry still reads it
+        LANE_BUFFERED; the walk's own window is what refuses the cancel."""
+        from orchestrator.merge_lane import MergeCancelRefusal
+
+        scene: dict = {}
+        verdicts: list = []
+
+        async def _cancel_link_102_mid_landing(n: int):
+            if n == 2:
+                verdicts.append(scene['worker'].cancel_request(scene['reqs']['102'].request_id))
+            return None
+
+        scene.update(await _prefix_scene_upto_finalize(
+            git_repo, tmp_path, monkeypatch, db_name='delta-landing-cancel.db',
+            advance_hook=_cancel_link_102_mid_landing,
+        ))
+
+        assert await scene['worker']._finalize_inflight(scene['entry']) is True
+        await asyncio.sleep(0)
+
+        assert [v.refusal for v in verdicts] == [MergeCancelRefusal.FINALIZE_WINDOW]
+        assert scene['reqs']['102'].result.result().status == 'done'
+
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)
