@@ -20,7 +20,7 @@ import asyncio
 import dataclasses
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -499,6 +499,44 @@ async def _run_drift_check(
             await git_ops.cleanup_merge_worktree(wt)
 
 
+def _advance_land_count(worker: SpeculativeMergeWorker) -> DriftCheckState:
+    """Count this landing, persisted when the worker has a state path.
+
+    The persisted DriftCheckState (task 2886 fix 1a) survives the ~8h fleet
+    redeploy that reset the in-memory counter before it ever reached every_n.
+    A bare-harness worker (no ``_drift_state_path``) counts in memory only, so
+    it cannot carry a deferral.  ``worker._drift_land_count`` is kept in
+    lockstep either way.
+    """
+    path = worker._drift_state_path
+    if path is None:
+        state = DriftCheckState(land_count=worker._drift_land_count).after_land()
+    else:
+        state = _load_drift_check_state(path).after_land()
+        _save_drift_check_state(path, state)
+    worker._drift_land_count = state.land_count
+    return state
+
+
+def _spawn_drift_task(
+    worker: SpeculativeMergeWorker, coro: Coroutine[Any, Any, None],
+) -> asyncio.Task[None] | None:
+    """Schedule *coro* with a strong reference held until it finishes."""
+    task = asyncio.create_task(coro)
+    if not isinstance(task, asyncio.Task):
+        # create_task was intercepted (e.g. by a test mock) and did not
+        # schedule coro.  Close it here to prevent
+        # "coroutine was never awaited" RuntimeWarning from leaking into
+        # unrelated tests (pyproject.toml converts those warnings to errors).
+        coro.close()
+        return None
+    # asyncio keeps only a weak ref to Tasks, so without this the drift
+    # detective could be GC'd mid-run.  Mirrors _shadow_compare_tasks.
+    worker._drift_check_tasks.add(task)
+    task.add_done_callback(lambda t: worker._drift_check_tasks.discard(t))
+    return task
+
+
 async def _maybe_run_drift_check(
     worker: SpeculativeMergeWorker,
     git_ops: GitOps,
@@ -506,22 +544,24 @@ async def _maybe_run_drift_check(
     merge_commit: str,
     *,
     verifier: VerifyPort,
-) -> None:
+    host_settle_secs: float = _DRIFT_HOST_SETTLE_SECS,
+) -> asyncio.Task[None] | None:
     """Cadence gate + off-serial-lane spawn for the Lever C drift detective.
 
-    Called from :meth:`SpeculativeMergeWorker._verify_and_advance` on every
-    successful ('done') land, immediately after ``_maybe_schedule_shadow_compare``.
-    Returns **immediately** — spawns a background task when cadence is met,
-    otherwise is a no-op.
+    Called from merge_lane/worker.py::SpeculativeMergeWorker._finalize_inflight
+    on every successful ('done') land, immediately after
+    ``_maybe_schedule_shadow_compare``.  Returns immediately: the spawned
+    drift-check Task when one is due, otherwise None.
 
-    Cadence: every ``config.verify_drift_check_every_n_lands`` successful lands.
-    No-op when ``config.enabled_verify_runners`` is empty (Lever C off) or when
+    Firing rule: :meth:`DriftCheckState.is_due` — every
+    ``config.verify_drift_check_every_n_lands`` lands, and at every land after a
+    check deferred for want of host slots, until one runs.  A due land while a
+    drift check is already in flight (running, or waiting for its slots)
+    spawns nothing: that check serves it.  No-op when
+    ``config.enabled_verify_runners`` is empty (Lever C off) or when
     ``verify_drift_check_every_n_lands`` is 0 or negative (guards against
     ``ZeroDivisionError`` for a mocked/hand-built config that bypasses
     ``OrchestratorConfig``'s ``ge=1`` field validation).
-
-    State is tracked in worker-level attrs ``_drift_land_count`` (incremented
-    here) and ``_runner_quarantine`` (propagated from :func:`_run_drift_check`).
 
     Args:
         worker: Live :class:`SpeculativeMergeWorker` instance.
@@ -530,9 +570,10 @@ async def _maybe_run_drift_check(
         merge_commit: The just-landed merge commit SHA.
         verifier: The worker's :class:`~orchestrator.merge_lane.ports.VerifyPort`,
             handed on to :func:`_run_drift_check`.
+        host_settle_secs: How long the spawned check waits for both host slots.
     """
     if not req.config.enabled_verify_runners:
-        return
+        return None
     every_n = req.config.verify_drift_check_every_n_lands
     if every_n <= 0:
         # OrchestratorConfig enforces ge=1 at construction, but req.config is
@@ -541,52 +582,23 @@ async def _maybe_run_drift_check(
         # misconfigured/mocked 0-or-negative value degrades to "disabled"
         # instead of raising ZeroDivisionError on every land.  Mirrors the
         # every_n > 0 guard in _safety_valve_due (merge_liveness.py).
-        return
+        return None
 
-    # Cadence counter (task 2886 fix 1a): use the PERSISTED DriftCheckState when
-    # worker._drift_state_path is wired so the count survives the ~8h fleet
-    # redeploy (the in-memory counter reset before ever reaching every_n is why
-    # the drift check had NEVER fired).  Fall back to the in-memory
-    # worker._drift_land_count on bare-harness workers where _drift_state_path
-    # is None — mirrors _maybe_schedule_shadow_compare's _shadow_state_path
-    # None-safety.
-    if worker._drift_state_path is None:
-        worker._drift_land_count += 1
-        count = worker._drift_land_count
-    else:
-        state = _load_drift_check_state(worker._drift_state_path)
-        count = state.land_count + 1
-        # Persist on BOTH the fire and no-fire paths so every land is counted
-        # (the counter is additive across the worker lifetime — never reset —
-        # mirroring the in-memory _drift_land_count it supersedes).
-        _save_drift_check_state(
-            worker._drift_state_path, DriftCheckState(land_count=count)
+    if not _advance_land_count(worker).is_due(every_n):
+        return None
+    if worker._drift_check_tasks:
+        logger.debug(
+            'Drift check due at commit %s is served by the one already in flight',
+            merge_commit,
         )
-        # Keep the in-memory mirror in lockstep for observability / back-compat
-        # (existing tests and log lines still read worker._drift_land_count).
-        worker._drift_land_count = count
-
-    if count % every_n == 0:
-        _coro = _run_drift_check(
-            git_ops, req, merge_commit,
-            worker._escalation_queue, worker._event_store,
-            worker._runner_quarantine,
-            verifier=verifier,
-            allocator=worker._ensure_host_allocator(req.config),
-            on_unavailable=worker.bench_unavailable_runner,
-        )
-        _task = asyncio.create_task(_coro)
-        if not isinstance(_task, asyncio.Task):
-            # create_task was intercepted (e.g. by a test mock) and did not
-            # schedule _coro.  Close it here to prevent
-            # "coroutine was never awaited" RuntimeWarning from leaking into
-            # unrelated tests (pyproject.toml converts those warnings to errors).
-            _coro.close()
-        else:
-            # Hold a strong reference so the event loop cannot GC the drift
-            # detective mid-run (asyncio keeps only a weak ref to Tasks).
-            # Mirrors the _shadow_compare_tasks pattern at :func:`_maybe_schedule_shadow_compare`.
-            worker._drift_check_tasks.add(_task)
-            _task.add_done_callback(
-                lambda t: worker._drift_check_tasks.discard(t)
-            )
+        return None
+    return _spawn_drift_task(worker, _run_drift_check(
+        git_ops, req, merge_commit,
+        worker._escalation_queue, worker._event_store,
+        worker._runner_quarantine,
+        verifier=verifier,
+        allocator=worker._ensure_host_allocator(req.config),
+        on_unavailable=worker.bench_unavailable_runner,
+        state_path=worker._drift_state_path,
+        host_settle_secs=host_settle_secs,
+    ))
