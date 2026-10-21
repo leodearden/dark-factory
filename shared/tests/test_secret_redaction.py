@@ -12,6 +12,7 @@ import stat
 from pathlib import Path
 
 import pytest
+
 from shared.secret_redaction import (
     FileChangedDuringRedaction,
     RedactionWouldCorruptJson,
