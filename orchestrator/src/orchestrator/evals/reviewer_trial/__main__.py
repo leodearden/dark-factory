@@ -23,12 +23,13 @@ import sqlite3
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
+from shared import project_layout
 
 from orchestrator.agents.review_briefing import ReviewBriefing
 
@@ -563,19 +564,17 @@ def corpus_audit(min_diffs: int) -> None:
 # Mine: FN-candidate mining + frontier labeling (task 2495 / PRD D-6)
 # ---------------------------------------------------------------------------
 
-# Overridable via env var for portability across checkouts -- the mining
-# sources are offline, gitignored data that live in the MAIN repo, not a
-# task worktree (see corpus/README.md "Regenerating / extending the
-# corpus"). Defaults match this deployment's on-disk layout unchanged.
-_MINE_DEFAULT_DB = Path(os.environ.get(
-    'REVIEWER_TRIAL_RUNS_DB', '/home/leo/src/dark-factory/data/orchestrator/runs.db',
-))
-_MINE_DEFAULT_ESC_DIR = Path(os.environ.get(
-    'REVIEWER_TRIAL_ESCALATIONS_DIR', '/home/leo/src/dark-factory/data/escalations',
-))
-_MINE_DEFAULT_REPO = Path(os.environ.get(
-    'REVIEWER_TRIAL_REPO_ROOT', '/home/leo/src/dark-factory',
-))
+def _env_or_main_checkout(env_var: str, derive: Callable[[Path], Path]) -> Path:
+    """``$env_var`` when set, else *derive* applied to the main checkout.
+
+    The mining sources are gitignored data that live in the MAIN checkout, not
+    a task worktree (see corpus/README.md "Regenerating / extending the
+    corpus"). Resolved per invocation, so importing this module never needs a checkout.
+    """
+    override = os.environ.get(env_var)
+    return Path(override) if override else derive(project_layout.default_project_root())
+
+
 _MINE_SPLIT_SEED = 'reviewer_trial-2495-fn-mining'
 
 _LANG_EXTENSIONS = {
@@ -671,12 +670,15 @@ def _select_spot_check_subset(
 
 
 @cli.command('mine')
-@click.option('--runs-db', default=str(_MINE_DEFAULT_DB), type=click.Path(path_type=Path),
-              help='Path to the offline orchestrator runs.db (env: REVIEWER_TRIAL_RUNS_DB)')
-@click.option('--escalations-dir', default=str(_MINE_DEFAULT_ESC_DIR), type=click.Path(path_type=Path),
-              help='Path to the offline escalations directory (env: REVIEWER_TRIAL_ESCALATIONS_DIR)')
-@click.option('--repo-path', default=str(_MINE_DEFAULT_REPO), type=click.Path(path_type=Path),
-              help='Git repo to recover mined diffs from')
+@click.option('--runs-db', default=None, type=click.Path(path_type=Path),
+              help='Path to the offline orchestrator runs.db (env: REVIEWER_TRIAL_RUNS_DB; '
+                   "default: the main checkout's runs.db)")
+@click.option('--escalations-dir', default=None, type=click.Path(path_type=Path),
+              help='Path to the offline escalations directory (env: REVIEWER_TRIAL_ESCALATIONS_DIR; '
+                   "default: the main checkout's escalation queue)")
+@click.option('--repo-path', default=None, type=click.Path(path_type=Path),
+              help='Git repo to recover mined diffs from (env: REVIEWER_TRIAL_REPO_ROOT; '
+                   'default: the main checkout)')
 @click.option('--target-total', default=100, type=int, help='Aim for this many total diffs (existing + mined)')
 @click.option('--max-parallel', default=8, type=int, help='Max concurrent frontier-labeling calls')
 @click.option('--model', default='opus', help='Frontier model for propose_labels_frontier')
@@ -688,7 +690,7 @@ def _select_spot_check_subset(
 @click.option('--min-diffs', default=_DEFAULT_MIN_DIFFS, type=int,
               help="Minimum required diff count for the post-run audit (kept consistent with corpus-audit's --min-diffs)")
 def mine(
-    runs_db: Path, escalations_dir: Path, repo_path: Path, target_total: int,
+    runs_db: Path | None, escalations_dir: Path | None, repo_path: Path | None, target_total: int,
     max_parallel: int, model: str, max_turns: int, seed: str, oauth_token_env: str,
     limit: int | None, min_diffs: int,
 ) -> None:
@@ -700,6 +702,11 @@ def mine(
     after every successfully-labeled diff, so an interrupted run only loses
     whatever was still in flight.
     """
+    runs_db = runs_db or _env_or_main_checkout('REVIEWER_TRIAL_RUNS_DB', project_layout.runs_db)
+    escalations_dir = escalations_dir or _env_or_main_checkout(
+        'REVIEWER_TRIAL_ESCALATIONS_DIR', project_layout.escalation_queue_dir,
+    )
+    repo_path = repo_path or _env_or_main_checkout('REVIEWER_TRIAL_REPO_ROOT', Path)
 
     async def _run() -> int:
         from .adjudication import AdjudicationLog
@@ -1152,9 +1159,6 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
 # the same fixtures for N trials, scored, reduced by campaign.py.
 # ---------------------------------------------------------------------------
 
-_CAMPAIGN_DEFAULT_CONFIG = Path('/home/leo/src/dark-factory/dark-factory-orchestrator.yaml')
-
-
 def _parse_briefings(
     _ctx: click.Context, _param: click.Parameter, value: str,
 ) -> list[ReviewBriefing]:
@@ -1196,12 +1200,12 @@ def _parse_briefings(
 @click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
 @click.option('--pool/--no-pool', default=True,
               help='Draw on the shared OAuth account pool via a UsageGate (default) or the CLI default login')
-@click.option('--config', 'config_path', default=str(_CAMPAIGN_DEFAULT_CONFIG),
-              type=click.Path(path_type=Path), help='Orchestrator config supplying usage_cap accounts')
+@click.option('--config', 'config_path', default=None, type=click.Path(path_type=Path),
+              help="Orchestrator config supplying usage_cap accounts (default: the main checkout's)")
 def campaign(
     results_dir: Path, trials: int, split: str, arms: str | None,
     briefings: list[ReviewBriefing], diff_cap: int | None,
-    max_parallel: int, pool: bool, config_path: Path,
+    max_parallel: int, pool: bool, config_path: Path | None,
 ) -> None:
     """Run the Fable evidence campaign: every arm x every fixture x N trials.
 
@@ -1212,9 +1216,11 @@ def campaign(
     ``<results-dir>/trial-<n>/scores/``, so a killed campaign resumes
     without re-spending. Re-running with the same arguments only reduces.
     """
+    from orchestrator.config import PROJECT_CONFIG_FILENAME, default_price_table, load_config
+
+    config_path = config_path or project_layout.default_project_root() / PROJECT_CONFIG_FILENAME
 
     async def _run() -> int:
-        from orchestrator.config import default_price_table, load_config
         from orchestrator.evals.runner import campaign_usage_gate
 
         from . import campaign as reduce

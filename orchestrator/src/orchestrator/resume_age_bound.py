@@ -31,17 +31,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from shared.project_layout import default_project_root, runs_db
+
 logger = logging.getLogger(__name__)
 
-# Overridable via env var for portability across checkouts -- runs.db is
-# offline, gitignored data that lives in the MAIN repo, not a task worktree
-# (mirrors prompt_opt.__main__'s PROMPT_OPT_RUNS_DB and reviewer_trial's
-# REVIEWER_TRIAL_RUNS_DB idiom). A project_root-relative spelling — the one
-# shared.flake_ledger.ledger_db_path uses — is deliberately NOT reused: in a
-# task worktree that composes against the WRONG tree, so the live derived-bound
-# guard would skip on every verify and the bound would be decorative.
+# runs.db is gitignored data that lives in the MAIN checkout, which
+# shared.project_layout.default_project_root returns even from a task worktree.
+# This env var overrides it.
 RUNS_DB_ENV_VAR = 'RESUME_AGE_RUNS_DB'
-_DEFAULT_RUNS_DB = '/home/leo/src/dark-factory/data/orchestrator/runs.db'
 
 # Trailing window BOTH terms are sampled over. Matches the 90-day retention
 # window the transcript archive keeps, and bounds the derivation to the fleet's
@@ -133,10 +130,10 @@ RESUME_AGE_SAFETY_FACTOR = 1.5
 def default_runs_db_path() -> Path:
     """Return the runs.db the live derived-bound guard measures.
 
-    ``$RESUME_AGE_RUNS_DB`` when set, else the main checkout's absolute path.
-    See :data:`RUNS_DB_ENV_VAR` for why this is not project_root-relative.
+    ``$RESUME_AGE_RUNS_DB`` when set, else the main checkout's runs.db.
     """
-    return Path(os.environ.get(RUNS_DB_ENV_VAR, _DEFAULT_RUNS_DB))
+    override = os.environ.get(RUNS_DB_ENV_VAR)
+    return Path(override) if override else runs_db(default_project_root())
 
 
 @dataclass(frozen=True)
