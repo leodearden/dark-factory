@@ -1178,7 +1178,7 @@ def _call_tool_against(result: dict) -> Any:
     """Drive the REAL ``call_tool`` with ``_post`` stubbed. No socket, as ever."""
     client = FusedMemoryClient('http://127.0.0.1:9')
 
-    async def _fake_post(payload: dict) -> dict:
+    async def _fake_post(payload: dict, *, timeout: float | None = None) -> dict:
         return result
 
     client._post = _fake_post
