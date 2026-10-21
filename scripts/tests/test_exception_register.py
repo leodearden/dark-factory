@@ -11,6 +11,7 @@ in ``tmp_path``, and every run passes an absent ``--sweep-state``.
 
 from __future__ import annotations
 
+import ast
 import datetime
 import json
 import os
@@ -1474,6 +1475,37 @@ def test_the_live_register_document_reads_the_real_tree(tmp_path: Path, capsys):
         {'id': row.id, 'date': row.date.isoformat(), 'source': row.source, 'covers': row.covers}
         for row in sorted(rows, key=lambda row: row.id)
     ]
+
+
+def _module_level_bindings(path: Path) -> set[str]:
+    if not path.is_file():
+        return set()
+    bindings: set[str] = set()
+    for statement in ast.parse(path.read_bytes(), filename=str(path)).body:
+        if isinstance(statement, ast.Assign):
+            bindings.update(target.id for target in statement.targets if isinstance(target, ast.Name))
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+            bindings.add(statement.target.id)
+    return bindings
+
+
+def test_every_not_exception_row_names_a_live_container():
+    """A classification row whose container was renamed or moved must be decided again.
+
+    The census ignores a row that matches no candidate, so without this a stale
+    row would silently outlive its container.
+    """
+    stale = sorted(
+        ref.render()
+        for ref in exception_register.NOT_EXCEPTION_LISTS
+        if ref.symbol not in _module_level_bindings(REPO_ROOT / ref.path)
+    )
+
+    assert not stale, (
+        'These NOT_EXCEPTION_LISTS rows name no module-level binding in the live tree. '
+        'Point each row at its container\'s new path::symbol, or delete it if the container '
+        'is gone:\n  ' + '\n  '.join(stale)
+    )
 
 
 _CLOSED_RULINGS_TASK = TaskRef(5603)

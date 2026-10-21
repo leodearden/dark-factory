@@ -807,9 +807,11 @@ NOT_EXCEPTION_LISTS: Mapping[ListRef, str] = MappingProxyType({
 """Containers whose names match the census but which are not exception lists.
 
 A classification, not a tolerated violation: each row carries a reason, never
-a ratification (D14).  The rows are the design rows of
-``docs/legibility/inv12-day-one-rulings.md`` Part 2, each reason copied from
-that table's last column.  A row that matches no candidate is inert.
+a ratification (D14).  Seeded on 2026-10-19 from the design rows of
+``docs/legibility/inv12-day-one-rulings.md`` Part 2; this mapping, not that
+table, is the live copy.  A row that matches no candidate is inert to the
+census, so ``scripts/tests/test_exception_register.py`` holds every row to a
+live module-level binding.
 """
 
 
