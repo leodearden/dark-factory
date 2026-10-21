@@ -13,11 +13,14 @@ import os
 import re
 import sys
 import types
+import urllib.error
+import urllib.request
+import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Protocol, TextIO
 
 CHECKOUT_ROOT = Path(__file__).resolve().parents[4]
 _SHARED_SRC = str(CHECKOUT_ROOT / 'shared' / 'src')
@@ -31,6 +34,7 @@ def _first_party(name: str) -> types.ModuleType:
 
 
 _task_statuses = _first_party('shared.task_statuses')
+_mcp_post = _first_party('shared.mcp_post')
 
 RETURN_SCHEMA = 'review-all-prd-return/1'
 PROGRAM_SCHEMA = 'review-all-program/1'
@@ -949,3 +953,335 @@ def append_rulings(home: Home, lines: Sequence[Mapping[str, Any]]) -> None:
 
 def read_rulings(home: Home) -> tuple[Mapping[str, Any], ...]:
     return _read_checked(home.rulings, _check_ruling_entry)
+
+
+MCP_CLIENT_NAME = 'review-all-program'
+_TASK_NOT_FOUND = 'TaskNotFoundError'
+_CAPABILITY_ARGUMENTS = ('include_rows',)
+FIND_PAGE_LIMIT = 100
+
+
+class _ToolRefused(StoreReaderError):
+    """A tool answered with a failure; ``error_type`` is the payload's, when it carried one."""
+
+    def __init__(self, tool: str, text: str, error_type: str | None) -> None:
+        self.error_type = error_type
+        super().__init__(f'{tool} failed: {text}')
+
+
+def _decode_body(body: bytes, content_type: str, url: str) -> Mapping[str, Any]:
+    """A JSON reply, or the first ``data:`` line of an SSE body (FusedMemoryClient's reading)."""
+    text = body.decode('utf-8', errors='replace')
+    if 'text/event-stream' in content_type:
+        data = [line[len('data:'):] for line in text.splitlines() if line.startswith('data:')]
+        text = data[0] if data else ''
+    try:
+        reply = json.loads(text)
+    except ValueError:
+        raise StoreReaderError(f'{url} answered an unparseable body: {text[:200]!r}') from None
+    if not isinstance(reply, Mapping):
+        raise StoreReaderError(f'{url} answered a non-object reply: {text[:200]!r}')
+    return reply
+
+
+class _McpSession:
+    """``scripts/migrate_metadata_modules_to_files.py::FusedMemoryClient``'s wire shape over urllib.
+
+    *url* is the endpoint form (``http://127.0.0.1:8002/mcp``). The handshake is
+    lazy and the ``mcp-session-id`` is minted once.
+    """
+
+    def __init__(self, url: str, timeout: float) -> None:
+        self._url = url
+        self._timeout = timeout
+        self._session_id = uuid.uuid4().hex
+        self._initialized = False
+        self._request_id = 1
+
+    def _post(self, message: Mapping[str, Any]) -> Mapping[str, Any]:
+        request = urllib.request.Request(
+            self._url, data=json.dumps(message).encode(), method='POST',
+            headers={**_mcp_post.MCP_POST_HEADERS, 'mcp-session-id': self._session_id},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                status, content_type = response.status, response.headers.get('Content-Type', '')
+                body = response.read()
+        except urllib.error.HTTPError as refused:
+            raise StoreReaderError(f'{self._url} answered HTTP {refused.code}') from None
+        except (urllib.error.URLError, OSError) as failed:
+            raise StoreReaderError(f'cannot reach {self._url}: {failed}') from None
+        if status == 202 or not body:
+            return {}
+        return _decode_body(body, content_type, self._url)
+
+    def _handshake(self) -> None:
+        self._post({
+            'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+            'params': {
+                'protocolVersion': '2024-11-05',
+                'clientInfo': {'name': MCP_CLIENT_NAME, 'version': '1.0'},
+                'capabilities': {},
+            },
+        })
+        self._post({'jsonrpc': '2.0', 'method': 'notifications/initialized', 'params': {}})
+        self._initialized = True
+
+    def call_tool(self, name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        """The tool's payload; any failure raises through ``_raise_for_failure``."""
+        if not self._initialized:
+            self._handshake()
+        self._request_id += 1
+        reply = self._post(
+            _mcp_post.mcp_tool_call_payload(name, dict(arguments), request_id=self._request_id)
+        )
+        _raise_for_failure(name, reply, arguments)
+        return _reply_payload(name, reply)
+
+
+def _first_text(result: Mapping[str, Any]) -> str | None:
+    for entry in result.get('content') or ():
+        if isinstance(entry, Mapping) and entry.get('type') == 'text':
+            return str(entry.get('text'))
+    return None
+
+
+def _reply_payload(tool: str, reply: Mapping[str, Any]) -> Mapping[str, Any]:
+    """structuredContent, else the first text content parsed as JSON."""
+    result = reply.get('result')
+    if not isinstance(result, Mapping):
+        raise StoreReaderError(f'{tool}: the reply carries no result: {str(reply)[:200]}')
+    structured = result.get('structuredContent')
+    if isinstance(structured, Mapping):
+        return structured
+    text = _first_text(result)
+    try:
+        payload = json.loads(text) if text is not None else None
+    except ValueError:
+        payload = None
+    if not isinstance(payload, Mapping):
+        raise StoreReaderError(f'{tool}: the reply carries no readable payload: {str(result)[:200]}')
+    return payload
+
+
+def _failure(tool: str, reply: Mapping[str, Any]) -> tuple[str, str | None] | None:
+    """The failure text and error_type a reply carries, at any of its three layers; else None."""
+    error = reply.get('error')
+    if error is not None:
+        return str(error.get('message', error) if isinstance(error, Mapping) else error), None
+    result = reply.get('result')
+    if isinstance(result, Mapping) and result.get('isError'):
+        return _first_text(result) or str(result), None
+    payload = _reply_payload(tool, reply)
+    if 'error' in payload:
+        return str(payload['error']), payload.get('error_type')
+    return None
+
+
+def _raise_for_failure(tool: str, reply: Mapping[str, Any], sent_args: Mapping[str, Any]) -> None:
+    """The one boundary classifier: a refusal naming a capability argument we sent is INV-11's."""
+    failure = _failure(tool, reply)
+    if failure is None:
+        return
+    text, error_type = failure
+    for argument in _CAPABILITY_ARGUMENTS:
+        if argument in sent_args and argument in text:
+            raise StoreReaderUnsupported(argument, f'{tool} refused the argument: {text}')
+    raise _ToolRefused(tool, text, error_type)
+
+
+@dataclass(frozen=True)
+class StoreRead:
+    """One reader result: the rows, when the store was read, and the ids re-read in full."""
+
+    rows: tuple[TaskRow, ...]
+    measured_at: str
+    reread: tuple[int, ...] = ()
+
+
+def _strict_int(value: Any, what: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise StoreReaderError(f'{what} is not an integer: {value!r}')
+    return value
+
+
+def _task_row(raw: Mapping[str, Any], id_key: str, updated_key: str) -> TaskRow:
+    task_id = _strict_int(raw.get(id_key), f'task id {raw.get(id_key)!r}')
+    try:
+        return TaskRow(
+            task_id=task_id, title=raw['title'], status=raw['status'],
+            priority=raw['priority'], updated_at=raw[updated_key],
+            metadata=raw['metadata'] if isinstance(raw['metadata'], Mapping) else {},
+            dependencies=tuple(
+                _strict_int(d, f'task {task_id} dependency') for d in raw['dependencies']
+            ),
+        )
+    except KeyError as missing:
+        raise StoreReaderError(f'task {task_id}: the store row lacks {missing}') from None
+
+
+def _require_rows(page: Mapping[str, Any]) -> None:
+    """INV-11: the server must echo include_rows and send metadata and dependencies on every row."""
+    if page.get('include_rows') is not True:
+        raise StoreReaderUnsupported(
+            'include_rows',
+            f'find_tasks_by_metadata sent no include_rows: true echo '
+            f'(got {page.get("include_rows", "no echo")!r}); the server predates the widening',
+        )
+    for raw in page.get('results', ()):
+        for key in ('metadata', 'dependencies'):
+            if key not in raw:
+                raise StoreReaderUnsupported(
+                    key, f'find_tasks_by_metadata sent task {raw.get("task_id")} without {key!r}',
+                )
+
+
+class _Found(NamedTuple):
+    rows: tuple[TaskRow, ...]
+    reread: tuple[int, ...]
+
+
+def _union(found: Iterable[_Found], measured_at: str) -> StoreRead:
+    rows: dict[int, TaskRow] = {}
+    reread: set[int] = set()
+    for part in found:
+        rows.update((row.task_id, row) for row in part.rows)
+        reread.update(part.reread)
+    return StoreRead(tuple(rows[i] for i in sorted(rows)), measured_at, tuple(sorted(reread)))
+
+
+def _trigger_chain_of(row: TaskRow) -> tuple[Any, Any]:
+    chain = row.metadata.get('trigger_chain')
+    return (chain.get('run_id'), chain.get('role')) if isinstance(chain, Mapping) else (None, None)
+
+
+class StoreReader:
+    """The only code that reads the task store: fused-memory MCP tools, never sqlite, never a write."""
+
+    def __init__(
+        self, server_url: str, project_root: str, *,
+        report: TextIO | None = None, timeout: float = 30.0,
+    ) -> None:
+        self._session = _McpSession(server_url, timeout)
+        self._project_root = project_root
+        self._report = report
+
+    def _get_task(self, task_id: int) -> TaskRow | None:
+        arguments = {'id': str(task_id), 'project_root': self._project_root}
+        try:
+            payload = self._session.call_tool('get_task', arguments)
+        except _ToolRefused as refused:
+            if refused.error_type == _TASK_NOT_FOUND:
+                return None
+            raise
+        return _task_row(payload, 'id', 'updatedAt')
+
+    def _reread(self, raw: Mapping[str, Any], cache: dict[int, TaskRow]) -> TaskRow:
+        task_id = _strict_int(raw.get('task_id'), 'truncated row id')
+        if task_id not in cache:
+            row = self._get_task(task_id)
+            if row is None:
+                raise StoreReaderError(f'task {task_id} was listed truncated but get_task finds none')
+            cache[task_id] = row
+            report = self._report if self._report is not None else sys.stderr
+            print(f'store reader: task {task_id} metadata is over the page budget; '
+                  're-read in full with get_task', file=report)
+        return cache[task_id]
+
+    def _find(
+        self, key: str, value: str | int | None = None, statuses: Sequence[str] | None = None,
+        *, cache: dict[int, TaskRow],
+    ) -> _Found:
+        """Every row of one lookup, paged on has_more, with truncated rows re-read in full."""
+        rows: list[TaskRow] = []
+        reread: list[int] = []
+        offset = 0
+        while True:
+            arguments: dict[str, Any] = {
+                'project_root': self._project_root, 'key': key,
+                'limit': FIND_PAGE_LIMIT, 'offset': offset, 'include_rows': True,
+            }
+            if value is not None:
+                arguments['value'] = value
+            if statuses is not None:
+                arguments['statuses'] = list(statuses)
+            page = self._session.call_tool('find_tasks_by_metadata', arguments)
+            _require_rows(page)
+            for raw in page['results']:
+                if raw.get('truncated_row'):
+                    rows.append(self._reread(raw, cache))
+                    reread.append(rows[-1].task_id)
+                else:
+                    rows.append(_task_row(raw, 'task_id', 'updated_at'))
+            pagination = page['pagination']
+            if not pagination['has_more']:
+                return _Found(tuple(rows), tuple(reread))
+            if pagination['returned'] == 0:
+                raise StoreReaderError(
+                    f'find_tasks_by_metadata {key}={value!r} reported has_more with no rows at '
+                    f'offset {offset}'
+                )
+            offset += pagination['returned']
+
+    def program_tasks(self, run_id: str, prd_paths: Iterable[str]) -> StoreRead:
+        """Tasks carrying x_finding_run = run_id, unioned with tasks whose prd_path is a stream's."""
+        measured_at = now_utc()
+        cache: dict[int, TaskRow] = {}
+        found = [self._find('x_finding_run', run_id, cache=cache)]
+        found += [self._find('prd_path', path, cache=cache) for path in prd_paths]
+        return _union(found, measured_at)
+
+    def held_leaves(self, run_id: str, prd_paths: Iterable[str]) -> StoreRead:
+        program = self.program_tasks(run_id, prd_paths)
+        held = tuple(
+            row for row in program.rows
+            if SEAM_WAIT_KEYS.key in row.metadata and SEAM_RELEASED_KEYS.key not in row.metadata
+        )
+        return replace(program, rows=held)
+
+    def _chain_task(self, run_id: str, role: TriggerChainRole) -> StoreRead:
+        measured_at = now_utc()
+        found = self._find('trigger_chain', statuses=NON_TERMINAL_STATUSES, cache={})
+        rows = tuple(r for r in found.rows if _trigger_chain_of(r) == (run_id, role))
+        if len(rows) > 1:
+            raise StoreReaderError(
+                f'{len(rows)} {role} tasks carry trigger_chain.run_id = {run_id}: '
+                f'{[r.task_id for r in rows]}'
+            )
+        return StoreRead(rows, measured_at, found.reread)
+
+    def gate(self, run_id: str) -> StoreRead:
+        return self._chain_task(run_id, TriggerChainRole.HUMAN_GATE)
+
+    def completion_gate(self, run_id: str) -> StoreRead:
+        return self._chain_task(run_id, TriggerChainRole.COMPLETION_GATE)
+
+    def tasks_declaring_files(self, paths: Iterable[str]) -> StoreRead:
+        measured_at = now_utc()
+        cache: dict[int, TaskRow] = {}
+        return _union(
+            [self._find('files', path, NON_TERMINAL_STATUSES, cache=cache) for path in paths],
+            measured_at,
+        )
+
+    def tasks_with_delivered_checks(self) -> StoreRead:
+        measured_at = now_utc()
+        return _union([self._find('delivered_checks', None, NON_TERMINAL_STATUSES, cache={})],
+                      measured_at)
+
+    def task(self, task_id: int) -> StoreRead:
+        measured_at = now_utc()
+        row = self._get_task(task_id)
+        return StoreRead(() if row is None else (row,), measured_at)
+
+
+class StoreView(Protocol):
+    """The store reads validate_return needs; StoreReader provides them."""
+
+    def task(self, task_id: int) -> StoreRead: ...
+
+    def gate(self, run_id: str) -> StoreRead: ...
+
+
+def open_reader(program: Program, environ: Mapping[str, str] = os.environ) -> StoreReader:
+    return StoreReader(fused_memory_url(environ), program.project_root)
