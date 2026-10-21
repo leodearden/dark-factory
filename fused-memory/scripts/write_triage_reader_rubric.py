@@ -1,11 +1,12 @@
-"""The one definition of write-triage correctness rubric v2.
+"""The one definition of write-triage correctness rubric v2.1.
 
 A rated item is a (write, record) pair judged on the binaries of
 :class:`Binary`. This module defines the verdict-row contract, the per-binary
-majority that resolves several raters' rows into one :class:`Judgement`, and
-the derivation that turns judgements into the wrong cells a reader meets.
+resolution of several raters' rows into one :class:`Judgement`, and the
+derivation that turns judgements into the wrong cells a reader meets.
 
-The rater-facing wording is ``fused-memory/calibration/write_triage_rater_brief_v2.md``;
+The rater-facing wording is ``fused-memory/calibration/write_triage_rater_brief_v2.md``
+(rater brief v2.1);
 the metrics built on the cells are ``fused-memory/calibration/write_triage_reader_metrics.md``.
 """
 from __future__ import annotations
@@ -52,6 +53,7 @@ class Binary(StrEnum):
     LOSS = 'loss'
     CONFLICT = 'conflict'
     SCOPE = 'scope'
+    ACTION_CHANGING = 'action_changing'
     DIGEST = 'digest'
 
 
@@ -71,6 +73,10 @@ class Role(StrEnum):
     DERIVED = 'derived'
 
 
+RATER_ROLES = frozenset({Role.PRIMARY, Role.SECOND, Role.THIRD})
+"""The roles of a row a rater answered; only these rows carry evidence or non_consumed answers."""
+
+
 class Resolved(StrEnum):
     """What the rows carrying one binary of one pair say, taken together."""
 
@@ -87,15 +93,52 @@ _WORDS: Mapping[Binary, type[StrEnum]] = MappingProxyType({
     Binary.LOSS: Answer,
     Binary.CONFLICT: Answer,
     Binary.SCOPE: Scope,
+    Binary.ACTION_CHANGING: Answer,
     Binary.DIGEST: Answer,
 })
 """The answer vocabulary of each binary."""
 
-_FOLLOWS: Mapping[Binary, Binary] = MappingProxyType({
-    Binary.SCOPE: Binary.CONFLICT,
-    Binary.DIGEST: Binary.LOSS,
+FOLLOW_UPS: Mapping[Binary, Mapping[Binary, Answer]] = MappingProxyType({
+    Binary.LOSS: MappingProxyType({Binary.HOME: Answer.YES, Binary.CONFLICT: Answer.NO}),
+    Binary.SCOPE: MappingProxyType({Binary.CONFLICT: Answer.YES}),
+    Binary.ACTION_CHANGING: MappingProxyType({Binary.CONFLICT: Answer.YES}),
+    Binary.DIGEST: MappingProxyType({Binary.LOSS: Answer.YES}),
 })
-"""A conditional follow-up, and the binary that must be YES on the same row to ask it."""
+"""Each conditional follow-up, and the answers the same row must give before it is asked."""
+
+
+def _is_conflict_quote(value: object) -> bool:
+    return isinstance(value, dict) and all(
+        _is_text(value.get(side)) for side in ('parent', 'child')
+    )
+
+
+def _is_loss_spans(value: object) -> bool:
+    return isinstance(value, list) and bool(value) and all(map(_is_text, value))
+
+
+def _is_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+@dataclass(frozen=True)
+class _Evidence:
+    """A row field that must back an answer, the shape it must have, and its check."""
+
+    field: str
+    shape: str
+    valid: Callable[[object], bool]
+
+
+_LOSS_SPANS = _Evidence('loss_spans', 'a non-empty list of non-empty strings', _is_loss_spans)
+
+_EVIDENCE: Mapping[tuple[Binary, Answer], _Evidence] = MappingProxyType({
+    (Binary.CONFLICT, Answer.YES): _Evidence(
+        'conflict_quote', 'an object with non-empty string parent and child', _is_conflict_quote,
+    ),
+    (Binary.LOSS, Answer.YES): _LOSS_SPANS,
+})
+"""The evidence a rater row must give for an answer; a derived row gives none."""
 
 _POLES: Mapping[Binary, tuple[Resolved, Resolved]] = MappingProxyType({
     binary: (Resolved.CENTRAL, Resolved.SECONDARY) if words is Scope else (Resolved.YES, Resolved.NO)
@@ -121,11 +164,16 @@ class PairKey:
 
 @dataclass(frozen=True)
 class Vote:
-    """One rater's validated answers on one pair key."""
+    """One rater's validated answers on one pair key.
+
+    ``answers`` holds only the voting answers; a binary in ``non_consumed`` was
+    answered and recorded, but a derived row fixes it, so it never votes.
+    """
 
     rater: str
     role: Role
     answers: Mapping[Binary, StrEnum]
+    non_consumed: frozenset[Binary] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -142,14 +190,16 @@ class Judgement:
 
 
 def resolve_judgements(rows: Iterable[Mapping[str, Any]]) -> Mapping[PairKey, Judgement]:
-    """Validate every verdict row and resolve each pair key's binaries by strict majority.
+    """Validate every verdict row and resolve each pair key's binaries.
 
-    Votes on one binary come from the rows carrying it. UNCLEAR abstains, an
-    all-UNCLEAR binary resolves UNCLEAR and an even split resolves TIED. The
-    ``current`` and ``attach_time`` bases are separate pair keys and never mix.
-    A malformed row, or a rater voting twice on one pair key, is refused.
+    Votes on one binary come from the rows carrying it as a voting answer.
+    UNCLEAR abstains, an all-UNCLEAR binary resolves UNCLEAR and an even split
+    resolves TIED. The ``current`` and ``attach_time`` bases are separate pair
+    keys and never mix. A malformed row, a rater voting twice on one pair key,
+    and a pair key whose rater answers and derived rows disagree about which
+    binaries a derived row fixes are refused.
     """
-    votes: defaultdict[PairKey, dict[str, Vote]] = defaultdict(dict)
+    votes: defaultdict[PairKey, dict[str, tuple[int, Vote]]] = defaultdict(dict)
     for index, row in enumerate(rows):
         pair = (row.get('entry_id'), row.get('target_id'), row.get('basis'))
         violation = _row_violation(row)
@@ -160,16 +210,45 @@ def resolve_judgements(rows: Iterable[Mapping[str, Any]]) -> Mapping[PairKey, Ju
             raise ValueError(
                 f'verdict row {index}: rater {row["rater"]!r} already rated pair {pair}'
             )
-        votes[key][row['rater']] = Vote(
-            rater=row['rater'],
-            role=Role(row['role']),
-            answers=MappingProxyType({
-                binary: words(row[binary]) for binary, words in _WORDS.items() if binary in row
-            }),
-        )
+        votes[key][row['rater']] = (index, _vote(row))
+    for key, indexed in votes.items():
+        _refuse_mixed_votes(key, list(indexed.values()))
     return MappingProxyType({
-        key: _judgement(key, tuple(votes[key].values())) for key in sorted(votes)
+        key: _judgement(key, tuple(vote for _, vote in votes[key].values())) for key in sorted(votes)
     })
+
+
+def _vote(row: Mapping[str, Any]) -> Vote:
+    non_consumed = frozenset(Binary(name) for name in row.get('non_consumed', ()))
+    return Vote(
+        rater=row['rater'],
+        role=Role(row['role']),
+        answers=MappingProxyType({
+            binary: words(row[binary])
+            for binary, words in _WORDS.items()
+            if binary in row and binary not in non_consumed
+        }),
+        non_consumed=non_consumed,
+    )
+
+
+def _refuse_mixed_votes(key: PairKey, indexed: list[tuple[int, Vote]]) -> None:
+    """Refuse a rater answer that votes beside a derived row, or a non_consumed one beside none."""
+    fixed = {binary for _, vote in indexed if vote.role is Role.DERIVED for binary in vote.answers}
+    pair = (key.entry_id, key.target_id, key.basis.value)
+    for index, vote in indexed:
+        for binary in sorted(vote.non_consumed - fixed):
+            raise ValueError(
+                f'verdict row {index} on pair {pair}: rater {vote.rater!r} lists non_consumed'
+                f' {binary.value!r}, which no derived row of the pair fixes'
+            )
+        if vote.role is Role.DERIVED:
+            continue
+        for binary in sorted(vote.answers.keys() & fixed):
+            raise ValueError(
+                f'verdict row {index} on pair {pair}: rater {vote.rater!r} votes {binary.value!r},'
+                ' which a derived row of the pair fixes, so the answer must be non_consumed'
+            )
 
 
 def _row_violation(row: Mapping[str, Any]) -> str | None:
@@ -193,12 +272,52 @@ def _row_violation(row: Mapping[str, Any]) -> str | None:
     reason = row.get('unclear_reason')
     if unclear and not (isinstance(reason, str) and reason.strip()):
         return f'{unclear[0]} {ABSTAIN!r} needs a non-empty unclear_reason'
-    for follow_up, asked_after in _FOLLOWS.items():
-        if follow_up in row and row.get(asked_after) != Answer.YES:
+    for follow_up, needs in FOLLOW_UPS.items():
+        if follow_up not in row:
+            continue
+        for asked_after, needed in needs.items():
+            if row.get(asked_after) != needed:
+                return (
+                    f'{follow_up} {row[follow_up]!r} needs {asked_after} {needed.value!r},'
+                    f' got {row.get(asked_after)!r}'
+                )
+    return _evidence_violation(row, carried) or _non_consumed_violation(row)
+
+
+def _evidence_violation(row: Mapping[str, Any], carried: list[Binary]) -> str | None:
+    """The first answer *row* gives without the evidence that must back it; None if none."""
+    required = [
+        (binary, _EVIDENCE[binary, row[binary]])
+        for binary in carried
+        if row['role'] in RATER_ROLES and (binary, row[binary]) in _EVIDENCE
+    ]
+    if Binary.DIGEST in row:
+        required.append((Binary.DIGEST, _LOSS_SPANS))
+    for binary, evidence in required:
+        if not evidence.valid(row.get(evidence.field)):
             return (
-                f'{follow_up} {row[follow_up]!r} needs {asked_after} {Answer.YES.value!r},'
-                f' got {row.get(asked_after)!r}'
+                f'{binary} {row[binary]!r} needs {evidence.field}, {evidence.shape},'
+                f' got {row.get(evidence.field)!r}'
             )
+    return None
+
+
+def _non_consumed_violation(row: Mapping[str, Any]) -> str | None:
+    """Why *row*'s non_consumed list is malformed, naming the offending binary; None if it is not."""
+    if 'non_consumed' not in row:
+        return None
+    listed = row['non_consumed']
+    if not isinstance(listed, list):
+        return f'non_consumed {listed!r} is not a list of binary names'
+    if row['role'] not in RATER_ROLES:
+        return f'non_consumed {listed!r} is on a {row["role"]} row; only a rater answer is non_consumed'
+    for position, name in enumerate(listed):
+        if not isinstance(name, str) or name not in set(_WORDS):
+            return f'non_consumed names {name!r}, not one of {", ".join(_WORDS)}'
+        if name in listed[:position]:
+            return f'non_consumed names {name!r} twice'
+        if name not in row:
+            return f'non_consumed names {name!r}, which the row does not carry'
     return None
 
 
