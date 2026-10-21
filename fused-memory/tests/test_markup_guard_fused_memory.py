@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -911,7 +912,7 @@ class TestInstalledOnTheRealServer:
     by review, not by a test. No assertion here reads source text.
     """
 
-    def test_the_installer_helper_declares_the_reject_with_repair_tier(self):
+    def test_the_installer_helper_declares_the_reject_with_repair_tier(self, tmp_path):
         """INV-1: the tier is declared at the interception point, not inferred.
 
         REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory
@@ -929,16 +930,45 @@ class TestInstalledOnTheRealServer:
             recorded.update(kwargs)
 
         known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        spool = MarkupResidueSpool(tmp_path / 'spool')
         server = create_mcp_server(AsyncMock())
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(main_module, 'install_markup_guard', _record)
             main_module._install_tool_dispatch_guards(
-                server, known_projects=known_projects
+                server, known_projects=known_projects, residue_spool=spool
             )
 
         assert recorded['mcp'] is server
         assert recorded['policy'] is RepairPolicy.REJECT_WITH_REPAIR
         assert recorded['known_projects'] is known_projects
+        # ``==`` compares a bound method's (func, self): this spool's preserve.
+        assert recorded['residue_floor'] == spool.preserve
+
+    def test_the_installer_helper_cannot_be_called_without_a_floor(self):
+        """``residue_spool`` is REQUIRED, so production wiring cannot drop the
+        floor by accident."""
+        from fused_memory.server.main import _install_tool_dispatch_guards
+
+        server = create_mcp_server(AsyncMock())
+
+        with pytest.raises(TypeError):
+            _install_tool_dispatch_guards(server, known_projects=_KNOWN_PROJECTS)
+
+    @pytest.mark.parametrize(
+        ('reconciliation', 'expected'),
+        [
+            (SimpleNamespace(data_dir='/var/lib/fused-memory'), Path('/var/lib/fused-memory')),
+            (None, Path('./data')),
+        ],
+        ids=['reconciliation-configured', 'reconciliation-absent'],
+    )
+    def test_the_server_data_dir_has_one_answer(self, reconciliation, expected):
+        """Where the spool lives. A legal config without a reconciliation
+        section must still yield a dir, or that shape would disable
+        preservation."""
+        from fused_memory.server.main import _server_data_dir
+
+        assert _server_data_dir(SimpleNamespace(reconciliation=reconciliation)) == expected
 
     def test_an_undeliverable_policy_is_refused_at_WIRING_time(self):
         """The declared ValueError, which is a fail-LOUD wiring guard.
@@ -988,14 +1018,18 @@ class TestInstalledOnTheRealServer:
 
         assert server._tool_manager.call_tool is wrapped
 
-    def test_the_installer_helper_installs_both_wrappers(self):
+    def test_the_installer_helper_installs_both_wrappers(self, tmp_path):
         """Unpatched, the helper leaves both sentinels set on the one tool
         manager — the guard is added to the defence-in-depth wrapper, never
         substituted for it."""
         from fused_memory.server.main import _install_tool_dispatch_guards
 
         server = create_mcp_server(AsyncMock())
-        _install_tool_dispatch_guards(server, known_projects=_KNOWN_PROJECTS)
+        _install_tool_dispatch_guards(
+            server,
+            known_projects=_KNOWN_PROJECTS,
+            residue_spool=MarkupResidueSpool(tmp_path / 'spool'),
+        )
 
         manager = server._tool_manager
         assert getattr(manager, '_fused_memory_safe_wrapped', False) is True
