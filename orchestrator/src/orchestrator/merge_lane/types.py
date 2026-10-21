@@ -915,6 +915,30 @@ class MergeRequest:
 
 
 @dataclass(frozen=True)
+class RelaneOutcome:
+    """What :meth:`SpeculativeMergeWorker.relane` did with an operator's
+    request to move a waiting merge into another lane (task 5246).
+
+    ``relaned`` is True when the addressed request — or, for a coalesced
+    member, the train carrying it, named by ``via_train`` — now belongs to
+    ``lane``; ``request_id`` and ``from_lane`` name that queue entry.
+
+    Otherwise ``refusal`` says why nothing moved: ``'already_picked'`` (the
+    merger has taken it, so no lane orders it any more; ``state`` is its
+    lifecycle state) or ``'not_found'`` (nothing the lane holds answers to
+    that id, or its outcome is already decided).
+    """
+
+    relaned: bool
+    lane: Literal['normal', 'high']
+    request_id: str | None = None
+    from_lane: Literal['normal', 'high'] | None = None
+    via_train: str | None = None
+    refusal: Literal['already_picked', 'not_found'] | None = None
+    state: str | None = None
+
+
+@dataclass(frozen=True)
 class TrainCallbacks:
     """Scheduler-backed callbacks for a single train, built in the harness.
 

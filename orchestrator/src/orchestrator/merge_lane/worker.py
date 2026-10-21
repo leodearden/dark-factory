@@ -178,6 +178,7 @@ from orchestrator.merge_lane.types import (
     OutcomeKind,
     QueuedBranch,
     RealMergeItem,
+    RelaneOutcome,
     SoloVerifyResult,
     SpeculativeItem,
     TerminalOutcomeRecord,
@@ -342,6 +343,16 @@ single module-bool branch at each call site."""
 def _normalize_lane(lane: str) -> str:
     """Map an unrecognised lane value to 'normal' (defensive; prevents starvation)."""
     return lane if lane in MERGE_LANES else 'normal'
+
+
+def _answers_to(req: MergeRequest, request_id: str | None, task_id: str | None) -> bool:
+    """Whether *req* is the queue entry an operator named: by its own request id,
+    or by a task id it carries — its own, or a coalesced member's (task 5246)."""
+    if request_id is not None:
+        return req.request_id == request_id
+    return req.task_id == task_id or (
+        isinstance(req, GroupMergeRequest) and task_id in req.member_task_ids
+    )
 
 
 def _aging_key(req: MergeRequest) -> tuple[float, str]:
@@ -12032,6 +12043,119 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return  # sentinel consumed — all prior items already buffered
             self._buffer_owned_request(item)
 
+    def _queued_arrivals(self) -> list[MergeRequest]:
+        """Requests still on the external ``_queue``, not yet drained into a lane buffer."""
+        return [
+            _q_req
+            for _q_req in self._queue._queue  # type: ignore[attr-defined]
+            if _q_req is not None
+        ]
+
+    def relane(
+        self,
+        lane: Literal['normal', 'high'],
+        *,
+        request_id: str | None = None,
+        task_id: str | None = None,
+    ) -> RelaneOutcome:
+        """Move a request still waiting for the merger into *lane* (task 5246).
+
+        The operator's lever on an ALREADY-ENQUEUED request.
+        ``metadata.merge_lane`` is read once, at enqueue, so editing it later
+        moves nothing.  Address the request by *request_id*, or by *task_id*:
+        a coalesced member is reachable only by task id, because coalescing
+        retired its own request id, and it moves its whole train
+        (``via_train``).  Moving to ``'normal'`` demotes.
+
+        Only ``req.lane`` changes here, plus its journal record so a restart
+        keeps it.  The lane buffers belong to ``_merger_task``, and the
+        coalescing pass holds a view of them across awaits, so the move
+        itself is the owner's: :meth:`_rebucket_relaned_requests` runs at the
+        top of :meth:`_pop_next_pickable`, and the merger is woken to reach
+        it.  A request the merger has already taken is refused, since no lane
+        orders it any more and the frozen prefix is never reordered.  No
+        await: lookup and write are one atomic step on the loop.
+        """
+        if lane not in MERGE_LANES:
+            raise ValueError(f'unknown merge lane {lane!r}; expected one of {list(MERGE_LANES)}')
+        if (request_id is None) == (task_id is None):
+            raise ValueError('relane needs exactly one of request_id or task_id')
+        waiting = [
+            *(req for ln in MERGE_LANES for req in self._lane_buffers[ln]),
+            *self._queued_arrivals(),
+        ]
+        target = next(
+            (req for req in waiting
+             if not req.result.done() and _answers_to(req, request_id, task_id)),
+            None,
+        )
+        if target is None:
+            return self._relane_refusal(lane, request_id, task_id)
+        from_lane = target.lane
+        target.lane = lane
+        if self._merge_store is not None and target.request_id in self._journaled_request_ids:
+            try:
+                self._merge_store.record(target)
+            except Exception:
+                logger.warning(
+                    'merge_queue: relane: store.record failed for %s',
+                    target.request_id, exc_info=True,
+                )
+        via_train = target.train_id if isinstance(target, GroupMergeRequest) else None
+        logger.info(
+            'merge_queue: relane: %s (task %s, train %s) %s -> %s',
+            target.request_id, target.task_id, via_train, from_lane, lane,
+        )
+        self._signal_resume()
+        return RelaneOutcome(
+            relaned=True, lane=lane, request_id=target.request_id,
+            from_lane=from_lane, via_train=via_train,
+        )
+
+    def _relane_refusal(
+        self,
+        lane: Literal['normal', 'high'],
+        request_id: str | None,
+        task_id: str | None,
+    ) -> RelaneOutcome:
+        """Why :meth:`relane` found nothing waiting under that id: picked, or absent."""
+        waiting_states = (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED)
+        for rid, state in self._lifecycle.non_terminal_items().items():
+            live = self._live_items.get(rid)
+            if (
+                state not in waiting_states
+                and live is not None
+                and _answers_to(_request_of(live), request_id, task_id)
+            ):
+                return RelaneOutcome(
+                    relaned=False, lane=lane, request_id=rid,
+                    refusal='already_picked', state=str(state),
+                )
+        return RelaneOutcome(relaned=False, lane=lane, refusal='not_found')
+
+    def _rebucket_relaned_requests(self) -> None:
+        """Move each buffered request whose ``lane`` was changed by :meth:`relane`
+        into that lane's buffer, at its aging position (task 5246).
+
+        Runs on ``_merger_task``, the buffers' owner, so it never lands inside
+        an await that holds a view of them (the coalescing pass does).
+        """
+        for lane in MERGE_LANES:
+            buf = self._lane_buffers[lane]
+            strays = [req for req in buf if _normalize_lane(req.lane) != lane]
+            if not strays:
+                continue
+            self._assert_single_writer(self._merger_task, '_lane_buffers')
+            for req in strays:
+                buf.remove(req)
+                target = self._lane_buffers[_normalize_lane(req.lane)]
+                key = _aging_key(req)
+                idx = next(
+                    (i for i, queued in enumerate(target) if _aging_key(queued) > key),
+                    len(target),
+                )
+                target.insert(idx, req)
+
     def _pop_next_pickable(self) -> MergeRequest | None:
         """Return the next pickable request using clique-scoped aging (ζ=1891).
 
@@ -12069,6 +12193,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         if self.is_admission_halted:
             return None
+        self._rebucket_relaned_requests()
         graph = self._suffix_conflict_graph
         for lane in MERGE_LANES:  # high → normal
             if self.is_lane_halted(lane):
@@ -14037,7 +14162,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             state: str,
             worktree_path=None,
             position: int = 0,
-            lane: str | None = None,
         ) -> dict:
             return {
                 'task_id': req.task_id,
@@ -14050,7 +14174,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'worktree': str(worktree_path) if worktree_path is not None else None,
                 'pre_rebased': req.pre_rebased,
                 'request_id': req.request_id,
-                'lane': lane if lane is not None else req.lane,
+                'lane': req.lane,
                 # Uniform schema: present on all entries; non-None only on _inflight entries.
                 'host': None,
                 'verify_started_at': None,
@@ -14106,11 +14230,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             for _lane in MERGE_LANES
             for _lb_req in self._lane_buffers[_lane]
         }
-        _arrivals: list[MergeRequest] = [
-            _q_req
-            for _q_req in self._queue._queue  # type: ignore[attr-defined]
-            if _q_req is not None
-        ]
+        _arrivals = self._queued_arrivals()
         _container_ids |= {_q_req.request_id for _q_req in _arrivals}
         _decided = self._decided_predispatch_ids(_arrivals)
 
@@ -14225,21 +14345,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         # 4. Queued (waiting for the merger; the incident blind spot)
         # Items may be in the external _queue OR already drained into _lane_buffers.
-        # Enumerate _lane_buffers first (priority-ordered; items here are already
-        # waiting), then _queue for any not-yet-drained arrivals, which carry
-        # their own lane.
-        _waiting = [
-            (lane, req)
-            for lane, req in (
-                *((_ln, _r) for _ln in MERGE_LANES for _r in self._lane_buffers[_ln]),
-                *((None, _r) for _r in _arrivals),
-            )
-            if req.request_id not in _decided
-        ]
-        for lane, req in _waiting:
+        # Enumerate _lane_buffers first (items here are already waiting), then
+        # _queue for any not-yet-drained arrivals, and list them in the order
+        # the merger will pick: by each request's OWN lane, high first, which
+        # a relane (task 5246) changes before the merger re-buckets it.
+        _waiting = sorted(
+            (
+                req
+                for req in (
+                    *(_r for _ln in MERGE_LANES for _r in self._lane_buffers[_ln]),
+                    *_arrivals,
+                )
+                if req.request_id not in _decided
+            ),
+            key=lambda req: MERGE_LANES.index(_normalize_lane(req.lane)),
+        )
+        for req in _waiting:
             entries.append(_entry(
-                req, 'queued', worktree_path=None,
-                position=len(entries), lane=lane,
+                req, 'queued', worktree_path=None, position=len(entries),
             ))
 
         entries, _duplicate_rids = _first_copy_per_request(entries)
@@ -16018,6 +16141,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         candidates = [
             req for req in self._lane_buffers['normal']
             if not isinstance(req, GroupMergeRequest)
+            and req.lane == 'normal'
             and not req.result.done()
             and not req.result.cancelled()
         ]
@@ -16177,6 +16301,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             mark_member_done=callbacks.mark_member_done,
             redrive_member=callbacks.redrive_member,
             member_pre_stack_tips=stack_result.pre_stack_tips,
+            lane='high' if any(r.lane == 'high' for r in survivor_reqs) else 'normal',
         )
         # MQ-reliability kappa (task 2169): group_req is a brand-new
         # request_id (GroupMergeRequest.request_id auto-generated at

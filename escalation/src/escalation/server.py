@@ -7,7 +7,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, assert_never, cast
@@ -3836,8 +3836,9 @@ def create_server(
           ``lane_applied`` is **False** here and the resolution is audit only.
           Branch on ``lane_applied``, never on ``lane`` alone: a ``lane='high'``
           hotfix that coalesced is riding a possibly-``'normal'`` in-flight
-          entry.  To actually get the high lane, ``merge_cancel`` the
-          in-flight entry and resubmit, or wait for it and resubmit after.
+          entry.  To actually get the high lane, ``merge_relane`` that
+          entry while it still waits for the merger; once it has been picked,
+          ``merge_cancel`` it and resubmit, or wait for it and resubmit after.
           The in-flight entry's OWN lane is not echoed here — this arm can
           reach a foreign or pre-restart merger for which no in-process entry
           exists at all (``poll_by='branch'``), so it is not knowable
@@ -5362,5 +5363,62 @@ def create_server(
             event_store=event_store,
         )
         return {'cancelled': True, 'state': MergeState.abandoned, 'reason': None}
+
+    # ── merge_relane — move an already-enqueued request between lanes (task 5246) ──
+
+    @mcp.tool()
+    async def merge_relane(
+        lane: str,
+        request_id: str | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Move a merge request that is still waiting for the merger into *lane*.
+
+        A request's lane is decided ONCE, at enqueue, from ``merge_request``'s
+        ``lane`` or the task's ``metadata.merge_lane``.  Editing that metadata
+        afterwards moves nothing, so this tool is the lever for an
+        already-enqueued request.  ``lane='high'`` gets the request picked
+        ahead of every normal-lane request, and ``lane='normal'`` demotes it.
+        It is non-preemptive: a merge or verify already in progress is never
+        touched.
+
+        Name the request with exactly one of *request_id* (as
+        ``get_merge_queue`` lists it) or *task_id*.  A task coalesced into a
+        train has no queue entry of its own, because coalescing retired its
+        request id.  Address it by *task_id* instead: its whole train moves,
+        named by ``via_train``.
+
+        Returns ``{relaned, lane, request_id, from_lane, via_train, refusal,
+        state}``
+        (orchestrator/src/orchestrator/merge_lane/types.py::RelaneOutcome).
+        ``refusal`` is ``'already_picked'`` once the merger has taken the
+        request, since no lane orders it any more; ``state`` then names where
+        it is.  Otherwise ``refusal`` is ``'not_found'``.  Bad input returns
+        ``{error, code, hint}`` with ``code`` ``'invalid_lane'`` or
+        ``'invalid_target'``, and nothing moves.  The new lane is journaled
+        with the request, so a restart keeps it.
+
+        Operator-only: this tool appears in no agent role's allow-list.
+        """
+        worker = _get_merge_worker(harness)
+        if worker is None or not hasattr(worker, 'relane'):
+            return {'error': 'Merge worker not available — orchestrator not running'}
+        try:
+            validated_lane = validate_requested_lane(lane)
+        except InvalidMergeLane as exc:
+            valid = ', '.join(repr(v) for v in exc.valid_lanes)
+            return {
+                'error': f'invalid merge lane {exc.value!r}',
+                'code': 'invalid_lane',
+                'hint': f'lane must be one of: {valid}',
+            }
+        if (request_id is None) == (task_id is None):
+            return {
+                'error': 'name the request with exactly one of request_id or task_id',
+                'code': 'invalid_target',
+                'hint': 'a coalesced member is addressed by task_id',
+            }
+        outcome = worker.relane(validated_lane, request_id=request_id, task_id=task_id)
+        return asdict(outcome)
 
     return mcp

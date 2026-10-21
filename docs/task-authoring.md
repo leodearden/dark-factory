@@ -1509,6 +1509,12 @@ asymmetry is deliberate; the reason for it is stated once, in
 `escalation/src/escalation/merge_lane_resolution.py`, under the same one-place
 rule this section applies to the carrier census below.
 
+The lane is decided once, at enqueue. Editing `metadata.merge_lane` on a task
+whose request is already queued moves nothing (task 5246). An operator moves a
+request that is still waiting for the merger with the `merge_relane` MCP tool
+(`escalation/src/escalation/server.py::merge_relane`), which also reaches a
+coalesced member by task id and moves its whole train.
+
 `'high'` remains reserved for the **rare, gated hotfix / main-health class**
 (task 1689) — its three machine writers are all of that shape. Routine work
 declaring itself urgent starves the normal lane, which is the failure the
