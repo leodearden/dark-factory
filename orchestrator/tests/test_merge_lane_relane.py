@@ -120,10 +120,14 @@ def _halted_normal_lane(
     return lane, queue
 
 
-async def _until_buffered(queue: asyncio.Queue[Any]) -> None:
-    """Wait for the merger to take everything off the queue into its buffers."""
+async def _until_parked(queue: asyncio.Queue[Any]) -> None:
+    """Wait for the merger to take everything off the queue into its buffers,
+    then long enough for it to park with nothing pickable.  A merger that has
+    not parked yet would reach the pick on its own; the settle can only make
+    a broken wake-up pass, never make a working one fail."""
     while not queue.empty():
         await asyncio.sleep(0.01)
+    await asyncio.sleep(0.5)
 
 
 def _queued_lanes(lane: SpeculativeMergeWorker) -> list[tuple[str, str]]:
@@ -139,7 +143,7 @@ async def test_a_relaned_request_lands_ahead_of_the_halted_normal_lane(scene: _S
     lane, queue = _halted_normal_lane(scene, [older, urgent])
 
     async with running_lane(lane) as run:
-        await wait_responsive(_until_buffered(queue), label='both requests buffered')
+        await wait_responsive(_until_parked(queue), label='both requests buffered')
 
         moved = lane.relane('high', request_id=urgent.request_id)
 
