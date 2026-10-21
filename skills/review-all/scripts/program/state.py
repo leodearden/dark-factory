@@ -1739,4 +1739,140 @@ def validate_return(
     rejections, value = _check_form(data, program)
     if value is None:
         return ReturnCheck(tuple(rejections), None, None)
-    return ReturnCheck((), value, None)
+    if value.pass_ is not Pass.DECOMPOSE:
+        return ReturnCheck((), value, None)
+    contradictions, measured_at = _check_store(value, stream_views(program, ledger), store)
+    return ReturnCheck(tuple(contradictions), None if contradictions else value, measured_at)
+
+
+class _StoreReads:
+    """One validation's store reads: each id is read once, and measured_at is the earliest read's."""
+
+    def __init__(self, store: StoreView) -> None:
+        self._store = store
+        self._rows: dict[int, TaskRow | None] = {}
+        self.measured_at: str | None = None
+
+    def _noted(self, read: StoreRead) -> TaskRow | None:
+        self.measured_at = min(filter(None, (self.measured_at, read.measured_at)))
+        return read.rows[0] if read.rows else None
+
+    def task(self, task_id: int) -> TaskRow | None:
+        if task_id not in self._rows:
+            self._rows[task_id] = self._noted(self._store.task(task_id))
+        return self._rows[task_id]
+
+    def gate(self, run_id: str) -> TaskRow | None:
+        return self._noted(self._store.gate(run_id))
+
+
+def _contradiction(field: str, reason: str) -> Rejection:
+    return Rejection(field, RejectionClass.CONTRADICTION, reason)
+
+
+def _authored_rejections(ret: PrdReturn, view: StreamView) -> list[Rejection]:
+    if view.authored:
+        return []
+    return [_contradiction(
+        'pass', f'{ret.stream} author return is not applied: the ledger has no '
+        f'stream_status authored line for {ret.stream}',
+    )]
+
+
+def _filed_key_rejections(ret: PrdReturn, view: StreamView) -> list[Rejection]:
+    return [
+        _contradiction(f'filed[{i}].keys[{k}]',
+                       f'{key!r} is not a key of {ret.stream} after amendments: {list(view.keys)}')
+        for i, filed in enumerate(ret.filed) for k, key in enumerate(filed.keys)
+        if key not in view.keys
+    ]
+
+
+def _filed_rejections(ret: PrdReturn, reads: _StoreReads) -> list[Rejection]:
+    rejections = []
+    for i, filed in enumerate(ret.filed):
+        field, row = f'filed[{i}].task_id', reads.task(filed.task_id)
+        if row is None:
+            rejections.append(_contradiction(field, f'task {filed.task_id} is absent from the store'))
+            continue
+        run = row.metadata.get('x_finding_run')
+        if run != ret.run_id:
+            rejections.append(_contradiction(
+                field, f'task {filed.task_id} carries x_finding_run {run!r}, not {ret.run_id!r}'))
+        prd_path = row.metadata.get('prd_path')
+        if not filed.adopted and prd_path != ret.prd_path:
+            rejections.append(_contradiction(
+                field, f'task {filed.task_id} carries prd_path {prd_path!r}, not {ret.prd_path!r}, '
+                'and adopted is false'))
+    return rejections
+
+
+def _gate_dep_rejections(ret: PrdReturn, reads: _StoreReads) -> list[Rejection]:
+    claimed = [(i, filed.task_id) for i, filed in enumerate(ret.filed) if filed.gate_dep]
+    if not claimed:
+        return []
+    gate = reads.gate(ret.run_id)
+    if gate is None:
+        reason = f'no human_gate task carries trigger_chain.run_id = {ret.run_id}'
+        return [_contradiction(f'filed[{i}].gate_dep', reason) for i, _ in claimed]
+    return [
+        _contradiction(f'filed[{i}].gate_dep', f'task {task_id} is not a dependency of gate '
+                       f'{gate.task_id}: {list(gate.dependencies)}')
+        for i, task_id in claimed if task_id not in gate.dependencies
+    ]
+
+
+def _held_rejections(ret: PrdReturn, reads: _StoreReads) -> list[Rejection]:
+    rejections = []
+    for i, held in enumerate(ret.held):
+        field, row = f'held[{i}].task_id', reads.task(held.task_id)
+        if row is None:
+            rejections.append(_contradiction(field, f'task {held.task_id} is absent from the store'))
+            continue
+        if row.status != _task_statuses.TaskStatus.DEFERRED:
+            rejections.append(_contradiction(
+                field, f'task {held.task_id} is {row.status}, not {_task_statuses.TaskStatus.DEFERRED}'))
+        wait = row.metadata.get(SEAM_WAIT_KEYS.key)
+        if not isinstance(wait, Mapping):
+            rejections.append(_contradiction(
+                field, f'task {held.task_id} carries no {SEAM_WAIT_KEYS.key}'))
+        elif wait.get('stream') != held.waits_on:
+            rejections.append(_contradiction(
+                f'held[{i}].waits_on', f'the store records {SEAM_WAIT_KEYS.key}.stream '
+                f'{wait.get("stream")!r} for task {held.task_id}, not {held.waits_on!r}'))
+    return rejections
+
+
+def _released_rejections(ret: PrdReturn, reads: _StoreReads) -> list[Rejection]:
+    rejections = []
+    for i, released in enumerate(ret.released):
+        field, row = f'released[{i}].task_id', reads.task(released.task_id)
+        if row is None:
+            rejections.append(_contradiction(field, f'task {released.task_id} is absent from the store'))
+            continue
+        if SEAM_RELEASED_KEYS.key not in row.metadata:
+            rejections.append(_contradiction(
+                field, f'task {released.task_id} carries no {SEAM_RELEASED_KEYS.key}'))
+        rejections += [
+            _contradiction(f'released[{i}].onto[{j}]', f'task {onto} is not a store dependency of '
+                           f'task {released.task_id}: {list(row.dependencies)}')
+            for j, onto in enumerate(released.onto) if onto not in row.dependencies
+        ]
+    return rejections
+
+
+def _check_store(
+    ret: PrdReturn, views: Mapping[str, StreamView], store: StoreView,
+) -> tuple[list[Rejection], str | None]:
+    """A decompose return's claims the store or the ledger contradicts, and when the store was read."""
+    reads = _StoreReads(store)
+    view = views[ret.stream]
+    rejections = [
+        *_authored_rejections(ret, view),
+        *_filed_key_rejections(ret, view),
+        *_filed_rejections(ret, reads),
+        *_gate_dep_rejections(ret, reads),
+        *_held_rejections(ret, reads),
+        *_released_rejections(ret, reads),
+    ]
+    return rejections, reads.measured_at
