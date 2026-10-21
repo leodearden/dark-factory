@@ -242,9 +242,9 @@ class BatchStats:
     """Per-batch mining tally: how one ``coder.code_digests`` batch scored
     against the saturation threshold.
 
-    ``status`` mirrors ``coder.RunResult.status`` (``"ok"`` or
-    ``"failure"`` -- a storm, PRD §8.6, when this batch's failed/total
-    fraction strictly exceeds 0.5): surfaced so a caller (``run_census``,
+    ``status`` mirrors ``coder.RunResult.status`` (``coder.CodingStatus``;
+    FAILURE is a storm, PRD §8.6, when this batch's failed/total fraction
+    strictly exceeds 0.5): surfaced so a caller (``run_census``,
     or any future one) can tell a batch's ``dup_rate`` was drawn from a
     small, skewed, storm-degraded sample rather than a healthy one, even
     though ``saturated`` already accounts for it (a storm batch is never
@@ -256,7 +256,11 @@ class BatchStats:
     failed: int
     dup_rate: float
     saturated: bool
-    status: str = "ok"
+    status: coder.CodingStatus = coder.CodingStatus.OK
+
+    def __post_init__(self) -> None:
+        # A census record read back from JSON carries the status as its string.
+        self.status = coder.CodingStatus(self.status)
 
 
 @dataclass
@@ -301,14 +305,14 @@ def mine_to_saturation(
     consecutive saturated batch, so no further batch is pulled. If
     *batch_source* exhausts before that, ``stop_reason="exhausted"``.
 
-    A STORM batch (``coder.RunResult.status == "failure"`` -- PRD §8.6,
+    A STORM batch (``coder.CodingStatus.FAILURE`` -- PRD §8.6,
     more than half the batch's digests failed to code) never counts toward
     saturation, however high its ``dup_rate`` computes: that rate is drawn
     from whatever handful of records happened to succeed, too small and
     too skewed a sample to trust, and a run of storms would otherwise be
     able to trip the saturation stop on degraded data rather than genuine
     novelty exhaustion. The batch's ``dup_rate`` is still recorded on its
-    ``BatchStats`` (with ``status="failure"``) for visibility, but
+    ``BatchStats`` (with ``status=CodingStatus.FAILURE``) for visibility, but
     ``saturated`` is forced False and the consecutive-saturated counter is
     reset, exactly as if the batch scored below threshold.
 
@@ -392,10 +396,13 @@ def mine_to_saturation(
         result.records.extend(run_result.records)
 
         dup_rate = batch_dup_rate(run_result.records)
-        # A storm (run_result.status == "failure") never satisfies
+        # A storm (coder.CodingStatus.FAILURE) never satisfies
         # saturation, no matter how high dup_rate computes over its few
         # successful records -- see the storm paragraph above.
-        saturated = dup_rate >= config.dup_rate and run_result.status != "failure"
+        saturated = (
+            dup_rate >= config.dup_rate
+            and run_result.status != coder.CodingStatus.FAILURE
+        )
         result.batch_stats.append(
             BatchStats(
                 index=index,
@@ -3559,7 +3566,10 @@ def run_census(
         if decision.ticket is not None and decision.filing.project_root != project_root
     )
 
-    storm_batch_indices = [s.index for s in mining_result.batch_stats if s.status == "failure"]
+    storm_batch_indices = [
+        s.index for s in mining_result.batch_stats
+        if s.status == coder.CodingStatus.FAILURE
+    ]
     if storm_batch_indices:
         logger.warning(
             "census: %d storm batch(es) (>50%% coding failures, PRD §8.6) at "

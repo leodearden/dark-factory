@@ -748,7 +748,7 @@ class NightlyResult:
     exit_code: int = 0
     commit_made: bool = False
     applied: int = 0
-    coder_status: str | None = None
+    coder_status: coder.CodingStatus | None = None
     census_line: str | None = None
     census_fire: bool = False
     escalated: bool = False
@@ -1619,7 +1619,7 @@ def _run_configured_nightly(
             )
             return result
 
-        if run.status == 'failure':
+        if run.status == coder.CodingStatus.FAILURE:
             # >50% of digests failed to code (PRD §5.3/§6.8 storm threshold):
             # fail loud (decision 8) and skip merge/dump/commit entirely -- the
             # codebook is left untouched rather than partially applied.
