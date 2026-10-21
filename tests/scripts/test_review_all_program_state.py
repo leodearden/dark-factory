@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from review_all_program_fixture import PROGRAM_DIR, load_state
+
 from shared import task_statuses
 
 state = load_state()
@@ -71,6 +72,5 @@ def test_wire_constants() -> None:
         'stream_status', 'amend_stream', 'amend_program', 'xref', 'action',
         'action_result', 'scanned', 'note', 'commit',
     }
-    assert state.NON_TERMINAL_STATUSES == tuple(
-        sorted(str(s) for s in task_statuses.ACTIVE)
-    )
+    active = tuple(sorted(str(s) for s in task_statuses.ACTIVE))
+    assert active == state.NON_TERMINAL_STATUSES
