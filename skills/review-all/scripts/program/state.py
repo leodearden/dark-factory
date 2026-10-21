@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import enum
 import importlib
+import json
+import os
+import re
 import sys
 import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, NamedTuple
 
 CHECKOUT_ROOT = Path(__file__).resolve().parents[4]
 _SHARED_SRC = str(CHECKOUT_ROOT / 'shared' / 'src')
@@ -630,3 +633,134 @@ def stream_of(row: TaskRow, views: Mapping[str, StreamView]) -> str:
             f'task {row.task_id}: finding keys {list(keys)} belong to streams {", ".join(hits)}'
         )
     return hits[0] if hits else UNSTREAMED
+
+
+_PATH_SEGMENT = re.compile(r'[A-Za-z0-9._-]+')
+
+
+def _segment(text: str, what: str) -> str:
+    """*text* when it is one safe path segment; StateError naming it otherwise."""
+    if not isinstance(text, str) or not _PATH_SEGMENT.fullmatch(text) or text in {'.', '..'}:
+        raise StateError(f'{what} {text!r} is not one path segment of [A-Za-z0-9._-], nor . or ..')
+    return text
+
+
+def _pass_stem(stream: str, pass_: Pass | str, item: str | None) -> str:
+    """The one naming rule for per-pass files: ``<S>.<pass>`` or ``<S>.investigate-<item>``."""
+    pass_ = Pass(pass_)
+    _segment(stream, 'stream')
+    if pass_ is Pass.INVESTIGATE:
+        if item is None:
+            raise StateError(f'{stream}.investigate files are named by the item they investigate')
+        return f'{stream}.investigate-{_segment(item, "item")}'
+    if item is not None:
+        raise StateError(f'{stream}.{pass_}: item {item!r} names only an investigate pass')
+    return f'{stream}.{pass_}'
+
+
+class BatchFiles(NamedTuple):
+    actions: Path
+    prompt: Path
+    result: Path
+
+
+@dataclass(frozen=True)
+class Home:
+    """The run's working state home and every file and directory of its layout."""
+
+    root: Path
+
+    @property
+    def program_json(self) -> Path:
+        return self.root / 'program.json'
+
+    @property
+    def rulings(self) -> Path:
+        return self.root / 'rulings.jsonl'
+
+    @property
+    def ledger(self) -> Path:
+        return self.root / 'ledger.jsonl'
+
+    @property
+    def sessions_json(self) -> Path:
+        return self.root / 'sessions.json'
+
+    @property
+    def handoff(self) -> Path:
+        return self.root / 'HANDOFF.md'
+
+    @property
+    def render_state_dir(self) -> Path:
+        return self.root / 'render' / '.state'
+
+    def render_doc(self, program: Program) -> Path:
+        return self.root / 'render' / PurePosixPath(program.doc_path).name
+
+    def prds_dir(self, stream: str) -> Path:
+        return self.root / 'prds' / _segment(stream, 'stream')
+
+    def inbox_file(self, stream: str, pass_: Pass | str, item: str | None = None) -> Path:
+        return self.root / 'inbox' / f'{_pass_stem(stream, pass_, item)}.json'
+
+    def returns_file(self, stream: str, pass_: Pass | str, item: str | None = None) -> Path:
+        return self.root / 'returns' / f'{_pass_stem(stream, pass_, item)}.json'
+
+    def brief_file(self, stream: str, pass_: Pass | str, item: str | None = None) -> Path:
+        return self.root / 'briefs' / f'{_pass_stem(stream, pass_, item)}.md'
+
+    def handback_file(
+        self, stream: str, pass_: Pass | str, item: str | None = None,
+        checkpoint: int | None = None,
+    ) -> Path:
+        suffix = '' if checkpoint is None else f'.checkpoint-{checkpoint}'
+        return self.root / 'handbacks' / f'{_pass_stem(stream, pass_, item)}{suffix}.md'
+
+    def batch_files(self, number: int) -> BatchFiles:
+        actions = self.root / 'actions'
+        return BatchFiles(
+            actions / f'batch-{number}.json',
+            actions / f'batch-{number}.prompt.md',
+            actions / f'batch-{number}.result.json',
+        )
+
+
+def homes_root(environ: Mapping[str, str] = os.environ) -> Path:
+    """``$REVIEW_ALL_HOME``, which must be absolute, else ``~/.claude/review-all``."""
+    configured = environ.get('REVIEW_ALL_HOME')
+    if configured is None:
+        return Path.home() / '.claude' / 'review-all'
+    if not Path(configured).is_absolute():
+        raise StateError(f'REVIEW_ALL_HOME must be an absolute path, got {configured!r}')
+    return Path(configured)
+
+
+def run_home(run_id: str, environ: Mapping[str, str] = os.environ) -> Home:
+    return Home(homes_root(environ) / _segment(run_id, 'run_id'))
+
+
+def published_doc(program: Program) -> Path:
+    return Path(program.project_root) / program.doc_path
+
+
+def snapshot_dir(program: Program) -> Path:
+    return published_doc(program).with_suffix('.state')
+
+
+def fused_memory_url(
+    environ: Mapping[str, str] = os.environ, checkout: Path = CHECKOUT_ROOT,
+) -> str:
+    """The fused-memory MCP endpoint: ``$FUSED_MEMORY_URL``, else the checkout's ``.mcp.json`` entry."""
+    if environ.get('FUSED_MEMORY_URL'):
+        return environ['FUSED_MEMORY_URL']
+    mcp_json = checkout / '.mcp.json'
+    try:
+        url = json.loads(mcp_json.read_text())['mcpServers']['fused-memory']['url']
+    except (OSError, ValueError, KeyError, TypeError):
+        url = None
+    if not isinstance(url, str) or not url:
+        raise StateError(
+            f'no fused-memory URL: FUSED_MEMORY_URL is unset and {mcp_json} carries no '
+            "mcpServers['fused-memory'].url"
+        )
+    return url
