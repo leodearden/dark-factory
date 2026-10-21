@@ -609,3 +609,185 @@ class TestShippedWritePath:
         assert guard == AttachGuard(
             min_parent_cosine=triage.min_parent_cosine, hoist_max_cosine_gap=triage.hoist_max_cosine_gap,
         )
+
+
+# --- per-project band arms and the replay -----------------------------------
+
+
+def _pooled() -> Any:
+    return _routing(t_high=0.88, t_low=0.52)
+
+
+def _report(
+    *, t_high: float | None = None, t_low: float | None = None,
+    per_category: dict[str, tuple[float | None, float | None]] | None = None,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {'chosen_t_high': t_high, 'chosen_t_low': t_low}
+    if per_category is not None:
+        report['per_category'] = {
+            category: {'t_high': high, 't_low': low, 'reason': None if low is not None else 'empty_class: n_duplicate=0'}
+            for category, (high, low) in per_category.items()
+        }
+    return report
+
+
+def _edges(arm: Any, category: str) -> tuple[tuple[float | None, str], tuple[float | None, str]]:
+    edges = arm.edges_for(category)
+    return (edges.t_high.value, edges.t_high.source.value), (edges.t_low.value, edges.t_low.source.value)
+
+
+_FALLBACK = ((0.88, 'pooled_fallback'), (0.52, 'pooled_fallback'))
+
+
+class TestProjectBandArms:
+    def test_the_two_arms_are_project_and_project_category(self):
+        arms = _mod().project_band_arms(_report(), _pooled())
+
+        assert set(arms) == {'project', 'project_category'}
+
+    def test_a_fully_refused_report_falls_back_to_pooled_on_every_edge(self):
+        report = _report(per_category={'procedural_knowledge': (None, None), 'preferences_and_norms': (None, None)})
+
+        arms = _mod().project_band_arms(report, _pooled())
+
+        for arm in arms.values():
+            for category in ('procedural_knowledge', 'preferences_and_norms', 'observations_and_summaries'):
+                assert _edges(arm, category) == _FALLBACK
+
+    def test_a_derived_category_overrides_only_that_category(self):
+        report = _report(per_category={'observations_and_summaries': (0.85, 0.63), 'preferences_and_norms': (None, None)})
+
+        arm = _mod().project_band_arms(report, _pooled())['project_category']
+
+        assert _edges(arm, 'observations_and_summaries') == ((0.85, 'report'), (0.63, 'report'))
+        assert _edges(arm, 'preferences_and_norms') == _FALLBACK
+        assert _edges(arm, 'procedural_knowledge') == _FALLBACK
+
+    def test_a_derived_category_leaves_the_project_arm_on_its_own_chosen_edges(self):
+        report = _report(per_category={'observations_and_summaries': (0.85, 0.63)})
+
+        arm = _mod().project_band_arms(report, _pooled())['project']
+
+        assert _edges(arm, 'observations_and_summaries') == _FALLBACK
+
+    def test_the_project_arm_takes_the_chosen_edges_for_every_category(self):
+        arm = _mod().project_band_arms(_report(t_high=0.8, t_low=0.7), _pooled())['project']
+
+        assert _edges(arm, 'procedural_knowledge') == ((0.8, 'report'), (0.7, 'report'))
+
+    def test_each_edge_falls_back_on_its_own(self):
+        arm = _mod().project_band_arms(_report(t_low=0.6), _pooled())['project']
+
+        assert _edges(arm, 'procedural_knowledge') == ((0.88, 'pooled_fallback'), (0.6, 'report'))
+
+    def test_a_missing_per_category_section_is_all_fallback(self):
+        arm = _mod().project_band_arms(_report(t_high=0.8, t_low=0.7), _pooled())['project_category']
+
+        assert _edges(arm, 'procedural_knowledge') == _FALLBACK
+
+
+def _move(memory_id: str, max_cosine: float, **overrides: Any) -> Any:
+    return _write(memory_id=memory_id, max_cosine=max_cosine, **overrides)
+
+
+def _replay(writes: list[Any], report: dict[str, Any], arm: str = 'project') -> dict[str, Any]:
+    arms = {'solar_challenge': _mod().project_band_arms(report, _pooled())}
+    return _mod().replay_bands(writes, _pooled(), arms)['solar_challenge'][arm]
+
+
+def _matrix(**cells: int) -> dict[str, dict[str, int]]:
+    bands = ('restated', 'judge', 'stored')
+    matrix = {source: dict.fromkeys(bands, 0) for source in bands}
+    for cell, count in cells.items():
+        source, target = cell.split('__')
+        matrix[source][target] = count
+    return matrix
+
+
+class TestReplayBands:
+    def _raised_floor_lowered_ceiling(self) -> dict[str, Any]:
+        # Arm 0.80 / 0.70 against pooled 0.88 / 0.52.
+        return _replay([
+            _move('a', 0.60, verdict=_verdict('misfile')),
+            _move('b', 0.65, outcome='contested', verdict=_verdict('correct')),
+            _move('c', 0.68),
+            _move('d', 0.82, verdict=_verdict('correct')),
+            _move('e', 0.75, verdict=_verdict('unclear')),
+            _stored(memory_id='f', max_cosine=0.40),
+            _move('g', 0.95, outcome='restated'),
+            _move('h', 0.60, project='dark_factory', verdict=_verdict('misfile')),
+        ], _report(t_high=0.80, t_low=0.70))
+
+    def test_the_matrix_counts_every_write_once_from_its_pooled_band_to_its_arm_band(self):
+        assert self._raised_floor_lowered_ceiling()['matrix'] == _matrix(
+            restated__restated=1, judge__stored=3, judge__restated=1, judge__judge=1, stored__stored=1,
+        )
+
+    def test_moving_into_stored_removes_rated_misfiles_and_loses_rated_non_misfiles(self):
+        assert self._raised_floor_lowered_ceiling()['into_stored'] == {
+            'movers': 3, 'rated_misfiles_removed': 1, 'rated_non_misfiles_lost': 1, 'unrated': 1,
+        }
+
+    def test_any_other_move_reports_soak_outcomes_and_verdicts_and_an_unknown_counterfactual(self):
+        assert self._raised_floor_lowered_ceiling()['other_moves'] == [{
+            'from': 'judge', 'to': 'restated', 'movers': 1,
+            'soak_outcomes': {'amended': 1}, 'rated_verdicts': {'correct': 1}, 'unrated': 0,
+            'counterfactual_verdict': 'unknown',
+        }]
+
+    def test_a_lowered_floor_moves_stored_writes_into_the_judge_band(self):
+        replay = _replay(
+            [_stored(memory_id='s', max_cosine=0.48), _stored(memory_id='t', max_cosine=0.40)],
+            _report(t_low=0.45),
+        )
+
+        assert replay['matrix'] == _matrix(judge__stored=0, stored__judge=1, stored__stored=1)
+        assert replay['other_moves'] == [{
+            'from': 'stored', 'to': 'judge', 'movers': 1, 'soak_outcomes': {'stored': 1},
+            'rated_verdicts': {}, 'unrated': 1, 'counterfactual_verdict': 'unknown',
+        }]
+
+    def test_a_fully_refused_report_replays_to_the_diagonal_only(self):
+        replay = _replay(
+            [_move('a', 0.60, verdict=_verdict('misfile')), _stored(memory_id='f', max_cosine=0.40)],
+            _report(per_category={'procedural_knowledge': (None, None)}), arm='project_category',
+        )
+
+        assert replay['matrix'] == _matrix(judge__judge=1, stored__stored=1)
+        assert replay['into_stored'] == {
+            'movers': 0, 'rated_misfiles_removed': 0, 'rated_non_misfiles_lost': 0, 'unrated': 0,
+        }
+        assert replay['other_moves'] == []
+
+    def test_the_category_arm_routes_each_write_on_its_own_category(self):
+        report = _report(per_category={'observations_and_summaries': (0.85, 0.63)})
+
+        replay = _replay([
+            _move('o', 0.60, category='observations_and_summaries'),
+            _move('p', 0.60, category='procedural_knowledge'),
+        ], report, arm='project_category')
+
+        assert replay['matrix'] == _matrix(judge__stored=1, judge__judge=1)
+
+    def test_each_arm_echoes_its_edges_and_where_each_came_from(self):
+        report = _report(per_category={'observations_and_summaries': (0.85, 0.63)})
+
+        edges = _replay([], report, arm='project_category')['edges']
+
+        assert edges == {
+            'default': {
+                't_high': {'value': 0.88, 'source': 'pooled_fallback'},
+                't_low': {'value': 0.52, 'source': 'pooled_fallback'},
+            },
+            'by_category': {'observations_and_summaries': {
+                't_high': {'value': 0.85, 'source': 'report'},
+                't_low': {'value': 0.63, 'source': 'report'},
+            }},
+        }
+
+    def test_a_project_with_no_report_is_not_replayed(self):
+        arms = {'solar_challenge': _mod().project_band_arms(_report(), _pooled())}
+
+        replay = _mod().replay_bands([_move('h', 0.6, project='dark_factory')], _pooled(), arms)
+
+        assert set(replay) == {'solar_challenge'}
