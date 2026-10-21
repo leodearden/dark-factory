@@ -118,9 +118,25 @@ class FixOwner:
     signature: str
     task_id: str | None = None
     filed: bool = False
+    spawn_context: FixSpawnContext | None = None
 
     def next_action(self, otherwise: MainHealthNextAction) -> MainHealthNextAction:
         return MainHealthNextAction.FIX_TASK_FILED if self.task_id else otherwise
+
+    def behind_halt_action(self, *, heal_attempted: bool) -> MainHealthNextAction:
+        """The next action for a break met while the normal lane is halted.
+
+        Only an auto-heal task owning this signature is a heal in flight;
+        *heal_attempted* stands in for it when no owner could be read.
+        """
+        if self.task_id is None:
+            return (
+                MainHealthNextAction.AUTO_HEAL_IN_FLIGHT if heal_attempted
+                else MainHealthNextAction.NO_FIX_OWNER
+            )
+        if self.spawn_context is FixSpawnContext.AUTO_HEAL:
+            return MainHealthNextAction.AUTO_HEAL_IN_FLIGHT
+        return MainHealthNextAction.FIX_TASK_FILED
 
     def escalation_detail(self, text: str) -> str:
         if self.task_id is None:
@@ -176,14 +192,12 @@ class MainFixTaskFiler:
             try:
                 hit = await self._find_open(sig, project_root)
                 if hit is not None:
-                    task_id, status = hit
-                    await _finish_half_filed(tasks, task_id, status)
-                    return FixOwner(sig, task_id)
+                    return await _adopt(tasks, sig, *hit)
                 arguments = build_main_fix_task_arguments(
                     brk, project_root=project_root,
                     spawn_context=spawn_context, escalation_id=escalation_id,
                 )
-                return await _file(tasks, sig, arguments)
+                return await _file(tasks, sig, arguments, spawn_context)
             except Exception:
                 logger.warning(
                     'main-health fix owner: could not ensure a fix-main task for '
@@ -210,13 +224,16 @@ class MainFixTaskFiler:
 
 
 async def _file(
-    tasks: SchedulerChronicFlakeTaskClient, sig: str, arguments: dict,
+    tasks: SchedulerChronicFlakeTaskClient,
+    sig: str,
+    arguments: dict,
+    spawn_context: FixSpawnContext,
 ) -> FixOwner:
     outcome = await tasks.submit_task({**arguments, 'planning_mode': True})
     match outcome:
         case SubmittedTask(task_id=task_id, combined=False):
             await tasks.commit_planning([task_id])
-            return FixOwner(sig, task_id, filed=True)
+            return FixOwner(sig, task_id, filed=True, spawn_context=spawn_context)
         case SubmittedTask(task_id=task_id, status=status) if (
             status is not None and status not in TERMINAL
         ):
@@ -228,31 +245,37 @@ async def _file(
     return FixOwner(sig)
 
 
-async def _finish_half_filed(
-    tasks: SchedulerChronicFlakeTaskClient, task_id: str, status: str,
-) -> None:
-    """Release an owner this filer created whose ``commit_planning`` never landed.
+async def _adopt(
+    tasks: SchedulerChronicFlakeTaskClient, sig: str, task_id: str, status: str,
+) -> FixOwner:
+    """Adopt the open owner *task_id*, releasing it first when it is half-filed.
 
-    The ``deferred`` arm of
-    ``orchestrator/src/orchestrator/flake_ledger.py::_ensure_owner_task``: a
-    ``planning_mode`` task left ``deferred`` would own its signature forever
-    without ever being dispatched.  A deferral someone stamped
-    (``metadata.deferral``, e.g. a hand carry) is theirs to release, and is
-    left alone, as is a deferred task some other writer filed.
+    A ``deferred`` owner this filer created is the ``deferred`` arm of
+    ``orchestrator/src/orchestrator/flake_ledger.py::_ensure_owner_task``: its
+    ``commit_planning`` never landed, and it would own its signature forever
+    without being dispatched, so the commit is re-run.  A hold someone stamped
+    on it (a hand carry) is theirs: fused-memory refuses ``commit_planning`` on
+    any hold but the planning one it stamped at birth
+    (``fused-memory/src/fused_memory/middleware/deferral_gate.py::_not_planning_refusal``).
     """
-    if owner_liveness(status) is not OwnerLiveness.DEFERRED:
-        return
     task, read_error = await tasks.get_task(task_id)
     if task is None:
         logger.warning(
-            'main-health fix owner: could not read deferred owner %s (%s); the '
-            'next break retries', task_id, read_error,
+            'main-health fix owner: could not read owner %s (%s); adopting it '
+            'unread', task_id, read_error,
         )
-        return
-    metadata = coerce_task_metadata(task.get('metadata')) or {}
-    if metadata.get('spawn_context') in set(FixSpawnContext) and 'deferral' not in metadata:
+        return FixOwner(sig, task_id)
+    spawn_context = _spawn_context_of(task)
+    if spawn_context is not None and owner_liveness(status) is OwnerLiveness.DEFERRED:
         logger.info('main-health fix owner: completing the half-filed task %s', task_id)
         await tasks.commit_planning([task_id])
+    return FixOwner(sig, task_id, spawn_context=spawn_context)
+
+
+def _spawn_context_of(task: dict) -> FixSpawnContext | None:
+    """The filer context that created *task*, or ``None`` for a task some other writer filed."""
+    value = (coerce_task_metadata(task.get('metadata')) or {}).get('spawn_context')
+    return FixSpawnContext(value) if value in set(FixSpawnContext) else None
 
 
 async def ensure_main_fix_owner(

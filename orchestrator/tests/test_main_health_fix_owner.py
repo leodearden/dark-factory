@@ -105,21 +105,31 @@ class FakeTaskStore:
             task = self.tasks[arguments['id']]
             return _envelope({'data': {'id': arguments['id'], **task}})
         if name == 'commit_planning':
-            if self.commit_fails:
-                return _envelope({'error': 'timed out', 'error_type': 'TimeoutError'})
-            for tid in arguments['task_ids'].split(','):
-                if self.tasks[tid]['status'] == 'deferred':
-                    self.tasks[tid]['status'] = arguments['target_status']
-            return _envelope({'success': True})
+            return _envelope(self._commit_planning(arguments))
         raise AssertionError(f'unexpected tool {name}')
+
+    def _commit_planning(self, arguments: dict) -> dict:
+        """Like fused-memory: only a planning hold (or none) is released."""
+        if self.commit_fails:
+            return {'error': 'timed out', 'error_type': 'TimeoutError'}
+        for tid in arguments['task_ids'].split(','):
+            task = self.tasks[tid]
+            if task['metadata'].get('deferral', {'kind': 'planning'})['kind'] != 'planning':
+                return {'error': 'not a planning hold', 'error_type': 'DeferralInvalid'}
+            if task['status'] == 'deferred':
+                task['status'] = arguments['target_status']
+                task['metadata'].pop('deferral', None)
+        return {'success': True}
 
     async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmittedTask | SubmitFailed:
         await asyncio.sleep(0)
         self.submits.append(arguments)
         if self.submit_fails:
             return SubmitFailed('submit refused')
-        status = 'deferred' if arguments.get('planning_mode') else 'pending'
-        return SubmittedTask(self.add(status=status, metadata=arguments['metadata']), status)
+        if arguments.get('planning_mode'):
+            metadata = {**arguments['metadata'], 'deferral': {'kind': 'planning'}}
+            return SubmittedTask(self.add(status='deferred', metadata=metadata), 'deferred')
+        return SubmittedTask(self.add(status='pending', metadata=arguments['metadata']), 'pending')
 
     async def post_submit_tasks(self, arguments_list: list[dict]) -> None:
         for arguments in arguments_list:
@@ -317,7 +327,16 @@ def _arrange(case: str, worker: SpeculativeMergeWorker, store: FakeTaskStore | N
     if case == 'attempt_cap':
         for _ in range(MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS):
             worker.auto_heal_registry.record_attempt(brk.signature)
-    in_flight = {'in_flight': brk, 'foreign_halt': FOREIGN_BREAK}.get(case)
+    if case == 'foreign_halt_rebreak':
+        worker.auto_heal_registry.record_attempt(brk.signature)
+        if store is not None:
+            store.add(
+                status='done',
+                metadata={SIGNATURE_KEY: brk.signature, 'spawn_context': 'main_health_auto_heal'},
+            )
+    in_flight = {
+        'in_flight': brk, 'foreign_halt': FOREIGN_BREAK, 'foreign_halt_rebreak': FOREIGN_BREAK,
+    }.get(case)
     if in_flight is not None:
         worker.auto_heal_registry.record_attempt(in_flight.signature)
         worker.halt_lane('normal', 'auto-heal already in flight')
@@ -334,6 +353,7 @@ MERGE_LANE_CASES = {
     'happy': COMPILE_ERROR_RESULT,
     'in_flight': COMPILE_ERROR_RESULT,
     'foreign_halt': COMPILE_ERROR_RESULT,
+    'foreign_halt_rebreak': COMPILE_ERROR_RESULT,
 }
 
 VERIFY_ARM_CASES = {

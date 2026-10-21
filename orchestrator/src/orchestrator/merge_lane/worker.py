@@ -18493,9 +18493,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Mirrors ``TaskWorkflow._auto_heal_main_health`` in full: branch (d)
         non-mechanical / no escalation_queue and branch (e) attempt-cap each
         ensure a fix-main task (task 5471) and file an escalation naming it;
-        branch (idempotency) lane-already-halted folds into the in-flight
-        auto-heal when that heal is this signature's (else the break is owned
-        as in (d)); the (a) happy path records the attempt, halts the 'normal'
+        branch (idempotency) lane-already-halted adopts this signature's
+        owner (its in-flight heal, folding into the halt owner) or files one;
+        the (a) happy path records the attempt, halts the 'normal'
         lane, submits/folds the dedup'd halt-owner escalation, registers
         lane-halt ownership, and spawns a HIGH-lane fix task.  Called from the
         deferred main-health probe (:func:`_run_deferred_main_health_probe`,
@@ -18541,26 +18541,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
             return
 
-        # The lane is halted, but not by this signature's heal: this break
-        # needs an owner of its own.
-        if self.is_lane_halted('normal') and self.auto_heal_registry.attempts(sig) == 0:
-            await self._escalate_owned_main_break(
-                req, outcome, brk, otherwise=MainHealthNextAction.NO_FIX_OWNER,
+        # Branch (idempotency): the lane is already halted.  No second
+        # attempt/halt/spawn; the break is owned by whatever task owns its
+        # signature — this signature's in-flight heal, whose halt-owner
+        # escalation this folds into, or a fix-main task filed for it now.
+        if self.is_lane_halted('normal'):
+            owner = await ensure_main_fix_owner(
+                self.main_fix_filer, brk, project_root=str(req.config.project_root),
+            )
+            _file_main_health_escalation(
+                self._escalation_queue, req, outcome,
+                suggested_action=owner.behind_halt_action(
+                    heal_attempted=self.auto_heal_registry.attempts(sig) > 0,
+                ),
+                detail=owner.escalation_detail(outcome.reason),
             )
             return
 
-        # Build and submit/fold the dedup'd halt-owner escalation — shared by
-        # both the idempotency branch and the happy path below.
         esc_id = _file_main_health_escalation(
             self._escalation_queue, req, outcome,
             suggested_action=MainHealthNextAction.AUTO_HEAL_IN_FLIGHT,
         )
-
-        # Branch (idempotency): lane already halted → an auto-heal is already
-        # in flight; the escalation above folds into it and no second
-        # attempt/halt/owner/spawn is recorded.
-        if self.is_lane_halted('normal'):
-            return
 
         # Branch (a): happy path — record attempt, halt lane, register
         # owner, spawn fix.

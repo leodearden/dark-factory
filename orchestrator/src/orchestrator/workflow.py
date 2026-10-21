@@ -12328,9 +12328,9 @@ class TaskWorkflow:
             → ensure a fix-main task, file the shared L1 naming it, no halt.
         (e) Attempt cap reached (sha-independent signature recurred after prior heal)
             → the same as (d), with the re-break recorded as root cause.
-        (idempotency) Normal lane already halted by this signature's heal
-            → fold escalation, no second halt/spawn; halted by anything else
-            → owned as in (d).
+        (idempotency) Normal lane already halted → no second halt/spawn;
+            adopt this signature's owner (its in-flight heal: fold into the
+            halt owner) or file one.
         (a) Happy path: record attempt; halt 'normal' lane; submit one dedup'd
             L1 escalation; register it as halt-owner; spawn a HIGH-lane fix task.
         Every branch blocks via _mark_blocked(skip_escalation=True).
@@ -12388,26 +12388,28 @@ class TaskWorkflow:
                 root_cause=f'main-health-auto-heal-rebreak:{sig}',
             )
 
-        # The lane is halted, but not by this signature's heal: this break
-        # needs an owner of its own.
-        if self.merge_worker.is_lane_halted('normal') and registry.attempts(sig) == 0:
-            return await self._block_on_owned_main_break(
-                brk, fp, merge_phase=merge_phase,
-                otherwise=MainHealthNextAction.NO_FIX_OWNER,
+        # Branch (idempotency): the lane is already halted.  No second
+        # attempt/halt/spawn; the break is owned by whatever task owns its
+        # signature — this signature's in-flight heal, whose halt-owner L1
+        # this folds into, or a fix-main task filed for it now.
+        if self.merge_worker.is_lane_halted('normal'):
+            owner = await self._ensure_main_fix_owner(brk)
+            self._file_main_health_l1(
+                reason, detail=owner.escalation_detail(reason), fingerprint=fp,
+                suggested_action=owner.behind_halt_action(
+                    heal_attempted=registry.attempts(sig) > 0,
+                ),
+            )
+            return await self._mark_blocked(
+                reason,
+                merge_phase=merge_phase,
+                skip_escalation=True,
             )
 
         esc_id = self._file_main_health_l1(
             reason, detail=reason, fingerprint=fp,
             suggested_action=MainHealthNextAction.AUTO_HEAL_IN_FLIGHT,
         )
-
-        # Branch (idempotency): lane already halted → adopt the in-flight auto-heal
-        if self.merge_worker.is_lane_halted('normal'):
-            return await self._mark_blocked(
-                reason,
-                merge_phase=merge_phase,
-                skip_escalation=True,
-            )
 
         # Branch (a): happy path — record attempt, halt lane, register owner, spawn fix
         registry.record_attempt(sig)
