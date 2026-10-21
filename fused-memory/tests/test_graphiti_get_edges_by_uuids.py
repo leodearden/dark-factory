@@ -2,7 +2,8 @@
 
 The overreach shadow judges an episode's minted edges only after the identity
 lock is released, by which time the reconcile sub-passes may have deleted a
-duplicate edge or renamed an endpoint, so it reads the survivors back.
+duplicate edge or renamed an endpoint, so it reads the survivors back. Its O4
+handoff reads them again to drop flags whose edge is gone or retired.
 """
 from __future__ import annotations
 
@@ -36,8 +37,8 @@ def _backend(make_backend, mock_config, rows: list[list[Any]]):
 
 
 def _row(uuid: str, *, fact: str = '', source: str = 'S', target: str = 'T',
-         episodes: tuple[str, ...] | list[str] = ()) -> list[Any]:
-    return [uuid, fact or f'fact of {uuid}', source, target, list(episodes)]
+         episodes: tuple[str, ...] | list[str] = (), active: bool = True) -> list[Any]:
+    return [uuid, fact or f'fact of {uuid}', source, target, list(episodes), active]
 
 
 class TestGetEdgesByUuids:
@@ -50,9 +51,9 @@ class TestGetEdgesByUuids:
         edges = await backend.get_edges_by_uuids(['e1', 'e2'], group_id='test')
         assert edges == [
             {'uuid': 'e1', 'fact': 'fact of e1', 'source_name': 'A', 'target_name': 'B',
-             'episodes': ['ep1', 'ep9']},
+             'episodes': ['ep1', 'ep9'], 'active': True},
             {'uuid': 'e2', 'fact': 'fact of e2', 'source_name': 'B', 'target_name': 'C',
-             'episodes': ['ep2']},
+             'episodes': ['ep2'], 'active': True},
         ]
 
     @pytest.mark.asyncio
@@ -77,6 +78,12 @@ class TestGetEdgesByUuids:
         assert [edge['uuid'] for edge in edges] == ['e1']
 
     @pytest.mark.asyncio
+    async def test_a_retired_edge_is_returned_marked_inactive(self, make_backend, mock_config) -> None:
+        backend, _ = _backend(make_backend, mock_config, [_row('live'), _row('retired', active=False)])
+        edges = await backend.get_edges_by_uuids(['live', 'retired'], group_id='test')
+        assert [(edge['uuid'], edge['active']) for edge in edges] == [('live', True), ('retired', False)]
+
+    @pytest.mark.asyncio
     async def test_duplicate_uuid_rows_collapse_to_the_first(self, make_backend, mock_config) -> None:
         backend, _ = _backend(make_backend, mock_config, [
             _row('e1', fact='first'), _row('e1', fact='second'),
@@ -87,7 +94,10 @@ class TestGetEdgesByUuids:
     @pytest.mark.asyncio
     async def test_nulls_become_empty(self, make_backend, mock_config) -> None:
         backend, _ = _backend(make_backend, mock_config, [
-            ['e1', None, None, None, None],
+            ['e1', None, None, None, None, True],
         ])
         (edge,) = await backend.get_edges_by_uuids(['e1'], group_id='test')
-        assert edge == {'uuid': 'e1', 'fact': '', 'source_name': '', 'target_name': '', 'episodes': []}
+        assert edge == {
+            'uuid': 'e1', 'fact': '', 'source_name': '', 'target_name': '', 'episodes': [],
+            'active': True,
+        }

@@ -158,23 +158,24 @@ async def _seed_flags(tmp_path: Path) -> OverreachShadowStore:
     return opened
 
 
-class TestOverreachFlagsSince:
+class TestPendingFlags:
     @pytest.mark.asyncio
     async def test_only_this_graphs_overreach_flags_in_order(self, tmp_path: Path) -> None:
         opened = await _seed_flags(tmp_path)
         try:
-            page = await opened.overreach_flags_since('g', None, 10)
+            page = await opened.pending_overreach_flags('g', 10)
         finally:
             await opened.close()
         assert isinstance(page, OverreachFlagPage)
+        assert page.graph == 'g'
         assert [f.edge_uuid for f in page.flags] == ['a1', 'a2', 'b1']
-        assert page.omitted == 0
+        assert (page.omitted, page.dropped) == (0, ())
 
     @pytest.mark.asyncio
     async def test_a_flag_carries_what_stage_1_needs(self, tmp_path: Path) -> None:
         opened = await _seed_flags(tmp_path)
         try:
-            page = await opened.overreach_flags_since('g', None, 10)
+            page = await opened.pending_overreach_flags('g', 10)
         finally:
             await opened.close()
         flag = page.flags[0]
@@ -183,49 +184,63 @@ class TestOverreachFlagsSince:
         assert flag.judged_at == T0 and flag.judged_at.tzinfo is not None
 
     @pytest.mark.asyncio
-    async def test_only_flags_judged_after_since(self, tmp_path: Path) -> None:
-        opened = await _seed_flags(tmp_path)
-        try:
-            page = await opened.overreach_flags_since('g', T0, 10)
-        finally:
-            await opened.close()
-        assert [f.edge_uuid for f in page.flags] == ['b1']
-
-    @pytest.mark.asyncio
-    async def test_a_naive_since_is_utc(self, tmp_path: Path) -> None:
-        opened = await _seed_flags(tmp_path)
-        try:
-            page = await opened.overreach_flags_since('g', T0.replace(tzinfo=None), 10)
-        finally:
-            await opened.close()
-        assert [f.edge_uuid for f in page.flags] == ['b1']
-
-    @pytest.mark.asyncio
     async def test_the_page_is_capped_and_counts_the_rest(self, tmp_path: Path) -> None:
         opened = await _seed_flags(tmp_path)
         try:
-            page = await opened.overreach_flags_since('g', None, 2)
+            page = await opened.pending_overreach_flags('g', 2)
         finally:
             await opened.close()
         assert [f.edge_uuid for f in page.flags] == ['a1', 'a2']
         assert page.omitted == 1
 
     @pytest.mark.asyncio
-    async def test_instants_in_one_second_compare_as_instants(self, tmp_path: Path) -> None:
+    async def test_a_handed_over_flag_leaves_only_its_own_graphs_pending_set(self, tmp_path: Path) -> None:
+        opened = await _seed_flags(tmp_path)
+        try:
+            await opened.record_handoffs('g', ['a1', 'b1', 'x1'])
+            await opened.record_handoffs('g', [])
+            pending = await opened.pending_overreach_flags('g', 10)
+            other = await opened.pending_overreach_flags('other', 10)
+        finally:
+            await opened.close()
+        assert [f.edge_uuid for f in pending.flags] == ['a2']
+        assert [f.edge_uuid for f in other.flags] == ['x1']
+
+    @pytest.mark.asyncio
+    async def test_the_rest_follows_once_the_page_is_handed_over(self, tmp_path: Path) -> None:
+        opened = await _seed_flags(tmp_path)
+        try:
+            first = await opened.pending_overreach_flags('g', 2)
+            await opened.record_handoffs('g', first.handed_over())
+            second = await opened.pending_overreach_flags('g', 2)
+        finally:
+            await opened.close()
+        assert ([f.edge_uuid for f in second.flags], second.omitted) == (['b1'], 0)
+
+    @pytest.mark.asyncio
+    async def test_handoffs_persist_across_reopen(self, tmp_path: Path) -> None:
+        first = await _seed_flags(tmp_path)
+        await first.record_handoffs('g', ['a1', 'a2'])
+        await first.close()
+        second = await OverreachShadowStore.open(tmp_path / 'flags')
+        try:
+            page = await second.pending_overreach_flags('g', 10)
+        finally:
+            await second.close()
+        assert [f.edge_uuid for f in page.flags] == ['b1']
+
+    @pytest.mark.asyncio
+    async def test_instants_in_one_second_order_as_instants(self, tmp_path: Path) -> None:
         whole, fraction = T0, T0 + timedelta(microseconds=500_000)
         opened = await OverreachShadowStore.open(tmp_path / 'same-second', clock=_Clock(fraction, whole))
         try:
             await opened.record(episode=_episode('ep-late'), judgements=[_judged('late', 'overreach')])
             await opened.record(episode=_episode('ep-whole'), judgements=[_judged('whole', 'overreach')])
-            every = await opened.overreach_flags_since('g', None, 10)
-            after_whole = await opened.overreach_flags_since('g', whole, 10)
-            before_whole = await opened.overreach_flags_since('g', whole - timedelta(microseconds=1), 10)
+            every = await opened.pending_overreach_flags('g', 10)
         finally:
             await opened.close()
         assert [f.edge_uuid for f in every.flags] == ['whole', 'late']
         assert [f.judged_at for f in every.flags] == [whole, fraction]
-        assert [f.edge_uuid for f in after_whole.flags] == ['late']
-        assert [f.edge_uuid for f in before_whole.flags] == ['whole', 'late']
 
 
 class TestStoreLifecycle:
@@ -278,10 +293,16 @@ JOB = ShadowJob(
     graph='g', episode_uuid='ep1', content='RULING (Leo, 2026-09-01): narrow the gate',
     edge_uuids=('e1', 'e2', 'e3', 'gone'), classifiers=('category_decisions', 'header_ruling'),
 )
+def _edge_row(uuid: str, *, source: str = 'S', target: str = 'T', episodes: tuple[str, ...] = (),
+              active: bool = True) -> dict[str, Any]:
+    return {'uuid': uuid, 'fact': f'fact {uuid}', 'source_name': source, 'target_name': target,
+            'episodes': list(episodes), 'active': active}
+
+
 SURVIVORS = [
-    {'uuid': 'e1', 'fact': 'fact e1', 'source_name': 'A', 'target_name': 'B', 'episodes': ['ep1']},
-    {'uuid': 'e2', 'fact': 'fact e2', 'source_name': 'B', 'target_name': 'C', 'episodes': ['ep1', 'later']},
-    {'uuid': 'e3', 'fact': 'fact e3', 'source_name': 'C', 'target_name': 'D', 'episodes': ['older', 'ep1']},
+    _edge_row('e1', source='A', target='B', episodes=('ep1',)),
+    _edge_row('e2', source='B', target='C', episodes=('ep1', 'later')),
+    _edge_row('e3', source='C', target='D', episodes=('older', 'ep1')),
 ]
 
 
@@ -451,14 +472,41 @@ class TestRunner:
         finally:
             await reopened.close()
 
+
+
+class TestFlagPage:
     @pytest.mark.asyncio
-    async def test_flags_are_read_through_the_runner(self, tmp_path: Path) -> None:
-        seeded = await _seed_flags(tmp_path)
-        runner = _runner(seeded)
+    async def test_a_gone_or_retired_edge_is_dropped_from_the_page(self, tmp_path: Path) -> None:
+        reader = _EdgeReader(rows=[_edge_row('a1'), _edge_row('b1', active=False)])
+        runner = _runner(await _seed_flags(tmp_path), reader=reader)
         try:
-            assert await runner.overreach_flags_since('g', T0, 5) == await seeded.overreach_flags_since('g', T0, 5)
+            page = await runner.overreach_flag_page('g', 10)
         finally:
             await runner.close()
+        assert reader.calls == [(['a1', 'a2', 'b1'], 'g')]
+        assert [f.edge_uuid for f in page.flags] == ['a1']
+        assert page.dropped == ('a2', 'b1')
+        assert page.handed_over() == ('a1', 'a2', 'b1')
+
+    @pytest.mark.asyncio
+    async def test_an_acknowledged_page_is_never_offered_again(self, tmp_path: Path) -> None:
+        reader = _EdgeReader(rows=[_edge_row('a1'), _edge_row('a2'), _edge_row('b1', active=False)])
+        runner = _runner(await _seed_flags(tmp_path), reader=reader)
+        try:
+            first = await runner.overreach_flag_page('g', 10)
+            again = await runner.overreach_flag_page('g', 10)
+            await runner.acknowledge(first)
+            after = await runner.overreach_flag_page('g', 10)
+        finally:
+            await runner.close()
+        assert again == first
+        assert after == OverreachFlagPage(graph='g', flags=(), omitted=0)
+
+    @pytest.mark.asyncio
+    async def test_nothing_pending_reads_no_graph(self, store) -> None:
+        reader = _EdgeReader()
+        page = await _runner(store, reader=reader).overreach_flag_page('g', 10)
+        assert (page.flags, reader.calls) == ((), [])
 
 
 class TestShadowJobFromWrite:

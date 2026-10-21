@@ -71,7 +71,10 @@ from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
-from fused_memory.reconciliation.overreach_flags import fetch_overreach_flags
+from fused_memory.reconciliation.overreach_flags import (
+    acknowledge_overreach_flags,
+    fetch_overreach_flags,
+)
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
 from fused_memory.reconciliation.scope_freshness import (
@@ -3781,10 +3784,7 @@ class ReconciliationHarness:
         # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
         graphiti_queue_health = await self._check_graphiti_queue_health(scope.project_id)
 
-        # since is the previous run's START, the episode window's anchor (test_recon_window_anchor.py).
-        overreach_flags = await fetch_overreach_flags(
-            self.memory, scope.project_id, since=watermark.last_episode_timestamp,
-        )
+        overreach_flags = await fetch_overreach_flags(self.memory.overreach_shadow, scope.project_id)
 
         # Check FalkorDB index provisioning and escalate on drift (task 3709 / PRD δ).
         # This is the recon-cadence half of Q3; the startup sweep calls the SAME
@@ -3955,6 +3955,7 @@ class ReconciliationHarness:
                     'last_task_change_timestamp': completed_at,
                 })
                 await self.journal.update_watermark(watermark)
+                await acknowledge_overreach_flags(self.memory.overreach_shadow, overreach_flags)
 
                 run.completed_at = datetime.now(UTC)
                 run.status = RunStatus.completed

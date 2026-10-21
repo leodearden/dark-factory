@@ -4,12 +4,13 @@ After a ``decisions_and_rationale`` write releases its identity lock, a judge
 labels the edges the episode minted and records every label to a SQLite
 sidecar, ``<queue.data_dir>/overreach_shadow.db``. It writes nothing to the
 graph and filters nothing. Recon reads the overreach flags back as Stage 1's
-O4 list, and scripts/eval_overreach_judge.py reads the labels for the online
-gate.
+O4 list, acknowledging each page once its run completes, and
+scripts/eval_overreach_judge.py reads the labels for the online gate.
 """
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from collections import defaultdict
@@ -70,6 +71,12 @@ _DDL = (
         PRIMARY KEY (graph, edge_uuid)
     )""",
     'CREATE INDEX IF NOT EXISTS idx_edge_judgements_flags ON edge_judgements (graph, label, judged_at)',
+    """CREATE TABLE IF NOT EXISTS flag_handoffs (
+        graph TEXT NOT NULL,
+        edge_uuid TEXT NOT NULL,
+        handed_at TEXT NOT NULL,
+        PRIMARY KEY (graph, edge_uuid)
+    )""",
 )
 
 
@@ -122,8 +129,20 @@ class OverreachFlag:
 
 @dataclass(frozen=True)
 class OverreachFlagPage:
+    """One cycle's slice of *graph*'s flags not yet handed over.
+
+    ``flags`` go to Stage 1. ``dropped`` names the edges read for this page
+    that are gone or retired. ``omitted`` counts the flags left for a later page.
+    """
+
+    graph: str
     flags: tuple[OverreachFlag, ...]
     omitted: int
+    dropped: tuple[str, ...] = ()
+
+    def handed_over(self) -> tuple[str, ...]:
+        """The edge uuids this page disposes of once its run completes."""
+        return (*(flag.edge_uuid for flag in self.flags), *self.dropped)
 
 
 def _to_stored_instant(instant: datetime) -> str:
@@ -144,12 +163,13 @@ def _utc_now() -> datetime:
 # The sidecar store
 # --------------------------------------------------------------------------- #
 
-_FLAGS_SQL = """
+_PENDING_FLAGS_SQL = """
 SELECT j.episode_uuid, j.edge_uuid, j.fact, j.rationale, j.judged_at, e.prompt_version,
        COUNT(*) OVER () AS total
 FROM edge_judgements j
 JOIN judged_episodes e ON e.graph = j.graph AND e.episode_uuid = j.episode_uuid
-WHERE j.graph = ? AND j.label = ? AND j.judged_at > ?
+LEFT JOIN flag_handoffs h ON h.graph = j.graph AND h.edge_uuid = j.edge_uuid
+WHERE j.graph = ? AND j.label = ? AND h.edge_uuid IS NULL
 ORDER BY j.judged_at, j.edge_uuid
 LIMIT ?
 """
@@ -259,12 +279,9 @@ class OverreachShadowStore:
                 )
         return found
 
-    async def overreach_flags_since(
-        self, graph: str, since: datetime | None, limit: int,
-    ) -> OverreachFlagPage:
-        """*graph*'s overreach labels judged after *since*, oldest first, at most *limit*."""
-        floor = _to_stored_instant(since) if since is not None else ''
-        rows = await self._require_access().read_all(_FLAGS_SQL, (graph, OVERREACH, floor, limit))
+    async def pending_overreach_flags(self, graph: str, limit: int) -> OverreachFlagPage:
+        """*graph*'s overreach labels not yet handed over, oldest first, at most *limit*."""
+        rows = await self._require_access().read_all(_PENDING_FLAGS_SQL, (graph, OVERREACH, limit))
         flags = tuple(
             OverreachFlag(
                 episode_uuid=episode_uuid, edge_uuid=edge_uuid, fact=fact, rationale=rationale,
@@ -273,7 +290,18 @@ class OverreachShadowStore:
             for episode_uuid, edge_uuid, fact, rationale, at, prompt_version, _ in rows
         )
         total = rows[0][-1] if rows else 0
-        return OverreachFlagPage(flags=flags, omitted=total - len(flags))
+        return OverreachFlagPage(graph=graph, flags=flags, omitted=total - len(flags))
+
+    async def record_handoffs(self, graph: str, edge_uuids: Sequence[str]) -> None:
+        """Take *edge_uuids* out of *graph*'s pending flags; the first handoff of an edge is kept."""
+        if not edge_uuids:
+            return
+        handed_at = _to_stored_instant(self._clock())
+        async with self._require_access().write() as db:
+            await db.executemany(
+                'INSERT OR IGNORE INTO flag_handoffs VALUES (?, ?, ?)',
+                [(graph, edge_uuid, handed_at) for edge_uuid in edge_uuids],
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -360,10 +388,22 @@ class OverreachShadow:
         if self._tasks:
             await asyncio.wait(tuple(self._tasks))
 
-    async def overreach_flags_since(
-        self, graph: str, since: datetime | None, limit: int,
-    ) -> OverreachFlagPage:
-        return await self._store.overreach_flags_since(graph, since, limit)
+    async def overreach_flag_page(self, graph: str, limit: int) -> OverreachFlagPage:
+        """The oldest *limit* flags not yet handed over, less those whose edge is gone or retired."""
+        pending = await self._store.pending_overreach_flags(graph, limit)
+        if not pending.flags:
+            return pending
+        rows = await self._read_edges([flag.edge_uuid for flag in pending.flags], group_id=graph)
+        active = {row['uuid']: bool(row['active']) for row in rows}
+        return dataclasses.replace(
+            pending,
+            flags=tuple(flag for flag in pending.flags if active.get(flag.edge_uuid)),
+            dropped=tuple(flag.edge_uuid for flag in pending.flags if not active.get(flag.edge_uuid)),
+        )
+
+    async def acknowledge(self, page: OverreachFlagPage) -> None:
+        """No later page offers what *page* handed over."""
+        await self._store.record_handoffs(page.graph, page.handed_over())
 
     async def close(self) -> None:
         """Cancel in-flight judgements, then close the store; a second call is a no-op.
