@@ -195,6 +195,27 @@ def test_a_server_that_rejects_the_argument_is_refused_the_same_way() -> None:
     assert caught.value.missing == 'include_rows'
 
 
+def test_a_tool_error_that_mentions_include_rows_is_the_tools_not_inv_11s() -> None:
+    text = "include_rows must be a bool; got 'yes'"
+    with (
+        running_fake_store('--find-error', text) as running,
+        pytest.raises(state.StoreReaderError) as caught,
+    ):
+        _reader(running).program_tasks(RUN_ID, PRD_PATHS)
+    assert not isinstance(caught.value, state.StoreReaderUnsupported)
+    assert text in str(caught.value)
+
+
+@pytest.mark.timeout(60)
+def test_has_more_with_no_rows_is_a_reader_error_not_an_endless_loop() -> None:
+    with (
+        running_fake_store('--limit-cap', '0') as running,
+        pytest.raises(state.StoreReaderError, match='has_more with no rows') as caught,
+    ):
+        _reader(running).program_tasks(RUN_ID, PRD_PATHS)
+    assert not isinstance(caught.value, state.StoreReaderUnsupported)
+
+
 def test_a_row_without_dependencies_is_refused_naming_key_and_task() -> None:
     with (
         running_fake_store('--drop-row-key', 'dependencies') as running,

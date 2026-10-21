@@ -9,8 +9,10 @@ stdout line, then serves until SIGTERM or SIGINT.
 
 Flags, one per axis: ``--no-include-rows`` (the pre-widening server),
 ``--reject-unknown-args`` (undeclared arguments refused, not dropped),
-``--byte-budget N``, ``--drop-row-key KEY``, ``--sse`` (event-stream framing)
-and ``--journal PATH`` (one JSON line per request).
+``--byte-budget N``, ``--limit-cap N`` (the clamp on ``limit``; 0 is a server
+that reports ``has_more`` with no rows), ``--drop-row-key KEY``,
+``--find-error TEXT`` (every lookup answers that tool error), ``--sse``
+(event-stream framing) and ``--journal PATH`` (one JSON line per request).
 """
 from __future__ import annotations
 
@@ -56,7 +58,9 @@ class Behaviour:
     include_rows: bool
     reject_unknown_args: bool
     byte_budget: int
+    limit_cap: int
     drop_row_key: str | None
+    find_error: str | None
     sse: bool
 
 
@@ -165,6 +169,8 @@ def _pagination(total: int, offset: int, page_size: int, returned: int) -> dict[
 
 
 def find_tasks_by_metadata(arguments: Mapping[str, Any], behaviour: Behaviour) -> dict[str, Any]:
+    if behaviour.find_error is not None:
+        return _validation_error(behaviour.find_error)
     limit, offset = arguments.get('limit', DEFAULT_LIMIT), arguments.get('offset', 0)
     statuses = arguments.get('statuses')
     error = (_paging_error(limit, offset) or _statuses_error(statuses)
@@ -175,7 +181,7 @@ def find_tasks_by_metadata(arguments: Mapping[str, Any], behaviour: Behaviour) -
     searched = [t for t in _load_tasks(behaviour) if statuses is None or t['status'] in statuses]
     carrying = [t for t in searched if key in t['metadata']]
     matching = [t for t in carrying if value is None or _matches(t['metadata'][key], value)]
-    page_size = min(limit, LIMIT_CAP)
+    page_size = min(limit, behaviour.limit_cap)
     rows = [_row(t, key, arguments, behaviour) for t in matching[offset:offset + page_size]]
     if arguments.get('include_value') or (behaviour.include_rows and arguments.get('include_rows')):
         rows = _fit_rows_to_budget(rows, behaviour.byte_budget)
@@ -341,7 +347,9 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument('--no-include-rows', action='store_true')
     parser.add_argument('--reject-unknown-args', action='store_true')
     parser.add_argument('--byte-budget', type=int, default=DEFAULT_BYTE_BUDGET)
+    parser.add_argument('--limit-cap', type=int, default=LIMIT_CAP)
     parser.add_argument('--drop-row-key')
+    parser.add_argument('--find-error')
     parser.add_argument('--sse', action='store_true')
     return parser.parse_args(argv)
 
@@ -351,7 +359,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     behaviour = Behaviour(
         store=args.store.resolve(), journal=args.journal, include_rows=not args.no_include_rows,
         reject_unknown_args=args.reject_unknown_args, byte_budget=args.byte_budget,
-        drop_row_key=args.drop_row_key, sse=args.sse,
+        limit_cap=args.limit_cap, drop_row_key=args.drop_row_key, find_error=args.find_error,
+        sse=args.sse,
     )
     server = ThreadingHTTPServer(
         (args.host, args.port), functools.partial(McpHandler, behaviour=behaviour),

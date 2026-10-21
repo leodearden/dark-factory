@@ -140,6 +140,14 @@ def _drop_doc_path(data: dict[str, Any]) -> None:
     del data['doc_path']
 
 
+def _unknown_stream_field(data: dict[str, Any]) -> None:
+    data['streams'][0]['colour'] = 'blue'
+
+
+def _non_text_key(data: dict[str, Any]) -> None:
+    data['streams'][1]['keys'] = ['fk-0000000000b1', 7]
+
+
 @pytest.mark.parametrize(
     ('mutate', 'named'),
     [
@@ -147,8 +155,13 @@ def _drop_doc_path(data: dict[str, Any]) -> None:
         (_dep_on_missing_stream, 'streams[1].deps[0]'),
         (_duplicate_stream_id, 'streams[2].id'),
         (_drop_doc_path, 'doc_path'),
+        (_unknown_stream_field, 'streams[0].colour'),
+        (_non_text_key, 'streams[1].keys[1]'),
     ],
-    ids=['schema', 'dep-names-no-stream', 'duplicate-stream-id', 'missing-key'],
+    ids=[
+        'schema', 'dep-names-no-stream', 'duplicate-stream-id', 'missing-key',
+        'unknown-stream-field', 'non-text-key',
+    ],
 )
 def test_parse_program_refuses_a_malformed_program_naming_the_value(
     mutate: Callable[[dict[str, Any]], None], named: str,
@@ -278,11 +291,33 @@ def test_waves_are_one_plus_the_latest_upstream_wave() -> None:
     assert dict(state.waves(amended)) == {'S1': 1, 'S2': 2, 'S3': 3}
 
 
-def test_waves_refuse_an_amendment_that_makes_a_cycle() -> None:
-    cyclic = state.stream_views(_program(), [_amend(1, 'S1', 'deps', 'add', 'S2')])
+@pytest.mark.parametrize(
+    ('amendment', 'named'),
+    [
+        (_amend(1, 'S3', 'keys', 'add', 'fk-0000000000a2'), ('fk-0000000000a2', 'S1', 'S3')),
+        (_amend(1, 'S2', 'deps', 'add', 'S9'), ('S2.deps[1]', 'S9')),
+        (_amend(1, 'S1', 'deps', 'add', 'S2'), ('cycle', 'S1', 'S2')),
+    ],
+    ids=['key-in-two-streams', 'dep-names-no-stream', 'cycle'],
+)
+def test_stream_views_refuse_an_amendment_that_breaks_a_program_rule(
+    amendment: dict[str, Any], named: tuple[str, ...],
+) -> None:
     with pytest.raises(state.StateError) as caught:
-        state.waves(cyclic)
-    assert 'S1' in str(caught.value) and 'S2' in str(caught.value)
+        state.stream_views(_program(), [amendment])
+    message = str(caught.value)
+    assert all(name in message for name in named), message
+
+
+def test_a_key_moved_between_streams_folds_once_both_lines_are_in() -> None:
+    views = state.stream_views(_program(), [
+        _amend(1, 'S3', 'keys', 'add', 'fk-0000000000a2'),
+        _amend(2, 'S1', 'keys', 'remove', 'fk-0000000000a2'),
+    ])
+    assert views['S1'].keys == ('fk-0000000000a1',)
+    assert views['S3'].keys == ('fk-0000000000c1', 'fk-0000000000a2')
+    row = _row(150, x_finding_key=['fk-0000000000a2'])
+    assert state.stream_of(row, views) == 'S3'
 
 
 def test_stream_of_matches_prd_path_before_finding_keys() -> None:

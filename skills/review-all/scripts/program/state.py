@@ -16,7 +16,7 @@ import types
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -171,50 +171,53 @@ class LedgerOp(enum.StrEnum):
 
 
 @dataclass(frozen=True)
-class LedgerOpSpec:
-    """The fields one ledger op carries beyond ``LEDGER_COMMON_FIELDS``, and their vocabularies."""
+class FieldSpec:
+    """The fields one kind of JSONL line carries (a ledger op, a ruling), and their vocabularies.
+
+    A ledger op's spec excludes ``LEDGER_COMMON_FIELDS``; ``check_ledger_line`` adds them.
+    """
 
     required: frozenset[str]
     optional: frozenset[str]
-    enums: Mapping[str, frozenset[str]]
+    enums: Mapping[str, type[enum.StrEnum]]
 
 
 def _values(vocabulary: type[enum.StrEnum]) -> frozenset[str]:
     return frozenset(member.value for member in vocabulary)
 
 
-def _ledger_op(
+def _field_spec(
     required: Sequence[str],
     optional: Sequence[str] = (),
     **enums: type[enum.StrEnum],
-) -> LedgerOpSpec:
-    return LedgerOpSpec(
+) -> FieldSpec:
+    return FieldSpec(
         required=frozenset(required),
         optional=frozenset(optional),
-        enums=types.MappingProxyType({field: _values(e) for field, e in enums.items()}),
+        enums=types.MappingProxyType(enums),
     )
 
 
 LEDGER_COMMON_FIELDS = frozenset({'seq', 'at', 'by', 'op'})
-LEDGER_OPS: Mapping[LedgerOp, LedgerOpSpec] = types.MappingProxyType({
-    LedgerOp.STREAM_STATUS: _ledger_op(
+LEDGER_OPS: Mapping[LedgerOp, FieldSpec] = types.MappingProxyType({
+    LedgerOp.STREAM_STATUS: _field_spec(
         ('stream', 'status'), ('prd_path', 'return'), status=StreamStatus,
     ),
-    LedgerOp.AMEND_STREAM: _ledger_op(
+    LedgerOp.AMEND_STREAM: _field_spec(
         ('stream', 'field', 'change', 'value', 'ruling'),
         field=StreamField, change=AmendChange,
     ),
-    LedgerOp.AMEND_PROGRAM: _ledger_op(('section', 'value'), ('ruling',), section=ProgramSection),
-    LedgerOp.XREF: _ledger_op(('from', 'to', 'text', 'return')),
-    LedgerOp.ACTION: _ledger_op(
+    LedgerOp.AMEND_PROGRAM: _field_spec(('section', 'value'), ('ruling',), section=ProgramSection),
+    LedgerOp.XREF: _field_spec(('from', 'to', 'text', 'return')),
+    LedgerOp.ACTION: _field_spec(
         ('id', 'op', 'task', 'target', 'text', 'needs_human', 'return'), op=LeadActionOp,
     ),
-    LedgerOp.ACTION_RESULT: _ledger_op(
+    LedgerOp.ACTION_RESULT: _field_spec(
         ('id', 'state', 'batch', 'detail'), state=ActionResultState,
     ),
-    LedgerOp.SCANNED: _ledger_op(('return', 'repaths')),
-    LedgerOp.NOTE: _ledger_op(('text',)),
-    LedgerOp.COMMIT: _ledger_op(('sha', 'paths', 'measured_at')),
+    LedgerOp.SCANNED: _field_spec(('return', 'repaths')),
+    LedgerOp.NOTE: _field_spec(('text',)),
+    LedgerOp.COMMIT: _field_spec(('sha', 'paths', 'measured_at')),
 })
 
 
@@ -255,6 +258,134 @@ def _frozen(value: Any) -> Any:
     if isinstance(value, list | tuple):
         return tuple(_frozen(v) for v in value)
     return value
+
+
+@dataclass(frozen=True)
+class Rejection:
+    field: str
+    kind: RejectionClass
+    reason: str
+
+    def __str__(self) -> str:
+        return f'{self.kind}: {self.field}: {self.reason}'
+
+
+class _Invalid:
+    """The result of a field check that recorded a rejection."""
+
+
+_INVALID = _Invalid()
+_FieldCheck = Callable[[Any, str, list[Rejection]], Any]
+
+
+def _reject(rejections: list[Rejection], field: str, reason: str) -> _Invalid:
+    rejections.append(Rejection(field, RejectionClass.FORM, reason))
+    return _INVALID
+
+
+def _violations(rejections: Iterable[Rejection]) -> list[str]:
+    """Rejections as ``<field>: <reason>`` text, for the errors that carry text."""
+    return [f'{r.field}: {r.reason}' for r in rejections]
+
+
+def _is_repo_relative(path: Any) -> bool:
+    """A non-empty POSIX path that is not absolute and has no '..' segment."""
+    if not isinstance(path, str) or not path or '\\' in path:
+        return False
+    posix = PurePosixPath(path)
+    return not posix.is_absolute() and '..' not in posix.parts
+
+
+def _of_type(kind: type, described: str) -> _FieldCheck:
+    def check(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        if isinstance(value, kind) and (kind is bool or not isinstance(value, bool)):
+            return value
+        return _reject(rejections, field, f'expected {described}, got {value!r}')
+    return check
+
+
+_TEXT = _of_type(str, 'a string')
+_BOOL = _of_type(bool, 'a bool')
+_INT = _of_type(int, 'an integer')
+
+
+def _vocabulary(vocabulary: type[enum.StrEnum]) -> _FieldCheck:
+    def check(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        if isinstance(value, str) and value in _values(vocabulary):
+            return vocabulary(value)
+        return _reject(rejections, field, f'{value!r} is not one of {sorted(_values(vocabulary))}')
+    return check
+
+
+def _member(allowed: Iterable[Any], described: str) -> _FieldCheck:
+    allowed = frozenset(allowed)
+
+    def check(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        if isinstance(value, str | int) and not isinstance(value, bool) and value in allowed:
+            return value
+        return _reject(rejections, field, f'{value!r} is not {described}')
+    return check
+
+
+def _repo_path(value: Any, field: str, rejections: list[Rejection]) -> Any:
+    if _is_repo_relative(value):
+        return value
+    return _reject(rejections, field, f'{value!r} is not a repo-relative POSIX path')
+
+
+def _unchecked(value: Any, field: str, rejections: list[Rejection]) -> Any:
+    return value
+
+
+def _nullable(check: _FieldCheck) -> _FieldCheck:
+    def nullable(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        return None if value is None else check(value, field, rejections)
+    return nullable
+
+
+def _list_of(check: _FieldCheck) -> _FieldCheck:
+    def items(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        if not isinstance(value, list):
+            return _reject(rejections, field, f'expected a list, got {value!r}')
+        parsed = tuple(check(item, f'{field}[{i}]', rejections) for i, item in enumerate(value))
+        return _INVALID if any(item is _INVALID for item in parsed) else parsed
+    return items
+
+
+_TEXTS = _list_of(_TEXT)
+
+
+def _parsed_fields(
+    value: Mapping[str, Any], field: str, required: Mapping[str, _FieldCheck],
+    optional: Mapping[str, _FieldCheck], rejections: list[Rejection],
+) -> dict[str, Any]:
+    """Each present field checked at ``<field>.<name>`` (``<name>`` at the top level).
+
+    A field outside *required* and *optional*, or a missing required one, is rejected.
+    """
+    def path(name: str) -> str:
+        return f'{field}.{name}' if field else name
+
+    for name in sorted(set(value) - set(required) - set(optional)):
+        _reject(rejections, path(name), 'is not a field of this entry')
+    for name in sorted(set(required) - set(value)):
+        _reject(rejections, path(name), 'is required')
+    checks = {**required, **optional}
+    return {name: checks[name](value[name], path(name), rejections) for name in checks if name in value}
+
+
+def _record(
+    build: Callable[[dict[str, Any]], Any], required: Mapping[str, _FieldCheck],
+    optional: Mapping[str, _FieldCheck] = types.MappingProxyType({}),
+) -> _FieldCheck:
+    """An object with exactly these fields, each checked at ``<field>.<name>``, then *build* it."""
+    def record(value: Any, field: str, rejections: list[Rejection]) -> Any:
+        if not isinstance(value, Mapping):
+            return _reject(rejections, field, f'expected an object, got {value!r}')
+        found = len(rejections)
+        parsed = _parsed_fields(value, field, required, optional, rejections)
+        return _INVALID if len(rejections) > found else build(parsed)
+    return record
 
 
 @dataclass(frozen=True)
@@ -299,102 +430,56 @@ class Program:
         raise StateError(f'no stream {stream_id!r} in program {self.run_id}')
 
 
-_PROGRAM_TEXT_FIELDS = (
-    'run_id', 'project_id', 'project_root', 'as_of_sha', 'record_path', 'doc_path', 'plans_dir',
-)
-_PROGRAM_SECTION_FIELDS = tuple(section.value for section in ProgramSection)
-_STREAM_TEXT_FIELDS = ('id', 'name', 'slug', 'remedy')
-_STREAM_LIST_FIELDS = ('keys', 'deps', 'seams')
-_STREAM_VOCABULARIES: Mapping[str, type[enum.StrEnum]] = types.MappingProxyType({
-    'mode': StreamMode, 'size': StreamSize, 'risk': StreamRisk,
+_STREAM = _record(lambda f: Stream(**f), {
+    'id': _TEXT, 'name': _TEXT, 'slug': _TEXT, 'remedy': _TEXT, 'deletable': _BOOL,
+    'keys': _TEXTS, 'mode': _vocabulary(StreamMode), 'size': _vocabulary(StreamSize),
+    'risk': _vocabulary(StreamRisk), 'deps': _TEXTS, 'seams': _TEXTS,
+})
+_PROGRAM_FIELDS: Mapping[str, _FieldCheck] = types.MappingProxyType({
+    'schema': _member({PROGRAM_SCHEMA}, repr(PROGRAM_SCHEMA)),
+    **{name: _TEXT for name in (
+        'run_id', 'project_id', 'project_root', 'as_of_sha', 'record_path', 'doc_path',
+        'plans_dir',
+    )},
+    **{section.value: _list_of(_unchecked) for section in ProgramSection},
+    'streams': _list_of(_unchecked),
 })
 
 
-def _typed(
-    data: Mapping[str, Any], key: str, kind: type, prefix: str, violations: list[str],
-) -> Any:
-    """``data[key]`` when present and of *kind*; otherwise None, with a violation named by path."""
-    if key not in data:
-        violations.append(f'{prefix}{key}: missing')
-        return None
-    value = data[key]
-    if not isinstance(value, kind) or (kind is not bool and isinstance(value, bool)):
-        violations.append(f'{prefix}{key}: expected {kind.__name__}, got {value!r}')
-        return None
-    return value
+class _StreamRow(NamedTuple):
+    """The stream fields the cross-stream rules read, and where the row was read from."""
+
+    where: str
+    id: str
+    keys: tuple[str, ...]
+    deps: tuple[str, ...]
 
 
-def _text_list(
-    data: Mapping[str, Any], key: str, prefix: str, violations: list[str],
-) -> tuple[str, ...] | None:
-    items = _typed(data, key, list, prefix, violations)
-    if items is None:
-        return None
-    bad = [f'{prefix}{key}[{i}]: expected str, got {v!r}' for i, v in enumerate(items)
-           if not isinstance(v, str)]
-    violations.extend(bad)
-    return None if bad else tuple(items)
-
-
-def _vocabulary_value(
-    data: Mapping[str, Any], key: str, vocabulary: type[enum.StrEnum], prefix: str,
-    violations: list[str],
-) -> enum.StrEnum | None:
-    value = _typed(data, key, str, prefix, violations)
-    if value is None:
-        return None
-    if value not in _values(vocabulary):
-        violations.append(
-            f'{prefix}{key}: {value!r} is not one of {sorted(_values(vocabulary))}'
-        )
-        return None
-    return vocabulary(value)
-
-
-def _parse_stream(raw: Any, index: int, violations: list[str]) -> Stream | None:
-    prefix = f'streams[{index}].'
-    if not isinstance(raw, Mapping):
-        violations.append(f'streams[{index}]: expected object, got {raw!r}')
-        return None
-    found = len(violations)
-    fields: dict[str, Any] = {k: _typed(raw, k, str, prefix, violations) for k in _STREAM_TEXT_FIELDS}
-    fields['deletable'] = _typed(raw, 'deletable', bool, prefix, violations)
-    fields.update({k: _text_list(raw, k, prefix, violations) for k in _STREAM_LIST_FIELDS})
-    fields.update({
-        k: _vocabulary_value(raw, k, vocabulary, prefix, violations)
-        for k, vocabulary in _STREAM_VOCABULARIES.items()
-    })
-    return None if len(violations) > found else Stream(**fields)
-
-
-def _duplicate_id_violations(streams: Sequence[Stream | None]) -> list[str]:
+def _duplicate_id_violations(rows: Sequence[_StreamRow]) -> list[str]:
     seen: set[str] = set()
     violations = []
-    for index, stream in enumerate(streams):
-        if stream is None:
-            continue
-        if stream.id in seen:
-            violations.append(f'streams[{index}].id: duplicate stream id {stream.id!r}')
-        seen.add(stream.id)
+    for row in rows:
+        if row.id in seen:
+            violations.append(f'{row.where}.id: duplicate stream id {row.id!r}')
+        seen.add(row.id)
     return violations
 
 
-def _shared_key_violations(streams: Sequence[Stream]) -> list[str]:
+def _shared_key_violations(rows: Sequence[_StreamRow]) -> list[str]:
     owners: dict[str, list[str]] = {}
-    for stream in streams:
-        for key in stream.keys:
-            owners.setdefault(key, []).append(stream.id)
+    for row in rows:
+        for key in row.keys:
+            owners.setdefault(key, []).append(row.id)
     return [
         f'key {key!r} is in more than one stream: {", ".join(ids)}'
         for key, ids in owners.items() if len(ids) > 1
     ]
 
 
-def _unknown_dep_violations(streams: Sequence[Stream | None], known: set[str]) -> list[str]:
+def _unknown_dep_violations(rows: Sequence[_StreamRow], known: Collection[str]) -> list[str]:
     return [
-        f'streams[{index}].deps[{d}]: {dep!r} names no stream'
-        for index, stream in enumerate(streams) if stream is not None
-        for d, dep in enumerate(stream.deps) if dep not in known
+        f'{row.where}.deps[{d}]: {dep!r} names no stream'
+        for row in rows for d, dep in enumerate(row.deps) if dep not in known
     ]
 
 
@@ -430,48 +515,50 @@ def _wave_numbers(deps_by_stream: Mapping[str, Sequence[str]]) -> dict[str, int]
     return waves
 
 
-def _cycle_violations(streams: Sequence[Stream]) -> list[str]:
-    known = {s.id for s in streams}
+def _cycle_violations(rows: Sequence[_StreamRow]) -> list[str]:
+    ids = {row.id for row in rows}
     try:
-        _wave_numbers({s.id: [d for d in s.deps if d in known] for s in streams})
+        _wave_numbers({row.id: [d for d in row.deps if d in ids] for row in rows})
     except StateError as cycle:
         return [str(cycle)]
     return []
 
 
-def _stream_violations(raw_streams: Sequence[Any], streams: Sequence[Stream | None]) -> list[str]:
-    """Cross-stream rules; a stream that failed its own parse still counts as a known id."""
-    known = {raw.get('id') for raw in raw_streams if isinstance(raw, Mapping)}
-    parsed = [s for s in streams if s is not None]
+def _cross_stream_violations(rows: Sequence[_StreamRow], known: Collection[str]) -> list[str]:
+    """The rules streams obey together, checked at parse and again after the ledger's amendments."""
     return (
-        _duplicate_id_violations(streams)
-        + _shared_key_violations(parsed)
-        + _unknown_dep_violations(streams, known)
-        + _cycle_violations(parsed)
+        _duplicate_id_violations(rows)
+        + _shared_key_violations(rows)
+        + _unknown_dep_violations(rows, known)
+        + _cycle_violations(rows)
     )
 
 
-def parse_program(data: Mapping[str, Any]) -> Program:
+def parse_program(data: Any) -> Program:
     """Validate program.json's parsed object into a frozen Program; raises ProgramInvalid.
 
-    Every violation is collected and named by its path and value, not only the first.
+    Every violation is collected and named by its path and value, not only the first:
+    each stream is checked on its own, and one that fails its own checks still counts
+    as a known id for the others' deps.
     """
     if not isinstance(data, Mapping):
         raise ProgramInvalid([f'program.json must be a JSON object, got {data!r}'])
-    violations: list[str] = []
-    if data.get('schema') != PROGRAM_SCHEMA:
-        violations.append(f'schema: expected {PROGRAM_SCHEMA!r}, got {data.get("schema")!r}')
-    fields: dict[str, Any] = {k: _typed(data, k, str, '', violations) for k in _PROGRAM_TEXT_FIELDS}
-    sections = {k: _typed(data, k, list, '', violations) for k in _PROGRAM_SECTION_FIELDS}
-    raw_streams = _typed(data, 'streams', list, '', violations) or []
-    streams = [_parse_stream(raw, i, violations) for i, raw in enumerate(raw_streams)]
-    violations.extend(_stream_violations(raw_streams, streams))
+    rejections: list[Rejection] = []
+    fields = _parsed_fields(data, '', _PROGRAM_FIELDS, {}, rejections)
+    raw_streams = fields.pop('streams', ())
+    raw_streams = () if raw_streams is _INVALID else raw_streams
+    checked = [_STREAM(raw, f'streams[{i}]', rejections) for i, raw in enumerate(raw_streams)]
+    streams = [(i, stream) for i, stream in enumerate(checked) if stream is not _INVALID]
+    violations = _violations(rejections) + _cross_stream_violations(
+        [_StreamRow(f'streams[{i}]', s.id, s.keys, s.deps) for i, s in streams],
+        {raw.get('id') for raw in raw_streams if isinstance(raw, Mapping)},
+    )
     if violations:
         raise ProgramInvalid(violations)
+    del fields['schema']
     return Program(
-        **fields,
-        streams=tuple(s for s in streams if s is not None),
-        **{k: _frozen(v) for k, v in sections.items()},
+        **{name: _frozen(value) for name, value in fields.items()},
+        streams=tuple(stream for _, stream in streams),
     )
 
 
@@ -584,17 +671,11 @@ def _initial_view(stream: Stream) -> StreamView:
     )
 
 
-def _check_view_deps(views: Mapping[str, StreamView]) -> None:
-    for view in views.values():
-        unknown = [dep for dep in view.deps if dep not in views]
-        if unknown:
-            raise StateError(f'stream {view.id} depends on {unknown}, which name no stream')
-
-
 def stream_views(program: Program, ledger: Iterable[Mapping[str, Any]]) -> Mapping[str, StreamView]:
     """Each stream's row after the ledger's ``stream_status`` and ``amend_stream`` lines, in seq order.
 
-    The single home of a stream's keys and deps after amendments.
+    The single home of a stream's keys and deps after amendments. The folded rows
+    must still obey parse_program's cross-stream rules; StateError names each breach.
     """
     views = {stream.id: _initial_view(stream) for stream in program.streams}
     for line in sorted(ledger, key=lambda entry: entry['seq']):
@@ -605,7 +686,11 @@ def stream_views(program: Program, ledger: Iterable[Mapping[str, Any]]) -> Mappi
         if stream_id not in views:
             raise StateError(f'ledger seq {line["seq"]}: {line["op"]} names no stream {stream_id!r}')
         views[stream_id] = fold(views[stream_id], line)
-    _check_view_deps(views)
+    violations = _cross_stream_violations(
+        [_StreamRow(v.id, v.id, v.keys, v.deps) for v in views.values()], views,
+    )
+    if violations:
+        raise StateError("the ledger's amendments break the program: " + '; '.join(violations))
     return types.MappingProxyType(views)
 
 
@@ -798,17 +883,15 @@ class ItemRef:
 _EntryCheck = Callable[[Sequence[Mapping[str, Any]], Mapping[str, Any]], None]
 
 
-def _check_fields(spec: LedgerOpSpec, line: Mapping[str, Any], what: str) -> None:
-    missing = sorted(spec.required - set(line))
-    if missing:
-        raise LedgerRefused(f'{what} lacks {", ".join(missing)}')
-    extra = sorted(set(line) - spec.required - spec.optional)
-    if extra:
-        raise LedgerRefused(f'{what} carries fields it does not take: {", ".join(extra)}')
-    for field, allowed in spec.enums.items():
-        value = line[field]
-        if not isinstance(value, str) or value not in allowed:
-            raise LedgerRefused(f'{what}: {field} {value!r} is not one of {sorted(allowed)}')
+def _check_fields(spec: FieldSpec, line: Mapping[str, Any], what: str) -> None:
+    """Refuse a line *spec* does not describe, naming every field at fault."""
+    def checks(names: frozenset[str]) -> dict[str, _FieldCheck]:
+        return {n: _vocabulary(spec.enums[n]) if n in spec.enums else _unchecked for n in names}
+
+    rejections: list[Rejection] = []
+    _parsed_fields(line, '', checks(spec.required), checks(spec.optional), rejections)
+    if rejections:
+        raise LedgerRefused(f'{what}: ' + '; '.join(_violations(rejections)))
 
 
 def _parse_jsonl(text: str, path: Path) -> list[Mapping[str, Any]]:
@@ -899,7 +982,7 @@ def read_ledger(home: Home) -> tuple[Mapping[str, Any], ...]:
     return _read_checked(home.ledger, _check_ledger_entry)
 
 
-RULING_FIELDS = _ledger_op(
+RULING_FIELDS = _field_spec(
     ('id', 'ruled_by', 'date', 'stream', 'item', 'question', 'ruling', 'options',
      'consequence', 'keys', 'source', 'supersedes'),
     ('answers', 'reask'),
@@ -957,7 +1040,14 @@ def read_rulings(home: Home) -> tuple[Mapping[str, Any], ...]:
 
 MCP_CLIENT_NAME = 'review-all-program'
 _TASK_NOT_FOUND = 'TaskNotFoundError'
-_CAPABILITY_ARGUMENTS = ('include_rows',)
+def _undeclared_argument(argument: str) -> re.Pattern[str]:
+    """FastMCP's refusal of an argument its tool does not declare: pydantic's extra_forbidden."""
+    return re.compile(rf'^{re.escape(argument)}\n\s+Extra inputs are not permitted', re.MULTILINE)
+
+
+_CAPABILITY_REFUSALS: Mapping[str, re.Pattern[str]] = types.MappingProxyType({
+    'include_rows': _undeclared_argument('include_rows'),
+})
 FIND_PAGE_LIMIT = 100
 
 
@@ -1079,14 +1169,17 @@ def _failure(tool: str, reply: Mapping[str, Any]) -> tuple[str, str | None] | No
 
 
 def _raise_for_failure(tool: str, reply: Mapping[str, Any], sent_args: Mapping[str, Any]) -> None:
-    """The one boundary classifier: a refusal naming a capability argument we sent is INV-11's."""
+    """The one boundary classifier: an undeclared-argument refusal of a capability we sent is INV-11's.
+
+    Any other failure, including one whose text mentions the argument, is the tool's.
+    """
     failure = _failure(tool, reply)
     if failure is None:
         return
     text, error_type = failure
-    for argument in _CAPABILITY_ARGUMENTS:
-        if argument in sent_args and argument in text:
-            raise StoreReaderUnsupported(argument, f'{tool} refused the argument: {text}')
+    for argument, refusal in _CAPABILITY_REFUSALS.items():
+        if argument in sent_args and refusal.search(text):
+            raise StoreReaderUnsupported(argument, f'{tool} does not declare the argument: {text}')
     raise _ToolRefused(tool, text, error_type)
 
 
@@ -1456,16 +1549,6 @@ LEAD_ACTION_TARGETS: Mapping[LeadActionOp, TargetKind] = types.MappingProxyType(
 
 
 @dataclass(frozen=True)
-class Rejection:
-    field: str
-    kind: RejectionClass
-    reason: str
-
-    def __str__(self) -> str:
-        return f'{self.kind}: {self.field}: {self.reason}'
-
-
-@dataclass(frozen=True)
 class ReturnCheck:
     rejections: tuple[Rejection, ...]
     value: PrdReturn | None
@@ -1474,105 +1557,6 @@ class ReturnCheck:
     @property
     def ok(self) -> bool:
         return not self.rejections
-
-
-class _Invalid:
-    """The result of a field check that recorded a rejection."""
-
-
-_INVALID = _Invalid()
-_FieldCheck = Callable[[Any, str, list[Rejection]], Any]
-
-
-def _reject(rejections: list[Rejection], field: str, reason: str) -> _Invalid:
-    rejections.append(Rejection(field, RejectionClass.FORM, reason))
-    return _INVALID
-
-
-def _is_repo_relative(path: Any) -> bool:
-    """A non-empty POSIX path that is not absolute and has no '..' segment."""
-    if not isinstance(path, str) or not path or '\\' in path:
-        return False
-    posix = PurePosixPath(path)
-    return not posix.is_absolute() and '..' not in posix.parts
-
-
-def _of_type(kind: type, described: str) -> _FieldCheck:
-    def check(value: Any, field: str, rejections: list[Rejection]) -> Any:
-        if isinstance(value, kind) and (kind is bool or not isinstance(value, bool)):
-            return value
-        return _reject(rejections, field, f'expected {described}, got {value!r}')
-    return check
-
-
-_TEXT = _of_type(str, 'a string')
-_BOOL = _of_type(bool, 'a bool')
-_INT = _of_type(int, 'an integer')
-
-
-def _vocabulary(vocabulary: type[enum.StrEnum]) -> _FieldCheck:
-    def check(value: Any, field: str, rejections: list[Rejection]) -> Any:
-        if isinstance(value, str) and value in _values(vocabulary):
-            return vocabulary(value)
-        return _reject(rejections, field, f'{value!r} is not one of {sorted(_values(vocabulary))}')
-    return check
-
-
-def _member(allowed: Iterable[Any], described: str) -> _FieldCheck:
-    allowed = frozenset(allowed)
-
-    def check(value: Any, field: str, rejections: list[Rejection]) -> Any:
-        if isinstance(value, str | int) and not isinstance(value, bool) and value in allowed:
-            return value
-        return _reject(rejections, field, f'{value!r} is not {described}')
-    return check
-
-
-def _repo_path(value: Any, field: str, rejections: list[Rejection]) -> Any:
-    if _is_repo_relative(value):
-        return value
-    return _reject(rejections, field, f'{value!r} is not a repo-relative POSIX path')
-
-
-def _nullable(check: _FieldCheck) -> _FieldCheck:
-    def nullable(value: Any, field: str, rejections: list[Rejection]) -> Any:
-        return None if value is None else check(value, field, rejections)
-    return nullable
-
-
-def _list_of(check: _FieldCheck) -> _FieldCheck:
-    def items(value: Any, field: str, rejections: list[Rejection]) -> Any:
-        if not isinstance(value, list):
-            return _reject(rejections, field, f'expected a list, got {value!r}')
-        parsed = tuple(check(item, f'{field}[{i}]', rejections) for i, item in enumerate(value))
-        return _INVALID if any(item is _INVALID for item in parsed) else parsed
-    return items
-
-
-def _record(
-    build: Callable[[dict[str, Any]], Any], required: Mapping[str, _FieldCheck],
-    optional: Mapping[str, _FieldCheck] = types.MappingProxyType({}),
-) -> _FieldCheck:
-    """An object with exactly these fields, each checked at ``<field>.<name>``, then *build* it."""
-    def record(value: Any, field: str, rejections: list[Rejection]) -> Any:
-        if not isinstance(value, Mapping):
-            return _reject(rejections, field, f'expected an object, got {value!r}')
-        found = len(rejections)
-        for name in sorted(set(value) - set(required) - set(optional)):
-            _reject(rejections, f'{field}.{name}', 'is not a field of this entry')
-        for name in sorted(set(required) - set(value)):
-            _reject(rejections, f'{field}.{name}', 'is required')
-        checks = {**required, **optional}
-        parsed = {n: checks[n](value[n], f'{field}.{n}', rejections) for n in checks if n in value}
-        return _INVALID if len(rejections) > found else build(parsed)
-    return record
-
-
-_TEXTS = _list_of(_TEXT)
-
-
-def _unchecked(value: Any, field: str, rejections: list[Rejection]) -> Any:
-    return value
 
 
 def _capped_notes(value: Any, field: str, rejections: list[Rejection]) -> Any:

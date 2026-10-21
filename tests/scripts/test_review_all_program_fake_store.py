@@ -214,6 +214,25 @@ def test_a_dropped_row_key_is_absent_from_full_rows() -> None:
     assert all('dependencies' not in row and 'metadata' in row for row in reply['results'])
 
 
+@pytest.mark.parametrize('cap', [3, 0])
+def test_the_limit_cap_clamps_every_page(cap: int) -> None:
+    with running_fake_store('--limit-cap', str(cap)) as running:
+        reply = _find(running.url, key='x_finding_run', value=RUN_ID, limit=50)
+    assert len(reply['results']) == cap
+    assert reply['pagination'] == {
+        'total': 9, 'offset': 0, 'page_size': cap, 'returned': cap, 'has_more': True,
+    }
+
+
+def test_a_find_error_answers_every_lookup_and_leaves_get_task_alone() -> None:
+    text = "include_rows must be a bool; got 'yes'"
+    with running_fake_store('--find-error', text) as running:
+        refused = _find(running.url, key='x_finding_run', value=RUN_ID, include_rows=True)
+        task = _structured(running.url, 'get_task', id='101', project_root=PROJECT_ROOT)
+    assert refused == {'error': text, 'error_type': 'ValidationError'}
+    assert task['id'] == 101
+
+
 def test_sse_framing_carries_the_reply_on_a_data_line() -> None:
     with running_fake_store('--sse') as running:
         status, content_type, body = _post(
