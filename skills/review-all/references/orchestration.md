@@ -313,6 +313,8 @@ function topReads(s) {
 function areaPrompt(s) {
   return `You are one seat of a whole-project quality review of ${A.project.id}. The tree is ${ROOT}, a detached checkout of ${A.as_of_sha}. READ-ONLY: modify nothing, run no state-changing command, make no MCP write. Intermediates go under ${A.scratch}/seats/${s.seat}/.
 
+IF THE TREE DOES NOT RESOLVE (${ROOT} missing, or a dangling path): do not review the main checkout or any other tree, whatever state it is in. Export the pinned commit into your own scratch with git -C ${A.project.main_root} archive ${A.as_of_sha} | tar -x -C ${A.scratch}/seats/${s.seat}/tree (mkdir the target first), read that export in place of ${ROOT} for every path below, and say so in area_health.
+
 ${QUALITY}quality is the expected cost and risk of the next change, made by an agent from a partial view. The fourteen heuristics and the two stances are lenses you name on each finding (tags), not a checklist to walk; one finding per heuristic is the failure mode this prompt exists to prevent.
 
 YOUR SLICE: ${s.seat} (findings carry area "${s.area}" unless a READ FULLY entry names another area). ${A.language_note ? `LANGUAGE NOTE: ${A.language_note}\n\n` : ''}Your slice brief is the file ${s.brief} — Read it first, in full. It holds, in this order: READ FULLY (ranked by the instruments in that doc's "What to measure" table, each entry with its snapshot numbers; line counts set only how much fits in your budget — top entries: ${topReads(s)}), INDEX ONLY (${s.index_only_count} files), TESTS THAT REACH THIS SLICE'S INTERNALS (${s.tests_reaching_internals_count} test files), SIZE ALARMS (${s.size_alarms.length ? s.size_alarms.join(', ') : 'none'} — heuristic 14 protocol mandatory for each; fill h14_measurements with prose share and whether the prose is in its right home, a named partition of top-level symbols, and per candidate the heuristic-13 symptom naming the two modules and the specific import, or none), PRIOR OPEN FINDINGS AT THIS AREA (${s.prior_open.length}, with full statements; re-verify each at this tree and report every one in prior_verdicts using its exact canonical string — still_present or gone, a gone needs the commit or the replacing code; set prior_canonical on a new finding only when it adds evidence to one rather than restating it), and LEADS (${s.leads_count}; things to verify, never findings in themselves).
@@ -327,7 +329,7 @@ METHOD
 3. For every candidate, write next_change first: the change an agent would plausibly make here, what it must read or know beyond the file to make it correctly, and what catches a wrong version before it lands. If that cannot be written concretely, it is not a finding.
 4. Measure: at least one measurement per finding, each with the rule it was computed under (what was counted, excluded, over what population). Re-run a metric you rely on rather than quoting the sheet.
 5. Anchor at path::symbol (the enclosing top-level or class-level definition) at this tree; no line numbers.
-6. Severity per docs/quality-findings-contract.md §4; class mechanical only when one anchor, no design choice, and fixable from the statement — any split or reduce-this-number proposal is structural.
+6. Severity per docs/quality-findings-contract.md §4, and before writing high, answer from the next_change scenario: is the wrong version caught, and by what (a test, type check, gate, invariant, or a reader who must open the other site)? A wrong version that a named check catches before it lands is medium; high needs a wrong version that lands uncaught. Class mechanical only when one anchor, no design choice, and fixable from the statement — any split or reduce-this-number proposal is structural.
 
 NOT A FINDING: a style nit; a heuristic that could apply; anything whose severity rests on raw line count, average complexity, coverage or test count (the doc's "Do not steer by" — context only); a restatement of a prior open finding; a proposal without a statement; a cost you did not read the code for.
 
@@ -649,8 +651,8 @@ JOBS
 1. MATRIX: one ranked view per area × primary tag that has findings, ids best payoff first. Payoff = next-change cost removed × breadth (sites, areas) × verdict weight (confirmed 1, weakened 0.5; a prior re-checked this run takes this run's verdict, an unchecked prior keeps its instrument's). Standing findings are listed, never ranked. State the rule once in method and apply it everywhere.
 2. STREAMS: group findings that one named remedy removes together. Each stream names the mechanism, what becomes deletable, size and risk, the shared artefacts needing one owner, and mode (agent for mechanical, spawn for design-heavy). Mechanical findings that need no design stay out of streams — the lead files them. Where two viable designs exist, write open_choices with options, trade-offs and the long-term consequence; do not pick unless the analysis converges.
 3. INVARIANT CANDIDATES: only rules with a checkable form and a fixture sketch (docs/code-quality.md §Relationship to the design invariants); map to an existing INV when one already encodes it instead of proposing a new one.
-4. CONTRADICTIONS: seats proposing conflicting remedies, or a remedy that duplicates a mechanism that already exists; resolve or pose the question.
-5. EXONERATIONS: what the metrics flag that the reading shows healthy.
+4. CONTRADICTIONS: seats proposing conflicting remedies, or a remedy that duplicates a mechanism that already exists; resolve or pose the question. A proposed helper, module or check the tree already has is a duplicate-mechanism contradiction: grep the tree for it before a stream carries the remedy, and when it exists, name it and re-aim the stream at using it.
+5. EXONERATIONS: what the metrics flag that the reading shows healthy. An exoneration resting on a test-share ratio or a per-function max alone is not an exoneration: each is one term of a pair, so name the reading of the code that shows the flagged cost is absent (the guard, the derivation, the test that fails on the wrong version), or leave the flag standing.
 A weakened finding keeps its weight through its id; the report marks it from the record. Never rank by, or justify a severity with, a measure from the doc's Do-not-steer list.
 ${critique ? `\nA critic read your previous synthesis and found these join errors. Fix each you accept, say in method how, and fill critic_responses with one entry per item in order (accepted true/false and how); a declined item needs its reason:\n${JSON.stringify(critique, null, 1)}\n` : ''}${mechanical && mechanical.length ? `\nThe pipeline's mechanical join checks found these in your previous synthesis; fix each and say how in method:\n${JSON.stringify(mechanical, null, 1)}\n` : ''}
 DIGEST:
@@ -707,8 +709,28 @@ DIGEST (the inputs the synthesis was built from):
 ${JSON.stringify(digest, null, 1)}`
 }
 
+const RECHECK_SCHEMA = { type: 'object', required: ['items'], properties: {
+  items: { type: 'array', items: { type: 'object', required: ['join_error', 'resolved', 'checked'], properties: {
+    join_error: { type: 'integer', description: '0-based index into the critic join_errors' },
+    resolved: { type: 'boolean', description: 'true when the revised synthesis no longer carries the error, or a declined item\'s reason holds against the tree' },
+    checked: { type: 'string', description: 'the synthesis entry and the code or file you opened' } } } } } }
+
+function recheckPrompt(errors, responses, revisedSynthesis) {
+  return `You are a re-check seat for a whole-project quality review of ${A.project.id} at ${ROOT}. READ-ONLY. A critic listed join errors in a synthesis; the synthesis was revised. For each listed item, decide from the revised synthesis alone whether the error is gone: the named entry (short id, stream or matrix cell) must now say what the item's fix asked, and a declined item must carry a reason that holds when you open the code it cites. This is a cheap re-check of the critic's listed items only — do not look for new errors, and do not re-judge the findings. One entry per item, in order.
+
+CRITIC JOIN ERRORS:
+${JSON.stringify(errors, null, 1)}
+
+THE REVISION'S RESPONSES:
+${JSON.stringify(responses, null, 1)}
+
+REVISED SYNTHESIS:
+${JSON.stringify(revisedSynthesis, null, 1)}`
+}
+
 phase('Critique')
 let critic = null
+let criticRecheck = null
 let revised = false
 if (!synthesis) {
   log('synthesis lost — critic skipped; the lead synthesises from the digest by hand and the report says so')
@@ -719,7 +741,13 @@ if (!synthesis) {
   if (critic && critic.verdict === 'revise') {
     log(`critic: ${critic.join_errors.length} join errors — one revision of the synthesis`)
     const revisedSynthesis = await seatWithRetry('synthesize:revised', (note) => agent(synthesisPrompt(critic.join_errors, firstJoinErrors) + note, synthOpts(note ? 'synthesize:revised:retry' : 'synthesize:revised')), degenerateSynthesis)
-    if (revisedSynthesis) { synthesis = revisedSynthesis; revised = true } else log('revision lost — the unrevised synthesis is returned with the critic errors attached')
+    if (revisedSynthesis) {
+      synthesis = revisedSynthesis
+      revised = true
+      const route = A.routing.recheck || { model: 'sonnet', effort: 'medium' }
+      criticRecheck = await agent(recheckPrompt(critic.join_errors, synthesis.critic_responses || [], synthesis), { label: 'critic:recheck', phase: 'Critique', model: route.model, effort: route.effort, schema: RECHECK_SCHEMA })
+      if (!criticRecheck) log('critic re-check lost — the revision is returned unchecked')
+    } else log('revision lost — the unrevised synthesis is returned with the critic errors attached')
   }
 }
 
@@ -743,7 +771,7 @@ return {
   refuted,
   verification: counts, calibration, yellow_flag_sample: yellowFlagSample, observation, dropped,
   short_ids: [...idOf].map(([c, id]) => ({ id, canonical: c })),
-  synthesis: synthesis && { ...mapIds(synthesis), join_errors_mechanical: joinErrorsMechanical }, critic, synthesis_revised: revised, severity_corrections: severityCorrections,
+  synthesis: synthesis && { ...mapIds(synthesis), join_errors_mechanical: joinErrorsMechanical }, critic, synthesis_revised: revised, critic_recheck: criticRecheck, severity_corrections: severityCorrections,
 }
 ```
 
@@ -760,6 +788,7 @@ Set in `args.routing` by the lead, explicit on every `agent()`; the session mode
 | cross-area lens (×4) | opus | high | cross-input synthesis over a graph plus N reports |
 | synthesis | fable (standing in the DF overlay; else per the provenance rule) | high | synthesis of conflicting complex reports — the team skill's named fable case; fallback opus / xhigh |
 | critic | fable (standing in the DF overlay; else per the provenance rule) | high | adversarial review of that synthesis — the other named case; fallback opus / xhigh |
+| critic re-check (one, only after a revision; `args.routing.recheck` overrides) | sonnet | medium | bounded look at whether each listed item is gone from the revised synthesis |
 
 Provenance rule (`skills/team/SKILL.md` §Fable): a fable lead sets the two fable seats directly; an opus lead sets them under the project overlay's standing ruling (`.claude/skills/review-all/project.md`, as dark-factory's grants since 2026-10-05), `--fable`, or a statement in the conversation, otherwise runs the fallback and says in the report that fable was wanted.
 
@@ -788,3 +817,4 @@ Expected per-seat spend, extrapolated from the hotspot run's measured 100–140k
 19. **Calibration outcomes went nowhere.** Measured on reify: 5 of 10 sampled highs came back `weakened` (solar_challenge_platform: 2 of 10), and every one stayed `confirmed` in the record, the matrix and the streams — `calibrate()` returned its outcomes and nothing consumed them; it also ran only at zero refutations. Now it runs under a 5 % refutation rate (failure mode 4); `recordOutcome` attaches `calibration_disputes_verdict: {to, note}` to each sampled finding a fresh skeptic weakens (or refutes) and leaves the finding's own verdict standing — one skeptic does not silently overwrite another, the deliberation rules (`report-format.md` §Artefact 2); and a sample with ≥ 30 % disputed or ≥ 2 disputed highs is the drift signal: the `Reverify high stratum` step gives every remaining confirmed `high` a fresh skeptic (`A.routing.skeptic`), records outcomes the same way under `calibration.high_stratum`, and sets `calibration.high_stratum_reverified = true`. The sample is awaited before the digest, so the synthesis and the critic see the disputes.
 20. **Skeptic notes never reached the join.** `digestFindings` carried the verdict but not the skeptic's note, so a weakened finding reached the synthesis uncorrected and the critic could not check it (reify's critic worked "vs fNN skeptic notes" by hand; solar_challenge's: "skeptic notes are absent"). The digest now carries each finding's `verdict_notes` and `calibration_disputes_verdict`, and `digest.refuted` the refuted list (the one the result returns), and the critic prompt tells it to check weakened and disputed findings against them.
 21. **Critics re-found set-membership errors by hand.** All three critics reported the same structural join errors, and the lesser items never reached the revision. `mechanicalJoinErrors` now runs after the synthesis and again after a revision — new: a key in two streams, a key twice in one matrix cell, a high structural finding in no stream (mechanical highs are filed by the lead, not streamed; priors carry no severity in the script and are not checked) — logs them, feeds the first set to the critic (as already found) and to the revision, and returns the final set as `synthesis.join_errors_mechanical`. Kept unchanged: the critic's `weakened-hidden` class and the pipeline's duplicate-canonical-across-seats log. The critic's budget goes to evidence-contradicts-conclusion and exonerations (17 of 53 critic errors across three runs were in exonerations; 8 were duplicate-mechanism).
+22. **A revision nobody checked.** The revised synthesis answered the critic's items in `critic_responses`, and the lead's digest took those answers on trust. One sonnet/medium seat now makes a cheap re-check of exactly the critic's listed items against the revised synthesis (`recheckPrompt`) and the result returns as `critic_recheck`; an item with `resolved: false` is the lead's to rule on at the digest. The same revision carries the two checks the critic kept finding by hand — a proposed helper the tree already has, and an exoneration resting on a test-share ratio or a per-function max alone (synthesis jobs 4–5) — and the area seat asks of each high whether the wrong version is caught, and by what (every one of the four critic downgrades was high → medium on that basis).
