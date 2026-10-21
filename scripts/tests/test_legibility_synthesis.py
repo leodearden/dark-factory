@@ -8,7 +8,7 @@ import copy
 import json
 
 import pytest
-from legibility import census_findings, synthesis, verdict
+from legibility import census_findings, codebook, synthesis, verdict
 
 _RUN = "census-dark_factory-20261021"
 _EXTERNAL_RUN = "review-dark_factory-20261019"
@@ -457,3 +457,114 @@ def test_every_problem_of_an_invalid_document_is_named():
     assert isinstance(result, synthesis.Unavailable)
     assert "new[0].observation" in result.reason
     assert "notes[0].verified" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# Applying the document, and the standing count
+# ---------------------------------------------------------------------------
+
+def _cluster(title: str, *sessions: str) -> dict:
+    return {
+        "title": title,
+        "origin_phase": "implement",
+        "manifested_phase": "verify",
+        "sightings": [
+            {"session": session, "origin_phase": "implement", "manifested_phase": "verify"} for session in sessions
+        ],
+    }
+
+
+def _refined_phases(cluster: dict) -> set[tuple[str, str]]:
+    return {
+        (record["origin_phase"], record["manifested_phase"]) for record in (cluster, *cluster["sightings"])
+    }
+
+
+def _entry_by_id(cb: dict, entry_id: str) -> dict:
+    (entry,) = (entry for entry in cb["entries"] if entry["id"] == entry_id)
+    return entry
+
+
+def test_refinements_rewrite_the_runs_clusters_and_the_entries_it_created_only():
+    after = _after()
+    pristine = copy.deepcopy(after)
+    document = synthesis.Synthesis(phase_refinements=(
+        synthesis.PhaseRefinement(_key(_ANCHOR_NEW), "merge", "review", "a merge made it"),
+        synthesis.PhaseRefinement(_key(_ANCHOR_ATTACHED), "prd", "ops", "the PRD set it up"),
+    ))
+    clusters = [
+        (_cluster("new", "s-run-4"), _NEW_ID),
+        (_cluster("attached", "s-run-1"), "entry-attached"),
+        (_cluster("unplaced", "s-run-6"), None),
+        (_cluster("adopted", "s-run-5"), _ADOPTED_ID),
+    ]
+
+    refined = synthesis.apply_refinements(after, document, clusters=clusters, created={_NEW_ID, _ADOPTED_ID})
+
+    new, attached, unplaced, adopted = refined.clusters
+    assert _refined_phases(new) == {("merge", "review")}
+    assert _refined_phases(attached) == {("prd", "ops")}
+    assert unplaced == _cluster("unplaced", "s-run-6")
+    assert adopted == _cluster("adopted", "s-run-5")
+    created = _entry_by_id(refined.codebook, _NEW_ID)
+    standing = _entry_by_id(refined.codebook, "entry-attached")
+    assert (created["origin_phase"], created["manifested_phase"]) == ("merge", "review")
+    assert (standing["origin_phase"], standing["manifested_phase"]) == ("implement", "verify")
+    assert (refined.clusters_refined, refined.entries_refined) == (2, 1)
+    assert after == pristine
+    assert clusters[0][0] == _cluster("new", "s-run-4")
+    assert codebook.validate(refined.codebook) == []
+
+
+def test_no_refinement_leaves_the_codebook_and_clusters_equal():
+    clusters = [(_cluster("new", "s-run-4"), _NEW_ID)]
+
+    refined = synthesis.apply_refinements(_after(), synthesis.Synthesis(), clusters=clusters, created={_NEW_ID})
+
+    assert refined.codebook == _after()
+    assert refined.clusters == (_cluster("new", "s-run-4"),)
+    assert (refined.clusters_refined, refined.entries_refined) == (0, 0)
+
+
+def test_a_document_without_corrections_has_no_corrections_record():
+    assert synthesis.corrections_record(
+        synthesis.Synthesis(), run_id=_RUN, date="2026-10-21", project="dark_factory",
+    ) is None
+
+
+def test_the_corrections_record_is_a_coding_record_the_merger_applies():
+    document = synthesis.Synthesis(corrections=(
+        synthesis.Correction("entry-matched", note="the framing was refuted", title=None, cause="a truer cause"),
+        synthesis.Correction("entry-attached", note="renamed", title="a clearer title", cause=None),
+    ))
+
+    record = synthesis.corrections_record(document, run_id=_RUN, date="2026-10-21", project="dark_factory")
+
+    assert record is not None
+    assert codebook.validate_coding_record(record) == []
+    assert (record["session"], record["agent_class"]) == (_RUN, "census-synthesis")
+    merged = codebook.apply_coding_records(_after(), [record], invariant_slugs=())
+    matched = _entry_by_id(merged.codebook, "entry-matched")
+    attached = _entry_by_id(merged.codebook, "entry-attached")
+    assert matched["cause"] == "a truer cause"
+    assert matched["title"] == "title of entry-matched"
+    assert attached["title"] == "a clearer title"
+    assert [sighting.get("note") for sighting in matched["sightings"] if sighting["session"] == _RUN] == [
+        "the framing was refuted",
+    ]
+    assert merged.counts.corrections_applied == 2
+
+
+def test_the_standing_count_is_open_entries_that_stood_and_gained_no_session():
+    before = _before()
+    before["entries"].extend([
+        _entry("entry-still", _sighting("s-old-e"), status="partially"),
+        _entry("entry-fixed", _sighting("s-old-f"), status="fixed"),
+        _entry("entry-retired-now", _sighting("s-old-g")),
+        _entry("entry-accepted", _sighting("s-old-h"), status="accepted", accepted_by=7),
+    ])
+    after = _after()
+    after["entries"].extend(copy.deepcopy(before["entries"][4:]))
+    _entry_by_id(after, "entry-retired-now")["status"] = "retired"
+
+    assert synthesis.standing_count(before, after) == 2
