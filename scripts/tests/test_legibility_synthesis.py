@@ -252,3 +252,208 @@ def test_the_brief_record_round_trips_through_json():
 def test_a_verdict_naming_no_entry_of_the_run_is_refused():
     with pytest.raises(ValueError, match="entry-missing"):
         _brief(verdicts=[census_findings.Adjudication("entry-missing", _NEW_FOUND, None)])
+
+
+# ---------------------------------------------------------------------------
+# The C6 document's validator
+# ---------------------------------------------------------------------------
+
+_DROP = object()
+
+
+def _shaped(base: dict, overrides: dict) -> dict:
+    return {name: value for name, value in {**base, **overrides}.items() if value is not _DROP}
+
+
+def _new_item(**overrides) -> dict:
+    return _shaped({"key": _key(_ANCHOR_NEW), "observation": "h does two jobs"}, overrides)
+
+
+def _change(**overrides) -> dict:
+    return _shaped({"field": "severity", "from": "low", "to": "medium", "why": "it recurred"}, overrides)
+
+
+def _re_item(**overrides) -> dict:
+    return _shaped({"key": _key(_ANCHOR_ATTACHED), "sessions": ["s-run-1"], "changed": [_change()]}, overrides)
+
+
+def _refinement(**overrides) -> dict:
+    return _shaped(
+        {"key": _key(_ANCHOR_NEW), "origin_phase": "merge", "manifested_phase": "review", "why": "a merge made it"},
+        overrides,
+    )
+
+
+def _correction(**overrides) -> dict:
+    return _shaped({"entry_id": "entry-matched", "note": "the framing was refuted", "cause": "a truer cause"}, overrides)
+
+
+def _note(**overrides) -> dict:
+    return _shaped({"claim": "a.py and b.py share a cause", "evidence": "both name f", "verified": False}, overrides)
+
+
+def _document(**overrides) -> dict:
+    return _shaped(
+        {
+            "new": [_new_item()],
+            "re_observed": [_re_item()],
+            "phase_refinements": [_refinement()],
+            "corrections": [_correction()],
+            "notes": [_note()],
+        },
+        overrides,
+    )
+
+
+_EMPTY_DOCUMENT = {"new": [], "re_observed": [], "phase_refinements": [], "corrections": [], "notes": []}
+
+
+@pytest.mark.parametrize("raw", [
+    pytest.param(json.dumps(_document()), id="bare"),
+    pytest.param("Here it is:\n```json\n" + json.dumps(_document()) + "\n```\n", id="fenced"),
+])
+def test_a_valid_document_parses_to_typed_values(raw):
+    result = synthesis.parse(raw, _brief())
+
+    assert result == synthesis.Synthesis(
+        new=(synthesis.NewObservation(_key(_ANCHOR_NEW), "h does two jobs"),),
+        re_observed=(
+            synthesis.ReObservation(
+                key=_key(_ANCHOR_ATTACHED),
+                sessions=("s-run-1",),
+                changed=(synthesis.Change("severity", from_value="low", to_value="medium", why="it recurred"),),
+            ),
+        ),
+        phase_refinements=(synthesis.PhaseRefinement(_key(_ANCHOR_NEW), "merge", "review", "a merge made it"),),
+        corrections=(
+            synthesis.Correction("entry-matched", note="the framing was refuted", title=None, cause="a truer cause"),
+        ),
+        notes=(synthesis.Note("a.py and b.py share a cause", "both name f"),),
+    )
+
+
+@pytest.mark.parametrize("brief", [
+    pytest.param(_brief(), id="full-brief"),
+    pytest.param(_brief(after=_before(), verdicts=[], adopted={}), id="empty-brief"),
+])
+def test_the_empty_document_is_valid_against_any_brief(brief):
+    assert synthesis.parse(json.dumps(_EMPTY_DOCUMENT), brief) == synthesis.Synthesis()
+
+
+@pytest.mark.parametrize(("raw", "fragments"), [
+    pytest.param("not json at all", ["not a JSON object"], id="non-json"),
+    pytest.param(json.dumps([_document()]), ["not a JSON object"], id="top-level-array"),
+    pytest.param(json.dumps(_document(notes=_DROP)), ["$: missing key 'notes'"], id="missing-top-level-key"),
+    pytest.param(json.dumps(_document(standing=[])), ["$: unexpected key 'standing'"], id="extra-top-level-key"),
+    pytest.param(json.dumps(_document(new={})), ["new: must be a list", "{}"], id="list-of-wrong-type"),
+    pytest.param(
+        json.dumps(_document(new=[_new_item(severity="high")])), ["new[0]: unexpected key 'severity'"],
+        id="extra-item-key",
+    ),
+    pytest.param(
+        json.dumps(_document(new=[_new_item(key=_key(_ANCHOR_ATTACHED))])),
+        ["new[0].key: not a new finding of this run", _key(_ANCHOR_ATTACHED)],
+        id="re-observed-key-in-new",
+    ),
+    pytest.param(
+        json.dumps(_document(re_observed=[_re_item(key=_key(_ANCHOR_NEW))])),
+        ["re_observed[0].key: not a re-observed finding of this run", _key(_ANCHOR_NEW)],
+        id="new-key-in-re-observed",
+    ),
+    pytest.param(
+        json.dumps(_document(new=[_new_item(), _new_item()])),
+        ["new[1].key: duplicate", _key(_ANCHOR_NEW)],
+        id="duplicate-key",
+    ),
+    pytest.param(
+        json.dumps(_document(re_observed=[_re_item(sessions=["s-old-a"])])),
+        ["re_observed[0].sessions[0]: not a session this finding gained", "s-old-a"],
+        id="session-not-gained",
+    ),
+    pytest.param(
+        json.dumps(_document(re_observed=[_re_item(changed=[_change(field="title")])])),
+        ["re_observed[0].changed[0].field", "'title'"],
+        id="changed-field-outside-vocabulary",
+    ),
+    pytest.param(
+        json.dumps(_document(re_observed=[_re_item(changed=[_change(to="critical")])])),
+        ["re_observed[0].changed[0].to", "'critical'"],
+        id="severity-outside-vocabulary",
+    ),
+    pytest.param(
+        json.dumps(_document(re_observed=[_re_item(changed=[_change(field="verdict", **{"from": "unverified"}, to="maybe")])])),
+        ["re_observed[0].changed[0].to", "'maybe'"],
+        id="verdict-outside-vocabulary",
+    ),
+    pytest.param(
+        json.dumps(_document(re_observed=[_re_item(changed=[_change(field="origin_phase", **{"from": "implement"}, to="coding")])])),
+        ["re_observed[0].changed[0].to", "'coding'"],
+        id="phase-change-outside-vocabulary",
+    ),
+    pytest.param(
+        json.dumps(_document(phase_refinements=[_refinement(key=_key(_ANCHOR_MATCHED))])),
+        ["phase_refinements[0].key: no verdict this run", _key(_ANCHOR_MATCHED)],
+        id="refinement-of-an-unjudged-finding",
+    ),
+    pytest.param(
+        json.dumps(_document(phase_refinements=[_refinement(origin_phase="coding")])),
+        ["phase_refinements[0].origin_phase", "'coding'"],
+        id="refinement-phase-outside-vocabulary",
+    ),
+    pytest.param(
+        json.dumps(_document(phase_refinements=[_refinement(why="  ")])),
+        ["phase_refinements[0].why: must be a non-empty string"],
+        id="empty-why",
+    ),
+    pytest.param(
+        json.dumps(_document(new=[_new_item(observation="")])),
+        ["new[0].observation: must be a non-empty string"],
+        id="empty-observation",
+    ),
+    pytest.param(
+        json.dumps(_document(corrections=[_correction(note="")])),
+        ["corrections[0].note: must be a non-empty string"],
+        id="empty-note",
+    ),
+    pytest.param(
+        json.dumps(_document(corrections=[_correction(entry_id=_ADOPTED_ID)])),
+        ["corrections[0].entry_id: not a correctable entry", _ADOPTED_ID],
+        id="correction-of-an-uncorrectable-entry",
+    ),
+    pytest.param(
+        json.dumps(_document(corrections=[_correction(status="fixed")])),
+        ["corrections[0]: unexpected key 'status'", "census-owned"],
+        id="correction-carrying-status",
+    ),
+    pytest.param(
+        json.dumps(_document(corrections=[_correction(cause=_DROP)])),
+        ["corrections[0]: writes neither title nor cause"],
+        id="correction-writing-nothing",
+    ),
+    pytest.param(
+        json.dumps(_document(corrections=[_correction(), _correction(cause="another cause")])),
+        ["corrections[1].entry_id: duplicate", "entry-matched"],
+        id="two-corrections-for-one-entry",
+    ),
+    pytest.param(
+        json.dumps(_document(notes=[_note(verified=True)])),
+        ["notes[0].verified: must be false", "no tools"],
+        id="verified-note",
+    ),
+])
+def test_an_invalid_document_is_unavailable_naming_the_path_and_value(raw, fragments):
+    result = synthesis.parse(raw, _brief())
+
+    assert isinstance(result, synthesis.Unavailable)
+    for fragment in fragments:
+        assert fragment in result.reason
+
+
+def test_every_problem_of_an_invalid_document_is_named():
+    raw = json.dumps(_document(new=[_new_item(observation="")], notes=[_note(verified=True)]))
+
+    result = synthesis.parse(raw, _brief())
+
+    assert isinstance(result, synthesis.Unavailable)
+    assert "new[0].observation" in result.reason
+    assert "notes[0].verified" in result.reason
