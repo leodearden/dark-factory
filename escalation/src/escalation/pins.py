@@ -366,9 +366,7 @@ def classify_pins(
     ``orchestrator.deterministic_runner`` (all six sites ``level=2`` /
     ``severity='critical'``),
     ``orchestrator/src/orchestrator/merge_lane/worker.py::_file_main_health_escalation``
-    (which files at level 1 since task 3774, because it has no per-task
-    incarnation, so ``None`` is its honest identity and link 3 decides it
-    before link 4 — pinned by
+    (level 1, no per-task incarnation; pinned by
     ``orchestrator/tests/test_merge_queue_main_health_deferred.py::_assert_pins_only_as_queue_handoff``)
     and the other level-1/2-only filers — where link 3 makes the identity
     moot.  The L0 ``severity='info'`` filers (e.g.

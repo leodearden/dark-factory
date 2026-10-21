@@ -129,8 +129,8 @@ def _assert_pins_only_as_queue_handoff(
     escalation_queue: EscalationQueue, task_id: str,
 ) -> None:
     """A worker main-health record has no filing incarnation, so its pin must
-    not depend on one: at level 0 the no-live-claimant state reads dead_l0
-    (escalation.pins Link 4)."""
+    not depend on one. A level-0 filing would read dead_l0 with no live
+    claimant (escalation.pins Link 4), which this rejects."""
     records = escalation_queue.get_by_task(task_id, status='pending')
     assert records, f'Expected open escalations for task {task_id!r}; got none'
     record_ids = tuple(r.id for r in records)
