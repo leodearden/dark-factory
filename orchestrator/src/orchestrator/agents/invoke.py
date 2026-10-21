@@ -36,6 +36,7 @@ from shared.cli_invoke import (  # noqa: F401
 
 # Process-group termination helper for subprocess tree cleanup
 from shared.proc_group import terminate_process_group
+from shared.secret_env import agent_subprocess_env
 
 from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
 
@@ -319,7 +320,7 @@ async def _invoke_claude_with_sandbox(
             # User prompt piped via stdin to avoid ARG_MAX
             stdin_data = prompt.encode()
 
-            env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+            env = agent_subprocess_env(os.environ)
             if env_overrides:
                 env.update(env_overrides)
             if oauth_token:
