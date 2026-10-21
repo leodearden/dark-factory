@@ -3,9 +3,10 @@
 Tickets survive fused-memory restarts via SQLite (sibling DB to reconciliation.db).
 
 Two statuses are non-terminal. ``pending`` is queued for, or in, curation.
-``awaiting_curation`` is parked: the curator's account pool could not judge
-the submission, so it waits for its ``next_attempt_at`` and the ticket janitor
-requeues it to ``pending``. ``attempts`` counts its deferrals and
+``awaiting_curation`` is parked: the curator could not judge the submission
+(its account pool, LLM call or corpus was unavailable, its zero-output breaker
+was open, or it raised instead of deciding), so it waits for its
+``next_attempt_at`` and the ticket janitor requeues it to ``pending``. ``attempts`` counts its deferrals and
 ``defer_reason`` holds the :class:`DeferReason` of the latest one; both
 survive the requeue. A parked ticket has no terminal bound: it waits for a
 verdict.

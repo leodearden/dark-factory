@@ -2455,10 +2455,11 @@ class CuratorConfig(BaseModel):
     # which counts only hung calls and short-circuits them; this only reports.
     degraded_streak_threshold: int = Field(default=5, ge=1)
 
-    # A submission the account pool could not serve parks awaiting_curation and
-    # is retried on this backoff until an attempt yields a verdict; the max is
-    # the retry-interval cap, not a bound on how long a ticket stays parked
-    # (fused_memory/middleware/curation_deferral.py).
+    # A submission the curator could not judge (account pool, LLM call or corpus
+    # unavailable, zero-output breaker open, or the curator raised) parks
+    # awaiting_curation and is retried on this backoff until an attempt yields
+    # a verdict; the max is the retry-interval cap, not a bound on how long a
+    # ticket stays parked (fused_memory/middleware/curation_deferral.py).
     deferral_backoff_base_seconds: float = Field(default=60.0, gt=0)
     deferral_backoff_max_seconds: float = Field(default=1800.0, gt=0)
 

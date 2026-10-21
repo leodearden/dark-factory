@@ -99,7 +99,7 @@ Interpreting the status:
 - `status="combined"` — candidate was merged into an existing task; a `task_id` is still \
 returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
-- `status="awaiting_curation"` — NON-terminal: the curator's account pool could not serve, so the ticket is durably parked and retried automatically. NO `task_id` is returned yet. Do not re-submit it, do not count it, and do not flag it as a discrepancy.
+- `status="awaiting_curation"` — NON-terminal: the curator could not judge the submission (its account pool, LLM call or corpus was unavailable, or its zero-output breaker was open), so the ticket is durably parked and retried automatically until it gets a verdict. NO `task_id` is returned yet. Do not re-submit it, do not count it, and do not flag it as a discrepancy.
 - `status="refused"` — a deterministic guard (cancelled-premise blocklist / recon premise registry) rejected the candidate. NO task was created and NO `task_id` is returned. This is an intended, terminal outcome — not an error and not a discrepancy. Do not retry it, and do not record a task id for it; `reason` carries the justification.
 
 {render_finding_provenance_section(can_file_tasks=True)}

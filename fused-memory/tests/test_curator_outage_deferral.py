@@ -239,7 +239,9 @@ class TestBatchDefersOnCuratorOutage:
             'new alpha', 'new gamma',
         ]
         invoke.assert_awaited_once()
-        assert 'Broken beta' not in invoke.await_args.kwargs['prompt']
+        batch_call = invoke.await_args
+        assert batch_call is not None
+        assert 'Broken beta' not in batch_call.kwargs['prompt']
 
     @pytest.mark.asyncio
     async def test_an_open_breaker_defers_every_llm_bound_candidate(self):
