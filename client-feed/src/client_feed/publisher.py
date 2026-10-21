@@ -153,7 +153,7 @@ def _events_store_unit(
 def _tasks_unit(
     root: Path, since: str | None, store: _EventsStore | None, degraded: list[Degradation]
 ) -> TasksRead | None:
-    """The task rows; while runs.db is unreadable they are read as if no escalation were open."""
+    """The task rows; while runs.db is unreadable no escalation is known, so each row's waiting_on follows its status alone."""
     escalations = _NO_ESCALATIONS if store is None else store.escalations
     tasks = _guarded(lambda: read_tasks(root, since=since, escalations=escalations), degraded)
     if tasks is not None:

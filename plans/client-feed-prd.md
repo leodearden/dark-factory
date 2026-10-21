@@ -465,7 +465,10 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     `Degradation(source, redact_paths(str(exc)))` while any other exception propagates
     (`client-feed/src/client_feed/publisher.py::_guarded`). Unprojectable rows are named as
     `skipped N rows: <reason>=<count>, …` under `events` or `tasks`
-    (`client-feed/src/client_feed/publisher.py::_skipped`).
+    (`client-feed/src/client_feed/publisher.py::_skipped`). While `runs.db` cannot be read, no
+    escalation is known: a re-read task whose status the state already records keeps its recorded
+    `waiting_on`, so a degraded pass holds the last known value rather than publishing a guess
+    (`client-feed/src/client_feed/value_events.py::task_events`).
   - (g) Until δ, `tree_snapshot.budget` uses §4.12's null `delivered_commit` rule. `counted_lines`
     counts the production files that match neither `free_globs` nor `never_reveal_globs`.
     `budget_lines` is `floor(proportion × counted_lines)` and `spent_lines` is 0

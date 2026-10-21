@@ -38,13 +38,22 @@ def _differs(recorded: FeedEvent | None, said: Mapping[str, Any]) -> bool:
     return recorded is None or payload(recorded) != said
 
 
+def _said(row: TaskRow, recorded: TaskUpserted | None, *, escalations_known: bool) -> dict[str, Any]:
+    """The row's fields; with the escalations unknown, an unchanged status keeps the recorded waiting_on."""
+    said = asdict(row)
+    if not escalations_known and recorded is not None and recorded.status is row.status:
+        said['waiting_on'] = recorded.waiting_on
+    return said
+
+
 def _read_task_events(
-    rows: Iterable[TaskRow], state: FeedState, stamp: Stamp
+    rows: Iterable[TaskRow], state: FeedState, stamp: Stamp, *, escalations_known: bool
 ) -> list[TaskUpserted]:
     events: list[TaskUpserted] = []
     for row in rows:
-        said = asdict(row)
-        if _differs(state.tasks.get(row.task_id), said):
+        recorded = state.tasks.get(row.task_id)
+        said = _said(row, recorded, escalations_known=escalations_known)
+        if _differs(recorded, said):
             events.append(TaskUpserted(**stamp(row.updated_at), **said))
     return events
 
@@ -69,9 +78,13 @@ def task_events(
     stamp: Stamp,
     now: datetime,
 ) -> tuple[TaskUpserted, ...]:
-    """Each read row the state does not already say; then, given the open escalations, each unread task whose waiting_on they change."""
+    """Each read row the state does not already say; then, given the open escalations, each unread task whose waiting_on they change.
+
+    With the escalations unknown (None), a read row whose status the state already records keeps the
+    recorded waiting_on, so an unreadable runs.db holds who a task waits on rather than clearing it.
+    """
     rows = tuple(rows)
-    events = _read_task_events(rows, state, stamp)
+    events = _read_task_events(rows, state, stamp, escalations_known=escalations is not None)
     if escalations is not None:
         read_ids = {row.task_id for row in rows}
         unread = [task_id for task_id in state.tasks if task_id not in read_ids]

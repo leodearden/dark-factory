@@ -373,6 +373,23 @@ def test_a_restored_runs_db_publishes_the_held_stream_and_rewaits_the_escalated_
     assert_valid(project)
 
 
+def test_a_rescan_while_runs_db_is_unreadable_holds_the_escalated_tasks_waiting_on(
+    project: Project,
+) -> None:
+    out = project.open()
+    run_pass(project.policy, out, now=NOW)
+    assert out.state.tasks[9].waiting_on is WaitingOn.LEO
+    first = feed(project)
+    runs_db(project.root).write_bytes(NOT_A_DATABASE)
+
+    report = run_pass(project.policy, out, now=NOW, rescan_tasks=True)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.EVENTS]
+    assert 'task_upserted' not in types_of(feed(project)[len(first) :])
+    assert out.state.tasks[9].waiting_on is WaitingOn.LEO
+    assert_valid(project)
+
+
 def test_a_missing_tasks_db_is_named_tasks_and_the_events_and_git_still_publish(
     project: Project,
 ) -> None:

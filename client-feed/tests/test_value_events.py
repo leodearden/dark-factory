@@ -150,6 +150,36 @@ def test_without_escalations_no_waiting_on_is_recomputed() -> None:
     assert _waiting_change(WaitingOn.LEO, None) == ()
 
 
+def _reread_without_escalations(recorded: TaskRow, read: TaskRow) -> tuple[TaskUpserted, ...]:
+    state = state_of(upserted(recorded, 5))
+    return task_events([read], state=state, escalations=None, stamp=stamp(), now=NOW)
+
+
+def test_without_escalations_a_reread_task_keeps_its_recorded_waiting_on() -> None:
+    recorded = row(9, status=TaskStatus.BLOCKED, waiting_on=WaitingOn.LEO)
+    read_blind = replace(recorded, waiting_on=WaitingOn.FACTORY)
+
+    assert _reread_without_escalations(recorded, read_blind) == ()
+
+
+def test_without_escalations_a_reread_task_with_other_news_keeps_its_recorded_waiting_on() -> None:
+    recorded = row(9, status=TaskStatus.IN_PROGRESS, waiting_on=WaitingOn.LEO)
+    read_blind = replace(recorded, title='Renamed', waiting_on=None)
+
+    (event,) = _reread_without_escalations(recorded, read_blind)
+
+    assert (event.title, event.waiting_on) == ('Renamed', WaitingOn.LEO)
+
+
+def test_without_escalations_a_task_whose_status_changed_takes_the_read_waiting_on() -> None:
+    recorded = row(9, status=TaskStatus.BLOCKED, waiting_on=WaitingOn.LEO)
+    finished = replace(recorded, status=TaskStatus.DONE, waiting_on=None)
+
+    (event,) = _reread_without_escalations(recorded, finished)
+
+    assert (event.status, event.waiting_on) == (TaskStatus.DONE, None)
+
+
 def tasks_view(*tasks: TaskRow) -> tuple[TaskUpserted, ...]:
     return tuple(upserted(task, seq) for seq, task in enumerate(tasks, 1))
 
