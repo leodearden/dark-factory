@@ -7,7 +7,11 @@ from typing import Any
 
 import httpx
 import migrate_metadata_modules_to_files as migrate_mod
-from migrate_metadata_modules_to_files import DEFAULT_CALL_TIMEOUT_S, FusedMemoryClient, call_tool_with_retry
+from migrate_metadata_modules_to_files import (
+    DEFAULT_CALL_TIMEOUT_S,
+    FusedMemoryClient,
+    call_tool_with_retry,
+)
 
 
 def _recording_transport(seen: list, *, read_timeouts: int = 0) -> httpx.MockTransport:
