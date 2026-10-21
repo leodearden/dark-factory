@@ -315,7 +315,7 @@ path. It writes nowhere but O. The portal account reads O and nothing under R.
 | B4 | Foreign project refusal | the policy names project X; feed lines name Y | `validate-feed` rejects; the portal's consumer test (other repo) rejects the same fixture |
 | B5 | Fixture round trip | the committed fixture feed `tests/fixtures/feed-v1/` | validates under `contract.py`; `fold(feed)` equals the committed `state.json`; the portal's suite validates and renders it |
 | B6 | Landed merge with review | `merge_finalized` `state=done` for task 7, two `review_completed` rows, a `Merge task/7 into main` commit | one `merge_landed` with that sha, stat counts from git, `review.cycles == 2` and the last row's counts; with no rows, `review == "not_recorded"` |
-| B7 | Red shown | `workflow_verify` `passed=false` and a junit with one failure | `verify_run.passed == false`; `test_results.counts.failed == 1`; `exception_type` present, no message |
+| B7 | Red shown | an archived red attempt summary (a leg rc ≠ 0) and a junit with one failure under the task's archive dir | `verify_run.passed == false`; `test_results.counts.failed == 1`; `exception_type` present, no message |
 | B8 | Not recorded | a `verify_run` whose task dir has no junit | `test_results` absent; `verify_run.legs == "not_recorded"` |
 | B9 | Factory state | `scheduler_paused` then nothing for 3 h | `factory_state.scheduler == paused`, `idle_seconds ≥ 10800` |
 | B10 | Waiting on Leo | task 9 blocked with an open `escalation_created` level 2 | `task_upserted.waiting_on == "leo"`; after `escalation_resolved`, `"factory"` |
@@ -384,6 +384,46 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
   `by_kind` counts to `review_completed`; the ε sidecar block's plugin check is replaced. The defect display
   (`cases[].defects`, `defects_results`) is that PRD's ι, not a task of this one.
 
+- 2026-10-20, from β1 (task 6968), answering the esc-6969-1 note routed to it. These bind γ (6970):
+  - (a) Red task verifies come from the verify archive's per-attempt summaries, which
+    `orchestrator/src/orchestrator/verify.py::_archive_attempt_summary` writes for every attempt, green
+    or red. γ assembles them through `client-feed/src/client_feed/sources/archive.py::read_archived_run`.
+    `workflow_verify` cannot be that source: it is emitted only on VERIFY→REVIEW, with `passed=true`
+    (0 of 6,377 live rows are false). β1 still maps the recorded `passed` of `workflow_verify` and
+    `merge_verify` (`client-feed/src/client_feed/sources/events.py::read_events`), so either source
+    flows through unchanged. B7's precondition is amended to match.
+  - (b) `waiting_on` (`client-feed/src/client_feed/sources/tasks.py::waiting_on`): done or cancelled
+    gives null; an open escalation with recorded level 2 gives `leo`; any other open escalation, or a
+    blocked task, gives `factory`; otherwise null. An escalation is closed by `escalation_id`, else by
+    `escalation_ids`, else task-wide by an outcome-only `escalation_resolved`
+    (`client-feed/src/client_feed/sources/events.py::read_open_escalations`). Level promotions and
+    most resolutions are not recorded in runs.db, so `leo` rarely fires today; follow-up ticket
+    tkt_0RW1F0587N3HXAH0PN8A4A5TYJ covers recording them.
+  - (c) PRD title and excerpt are read from main's git objects, never the working tree (§8;
+    `client-feed/src/client_feed/sources/prds.py::read_prds`).
+  - (d) `review.cycles` = max(newest `review_completed` cycle, Σ `task_results.review_cycles` for the
+    task); a task with no valid row gives `not_recorded`
+    (`client-feed/src/client_feed/sources/events.py::read_review_counts`).
+
+- 2026-10-21, from β1's review amendments (task 6968). These bind γ (6970):
+  - (e) The tasks cursor (`client-feed/src/client_feed/sources/tasks.py::read_tasks`) is the last
+    projected row's raw `updated_at`. A skipped row never moves it, so it is read again until a
+    projected row passes it. The cursor is not exactly-once. Rows are ordered as the store spells
+    `updated_at` (`.mmmZ` beside microsecond `+00:00`), and the next read takes rows strictly after
+    the cursor. So a row stamped at or before the cursor (the producer stamps to the millisecond),
+    but committed after the read, is missed until that task is next written. If γ needs every
+    write, it re-reads with `since=None` on some cadence and emits only rows that differ from its
+    folded state.
+  - (f) `client-feed/src/client_feed/cli.py` is no longer vendorable: `dump-sources` pulls in
+    `yaml`, `shared.project_layout` and git through `policy` and the sources.
+    `client-feed/tests/test_import_boundary.py` still lists `cli` in `VENDORABLE_MODULES` and
+    passes, because it checks only each direct import's root package. That file is outside β1's
+    scope; ticket tkt_0RW1SJ7XHC6R7VVTB1AERS60T7 drops `cli` from the set.
+  - (g) `client-feed/tests/_stores.py` copies the producers' DDL by hand, citing each by
+    path::symbol. Nothing executable catches drift, so a renamed producer column would leave the
+    fixture tests green and a live read failing. The risk is accepted: `client-feed dump-sources`
+    against a live root is the check.
+
 ## 13. Open questions (tactical)
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
@@ -393,7 +433,9 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
    per project, `--config ~/.config/client-feed/<name>.yaml`. Decide in η.
 3. **Default globs** for visible, test, docs and generated sets. Suggested as in §7.2 and §7.6, with
    `visible_globs` having no default (a policy must name it). Decide in β2.
-4. **`excerpt` rule for PRDs** whose first paragraph is a status line. Suggested: first paragraph after
-   the first `## ` heading. Decide in β1.
+4. **`excerpt` rule for PRDs** whose first paragraph is a status line. **Decided by β1 (6968):** the
+   first paragraph after the first `## ` heading, skipping subheadings and fenced blocks; the title is
+   the first H1, else the path; both are path-redacted
+   (`client-feed/src/client_feed/sources/prds.py::summarize_prd`).
 5. **Where the plugin writes the map when no `--junitxml` is given.** Suggested: nowhere; the plugin is
    inert without a junit target. Decide in ε.
