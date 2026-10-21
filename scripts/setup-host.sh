@@ -1180,6 +1180,15 @@ else
   warn "hooks/setup.sh not found or not executable"
 fi
 
+# dark-factory's own merge driver for the ratchet baseline (.gitattributes names
+# it). hooks/setup.sh is a generic bootstrap any repo can copy, so this lives
+# here. Without it a two-branch baseline merge conflicts instead of composing.
+if (cd "$REPO_ROOT" && python3 scripts/merge_lane_ratchet_merge.py install); then
+  ok "Ratchet-baseline merge driver installed"
+else
+  warn "Ratchet-baseline merge driver NOT installed -- baseline merges will conflict"
+fi
+
 # ---------------------------------------------------------------------------
 # 10. Manual steps reminder
 # ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ commit (``python scripts/merge_lane_metrics.py --write-baseline
 orchestrator/tests/merge_lane_ratchet_baseline.json``). A raise is a different
 matter but not a forbidden one: it must be AUTHORIZED, never silent. Adding
 ``--authorize-raise <task-id> --reason <text>`` to that same command records the
-per-measure delta in ``merge_lane_ratchet_authorized_raises.json``; without
+per-measure delta as one new file under ``merge_lane_ratchet_raises/``; without
 those flags ``--write-baseline`` refuses to absorb a raise over an EXISTING
 baseline, so regenerating cannot make this test pass by widening the ratchet.
 Deleting the baseline first would -- there is then nothing to compare against --
@@ -1340,6 +1340,19 @@ class TestBaselineIO:
         assert 'baseline.json' in str(excinfo.value)
 
 
+def _ledger_files(ledger: Path) -> dict[str, str]:
+    """Every file in the ledger directory *ledger*, by name -- what a write may not touch."""
+    return {path.name: path.read_text(encoding='utf-8') for path in sorted(ledger.iterdir())}
+
+
+def _corrupt_ledger(tmp_path: Path) -> Path:
+    """A ledger directory holding one entry that cannot be read."""
+    ledger = tmp_path / 'raises'
+    ledger.mkdir()
+    (ledger / 'corrupt.json').write_text('{ not json at all', encoding='utf-8')
+    return ledger
+
+
 class TestWriteBaselineRefusesAnUnauthorizedRaise:
     """The write path is where the ratchet is actually enforceable.
 
@@ -1486,21 +1499,21 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # which leaves this branch green whether the gate consults the file or
         # not.
         target = self._seeded(tmp_path)
-        ledger = tmp_path / 'ledger.json'
+        ledger = tmp_path / 'raises'
         first = copy.deepcopy(_ratchet_baseline())
         first['files'][_MQ]['lines'] += 103
         metrics.write_baseline(
             target, first, authorization=self._AUTHORIZATION, ledger=ledger
         )
-        recorded = ledger.read_text(encoding='utf-8')
-        assert metrics.load_ledger(ledger)['raises']
+        recorded = _ledger_files(ledger)
+        assert metrics.load_ledger(ledger)
 
         further = copy.deepcopy(first)
         further['files'][_MQ]['lines'] += 50
         with pytest.raises(metrics.UnauthorizedRaise):
             metrics.write_baseline(target, further, ledger=ledger)
 
-        assert ledger.read_text(encoding='utf-8') == recorded
+        assert _ledger_files(ledger) == recorded
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(first)
 
     def test_a_plain_regeneration_never_reads_the_ledger(
@@ -1509,15 +1522,14 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # The other face of the same property: with nothing to record, the
         # ledger is not consulted, so a lowering regeneration cannot be blocked
         # by the health of a file it does not touch. load_ledger fails HARD on
-        # a malformed file, so any read at all would redden this.
+        # a malformed entry, so any read at all would redden this.
         target = self._seeded(tmp_path)
-        ledger = tmp_path / 'ledger.json'
-        ledger.write_text('{ not json at all', encoding='utf-8')
+        ledger = _corrupt_ledger(tmp_path)
         lowered = copy.deepcopy(_ratchet_baseline())
         lowered['files'][_MQ]['lines'] -= 4000
 
         assert metrics.write_baseline(target, lowered, ledger=ledger).record is None
-        assert ledger.read_text(encoding='utf-8') == '{ not json at all'
+        assert _ledger_files(ledger) == {'corrupt.json': '{ not json at all'}
 
     def test_unauthorized_raise_is_not_a_metrics_error(self) -> None:
         # The exit ladder: 1 is "a measure rose", 2 is "the instrument broke".
@@ -1624,7 +1636,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     def test_an_authorized_ceiling_breach_is_recorded(self, tmp_path: Path) -> None:
         # The discriminator pair, completed for ceilings.
         target = self._seeded(tmp_path)
-        ledger = tmp_path / 'ledger.json'
+        ledger = tmp_path / 'raises'
         current = copy.deepcopy(_ratchet_baseline())
         current['files'][self._NEW_PATH] = blank_file_entry(
             lines=metrics.FILE_LINE_CEILING + 1
@@ -1634,7 +1646,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
             target, current, authorization=self._AUTHORIZATION, ledger=ledger
         )
 
-        measures = metrics.load_ledger(ledger)['raises'][0]['measures']
+        measures = metrics.load_ledger(ledger)[0]['measures']
         breach = next(
             row for row in measures if row['measure'] == 'new_file_over_ceiling'
         )
@@ -1658,7 +1670,7 @@ class TestAuthorizedRaise:
     def _seeded(tmp_path: Path) -> tuple[Path, Path]:
         target = tmp_path / 'b.json'
         metrics.write_baseline(target, _ratchet_baseline())
-        return target, tmp_path / 'ledger.json'
+        return target, tmp_path / 'raises'
 
     @staticmethod
     def _raised() -> dict:
@@ -1696,7 +1708,7 @@ class TestAuthorizedRaise:
             target, self._raised(), authorization=authorization, ledger=ledger
         )
 
-        entries = metrics.load_ledger(ledger)['raises']
+        entries = metrics.load_ledger(ledger)
         assert len(entries) == 1
         assert entries[0]['task_id'] == authorization.task_id
         assert entries[0]['reason'] == authorization.reason
@@ -1727,7 +1739,7 @@ class TestAuthorizedRaise:
             target, current, authorization=self._authorization(), ledger=ledger
         )
 
-        assert metrics.load_ledger(ledger)['raises'][0]['measures'] == expected
+        assert metrics.load_ledger(ledger)[0]['measures'] == expected
 
     def test_the_derived_totals_travel_with_the_per_path_rises(
         self, tmp_path: Path
@@ -1740,7 +1752,7 @@ class TestAuthorizedRaise:
             target, self._raised(), authorization=self._authorization(), ledger=ledger
         )
 
-        measures = metrics.load_ledger(ledger)['raises'][0]['measures']
+        measures = metrics.load_ledger(ledger)[0]['measures']
         totals = [row for row in measures if row['measure'].startswith('total:')]
         assert {row['measure'] for row in totals} == {
             'total:lines', 'total:cognitive'
@@ -1817,13 +1829,18 @@ class TestAuthorizedRaise:
 
 
 class TestAuthorizedRaiseLedger:
-    """The ledger file's own contract, and the polarity split it makes deliberate."""
+    """The ledger directory's own contract, and the polarity split it makes deliberate.
+
+    One file per authorization, named for its content, so two branches
+    authorizing at once add two different files and never conflict -- the tail
+    of the retired single array conflicted on every such pair.
+    """
 
     @staticmethod
-    def _record(task_id: str) -> dict:
+    def _record(task_id: str, rise: int = 103) -> dict:
         return metrics.authorization_record(
             metrics.RaiseAuthorization(task_id=task_id, reason=f'reason {task_id}'),
-            [metrics.Violation.rose('lines', _MQ, 21550, 21653)],
+            [metrics.Violation.rose('lines', _MQ, 21550, 21550 + rise)],
         )
 
     def test_absence_is_empty_here_and_fatal_for_the_baseline(
@@ -1836,89 +1853,114 @@ class TestAuthorizedRaiseLedger:
         # authorized, which is the fail-CLOSED state: it permits nothing.
         missing = tmp_path / 'nope.json'
 
-        assert metrics.load_ledger(missing)['raises'] == []
+        assert metrics.load_ledger(missing) == []
 
         with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.load_baseline(missing)
         assert 'nope.json' in str(excinfo.value)
 
     @pytest.mark.parametrize(
-        ('content', 'why'),
+        ('name', 'content', 'why'),
         [
-            pytest.param('{"raises": ', 'invalid JSON', id='truncated'),
-            pytest.param('[]', 'a JSON array at top level', id='array'),
-            pytest.param('{"raises": {}}', 'a non-list raises', id='raises-not-list'),
-            pytest.param('{}', 'no raises key at all', id='raises-missing'),
+            pytest.param('x.json', '{"measures": ', 'invalid JSON', id='truncated'),
+            pytest.param('x.json', '[]', 'a JSON array at top level', id='array'),
+            pytest.param(
+                'x.json', '{"task_id": "5342"}', 'a name not derived from the content',
+                id='misnamed',
+            ),
         ],
     )
-    def test_a_malformed_ledger_is_a_named_hard_failure(
-        self, tmp_path: Path, content: str, why: str
+    def test_a_malformed_entry_is_a_named_hard_failure(
+        self, tmp_path: Path, name: str, content: str, why: str
     ) -> None:
-        # A ledger that cannot be parsed is one whose entries cannot be audited.
-        # Reading it as empty would hide history, so corruption -- unlike
+        # An entry that cannot be read is provenance that cannot be audited.
+        # Reading it as absent would hide history, so corruption -- unlike
         # absence -- fails hard and names the file.
-        target = tmp_path / 'ledger.json'
-        target.write_text(content, encoding='utf-8')
+        ledger = tmp_path / 'raises'
+        ledger.mkdir()
+        (ledger / name).write_text(content, encoding='utf-8')
         with pytest.raises(metrics.RatchetError) as excinfo:
-            metrics.load_ledger(target)
-        assert 'ledger.json' in str(excinfo.value), why
+            metrics.load_ledger(ledger)
+        assert name in str(excinfo.value), why
 
-    def test_render_round_trips_without_dropping_an_entry(self) -> None:
-        ledger = metrics.empty_ledger()
-        ledger['raises'] = [self._record('5342'), self._record('5500')]
-        assert json.loads(metrics.render_ledger(ledger))['raises'] == ledger['raises']
-
-    def test_rendering_is_idempotent(self) -> None:
-        ledger = metrics.empty_ledger()
-        ledger['raises'] = [self._record('5342')]
-        once = metrics.render_ledger(ledger)
-        assert metrics.render_ledger(json.loads(once)) == once
-
-    def test_leads_with_a_readme_and_ends_with_one_newline(self) -> None:
-        text = metrics.render_ledger(metrics.empty_ledger())
-        assert text.splitlines()[1].lstrip().startswith('"_README":')
-        assert text.endswith('\n') and not text.endswith('\n\n')
-
-    def test_append_preserves_prior_entries_in_order(self, tmp_path: Path) -> None:
-        # APPEND-ONLY means history is never rewritten: a reviewer reading the
-        # file reads every raise the baseline has ever absorbed.
-        target = tmp_path / 'ledger.json'
-        written = [self._record(task_id) for task_id in ('5342', '5500', '5600')]
-        for record in written:
-            metrics.append_authorization(target, record)
-
-        stored = metrics.load_ledger(target)['raises']
-        assert [entry['task_id'] for entry in stored] == ['5342', '5500', '5600']
-        assert stored[:2] == written[:2]
-
-    def test_append_on_a_missing_path_creates_a_legible_file(
+    def test_a_ledger_path_that_is_a_file_is_a_named_hard_failure(
         self, tmp_path: Path
     ) -> None:
-        target = tmp_path / 'ledger.json'
-        metrics.append_authorization(target, self._record('5342'))
+        # The retired shape at the new path: a single file is not a ledger.
+        target = tmp_path / 'raises'
+        target.write_text('{"raises": []}', encoding='utf-8')
+        with pytest.raises(metrics.RatchetError) as excinfo:
+            metrics.load_ledger(target)
+        assert 'not a directory' in str(excinfo.value)
 
-        loaded = metrics.load_ledger(target)
-        assert loaded['schema_version'] == metrics.LEDGER_SCHEMA_VERSION
-        assert '--authorize-raise' in loaded['_README']
+    def test_an_entry_round_trips_through_its_file(self) -> None:
+        record = self._record('5342')
+        text = metrics.render_entry(record)
+
+        assert metrics.parse_entry(metrics.entry_filename(record), text) == record
+        assert metrics.render_entry(json.loads(text)) == text
+
+    def test_the_name_leads_with_the_task_and_ends_with_a_content_digest(self) -> None:
+        name = metrics.entry_filename(self._record('5342'))
+
+        assert name.startswith('5342-') and name.endswith('.json')
+        assert name != metrics.entry_filename(self._record('5342', rise=104))
+
+    def test_a_free_text_task_id_still_makes_a_plain_file_name(self) -> None:
+        name = metrics.entry_filename(self._record('3790 carry/../x'))
+
+        assert '/' not in name and ' ' not in name
+
+    def test_each_authorization_is_its_own_file_and_none_is_rewritten(
+        self, tmp_path: Path
+    ) -> None:
+        # APPEND-ONLY by construction: recording one entry cannot touch another.
+        ledger = tmp_path / 'raises'
+        first = metrics.append_authorization(ledger, self._record('5342'))
+        before = first.read_text(encoding='utf-8')
+        for task_id in ('5500', '5600'):
+            metrics.append_authorization(ledger, self._record(task_id))
+
+        assert first.read_text(encoding='utf-8') == before
+        assert sorted(entry['task_id'] for entry in metrics.load_ledger(ledger)) == [
+            '5342', '5500', '5600'
+        ]
+
+    def test_recording_the_same_entry_twice_is_one_file(self, tmp_path: Path) -> None:
+        ledger = tmp_path / 'raises'
+        metrics.append_authorization(ledger, self._record('5342'))
+        metrics.append_authorization(ledger, self._record('5342'))
+
+        assert len(metrics.load_ledger(ledger)) == 1
+
+    def test_the_first_append_writes_a_legible_readme(self, tmp_path: Path) -> None:
+        ledger = tmp_path / 'raises'
+        metrics.append_authorization(ledger, self._record('5342'))
+
+        readme = (ledger / metrics.LEDGER_README_NAME).read_text(encoding='utf-8')
+        assert readme == metrics.render_ledger_readme()
+        assert '--authorize-raise' in json.loads(readme)['_README']
 
     def test_the_committed_ledger_is_present_and_legible(self) -> None:
-        # ANTI-VACUITY for the artifact a human actually opens. Its day-one
-        # `raises` list is empty, which is a legible state -- not an absent one,
-        # and not a file whose only copy of the rule is in a docstring.
-        path = _REPO_ROOT / metrics.LEDGER_RELPATH
-        # EXISTENCE is asserted on the PATH, not inferred from load_ledger:
-        # absence reads as the empty ledger by design (the polarity pinned
-        # above), so every other assertion here would pass just as happily with
-        # nothing committed at all -- and the file a reader opens next to the
-        # baseline would not exist.
-        assert path.exists(), path
-        committed = metrics.load_ledger(path)
-        assert committed['schema_version'] == metrics.LEDGER_SCHEMA_VERSION
-        assert '--authorize-raise' in committed['_README']
-        assert isinstance(committed['raises'], list)
-        # Written by the module's own writer, so the committed bytes stay a
-        # no-op round trip rather than drifting into a hand-edited shape.
-        assert path.read_text(encoding='utf-8') == metrics.render_ledger(committed)
+        # ANTI-VACUITY for the artifact a human actually opens. EXISTENCE is
+        # asserted on the PATH, not inferred from load_ledger: absence reads as
+        # the empty ledger by design (the polarity pinned above), so every
+        # other assertion here would pass just as happily with nothing
+        # committed at all.
+        ledger = _REPO_ROOT / metrics.LEDGER_DIR_RELPATH
+        assert ledger.is_dir(), ledger
+        readme = (ledger / metrics.LEDGER_README_NAME).read_text(encoding='utf-8')
+        assert readme == metrics.render_ledger_readme()
+        # Every entry was written by the module's own writer and never edited:
+        # its name is derived from its content, and its bytes are a no-op
+        # round trip rather than a hand-edited shape.
+        entries = metrics.load_ledger(ledger)
+        assert entries
+        for entry in entries:
+            path = ledger / metrics.entry_filename(entry)
+            assert path.read_text(encoding='utf-8') == metrics.render_entry(entry), path
+        # The retired single array is gone: one home for one fact.
+        assert not (_REPO_ROOT / metrics.LEGACY_LEDGER_RELPATH).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -2513,8 +2555,7 @@ class TestWriteBaselineCli:
         # so "a plain regeneration never depends on that file's health" has to
         # be pinned rather than read off a call site that no longer says it.
         target = tmp_path / 'b.json'
-        ledger = tmp_path / 'ledger.json'
-        ledger.write_text('{ not json at all', encoding='utf-8')
+        ledger = _corrupt_ledger(tmp_path)
 
         assert metrics.main([
             '--write-baseline', str(target), '--ledger', str(ledger)
@@ -2522,7 +2563,7 @@ class TestWriteBaselineCli:
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(
             stub_measurement
         )
-        assert ledger.read_text(encoding='utf-8') == '{ not json at all'
+        assert _ledger_files(ledger) == {'corrupt.json': '{ not json at all'}
 
 
 class TestAuthorizeRaiseCli:
@@ -2539,7 +2580,7 @@ class TestAuthorizeRaiseCli:
         metrics.write_baseline(target, stub)
         raised = copy.deepcopy(stub)
         raised['files'][_MQ]['lines'] += 103
-        return target, tmp_path / 'ledger.json', raised
+        return target, tmp_path / 'raises', raised
 
     def test_an_authorized_raise_is_written_and_recorded(
         self, stub_measurement: dict, tmp_path: Path,
@@ -2556,7 +2597,7 @@ class TestAuthorizeRaiseCli:
         ]) == 0
 
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(raised)
-        entries = metrics.load_ledger(ledger)['raises']
+        entries = metrics.load_ledger(ledger)
         assert len(entries) == 1
         assert entries[0]['task_id'] == '5342'
         out = capsys.readouterr().out
@@ -2675,7 +2716,7 @@ class TestAuthorizeRaiseCli:
         # to the agent who typed the flags, exactly like one that was granted
         # and recorded (INV-11).
         target = tmp_path / 'b.json'
-        ledger = tmp_path / 'ledger.json'
+        ledger = tmp_path / 'raises'
         metrics.write_baseline(target, stub_measurement)
         lowered = copy.deepcopy(stub_measurement)
         lowered['files'][_MQ]['lines'] -= 10
@@ -2760,7 +2801,7 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         for fragment in (
             '--authorize-raise',
             '--reason',
-            metrics.LEDGER_RELPATH,
+            metrics.LEDGER_DIR_RELPATH,
             metrics.BASELINE_RELPATH,
             # The MECHANISM NAME an agent greps for after being blocked. Until
             # task 5722 this paragraph told them "what no gate can see is a
@@ -2793,7 +2834,7 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
             encoding='utf-8'
         )
         assert '--authorize-raise' in committed
-        assert metrics.LEDGER_RELPATH in committed
+        assert metrics.LEDGER_DIR_RELPATH in committed
         assert json.loads(committed)['_README'].endswith(metrics.RAISE_REMEDY)
 
     def test_the_readme_composes_the_remedy_rather_than_paraphrasing_it(

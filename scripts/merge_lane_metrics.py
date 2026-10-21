@@ -13,8 +13,9 @@ Ratchet contract, and it has two sides. An UNAUTHORIZED raise is refused: by
 ``--check``, and decisively by ``--write-baseline`` itself, so a raise cannot be
 absorbed by regenerating the file that would have caught it. An AUTHORIZED one
 is permitted and recorded -- ``--authorize-raise <task-id> --reason <text>``
-appends the exact per-measure delta to ``LEDGER_RELPATH``, so net-additive work
-lands as a reviewed diff rather than as a number nobody saw move. Lowering needs
+writes the exact per-measure delta as one new file under ``LEDGER_DIR_RELPATH``,
+so net-additive work lands as a reviewed diff rather than as a number nobody saw
+move. Lowering needs
 no ceremony and equality is permitted -- this is a ratchet, not a day-one gate.
 The two ceilings (``FILE_LINE_CEILING``, ``NEW_FUNCTION_COGNITIVE_CEILING``)
 apply only to paths and qualnames ABSENT from the baseline, so the
@@ -78,11 +79,13 @@ from __future__ import annotations
 import argparse
 import ast
 import dataclasses
+import hashlib
 import json
+import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 import _checkout as _checkout
 import source_measures
@@ -103,7 +106,8 @@ class RatchetError(source_measures.MetricsError):
 
 
 class AppendOnlyViolation(RatchetError):
-    """The ledger's recorded history was REWRITTEN -- a verdict, not a fault.
+    """The ledger's recorded history was REWRITTEN, or the one commit that splits
+    the retired array into files broke its rule -- a verdict, not a fault.
 
     A ``RatchetError`` subclass, so nothing that already catches one changes
     behaviour; a DISTINCT type, because the two are read differently at a
@@ -151,6 +155,14 @@ FILE_LINE_CEILING = 1500
 
 #: A function ABSENT from the baseline may not exceed this cognitive complexity.
 NEW_FUNCTION_COGNITIVE_CEILING = 15
+
+#: The measures a breach of those two ceilings is reported under. A breach is
+#: not a rise over a recorded value, so ``unrecorded_raises`` covers it by name.
+NEW_FILE_OVER_CEILING = 'new_file_over_ceiling'
+NEW_FUNCTION_OVER_CEILING = 'new_function_over_ceiling'
+CEILING_BREACH_MEASURES: frozenset[str] = frozenset(
+    {NEW_FILE_OVER_CEILING, NEW_FUNCTION_OVER_CEILING}
+)
 
 # ---------------------------------------------------------------------------
 # Enumeration -- completeness carried in the RESULT, per INV-11.
@@ -535,12 +547,18 @@ def derive_totals(report: dict) -> dict[str, int]:
 # ``TestRenderBaseline::test_every_per_path_entry_occupies_exactly_one_line``.
 
 # The ratchet's two COMMITTED ARTIFACTS, relative to the repo root. The
-# baseline holds the frozen measures; its sidecar ledger holds the provenance of
-# every raise that was ever authorized against them. Both paths are named here,
-# above the README that cites them, because the remedy text an agent reads when
-# the gate goes red is composed from them.
+# baseline holds the frozen measures; its sidecar ledger -- a DIRECTORY holding
+# one file per authorization -- holds the provenance of every raise that was
+# ever authorized against them. Both paths are named here, above the README that
+# cites them, because the remedy text an agent reads when the gate goes red is
+# composed from them.
 BASELINE_RELPATH = 'orchestrator/tests/merge_lane_ratchet_baseline.json'
-LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises.json'
+LEDGER_DIR_RELPATH = 'orchestrator/tests/merge_lane_ratchet_raises'
+
+#: The RETIRED single-array ledger, which every two authorizing branches
+#: conflicted on at its tail. Read only by ``retire_legacy_ledger``, the rule for
+#: the one commit that splits it into ``LEDGER_DIR_RELPATH`` (task 7298).
+LEGACY_LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises.json'
 
 #: The commit-time auditor the remedy tells a blocked agent about, named here
 #: rather than spelled into the prose. It is a REAL PATH a reader is sent to
@@ -566,9 +584,12 @@ RAISE_REMEDY = (
     f'  python scripts/merge_lane_metrics.py --write-baseline {BASELINE_RELPATH} '
     '--authorize-raise <task-id> '
     '--reason "<why this is net-additive work, not a refactor that failed>"\n'
-    f'That appends the exact per-measure delta to {LEDGER_RELPATH}, naming the '
-    'task and the reason, so the raise lands as a diff a reviewer reads rather '
-    'than as a number nobody saw move. Without those flags --write-baseline '
+    'That writes the exact per-measure delta as ONE NEW FILE under '
+    f'{LEDGER_DIR_RELPATH}/, naming the task and the reason, so the raise lands '
+    'as a diff a reviewer reads rather than as a number nobody saw move. A '
+    "commit's raises are covered by the entry files THAT COMMIT adds: per "
+    'measure and key, the rise may not exceed the sum of their deltas. Without '
+    'those flags --write-baseline '
     'REFUSES to absorb a raise over an EXISTING baseline, so regenerating in '
     'place cannot widen the ratchet. Nor can going around it: '
     f'{COMMIT_GATE_RELPATH} runs in pre-commit on EVERY branch '
@@ -577,7 +598,7 @@ RAISE_REMEDY = (
     'hold -- so a baseline deleted first, written elsewhere and copied over, '
     'or hand-edited is refused on the same terms as a regeneration -- and so '
     'is a commit that '
-    'drops or rewrites a recorded entry in the ledger. The one thing it lets '
+    'modifies, deletes or renames a recorded entry file. The one thing it lets '
     'through deliberately is UNDOING THE LAST CHANGE to the baseline: staging '
     'the value this path held one commit ago, and nothing further back. That '
     'is the state the tree was just running with, so putting it back re-raises '
@@ -586,9 +607,10 @@ RAISE_REMEDY = (
     'every image in between is a value the ratchet moved through and returning '
     'behind them re-absorbs every measure they lowered.\n'
     'RESIDUAL, so you do not trust more than is true: `git rebase` and a CLEAN '
-    'merge do not run pre-commit at all, and the merge worker advances main '
-    'with `git update-ref`, which runs no hooks. A raise introduced before this '
-    'guard existed and replayed across its introduction still reaches main '
+    'merge -- including one the ratchet-baseline merge driver resolved -- do '
+    'not run pre-commit at all, and the merge worker advances main with `git '
+    'update-ref`, which runs no hooks. A raise introduced before this guard '
+    'existed and replayed across its introduction still reaches main '
     'unexamined. Closing that needs a merge-lane or reference-transaction gate, '
     'not this one. --authorize-raise is the way past.'
 )
@@ -613,7 +635,7 @@ BASELINE_README = (
 )
 
 #: The three per-path maps whose entries get one line each.
-_PER_PATH_SECTIONS: tuple[str, ...] = ('files', 'functions', 'tests')
+PER_PATH_SECTIONS: tuple[str, ...] = ('files', 'functions', 'tests')
 
 
 def _stored_enumeration(enumeration: dict) -> dict:
@@ -674,20 +696,24 @@ def _render_section(name: str, mapping: dict) -> str:
     return f'  {json.dumps(name)}: {{\n{rows}\n  }}'
 
 
-def render_baseline(report: dict) -> str:
+def render_baseline(report: dict, *, readme: str = BASELINE_README) -> str:
     """Serialize *report* as the committed baseline's exact bytes.
 
     Idempotent: ``render_baseline(json.loads(render_baseline(r)))`` reproduces
     the same text, so regenerating a baseline from a baseline is a no-op rather
     than a churned file full of manufactured conflicts. The ``_README`` key is
-    emitted from ``BASELINE_README`` and any inbound one is dropped, which is
-    what makes that hold across a round trip.
+    emitted from *readme* -- ``BASELINE_README`` for every measurement -- and
+    any inbound one is dropped, which is what makes that hold across a round
+    trip. The one caller passing another is the merge driver
+    (``scripts/merge_lane_ratchet_merge.py``): it may run a different checkout's
+    copy of this module than the tree it merges, so it carries the merged
+    images' own README through rather than substituting its own.
     """
-    entries = [f'  "_README": {json.dumps(BASELINE_README)}']
+    entries = [f'  "_README": {json.dumps(readme)}']
     for key, value in report.items():
         if key == '_README':
             continue
-        if key in _PER_PATH_SECTIONS and isinstance(value, dict):
+        if key in PER_PATH_SECTIONS and isinstance(value, dict):
             entries.append(_render_section(key, value))
         else:
             # Top-level scalars and the small params/enumeration blocks are
@@ -784,9 +810,10 @@ def write_baseline(
     reviewer the INSTRUMENT moved rather than the code, which is why
     ``_require_matching_params`` asks for the version in it.
 
-    With an *authorization*, the raises are recorded in the append-only ledger
-    at *ledger* (default ``repo_root() / LEDGER_RELPATH``) and the write goes
-    ahead. WRITE ORDER PICKS THE SURVIVABLE FAILURE: the ledger lands FIRST, so
+    With an *authorization*, the raises are recorded as one new entry file in
+    the append-only ledger directory *ledger* (default ``repo_root() /
+    LEDGER_DIR_RELPATH``) and the write goes ahead. WRITE ORDER PICKS THE
+    SURVIVABLE FAILURE: the ledger entry lands FIRST, so
     a crash between the two writes leaves a recorded authorization over an
     unchanged baseline -- the gate stays red, nothing was widened, and the
     orphaned record is visible -- rather than an unrecorded raise sitting in the
@@ -832,7 +859,7 @@ def write_baseline(
             raise UnauthorizedRaise(raises)
         record = authorization_record(authorization, raises)
         append_authorization(
-            Path(ledger) if ledger is not None else repo_root() / LEDGER_RELPATH,
+            Path(ledger) if ledger is not None else repo_root() / LEDGER_DIR_RELPATH,
             record,
         )
     safe_io.atomic_write_text(target, text, mkdir=True)
@@ -924,24 +951,38 @@ class RaiseAuthorization:
         _require_non_blank(self, 'reason')
 
 
-#: Bumped only if an entry's SHAPE changes; the file is append-only otherwise.
+#: Bumped only if an entry's SHAPE changes; entries are never rewritten otherwise.
 LEDGER_SCHEMA_VERSION = 1
 
-#: Emitted as the ledger's leading key, for the same reason BASELINE_README is:
-#: the rule belongs in the file a reader has open.
+#: The one file in ``LEDGER_DIR_RELPATH`` that records no authorization.
+LEDGER_README_NAME = '_README.json'
+
+#: Emitted as ``LEDGER_README_NAME``'s leading key, for the same reason
+#: BASELINE_README is: the rule belongs where a reader has the entries open.
 LEDGER_README = (
-    'This is the APPEND-ONLY provenance of every raise ever authorized against '
-    'the merge-lane ratchet baseline '
-    '(orchestrator/tests/merge_lane_ratchet_baseline.json). It is NOT a '
-    'permission list: nothing in this file grants a future raise, and no entry '
-    'here will ever let --write-baseline absorb one. Authorization is an act, '
-    'not a standing entry -- rerun --authorize-raise for each raise, and it '
-    'appends one more record. Each entry\'s "measures" block is DERIVED from the '
-    'measured raises the write gate computed, never hand-written, so it is '
-    'mechanically incapable of disagreeing with the baseline diff it '
-    'accompanies. There is no timestamp: git already carries the date, and a '
-    'clock would churn this file on every rewrite. Written by '
-    'scripts/merge_lane_metrics.py --write-baseline '
+    'This directory is the APPEND-ONLY provenance of every raise ever '
+    'authorized against the merge-lane ratchet baseline '
+    '(orchestrator/tests/merge_lane_ratchet_baseline.json): ONE FILE PER '
+    'AUTHORIZATION, named <task-id>-<first 12 hex of the sha256 of the entry '
+    'as sorted-key compact JSON>.json, so two branches authorizing at once add '
+    'two different files and never conflict. A recorded entry is never '
+    'modified, deleted or renamed. It is NOT a permission list: no entry here '
+    'grants a future raise. A commit\'s raises are covered only by the entry '
+    'files THAT COMMIT adds -- per measure and key, the rise may not exceed the '
+    f'sum of their (current - baseline); a {NEW_FILE_OVER_CEILING} or '
+    f'{NEW_FUNCTION_OVER_CEILING} row is covered when an added entry names it. '
+    'An added entry must be ATTRIBUTED: its task_id is the task the branch '
+    'works on -- the id in task/<id> or carry/<id> -- or one a commit on the '
+    'branch since main cites, as its scope (fix(<id>): ...) or as "task <id>", '
+    'which is how a carrier records the task it lands; and its reason is not '
+    'blank. Pre-commit (scripts/check_staged_ratchet_raise.py) refuses any '
+    'other, without reading the task store. '
+    'Each entry\'s "measures" block is DERIVED from the measured raises the '
+    'write gate computed, never hand-written, so it describes the BRANCH COMMIT '
+    'it accompanied, not a state of main: when the ratchet-baseline merge '
+    'driver composes two branches\' moves of one row, main holds ours + theirs '
+    '- base, a value no single entry names. There is no timestamp: git carries '
+    'the date. Written by scripts/merge_lane_metrics.py --write-baseline '
     'orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise '
     '<task-id> --reason "<why>".'
 )
@@ -974,250 +1015,264 @@ def authorization_record(
     }
 
 
+def entry_filename(record: dict) -> str:
+    """The file name *record* is recorded under: its task id, then its content digest.
 
-def _record_measures(record: dict) -> list[dict]:
-    measures = record.get('measures')
-    if not isinstance(measures, list):
-        return []
-    return [measure for measure in measures if isinstance(measure, dict)]
-
-
-def unrecorded_raises(
-    raises: Sequence[Violation], records: Sequence[dict]
-) -> list[Violation]:
-    """The raises in *raises* that no entry in *records* names. Pure.
-
-    The inverse of ``authorization_record``, and placed beside it so the writer
-    and the auditor read a raise out of one field vocabulary (SPOT) rather than
-    two that can drift. Coverage is the triple ``(measure, key, current)``.
-
-    ``current`` is in the triple because it is the discriminator that actually
-    catches a stale or hand-written entry: such an entry names the right measure
-    and the right key while the baseline it accompanies landed somewhere else,
-    so a ``(measure, key)`` check would wave it through. ``baseline`` is
-    deliberately OUT of it: an agent who runs ``--write-baseline
-    --authorize-raise`` twice in one commit records ``b -> m`` and ``m -> f``,
-    while the HEAD-to-staged delta reads ``b -> f``, so requiring it to match
-    would refuse a correctly authorized commit.
-
-    A record whose ``measures`` is missing or not a list simply covers nothing:
-    a badly hand-edited ledger must REFUSE the commit, not crash the gate.
+    DERIVED FROM THE CONTENT, so a name can never hold two different entries:
+    two branches adding the same name added the same bytes, which git merges
+    clean, and an entry edited after it was written stops matching its own
+    name -- which ``parse_entry`` refuses. The task id leads so an entry is
+    findable by eye; it is reduced to filename-safe characters, because it is
+    free text and the digest already carries uniqueness.
     """
-    covered = {
-        (measure.get('measure'), measure.get('key'), measure.get('current'))
-        for record in records
-        for measure in _record_measures(record)
-    }
-    return [
-        violation
-        for violation in raises
-        if (violation.measure, violation.key, violation.current) not in covered
-    ]
+    canonical = json.dumps(record, sort_keys=True, separators=(',', ':'))
+    digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:12]
+    task = re.sub(r'[^A-Za-z0-9_-]', '_', str(record.get('task_id')))[:40]
+    return f'{task}-{digest}.json'
 
 
-
-def empty_ledger() -> dict:
-    """A ledger that has authorized nothing -- the day-one and fail-closed state."""
-    return {
-        '_README': LEDGER_README,
-        'schema_version': LEDGER_SCHEMA_VERSION,
-        'raises': [],
-    }
+def render_entry(record: dict) -> str:
+    """One entry file's exact bytes."""
+    return json.dumps(record, indent=2) + '\n'
 
 
-def render_ledger(ledger: dict) -> str:
-    """Serialize *ledger* as the committed file's exact bytes.
+def render_ledger_readme() -> str:
+    """``LEDGER_README_NAME``'s exact bytes."""
+    readme = {'_README': LEDGER_README, 'schema_version': LEDGER_SCHEMA_VERSION}
+    return json.dumps(readme, indent=2) + '\n'
 
-    Idempotent, like ``render_baseline``: the ``_README`` is re-emitted from
-    ``LEDGER_README`` and any inbound one dropped, so a round trip is a no-op
-    rather than a churned file.
 
-    Plain ``json.dumps(indent=2)``: the baseline's one-line-per-entry writer
-    would buy nothing here. It makes edits at DIFFERENT positions disjoint
-    hunks, but two concurrent authorizations both append at the tail of
-    ``raises``, which conflicts under any line layout. The conflict is loud;
-    a merge commit's resolution of it is audited in pre-commit by
-    ``ledger_merged_entries``, and a rebase's is the residual ``RAISE_REMEDY``
-    names.
+def parse_entry(name: str, text: str) -> dict:
+    """The authorization recorded in the entry file *name* holding *text*.
+
+    MALFORMED IS FATAL, as for every ratchet artifact: an entry that cannot be
+    read is one whose provenance cannot be audited, and reading it as absent
+    would hide history. So is an entry whose name is not ``entry_filename`` of
+    its content -- it was edited after it was written, or written by hand under
+    a guessed name, and either way the name no longer says what the file holds.
     """
-    body = {key: value for key, value in ledger.items() if key != '_README'}
-    return json.dumps({'_README': LEDGER_README, **body}, indent=2) + '\n'
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RatchetError(
+            f'authorized-raise entry {name} is not valid JSON: {exc}'
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise RatchetError(
+            f'authorized-raise entry {name} holds a {type(loaded).__name__} at '
+            'top level, expected a JSON object'
+        )
+    expected = entry_filename(loaded)
+    if name != expected:
+        raise RatchetError(
+            f'authorized-raise entry {name} is not named for its content '
+            f'(its content is named {expected}). Entries are written by '
+            '--authorize-raise and never edited afterwards; record a new one '
+            'instead of changing a recorded one.'
+        )
+    return loaded
 
 
-def load_ledger(path: Path) -> dict:
-    """Load the authorized-raise ledger. ABSENT is empty; MALFORMED is fatal.
+def load_ledger(directory: Path) -> list[dict]:
+    """Every authorization recorded under *directory*. ABSENT is empty; MALFORMED is fatal.
 
     THE POLARITY IS THE OPPOSITE OF ``load_baseline``'s on absence, deliberately,
     because absence means opposite things. An absent BASELINE would compare clean
     against every measure -- a silent disarming, so it must fail hard (INV-11).
     An absent LEDGER means no raise was ever authorized, which is the fail-CLOSED
-    state: nothing is permitted by it, and hard-failing would only break the
-    day-one and fresh-tmp-path cases for no safety gain.
-
-    Corruption is different in kind. A ledger that cannot be parsed is one whose
-    entries cannot be audited, and reading it as empty would hide history, so
-    every malformed shape fails hard and names the file. Do not "fix" the split
-    by copying the neighbour -- this module already carries one deliberate
-    fail-soft/fail-hard seam that neighbours were tempted to flatten.
+    state: nothing is permitted by it. Corruption is different in kind, and
+    every file but ``LEDGER_README_NAME`` must parse as an entry
+    (``parse_entry``). Ordered by file name, since git -- not the file -- carries
+    the chronology.
     """
-    target = Path(path)
-    try:
-        text = target.read_text(encoding='utf-8')
-    except FileNotFoundError:
-        return empty_ledger()
-    except (OSError, UnicodeDecodeError) as exc:
+    target = Path(directory)
+    if not target.exists():
+        return []
+    if not target.is_dir():
         raise RatchetError(
-            f'authorized-raise ledger {target} could not be read: '
-            f'{exc.__class__.__name__}: {exc}'
-        ) from exc
+            f'authorized-raise ledger {target} is not a directory -- the ledger '
+            'holds one file per authorization'
+        )
+    entries = []
+    for path in sorted(target.iterdir()):
+        if path.name == LEDGER_README_NAME:
+            continue
+        try:
+            text = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RatchetError(
+                f'authorized-raise entry {path} could not be read: '
+                f'{exc.__class__.__name__}: {exc}'
+            ) from exc
+        entries.append(parse_entry(path.name, text))
+    return entries
+
+
+def append_authorization(directory: Path, record: dict) -> Path:
+    """Record *record* as a NEW file under *directory*; no existing file is touched.
+
+    Append-only by construction: an authorization is a file of its own, so
+    recording one cannot rewrite another, and the README is written only where
+    it is absent. Writing the same record twice writes the same bytes to the
+    same name. The promise still has to be CHECKED, because the directory is
+    also edited by rebases, merges and hands -- ``own_entry_names`` is the
+    reader that refuses a commit dropping or rewriting a recorded entry.
+    """
+    target = Path(directory)
+    readme = target / LEDGER_README_NAME
+    if not readme.exists():
+        safe_io.atomic_write_text(readme, render_ledger_readme(), mkdir=True)
+    entry = target / entry_filename(record)
+    safe_io.atomic_write_text(entry, render_entry(record), mkdir=True)
+    return entry
+
+
+def own_entry_names(
+    parents: Sequence[Mapping[str, str]], staged: Mapping[str, str]
+) -> list[str]:
+    """The entry files a commit adds, refusing any recorded one it drops or rewrites.
+
+    Each mapping is entry file name -> content identity (a blob id, at the git
+    boundary) for one parent's ledger and for the staged one. A commit's OWN
+    entries are the staged files NO parent holds: for a merge, a file either
+    parent recorded is HISTORY, never the merge's own, so it can cover nothing
+    the merge raises (LEDGER_README: no entry grants a future raise).
+
+    Append-only is a set comparison, not an ordering one: every file any parent
+    holds must be staged unchanged. A drop, an edit and a rename (a drop plus an
+    add) are each refused with an ``AppendOnlyViolation``. Pure; the caller
+    decides where the listings came from.
+    """
+    for parent in parents:
+        lost = sorted(name for name, identity in parent.items() if staged.get(name) != identity)
+        if lost:
+            raise AppendOnlyViolation(
+                'the authorized-raise ledger is append-only, and this change '
+                f'modifies, deletes or renames {len(lost)} of the '
+                f'{len(parent)} recorded entr(ies) a parent holds: '
+                f'{", ".join(lost[:5])}{" ..." if len(lost) > 5 else ""}. A '
+                'recorded entry is never touched -- record a new one with '
+                '--authorize-raise instead.'
+            )
+    return sorted(name for name in staged if not any(name in parent for parent in parents))
+
+
+def legacy_ledger_entries(text: str) -> list[dict]:
+    """The entries of the retired single-array ledger *text*. MALFORMED is fatal."""
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError as exc:
         raise RatchetError(
-            f'authorized-raise ledger {target} is not valid JSON: {exc}'
+            f'retired ledger {LEGACY_LEDGER_RELPATH} is not valid JSON: {exc}'
         ) from exc
-    if not isinstance(loaded, dict):
+    raises = loaded.get('raises') if isinstance(loaded, dict) else None
+    if not isinstance(raises, list) or not all(isinstance(entry, dict) for entry in raises):
         raise RatchetError(
-            f'authorized-raise ledger {target} holds a '
-            f'{type(loaded).__name__} at top level, expected a JSON object'
+            f'retired ledger {LEGACY_LEDGER_RELPATH} has no "raises" list of '
+            'entries, so the history it carries cannot be checked into files'
         )
-    if not isinstance(loaded.get('raises'), list):
-        raise RatchetError(
-            f'authorized-raise ledger {target} has no "raises" list -- a ledger '
-            'whose entries cannot be read is one whose history cannot be '
-            'audited, which must never read as "nothing was authorized"'
-        )
-    return loaded
+    return raises
 
 
-def append_authorization(path: Path, record: dict) -> Path:
-    """Append one record to the ledger at *path*, preserving every prior entry.
+def retire_legacy_ledger(
+    retired: Sequence[dict], staged_names: Collection[str], own: Sequence[dict]
+) -> list[dict]:
+    """The ONE-COMMIT RULE for retiring ``LEGACY_LEDGER_RELPATH``: what may cover a raise.
 
-    Append-only: history is never rewritten, so a reviewer reading the file
-    reads every raise this baseline has ever absorbed. That promise is about
-    every writer of the file, not only about this function, so it is CHECKED
-    rather than merely asserted -- ``ledger_appended_entries`` below is what
-    reads a staged ledger against its committed predecessor and refuses a
-    commit that dropped, rewrote or reordered any of it.
-    """
-    target = Path(path)
-    ledger = load_ledger(target)
-    ledger['schema_version'] = LEDGER_SCHEMA_VERSION
-    ledger['raises'] = [*ledger['raises'], record]
-    safe_io.atomic_write_text(target, render_ledger(ledger), mkdir=True)
-    return target
-
-
-def _common_prefix_length(previous: list, current: list) -> int:
-    """How many leading entries the two lists still agree on."""
-    return next(
-        (
-            index
-            # strict=False deliberately: the recorded history and the staged
-            # list may differ in length.
-            for index, (was, now) in enumerate(
-                zip(previous, current, strict=False)
-            )
-            if was != now
-        ),
-        min(len(previous), len(current)),
-    )
-
-
-def ledger_appended_entries(previous: dict, current: dict) -> list[dict]:
-    """The entries *current* adds to *previous*, refusing any rewrite of history.
-
-    The reader half of ``append_authorization``'s append-only promise, and the
-    only thing that makes that promise checkable: the writer can only keep it
-    for its own writes, while the file is edited by rebases, merges and hands.
-    *previous* must be a PREFIX of *current* -- length equality is not prefix
-    equality, so an entry rewritten in place is refused exactly like a dropped
-    one, and a reorder like both. The refusal is an ``AppendOnlyViolation``
-    rather than a bare ``RatchetError`` so a caller can tell this VERDICT apart
-    from an instrument failure at its own exit boundary.
-
-    Pure: two loaded dicts in, the suffix out. The caller decides where the two
-    images came from, which is what keeps every git invocation in
-    ``scripts/check_staged_ratchet_raise.py`` and none of it here.
-    """
-    previous_raises = list(previous.get('raises', ()))
-    current_raises = list(current.get('raises', ()))
-    if current_raises[: len(previous_raises)] != previous_raises:
-        kept = _common_prefix_length(previous_raises, current_raises)
-        raise AppendOnlyViolation(
-            'the authorized-raise ledger is append-only, and this change '
-            f'rewrites its history: {len(previous_raises) - kept} of its '
-            f'{len(previous_raises)} recorded entr(ies) are no longer where '
-            f'they were recorded (the staged file holds {len(current_raises)}). '
-            'Dropping, editing or reordering a recorded raise is what makes the '
-            'ledger stop reading as the provenance of every raise this baseline '
-            'has ever absorbed. Append a new entry with --authorize-raise '
-            'instead of touching a recorded one.'
-        )
-    return current_raises[len(previous_raises) :]
-
-
-def _merged_history_length(ours: list, theirs: list, current: list) -> int | None:
-    """How many leading entries of *current* hold both parents' histories.
-
-    One read position per parent. An entry advances every parent whose next
-    unread entry it equals -- both at once for shared history, or for an
-    identical addition git's text merge coalesced into one copy. An entry that
-    is neither parent's next is a drop, a rewrite, a reorder or a foreign
-    insertion, and so is running out before both parents are read: None.
-    """
-    read_ours = read_theirs = position = 0
-    while read_ours < len(ours) or read_theirs < len(theirs):
-        if position == len(current):
-            return None
-        entry = current[position]
-        advances_ours = read_ours < len(ours) and ours[read_ours] == entry
-        advances_theirs = read_theirs < len(theirs) and theirs[read_theirs] == entry
-        if not (advances_ours or advances_theirs):
-            return None
-        read_ours += advances_ours
-        read_theirs += advances_theirs
-        position += 1
-    return position
-
-
-def ledger_merged_entries(ours: dict, theirs: dict, current: dict) -> list[dict]:
-    """The entries a MERGE commit adds beyond BOTH parents' histories.
-
-    The reader half of ``append_authorization``'s promise for a merge commit,
-    as ``ledger_appended_entries`` is for an ordinary one. Every entry each
-    parent recorded must survive unchanged and in that parent's own order. The
-    two histories may interleave, as git's merge of the text interleaves them,
-    but nothing else may sit among them; anything else is the same
+    *retired* is every entry of the array a parent held and this commit no
+    longer stages; *staged_names* is every staged entry file; *own* is this
+    commit's own entries (``own_entry_names``). Nothing retired -> *own*,
+    unchanged. Otherwise the commit is the split, and it is SET-EQUAL: every
+    retired entry must be staged as its ``entry_filename``, and every own entry
+    must be a retired one -- so the split drops nothing, rewrites nothing, and
+    authorizes nothing of its own. It returns no entry at all, because a
+    retired entry is history and covers no raise. Any breach is an
     ``AppendOnlyViolation``.
 
-    No merge base is taken: every base entry a parent still carries must
-    survive already, so the base would add a constraint only for an entry BOTH
-    parents dropped -- and demanding that one back would refuse a merge for
-    something neither parent holds.
-
-    A parent's entries are HISTORY, never this merge's own: LEDGER_README
-    promises that nothing in the file grants a future raise, so only entries
-    after both histories that equal no parent's entry may cover a raise the
-    merge makes.
+    Uniform across a merge that retires the array (a branch still carrying it
+    merging a main that already split it): the entries main already holds as
+    files are staged as history, the branch's own become own files here, and
+    the same two conditions hold.
     """
-    ours_raises = list(ours.get('raises', ()))
-    theirs_raises = list(theirs.get('raises', ()))
-    current_raises = list(current.get('raises', ()))
-    history_length = _merged_history_length(ours_raises, theirs_raises, current_raises)
-    if history_length is None:
+    if not retired:
+        return list(own)
+    retired_names = {entry_filename(entry) for entry in retired}
+    dropped = sorted(retired_names - set(staged_names))
+    fresh = sorted({entry_filename(entry) for entry in own} - retired_names)
+    if dropped or fresh:
         raise AppendOnlyViolation(
-            'the authorized-raise ledger is append-only, and this merge rewrites '
-            'its history: every entry each parent recorded must stay unchanged '
-            "and in that parent's order. The two histories may interleave, as "
-            "git's merge of the text interleaves them, but nothing else may sit "
-            "among them, and the merge's own entries go after both. Ours "
-            f'records {len(ours_raises)} entr(ies), theirs {len(theirs_raises)}, '
-            f'and the staged file holds {len(current_raises)}. Append a new '
-            'entry with --authorize-raise instead of touching a recorded one.'
+            f'this commit retires {LEGACY_LEDGER_RELPATH}, so it must split '
+            f'its {len(retired_names)} entr(ies) into {LEDGER_DIR_RELPATH}/ '
+            'exactly: one file per entry, no entry dropped or rewritten, and no '
+            f'authorization of its own. Missing: {len(dropped)} '
+            f'({", ".join(dropped[:5])}); not from the retired array: '
+            f'{len(fresh)} ({", ".join(fresh[:5])}). Re-run '
+            'scripts/split_merge_lane_ratchet_ledger.py, and authorize any '
+            'raise in a commit of its own.'
         )
-    recorded = [*ours_raises, *theirs_raises]
-    return [entry for entry in current_raises[history_length:] if entry not in recorded]
+    return []
+
+
+def is_count(value: object) -> TypeGuard[int]:
+    """A measured count: an int, and not a bool, which JSON would also load as one."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _authorized_amounts(records: Sequence[dict]) -> tuple[dict[tuple, int], set[tuple]]:
+    """Per (measure, key): the summed (current - baseline) *records* authorize, and every pair named.
+
+    A row whose numbers are not both ints adds nothing but is still NAMED; a
+    record whose ``measures`` is missing or not a list names nothing. A badly
+    hand-edited entry must REFUSE the commit, not crash the gate.
+    """
+    amounts: dict[tuple, int] = {}
+    named: set[tuple] = set()
+    for record in records:
+        measures = record.get('measures')
+        for row in measures if isinstance(measures, list) else ():
+            if not isinstance(row, dict):
+                continue
+            pair = (row.get('measure'), row.get('key'))
+            named.add(pair)
+            baseline, current = row.get('baseline'), row.get('current')
+            if is_count(baseline) and is_count(current):
+                amounts[pair] = amounts.get(pair, 0) + current - baseline
+    return amounts, named
+
+
+def unrecorded_raises(
+    raises: Sequence[Violation], records: Sequence[dict]
+) -> list[Violation]:
+    """The raises in *raises* that *records* -- a commit's OWN entries -- do not cover. Pure.
+
+    THE COVERAGE RULE, one rule at every enforcement point (heuristic 10): per
+    ``(measure, key)``, a raise is covered when its rise (``current -
+    baseline``) is at most the SUM of ``current - baseline`` over every row of
+    *records* naming that pair. A ceiling breach (``CEILING_BREACH_MEASURES``)
+    is not a rise over a recorded value, so it is covered when a record names
+    its measure and key.
+
+    A SUM, because a commit -- and a branch -- carries several entries for one
+    key: an agent running ``--authorize-raise`` twice records ``b -> m`` and
+    ``m -> f`` while the commit's delta reads ``b -> f``, and two raises of one
+    key composed by a merge add up the same way. Matching any one entry's
+    absolute ``current`` refused 9 of 27 legitimately authorized landings when
+    task 7298's design replayed the json-touching landings of 2026-10-06..20; the
+    sum refused none, and still refuses an unrecorded rise, because only the
+    commit's own entries are summed and a stale entry claims less than the rise.
+
+    The inverse of ``authorization_record``, and placed beside it so the writer
+    and the auditor read a raise out of one field vocabulary (SPOT).
+    """
+    amounts, named = _authorized_amounts(records)
+
+    def covered(violation: Violation) -> bool:
+        pair = (violation.measure, violation.key)
+        if violation.measure in CEILING_BREACH_MEASURES:
+            return pair in named
+        return violation.current - violation.baseline <= amounts.get(pair, 0)
+
+    return [violation for violation in raises if not covered(violation)]
 
 
 # ---------------------------------------------------------------------------
@@ -1341,7 +1396,7 @@ def _require_matching_params(current: dict, baseline: dict) -> None:
             '-- which is a RE-MEASUREMENT, not code growth, and the write gate '
             'cannot tell the difference: every number the new version reads '
             'higher is a raise it will refuse. Pass --authorize-raise with a '
-            f'--reason naming the version change, so the {LEDGER_RELPATH} entry '
+            f'--reason naming the version change, so the {LEDGER_DIR_RELPATH} entry '
             'reads as a change of instrument rather than as a task that grew '
             'the cluster.'
         )
@@ -1435,12 +1490,12 @@ def _check_ceilings(current: dict, baseline: dict) -> list[Violation]:
         if lines > FILE_LINE_CEILING:
             violations.append(
                 Violation(
-                    measure='new_file_over_ceiling',
+                    measure=NEW_FILE_OVER_CEILING,
                     key=path,
                     baseline=FILE_LINE_CEILING,
                     current=lines,
                     message=(
-                        f'new_file_over_ceiling: {path} is {lines} lines, above '
+                        f'{NEW_FILE_OVER_CEILING}: {path} is {lines} lines, above '
                         f'the {FILE_LINE_CEILING}-line ceiling that applies to '
                         'paths absent from the baseline'
                     ),
@@ -1455,12 +1510,12 @@ def _check_ceilings(current: dict, baseline: dict) -> list[Violation]:
         if score > NEW_FUNCTION_COGNITIVE_CEILING:
             violations.append(
                 Violation(
-                    measure='new_function_over_ceiling',
+                    measure=NEW_FUNCTION_OVER_CEILING,
                     key=key,
                     baseline=NEW_FUNCTION_COGNITIVE_CEILING,
                     current=score,
                     message=(
-                        f'new_function_over_ceiling: {key} has cognitive '
+                        f'{NEW_FUNCTION_OVER_CEILING}: {key} has cognitive '
                         f'complexity {score}, above the '
                         f'{NEW_FUNCTION_COGNITIVE_CEILING} ceiling that applies '
                         'to functions absent from the baseline'
@@ -1576,7 +1631,7 @@ def _merge_bound(base: dict, ours: dict, theirs: dict) -> dict:
         name: _merged_mapping(
             _section(base, name), _section(ours, name), _section(theirs, name)
         )
-        for name in _PER_PATH_SECTIONS
+        for name in PER_PATH_SECTIONS
     }
 
 
@@ -1749,10 +1804,11 @@ def _build_parser() -> argparse.ArgumentParser:
         'failed. Requires --authorize-raise; recorded verbatim in the ledger.',
     )
     parser.add_argument(
-        '--ledger', default=str(repo_root() / LEDGER_RELPATH),
-        help='Authorized-raise ledger appended by --authorize-raise (default: '
-        '%(default)s). Pair it with --write-baseline when writing outside this '
-        'checkout; on its own it would append to THIS checkout\'s ledger.',
+        '--ledger', default=str(repo_root() / LEDGER_DIR_RELPATH),
+        help='Authorized-raise ledger DIRECTORY --authorize-raise records one new '
+        'entry file in (default: %(default)s). Pair it with --write-baseline when '
+        'writing outside this checkout; on its own it would record in THIS '
+        'checkout\'s ledger.',
     )
     return parser
 

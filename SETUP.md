@@ -62,7 +62,7 @@ The script is idempotent (safe to re-run) and self-reports each step with
 6. **jCodeMunch** — optional personal productivity tooling (AST-based code retrieval) the repo's original maintainer uses. Safe to let run; skip/ignore if you don't want it — nothing else in this repo depends on it. Step 6 also installs the version-pinned `jcodemunch-mcp` launcher with `uv tool install` (the pin lives in `shared/src/shared/jcodemunch_launch.py`) and registers it in your user-level Claude config, so uv's tool bin dir (`uv tool dir --bin`) must be on your PATH.
 7. **Dashboard systemd units** — renders and enables `dark-factory-dashboard` + its watchdog timer (installed, not started — see §7).
 8. **Claude Code skill symlinks** — wires the in-repo `skills/` into your Claude Code install. Covered in full in §8 below.
-9. **Git hooks** — runs `hooks/setup.sh`, which points `core.hooksPath` at `hooks/` (pre-commit, pre-merge-commit).
+9. **Git hooks** — runs `hooks/setup.sh`, which points `core.hooksPath` at `hooks/` (pre-commit, pre-merge-commit), then `python3 scripts/merge_lane_ratchet_merge.py install`, which writes dark-factory's own merge driver for the ratchet baseline (`merge.ratchet-baseline.driver`, named by `.gitattributes`) into the repo's `.git/config`. Without the driver a merge of two branches that both moved the baseline conflicts instead of composing.
 10. **Manual steps reminder** — printed only, for migrating data from another host (`export-data.sh`/`import-data.sh`); irrelevant on a genuinely fresh install.
 12. **Health checks** — re-probes FalkorDB, Qdrant, fused-memory, and jCodeMunch, plus a parity check between your installed fused-memory unit and its template.
 
