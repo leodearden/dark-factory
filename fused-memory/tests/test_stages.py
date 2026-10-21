@@ -43,6 +43,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_CONSOLIDATION_OP,
     DISALLOW_CONSOLIDATION_PROPOSALS,
+    DISALLOW_ESCALATION_MERGE_LANE_CONTROL,
     DISALLOW_ESCALATION_READS,
     DISALLOW_ESCALATION_WRITES,
     DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES,
@@ -211,7 +212,7 @@ class TestMockTypesConstant:
 #     record the caller holds and has just mutated, in the queue it is connected
 #     to — never an arbitrary per-task query, so it answers no existence
 #     question either.
-#   - merge_* / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
+#   - merge_* (except merge_relane, denied by DISALLOW_ESCALATION_MERGE_LANE_CONTROL) / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
 #     reload_config / get_task_runtime_state — orchestrator control-plane and
 #     merge-lane surface, unrelated to the escalation-record question.
 #
@@ -520,6 +521,7 @@ class TestDisallowedToolLists:
             {
                 'DISALLOW_ESCALATION_READS': DISALLOW_ESCALATION_READS,
                 'DISALLOW_ESCALATION_WRITES': DISALLOW_ESCALATION_WRITES,
+                'DISALLOW_ESCALATION_MERGE_LANE_CONTROL': DISALLOW_ESCALATION_MERGE_LANE_CONTROL,
                 '_REVIEWED_STAGE_SAFE': _REVIEWED_STAGE_SAFE,
             },
             remedy=(
@@ -643,6 +645,20 @@ class TestDisallowedToolLists:
             assert set(DISALLOW_ESCALATION_WRITES).issubset(set(stage_list)), (
                 f'{name} must deny the escalation filing tools'
             )
+
+    def test_merge_relane_is_denied_in_every_stage(self):
+        """Operator merge-lane control: no reconciliation stage may re-prioritise merges."""
+        deps = _mock_stage_deps()
+        assert DISALLOW_ESCALATION_MERGE_LANE_CONTROL == ['mcp__escalation__merge_relane']
+        for stage_list in (STAGE1_DISALLOWED, STAGE2_DISALLOWED, STAGE3_DISALLOWED):
+            assert set(DISALLOW_ESCALATION_MERGE_LANE_CONTROL).issubset(set(stage_list))
+        for cls, stage_id in (
+            (MemoryConsolidator, StageId.memory_consolidator),
+            (TaskKnowledgeSync, StageId.task_knowledge_sync),
+            (IntegrityCheck, StageId.integrity_check),
+        ):
+            hook = set(cls(stage_id, **deps).get_disallowed_tools())
+            assert set(DISALLOW_ESCALATION_MERGE_LANE_CONTROL).issubset(hook)
 
     def test_escalate_blocker_stays_allowed_in_stage2_only(self):
         """Stage 2 keeps both filing tools for FIX D; Stages 1 and 3 deny escalate_blocker."""
