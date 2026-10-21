@@ -9,13 +9,17 @@ Every assertion here is about a READ. The module's central promise is that
 counting the residue cannot change it, which is why "no writes" is asserted
 structurally — against the backend's mutating methods and against the graph
 driver itself — rather than by reading the source and trusting it.
+
+Each graph is read ONCE (task 5662): membership and edge counts come from the
+same group-scoped ranked enumeration, so there is no per-family probe to
+disagree with it.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 from dataclasses import FrozenInstanceError
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from _fm_helpers import pydantic_spec
@@ -24,7 +28,9 @@ from fused_memory.backends.graphiti_client import PagedRead
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.maintenance.task_family_census import (
     CensusSweep,
+    FragmentedFamily,
     TaskFamilyCensus,
+    VariantSpelling,
     _build_parser,
     main,
     run_task_family_census,
@@ -41,65 +47,56 @@ MUTATING_BACKEND_METHODS = (
     'ensure_entity_node',
 )
 
-#: The fixture graph, as enumerate_entity_nodes returns it. Five shapes in one
-#: corpus, because the census's whole job is telling them apart:
+def ranked(uuid, name, created_at, edge_count, mentions_count=0):
+    """One row as enumerate_ranked_entity_nodes returns it."""
+    return {
+        'uuid': uuid, 'name': name, 'created_at': created_at,
+        'edge_count': edge_count, 'mentions_count': mentions_count,
+        'provenance_rank': edge_count + mentions_count,
+    }
+
+
+#: The fixture graph, as enumerate_ranked_entity_nodes returns it: survivor-first
+#: (provenance_rank DESC, created_at ASC, uuid ASC), so the families arrive
+#: INTERLEAVED and only grouping, never adjacency, keeps each one together.
+#: Five shapes in one corpus, because the census's whole job is telling them
+#: apart:
 #:   - a fragmented family spelled three ways (605);
 #:   - a clean single canonical node (700) — NOT residue;
 #:   - a lone non-canonically-named node (800) — NOT residue either: it is one
 #:     node, and workstream A heals it the next time an episode touches it;
 #:   - an exact-name duplicate PAIR (900) — residue with only one spelling;
-#:   - noise that a CONTAINS '605' probe would hand back but that is not the
-#:     605 family: 'Alice', the foreign 'reify:605', and 'Task 6051'.
-FIXTURE_NODES = [
-    {'uuid': 'u-605-lower', 'name': 'task 605', 'summary': ''},
-    {'uuid': 'u-605-canon', 'name': 'Task 605', 'summary': ''},
-    {'uuid': 'u-605-plural', 'name': 'tasks 605', 'summary': ''},
-    {'uuid': 'u-700', 'name': 'Task 700', 'summary': ''},
-    {'uuid': 'u-800', 'name': 'task 800', 'summary': ''},
-    {'uuid': 'u-900-a', 'name': 'Task 900', 'summary': ''},
-    {'uuid': 'u-900-b', 'name': 'Task 900', 'summary': ''},
-    {'uuid': 'u-alice', 'name': 'Alice', 'summary': ''},
-    {'uuid': 'u-foreign', 'name': 'reify:605', 'summary': ''},
-    {'uuid': 'u-6051', 'name': 'Task 6051', 'summary': ''},
+#:   - noise that is not the 605 family: 'Alice', and two names that do contain
+#:     '605', the foreign 'reify:605' and 'Task 6051'.
+FIXTURE_ROWS = [
+    ranked('u-605-lower', 'task 605', '2026-04-10', 13, 1),
+    ranked('u-foreign', 'reify:605', '2026-01-20', 7),
+    ranked('u-alice', 'Alice', '2026-01-10', 5),
+    ranked('u-900-a', 'Task 900', '2026-01-30', 4),
+    ranked('u-605-canon', 'Task 605', '2026-02-19', 2, 1),
+    ranked('u-700', 'Task 700', '2026-03-01', 2),
+    ranked('u-6051', 'Task 6051', '2026-01-09', 1),
+    ranked('u-900-b', 'Task 900', '2026-02-09', 1),
+    ranked('u-605-plural', 'tasks 605', '2026-05-30', 1),
+    ranked('u-800', 'task 800', '2026-03-11', 0),
 ]
-
-#: What find_entity_nodes_by_name_substring returns per probed number, in the
-#: backend's survivor-first order. The '605' probe deliberately includes the
-#: foreign 'reify:605' and the unrelated 'Task 6051' — both really do contain
-#: the substring, and filtering them out is the caller's job.
-FIXTURE_PROBES = {
-    '605': [
-        {'uuid': 'u-605-lower', 'name': 'task 605', 'created_at': 100,
-         'edge_count': 13, 'mentions_count': 1, 'provenance_rank': 14},
-        {'uuid': 'u-foreign', 'name': 'reify:605', 'created_at': 20,
-         'edge_count': 7, 'mentions_count': 0, 'provenance_rank': 7},
-        {'uuid': 'u-605-canon', 'name': 'Task 605', 'created_at': 50,
-         'edge_count': 2, 'mentions_count': 1, 'provenance_rank': 3},
-        {'uuid': 'u-605-plural', 'name': 'tasks 605', 'created_at': 150,
-         'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
-        {'uuid': 'u-6051', 'name': 'Task 6051', 'created_at': 9,
-         'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
-    ],
-    '900': [
-        {'uuid': 'u-900-a', 'name': 'Task 900', 'created_at': 30,
-         'edge_count': 4, 'mentions_count': 0, 'provenance_rank': 4},
-        {'uuid': 'u-900-b', 'name': 'Task 900', 'created_at': 40,
-         'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
-    ],
-}
 
 #: A family whose survivor is decided by EPISODES, not edges (task 4986): the
 #: edge-poorer 'Task 700' outranks 'task 700' on mentions and so comes back
 #: first. Without this the file would merely SURVIVE the new rule while every
 #: assertion still described the old one.
-MENTIONS_DECIDED_PROBES = {
-    '700': [
-        {'uuid': 'u-700-canon', 'name': 'Task 700', 'created_at': 80,
-         'edge_count': 2, 'mentions_count': 9, 'provenance_rank': 11},
-        {'uuid': 'u-700-lower', 'name': 'task 700', 'created_at': 70,
-         'edge_count': 8, 'mentions_count': 0, 'provenance_rank': 8},
-    ],
-}
+MENTIONS_DECIDED_ROWS = [
+    ranked('u-700-canon', 'Task 700', '2026-02-20', 2, 9),
+    ranked('u-alice', 'Alice', '2026-01-10', 9),
+    ranked('u-700-lower', 'task 700', '2026-02-10', 8),
+]
+
+#: A backend whose rank rule is not a plain sum — the census must report the
+#: backend's key, whatever rule produced it.
+WEIGHTED_RANK_ROWS = [
+    {**ranked('u-700-canon', 'Task 700', '2026-02-20', 2, 9), 'provenance_rank': 29},
+    ranked('u-700-lower', 'task 700', '2026-02-10', 8),
+]
 
 
 def complete_read(rows_seen: int) -> PagedRead:
@@ -109,7 +106,7 @@ def complete_read(rows_seen: int) -> PagedRead:
     )
 
 
-def make_census_backend(nodes=None, probes=None, paged=None, graphs=('home',)):
+def make_census_backend(rows=None, paged=None, graphs=('home',)):
     """A backend stub exposing only what the census is allowed to use.
 
     Every mutating method is present as an AsyncMock so a test can assert it
@@ -117,17 +114,10 @@ def make_census_backend(nodes=None, probes=None, paged=None, graphs=('home',)):
     instead, which proves nothing about intent.
     """
     backend = MagicMock()
-    nodes = FIXTURE_NODES if nodes is None else nodes
-    backend.enumerate_entity_nodes = AsyncMock(
-        return_value=(nodes, paged if paged is not None else complete_read(len(nodes)))
+    rows = FIXTURE_ROWS if rows is None else rows
+    backend.enumerate_ranked_entity_nodes = AsyncMock(
+        return_value=(rows, paged if paged is not None else complete_read(len(rows)))
     )
-
-    probe_rows = FIXTURE_PROBES if probes is None else probes
-
-    async def fake_probe(substring, *, group_id):
-        return list(probe_rows.get(substring, []))
-
-    backend.find_entity_nodes_by_name_substring = AsyncMock(side_effect=fake_probe)
     backend.list_graphs = AsyncMock(return_value=list(graphs))
     for method_name in MUTATING_BACKEND_METHODS:
         setattr(backend, method_name, AsyncMock())
@@ -154,18 +144,14 @@ class TestTaskFamilyCensusRun:
         ]
 
     @pytest.mark.asyncio
-    async def test_probes_only_the_fragmented_families(self):
-        """The edge-count probe is scoped to families the grouping pass already
-        flagged, so a clean graph costs exactly one enumeration and nothing
-        else."""
+    async def test_one_read_per_graph_whatever_the_number_of_families(self):
+        """Two fragmented families, one backend call: no per-family probe, no
+        list_graphs, and no write."""
         backend = make_census_backend()
 
         await TaskFamilyCensus(backend=backend).run(group_id='home')
 
-        probed = {
-            c.args[0] for c in backend.find_entity_nodes_by_name_substring.await_args_list
-        }
-        assert probed == {'605', '900'}
+        assert backend.mock_calls == [call.enumerate_ranked_entity_nodes(group_id='home')]
 
     @pytest.mark.asyncio
     async def test_each_family_carries_every_variant_spelling_with_its_edge_count(self):
@@ -197,21 +183,46 @@ class TestTaskFamilyCensusRun:
         happen to agree, so none of them would notice if the census started
         re-deriving the old rule.
         """
-        nodes = [
-            {'uuid': 'u-700-canon', 'name': 'Task 700', 'summary': ''},
-            {'uuid': 'u-700-lower', 'name': 'task 700', 'summary': ''},
-        ]
-        census = TaskFamilyCensus(
-            backend=make_census_backend(nodes=nodes, probes=MENTIONS_DECIDED_PROBES),
-        )
+        census = TaskFamilyCensus(backend=make_census_backend(rows=MENTIONS_DECIDED_ROWS))
 
         result = await census.run(group_id='home')
 
         (family_700,) = result.families
-        assert [(v.name, v.uuid, v.edge_count) for v in family_700.variants] == [
-            ('Task 700', 'u-700-canon', 2),
-            ('task 700', 'u-700-lower', 8),
+        assert [
+            (v.name, v.uuid, v.edge_count, v.mentions_count, v.provenance_rank)
+            for v in family_700.variants
+        ] == [
+            ('Task 700', 'u-700-canon', 2, 9, 11),
+            ('task 700', 'u-700-lower', 8, 0, 8),
         ], 'the episode-richer variant leads even though it holds FEWER edges'
+
+    @pytest.mark.asyncio
+    async def test_an_exact_name_pair_carries_each_nodes_provenance(self):
+        """Same spelling, different nodes: the per-variant numbers are all that
+        tells the operator which of the pair would survive, without a second
+        trip to the graph."""
+        census = TaskFamilyCensus(backend=make_census_backend())
+
+        result = await census.run(group_id='home')
+
+        _, family_900 = result.families
+        assert [
+            (v.edge_count, v.mentions_count, v.provenance_rank)
+            for v in family_900.variants
+        ] == [(4, 0, 4), (1, 0, 1)]
+
+    @pytest.mark.asyncio
+    async def test_the_rank_is_the_backends_number_not_a_recomputation(self):
+        """The ranking rule has one home (graphiti_client.py::_PROVENANCE_RANK_CLAUSE
+        and the RETURN projection beside it); a census that re-derived the rank
+        would silently disagree with the order it prints the moment that rule
+        changed."""
+        census = TaskFamilyCensus(backend=make_census_backend(rows=WEIGHTED_RANK_ROWS))
+
+        result = await census.run(group_id='home')
+
+        (family_700,) = result.families
+        assert [v.provenance_rank for v in family_700.variants] == [29, 8]
 
     @pytest.mark.asyncio
     async def test_a_multi_spelling_family_is_distinguishable_from_an_exact_name_pair(self):
@@ -231,8 +242,8 @@ class TestTaskFamilyCensusRun:
     @pytest.mark.asyncio
     async def test_noise_matching_the_substring_never_joins_a_family(self):
         """'reify:605' names ANOTHER project's task and 'Task 6051' a different
-        one of ours; both really do contain '605'. Precision comes from
-        task_naming's acceptance rule, never from the query."""
+        one of ours, although both contain '605'. Membership comes from
+        task_naming's acceptance rule."""
         census = TaskFamilyCensus(backend=make_census_backend())
 
         result = await census.run(group_id='home')
@@ -251,7 +262,7 @@ class TestTaskFamilyCensusRun:
         result = await census.run(group_id='home')
 
         assert result.group_id == 'home'
-        assert result.nodes_scanned == len(FIXTURE_NODES)
+        assert result.nodes_scanned == len(FIXTURE_ROWS)
 
     @pytest.mark.asyncio
     async def test_the_result_is_frozen_all_the_way_down(self):
@@ -284,128 +295,71 @@ class TestTaskFamilyCensusRun:
         assert isinstance(result.families[0].variants, tuple)
 
 
-#: A family the ENUMERATION sees whole and the PROBE does not. The two reads
-#: are differently scoped — enumerate_entity_nodes matches every :Entity node
-#: under the graph KEY, while the probe additionally requires
-#: `n.group_id = $group_id` — so a node leaked in by task 2115 counts toward
-#: the >1 threshold and is then dropped from the probe.
-LEAKED_FAMILY_NODES = [
-    {'uuid': 'u-605-canon', 'name': 'Task 605', 'summary': ''},
-    {'uuid': 'u-605-leaked', 'name': 'task 605', 'summary': ''},
-]
+class TestAFragmentedFamilyHoldsAtLeastTwoVariants:
+    """'Split across more than one node' is enforced by the type, not by prose."""
 
-#: What the group-scoped probe returns for that family: the leaked node is
-#: correctly invisible to it, leaving one spelling where the enumeration saw two.
-LEAKED_FAMILY_PROBES = {
-    '605': [
-        {'uuid': 'u-605-canon', 'name': 'Task 605', 'created_at': 50,
-         'edge_count': 2, 'mentions_count': 1, 'provenance_rank': 3},
-    ],
-}
-
-
-class TestAFamilyTheProbeDoesNotConfirm:
-    """The enumeration decides membership and the probe supplies the edge
-    counts, and those two reads can disagree: they are scoped differently and
-    they are not one snapshot. A family that thins below two spellings in
-    between is not residue, and must not be counted as any."""
-
-    @pytest.mark.asyncio
-    async def test_a_short_probe_is_not_reported_as_a_fragmented_family(self):
-        """A FragmentedFamily of one variant would contradict its own meaning —
-        'split across more than one node' — while still incrementing the number
-        this module exists to produce."""
-        backend = make_census_backend(
-            nodes=LEAKED_FAMILY_NODES, probes=LEAKED_FAMILY_PROBES,
+    def test_a_fragmented_family_cannot_be_built_with_fewer_than_two_variants(self):
+        one = (
+            VariantSpelling(
+                name='Task 1', uuid='u-1', edge_count=3, mentions_count=0, provenance_rank=3,
+            ),
         )
 
-        result = await TaskFamilyCensus(backend=backend).run(group_id='home')
+        with pytest.raises(ValueError) as exc_info:
+            FragmentedFamily(canonical_name='Task 1', variants=one)
 
-        assert result.families == ()
+        message = str(exc_info.value)
+        assert 'a fragmented family holds at least two variants' in message
+        assert "'Task 1' has 1" in message
+        with pytest.raises(ValueError):
+            FragmentedFamily(canonical_name='Task 1', variants=())
 
-    @pytest.mark.asyncio
-    async def test_it_is_recorded_rather_than_silently_dropped(self):
-        """Dropping it would hide a leak: one is a race, a persistent count is
-        a group_id leak worth chasing, and only the two membership numbers tell
-        those apart."""
-        backend = make_census_backend(
-            nodes=LEAKED_FAMILY_NODES, probes=LEAKED_FAMILY_PROBES,
-        )
 
-        result = await TaskFamilyCensus(backend=backend).run(group_id='home')
+async def fragmented_family_line(caplog, backend, canonical_name: str) -> str:
+    """The one WARNING a census run logs for *canonical_name*'s family."""
+    with caplog.at_level('WARNING'):
+        await TaskFamilyCensus(backend=backend).run(group_id='home')
+    (line,) = [
+        record.getMessage() for record in caplog.records
+        if record.getMessage().startswith(f'fragmented task family {canonical_name}')
+    ]
+    return line
 
-        assert [
-            (u.canonical_name, u.enumerated_members, u.probed_members)
-            for u in result.unconfirmed
-        ] == [('Task 605', 2, 1)]
 
-    @pytest.mark.asyncio
-    async def test_a_family_that_vanished_entirely_is_recorded_too(self):
-        """The zero case is reachable the same way — every enumerated member
-        was a leaked node — and a zero-variant FragmentedFamily would be the
-        most misleading shape of all."""
-        backend = make_census_backend(nodes=LEAKED_FAMILY_NODES, probes={})
-
-        result = await TaskFamilyCensus(backend=backend).run(group_id='home')
-
-        assert result.families == ()
-        assert [u.probed_members for u in result.unconfirmed] == [0]
+class TestTheFragmentedFamilyLineExplainsTheSurvivor:
+    """The WARNING is the operator-facing report, and after task 4986 an edge
+    count alone cannot explain why variants[0] leads."""
 
     @pytest.mark.asyncio
-    async def test_a_confirmed_family_alongside_it_is_still_reported(self):
-        """The exclusion is per-family: one unconfirmed family must not cost
-        the census the residue it did confirm.
+    async def test_an_edge_poorer_survivor_shows_why_it_leads(self, caplog):
+        """'Task 700' holds fewer edges yet leads; the line has to show the
+        rank and the mentions that put it there."""
+        backend = make_census_backend(rows=MENTIONS_DECIDED_ROWS)
 
-        The whole fixture corpus, with only the 605 probe thinned — so 605 goes
-        unconfirmed while the 900 pair, probed normally, is still reported.
-        """
-        backend = make_census_backend(
-            probes={**FIXTURE_PROBES, **LEAKED_FAMILY_PROBES},
-        )
+        line = await fragmented_family_line(caplog, backend, 'Task 700')
 
-        result = await TaskFamilyCensus(backend=backend).run(group_id='home')
-
-        assert [family.canonical_name for family in result.families] == ['Task 900']
-        assert [u.canonical_name for u in result.unconfirmed] == ['Task 605']
+        first = "'Task 700' provenance_rank=11 (2 edge(s), 9 mention(s))"
+        second = "'task 700' provenance_rank=8 (8 edge(s), 0 mention(s))"
+        assert first in line and second in line
+        assert line.index(first) < line.index(second)
 
     @pytest.mark.asyncio
-    async def test_it_is_logged_loudly_with_both_counts(self, caplog):
-        backend = make_census_backend(
-            nodes=LEAKED_FAMILY_NODES, probes=LEAKED_FAMILY_PROBES,
-        )
+    async def test_every_variant_of_a_three_way_split_is_rendered_in_order(self, caplog):
+        """Every spelling appears, survivor first, and the substring noise in
+        the same graph never reaches the report."""
+        line = await fragmented_family_line(caplog, make_census_backend(), 'Task 605')
 
-        with caplog.at_level('WARNING'):
-            await TaskFamilyCensus(backend=backend).run(group_id='home')
+        fragments = [
+            "'task 605' provenance_rank=14 (13 edge(s), 1 mention(s))",
+            "'Task 605' provenance_rank=3 (2 edge(s), 1 mention(s))",
+            "'tasks 605' provenance_rank=1 (1 edge(s), 0 mention(s))",
+        ]
+        assert all(fragment in line for fragment in fragments)
+        positions = [line.index(fragment) for fragment in fragments]
+        assert positions == sorted(set(positions))
+        assert "'reify:605'" not in line
+        assert "'Task 6051'" not in line
 
-        assert 'unconfirmed task family Task 605' in caplog.text
-        assert 'NOT counted as residue' in caplog.text
-
-    @pytest.mark.asyncio
-    async def test_it_does_not_make_the_graph_incomplete(self):
-        """Coverage and confirmation are different questions. The graph WAS
-        read in full — that is exactly how the divergence became visible — so
-        flipping `complete` would send an operator looking for a truncated read
-        that never happened, and would fail the CLI's exit status too."""
-        backend = make_census_backend(
-            nodes=LEAKED_FAMILY_NODES, probes=LEAKED_FAMILY_PROBES,
-        )
-
-        result = await TaskFamilyCensus(backend=backend).run(group_id='home')
-
-        assert result.complete is True
-        assert result.incomplete_kind is None
-
-    @pytest.mark.asyncio
-    async def test_the_record_is_frozen_like_the_rest_of_the_result(self):
-        backend = make_census_backend(
-            nodes=LEAKED_FAMILY_NODES, probes=LEAKED_FAMILY_PROBES,
-        )
-
-        result = await TaskFamilyCensus(backend=backend).run(group_id='home')
-
-        assert isinstance(result.unconfirmed, tuple)
-        with pytest.raises(FrozenInstanceError):
-            setattr(result.unconfirmed[0], 'probed_members', 99)  # noqa: B010
 
 class TestTaskFamilyCensusIsReadOnly:
     """No write reaches the graph from the census path — asserted structurally."""
@@ -421,51 +375,35 @@ class TestTaskFamilyCensusIsReadOnly:
 
     @pytest.mark.asyncio
     async def test_the_real_backend_never_touches_the_writable_query_channel(
-        self, mock_config, make_backend,
+        self, mock_config, make_backend, make_graph_mock,
     ):
         """End-to-end through a REAL GraphitiBackend down to the driver: every
         query the census causes goes through ``ro_query``, never ``query``.
 
-        This is the assertion ``_fm_helpers.assert_ro_query_only`` makes, spelled
-        out rather than reused: that helper also pins ``ro_query`` to exactly ONE
-        await, and a census legitimately issues several (a count probe, a page,
-        then one probe per fragmented family).
+        Exactly two of them for a graph holding two fragmented families — the
+        census probe and one page — which is the driver-level proof that no
+        per-family read remains. The rows are handed over in uuid order, as the
+        server pages them, so survivor-first variants prove the backend's sort
+        reaches the census.
         """
+        in_uuid_order = sorted(FIXTURE_ROWS, key=lambda row: row['uuid'])
         backend = make_backend(mock_config)
-        graph = MagicMock()
-        graph.query = AsyncMock()
-
-        async def dispatch_ro(cypher, params=None):
-            # CONTAINS is tested FIRST: the substring probe's own Cypher carries
-            # a `count(DISTINCT e)` edge-count aggregate — and since task 4986 a
-            # `count(DISTINCT m)` mentions aggregate as well — so a `count(` test
-            # would claim it and answer a six-column read with a one-column
-            # census row. The second aggregate makes this ordering more
-            # load-bearing, not less.
-            result = MagicMock()
-            if 'CONTAINS' in cypher:
-                result.result_set = [
-                    [row['uuid'], row['name'], row['created_at'], row['edge_count'],
-                     row['mentions_count'], row['provenance_rank']]
-                    for row in FIXTURE_PROBES.get((params or {})['substring'], [])
-                ]
-            elif 'count(' in cypher:
-                result.result_set = [[len(FIXTURE_NODES)]]
-            else:
-                result.result_set = [
-                    [node['uuid'], node['name'], node['summary']] for node in FIXTURE_NODES
-                ]
-            return result
-
-        graph.ro_query = AsyncMock(side_effect=dispatch_ro)
+        graph = make_graph_mock([
+            [row['uuid'], row['name'], row['created_at'], row['edge_count'],
+             row['mentions_count'], row['provenance_rank']]
+            for row in in_uuid_order
+        ])
         backend._driver._get_graph = MagicMock(return_value=graph)
 
         result = await TaskFamilyCensus(backend=backend).run(group_id='home')
 
         graph.query.assert_not_awaited()
-        assert graph.ro_query.await_count >= 2  # census probe + at least one page
+        assert graph.ro_query.await_count == 2
         assert [family.canonical_name for family in result.families] == [
             'Task 605', 'Task 900',
+        ]
+        assert [v.uuid for v in result.families[0].variants] == [
+            'u-605-lower', 'u-605-canon', 'u-605-plural',
         ]
 
 
@@ -506,24 +444,26 @@ class TestTaskFamilyCensusCoverageHonesty:
 # step-11: the multi-graph sweep and the CLI-callable entrypoint
 # ---------------------------------------------------------------------------
 
-#: A second graph's corpus: the 900 pair and nothing else. Distinct from
-#: FIXTURE_NODES on purpose — a sweep that merged graphs into one number would
-#: report the wrong residue for both, which is why the breakdown is per-graph.
-OTHER_GRAPH_NODES = [
-    {'uuid': 'u-900-a', 'name': 'Task 900', 'summary': ''},
-    {'uuid': 'u-900-b', 'name': 'Task 900', 'summary': ''},
+#: A second graph's corpus: the 900 pair with noise between its two nodes.
+#: Distinct from FIXTURE_ROWS on purpose — a sweep that merged graphs into one
+#: number would report the wrong residue for both, which is why the breakdown
+#: is per-graph.
+OTHER_GRAPH_ROWS = [
+    ranked('u-900-a', 'Task 900', '2026-01-30', 4),
+    ranked('u-bob', 'Bob', '2026-01-05', 2),
+    ranked('u-900-b', 'Task 900', '2026-02-09', 1),
 ]
 
 #: A graph with nothing split at all: one clean canonical node.
-CLEAN_GRAPH_NODES = [
-    {'uuid': 'u-700', 'name': 'Task 700', 'summary': ''},
+CLEAN_GRAPH_ROWS = [
+    ranked('u-700', 'Task 700', '2026-03-01', 2),
 ]
 
 
 def make_sweep_backend(per_graph, graphs=None):
-    """A backend whose ``enumerate_entity_nodes`` answers per group_id.
+    """A backend whose ``enumerate_ranked_entity_nodes`` answers per group_id.
 
-    ``per_graph`` maps group_id -> either an ``(nodes, PagedRead)`` pair or an
+    ``per_graph`` maps group_id -> either a ``(rows, PagedRead)`` pair or an
     Exception INSTANCE to raise. Simulating a per-graph failure by raising from
     the backend is what lets the isolation test stay outside the census: it
     never has to reach in and break an internal.
@@ -536,12 +476,7 @@ def make_sweep_backend(per_graph, graphs=None):
             raise outcome
         return outcome
 
-    backend.enumerate_entity_nodes = AsyncMock(side_effect=fake_enumerate)
-
-    async def fake_probe(substring, *, group_id):
-        return list(FIXTURE_PROBES.get(substring, []))
-
-    backend.find_entity_nodes_by_name_substring = AsyncMock(side_effect=fake_probe)
+    backend.enumerate_ranked_entity_nodes = AsyncMock(side_effect=fake_enumerate)
     backend.list_graphs = AsyncMock(
         return_value=list(per_graph if graphs is None else graphs)
     )
@@ -550,17 +485,17 @@ def make_sweep_backend(per_graph, graphs=None):
     return backend
 
 
-def whole(nodes):
-    """``(nodes, PagedRead)`` for a graph that was enumerated in full."""
-    return (nodes, complete_read(len(nodes)))
+def whole(rows):
+    """``(rows, PagedRead)`` for a graph that was enumerated in full."""
+    return (rows, complete_read(len(rows)))
 
 
 def make_three_graph_backend():
     """home (2 families) / other (1 family) / clean (0) — in list_graphs order."""
     return make_sweep_backend({
-        'home': whole(FIXTURE_NODES),
-        'other': whole(OTHER_GRAPH_NODES),
-        'clean': whole(CLEAN_GRAPH_NODES),
+        'home': whole(FIXTURE_ROWS),
+        'other': whole(OTHER_GRAPH_ROWS),
+        'clean': whole(CLEAN_GRAPH_ROWS),
     })
 
 
@@ -632,9 +567,9 @@ class TestTaskFamilyCensusSweepIsBestEffortPerGraph:
         """Mirrors _run_startup_identity_scan: each graph is processed inside its
         own try/except so a failure on one never aborts the sweep."""
         backend = make_sweep_backend({
-            'home': whole(FIXTURE_NODES),
+            'home': whole(FIXTURE_ROWS),
             'broken': RuntimeError('FalkorDB connection reset'),
-            'clean': whole(CLEAN_GRAPH_NODES),
+            'clean': whole(CLEAN_GRAPH_ROWS),
         })
 
         aggregate = await TaskFamilyCensus(backend=backend).sweep()
@@ -648,7 +583,7 @@ class TestTaskFamilyCensusSweepIsBestEffortPerGraph:
         whether to retry or to go fix something."""
         backend = make_sweep_backend({
             'broken': RuntimeError('FalkorDB connection reset'),
-            'clean': whole(CLEAN_GRAPH_NODES),
+            'clean': whole(CLEAN_GRAPH_ROWS),
         })
 
         aggregate = await TaskFamilyCensus(backend=backend).sweep()
@@ -673,9 +608,9 @@ class TestTaskFamilyCensusSweepIsBestEffortPerGraph:
         reads as 'two graphs have no residue' when the truth is 'one graph was
         never looked at'."""
         backend = make_sweep_backend({
-            'home': whole(FIXTURE_NODES),
+            'home': whole(FIXTURE_ROWS),
             'broken': RuntimeError('FalkorDB connection reset'),
-            'clean': whole(CLEAN_GRAPH_NODES),
+            'clean': whole(CLEAN_GRAPH_ROWS),
         })
 
         aggregate = await TaskFamilyCensus(backend=backend).sweep()
@@ -702,8 +637,8 @@ class TestTaskFamilyCensusSweepCompleteness:
             reason='page cap reached', incomplete_kind='page_cap',
         )
         backend = make_sweep_backend({
-            'home': whole(FIXTURE_NODES),
-            'huge': (OTHER_GRAPH_NODES, truncated),
+            'home': whole(FIXTURE_ROWS),
+            'huge': (OTHER_GRAPH_ROWS, truncated),
         })
 
         aggregate = await TaskFamilyCensus(backend=backend).sweep()
@@ -711,32 +646,12 @@ class TestTaskFamilyCensusSweepCompleteness:
         assert aggregate.complete is False
 
     @pytest.mark.asyncio
-    async def test_unconfirmed_families_total_up_without_going_incomplete(self):
-        """A graph read in full that reported a probe divergence stays
-        complete: every graph WAS read, and the total is honest precisely
-        because those families were excluded from it."""
-        backend = make_sweep_backend(
-            {'home': whole(LEAKED_FAMILY_NODES), 'other': whole(LEAKED_FAMILY_NODES)},
-        )
-
-        async def thin_probe(substring, *, group_id):
-            return list(LEAKED_FAMILY_PROBES.get(substring, []))
-
-        backend.find_entity_nodes_by_name_substring = AsyncMock(side_effect=thin_probe)
-
-        aggregate = await TaskFamilyCensus(backend=backend).sweep()
-
-        assert aggregate.total_families == 0
-        assert aggregate.total_unconfirmed == 2
-        assert aggregate.complete is True
-
-    @pytest.mark.asyncio
     async def test_incomplete_when_any_graph_errored(self):
         """An errored graph is an unknown, not a zero — so the sweep's own
         completeness flag has to go False even though every graph it DID read
         was read in full."""
         backend = make_sweep_backend({
-            'home': whole(FIXTURE_NODES),
+            'home': whole(FIXTURE_ROWS),
             'broken': RuntimeError('FalkorDB connection reset'),
         })
 
@@ -892,7 +807,7 @@ class TestTheExitCodeAnswersCanIActOnThisNumber:
     def test_a_truncated_census_exits_non_zero(self):
         """The number is a lower bound, so a script that treated the exit code
         as 'did it run' would under-count the residue and never know."""
-        backend = make_sweep_backend({'huge': (FIXTURE_NODES, TRUNCATED_READ)})
+        backend = make_sweep_backend({'huge': (FIXTURE_ROWS, TRUNCATED_READ)})
 
         assert run_main(sweep_of(backend)) == 1
 
@@ -900,27 +815,11 @@ class TestTheExitCodeAnswersCanIActOnThisNumber:
         """An unreadable graph is an unknown, not a zero — the same reason the
         sweep's own completeness flag goes False."""
         backend = make_sweep_backend({
-            'home': whole(FIXTURE_NODES),
+            'home': whole(FIXTURE_ROWS),
             'broken': RuntimeError('FalkorDB connection reset'),
         })
 
         assert run_main(sweep_of(backend)) == 1
-
-    def test_an_unconfirmed_family_does_not_move_the_exit_code(self):
-        """Coverage and confirmation are different questions. The graph WAS
-        read in full, and the count is honest precisely because the unconfirmed
-        family was excluded from it — failing the run would send an operator
-        looking for a truncated read that never happened."""
-        backend = make_sweep_backend({'home': whole(LEAKED_FAMILY_NODES)})
-
-        async def thin_probe(substring, *, group_id):
-            return list(LEAKED_FAMILY_PROBES.get(substring, []))
-
-        backend.find_entity_nodes_by_name_substring = AsyncMock(side_effect=thin_probe)
-        sweep = sweep_of(backend)
-
-        assert sweep.total_unconfirmed == 1
-        assert run_main(sweep) == 0
 
 
 class TestTheTwoOutputShapes:
@@ -937,14 +836,20 @@ class TestTheTwoOutputShapes:
         emitted = json.loads(capsys.readouterr().out)
 
         assert set(emitted) == {
-            'graphs', 'failures', 'total_families', 'total_unconfirmed',
-            'complete', 'elapsed_ms',
+            'graphs', 'failures', 'total_families', 'complete', 'elapsed_ms',
+        }
+        assert set(emitted['graphs'][0]) == {
+            'group_id', 'families', 'nodes_scanned', 'complete', 'incomplete_kind',
+            'rows_seen', 'expected_rows',
         }
         assert emitted['total_families'] == 3
         assert [graph['group_id'] for graph in emitted['graphs']] == [
             'home', 'other', 'clean',
         ]
-        assert emitted['graphs'][0]['families'][0]['variants'][0]['edge_count'] == 13
+        survivor = emitted['graphs'][0]['families'][0]['variants'][0]
+        assert {
+            k: survivor[k] for k in ('edge_count', 'mentions_count', 'provenance_rank')
+        } == {'edge_count': 13, 'mentions_count': 1, 'provenance_rank': 14}
 
     def test_without_json_the_summary_names_each_graph_and_its_count(self, capsys):
         """'three families somewhere' is not actionable; the breakdown is what
@@ -961,7 +866,7 @@ class TestTheTwoOutputShapes:
         """A failure folded into a count reads as 'no residue here' when the
         truth is 'never looked at', so it gets its own line."""
         backend = make_sweep_backend({
-            'home': whole(FIXTURE_NODES),
+            'home': whole(FIXTURE_ROWS),
             'broken': RuntimeError('FalkorDB connection reset'),
         })
 
@@ -973,15 +878,6 @@ class TestTheTwoOutputShapes:
         assert 'broken' in out
         assert 'RuntimeError' in out
         assert 'complete=False' in out
-
-    def test_the_summary_reports_unconfirmed_families_even_when_there_are_none(
-        self, capsys,
-    ):
-        """Reported unconditionally: a field that appears only when non-zero is
-        a field nobody knows to look for, and its normal value IS zero."""
-        run_main(sweep_of(make_three_graph_backend()))
-
-        assert 'unconfirmed=0' in capsys.readouterr().out
 
     def test_the_summary_survives_a_sweep_that_censused_nothing(self, capsys):
         """The empty store is the one shape a ' '.join breakdown renders as an

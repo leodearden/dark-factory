@@ -515,6 +515,98 @@ landed, have since landed under task 3134 (below).
 
 ### Changed
 
+#### Only a pending owner whose dependencies are not known unsatisfied may hold parks (task 6518, esc-6040-7)
+
+**Old behaviour.** Park GC expired a park only when its owner was terminal, missing from
+the task read, or blocked by a LOCAL dependency. A blocked, deferred, in-review,
+merge-deferred or running owner kept its parks indefinitely, and a cross-project or
+delivered-check dependency was never consulted, because park GC ran before the phases
+that fill those caches.
+
+**New behaviour.** One owner-state predicate,
+`orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal`, decides whether
+an owner may hold parks, pin reservations included: it must be `pending`, and no
+dependency may be known to be unsatisfied. An UNKNOWN dependency (resolver failed,
+dependency absent from the resolver's answer, delivered check not evaluated this tick)
+keeps the park.
+
+- **New `reservation_expired` reasons**: `not_pending:<status>` (any status other than
+  `pending`, terminal excepted), `deps_unsatisfied:external` (the resolver reports a
+  cross-project dependency other than `done`, sentinels included) and
+  `deps_unsatisfied:delivered_check` (a dependency's delivered check ran and failed).
+  `deps_unsatisfied` for a local dependency, `terminal:<status>` and `missing` are
+  unchanged. `LIKE 'deps_unsatisfied%'` catches every dependency expiry.
+- **Park GC moved** after `external_dep_policy` and `delivered_check_gate` in
+  `_TICK_PHASE_ORDER`, with the park-eviction drain still immediately ahead of it, so
+  the dependency arm reads this tick's caches. It still runs before `reserve_now` and the
+  dispatch loops, and on an idle tick.
+- **`request_park_eviction`** is no longer refused (`live_owner`) for an owner park GC
+  would expire: the drain evicts it first and emits `reservation_force_evicted`. It is
+  refused exactly for the owners park GC keeps.
+- **`reserve_now`** on an owner that fails the predicate installs nothing: its flag is
+  consumed and the new `reserve_now_refused` event carries `{reason}` in the vocabulary
+  above.
+- **A released pin head** completes the fairness parks its skips earned only while it
+  is still a dispatch candidate that tick, so a blocked or deferred head drops its whole
+  footprint instead of re-parking it.
+- Dispatch is unchanged: it still treats an unknown dependency as not satisfied. Dispatch
+  and park GC read one tri-state dependency predicate,
+  `orchestrator/src/orchestrator/dependency_verdict.py::deps_verdict`.
+
+**Operator-visible signal.** `reservation_expired` rows with the new reasons in
+`runs.db`, and no fairness `reservation_installed` for a non-pending owner. The design
+note is the task 6518 amendment in `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md`
+§7.
+
+#### Referent repair defers a degraded target lookup instead of minting off it (task 5191)
+
+When zeta's lookup of a repair target fails, the finding carries
+`uuid_lookup_degraded=True` (task 4506). The write-time repair pass (eta) now treats
+"could not look" as neither "absent" nor "present". See
+`fused-memory/src/fused_memory/services/memory_service.py::MemoryService._repair_edge_findings`
+and `::MemoryService._record_referent_repair_pass`.
+
+- **A degraded finding is recorded as `outcome='failed'` and nothing is written.**
+  Previously it went through `ensure_entity_node` -> `reassign_edge` and was booked
+  `minted=True`. So `nodes_minted` no longer counts backend errors as mints, and the
+  whole-set-fallback plausibility guard no longer refuses with a "no node of that name
+  exists" reason it could not check.
+- **A repair pass with zero repairs and at least one `'failed'` record now leaves the
+  per-group storm streak unchanged instead of resetting it.** This changes a rule task
+  3672 pinned: a backend blip can no longer disarm an in-progress storm alarm. A
+  `'failed'` record still never increments the streak, and a pass that both repaired
+  and failed still increments.
+
+#### Task-family census reads each graph once (task 5662)
+
+`maintenance/task_family_census.py` now makes one backend read per graph instead
+of one per fragmented family, and the structure that existed only to reconcile
+its two reads is gone.
+
+- The per-family `find_entity_nodes_by_name_substring` probe (one un-indexed
+  `CONTAINS` scan per fragmented family, 296 of them on the 2026-09-19 sweep) is
+  replaced by one group-scoped paged read per graph, the new
+  `GraphitiBackend.enumerate_ranked_entity_nodes`. `enumerate_entity_nodes` is
+  unchanged (task 5264, decision 7).
+- Membership and edge counts now come from the same rows, so `UnconfirmedFamily`
+  is unreachable and was deleted, and `FragmentedFamily` now raises `ValueError`
+  below two variants. **Output shape change:** the JSON loses top-level
+  `total_unconfirmed` and per-graph `unconfirmed`, and the summary line loses its
+  `unconfirmed=` token. This supersedes the "two reads disagreeing" paragraph of
+  the task-5264 entry above.
+- `nodes_scanned` now counts same-group nodes only. A node whose `group_id`
+  property names another project (task 2115's leak) is out of the census's
+  scope and is counted nowhere in its output. The deleted `unconfirmed` count
+  was the census's only trace of such a node. A separate read-only leak
+  detector is proposed as follow-up ticket `tkt_0RVQ5JNVSFM3WGVERS1Q2BEHZ0`.
+- The survivor ordering is now one structured spec in `graphiti_client.py`,
+  `_PROVENANCE_RANK_KEYS`, rendered both as the shared Cypher `ORDER BY`
+  (unchanged text) and as the Python sort. A unit test checks the Python sort
+  against openCypher's `ORDER BY` semantics. A live-FalkorDB test, run only
+  with `-m integration`, checks that the two agree on a real server. A rank
+  column whose non-NULL values mix types that Python cannot compare fails that
+  graph with `SurvivorRankTypeError`, which names the column and the types.
+
 #### Store preflight refuses an existing-but-empty target, not just a missing one (task 5468)
 
 The seven fused-memory store scripts that preflight their target now refuse an

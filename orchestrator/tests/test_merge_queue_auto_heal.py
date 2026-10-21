@@ -21,12 +21,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import FakeClock, FakeVerifier
+from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
@@ -135,39 +137,39 @@ class TestIsAutoHealEligible:
     """Conservative mechanical gate for auto-heal eligibility."""
 
     def test_compile_error_with_hint_is_eligible(self) -> None:
-        from orchestrator.merge_queue import is_auto_heal_eligible
+        from orchestrator.merge_lane.worker import is_auto_heal_eligible
         assert is_auto_heal_eligible('compile_error', 'error TS2322: StatusBar.tsx') is True
 
     def test_compile_error_no_hint_is_eligible(self) -> None:
-        from orchestrator.merge_queue import is_auto_heal_eligible
+        from orchestrator.merge_lane.worker import is_auto_heal_eligible
         assert is_auto_heal_eligible('compile_error', '') is True
 
     def test_compile_error_none_hint_is_eligible(self) -> None:
-        from orchestrator.merge_queue import is_auto_heal_eligible
+        from orchestrator.merge_lane.worker import is_auto_heal_eligible
         assert is_auto_heal_eligible('compile_error', None) is True
 
     def test_test_failure_is_not_eligible(self) -> None:
-        from orchestrator.merge_queue import is_auto_heal_eligible
+        from orchestrator.merge_lane.worker import is_auto_heal_eligible
         assert is_auto_heal_eligible('test_failure', 'some test output') is False
 
     def test_unknown_test_failure_is_not_eligible(self) -> None:
-        from orchestrator.merge_queue import is_auto_heal_eligible
+        from orchestrator.merge_lane.worker import is_auto_heal_eligible
         assert is_auto_heal_eligible('unknown_test_failure', '') is False
 
     def test_infra_timeout_is_not_eligible(self) -> None:
-        from orchestrator.merge_queue import is_auto_heal_eligible
+        from orchestrator.merge_lane.worker import is_auto_heal_eligible
         assert is_auto_heal_eligible('infra_timeout', '') is False
 
     def test_flock_error_is_not_eligible(self) -> None:
-        from orchestrator.merge_queue import is_auto_heal_eligible
+        from orchestrator.merge_lane.worker import is_auto_heal_eligible
         assert is_auto_heal_eligible('flock_error', '') is False
 
     def test_empty_strings_are_not_eligible(self) -> None:
-        from orchestrator.merge_queue import is_auto_heal_eligible
+        from orchestrator.merge_lane.worker import is_auto_heal_eligible
         assert is_auto_heal_eligible('', '') is False
 
     def test_none_category_is_not_eligible(self) -> None:
-        from orchestrator.merge_queue import is_auto_heal_eligible
+        from orchestrator.merge_lane.worker import is_auto_heal_eligible
         assert is_auto_heal_eligible(None, None) is False
 
     @pytest.mark.parametrize(
@@ -177,7 +179,7 @@ class TestIsAutoHealEligible:
     def test_task_4843_categories_are_not_eligible(self, category: FailureCategory) -> None:
         """The eligible set is hand-enumerated, so admitting any of these
         (task 4843) must be a loud, deliberate edit."""
-        from orchestrator.merge_queue import is_auto_heal_eligible
+        from orchestrator.merge_lane.worker import is_auto_heal_eligible
         assert is_auto_heal_eligible(category.value, '') is False
 
 
@@ -190,23 +192,23 @@ class TestLaneForTaskMetadata:
     """lane_for_task_metadata reads merge_lane from task metadata."""
 
     def test_high_lane(self) -> None:
-        from orchestrator.merge_queue import lane_for_task_metadata
+        from orchestrator.merge_lane.worker import lane_for_task_metadata
         assert lane_for_task_metadata({'merge_lane': 'high'}) == 'high'
 
     def test_normal_lane(self) -> None:
-        from orchestrator.merge_queue import lane_for_task_metadata
+        from orchestrator.merge_lane.worker import lane_for_task_metadata
         assert lane_for_task_metadata({'merge_lane': 'normal'}) == 'normal'
 
     def test_empty_dict_defaults_to_normal(self) -> None:
-        from orchestrator.merge_queue import lane_for_task_metadata
+        from orchestrator.merge_lane.worker import lane_for_task_metadata
         assert lane_for_task_metadata({}) == 'normal'
 
     def test_none_defaults_to_normal(self) -> None:
-        from orchestrator.merge_queue import lane_for_task_metadata
+        from orchestrator.merge_lane.worker import lane_for_task_metadata
         assert lane_for_task_metadata(None) == 'normal'
 
     def test_bogus_value_normalizes_to_normal(self) -> None:
-        from orchestrator.merge_queue import lane_for_task_metadata
+        from orchestrator.merge_lane.worker import lane_for_task_metadata
         assert lane_for_task_metadata({'merge_lane': 'bogus'}) == 'normal'
 
 
@@ -219,14 +221,14 @@ class TestComposeFixMainBrief:
     """compose_fix_main_brief produces a title + description for a fix-main task."""
 
     def test_title_starts_with_fix_main(self) -> None:
-        from orchestrator.merge_queue import compose_fix_main_brief
+        from orchestrator.main_health_fix_owner import compose_fix_main_brief
         title, _ = compose_fix_main_brief(
             'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
         )
         assert title.startswith('fix main:'), f'Title must start with "fix main:"; got {title!r}'
 
     def test_title_contains_relevant_identifier(self) -> None:
-        from orchestrator.merge_queue import compose_fix_main_brief
+        from orchestrator.main_health_fix_owner import compose_fix_main_brief
         title, _ = compose_fix_main_brief(
             'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
         )
@@ -236,19 +238,19 @@ class TestComposeFixMainBrief:
         )
 
     def test_title_bounded_length(self) -> None:
-        from orchestrator.merge_queue import compose_fix_main_brief
+        from orchestrator.main_health_fix_owner import compose_fix_main_brief
         title, _ = compose_fix_main_brief(
             'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
         )
         assert len(title) <= 120, f'Title must be ≤120 chars; got {len(title)}: {title!r}'
 
     def test_title_non_empty(self) -> None:
-        from orchestrator.merge_queue import compose_fix_main_brief
+        from orchestrator.main_health_fix_owner import compose_fix_main_brief
         title, _ = compose_fix_main_brief('compile_error', 'hint', 'detail')
         assert title, 'Title must be non-empty'
 
     def test_description_contains_category(self) -> None:
-        from orchestrator.merge_queue import compose_fix_main_brief
+        from orchestrator.main_health_fix_owner import compose_fix_main_brief
         _, description = compose_fix_main_brief(
             'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
         )
@@ -257,7 +259,7 @@ class TestComposeFixMainBrief:
         )
 
     def test_description_contains_cause_hint(self) -> None:
-        from orchestrator.merge_queue import compose_fix_main_brief
+        from orchestrator.main_health_fix_owner import compose_fix_main_brief
         _, description = compose_fix_main_brief(
             'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
         )
@@ -266,7 +268,7 @@ class TestComposeFixMainBrief:
         )
 
     def test_description_contains_detail(self) -> None:
-        from orchestrator.merge_queue import compose_fix_main_brief
+        from orchestrator.main_health_fix_owner import compose_fix_main_brief
         _, description = compose_fix_main_brief(
             'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
         )
@@ -275,7 +277,7 @@ class TestComposeFixMainBrief:
         )
 
     def test_description_non_empty(self) -> None:
-        from orchestrator.merge_queue import compose_fix_main_brief
+        from orchestrator.main_health_fix_owner import compose_fix_main_brief
         _, description = compose_fix_main_brief('compile_error', 'hint', 'detail')
         assert description, 'Description must be non-empty'
 
@@ -289,23 +291,23 @@ class TestMainHealthAutoHealRegistry:
     """MainHealthAutoHealRegistry is a monotonic per-signature attempt counter."""
 
     def test_fresh_registry_has_zero_attempts(self) -> None:
-        from orchestrator.merge_queue import MainHealthAutoHealRegistry
+        from orchestrator.merge_lane.worker import MainHealthAutoHealRegistry
         r = MainHealthAutoHealRegistry()
         assert r.attempts('sig-A') == 0
 
     def test_record_attempt_returns_incremented_count(self) -> None:
-        from orchestrator.merge_queue import MainHealthAutoHealRegistry
+        from orchestrator.merge_lane.worker import MainHealthAutoHealRegistry
         r = MainHealthAutoHealRegistry()
         assert r.record_attempt('sig-A') == 1
 
     def test_attempts_reflects_recorded_count(self) -> None:
-        from orchestrator.merge_queue import MainHealthAutoHealRegistry
+        from orchestrator.merge_lane.worker import MainHealthAutoHealRegistry
         r = MainHealthAutoHealRegistry()
         r.record_attempt('sig-A')
         assert r.attempts('sig-A') == 1
 
     def test_monotonically_increments(self) -> None:
-        from orchestrator.merge_queue import MainHealthAutoHealRegistry
+        from orchestrator.merge_lane.worker import MainHealthAutoHealRegistry
         r = MainHealthAutoHealRegistry()
         r.record_attempt('sig-A')
         result = r.record_attempt('sig-A')
@@ -313,17 +315,20 @@ class TestMainHealthAutoHealRegistry:
         assert r.attempts('sig-A') == 2
 
     def test_different_keys_are_independent(self) -> None:
-        from orchestrator.merge_queue import MainHealthAutoHealRegistry
+        from orchestrator.merge_lane.worker import MainHealthAutoHealRegistry
         r = MainHealthAutoHealRegistry()
         r.record_attempt('sig-A')
         assert r.attempts('sig-B') == 0
 
     def test_max_attempts_constant(self) -> None:
-        from orchestrator.merge_queue import MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
+        from orchestrator.merge_lane.worker import MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
         assert MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS == 1
 
     def test_speculative_merge_worker_exposes_registry(self) -> None:
-        from orchestrator.merge_queue import MainHealthAutoHealRegistry, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import (
+            MainHealthAutoHealRegistry,
+            SpeculativeMergeWorker,
+        )
         git_ops = _make_mock_git_ops()
         worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
         assert isinstance(worker.auto_heal_registry, MainHealthAutoHealRegistry)
@@ -347,7 +352,10 @@ class TestSpeculativeWorkerBareHarnessContract:
     def test_bare_spec_mock_does_not_raise(self) -> None:
         """Constructing with bare MagicMock(spec=GitOps) — NO project_root wired —
         must NOT raise AttributeError."""
-        from orchestrator.merge_queue import MainHealthAutoHealRegistry, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import (
+            MainHealthAutoHealRegistry,
+            SpeculativeMergeWorker,
+        )
 
         # Intentionally bare: project_root is NOT set on this mock.
         # This exercises the project_root-absent / None path in __init__.
@@ -379,7 +387,7 @@ class TestMergeRequestLaneWiring:
 
         workflow._write_merge_failure_review = MagicMock()
 
-        with patch('orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue):
+        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
             asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=False)
             )
@@ -423,7 +431,7 @@ def _make_workflow_with_worker(
     task_metadata: dict | None = None,
 ) -> tuple[TaskWorkflow, MagicMock]:
     """Return (workflow, merge_worker_mock) with auto_heal_registry pre-wired."""
-    from orchestrator.merge_queue import MainHealthAutoHealRegistry
+    from orchestrator.merge_lane.worker import MainHealthAutoHealRegistry
 
     workflow = _make_workflow(config, worktree, task_metadata=task_metadata)
     workflow.merge_queue = asyncio.Queue()
@@ -433,6 +441,7 @@ def _make_workflow_with_worker(
     merge_worker.is_lane_halted = MagicMock(return_value=is_halted)
     merge_worker.halt_lane = MagicMock()
     merge_worker.set_lane_halt_owner = MagicMock()
+    merge_worker.main_fix_filer = None
 
     workflow.merge_worker = merge_worker
 
@@ -541,7 +550,7 @@ class TestSubmitToMergeQueueRoutesAutoHeal:
         async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
             request.result.set_result(outcome)
 
-        with patch('orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue):
+        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
             )
@@ -576,7 +585,7 @@ class TestSubmitToMergeQueueRoutesAutoHeal:
         async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
             request.result.set_result(generic_outcome)
 
-        with patch('orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue):
+        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=False)
             )
@@ -677,28 +686,29 @@ class TestAutoHealNonMechanicalEscalates:
         mark_blocked_mock = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
         workflow._mark_blocked = mark_blocked_mock  # type: ignore[method-assign]
 
-        result = asyncio.run(
-            workflow._auto_heal_main_health(outcome, merge_phase=True)
-        )
+        with patch(
+            'orchestrator.workflow.submit_or_dedupe', return_value={'status': 'queued'},
+        ) as submit_mock:
+            result = asyncio.run(
+                workflow._auto_heal_main_health(outcome, merge_phase=True)
+            )
 
         # No halt
         merge_worker.halt_lane.assert_not_called()
-        # No spawn
+        # No auto-heal spawn
         assert not spawned_args, f'[{category}] Expected no spawn for non-mechanical failure'
-        # Escalate to human
+        # One shared, foldable L1 (task 5471): no fix task store is wired here,
+        # so it names no owner.
+        submit_mock.assert_called_once()
+        esc = submit_mock.call_args[0][1]
+        assert esc.category == 'preexisting_main_break'
+        assert esc.level == 1
+        assert esc.dedupe_fingerprint == 'fp-test-001'
+        assert esc.suggested_action == MainHealthNextAction.NO_FIX_OWNER
         mark_blocked_mock.assert_called_once()
         call_kwargs = mark_blocked_mock.call_args[1]
-        assert call_kwargs.get('escalate_to_human') is True, (
-            f'[{category}] Expected escalate_to_human=True; got {call_kwargs}'
-        )
-        assert call_kwargs.get('category') == 'preexisting_main_break', (
-            f'[{category}] Expected category=preexisting_main_break; got {call_kwargs}'
-        )
-        assert call_kwargs.get('dedupe_fingerprint') == 'fp-test-001', (
-            f'[{category}] Expected dedupe_fingerprint forwarded; got {call_kwargs}'
-        )
-        assert call_kwargs.get('suggested_action') == 'await_preexisting_main_hotfix', (
-            f'[{category}] Expected suggested_action=await_preexisting_main_hotfix; got {call_kwargs}'
+        assert call_kwargs.get('skip_escalation') is True, (
+            f'[{category}] The L1 is already filed; got {call_kwargs}'
         )
         assert result == WorkflowOutcome.BLOCKED
 
@@ -712,7 +722,7 @@ class TestAutoHealAttemptCap:
     """Signal e: recurring same-signature break → attempt cap → hard-escalate, no spawn."""
 
     def test_attempt_cap_hard_escalates_without_spawn(self, tmp_path: Path) -> None:
-        from orchestrator.merge_queue import MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
+        from orchestrator.merge_lane.worker import MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
 
         config = _make_config(tmp_path)
         worktree = tmp_path / 'task-wt'
@@ -737,26 +747,26 @@ class TestAutoHealAttemptCap:
         mark_blocked_mock = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
         workflow._mark_blocked = mark_blocked_mock  # type: ignore[method-assign]
 
-        result = asyncio.run(
-            workflow._auto_heal_main_health(outcome, merge_phase=True)
-        )
+        with patch(
+            'orchestrator.workflow.submit_or_dedupe', return_value={'status': 'queued'},
+        ) as submit_mock:
+            result = asyncio.run(
+                workflow._auto_heal_main_health(outcome, merge_phase=True)
+            )
 
         # No new halt
         merge_worker.halt_lane.assert_not_called()
-        # No spawn
+        # No auto-heal spawn
         assert not spawned_args, 'Expected no spawn when attempt cap exceeded'
-        # Hard-escalate
+        # One shared L1 recording the re-break (task 5471)
+        submit_mock.assert_called_once()
+        esc = submit_mock.call_args[0][1]
+        assert esc.level == 1
+        assert esc.dedupe_fingerprint == 'fp-compile-001'
+        assert esc.suggested_action == MainHealthNextAction.AUTO_HEAL_EXHAUSTED
+        assert esc.root_cause == f'main-health-auto-heal-rebreak:{sig}'
         mark_blocked_mock.assert_called_once()
-        call_kwargs = mark_blocked_mock.call_args[1]
-        assert call_kwargs.get('escalate_to_human') is True, (
-            f'Expected escalate_to_human=True; got {call_kwargs}'
-        )
-        assert call_kwargs.get('category') == 'preexisting_main_break', (
-            f'Expected category=preexisting_main_break; got {call_kwargs}'
-        )
-        # root_cause should mention re-break or attempt cap
-        root_cause = call_kwargs.get('root_cause', '')
-        assert root_cause, f'Expected root_cause set; got {call_kwargs}'
+        assert mark_blocked_mock.call_args[1].get('skip_escalation') is True
         assert result == WorkflowOutcome.BLOCKED
 
 
@@ -864,7 +874,7 @@ class TestAutoHealSignatureDerivedFromOutcome:
     def test_two_distinct_outcomes_get_independent_attempt_counters(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import MainHealthAutoHealRegistry
+        from orchestrator.merge_lane.worker import MainHealthAutoHealRegistry
 
         config = _make_config(tmp_path)
 
@@ -874,6 +884,7 @@ class TestAutoHealSignatureDerivedFromOutcome:
         shared_merge_worker.is_lane_halted = MagicMock(return_value=False)
         shared_merge_worker.halt_lane = MagicMock()
         shared_merge_worker.set_lane_halt_owner = MagicMock()
+        shared_merge_worker.main_fix_filer = None
 
         # Outcome A: compile_error / TS2322 / StatusBar
         outcome_a = MergeOutcome(
@@ -1104,12 +1115,9 @@ class TestAutoHealNoHaltWithoutOwner:
         assert not spawned_args, (
             'Expected no spawn when escalation_queue is None (no owner can be registered)'
         )
-        # Must fall back to escalate-only (branch d)
+        # Falls back to branch (d): block with no escalation to file
         mark_blocked_mock.assert_called_once()
-        call_kwargs = mark_blocked_mock.call_args[1]
-        assert call_kwargs.get('escalate_to_human') is True, (
-            f'Expected escalate_to_human=True in fallback; got {call_kwargs}'
-        )
+        assert mark_blocked_mock.call_args[1].get('skip_escalation') is True
         assert result == WorkflowOutcome.BLOCKED
 
 
@@ -1137,7 +1145,7 @@ class TestAutoHealConcurrentSameSignature:
     def test_concurrent_duplicate_folds_via_idempotency_not_cap(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         config = _make_config(tmp_path)
 
@@ -1225,4 +1233,59 @@ class TestAutoHealConcurrentSameSignature:
         )
         assert not call_kwargs_b.get('escalate_to_human'), (
             f'Task B must NOT set escalate_to_human (indicates wrong branch); got {call_kwargs_b}'
+        )
+
+
+class TestAutoHealHaltOwnerSurvivesOwnBlock:
+    def test_halt_owner_is_l1_and_survives_mark_blocked(self, tmp_path: Path) -> None:
+        """The halt owner must outlive the _mark_blocked call that blocks its task.
+
+        Filed at L0, it did not: the happy path registers the halt owner and
+        then calls _mark_blocked(skip_escalation=True), which dismisses every
+        pending L0 for the task, once in its skip_escalation cleanup and again
+        in its orphan-L0 fall-through.  In production that dismissal reaches
+        harness.py::Harness._on_escalation_resolved, where is_halt_owner ->
+        unhalt_wip() releases the normal-lane halt while main is still red.
+        """
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt-survives'
+        worktree.mkdir()
+        outcome = _make_compile_error_outcome()
+
+        workflow = _make_workflow(config, worktree)
+        workflow.merge_queue = asyncio.Queue()
+        workflow.scheduler.update_task = AsyncMock()
+        workflow.mcp = None
+        real_lane = MergeLane(
+            git_ops=_make_mock_git_ops(tmp_path), queue=asyncio.Queue(),
+            verifier=FakeVerifier(), clock=FakeClock(),
+        )
+        workflow.merge_worker = real_lane
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        workflow.escalation_queue = escalation_queue
+
+        async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
+            request.result.set_result(outcome)
+
+        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
+            asyncio.run(
+                workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
+            )
+
+        main_breaks = [
+            esc for esc in escalation_queue.get_pending()
+            if esc.category == 'preexisting_main_break'
+        ]
+        assert len(main_breaks) == 1, (
+            f'Expected the halt owner to survive the block; pending: '
+            f'{escalation_queue.get_pending()}'
+        )
+        esc = main_breaks[0]
+        assert esc.level == 1, f'Expected level 1; got {esc.level}'
+        assert esc.suggested_action == MainHealthNextAction.AUTO_HEAL_IN_FLIGHT, (
+            f'Expected the in-flight auto-heal action; got {esc.suggested_action!r}'
+        )
+        assert real_lane.lane_owned_by(esc.id) == 'normal', (
+            f'{esc.id!r} must own the normal-lane halt; got '
+            f'{real_lane.lane_owned_by(esc.id)!r}'
         )

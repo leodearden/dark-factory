@@ -118,13 +118,13 @@ echo "pre-commit: linting (main branch)..."
 # PYRIGHT_PACKAGES, since it also names non-member paths. That leg is the
 # source of truth: tests/scripts/test_hook_ruff_targets_drift.py fails when
 # this list and the leg disagree, so widen both together.
-RUFF_TARGETS=(shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills)
+RUFF_TARGETS=(shared escalation fused-memory orchestrator dashboard sampler cockpit client-feed conftest.py df_pytest_isolation.py skills)
 # Every package the merge gate type-checks, in the order of
 # dark-factory-orchestrator.yaml::type_check_command (all carry [tool.pyright];
 # pyright runs per-package from its directory). That chain is the source of
 # truth: tests/scripts/test_hook_pyright_packages_drift.py fails when this list
 # and the chain disagree, so widen both together.
-PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard shared escalation sampler cockpit)
+PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard shared escalation sampler cockpit client-feed)
 # Dependency packages that the other PYRIGHT_PACKAGES import. They are
 # pyright-checked like any other member, but a staged change here can break a
 # consumer without touching the consumer's files, so it forces a sweep across
@@ -135,7 +135,7 @@ DEP_PACKAGES=(shared escalation)
 # scans, in the order of dark-factory-orchestrator.yaml::lint_command. That leg is
 # the source of truth: tests/scripts/test_hook_magicmock_test_dirs_drift.py fails
 # when this list and the leg disagree, so widen both together.
-MAGICMOCK_TEST_DIRS=(shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests)
+MAGICMOCK_TEST_DIRS=(shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests client-feed/tests)
 
 RUFF_PATHS=()
 for target in "${RUFF_TARGETS[@]}"; do

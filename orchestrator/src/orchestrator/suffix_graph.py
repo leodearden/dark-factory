@@ -1,15 +1,15 @@
 """Suffix-conflict graph and bounce-state tracker (MQ-refactor task δ=1988).
 
-Extracted verbatim from :mod:`orchestrator.merge_queue`: the two-layer
-suffix-conflict machinery — ``SuffixConflictGraph`` (the immutable
-conflict-graph dataclass) and ``EMPTY_SUFFIX_CONFLICT_GRAPH`` (its sentinel
-empty instance) — plus a NEW :class:`SuffixConflictTracker` class that owns
-the state (``graph`` / ``signature`` / ``last_known_main_sha`` /
+Extracted verbatim from the merge-lane worker (:mod:`orchestrator.merge_lane.worker`):
+the two-layer suffix-conflict machinery — ``SuffixConflictGraph`` (the
+immutable conflict-graph dataclass) and ``EMPTY_SUFFIX_CONFLICT_GRAPH`` (its
+sentinel empty instance) — plus a NEW :class:`SuffixConflictTracker` class
+that owns the state (``graph`` / ``signature`` / ``last_known_main_sha`` /
 ``bounce_registry``) and logic (``recompute()`` /
 ``bounce_conflicting_suffix_items()``) that previously lived directly on
-``SpeculativeMergeWorker``.  ``merge_queue`` re-exports all three names
-through a top-level shim so existing importers
-(``from orchestrator.merge_queue import X``, etc.) keep working unchanged.
+``SpeculativeMergeWorker``.  The worker imports all three names from here at
+module level; the pre-package alias module that also re-exported them is
+gone (task 5037).  This module is a lane component kept outside the package.
 
 ``SpeculativeMergeWorker`` delegates to a ``SuffixConflictTracker`` instance
 (``self._suffix_tracker``) via thin property/method wrappers that preserve
@@ -19,23 +19,23 @@ the worker's original attribute names (``_suffix_conflict_graph``,
 (``recompute_suffix_conflict_graph()``, ``_bounce_conflicting_suffix_items()``)
 so the existing conflict-graph and bounce test suites keep passing with zero
 churn.  The tracker itself never holds a worker reference: GitOps access,
-lane-buffer access, and frozen-prefix reads are injected as narrow
-*re-reading* callables (``git_ops``, ``lane_buffers``, ``frozen_prefix``,
-``frozen_prefix_tip``) that look up the caller's live attribute on every
-call — not a value or bound method captured once at construction — so the
-tracker is unit-testable standalone AND stays correct if the caller later
-reassigns e.g. ``worker._git_ops`` (amend: reviewer
+lane-buffer access, frozen-prefix reads, and lifecycle retirement are
+injected as narrow *re-reading* callables (``git_ops``, ``lane_buffers``,
+``frozen_prefix``, ``frozen_prefix_tip``, ``retire_item``) that look up the
+caller's live attribute on every call — not a value or bound method captured
+once at construction — so the tracker is unit-testable standalone AND stays
+correct if the caller later reassigns e.g. ``worker._git_ops`` (amend: reviewer
 robustness_stale_reference / consistency, task δ=1988).
 
-A moved method that reads a merge_queue-resident constant (``MERGE_LANES``,
+A moved method that reads a worker-resident constant (``MERGE_LANES``,
 ``MERGE_BOUNCE_CAP``, ``NEEDS_REBASE_REASON_PREFIX``) — these stay in
-``merge_queue.py`` and are NOT moved — resolves it through a function-local
-(deferred) import from :mod:`orchestrator.merge_queue` rather than a
-top-level import.  This mirrors the reach-back convention established by
-:mod:`orchestrator.merge_liveness` / :mod:`orchestrator.merge_drift` and
-keeps this module free of any top-level import of ``merge_queue`` (which
-would deadlock module load, since merge_queue's shim needs this module
-fully defined first).
+``merge_lane/worker.py`` and are NOT moved — resolves it through a
+function-local (deferred) import from :mod:`orchestrator.merge_lane.worker`
+rather than a top-level import.  This mirrors the reach-back convention of
+:mod:`orchestrator.merge_lane.liveness` / :mod:`orchestrator.merge_lane.drift` and
+keeps this module free of any top-level import of the worker (which would
+deadlock module load, since the worker imports this module at module level
+and needs it fully defined first).
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ import secrets
 from collections.abc import Callable
 
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_types import (
+from orchestrator.merge_lane.types import (
     GroupMergeRequest,
     MergeBounceRegistry,
     MergeOutcome,
@@ -56,7 +56,7 @@ from orchestrator.merge_types import (
 )
 from orchestrator.overlap_footprint import Footprint, get_overlap_detector
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -147,9 +147,9 @@ EMPTY_SUFFIX_CONFLICT_GRAPH = SuffixConflictGraph(
 def _merge_queue_constants() -> tuple[tuple[str, ...], int, str]:
     """Resolve MERGE_LANES / MERGE_BOUNCE_CAP / NEEDS_REBASE_REASON_PREFIX once.
 
-    These three constants stay in ``merge_queue.py`` (not moved — see module
-    docstring).  The function-local (deferred) import is required to avoid
-    deadlocking merge_queue's re-export shim, but that constraint only binds
+    These three constants stay in ``merge_lane/worker.py`` (not moved — see
+    module docstring).  The function-local (deferred) import is required to
+    avoid deadlocking the worker's own module load, but that constraint only binds
     at *module import time*; by the time :meth:`SuffixConflictTracker.recompute`
     or :meth:`SuffixConflictTracker.bounce_conflicting_suffix_items` actually
     run (the merge-acquire hot path), both modules are already fully loaded.
@@ -157,7 +157,7 @@ def _merge_queue_constants() -> tuple[tuple[str, ...], int, str]:
     sys.modules dict lookup + attribute rebind once, not on every call
     (amend: reviewer performance).
     """
-    from orchestrator.merge_queue import (
+    from orchestrator.merge_lane.worker import (
         MERGE_BOUNCE_CAP,
         MERGE_LANES,
         NEEDS_REBASE_REASON_PREFIX,
@@ -168,10 +168,12 @@ def _merge_queue_constants() -> tuple[tuple[str, ...], int, str]:
 class SuffixConflictTracker:
     """Owns the two-layer suffix-conflict state + logic (task δ=1988).
 
-    Constructed with four narrow accessor callables — ``git_ops``,
-    ``lane_buffers``, ``frozen_prefix``, ``frozen_prefix_tip`` — instead of a
-    worker reference, so the tracker is fully unit-testable without a
-    :class:`SpeculativeMergeWorker`.  All four are captured as callables (not
+    Constructed with five narrow accessor callables — ``git_ops``,
+    ``lane_buffers``, ``frozen_prefix``, ``frozen_prefix_tip``,
+    ``retire_item`` — instead of a worker reference, so the tracker is fully
+    unit-testable without a :class:`SpeculativeMergeWorker`.  ``retire_item``
+    is required: a request diverted out of its lane must leave the caller's
+    lifecycle registry too.  All five are captured as callables (not
     their values, and not a bound-method snapshot) so the tracker always
     re-reads the caller's live state at call time, including a
     :class:`~orchestrator.git_ops.GitOps` reassigned on the caller *after*
@@ -196,11 +198,13 @@ class SuffixConflictTracker:
         lane_buffers: Callable[[], dict[str, collections.deque[MergeRequest]]],
         frozen_prefix: Callable[[], tuple[str, ...]],
         frozen_prefix_tip: Callable[[str], str],
+        retire_item: Callable[[str], None],
     ) -> None:
         self._git_ops = git_ops
         self._lane_buffers = lane_buffers
         self._frozen_prefix = frozen_prefix
         self._frozen_prefix_tip = frozen_prefix_tip
+        self._retire_item = retire_item
         self.graph: SuffixConflictGraph = EMPTY_SUFFIX_CONFLICT_GRAPH
         self.signature: tuple[tuple[str, ...], str] | None = None
         self.last_known_main_sha: str | None = None
@@ -208,8 +212,9 @@ class SuffixConflictTracker:
         self._escalations_issued: int = 0
         self._incarnation: str = secrets.token_hex(4)
 
-    def _escalate(self, req: MergeRequest, detail: str) -> int:
-        """Divert *req* out of its lane and resolve it blocked; return the ordinal.
+    def _escalate(self, lane: str, req: MergeRequest, detail: str) -> int:
+        """Divert *req* out of *lane*, retire it from the caller's lifecycle
+        registry, and resolve it blocked; return the ordinal.
 
         Its reason never repeats, not even across a restart (guard and why:
         ``orchestrator/tests/test_merge_queue_bounce.py::TestBounceEscalationsNeverFeedTheThrashLadder``).
@@ -224,7 +229,8 @@ class SuffixConflictTracker:
         self._escalations_issued += 1
         ordinal = self._escalations_issued
         branch = req.branch.bare_id
-        self._lane_buffers()[req.lane].remove(req)
+        self._lane_buffers()[lane].remove(req)
+        self._retire_item(req.request_id)
         self.bounce_registry.clear(branch)  # fresh slate on resubmission
         outcome = MergeOutcome(
             status='blocked',
@@ -559,18 +565,20 @@ class SuffixConflictTracker:
 
         frozen_tip = self._frozen_prefix_tip(main_sha)
 
-        # Build a rid → MergeRequest index over all lane buffers.
-        rid_to_req: dict[str, MergeRequest] = {}
+        # Build a rid → (lane, MergeRequest) index over all lane buffers,
+        # keyed by the lane each request was FOUND in.
+        rid_to_req: dict[str, tuple[str, MergeRequest]] = {}
         for lane in MERGE_LANES:
             for req in self._lane_buffers()[lane]:
-                rid_to_req[req.request_id] = req
+                rid_to_req[req.request_id] = (lane, req)
 
         _any_bounced = False
 
         for rid in self.graph.conflicts_with_main:
-            req = rid_to_req.get(rid)
-            if req is None:
+            found = rid_to_req.get(rid)
+            if found is None:
                 continue  # item already gone (escalated or removed)
+            lane, req = found
             if isinstance(req, GroupMergeRequest):
                 continue  # trains keep their own TRAIN_REBASE_CONFLICT path
 
@@ -587,7 +595,7 @@ class SuffixConflictTracker:
             if count > MERGE_BOUNCE_CAP:
                 # Cap exceeded — escalate WITHOUT rebasing.
                 ordinal = self._escalate(
-                    req, f'bounce cap exceeded (count={count}, cap={MERGE_BOUNCE_CAP})',
+                    lane, req, f'bounce cap exceeded (count={count}, cap={MERGE_BOUNCE_CAP})',
                 )
                 logger.warning(
                     '_bounce_conflicting_suffix_items: cap exceeded task_id=%s '
@@ -620,7 +628,7 @@ class SuffixConflictTracker:
             else:
                 # Real conflict — remove from lane buffer and escalate.
                 ordinal = self._escalate(
-                    req, f'has a real rebase conflict onto frozen tip {frozen_tip!r}',
+                    lane, req, f'has a real rebase conflict onto frozen tip {frozen_tip!r}',
                 )
                 logger.warning(
                     '_bounce_conflicting_suffix_items: rebase conflict task_id=%s '

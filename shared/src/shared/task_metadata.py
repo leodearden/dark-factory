@@ -23,6 +23,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
 from shared.task_deferral import DeferralRecord
 
 __all__ = [
@@ -46,6 +47,7 @@ __all__ = [
     'is_known_metadata_key',
     'parse_metadata',
     'register_metadata_submodel',
+    'script_root_kind_conflict',
     'validate_model_overrides',
 ]
 
@@ -167,6 +169,12 @@ class BeforeDone(BaseModel):
     ``deterministic_task_guard._validate_before_done`` (fused-memory); the
     filesystem-level checks (path containment, executable bit) stay at the
     ``submit_task`` guard — this model enforces only the type/shape layer.
+    With ``script_root='factory'`` the script resolves against
+    ``shared.repo_paths.resolve_dark_factory_root()`` while cwd stays
+    project_root. ``shared.before_done_paths`` resolves that path for both the
+    submit guard and the orchestrator's deterministic runner; only the guard
+    (``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``)
+    checks the resolved file on disk — the runner joins the path and runs it.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -178,6 +186,29 @@ class BeforeDone(BaseModel):
     timeout_secs: int = Field(gt=0)
     target_unit: str | None = None
     kind: Literal['deploy', 'predicate'] = 'deploy'
+    script_root: Literal['project', 'factory'] = 'project'
+
+    @model_validator(mode='after')
+    def _factory_script_root_requires_predicate(self) -> BeforeDone:
+        conflict = script_root_kind_conflict(self.script_root, self.kind)
+        if conflict is not None:
+            raise ValueError(f'BeforeDone: {conflict}')
+        return self
+
+
+def script_root_kind_conflict(script_root: str, kind: str) -> str | None:
+    """Why ``before_done`` may not pair *script_root* with *kind*; ``None`` when it may.
+
+    The single statement of the predicate-only rule for factory-rooted scripts,
+    called by ``BeforeDone``, the fused-memory submit guard and
+    ``shared.before_done_paths.resolve_script_base``.
+    """
+    if script_root == 'factory' and kind != 'predicate':
+        return (
+            f"script_root='factory' requires kind='predicate' (got kind={kind!r}); "
+            'a deploy runs a script from its own project.'
+        )
+    return None
 
 
 class DoneProvenance(BaseModel):
@@ -830,6 +861,9 @@ register_metadata_submodel('recurrence', Recurrence, cardinality='dict')
 # deferral: plans/deferral-flip-condition-prd.md §5.1.
 register_metadata_submodel('deferral', DeferralRecord, cardinality='dict')
 
+# strand_converted: shared/src/shared/strand_conversion.py.
+register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardinality='dict')
+
 
 def _normalize_legacy_memory_hints(value: object) -> object:
     """Coerce a legacy list-of-dicts ``memory_hints`` value to canonical dict shape.
@@ -1037,6 +1071,8 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         'curator_action',
         'curator_justification',
         'combined_at',
+        # stamped by the task curator on every create its dedupe pass did not judge; the re-dedupe sweep key
+        'dedupe_skipped',
         'gate_escalated_at',
         'before_done_ran_at',
         'before_done_verified_at',
@@ -1262,8 +1298,9 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # writers `orchestrator/src/orchestrator/merge_queue.py::
         # SpeculativeMergeWorker::_spawn_main_health_fix_task` (auto-heal
         # main-health fix task, 'high'), `orchestrator/src/orchestrator/
-        # workflow.py::build_offline_lane_fix_task_arguments` (offline-lane fix
-        # task, 'normal') and `orchestrator/src/orchestrator/workflow.py::
+        # offline_lane_filing.py::build_lane_fix_task_arguments` and
+        # `::build_lane_command_task_arguments` (offline-lane fix tasks,
+        # 'normal') and `orchestrator/src/orchestrator/workflow.py::
         # TaskWorkflow::_spawn_main_health_fix_task` (fix-main brief, 'high');
         # reader `orchestrator/src/orchestrator/merge_queue.py::
         # lane_for_task_metadata` -> `_normalize_lane`, consumed at
@@ -1333,6 +1370,15 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # §10): written and read back only by
         # `fused-memory/src/fused_memory/reconciliation/audit_trail_rotation.py`.
         'audit_trail_rotation',
+        # Plan task-text provenance mirror (task 4031): written by orchestrator
+        # TaskWorkflow._mirror_plan_text_fp at plan authoring; read by
+        # fused-memory's amendment advisory (task 4034).
+        'plan_text_fp',
+        'plan_authored_at',
+        # The sha-independent main-break signature a fix-main task owns (task 5471):
+        # written by orchestrator/src/orchestrator/main_health_fix_owner.py, which
+        # also reads it back through find_tasks_by_metadata as its dedupe key.
+        'main_health_signature',
     }
 )
 

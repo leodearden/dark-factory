@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import _init_harness_state_for_test
 from escalation.queue import EscalationQueue
+from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.config import OrchestratorConfig
@@ -39,7 +40,6 @@ from orchestrator.harness import (
     _WATCHER_TIMEOUT_GRACE_SECS,
     Harness,
 )
-from orchestrator.repo_paths import DARK_FACTORY_ROOT_ENV
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
@@ -3174,6 +3174,30 @@ class TestWatcherAllowedTools:
             f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
             'silently blind the drain to archived L2s (task 3999); '
             f'current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+
+    def test_skill_tool_is_denied(self) -> None:
+        """The bare 'Skill' tool is denied, and never pre-granted.
+
+        On 2026-08-08 a resumed rotation invoked Skill{escalation-watcher}
+        and force-released the L2 watcher lease. The rotation runs under
+        bypassPermissions, where only the deny list blocks a tool, and an
+        allowlist entry is a permission pre-grant.
+        """
+        assert 'Skill' in _WATCHER_DISALLOWED_TOOLS, (
+            "'Skill' must be in _WATCHER_DISALLOWED_TOOLS: on 2026-08-08 a "
+            'resumed rotation invoked Skill{escalation-watcher} and '
+            'force-released the watcher lease, and under bypassPermissions '
+            f'only the deny list blocks; current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+        granted = [
+            t for t in _WATCHER_ALLOWED_TOOLS
+            if t == 'Skill' or t.startswith('Skill(')
+        ]
+        assert granted == [], (
+            f'_WATCHER_ALLOWED_TOOLS pre-grants the Skill tool via {granted}; '
+            'the 2026-08-08 incident (Skill{escalation-watcher} took the '
+            'watcher lease) needs it denied, not granted'
         )
 
 

@@ -327,8 +327,9 @@ the same for an embedding arm's copy, re-embed and index transitions.
 
 ## Known limitations
 
-- `GraphitiBackend.search` returns `[]` on timeout, so a timed-out retrieval
-  probe reads as a miss. That is the production behaviour being measured.
+- `GraphitiBackend.search` raises a `TimeoutError` naming its read budget when
+  it times out. A timed-out retrieval probe therefore stops the run; it is not
+  recorded as a miss.
 - The harness never sets graphiti's `SEMAPHORE_LIMIT`, whose env name collides
   with the queue knob. `run.json` records the effective value, and the
   symmetry check requires it to be equal across arms.

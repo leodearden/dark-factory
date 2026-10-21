@@ -1,15 +1,17 @@
-"""Structural guards on how ``task_curator.py`` fails open.
+"""Structural guards on how ``task_curator.py`` fails open, or defers.
 
-All three guard one hazard: a degraded curation that no signal distinguishes
-from a healthy one, which returns ``action='create'`` exactly as a healthy
-create does.
+All four guard one hazard: a curation that no judgement stands behind, yet
+which no signal distinguishes from a healthy one.
 
-1. Every exception arm around ``TaskCurator.curate()``'s LLM call routes
-   through ``report_failure``.
+1. Every exception arm around ``TaskCurator.curate()``'s LLM call either
+   routes through ``report_failure`` or returns ``CuratorDecision.deferred``.
+   A defer creates nothing, so it cannot pass for a healthy create.
 2. No ``TaskCurator`` method builds an ``action='create'`` decision except the
    ``_degraded_create`` funnel, which is what advances the degraded streak.
 3. Every ``CuratorDecision(action='create', ...)`` in the module states its
    ``degraded=`` classification explicitly, as a literal.
+4. ``CuratorDecision.deferred`` is the only builder of ``action='defer'`` in
+   the curator and the interceptor, so every defer carries a ``DeferReason``.
 
 The behavioural halves live in test_task_curator.py. Those pin the paths that
 exist today; these assert over the shapes themselves, so the requirements land
@@ -20,7 +22,8 @@ satisfy a check.
 Deliberately NOT asserted: which exception types the arms catch, their order,
 what each passes to ``report_failure``, or which way a branch is classified.
 Those are design choices; the invariants are only that no arm is silent, no
-create is uncounted, and no fail-open leaves its classification to a default.
+create is uncounted, no fail-open leaves its classification to a default, and
+no defer is built without its reason.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from _ast_guard import calls_named, parse_python_module
 
 SRC_ROOT = pathlib.Path(__file__).parents[1] / 'src' / 'fused_memory'
 TASK_CURATOR = SRC_ROOT / 'middleware' / 'task_curator.py'
+TASK_INTERCEPTOR = SRC_ROOT / 'middleware' / 'task_interceptor.py'
 
 CURATOR_CLASS = 'TaskCurator'
 CURATE_METHOD = 'curate'
@@ -40,15 +44,17 @@ CURATE_METHOD = 'curate'
 # path ``self._call_llm_batch(...)`` cannot select the wrong ``try``.
 LLM_CALL = '_call_llm'
 REPORT_CALL = 'report_failure'
+DEFER_FUNNEL = 'deferred'
 
 # The single funnel every degraded decision must leave through, so that
 # counting degradations does not mean enumerating their causes.
 DECISION_TYPE = 'CuratorDecision'
 DEGRADED_FUNNEL = '_degraded_create'
 
-# The arms as of the fix: AllAccountsCappedException, CuratorFailureError, and
-# the catch-all. A handler list shorter than this means an arm was deleted
-# rather than instrumented, which would satisfy the silence check vacuously.
+# The arms as of task 4503: the pool-unavailable errors (which defer),
+# CuratorFailureError, and the catch-all. A handler list shorter than this
+# means an arm was deleted rather than instrumented, which would satisfy the
+# silence check vacuously.
 EXPECTED_ARMS = 3
 
 
@@ -102,15 +108,17 @@ def test_llm_call_is_wrapped_in_the_expected_arms():
     )
 
 
-def test_every_llm_exception_arm_reports_failure():
+def test_every_llm_exception_arm_reports_failure_or_defers():
     silent = [
         handler
         for handler in _llm_try().handlers
         if not calls_named(handler, REPORT_CALL)
+        and not calls_named(handler, DEFER_FUNNEL)
     ]
     assert not silent, (
         f'{CURATOR_CLASS}.{CURATE_METHOD} has exception arm(s) around '
-        f'{LLM_CALL}() that never call {REPORT_CALL}(): '
+        f'{LLM_CALL}() that neither call {REPORT_CALL}() nor return '
+        f'{DECISION_TYPE}.{DEFER_FUNNEL}(): '
         + ', '.join(
             f'{_handler_label(handler)} at line {handler.lineno}'
             for handler in silent
@@ -118,7 +126,7 @@ def test_every_llm_exception_arm_reports_failure():
         + '. A curator failure that reaches a silent arm still returns '
         "action='create', which is indistinguishable downstream from a healthy "
         'create — the shape of the 2026-08-13 outage. Route it through the '
-        f'escalator ({REPORT_CALL}) as the sibling arms do.'
+        f'escalator ({REPORT_CALL}) as the sibling arms do, or defer it.'
     )
 
 
@@ -228,4 +236,61 @@ def test_every_fail_open_create_declares_degradedness():
         'it would fire the alarm on a working service. Give each cause its own '
         'branch — a condition ORing a payload failure into a state veto hands '
         'the payload failure the veto\'s classification.'
+    )
+
+
+# --- Invariant 4: one builder of a defer ------------------------------------
+
+
+def _decision_class() -> ast.ClassDef:
+    for node in ast.walk(parse_python_module(TASK_CURATOR)):
+        if isinstance(node, ast.ClassDef) and node.name == DECISION_TYPE:
+            return node
+    raise AssertionError(
+        f'{TASK_CURATOR.name}: no class {DECISION_TYPE} — this guard has lost '
+        f'its subject; re-point it rather than deleting it.'
+    )
+
+
+def _defer_funnel() -> ast.FunctionDef:
+    for child in _decision_class().body:
+        if isinstance(child, ast.FunctionDef) and child.name == DEFER_FUNNEL:
+            return child
+    raise AssertionError(
+        f'{DECISION_TYPE} has no {DEFER_FUNNEL}() — this guard has lost its '
+        f'subject; re-point it rather than deleting it.'
+    )
+
+
+def _builds_a_defer(call: ast.Call) -> bool:
+    action = next((kw.value for kw in call.keywords if kw.arg == 'action'), None)
+    return isinstance(action, ast.Constant) and action.value == 'defer'
+
+
+def test_no_module_builds_a_defer_but_its_constructor():
+    """Any call passing ``action='defer'`` — ``CuratorDecision(...)``,
+    ``cls(...)`` or ``dataclasses.replace(...)`` — outside the funnel would
+    yield a defer with no ``DeferReason`` for the store to park it under."""
+    funnel_calls = {
+        id(node) for node in ast.walk(_defer_funnel()) if isinstance(node, ast.Call)
+    }
+    assert any(
+        _builds_a_defer(node)
+        for node in ast.walk(_defer_funnel())
+        if isinstance(node, ast.Call)
+    ), f'{DECISION_TYPE}.{DEFER_FUNNEL}() builds no action=\'defer\' — re-point this guard.'
+    rogue = [
+        (module.name, node.lineno)
+        for module in (TASK_CURATOR, TASK_INTERCEPTOR)
+        for node in ast.walk(parse_python_module(module))
+        if isinstance(node, ast.Call)
+        and _builds_a_defer(node)
+        and id(node) not in funnel_calls
+    ]
+    assert not rogue, (
+        "action='defer' built outside "
+        f'{DECISION_TYPE}.{DEFER_FUNNEL}(): '
+        + ', '.join(f'{name} line {line}' for name, line in rogue)
+        + f'. Build every defer through {DECISION_TYPE}.{DEFER_FUNNEL}(reason), '
+        'which is what guarantees it carries the reason it is parked under.'
     )

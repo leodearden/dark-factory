@@ -1206,6 +1206,19 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'filed by task 4484 step-9.'
         ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
+    (
+        'fused-memory/src/fused_memory/server/tools.py',
+        'create_mcp_server.find_tasks_by_metadata',
+        '81d0d2709341',
+        'to_file',
+        'SAME ROOT CAUSE as the server/tools.py::_normalize_project_root '
+        'cluster above, added deliberately as its 23rd handler by task '
+        '6385: the cold-miss-only subprocess.run(git) in '
+        'models/scope.py::resolve_main_checkout, memoised by '
+        '_MAIN_CHECKOUT_CACHE. Offloading it here alone would diverge from '
+        'the 22 siblings that one shared fix closes together.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+    ),
 ]
 
 #: Derived, never hand-maintained beside the rows -- a second list would drift.

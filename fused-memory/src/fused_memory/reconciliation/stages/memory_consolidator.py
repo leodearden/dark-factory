@@ -19,6 +19,10 @@ from fused_memory.models.reconciliation import (
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
 )
+from fused_memory.reconciliation.consolidation_auto_executor import (
+    auto_consolidation_initial_stats,
+    run_auto_consolidation,
+)
 from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     extract_open_gate_task_ids,
     sweep_resolved_curator_gates,
@@ -473,6 +477,10 @@ class MemoryConsolidator(BaseStage):
         # active task is human-gate-owned.
         report.stats['gate_owned_suggested_actions_normalized'] = 0
 
+        # Always present (task 5240), the same convention as the pre-inits above;
+        # the key set's one home is auto_consolidation_initial_stats.
+        report.stats.update(auto_consolidation_initial_stats())
+
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
             return report
@@ -587,6 +595,32 @@ class MemoryConsolidator(BaseStage):
                     gate_sweep['flags'],
                 )
                 report.stats['curator_gate_resolution_errors'] = gate_sweep['errors']
+
+        # ── Auto-consolidation executor (task 5240) ────────────────────────────
+        # Contract: plans/memory-auto-consolidation-prd.md C4.
+        try:
+            await run_auto_consolidation(
+                self.memory,
+                self.taskmaster,
+                self._escalation_queue,
+                project_id=self.project_id,
+                project_root=self.project_root,
+                run_id=run_id,
+                config=self.memory.config.consolidation_auto,
+                active_tasks=(
+                    self.filtered_task_tree.active_tasks
+                    if self.filtered_task_tree is not None
+                    else None
+                ),
+                report=report,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                'reconciliation.auto_consolidation_failed',
+                extra={'project_id': self.project_id, 'run_id': run_id},
+            )
 
         # ── Orphaned recon-escalation sweep (task 3052) ────────────────────────
         # Flag pending L1 ``reconciliation_stale_*`` records whose subject task

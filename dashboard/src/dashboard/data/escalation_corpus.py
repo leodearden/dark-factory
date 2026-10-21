@@ -142,11 +142,11 @@ class EscalationCorpus:
         return any(scan.reached for scan in self.scans)
 
 
-def _orchestrator_queue(root: Path) -> QueueRef:
+def _orchestrator_queue(root: Path, label: str) -> QueueRef:
     """The escalation queue of the project at *root*, beside that project's run ledger."""
     data = root / 'data'
     return QueueRef(
-        id=str(root), label=root.name, kind=QueueKind.ORCHESTRATOR,
+        id=str(root), label=label, kind=QueueKind.ORCHESTRATOR,
         directory=data / 'escalations', runs_db=data / 'orchestrator' / 'runs.db',
     )
 
@@ -161,8 +161,11 @@ def reconciliation_queue(config: DashboardConfig) -> QueueRef:
 
 def corpus_queues(config: DashboardConfig) -> tuple[QueueRef, ...]:
     """Every escalation queue: the primary root, the other known roots, reconciliation."""
-    roots = dict.fromkeys([config.project_root, *config.known_project_roots])
-    return (*(_orchestrator_queue(root) for root in roots), reconciliation_queue(config))
+    labels = config.project_labels
+    return (
+        *(_orchestrator_queue(root, labels.of(root)) for root in config.all_project_roots),
+        reconciliation_queue(config),
+    )
 
 
 def _scan(queue: QueueRef) -> QueueScan:

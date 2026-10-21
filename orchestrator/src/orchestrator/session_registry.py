@@ -3237,6 +3237,14 @@ def build_lease_name(role: str, project: str, task_id: str | None = None) -> str
 SESSION_PID_ENV = 'CLAUDE_PID'
 """Env var naming the long-lived ``claude`` process's pid (see resolve_session_pid)."""
 
+SESSION_ID_ENV = 'CLAUDE_CODE_SESSION_ID'
+"""Env var naming THIS Claude Code session's id; the CLI sets it beside ``CLAUDE_PID``."""
+
+_SESSION_ID_RE = re.compile(r'[A-Za-z0-9-]{1,128}')
+
+_SHARED_SESSION_HOST_SUBCOMMAND = b'agents'
+"""``argv[1]`` of a ``claude agents`` process, which runs the sessions it hosts in-process."""
+
 
 def _parse_session_pid(env: Mapping[str, str]) -> int | None:
     """Parse *env*'s ``CLAUDE_PID`` as a positive int, else None. Never raises, never logs."""
@@ -3245,6 +3253,108 @@ def _parse_session_pid(env: Mapping[str, str]) -> int | None:
     except (AttributeError, TypeError, ValueError):
         return None
     return pid if pid > 0 else None
+
+
+def _parse_session_id(env: Mapping[str, str]) -> str | None:
+    """Parse *env*'s ``CLAUDE_CODE_SESSION_ID`` as a session-id token, else None. Never raises, never logs."""
+    try:
+        session_id = env.get(SESSION_ID_ENV, '').strip()
+    except (AttributeError, TypeError):
+        return None
+    return session_id if _SESSION_ID_RE.fullmatch(session_id) else None
+
+
+def _is_shared_session_host(pid: int) -> bool:
+    """Whether *pid* is a ``claude agents`` process hosting several sessions.
+
+    The one home of the rule that a pid hosting several sessions cannot vouch
+    for any one of them: it outlives each. An unreadable
+    ``/proc/<pid>/cmdline`` (no /proc, a dead pid) reads as not a host.
+    """
+    if pid <= 0:
+        return False
+    try:
+        argv = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+    except (OSError, ValueError):
+        return False
+    return len(argv) >= 2 and argv[1] == _SHARED_SESSION_HOST_SUBCOMMAND
+
+
+@dataclass(frozen=True)
+class SessionIdentity:
+    """THIS session's lease identity, resolved once from the env (resolve_session_identity).
+
+    claude_pid: ``$CLAUDE_PID`` parsed, or None when unusable.
+    session_id: ``$CLAUDE_CODE_SESSION_ID`` parsed, or None when unusable.
+    shared_host: whether *claude_pid* is a shared ``claude agents`` host
+        (_is_shared_session_host), so that pid does not die with this session.
+    """
+
+    claude_pid: int | None
+    session_id: str | None
+    shared_host: bool
+
+    @property
+    def session_scoped_pid(self) -> int | None:
+        """A pid that dies with THIS session, or None."""
+        return None if self.shared_host else self.claude_pid
+
+    def lease_slug(self, name: str) -> str | None:
+        """``<name>-<claude pid>``; under a shared host ``<name>-<claude pid>-<session id>``.
+
+        None when that token is underivable -- see default_lease_slug.
+        """
+        if self.claude_pid is None:
+            return None
+        if not self.shared_host:
+            return f'{name}-{self.claude_pid}'
+        if self.session_id is None:
+            return None
+        return f'{name}-{self.claude_pid}-{self.session_id}'
+
+
+def resolve_session_identity(env: Mapping[str, str] | None = None) -> SessionIdentity:
+    """Resolve THIS session's SessionIdentity from *env* (default ``os.environ``). Never logs."""
+    if env is None:
+        env = os.environ
+    claude_pid = _parse_session_pid(env)
+    return SessionIdentity(
+        claude_pid=claude_pid,
+        session_id=_parse_session_id(env),
+        shared_host=claude_pid is not None and _is_shared_session_host(claude_pid),
+    )
+
+
+def lease_liveness_pid(identity: SessionIdentity) -> int:
+    """The pid a lease body records for *identity*: its session-scoped pid, else 0, LOUDLY.
+
+    The single home of the lease liveness degradation WARNING; why the
+    fallback is 0 is resolve_session_pid's docstring.
+    """
+    if identity.session_scoped_pid is not None:
+        return identity.session_scoped_pid
+    if identity.shared_host:
+        logger.warning(
+            'lease_liveness_pid: $%s=%s names a shared `claude agents` host, whose pid '
+            'outlives every session it hosts, so it cannot vouch for this one. The lease '
+            'pid/liveness guard is DEGRADED to heartbeat-only staleness: recording pid 0, '
+            'which is never alive, so this lease ages out and is reaped once its heartbeat '
+            'stops.',
+            SESSION_PID_ENV,
+            identity.claude_pid,
+        )
+    else:
+        logger.warning(
+            'lease_liveness_pid: $%s is unset or unusable; the lease pid/liveness '
+            'guard is DEGRADED to heartbeat-only staleness. Recording pid 0, which is '
+            'never alive, so a crashed holder still ages out and is reaped normally. '
+            'Note: neither `$$` nor `$PPID` substitutes for it -- `$$` in a Claude Code '
+            'Bash tool call is the transient /bin/bash -c wrapper, and `$PPID` is not '
+            'stable across tool calls either. Set $CLAUDE_PID; if you cannot, the lease '
+            'slug is underivable too, so pass an explicit --slug <stable-token>.',
+            SESSION_PID_ENV,
+        )
+    return 0
 
 
 def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
@@ -3265,16 +3375,17 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     because the pid was wrong for that whole year precisely because it
     depended on every skill doc getting one shell token right.
 
-    Chain, in order: ``CLAUDE_PID`` (parsed, must be > 0) -> ``0``.
+    Chain, in order: ``CLAUDE_PID`` (parsed, must be > 0, and not a shared
+    ``claude agents`` host -- see SessionIdentity) -> ``0``.
 
     THE FALLBACK IS 0 DELIBERATELY, and specifically NOT ``os.getsid(0)`` ->
     ``os.getppid()`` (which this returned before review). Those are the
-    durable-pid idiom ``session_hooks._hand_launched_liveness_pid`` uses for
-    T6's hand-launched RECORDS, and they are wrong HERE, because a lease pid
-    is consumed by a REAPER rather than merely displayed: the POSIX session
-    leader is ordinarily the interactive shell, which session_hooks itself
-    documents as living "for the terminal's whole lifetime" -- so it stays
-    alive after the ``claude`` process it stood in for has crashed.
+    durable-pid idiom ``session_ownership_probes.py::EventProbes.hand_launched_liveness_pid``
+    uses for T6's hand-launched RECORDS, and they are wrong HERE, because a
+    lease pid is consumed by a REAPER rather than merely displayed: the POSIX
+    session leader is ordinarily the interactive shell, which lives for the
+    terminal's whole lifetime -- so it stays alive after the ``claude``
+    process it stood in for has crashed.
     ``_pid_alive`` would then answer True forever, and because BOTH staleness
     rules (claim_lease's ``is_stale`` and reap_stale_leases' ``stale_pid``)
     require a DEAD pid AND an aged heartbeat, a crashed holder's lease would
@@ -3293,28 +3404,10 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     and the prescribed response to ``orphaned`` is to file a DecisionRecord
     and exit -- never to steal.
 
-    Degradation is LOUD, never silent: an unresolvable ``CLAUDE_PID`` emits a
-    WARNING stating that the lease's pid/liveness guard is degraded to
-    heartbeat-only before falling back. Never raises -- a pid we cannot
-    resolve must not break a lease claim.
+    Degradation is LOUD, never silent: lease_liveness_pid emits the WARNING.
+    Never raises -- a pid we cannot resolve must not break a lease claim.
     """
-    if env is None:
-        env = os.environ
-    pid = _parse_session_pid(env)
-    if pid is not None:
-        return pid
-    logger.warning(
-        'resolve_session_pid: %s is unset or unusable (%r); the lease pid/liveness '
-        'guard is DEGRADED to heartbeat-only staleness. Recording pid 0, which is '
-        'never alive, so a crashed holder still ages out and is reaped normally. '
-        'Note: neither `$$` nor `$PPID` substitutes for it -- `$$` in a Claude Code '
-        'Bash tool call is the transient /bin/bash -c wrapper, and `$PPID` is not '
-        'stable across tool calls either. Set $CLAUDE_PID; if you cannot, the lease '
-        'slug is underivable too, so pass an explicit --slug <stable-token>.',
-        SESSION_PID_ENV,
-        env.get(SESSION_PID_ENV, ''),
-    )
-    return 0
+    return lease_liveness_pid(resolve_session_identity(env))
 
 
 def resolve_own_record_slug(
@@ -3331,19 +3424,23 @@ def resolve_own_record_slug(
     ``LeaseHolder.record_slug`` and ``DecisionRecord.record_slug``.
 
     None when ``CLAUDE_PID`` is unusable or no vouched-for pointer exists.
+    A shared ``claude agents`` host has no session-scoped pid, so the result
+    is None there too.
     Quiet by contract: this serves enrichment, so an unresolvable slug is a
     blank field in the caller's result, not a log line.
     """
-    pid = _parse_session_pid(os.environ if env is None else env)
-    if pid is None:
-        return None
-    return resolve_session_slug_for_pid(pid, root=root)
+    pid = resolve_session_identity(env).session_scoped_pid
+    return None if pid is None else resolve_session_slug_for_pid(pid, root=root)
 
 
 def default_lease_slug(
-    name: str, env: Mapping[str, str] | None = None, *, pid: int | None = None
+    name: str, env: Mapping[str, str] | None = None, *, identity: SessionIdentity | None = None
 ) -> str | None:
     """Derive THIS session's lease slug for lease *name*: ``<name>-<session pid>``.
+
+    Under a shared ``claude agents`` host it is
+    ``<name>-<session pid>-<CLAUDE_CODE_SESSION_ID>``: every hosted session
+    shares that pid, so the pid alone would hand them all one identity.
 
     WHY THIS EXISTS (task 4248). This is ``resolve_session_pid``'s own argument,
     extended from the pid to the slug. 3994 moved the PID into code because "it
@@ -3363,8 +3460,10 @@ def default_lease_slug(
     an unusable pid. Hence a pure function of (name, env), evaluated afresh on
     every verb, rather than a value threaded through the skills.
 
-    RETURNS None WHEN THE SESSION PID IS UNRESOLVABLE -- deliberately, and
-    specifically NOT ``f'{name}-0'``. ``resolve_session_pid`` may degrade to 0
+    RETURNS None WHEN THE SESSION PID IS UNRESOLVABLE (or, under a shared host,
+    when the session id is) -- deliberately, and specifically NOT
+    ``f'{name}-0'`` nor ``f'{name}-<host pid>'``, which every hosted session
+    would share. ``resolve_session_pid`` may degrade to 0
     because a pid is a LIVENESS probe and 0 is provably dead, which keeps a
     crashed holder's lease reapable. A slug is an IDENTITY, and ``{name}-0`` is
     not unique: two concurrently-degraded sessions contending the same lease
@@ -3373,43 +3472,29 @@ def default_lease_slug(
     -- exactly 3994 defect 1 ("any caller may evict/refresh any lease") reopened
     on the degraded path. Refusing to synthesize a token we cannot make unique
     is the only answer that keeps the ownership guard honest. The CLI turns the
-    None into a loud ``parser.error`` (exit 2) naming ``$CLAUDE_PID`` and the
-    ``--slug`` override -- the same exit-2 class a slug-less ``lease-claim``
+    None into a loud ``parser.error`` (exit 2) naming the unusable variable and
+    the ``--slug`` override -- the same exit-2 class a slug-less ``lease-claim``
     already produced pre-4248, so only the DERIVABLE case gains new behaviour.
 
-    SILENT ON THE DEGRADED PATH, on purpose: ``resolve_session_pid`` already
-    emits the loud WARNING for an unresolvable ``CLAUDE_PID``, and the CLI then
-    fails loudly on the None. A warning here would be the third report of one
-    fact. The *name* is passed through verbatim -- a lease slug is never a
+    SILENT ON THE DEGRADED PATH, on purpose: the CLI fails loudly on the None,
+    and ``lease_liveness_pid`` reports a degraded liveness pid where one is
+    written. The *name* is passed through verbatim -- a lease slug is never a
     filesystem path (``lease_path_for_name`` sanitizes only the NAME, and
     ``sanitize_slug`` applies only to session RECORD slugs), so the ``#`` in a
     task-scoped ``unblock-df#2085`` needs no escaping; see LeaseHolder.session_slug.
 
-    *pid* ACCEPTS AN ALREADY-RESOLVED session pid, so a caller that also needs
-    the pid for something else resolves it ONCE and derives from that single
-    value. ``main()`` uses this on ``lease-claim``, which writes the pid into
-    the lease body AND embeds it in the slug: two independent
-    ``resolve_session_pid()`` calls would agree only by coincidence, and any
-    later change making that function non-deterministic (a cached value, a
-    fallback probe, a re-read of a mutated env) would silently desynchronise
-    the IDENTITY token from the LIVENESS pid the ``holder_liveness`` probe
-    reads. Passing None keeps the self-contained behaviour: resolve from *env*
-    (defaulting to ``os.environ``). *env* is ignored when *pid* is given --
-    the pid IS the resolution.
+    *identity* ACCEPTS AN ALREADY-RESOLVED SessionIdentity, so ``main()`` derives
+    the lease body's liveness pid and this slug from ONE resolution; *env* is
+    then ignored. Passing None resolves from *env* (defaulting to ``os.environ``).
     """
-    if pid is None:
-        pid = resolve_session_pid(env)
-    if pid <= 0:
-        return None
-    return f'{name}-{pid}'
+    return (identity if identity is not None else resolve_session_identity(env)).lease_slug(name)
 
 
 LEASE_HEARTBEAT_TTL = timedelta(hours=2)
 """How long a lease survives with a dead holder pid and no fresh heartbeat
 (mtime touch) before it is stale-reapable. Mirrors NON_TERMINAL_HEARTBEAT_TTL's
-role for session records: staleness requires BOTH a dead holder pid AND an
-aged heartbeat (see claim_lease/reap_stale_leases) -- a live holder is never
-reaped regardless of heartbeat age.
+role for session records: staleness requires BOTH an aged heartbeat AND a
+holder pid that cannot vouch for the lease -- see _lease_is_stale.
 
 VALUE DERIVATION (task 2796 THREAD 1, RE-DERIVED by task 3994). The value is
 unchanged at 7200s; its BASIS is not, because task 2796's basis is now false
@@ -3424,12 +3509,14 @@ check. Task 3994's ``resolve_session_pid`` restores a real, long-lived
 session pid, so that premise no longer holds.
 
 CURRENT BASIS (3994): with the pid guard actually live, a LIVE holder is
-never reaped regardless of heartbeat age, so this TTL now bounds only ONE
+never reaped regardless of heartbeat age (a shared ``claude agents`` host pid
+excepted, see _lease_is_stale), so this TTL now bounds only ONE
 thing -- crash recovery for a genuinely-dead holder. It nonetheless stays at
 2h rather than dropping back toward the old 5min, for two reasons:
 (a) resolve_session_pid still degrades -- to pid 0, which `_pid_alive`
 reports dead by construction -- whenever CLAUDE_PID is unresolvable on some
-launch path, and that degradation is logged but not fatal. On that path the
+launch path or names a shared ``claude agents`` host, and that degradation is
+logged but not fatal. On that path the
 AND-guard collapses to its heartbeat half exactly as it did pre-3994, so
 heartbeat-only behaviour must remain SURVIVABLE:
 7200s = 2x the canonical 3600s watcher-rearm.sh ``--timeout`` slice, giving
@@ -3781,6 +3868,16 @@ def _read_lease_holder_state(
     return holder, _pid_alive(holder.pid), age_secs
 
 
+def _lease_is_stale(holder: LeaseHolder | None, *, holder_alive: bool, age_secs: float) -> bool:
+    """Whether a lease is reapable: heartbeat past LEASE_HEARTBEAT_TTL and no pid vouching for it.
+
+    A running shared-host pid cannot vouch for its session (see _is_shared_session_host).
+    """
+    if age_secs <= LEASE_HEARTBEAT_TTL.total_seconds():
+        return False
+    return holder is None or not holder_alive or _is_shared_session_host(holder.pid)
+
+
 def claim_lease(
     name: str,
     *,
@@ -3795,9 +3892,8 @@ def claim_lease(
     exclusive-create idiom as ``ArtifactStore.lock_plan`` (artifacts.py) --
     so the first caller to create the ``.lease`` file wins outright. When the
     lease is already held, the existing holder's liveness (_pid_alive) and
-    heartbeat age (file mtime) are checked: if BOTH the holder is dead AND
-    the heartbeat is older than LEASE_HEARTBEAT_TTL, the stale lease is
-    reaped and the claim retried once; otherwise the existing holder is
+    heartbeat age (file mtime) are checked: if _lease_is_stale, the stale
+    lease is reaped and the claim retried once; otherwise the existing holder is
     reported under *policy* (STAND_DOWN/WARN_AND_PROCEED) and the on-disk
     body is never touched (no clobbering). *now* is injectable for
     deterministic tests; defaults to the real UTC clock.
@@ -3815,7 +3911,7 @@ def claim_lease(
         return _acquired_claim(name, holder, root)
 
     existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
-    is_stale = (not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
+    is_stale = _lease_is_stale(existing_holder, holder_alive=holder_alive, age_secs=age_secs)
 
     if is_stale:
         # Re-verify staleness immediately before unlinking: a competitor
@@ -3826,7 +3922,7 @@ def claim_lease(
         # it must NOT be unlinked, or we would clobber the competitor's
         # brand-new, live lease and silently violate single-owner-per-role.
         existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
-        is_stale = (not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
+        is_stale = _lease_is_stale(existing_holder, holder_alive=holder_alive, age_secs=age_secs)
 
     if is_stale:
         path.unlink(missing_ok=True)
@@ -3839,8 +3935,8 @@ def claim_lease(
             existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
         else:
             # Reaped-and-reclaimed a stale lease. The displaced holder was
-            # SUPPOSED to be dead (dead pid AND heartbeat aged past
-            # LEASE_HEARTBEAT_TTL), but this is exactly the path that -- with a
+            # SUPPOSED to be gone (_lease_is_stale), but this is exactly the
+            # path that -- with a
             # mis-tuned TTL -- once let a duplicate steal a live-but-quiet
             # watcher's lease (task 2796, THREAD 1). Emit a structured, greppable
             # WARNING naming the displaced holder (slug + pid), the observed
@@ -4043,9 +4139,8 @@ class LeaseStatus:
         lease file's mtime (None when absent) -- the FRESHNESS axis.
     heartbeat_age_secs: seconds since that heartbeat.
     reclaimable: True iff a contender could legitimately reap this lease --
-        i.e. exactly claim_lease/reap_stale_leases' own staleness predicate
-        (a dead holder pid AND a heartbeat strictly past LEASE_HEARTBEAT_TTL).
-        A live holder is never reclaimable, however quiet it has been.
+        i.e. exactly claim_lease/reap_stale_leases' own staleness predicate,
+        _lease_is_stale.
     holder_record_slug: the body's ``record_slug``, or None when it is blank
         or the lease is not 'held'.
     holder_record_state: the holder's registry record (see
@@ -4087,8 +4182,8 @@ def lease_status(
     the SAME reader claim_lease decides on -- and ``heartbeat_ts`` is derived
     from the age that reader returns rather than from a second stat(), so
     there is exactly one clock and the display cannot disagree with the
-    decision. Likewise *reclaimable* restates claim_lease's own staleness
-    predicate rather than paraphrasing it.
+    decision. Likewise *reclaimable* is claim_lease's own staleness
+    predicate, _lease_is_stale.
 
     READ-ONLY and fail-soft: never mutates the lease (an inspection that
     bumped the mtime would keep a dead holder's lease unreapable), never
@@ -4120,10 +4215,7 @@ def lease_status(
         holder_pid_alive=holder_alive,
         heartbeat_ts=(now - timedelta(seconds=age_secs)).isoformat(),
         heartbeat_age_secs=age_secs,
-        # Deliberately claim_lease's `is_stale`, verbatim: staleness needs
-        # BOTH a dead pid AND an aged heartbeat. Restating it any other way
-        # would re-create the two-clocks-disagreeing failure this fixes.
-        reclaimable=(not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds(),
+        reclaimable=_lease_is_stale(holder, holder_alive=holder_alive, age_secs=age_secs),
         holder_record_slug=(holder.record_slug or None) if holder is not None else None,
         holder_record_state=holder_record_state(holder, root=root),
     )
@@ -4137,9 +4229,11 @@ class ReapedLease:
     lease_name: the lease's identity, derived from the filename itself
         (the stem of *path*) -- never from the body, so a corrupt/missing
         body is still reapable.
-    reason: why it was reaped -- ``'stale_pid'`` (holder pid dead and the
-        heartbeat is older than LEASE_HEARTBEAT_TTL) or ``'corrupt'`` (body
-        missing/unparseable and older than LEASE_HEARTBEAT_TTL).
+    reason: why it was reaped -- ``'stale_pid'`` (a parseable body whose
+        pid is not running), ``'shared_host'`` (a parseable body whose pid
+        is running but is a shared ``claude agents`` host, which cannot
+        vouch for its session) or ``'corrupt'`` (body missing/unparseable),
+        each once _lease_is_stale judges the lease stale.
     """
 
     path: Path
@@ -4163,11 +4257,12 @@ def reap_stale_leases(
     Rules (first match wins):
     - lease body unreadable (missing or corrupt) and age >
       LEASE_HEARTBEAT_TTL -> reaped, reason='corrupt'.
-    - holder pid is dead and age > LEASE_HEARTBEAT_TTL -> reaped,
-      reason='stale_pid'.
-    - otherwise -> kept -- in particular a LIVE holder is never reaped,
-      regardless of heartbeat age (mirrors reap_stale_records' non-terminal
-      live-pid rule).
+    - a parseable body that _lease_is_stale judges stale -> reaped,
+      reason='shared_host' when its pid is running (only a shared host's
+      running pid fails to vouch), else reason='stale_pid'.
+    - otherwise -> kept -- in particular a LIVE holder pid that can vouch
+      for its session is never reaped, regardless of heartbeat age (mirrors
+      reap_stale_records' non-terminal live-pid rule).
 
     *now* is injectable for deterministic tests; defaults to the real UTC
     clock.
@@ -4188,14 +4283,20 @@ def reap_stale_leases(
         except OSError:
             continue  # vanished mid-sweep (e.g. concurrent reap) -- skip it
         age_secs = (now - datetime.fromtimestamp(mtime, tz=UTC)).total_seconds()
-        stale = age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
 
         try:
             holder = LeaseHolder.from_json(lease_path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-            reason = 'corrupt' if stale else None
+            holder = None
+        holder_alive = holder is not None and _pid_alive(holder.pid)
+        if not _lease_is_stale(holder, holder_alive=holder_alive, age_secs=age_secs):
+            reason = None
+        elif holder is None:
+            reason = 'corrupt'
+        elif holder_alive:
+            reason = 'shared_host'
         else:
-            reason = 'stale_pid' if (not _pid_alive(holder.pid)) and stale else None
+            reason = 'stale_pid'
 
         if reason is not None:
             try:
@@ -4488,9 +4589,9 @@ def _run_lease_claim(
     doc getting one shell token right.
 
     ON THE CLI PATH IT ARRIVES ALREADY RESOLVED (task 4248): ``main()`` resolves
-    the session pid ONCE and hands the same value to ``default_lease_slug`` and
-    to this function, so the pid embedded in the slug and the pid written into
-    the lease body cannot desynchronise. The ``pid is None`` fallback below is
+    the SessionIdentity ONCE and derives both the slug and this pid from it, so
+    the identity token and the pid written into the lease body cannot
+    desynchronise. The ``pid is None`` fallback below is
     therefore a defensive path for a DIRECT caller (a test, a future in-process
     caller), not the CLI's route -- and it stays, so this function remains
     correct standalone rather than depending on a caller it cannot see.
@@ -4593,8 +4694,9 @@ def _run_lease_claim(
     # the status quo, never a steal), and a false `orphaned` still triggers
     # only a NON-destructive response (file a DecisionRecord, then exit --
     # never auto-steal, which is the duplicate-spawn incident path). A holder
-    # claimed on resolve_session_pid's DEGRADED path (pid 0, unresolvable
-    # CLAUDE_PID) therefore reads `orphaned` while possibly alive -- the
+    # claimed on resolve_session_pid's DEGRADED path (pid 0: an unresolvable
+    # CLAUDE_PID, or a shared `claude agents` host) therefore reads `orphaned`
+    # while possibly alive -- the
     # deliberate, bounded cost of keeping such a lease reapable at all.
     orphaned = claim.holder is not None and not claim.holder_alive
     print(f'holder_liveness={"orphaned" if orphaned else "held"}')
@@ -5428,7 +5530,9 @@ def _build_parser() -> argparse.ArgumentParser:
         '--slug',
         default=None,
         help="this claimant's own session_slug; defaults to "
-        'default_lease_slug(--name) (`<name>-$CLAUDE_PID`). Only pass this as '
+        'default_lease_slug(--name) (`<name>-$CLAUDE_PID`, or '
+        '`<name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID` under a shared `claude agents` '
+        'host). Only pass this as '
         'an explicit operator override -- the derived value is what every '
         'later lease-heartbeat/lease-release re-derives and matches against',
     )
@@ -5437,7 +5541,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="this claimant's own long-lived session pid; defaults to "
-        'resolve_session_pid() ($CLAUDE_PID). Only pass this as an explicit '
+        'resolve_session_pid() ($CLAUDE_PID, or 0 under a shared `claude agents` host, '
+        'whose pid outlives this session). Only pass this as an explicit '
         'operator override -- never `$$`, which is the transient Bash-tool shell. '
         'This is the lease body\'s LIVENESS pid only: it does not supply the '
         "slug's identity (which always derives from $CLAUDE_PID), so --pid alone "
@@ -5478,8 +5583,10 @@ def _build_parser() -> argparse.ArgumentParser:
             '--slug',
             default=None,
             help='the slug you claimed this lease with; a mismatch is refused. '
-            'Defaults to default_lease_slug(--name) (`<name>-$CLAUDE_PID`), the '
-            'same derivation lease-claim uses -- pass it only as an operator override',
+            'Defaults to default_lease_slug(--name) (`<name>-$CLAUDE_PID`, or '
+            '`<name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID` under a shared `claude agents` '
+            'host), the same derivation lease-claim uses -- pass it only as an operator '
+            'override',
         )
         _lease_mutation_p.add_argument(
             '--force',
@@ -5636,42 +5743,35 @@ def main(argv: list[str] | None = None) -> int:
     # makes that structural instead of a three-way convention nobody enforces.
     # An explicit --slug always wins: it stays the operator's override.
     #
-    # ONE PID RESOLUTION TOO. `lease-claim` both WRITES a pid (into the lease
-    # body, for the liveness guard) and EMBEDS one (in the derived slug, as this
-    # session's identity). Resolving twice -- once here for the slug, once
-    # inside _run_lease_claim for the body -- would make the two agree only
-    # because they happen to call the same function today; any later change
-    # making resolve_session_pid non-deterministic (a cache, a fallback probe,
-    # a re-read of a mutated env) would silently desynchronise the identity
-    # token from the pid `holder_liveness` probes. So it is resolved HERE, once,
-    # and handed to BOTH: to default_lease_slug via pid=, and to
-    # _run_lease_claim via args.pid. Pinned by
+    # ONE IDENTITY RESOLUTION TOO. `lease-claim` both WRITES a liveness pid
+    # (into the lease body) and EMBEDS an identity (the derived slug), so both
+    # derive from the one SessionIdentity resolved here: to default_lease_slug
+    # via identity=, and to _run_lease_claim via args.pid
+    # (lease_liveness_pid). Pinned by
     # test_main_lease_claim_derives_the_body_pid_and_the_slug_pid_from_one_resolution.
-    # An explicit --pid is the one case where the two legitimately differ: it
-    # overrides the BODY's liveness pid only, deliberately, and never the slug
-    # -- the identity has to stay derivable by the mutating verbs, which have no
-    # --pid at all (see that flag's help, and the parser.error below).
-    # The body pid has a third consumer: the holder's `record_slug` is read from
-    # THAT pid's pointer, so the record's claude_owner_pid cross-checks the very
-    # pid the body records -- with no second resolution and no WARNING.
+    # The two legitimately differ under a shared `claude agents` host (body pid
+    # 0, slug carrying the host pid and session id) and under an explicit --pid,
+    # which overrides the BODY's liveness pid only, never the slug -- the
+    # identity has to stay derivable by the mutating verbs, which have no --pid.
+    # The body pid also keys the holder's `record_slug` lookup below.
     #
-    # Resolution is DEMAND-DRIVEN: an explicit --slug on a mutating verb needs
-    # no pid at all (those verbs never write one), and resolving anyway would
-    # emit resolve_session_pid's degradation WARNING for a fact nothing in that
-    # call depends on -- loud degradation is only useful when it is TRUE of the
-    # work being done.
+    # Resolution is DEMAND-DRIVEN, and only lease-claim's liveness pid can log:
+    # a degradation WARNING is useful only when it is TRUE of the work being
+    # done, and a heartbeat writes no pid.
     if args.verb in ('lease-claim', 'lease-heartbeat', 'lease-release'):
-        needs_session_pid = args.slug is None or (args.verb == 'lease-claim' and args.pid is None)
-        session_pid = resolve_session_pid() if needs_session_pid else None
-        if args.verb == 'lease-claim' and args.pid is None:
-            args.pid = session_pid
-        if args.slug is None:
-            args.slug = default_lease_slug(args.name, pid=session_pid)
+        derives_body_pid = args.verb == 'lease-claim' and args.pid is None
+        identity = None
+        if args.slug is None or derives_body_pid:
+            identity = resolve_session_identity()
+            if derives_body_pid:
+                args.pid = lease_liveness_pid(identity)
+            if args.slug is None:
+                args.slug = default_lease_slug(args.name, identity=identity)
         # FAIL LOUDLY, never silently. default_lease_slug returns None only
-        # when $CLAUDE_PID is unresolvable, and it refuses to synthesize
-        # `<name>-0` because that token is IDENTICAL for two concurrently-
-        # degraded sessions -- each would then pass the other's
-        # _is_lease_owner check, reopening 3994 defect 1. So we stop here.
+        # when this session's identity is underivable, and it refuses to
+        # synthesize `<name>-0` (or `<name>-<shared host pid>`) because that
+        # token is IDENTICAL for two such sessions -- each would then pass the
+        # other's _is_lease_owner check, reopening 3994 defect 1. So we stop here.
         #
         # This is NOT a breach of _run_lease_claim's fail-open contract.
         # Fail-open covers lease-SUBSTRATE faults (a corrupt lease body, an
@@ -5687,9 +5787,16 @@ def main(argv: list[str] | None = None) -> int:
         # faults and returns 0. That escape is the point: this must reach the
         # shell as a nonzero exit, not as a silently-successful no-op.
         if not args.slug:
+            cause = (
+                f'${SESSION_PID_ENV}={identity.claude_pid} names a shared `claude agents` '
+                f'host, so this session\'s identity needs ${SESSION_ID_ENV}, which is unset '
+                'or unusable'
+                if identity is not None and identity.shared_host
+                else f'${SESSION_PID_ENV} is unset or unusable'
+            )
             parser.error(
-                f'cannot derive the lease slug for --name {args.name}: ${SESSION_PID_ENV} is '
-                'unset or unusable, so this session has no stable identity to claim, '
+                f'cannot derive the lease slug for --name {args.name}: {cause}, '
+                'so this session has no stable identity to claim, '
                 'heartbeat or release a lease with. Refusing to invent one -- a synthesized '
                 'token would collide with every other degraded session and let each act on '
                 "the other's lease. Fix the environment, or pass an explicit "

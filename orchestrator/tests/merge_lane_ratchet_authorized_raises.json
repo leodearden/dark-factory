@@ -2875,6 +2875,1476 @@
           "current": 6653
         }
       ]
+    },
+    {
+      "task_id": "6052",
+      "reason": "Net-additive: the autouse exit-contract guard now pins its logger level and tears down after _drain_leaked_tasks, so the zero-would-violate soak signal task mu reads cannot go deaf under a raised orchestrator log level or drop a leaked run()'s verdict (conftest.py prose); and a new TestReadyToMergeDispatch pin drives run() through that class's existing stub seams (_invoke, the exit handler, the observed-terminal mapper) to prove a CANCELLED plan-phase exit ends the run instead of paying for an architect (test_workflow_ready_to_merge.py private reads)",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_workflow_ready_to_merge.py",
+          "baseline": 32,
+          "current": 35
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 778,
+          "current": 781
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6653,
+          "current": 6655
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32110,
+          "current": 32113
+        }
+      ]
+    },
+    {
+      "task_id": "4737",
+      "reason": "net-additive: abandoned merge-deferred recovery (custody query, abandoned re-drive); per-member re-drive extracted from worker.py into merge_lane/member_redrive.py",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/__init__.py",
+          "baseline": 93,
+          "current": 95
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4866,
+          "current": 4867
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57857,
+          "current": 57911
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6652,
+          "current": 6655
+        }
+      ]
+    },
+    {
+      "task_id": "6160",
+      "reason": "train verify threads the worker's injected VerifyPort (step-2)",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22124,
+          "current": 22126
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57578,
+          "current": 57580
+        }
+      ]
+    },
+    {
+      "task_id": "6160",
+      "reason": "remote_runners constructor seam for verify-host tests (step-4)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2195,
+          "current": 2198
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::__init__",
+          "baseline": 10,
+          "current": 11
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_ensure_host_allocator",
+          "baseline": 2,
+          "current": 4
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22126,
+          "current": 22134
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12536,
+          "current": 12540
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4842,
+          "current": 4845
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57580,
+          "current": 57588
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32032,
+          "current": 32036
+        }
+      ]
+    },
+    {
+      "task_id": "6160",
+      "reason": "H1: train verify on a leased host (step-6)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2198,
+          "current": 2209
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_note_verify_started",
+          "baseline": 0,
+          "current": 2
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22134,
+          "current": 22240
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12540,
+          "current": 12566
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4845,
+          "current": 4856
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57588,
+          "current": 57694
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32036,
+          "current": 32062
+        }
+      ]
+    },
+    {
+      "task_id": "6160",
+      "reason": "H1: RunnerUnavailable on a train's remote host re-runs on local (step-8)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2209,
+          "current": 2215
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::_leased_train_verify",
+          "baseline": 1,
+          "current": 6
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22240,
+          "current": 22273
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12566,
+          "current": 12574
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4856,
+          "current": 4862
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57694,
+          "current": 57727
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32062,
+          "current": 32070
+        }
+      ]
+    },
+    {
+      "task_id": "6160",
+      "reason": "_TrainMergeHost gained _ensure_host_allocator (H1); MagicMock host fixture must stub it",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_train_attribution.py",
+          "baseline": 8,
+          "current": 9
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6647,
+          "current": 6648
+        }
+      ]
+    },
+    {
+      "task_id": "6160",
+      "reason": "amend: _TrainMergeHost declares _escalation_queue and _flake_task_client, which _leased_train_verify used to reach by getattr string (review suggestion 4)",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22273,
+          "current": 22275
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57727,
+          "current": 57729
+        }
+      ]
+    },
+    {
+      "task_id": "6160",
+      "reason": "an interrupted train verify tears down through _teardown_verify_task (review fix, step-10)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2215,
+          "current": 2216
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22275,
+          "current": 22313
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12574,
+          "current": 12588
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4862,
+          "current": 4863
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57729,
+          "current": 57767
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32070,
+          "current": 32084
+        }
+      ]
+    },
+    {
+      "task_id": "6160",
+      "reason": "merge main into task/6160: re-absorb the train-verify VerifyPort threading and H1 leased-host verify (already authorized step-2..step-N above) onto main's 6857/4953 baseline",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2174,
+          "current": 2195
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::__init__",
+          "baseline": 10,
+          "current": 11
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_ensure_host_allocator",
+          "baseline": 2,
+          "current": 4
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_note_verify_started",
+          "baseline": 0,
+          "current": 2
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22016,
+          "current": 22205
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_train_attribution.py",
+          "baseline": 8,
+          "current": 9
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12479,
+          "current": 12531
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4863,
+          "current": 4884
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57825,
+          "current": 58014
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6652,
+          "current": 6653
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32002,
+          "current": 32054
+        }
+      ]
+    },
+    {
+      "task_id": "4757",
+      "reason": "Net-additive: the new OrchestratorConfig.strict_mcp_config leaf (on in EVAL_PROFILE) is read by TaskWorkflow._invoke, so the shared mock_orch_config fixture pins its production default False -- unassigned, the spec_set MagicMock reads truthy and would run every mock-config workflow test strictly scoped (conftest.py lines/prose); and test_eval_mcp_isolation.py drives the real TaskWorkflow._invoke once to prove a strict config is never swallowed by a role whose MCP families compose no config, the same private seam nine other test files drive (one private read)",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 1254,
+          "current": 1257
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 781,
+          "current": 783
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57842,
+          "current": 57845
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6653,
+          "current": 6654
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31941,
+          "current": 31943
+        }
+      ]
+    },
+    {
+      "task_id": "7032",
+      "reason": "Net-additive test hermeticity guard: conftest's autouse _hermetic_disk_usage fixture (the whole raise) installs _orch_helpers.py::ample_disk_usage as shutil.disk_usage, so no orchestrator test reads the host's free disk through the 10 GiB pre-verify guard. With the disk faked at 9.99 GiB, 163 tests failed on main and 0 fail with the fixture (esc-5509-2). The same task's ENOSPC change lowers worker.py and git_ops.py.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 1257,
+          "current": 1270
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 783,
+          "current": 790
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31943,
+          "current": 31945
+        }
+      ]
+    },
+    {
+      "task_id": "6861",
+      "reason": "GitOps.is_ancestor_checked: the ancestry read tells a git error (None) from a no (False), so the lane engine's D10 'no decision' row and \u03b50's drain can read it; is_ancestor delegates to it (net-additive: +10 lines, +2 cognitive, +1 prose in git_ops.py; every other measure fell or held \u2014 offline_lane.py 957->381 lines)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1444,
+          "current": 1446
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 15997,
+          "current": 16007
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9318,
+          "current": 9319
+        }
+      ]
+    },
+    {
+      "task_id": "5037",
+      "reason": "Task 5037 re-points test string patch targets from the pre-package satellite aliases (orchestrator.merge_gates, orchestrator.merge_liveness) to orchestrator.merge_lane.<submodule>. LANE_PATCH_MODULES listed only orchestrator.merge_queue among the old paths, so these same names were patched before but invisible to the measure; they now count as '<submodule>.<leaf>' (gates._run, gates._check_plan_files_touched_in_branch, gates.resolve_already_landed_branch, liveness._MERGE_AHEAD_BOUND, liveness.per_host_inflight_bound). No new coupling: each patch hits the identical binding the alias named.",
+      "measures": [
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_convert_to_blocked.py",
+          "baseline": 3,
+          "current": 5
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_merge_gates_drop_guard_rename.py",
+          "baseline": 0,
+          "current": 1
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_merge_gates_equivalence_rename.py",
+          "baseline": 0,
+          "current": 1
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_merge_gates_plan_files_rename.py",
+          "baseline": 0,
+          "current": 1
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_merge_serial_lane_tripwire.py",
+          "baseline": 1,
+          "current": 2
+        }
+      ]
+    },
+    {
+      "task_id": "5037",
+      "reason": "Task 5037 rewrote the line 'from orchestrator.landed_outbox import LandedOutbox, MergeProvenance  # noqa: E402' in orchestrator/tests/conftest.py, which changed its INV-12 inline-suppression key, so scripts/inline_suppressions.py --check rejected the suppression as new and unowned. Rather than mint a debt owner for it, the import moved into _isolated_merge_provenance, the only fixture that uses the two names, where it needs no E402 suppression. That trades one suppression for one function-local import (6 -> 7); lines hold at 1254.",
+      "measures": [
+        {
+          "measure": "function_local_imports",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 6,
+          "current": 7
+        },
+        {
+          "measure": "total:function_local_imports",
+          "key": "<cluster>",
+          "baseline": 22,
+          "current": 23
+        }
+      ]
+    },
+    {
+      "task_id": "6862",
+      "reason": "new lane-importing test file test_offline_lane_policy_reload.py enters the ratchet with one private read, OfflineLaneWorker._run_once; test_offline_lane.py already reads _run_once about 20 times among its 38 private reads, and the worker has no public single-pass entry point",
+      "measures": [
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6556,
+          "current": 6557
+        }
+      ]
+    },
+    {
+      "task_id": "3113",
+      "reason": "Net-additive regression test: TestFinaliseMergedDoneWithoutMergeSha pins that a sha-less merge success resolves through the landed-outbox journal. It must live in this file because it needs the module's autouse MergeProvenance reset, and its one private read is the call to _finalise_merged_done, the method under test; the basis-marker read was cut.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_workflow_merge_provenance.py",
+          "baseline": 88,
+          "current": 89
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6542,
+          "current": 6543
+        }
+      ]
+    },
+    {
+      "task_id": "3860",
+      "reason": "task 3860: snapshot guard so a decided pre-dispatch request is never reported queued, bounce tracker retire_item wired to _retire_item (root-cause fix), and review-fix tests pinning the retire_item wiring and registry-only ghost arm through the lane's private registry (net-additive bug fix + test coverage)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2192,
+          "current": 2195
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22145,
+          "current": 22172
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_bounce.py",
+          "baseline": 0,
+          "current": 3
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_lifecycle_registry.py",
+          "baseline": 180,
+          "current": 181
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12491,
+          "current": 12501
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4839,
+          "current": 4842
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57076,
+          "current": 57103
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6543,
+          "current": 6547
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31562,
+          "current": 31572
+        }
+      ]
+    },
+    {
+      "task_id": "7022",
+      "reason": "net-additive custody read for the abandoned-member sweep: InFlightMergeRegistry.task_ids_in_flight() so a merge-deferred task with a live single merge request is owned, plus the wiring test's one read of the harness's shared registry",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 69,
+          "current": 70
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1907,
+          "current": 1911
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_harness_abandoned_merge_deferred_wiring.py",
+          "baseline": 3,
+          "current": 4
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 985,
+          "current": 986
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4842,
+          "current": 4843
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57103,
+          "current": 57107
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6547,
+          "current": 6548
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31572,
+          "current": 31573
+        }
+      ]
+    },
+    {
+      "task_id": "3154",
+      "reason": "net-additive: task 3154 re-cut ruling park primitive (park_prior_incarnation + prior_incarnation_evidence and five helpers, each <=8 cognitive) in git_ops.py; Part A of the same task already lowered git_ops.py (cognitive 1446->1432, lines 16007->15977)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1432,
+          "current": 1463
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 15977,
+          "current": 16110
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9302,
+          "current": 9321
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4825,
+          "current": 4856
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57046,
+          "current": 57179
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31545,
+          "current": 31564
+        }
+      ]
+    },
+    {
+      "task_id": "3154",
+      "reason": "net-additive: task 3154 provisioning-door refusal (recut_ruling keyword on create_worktree and acquire_warm_lane + _refuse_prior_incarnation, 2 cognitive); Part A of the same task lowered the disk-backstop nesting",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1463,
+          "current": 1465
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 16110,
+          "current": 16133
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9321,
+          "current": 9331
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4856,
+          "current": 4858
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57179,
+          "current": 57202
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31564,
+          "current": 31574
+        }
+      ]
+    },
+    {
+      "task_id": "6647",
+      "reason": "same-tree gate skip: _reverify_rebased_tree returns a typed GateClearance and compares the rebased tree with the verified one before the overlap probe; merge_attempt gate_retry rows carry the clearance",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 335,
+          "current": 342
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_emit_merge_attempt",
+          "baseline": 18,
+          "current": 20
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_reverify_rebased_tree",
+          "baseline": 4,
+          "current": 6
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 3493,
+          "current": 3550
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22172,
+          "current": 22178
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 1581,
+          "current": 1604
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4862,
+          "current": 4869
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57233,
+          "current": 57296
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31584,
+          "current": 31607
+        }
+      ]
+    },
+    {
+      "task_id": "7196",
+      "reason": "already-on-main short-circuit (6155 slice): the rebased_pending_reverify arm asks whether the verified commit is already an ancestor of main and, if so, finalizes it done through a new SpeculativeMergeWorker._finalize_landed_by_successor instead of re-verifying main's own tree",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2195,
+          "current": 2199
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_finalize_inflight",
+          "baseline": 99,
+          "current": 102
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22178,
+          "current": 22228
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12501,
+          "current": 12510
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4869,
+          "current": 4873
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57296,
+          "current": 57346
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31607,
+          "current": 31616
+        }
+      ]
+    },
+    {
+      "task_id": "3310",
+      "reason": "task 3310 item 1: PARK strand recorded in a finally so cancellation cannot strand the slot; task 3310 item 2: _slots-driven backstop sweep for untracked PARKED hosts wired into _reprobe_loop; regression tests for the PARK strand under cancellation drive the existing _cancel_and_release_tracked/_resolve_and_release seams (ported from task/3310 31e0f7e25a..b0c74fd5e6)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2199,
+          "current": 2200
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_reprobe_loop",
+          "baseline": 3,
+          "current": 5
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22228,
+          "current": 22256
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_multihost_wiring.py",
+          "baseline": 345,
+          "current": 347
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12510,
+          "current": 12521
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4873,
+          "current": 4874
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57346,
+          "current": 57374
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6541,
+          "current": 6543
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31616,
+          "current": 31627
+        }
+      ]
+    },
+    {
+      "task_id": "6647",
+      "reason": "review fix: the same-tree skip runs only when the project declares merge_gate_history_pure (its gate reads no git history); DF ships it false",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 342,
+          "current": 343
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_reverify_rebased_tree",
+          "baseline": 6,
+          "current": 7
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 3550,
+          "current": 3556
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 1604,
+          "current": 1609
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4874,
+          "current": 4875
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57374,
+          "current": 57380
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31627,
+          "current": 31632
+        }
+      ]
+    },
+    {
+      "task_id": "7196",
+      "reason": "review fix: _finalize_advanced_merge's docstring and queue-verified-tip comment name the already-on-main caller, whose sha is on main but behind its tip",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 3556,
+          "current": 3562
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 1609,
+          "current": 1615
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57380,
+          "current": 57386
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31632,
+          "current": 31638
+        }
+      ]
+    },
+    {
+      "task_id": "3310",
+      "reason": "review fixes: the tracker sweep re-admits only the park episode its probe saw (readmit(expect_epoch=)); worker-level tests pin the backstop exclusion and the epoch-guarded re-admission through the existing reprobe seams",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2200,
+          "current": 2203
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_reprobe_quarantined_hosts",
+          "baseline": 48,
+          "current": 51
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22256,
+          "current": 22258
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_multihost_wiring.py",
+          "baseline": 347,
+          "current": 358
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4875,
+          "current": 4878
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57386,
+          "current": 57388
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6543,
+          "current": 6554
+        }
+      ]
+    },
+    {
+      "task_id": "3788",
+      "reason": "net-additive bug fix: both main-health probe sites now bind the task-mu fork's flake sink to the flake recorder (one private factory, the escalation queue threaded into _classify_main_health_red), so a load-flaked wholly-preexisting verdict is recorded and reaches the INV-4 storm escalation instead of halting the queue",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22258,
+          "current": 22295
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12521,
+          "current": 12525
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57388,
+          "current": 57425
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31638,
+          "current": 31642
+        }
+      ]
+    },
+    {
+      "task_id": "3788",
+      "reason": "review fix: reverify_member_solo forwards the escalation queue to _run_post_merge_verify so a main-probe flake-suppression storm during train solo re-verify files its INV-4 escalation; one patch target (worker.reverify_member_solo) pins that the workflow passes its queue, since the solo re-verify has no injectable seam at that call",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22295,
+          "current": 22301
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_workflow_train_attribution.py",
+          "baseline": 0,
+          "current": 1
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_workflow_train_attribution.py",
+          "baseline": 68,
+          "current": 69
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12525,
+          "current": 12528
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57425,
+          "current": 57431
+        },
+        {
+          "measure": "total:patch_targets",
+          "key": "<cluster>",
+          "baseline": 55,
+          "current": 56
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6554,
+          "current": 6555
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31642,
+          "current": 31645
+        }
+      ]
+    },
+    {
+      "task_id": "4614",
+      "reason": "net-additive regression coverage for the merge-gate narrowing exit reports",
+      "measures": [
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6555,
+          "current": 6557
+        }
+      ]
+    },
+    {
+      "task_id": "5064",
+      "reason": "Net-additive observability: the post-rebase re-verify gate records each decision as merge_reverify_gate and forwards event_store into its re-verify; record vocabulary (incl. GateClearance, moved from gates.py) in new merge_lane/reverify_gate_decision.py",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 343,
+          "current": 345
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 3562,
+          "current": 3583
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22301,
+          "current": 22303
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 1615,
+          "current": 1616
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4878,
+          "current": 4883
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57431,
+          "current": 57571
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31645,
+          "current": 31661
+        }
+      ]
+    },
+    {
+      "task_id": "5064",
+      "reason": "Review fixes for 5064: ReverifyGateReason class docstring, and the gate log's overlap-path cap named as MAX_LOGGED_OVERLAP_PATHS beside the record cap (an import line in gates.py)",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 3583,
+          "current": 3584
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py",
+          "baseline": 117,
+          "current": 120
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py",
+          "baseline": 15,
+          "current": 16
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57528,
+          "current": 57532
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31654,
+          "current": 31655
+        }
+      ]
+    },
+    {
+      "task_id": "6660",
+      "reason": "New test file test_done_phase_wedge.py drives a real TaskWorkflow through Harness._run_slot, the one seam that owns slot release; the single private read is that entry point (net-additive test of a new guarantee, not a refactor)",
+      "measures": [
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6557,
+          "current": 6558
+        }
+      ]
+    },
+    {
+      "task_id": "6132",
+      "reason": "Net-additive bug fix: deep merge-ahead build_chain now refuses a link whose branch carries a stack base that never landed on main (GitOps.unlanded_stack_base, a read-only predicate, plus worker.py::_link_refusal and one ChainTruncationReason value), so the link takes the sequential path where classify_and_merge un-stacks it (task 5618) instead of landing the base's commits under its name; build_chain's own branching moved into the helper.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1465,
+          "current": 1467
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2203,
+          "current": 2205
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 16133,
+          "current": 16151
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1911,
+          "current": 1915
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22303,
+          "current": 22326
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9331,
+          "current": 9342
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 986,
+          "current": 989
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12528,
+          "current": 12540
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4883,
+          "current": 4887
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57575,
+          "current": 57620
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31662,
+          "current": 31688
+        }
+      ]
+    },
+    {
+      "task_id": "6565",
+      "reason": "Net-additive feature (remote gate): the merge lane gains per-sha gate checkouts on the verify host, the gate-identity handshake, the skew bench class with its sticky/reprobe handling, the deployed-sha heartbeat and a worker-start sweep of a predecessor's skew L1s (liveness.py, types.py, worker.py, drift.py); test_merge_queue_multihost_wiring.py gains three private reads at the allocator seam. New capability and new guards, not a refactor that failed.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/drift.py::_build_remote_runners",
+          "baseline": 3,
+          "current": 4
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/liveness.py",
+          "baseline": 49,
+          "current": 60
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 70,
+          "current": 74
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2205,
+          "current": 2221
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_quarantine_unreachable_host",
+          "baseline": 2,
+          "current": 3
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_record_runner_unavailable",
+          "baseline": 2,
+          "current": 5
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_reprobe_loop",
+          "baseline": 5,
+          "current": 7
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/liveness.py",
+          "baseline": 1181,
+          "current": 1342
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1915,
+          "current": 1974
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22326,
+          "current": 22539
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_multihost_wiring.py",
+          "baseline": 358,
+          "current": 361
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/liveness.py",
+          "baseline": 625,
+          "current": 656
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 989,
+          "current": 1012
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12540,
+          "current": 12601
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4887,
+          "current": 4913
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57620,
+          "current": 58047
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6558,
+          "current": 6567
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31688,
+          "current": 31801
+        }
+      ]
+    },
+    {
+      "task_id": "3774",
+      "reason": "Net-additive main-health fix: worker.py::_file_main_health_escalation files at level 1 and takes a required MainHealthNextAction (call-site plumbing across the four worker filings); test_merge_queue_auto_heal.py gains one regression test for the workflow auto-heal halt owner surviving its own block, driven through _submit_to_merge_queue, which reads one private seam. Not a refactor that failed.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22539,
+          "current": 22547
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_auto_heal.py",
+          "baseline": 43,
+          "current": 44
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 58047,
+          "current": 58055
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6567,
+          "current": 6568
+        }
+      ]
+    },
+    {
+      "task_id": "5471",
+      "reason": "Net-additive fix, not a failed refactor. Task 5471: SpeculativeMergeWorker._spawn_main_health_fix_task now delegates to the shared per-signature fix-main filer (main_health_fix_owner) so a pre-existing test_failure red main gets a schedulable owner task alongside its escalation; the cognitive rise on _spawn_main_health_fix_task (1->2) and SpeculativeMergeWorker.__init__ (9->10) is the owner wiring and filer injection, and the private_reads rise is the owner-seam reads in the merge-lane worker. The filing logic itself lives outside the ratchet cluster in main_health_fix_owner.py.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::__init__",
+          "baseline": 9,
+          "current": 10
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_spawn_main_health_fix_task",
+          "baseline": 1,
+          "current": 2
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6568,
+          "current": 6581
+        }
+      ]
     }
   ]
 }

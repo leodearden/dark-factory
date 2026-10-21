@@ -1037,7 +1037,7 @@ class TestFallbackPlanAuthorityGoldens:
             f'uv run --project shared ruff check {test_path}'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py '
             'shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-            ' sampler/tests cockpit/tests'
+            ' sampler/tests cockpit/tests client-feed/tests'
         )
         assert 'check_bare_magicmock_config' in (executed[0].lint_command or '')
         # TYPE: a cd-sequenced same-tool fan-out still truncates at the keyword.

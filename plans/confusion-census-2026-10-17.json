@@ -1,0 +1,176 @@
+{
+  "record_version": 1,
+  "run_id": "census-dark_factory-20261017",
+  "date": "2026-10-17",
+  "project_id": "dark_factory",
+  "force": false,
+  "method": {
+    "run_id": "census-dark_factory-20261017",
+    "as_of_sha": "c674ec95191828f1c069835ee17ae65b770b450d",
+    "since": "12cf3ebd163c228423cfe5018013497595d559d6",
+    "evidence": {
+      "window": [
+        "2026-09-17T00:00:00+00:00",
+        "2026-10-17T00:00:00+00:00"
+      ],
+      "sessions_enumerated": 9083,
+      "skipped_coded": 213,
+      "skipped_zero_signal": 5442,
+      "mined": 40,
+      "ledger_rows": 207
+    },
+    "verification": {
+      "confirmed": 2,
+      "weakened": 0,
+      "refuted": 0,
+      "unverified": 0
+    },
+    "cost": {
+      "miner_calls": 40,
+      "verify_calls": 2,
+      "synthesis_calls": 1,
+      "probe_calls": 2,
+      "embedding_calls": 0,
+      "wall_clock_secs": 1494.761
+    },
+    "inputs_consumed": [],
+    "extra": {
+      "inputs_consumed_note": "this census reads no other instrument's report yet; matching sightings against /review, /hotspot-survey and /review-all findings arrives with the pre-screen (plans/census-incremental-prd.md leaf L6)",
+      "ledger_created_this_run": false,
+      "ledger_state": "ok",
+      "ledger_pruned": 0,
+      "ledger_error": null,
+      "verify_normalisations": {
+        "anchor_rewritten": 0,
+        "anchor_from_remediation": 0,
+        "anchor_from_title": 0,
+        "tag_dropped": 0,
+        "severity_missing": 0,
+        "severity_substituted": 0,
+        "severity_reason_missing": 0,
+        "route_defaulted": 0,
+        "remediation_rejected": 0,
+        "reason_missing": 0
+      }
+    }
+  },
+  "mining": {
+    "batch_stats": [
+      {
+        "index": 0,
+        "total": 20,
+        "succeeded": 20,
+        "failed": 0,
+        "dup_rate": 1.0,
+        "saturated": true,
+        "status": "ok"
+      },
+      {
+        "index": 1,
+        "total": 20,
+        "succeeded": 20,
+        "failed": 0,
+        "dup_rate": 0.9,
+        "saturated": true,
+        "status": "ok"
+      }
+    ],
+    "stop_reason": "saturated",
+    "max_batches": 50
+  },
+  "verify_coverage": {
+    "novel": 2,
+    "offered": 2,
+    "cap": 150
+  },
+  "mass_rejection": null,
+  "dropped_verdicts": [],
+  "matrix_md": "| origin \\ manifested | ops | unknown |\n| --- | --- | --- |\n| ops | 1 | 0 |\n| unknown | 0 | 1 |\n",
+  "synthesis_md": "## Census synthesis \u2014 2026-10-17\n\nTwo confusion findings were verified this period. They do not share a cause, an area or a skill; each is reported as its own cluster. Both are low severity: in each case the agent or the human recovered within the session and no wrong state was written.\n\n### Cluster 1 \u2014 Spawned `/team` session hands the human a brief without enough context to follow the questions\n\n**Area:** agent handoff / spawned-session context. **Phase:** unknown (origin and manifestation). **Sightings:** 1 (session `d18be7a4-0132-4e27-972e-f6779d57a8f4`). **Anchor:** `skills/spawn/SKILL.md`. **Severity:** low.\n\nA session spawned by another session carried a framing prompt that assumed context the human had never seen: prompt files, the original request and task IDs that were not explained. The human could not interpret the agent's questions and asked for the sections to be restated with more context. The quoted evidence is the agent's own account: \"This session was spawned by another session rather than directly by me, so I don't know what was in the original prompt, nor what was in any prompt files. ... I appear to be missing the context required in order to make sense of the questions you're asking.\"\n\nWhat the tree shows. `skills/spawn/SKILL.md`, section \"Resolving the prompt for a fresh context\", makes the spawned prompt self-contained *for the agent*: it resolves deixis, spills long prompts to files, and does not enrich a prompt that already looks complete. It says nothing about orienting a human who opens the spawned window. The only human-facing handoff text the skill specifies is the outcome/changed/action_needed trailer, which is written at the *end* of the spawned session, not the start. A grep of `skills/team/SKILL.md` for `spawn|human|self-contained|summary` found no spawn-handoff or human-orientation rule.\n\nWhat the tree does not show. The verifier did not read the five `agents/team-*.md` files, and read the rest of `skills/spawn` only by grep. The session text itself is not in the tree, so the tree cannot show that this particular session came through the documented spawn path. The finding is therefore a verified guidance gap, not a verified causal chain from the skill to the sighting.\n\nHeuristics. The verdict rests on heuristic 6, well-defined purpose for each entity, and heuristic 13, files make internal sense in isolation. On heuristic 6: the spawn prompt is given one stated purpose \u2014 be complete for the agent \u2014 and the human reader is a second audience the prompt serves without any mechanism naming that purpose. On heuristic 13, read against a prompt rather than a module: the spawned prompt is the one artefact the human has, and it cannot be understood without the parent session's context, which the human cannot reach.\n\nVerified remediation (route: mechanical). In `skills/spawn/SKILL.md`, \"Resolving the prompt for a fresh context\", add a rule that when the spawned session will be driven by a human rather than a programmatic caller, the prompt must open with a plain-language orientation covering the original request, what each task ID or prompt file is, and why the human's input is needed, with no unexplained IDs or file references.\n\n### Cluster 2 \u2014 Escalation watcher emits `get_task_escalations` calls with an empty-valued optional parameter, producing unparseable JSON that recurs across tasks\n\n**Area:** escalation-watcher tool-call construction. **Phase:** ops \u2192 ops. **Sightings:** 1 this period (session `7f3e2ea8-d50f-4de6-ad68-01e0eca3ed4c`), plus two prior codebook candidates. **Anchor:** `skills/escalation-watcher-auto/SKILL.md`. **Severity:** low.\n\nWhen the watcher wants to omit the optional `status` filter it writes the key with no value, `{\"task_id\": \"5813\", \"level\": 2, \"status\": , \"compact\": true}`, instead of dropping the key. The harness rejects the whole call with `InputValidationError` and the turn is lost. Within the one session the same malformed shape appeared for tasks 6060 and 5813, 63 turns apart, so nothing within the session carried the first failure forward to the second.\n\nWhat the tree shows. The watcher skill's pseudo-code and prose call `get_task_escalations(task_id=tid, level=2, status=None, compact=True)` at roughly SKILL.md lines 305, 336 and 352, and state that `status=None` is what makes the read archive-inclusive. The tool's `status` parameter is declared `str | None = None` and is archive-inclusive by default, so the `status=None` argument is both redundant and the thing the agent is transcribing when it writes `\"status\": ,`. The codebook already records this shape for task 3711 (cand-20261003-2) and task 7921 (cand-20261002); with task 5813 that is three tasks across three sessions. The skill continues to teach the call shape that fails.\n\nWhat the tree does not show. Only the SKILL.md side is directly observable. The verifier did not confirm the exact path by which `status=None` in Python-style pseudo-code becomes an empty JSON value in the emitted call; the mechanism is inferred from the recurrence, not traced.\n\nHeuristics. The verdict rests on heuristic 12, structured data instead of meaningful strings, and heuristic 11, SPOT. On heuristic 12: the skill expresses a typed, optional argument as prose-and-pseudo-code text that the agent must re-serialise into JSON, and the re-serialisation is where the untyped `None` becomes an empty value the parser cannot read. On heuristic 11: the archive-inclusive default is already defined once, in the tool signature; the skill restates it as an explicit `status=None` argument, and that second copy is the one that produces the failure.\n\nVerified remediation (route: mechanical). In `skills/escalation-watcher-auto/SKILL.md`, replace every `status=None` in the `get_task_escalations` calls and in the call-shape bullet with an instruction to omit the `status` argument entirely, since the tool is archive-inclusive by default, and add that optional filters are to be left out and never written as an empty value.\n\n### Cross-cluster observations\n\n- Both findings are guidance-text defects in `skills/`, both are routed mechanical, and neither needed a code change to verify or to remediate.\n- Cluster 2 is the only recurrence this period: three sightings across three sessions on the same anchor. Cluster 1 is a single sighting with an incompletely read anchor neighbourhood (`agents/team-*.md` unread).\n- In both clusters the verifier recorded what was *not* read. Those gaps are carried above as stated, not resolved by this synthesis.\n\n## Proposed codebook changes (not applied; act on by hand)\n\n1. Add cluster 1 as a new entry anchored at `skills/spawn/SKILL.md`, area \"agent handoff / spawned-session context\", tags `h6`, `h13`, `kind:confusion`, severity low, route mechanical, one sighting (`d18be7a4-0132-4e27-972e-f6779d57a8f4`, phases unknown). Record the verifier's unread scope (`agents/team-*.md`; `skills/spawn` grepped only) in the entry so a later census knows what remains to check.\n2. Consolidate cluster 2 with the existing candidates cand-20261003-2 (task 3711) and cand-20261002 (task 7921) into one entry anchored at `skills/escalation-watcher-auto/SKILL.md`, tags `h12`, `h11`, `kind:confusion`, severity low, route mechanical, with sightings for all three tasks and the new session `7f3e2ea8-d50f-4de6-ad68-01e0eca3ed4c`. Record that the SKILL.md `status=None` text is the observed side of the cause and that the JSON-generation path is not traced.\n3. For cluster 2, once the SKILL.md remediation lands, mark the entry as awaiting confirmation: the next census should check whether the `\"status\": ,` shape appears in any watcher session after the change date before closing it.",
+  "filed_ticket_ids": [
+    "tkt_0RVWRB7SDDHRF8E8DJYC0H367N",
+    "tkt_0RVWRB81FBPJ2TA58664BQ8EN2"
+  ],
+  "cross_project_tickets": [],
+  "dry_run": null,
+  "withheld": [],
+  "findings": [
+    {
+      "id": "entry-cand-20260921-26",
+      "key": "fk-c1df06e83aa5",
+      "area": "repo",
+      "sub_area": null,
+      "anchor": "skills/spawn/SKILL.md",
+      "tags": [
+        "h6",
+        "h13",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts",
+        "present-tree"
+      ],
+      "statement": "A session spawned by another session carries a dense framing prompt that assumes context the user never saw, such as prompt files, the original request and unexplained task IDs. The user could not interpret the agent's questions and asked for the sections to be restated with more context. The handoff has no self-contained summary for the human to read. Verifier: skills/spawn/SKILL.md section 'Resolving the prompt for a fresh context' makes the spawned prompt self-contained for the agent. It does this by resolving deixis and file-spilling long prompts, and it never enriches a prompt that already looks complete. It says nothing about orienting the human who opens the window. Its only human-facing handoff text is the outcome/changed/action_needed trailer, which is written at the end of the spawned session. The skills/team/ files I grepped (SKILL.md, matching on spawn|human|self-contained|summary) contain no spawn-handoff or human-orientation rule. I did not read the five agents/team-*.md files for this, and the rest of skills/spawn was only grepped, not read. The quoted session text itself is not in the tree. So the guidance gap is observable, but this tree cannot show that this particular session came through it.",
+      "proposal": "Add a rule to 'Resolving the prompt for a fresh context' that when the spawned session will be driven by a human (not a programmatic caller), the prompt must open with a plain-language orientation covering the original request, what each task ID or prompt file is, and why the human's input is needed, with no unexplained IDs or file references.",
+      "verdict": "confirmed",
+      "disposition": "open",
+      "first_seen": "census-dark_factory-20261017",
+      "last_seen": [
+        "census-dark_factory-20261017"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "entry-cand-20260929-1",
+      "key": "fk-282c6e761d54",
+      "area": "repo",
+      "sub_area": null,
+      "anchor": "skills/escalation-watcher-auto/SKILL.md",
+      "tags": [
+        "h12",
+        "h11",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts",
+        "present-tree"
+      ],
+      "statement": "When the watcher wants to omit the optional status filter, it writes the key with no value instead of dropping it. The harness then rejects the whole call with InputValidationError, wasting a turn. The same malformed shape recurred for tasks 6060 and 5813, 63 turns apart, so nothing carries the lesson forward. The tool's parameter docs or the watcher prompt could state that optional filters must be omitted, not left blank. Verifier: The watcher skill's pseudo-code and prose call `get_task_escalations(task_id=tid, level=2, status=None, compact=True)` (SKILL.md lines ~305, 336 and 352) and say `status=None` is what makes the read archive-inclusive. The tool's `status` parameter is `str | None = None` and it is already archive-inclusive by default. An agent turning `status=None` into a JSON call writes `\"status\": ,`, which the harness rejects with InputValidationError. The codebook records repeat sightings (cand-20261003-2 for task 3711, cand-20261002 for task 7921, and this cluster's task 5813), so the skill keeps teaching the shape that fails. Only the SKILL.md side of the cause is directly observable. I did not confirm the exact generation path.",
+      "proposal": "Replace every `status=None` in the get_task_escalations calls and the call-shape bullet with an instruction to omit the `status` argument entirely, since the tool is archive-inclusive by default, and add that optional filters must be left out and never written as an empty value.",
+      "verdict": "confirmed",
+      "disposition": "open",
+      "first_seen": "census-dark_factory-20261017",
+      "last_seen": [
+        "census-dark_factory-20261017"
+      ],
+      "supersedes": []
+    }
+  ],
+  "area_map": {
+    "briefing": "review/briefing.yaml",
+    "areas": [
+      "dashboard",
+      "escalation",
+      "fused-memory",
+      "orchestrator",
+      "repo",
+      "sampler",
+      "shared"
+    ],
+    "overlay": ".claude/skills/review-all/project.md",
+    "rules": [
+      [
+        "scripts/legibility/**",
+        "shared"
+      ],
+      [
+        "scripts/**",
+        "repo"
+      ]
+    ],
+    "notes": []
+  },
+  "cost_note": "invoke calls: sonnet miner=40, sonnet verify=2, fable synthesis=1, haiku headroom-probe=2"
+}

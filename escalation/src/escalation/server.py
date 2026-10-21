@@ -45,6 +45,7 @@ from escalation.authority import (
     l2_auto_close_class,
 )
 from escalation.canonical import canonical_root_cause
+from escalation.categories import UnregisteredEscalationCategory, require_registered_category
 from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe_off_loop as _dedupe_submit_or_dedupe_off_loop
@@ -134,6 +135,25 @@ def _read_members(queue: EscalationQueue, member_ids: list[str]) -> dict[str, Es
     return {mid: queue.get(mid) for mid in dict.fromkeys(member_ids)}
 
 
+def _partition_usable_members(
+    members: dict[str, Escalation | None],
+) -> tuple[dict[str, str], list[str]]:
+    """Split *members* into ``({id: severity} usable, [id] unusable)``.
+
+    USABLE means the id resolves AND its severity is in ``KNOWN_SEVERITIES``;
+    :func:`_derive_l2_severity` says why.  The one home of that rule for both
+    the derivation and :func:`_info_only_refusal`.
+    """
+    usable: dict[str, str] = {}
+    unusable: list[str] = []
+    for mid, member in members.items():
+        if member is not None and member.severity in KNOWN_SEVERITIES:
+            usable[mid] = member.severity
+        else:
+            unusable.append(mid)
+    return usable, unusable
+
+
 def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     """Return max(member severities) for a promoted L2, or None if none is usable.
 
@@ -183,21 +203,17 @@ def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     seed would be indistinguishable from a real info member, and the explicit
     nothing-usable branch is what carries the fail-safe.
     """
-    resolved: list[str] = []
-    unusable: list[str] = []
-    for mid, member in members.items():
-        if member is None:
-            unusable.append(mid)
-        elif member.severity not in KNOWN_SEVERITIES:
+    usable, unusable = _partition_usable_members(members)
+    for mid in unusable:
+        member = members[mid]
+        if member is not None:
             logger.warning(
                 'promote_to_l2: member escalation %s carries out-of-vocabulary '
                 'severity %r (expected one of %s); excluding it from the derived '
                 'L2 severity rather than propagating it.',
                 mid, member.severity, sorted(KNOWN_SEVERITIES),
             )
-            unusable.append(mid)
-        else:
-            resolved.append(member.severity)
+    resolved = list(usable.values())
 
     if not resolved:
         logger.warning(
@@ -218,6 +234,25 @@ def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     for sev in resolved[1:]:
         derived = max_severity(derived, sev)
     return derived
+
+
+def _info_only_refusal(members: dict[str, Escalation | None]) -> dict[str, Any]:
+    """The ``info_only_cluster`` refusal for a cluster that derived ``'info'``.
+
+    The refusal's ``members`` key names only the records the derivation used —
+    each one ``'info'``, since they derived ``'info'`` — so each is safe to
+    close at L1.  Every other id goes to ``unusable``: a phantom id has no
+    record to close, and an out-of-vocabulary severity is not known to be
+    informational.  The *members* argument is :func:`_read_members`' answer.
+    """
+    usable, unusable = _partition_usable_members(members)
+    return {
+        'status': 'refused',
+        'code': 'info_only_cluster',
+        'members': list(usable),
+        'unusable': unusable,
+        'derived_severity': 'info',
+    }
 
 
 def _sentinel_bound_task_ids(members: dict[str, Escalation | None]) -> frozenset[str]:
@@ -285,7 +320,8 @@ def _amend_not_pending_refusal(escalation_id: str, status: str) -> dict[str, str
 
 
 # The role the steward's own filings carry (orchestrator.steward
-# _auto_escalate_to_human hard-codes ``agent_role='steward'``). Level-1 is the
+# _auto_escalate_to_human files under orchestrator.agents.roles.STEWARD.name,
+# which escalation cannot import). Level-1 is the
 # steward's documented recourse, so an L1 from this role — or from a harness
 # sentinel — is the EXPECTED shape and is not logged.
 _EXPECTED_L1_FILER_ROLE = 'steward'
@@ -538,29 +574,6 @@ def _project_task_runtime_entry(s: Any) -> TaskRuntimeEntry:
 RESOLVE_ACTIONS: tuple[str, ...] = ('resume', 'restart', 'park', 'abandon', 'close_only')
 # park is no longer dismissed — it keeps the record open at L2 (version-a).
 _DISMISS_ACTIONS: frozenset[str] = frozenset({'abandon', 'close_only'})
-
-CATEGORIES = [
-    'scope_violation',
-    'design_concern',
-    'cleanup_needed',
-    'dependency_discovered',
-    'risk_identified',
-    'infra_issue',
-    'task_failure',
-    # Reconciliation categories
-    'recon_failure',
-    'recon_backlog_overflow',
-    'recon_stale_run',
-    'recon_integrity_issue',
-    # Review triage
-    'review_suggestions',
-    # Stranded-blocked recovery (PRD-3 D5 / C6)
-    'stranded_blocked',
-    # Verified-green stranded remediation: durable merge/verify failure of a
-    # reaper-submitted branch (stranding-remediation-scheduler-ergonomics-prd.md
-    # leaf α).  Inert/unvalidated (action_effects.py:23) — vocabulary parity only.
-    'stranded_merge_failed',
-]
 
 # OUTPUT keys of a compact row — the triage-relevant subset a long-running L2
 # watcher needs to decide whether to pull a full record.  NOTE these are output
@@ -1020,9 +1033,10 @@ def create_server(
     *harness* is the running ``orchestrator.harness.Harness``.  When passed,
     it enables the ``release_workflow`` tool which lets external callers
     (humans via /unblock, automation) ask the orchestrator to soft-cancel a
-    workflow whose task has been completed out-of-band.  When omitted (e.g.
-    in tests with no orchestrator), the tool reports that no workflow is
-    active.
+    workflow whose task has been completed out-of-band, and the
+    ``clear_verify_host_quarantine`` operator clear.  When omitted (e.g. in
+    tests with no orchestrator), both tools report that no orchestrator is
+    attached.
 
     *dedupe_config* controls infra_issue deduplication.  When omitted,
     ``DedupeConfig()`` is used (enabled, 600 s window, infra_issue category).
@@ -1329,7 +1343,7 @@ def create_server(
     # process where orchestrator is always importable.
     _registry = merge_inflight_registry
     if merge_queue is not None and _registry is None:
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import (
             InFlightMergeRegistry,
         )
         _registry = InFlightMergeRegistry()
@@ -1837,7 +1851,10 @@ def create_server(
         """Report a non-blocking observation. The agent continues working after this call.
 
         Categories: scope_violation, design_concern, cleanup_needed,
-        dependency_discovered, risk_identified, infra_issue.
+        dependency_discovered, risk_identified, infra_issue.  Any category must
+        be a registered ``escalation.categories.EscalationCategory`` value; an
+        unregistered one is rejected with an ``{'error': ...}`` response naming
+        the closest registered values.
 
         *severity* defaults to ``'info'``.  Pass ``'critical'`` or ``'urgent'`` to
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
@@ -1891,6 +1908,10 @@ def create_server(
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+        try:
+            require_registered_category(category)
+        except UnregisteredEscalationCategory as exc:
+            return {'error': str(exc)}
         esc_id = await asyncio.to_thread(queue.make_id, task_id)
         esc = Escalation(
             id=esc_id,
@@ -1933,7 +1954,10 @@ def create_server(
         the repeat is bounded at one).
 
         Categories: scope_violation, design_concern, cleanup_needed,
-        dependency_discovered, risk_identified, infra_issue.
+        dependency_discovered, risk_identified, infra_issue.  Any category must
+        be a registered ``escalation.categories.EscalationCategory`` value; an
+        unregistered one is rejected with an ``{'error': ...}`` response naming
+        the closest registered values.
 
         *severity* defaults to ``'blocking'``.  Pass ``'critical'`` or ``'urgent'`` to
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
@@ -2032,6 +2056,10 @@ def create_server(
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+        try:
+            require_registered_category(category)
+        except UnregisteredEscalationCategory as exc:
+            return {'error': str(exc)}
         # Task 3236: validate `level` BEFORE constructing the Escalation, using
         # the same {'error': ...} early-return shape as the severity guard above,
         # so a misconfigured caller gets immediate feedback instead of a
@@ -3209,7 +3237,9 @@ def create_server(
         3997): the record's OWN framing stays immutable, but the framing a fold
         carried in is no longer lost.  That list is bounded — oldest-shed at
         ``queue._MAX_AMENDMENTS``, with every drop counted in the record's
-        ``amendments_truncated``.
+        ``amendments_truncated``.  The info-only refusal (see *severity*) is
+        judged BEFORE this fold, so an all-info cluster is never folded into an
+        already-pending L2 either.
 
         **Members stay at L1**: the member L1 escalations are referenced but
         NOT promoted; they remain pending at L1 until the L2 is resolved.
@@ -3242,8 +3272,8 @@ def create_server(
         **Sentinel-bound members** (task 4541): when at least one member
         resolves and EVERY resolved member was filed under a role in
         ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`` (today the
-        recovery-veto-streak alarm), a new L2 must be minted under one of
-        those members' own task ids.  Any other *task_id* is refused with
+        recovery-veto-streak alarm and the offline lane's escalations), a new
+        L2 must be minted under one of those members' own task ids.  Any other *task_id* is refused with
         ``code: 'sentinel_task_id_required'`` and ``required_task_ids`` —
         re-issue with one of them — and nothing is minted, for header-less
         callers too.  Why: see
@@ -3281,14 +3311,21 @@ def create_server(
         summary:
             One-line cluster hypothesis.
         category:
-            Escalation category; defaults to ``'design_concern'``.
+            Escalation category; defaults to ``'design_concern'``.  Must be a
+            registered ``escalation.categories.EscalationCategory`` value; an
+            unregistered one is rejected with an ``{'error': ...}`` response
+            naming the closest registered values.
         severity:
             Severity tag, decoupled from ``level=2`` — the tool sets
             ``level=2`` explicitly.  **Omit it (or pass ``None``) and the L2
             INHERITS ``max(member severities)``** — this is the correct default
             in the overwhelming majority of cases, and is what stops a cluster
             of purely-informational L1s from being born ``'blocking'`` and
-            paging a human (task 3976).
+            paging a human (task 3976).  An omitted severity whose members
+            derive ``'info'`` is REFUSED rather than minted or folded (PRD
+            ``plans/info-l0-disposition-router-prd.md`` D4, task 5222): see
+            **Info-only refusal** under Response shapes.  An explicit value
+            bypasses that refusal in both directions.
 
             An EXPLICIT value overrides the derivation in BOTH directions at
             mint time.  Upward in particular stays fully available and is not
@@ -3323,10 +3360,13 @@ def create_server(
             ``'blocking'`` and classified ``QUEUE_HANDOFF`` in
             ``escalation.pins``, and the only info-severity L2s were ones
             ``escalation.queue.EscalationQueue.park()`` promoted from an
-            already-open L0/L1.  Link 1 in ``escalation.pins`` short-circuits
+            already-open L0/L1.  Since task 5222 a silent all-info promote
+            mints nothing, so an info L2 now comes only from an explicit
+            ``severity='info'`` or from ``park()``.  Link 1 in
+            ``escalation.pins`` short-circuits
             on ``severity == 'info'`` BEFORE the ``level != 0`` link — "an
-            info record never pins, at any level" — so an inherited-info L2
-            no longer vetoes its subject task's ``done`` flip.  That is the
+            info record never pins, at any level" — so such an info L2
+            does not veto its subject task's ``done`` flip.  That is the
             INTENDED semantics and was considered here, not an oversight: the
             members it clusters were themselves non-pinning, and a record that
             does not merit a human's attention must not hold a task open
@@ -3359,6 +3399,15 @@ def create_server(
         ``severity`` reports what was ACTUALLY filed, which for a caller that
         omitted the argument is how the inherited value becomes visible — and
         on the update path is the post-floor value, not the argument.
+
+        Info-only refusal (an omitted *severity* whose members derive
+        ``'info'``; nothing is minted and nothing is folded)::
+
+            {'status': 'refused', 'code': 'info_only_cluster',
+             'members': [<the info members the derivation used>],
+             'unusable': [<ids that did not resolve, or carry an
+                           out-of-vocabulary severity>],
+             'derived_severity': 'info'}
 
         Error::
 
@@ -3429,6 +3478,10 @@ def create_server(
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+        try:
+            require_registered_category(category)
+        except UnregisteredEscalationCategory as exc:
+            return {'error': str(exc)}
 
         # Everything from here on is inside the lock: the FIND and the WRITE it
         # decides between must not interleave with another promote on this
@@ -3461,6 +3514,7 @@ def create_server(
                 members = _read_members(queue, member_ids)
                 derived = None if severity is not None else _derive_l2_severity(members)
                 return (
+                    members,
                     derived,
                     queue.find_pending_l2_by_root_cause(root_cause),
                     _sentinel_bound_task_ids(members),
@@ -3468,7 +3522,7 @@ def create_server(
                 )
 
             (
-                derived, existing_id, required_task_ids, eval_lane_members,
+                members, derived, existing_id, required_task_ids, eval_lane_members,
             ) = await asyncio.to_thread(_read_for_promote)
 
             if eval_lane_members:
@@ -3482,6 +3536,17 @@ def create_server(
                     for member_id, reason in eval_lane_members.items()
                 )
                 return _eval_lane_refusal(f'member(s) {named} are eval-lane artifacts')
+
+            # PRD info-l0-disposition-router D4: a cluster whose members derive
+            # 'info' never enters L2 by default — not minted, not folded into an
+            # existing L2.  An explicit severity bypasses it in both directions.
+            if severity is None and derived == 'info':
+                logger.info(
+                    'promote_to_l2: refused info-only cluster under task_id=%r '
+                    'root_cause=%r; members=%s',
+                    task_id, root_cause, member_ids,
+                )
+                return _info_only_refusal(members)
 
             # CREATE must land on some severity, so an underivable set fails safe
             # UP to 'blocking' — unchanged from before task 3976.
@@ -3865,20 +3930,17 @@ def create_server(
         # Runtime-only reverse import: orchestrator depends on escalation, not
         # vice versa, so this lazy import deliberately avoids a static cycle. It
         # resolves at runtime because the escalation server is hosted inside the
-        # orchestrator process; it is unresolvable in escalation's standalone
-        # typecheck env (orchestrator is not on its path), hence the suppression.
-        from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
-            branch_is_degenerate,
-        )
-        from orchestrator.merge_lane import (  # type: ignore[reportMissingImports]
-            WaiterRecord,
-        )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        # orchestrator process.
+        from orchestrator.merge_lane import (
             MergeOutcome,
             MergeRequest,
             QueuedBranch,
+            WaiterRecord,
             coalesce_or_enqueue_merge_request,
             patch_content_contained,
+        )
+        from orchestrator.merge_lane.landing_evidence import (
+            branch_is_degenerate,
         )
 
         # Single git_ops handle reused for both the already_merged fast-path
@@ -4184,16 +4246,16 @@ def create_server(
         # classifier ignores it).  event_store is None for a standalone
         # server (no orchestrator wired) — guarded so this degrades to no
         # attribution instead of raising (fail-open, mirrors the git-error
-        # None-degrade inside _resolve_dispatch_time_merge_base).
+        # None-degrade inside resolve_dispatch_time_merge_base).
         if verified_green and event_store is not None:
-            from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+            from orchestrator.event_store import (
                 EventType,
             )
-            from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-                _resolve_dispatch_time_merge_base,
+            from orchestrator.merge_lane import (
+                resolve_dispatch_time_merge_base,
             )
             base_sha = (
-                await _resolve_dispatch_time_merge_base(
+                await resolve_dispatch_time_merge_base(
                     orch_config.project_root, orch_config.git.main_branch, resolved_tip,
                 )
                 if resolved_tip is not None
@@ -4441,6 +4503,29 @@ def create_server(
         return result
 
     @mcp.tool()
+    async def clear_verify_host_quarantine(host: str) -> dict[str, Any]:
+        """Return a benched remote verify host to this orchestrator's verify pool.
+
+        The operator clear for a host the merge worker benched (task 6565,
+        design D6): an unreachable ('ru') or gate-skew ('skew') bench —
+        including a STICKY skew bench, which is never re-admitted
+        automatically — or a verdict-divergence quarantine.  It does not probe
+        the host first; use it once the cause is fixed.  A PARKED slot is still
+        freed only after a clean probe that no stale verify runs there.  The
+        open unreachability and skew L1s for the host are resolved.
+
+        Returns ``{host, cleared, quarantine_class, was_sticky}`` plus
+        ``reason`` when nothing was cleared (no orchestrator, no merge worker,
+        an unknown or un-benched host, or a PARKED slot not yet clean).
+        """
+        if harness is None:
+            return {
+                'host': host, 'cleared': False,
+                'reason': 'No orchestrator harness wired in — running in standalone mode',
+            }
+        return await harness.clear_verify_host_quarantine(host)
+
+    @mcp.tool()
     async def release_workflow(
         task_id: str,
         timeout_secs: int = 30,
@@ -4665,6 +4750,8 @@ def create_server(
 
         This snapshot captures the blind spot missed by runs.db-events: a
         genuinely-queued entry with no _merge-* worktree and no merge events.
+        A request still waiting for the merger whose outcome is already decided
+        (resolved or cancelled) is never listed.
         """
         if merge_queue is None:
             return {'error': 'Merge queue not available — orchestrator not running'}
@@ -4798,10 +4885,9 @@ def create_server(
             return {'error': mismatch}
 
         # Runtime-only reverse import: orchestrator depends on escalation, not
-        # vice versa (mirrors merge_request's lazy orchestrator.merge_queue
-        # import above) — unresolvable in escalation's standalone typecheck
-        # env, hence the suppression.
-        from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
+        # vice versa (mirrors merge_request's lazy orchestrator.merge_lane
+        # import above).
+        from orchestrator.git_ops import (
             InteractiveWorktreeLimitError,
         )
 
@@ -4900,7 +4986,7 @@ def create_server(
             path = gops.worktree_base / f'{gops.config.iact_prefix}{slug}'
 
         # Runtime-only reverse import — mirrors claim_warm_worktree above.
-        from orchestrator.git_ops import _run  # type: ignore[reportMissingImports]
+        from orchestrator.git_ops import _run
 
         rc, _, remove_stderr = await _run(
             ['git', 'worktree', 'remove', '--force', str(path)], cwd=gops.project_root,
@@ -5189,12 +5275,14 @@ def create_server(
             cancel's _on_finalized records terminal 'abandoned' first, then forget
             removes it), so an immediate resubmit gets a FRESH entry and never
             coalesces onto / observes the cancelled corpse.
-        Still async (unchanged): MergeWorker._request_abandoned drops the queued
-        work item at its next checkpoint via the cancel→worker CancelledError seam.
-        Because retirement yields the loop (the C1 removal is awaited), the
-        merge_request _waiters.pop done-callback fires during the first cancel, so an
-        immediate double-cancel finds rec=None and resolves via the current-run tier:
-        the live tier ignores the worker's cancelled (waiter_alive False) entry.
+        Only the physical drop stays async: the merger drops the queued work item
+        when it next dequeues it
+        (orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._request_abandoned),
+        but orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.snapshot
+        stops listing a decided request at once.  Because retirement yields the
+        loop (the C1 removal is awaited), the merge_request _waiters.pop
+        done-callback fires during the first cancel, so an immediate double-cancel
+        finds rec=None, misses the live tier and answers from the current-run tier.
 
         The tool is async so that future mutation runs on the event loop (not a FastMCP
         threadpool worker — PRD Open Q4 off-loop lesson).  The lookup → cancel sequence
@@ -5261,7 +5349,7 @@ def create_server(
         # immediate resubmit gets a FRESH entry.  lookup→cancel above stays
         # await-free (I10); the only awaits are here, after cancel.
         rec.future.cancel()
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import (
             retire_cancelled_merge_request,
         )
         await retire_cancelled_merge_request(

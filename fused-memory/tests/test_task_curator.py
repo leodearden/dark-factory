@@ -18,7 +18,7 @@ import pytest
 from _curator_helpers import agent_result as _agent_result
 from _curator_helpers import make_config as _make_config
 from _curator_helpers import pool_with_ids as _pool_with_ids
-from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.cli_invoke import AgentResult
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import (
     ArtifactProvenance,
@@ -1125,12 +1125,12 @@ class TestCurateFallbacks:
 class TestUnexpectedExceptionArmReports:
     """Part A: the catch-all arm around the LLM call must REPORT, not just degrade.
 
-    Its two named siblings (``AllAccountsCappedException``,
-    ``CuratorFailureError``) both route through ``report_failure``. This one
-    logged at WARNING and returned ``action='create'`` — a shape
-    indistinguishable downstream from a healthy create, which is how the
-    2026-08-13 to 08-18 curator outage ran for five days on a
-    ``FileNotFoundError`` for the ``claude`` binary.
+    Its named sibling (``CuratorFailureError``) routes through
+    ``report_failure``; the pool-unavailable arm defers rather than creating,
+    so it has nothing to report. This one logged at WARNING and returned
+    ``action='create'`` — a shape indistinguishable downstream from a healthy
+    create, which is how the 2026-08-13 to 08-18 curator outage ran for five
+    days on a ``FileNotFoundError`` for the ``claude`` binary.
 
     The degradation is NOT the defect: fail-open is the designed behaviour and
     is asserted here to survive. The silence is the defect.
@@ -1270,12 +1270,10 @@ class TestConsecutiveDegradedAlarm:
     async def test_mixed_arms_share_one_streak_and_fire_once(self):
         curator, escalator = self._curator_with_escalator()
 
-        # Five degraded calls across THREE different arms, then a sixth to
+        # Five degraded calls across BOTH reporting arms, then a sixth to
         # prove the latch, a success to prove the reset, then five more.
         outcomes = [
-            AllAccountsCappedException(
-                retries=3, elapsed_secs=1.0, label='task-curator[p]',
-            ),
+            CuratorFailureError('cap-free failure'),
             CuratorFailureError('boom'),
             RuntimeError('llm down'),
             FileNotFoundError(2, 'No such file or directory', 'claude'),
@@ -1795,65 +1793,6 @@ class TestZeroOutputTimeoutSignal:
                 project_root='/x',
             )
         assert exc_info.value.zero_output_timeout is False
-
-
-class TestCuratorCapHandling:
-    """Verify TaskCurator.curate() handles AllAccountsCappedException gracefully."""
-
-    @pytest.mark.asyncio
-    async def test_curate_handles_all_accounts_capped_without_escalator(self):
-        """Cap exception → action='create', justification='all-accounts-capped', no raise."""
-        config = _make_config()
-        curator = TaskCurator(config=config, taskmaster=None)
-
-        cap_exc = AllAccountsCappedException(
-            retries=3, elapsed_secs=90.0, label='task-curator[p]'
-        )
-
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(side_effect=cap_exc)):
-            result = await curator.curate(
-                CandidateTask(title='T'), project_id='p', project_root='/x',
-            )
-
-        assert result.action == 'create'
-        assert result.justification == 'all-accounts-capped'
-
-    @pytest.mark.asyncio
-    async def test_curate_handles_all_accounts_capped_with_escalator(self):
-        """Cap exception with escalator → escalator.report_failure called with cap justification."""
-        config = _make_config()
-
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-
-        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
-
-        cap_exc = AllAccountsCappedException(
-            retries=3, elapsed_secs=90.0, label='task-curator[p]'
-        )
-
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(side_effect=cap_exc)):
-            result = await curator.curate(
-                CandidateTask(title='T'), project_id='p', project_root='/x',
-            )
-
-        assert result.action == 'create'
-        assert result.justification == 'all-accounts-capped'
-        escalator.report_failure.assert_awaited_once()
-        kwargs = escalator.report_failure.await_args.kwargs
-        assert 'all-accounts-capped' in kwargs['justification']
-        assert kwargs['project_id'] == 'p'
-        assert kwargs['candidate_title'] == 'T'
 
 
 class TestZeroOutputTimeoutAcceptance:
@@ -4906,8 +4845,8 @@ class TestCuratorFailureErrorSchemaToolDenied:
 
 class TestCallLlmBatchWithFallback:
     """Fix R2 — the bisecting helper retries each half on
-    :exc:`CuratorFailureError` (recognised + unknown subtypes alike) and
-    re-raises :exc:`AllAccountsCappedException` without falling back."""
+    :exc:`CuratorFailureError` (recognised + unknown subtypes alike).
+    Pool unavailability defers instead: test_curator_pool_deferral.py."""
 
     @pytest.mark.asyncio
     async def test_n1_base_case_delegates_to_curate(self):
@@ -4991,27 +4930,6 @@ class TestCallLlmBatchWithFallback:
         # Bisect to n=1 twice; each delegates to curate().
         assert decisions == [d, d]
         assert mc.await_count == 2
-
-    @pytest.mark.asyncio
-    async def test_all_accounts_capped_propagates_without_bisect(self):
-        """Cap exhaustion on the whole batch must NOT bisect; re-raise so
-        the worker can defer the whole batch instead of repeating the
-        cap-retry storm N times."""
-        config = _make_config()
-        curator = TaskCurator(config=config, taskmaster=None)
-        candidates = [CandidateTask(title=f'T{i}') for i in range(4)]
-
-        cap_exc = AllAccountsCappedException(
-            retries=3, elapsed_secs=120.0, label='task-curator-batch[p]',
-        )
-        with patch.object(curator, '_call_llm_batch', side_effect=cap_exc), \
-             patch.object(curator, 'curate', new=AsyncMock()) as mc, \
-             pytest.raises(AllAccountsCappedException):
-            await curator._call_llm_batch_with_fallback(
-                candidates, [[]] * 4, [{}] * 4, 0.0, 'p', '/x',
-            )
-        # No fallback to per-item curate.
-        assert mc.await_count == 0
 
     @pytest.mark.asyncio
     async def test_right_half_batch_target_index_remapped_to_input_local_space(self):
@@ -5623,46 +5541,6 @@ class TestCurateBatchWholeBatchFailure:
 
 
 # ----------------------------------------------------------------------
-# curate_batch: AllAccountsCappedException now propagates
-# ----------------------------------------------------------------------
-
-
-class TestCurateBatchAllAccountsCapped:
-    @pytest.mark.asyncio
-    async def test_cap_exception_propagates_without_per_candidate_fallback(self):
-        """``AllAccountsCappedException`` from ``_call_llm_batch`` re-raises out of
-        ``curate_batch`` instead of fanning out to N×size-1 ``curate()`` calls.
-
-        Each fallback ``curate()`` would itself burn the ~10-min cap-retry
-        loop; the worker is responsible for deferring the whole batch via
-        :meth:`UsageGate.wait_for_open` (see Fix R5 / R2).
-        """
-        config = _make_config()
-        curator = TaskCurator(config=config, taskmaster=None)
-        c1 = CandidateTask(title='Cap One')
-        c2 = CandidateTask(title='Cap Two')
-
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch.object(
-                 curator, '_call_llm_batch',
-                 new=AsyncMock(side_effect=AllAccountsCappedException(
-                     retries=3, elapsed_secs=90.0,
-                     label='task-curator-batch[p]',
-                 )),
-             ), \
-             patch.object(curator, 'curate', new=AsyncMock()) as mock_curate, \
-             pytest.raises(AllAccountsCappedException):
-            await curator.curate_batch([c1, c2], 'p', '/x')
-
-        # Cap exhaustion must NOT trigger the size-1 curate() fallback
-        # (each fallback would repeat the cap-retry storm).
-        assert mock_curate.await_count == 0
-
-
-# ----------------------------------------------------------------------
 # batch_target_index validation and cycle detection
 # ----------------------------------------------------------------------
 
@@ -6073,29 +5951,6 @@ class TestCuratorCapWaitSanityBound:
         _, kwargs = mock.call_args
         assert kwargs['cap_wait_sanity_secs'] == _CURATOR_CAP_WAIT_SANITY_SECS
 
-    @pytest.mark.asyncio
-    async def test_regression_cap_handling_behavior_preserved(self):
-        """(d) AllAccountsCappedException from _call_llm still yields action='create'
-        from curate() — fast-fail/defer contract is preserved with the new explicit bound."""
-        config = _make_config()
-        curator = TaskCurator(config=config, taskmaster=None)
-
-        cap_exc = AllAccountsCappedException(
-            retries=3, elapsed_secs=90.0, label='task-curator[p]'
-        )
-
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(side_effect=cap_exc)):
-            result = await curator.curate(
-                CandidateTask(title='T'), project_id='p', project_root='/x',
-            )
-
-        assert result.action == 'create'
-        assert result.justification == 'all-accounts-capped'
 
 
 # ──────────────────────────────────────────────────────────────────────────────

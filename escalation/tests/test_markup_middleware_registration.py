@@ -837,7 +837,7 @@ class TestStormBurstAlarm:
             task_id=STORM_ANCHOR,
             agent_role='escalation-watcher',
             severity='blocking',
-            category='escalation_cluster',
+            category='design_concern',
             summary='Unrelated cluster record filed on the same synthetic anchor.',
             level=1,
         ))

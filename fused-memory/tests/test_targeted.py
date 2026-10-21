@@ -3370,116 +3370,6 @@ def test_targeted_uses_the_shared_supersedes_parser(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _truncate_clean unit tests (task 2080)
-#
-# _format_outcome_echo's `note[:max_note_chars]` slice (and _on_task_done's
-# identical `details[:500]` append) cut on a raw character count with no
-# regard for word/token boundaries, so a long note is silently garbled mid
-# word/number (e.g. task 2054: "8679,8680" chopped to "8679,868") and, in the
-# note+commit branch, the " (commit <sha>)" suffix is glued directly onto
-# that broken fragment. _truncate_clean is the shared pure helper that
-# replaces both raw slices with a clean, word-boundary-aware truncation.
-
-
-def test_truncate_clean_returns_short_text_unchanged():
-    """Text at or under the limit is returned verbatim -- no ellipsis
-    appended -- so every existing short-note/short-details case is
-    unaffected."""
-    from fused_memory.reconciliation.targeted import _truncate_clean
-
-    short = 'x' * 20
-    assert _truncate_clean(short, 500) == short
-    assert '…' not in _truncate_clean(short, 500)
-    # Boundary case: exactly at the limit is still "unchanged", not truncated.
-    exact = 'y' * 500
-    assert _truncate_clean(exact, 500) == exact
-
-
-def test_truncate_clean_cuts_on_word_boundary():
-    """A long text with whitespace near the cutoff backs up to that boundary
-    instead of slicing through the trailing word -- the dropped word must
-    not appear as a broken fragment glued to the ellipsis."""
-    from fused_memory.reconciliation.targeted import _truncate_clean
-
-    # Index 495 is the last whitespace char within text[:499] (the budget
-    # for limit=500); the word 'ZZZZZZZZZZ' starts right after it and would
-    # be chopped to 'ZZZ' by a naive text[:500] slice.
-    text = ('A' * 495) + ' ' + ('Z' * 10)
-    result = _truncate_clean(text, 500)
-
-    assert result.endswith('…')
-    assert len(result) <= 500
-    # The boundary word must be dropped whole, not split mid-token.
-    assert 'Z' not in result
-    assert 'ZZZ…' not in result
-    assert result == ('A' * 495) + '…'
-
-
-def test_truncate_clean_hard_cuts_when_no_whitespace_in_window():
-    """No whitespace anywhere in the truncation window -- falls back to a
-    hard cut at (limit - 1) chars plus the ellipsis, still honoring the
-    cap."""
-    from fused_memory.reconciliation.targeted import _truncate_clean
-
-    long_text = 'N' * 600
-    result = _truncate_clean(long_text, 500)
-
-    assert result == ('N' * 499) + '…'
-    assert len(result) == 500
-
-
-def test_truncate_clean_ignores_early_whitespace_min_retention_guard():
-    """Whitespace that sits very early in the window is NOT used as the cut
-    point when backing up to it would discard more than half the budget --
-    that would collapse a 500-char budget down to a couple of characters."""
-    from fused_memory.reconciliation.targeted import _truncate_clean
-
-    text = 'ab ' + ('N' * 600)
-    result = _truncate_clean(text, 500)
-
-    # Must NOT back up to the space at index 2 (would keep only 'ab').
-    assert not result.startswith('ab…')
-    assert result == text[:499] + '…'
-    assert len(result) == 500
-
-
-def test_truncate_clean_word_boundary_well_past_half_budget_retains_chunk():
-    """A last-whitespace index that is comfortably past budget // 2 -- but
-    nowhere near the edge of the window, unlike the near-boundary word-cut
-    test above -- still takes the word-boundary branch (backs up to that
-    whitespace) rather than falling through to a hard cut at the budget."""
-    from fused_memory.reconciliation.targeted import _truncate_clean
-
-    # budget = limit - 1 = 499, so budget // 2 == 249; the space at index 300
-    # is well past that threshold without hugging the window's edge.
-    text = ('A' * 300) + ' ' + ('B' * 300)
-    result = _truncate_clean(text, 500)
-
-    assert result == ('A' * 300) + '…'
-    assert 'B' not in result
-    assert len(result) < 500
-
-
-def test_truncate_clean_rstrips_trailing_whitespace_before_ellipsis():
-    """Multiple consecutive whitespace chars ending at the word-boundary cut
-    point leave the head (`text[:last_ws]`) still ending in whitespace --
-    rstrip() must trim that before the ellipsis is appended, so the result
-    never reads as "...word    …" and its length can land strictly under
-    the limit rather than exactly at it."""
-    from fused_memory.reconciliation.targeted import _truncate_clean
-
-    # Three consecutive spaces at indices 300-302; index 302 is the last
-    # whitespace in the text[:499] window for limit=500, so head = text[:302]
-    # still carries two of those spaces for rstrip() to remove.
-    text = ('A' * 300) + '   ' + ('B' * 300)
-    result = _truncate_clean(text, 500)
-
-    assert result == ('A' * 300) + '…'
-    assert not result.endswith(' …')
-    assert len(result) < 500
-
-
-# ---------------------------------------------------------------------------
 # _format_outcome_echo truth table (task 2049)
 #
 # _on_task_done's fast-path completion echo currently appends the task's raw
@@ -3541,7 +3431,7 @@ def test_format_outcome_echo_truth_table(provenance, expected_contains):
 
 
 def test_format_outcome_echo_truncates_long_note():
-    """``_truncate_clean(note, max_note_chars)`` caps the echoed note at 500
+    """``utils/clip_disclosure.py::fit_at_word`` caps the echoed note at 500
     chars, and in the note+commit branch the cap is applied to the note
     BEFORE the ``" (commit <sha>)"`` suffix is appended -- so the suffix must
     still appear, intact, after a note longer than the cap.
@@ -3990,7 +3880,7 @@ async def test_on_task_done_first_transition_echoes_provenance_not_description(
 # `details` was previously hard-cut with a raw `details[:500]` slice -- the
 # same naive-character-count bug fixed in _format_outcome_echo's note
 # branches. This pins the legacy fallback to the same clean, word-boundary
-# truncation contract (_truncate_clean).
+# truncation contract (utils/clip_disclosure.py::fit_at_word).
 
 
 @pytest.mark.asyncio
@@ -4049,7 +3939,8 @@ async def test_on_task_done_legacy_details_fallback_skips_non_str_details(
     reconciler, mock_memory_service, mock_taskmaster,
 ):
     """A non-str `details` (e.g. a list slipping through task metadata) must
-    not crash _truncate_clean's len()/slicing/.isspace() chain. Mirroring
+    not crash fit_at_word's len()/slicing/.isspace() chain (see
+    utils/clip_disclosure.py::fit_at_word). Mirroring
     _format_outcome_echo's isinstance guard on `note`, the fallback simply
     omits the Details section instead of propagating a TypeError."""
     mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])

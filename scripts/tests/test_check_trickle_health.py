@@ -6,12 +6,12 @@ CALLER — the full account is OPERATIONS.md §"Legibility trickle health
 probe (04:30)". So the tests that matter most here are the ones pinning
 that this module EXECUTES the sibling scripts by path.
 
-Almost every test injects BOTH probe runners, and none may shell out to a
+Almost every test injects EVERY probe runner, and none may shell out to a
 real ``systemctl``; ``scripts/tests/conftest.py::
 _isolate_legibility_trickle_state`` is the backstop if one ever slips.
 The exception is :class:`TestTheDefaultRunnersReallyExecute`, which runs
-the REAL progress probe against seeded state under that same tmp root —
-without it ``_run`` and both default runners would be dead code here, and
+the REAL progress and census probes against seeded state under that same
+tmp root — without it ``_run`` and the default runners would be dead code here, and
 the module's central claim (it EXECUTES the probes) would be pinned only
 as a string.
 """
@@ -21,7 +21,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -51,6 +51,7 @@ def _check(**kwargs):
     kwargs.setdefault('project_id', 'dark_factory')
     kwargs.setdefault('progress_runner', _ok)
     kwargs.setdefault('liveness_runner', _ok)
+    kwargs.setdefault('census_runner', _ok)
     kwargs.setdefault('poster', lambda url, envelope: None)
     return check_trickle_health.run_health_check(**kwargs)
 
@@ -126,6 +127,36 @@ class TestAggregateVerdict:
         )
 
 
+    def test_a_failing_census_probe_fails_the_aggregate(self):
+        result = _check(census_runner=_fails('ERROR: census fired unadvanced'))
+
+        assert result.exit_code == 1
+        assert result.census_ok is False
+        assert result.progress_ok is True
+        assert result.liveness_ok is True
+        assert 'census=FAILED' in result.reason
+
+    def test_all_three_probes_run_even_when_the_first_two_fail(self):
+        result = _check(
+            progress_runner=_fails('ERROR: progress detail here'),
+            liveness_runner=_fails('ERROR: liveness detail here'),
+            census_runner=_fails('ERROR: census detail here'),
+        )
+
+        assert result.exit_code == 1
+        assert (result.progress_ok, result.liveness_ok, result.census_ok) == (
+            False, False, False,
+        )
+        assert 'census detail here' in result.census_output
+
+    def test_a_raising_census_runner_is_a_failed_probe(self):
+        result = _check(census_runner=_raises(FileNotFoundError('no probe')))
+
+        assert result.exit_code == 1
+        assert result.census_ok is False
+        assert 'FileNotFoundError' in result.census_output
+
+
 class TestTheProbesItActuallyTargets:
     """THE GAP-2 regression tests. The defect was that nothing referenced
     either probe, so pinning the argv BY CONSTRUCTION is what keeps a
@@ -155,9 +186,21 @@ class TestTheProbesItActuallyTargets:
             'dark_factory', '72',
         ]
 
-    def test_both_probe_paths_exist(self):
+    def test_census_progress_argv_targets_the_sibling_script(self):
+        argv = check_trickle_health.census_progress_argv(
+            'dark_factory', max_unadvanced_census_fires=3,
+        )
+
+        assert argv == [
+            sys.executable,
+            str(SCRIPT.parent / 'check_census_progress.py'),
+            'dark_factory', '3',
+        ]
+
+    def test_every_probe_path_exists(self):
         assert check_trickle_health.PROGRESS_SCRIPT.is_file()
         assert check_trickle_health.LIVENESS_SCRIPT.is_file()
+        assert check_trickle_health.CENSUS_PROGRESS_SCRIPT.is_file()
 
 
 class TestCli:
@@ -177,6 +220,27 @@ class TestCli:
         assert defaults['max_barren_runs'] == trickle_state.DEFAULT_MAX_BARREN_RUNS
         assert defaults['max_failed_runs'] == trickle_state.DEFAULT_MAX_FAILED_RUNS
         assert defaults['max_age_hours'] == 72
+        assert defaults['max_unadvanced_census_fires'] == (
+            trickle_state.DEFAULT_MAX_UNADVANCED_CENSUS_FIRES
+        )
+
+    def test_main_forwards_the_census_threshold(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            check_trickle_health, 'run_health_check',
+            lambda **kw: seen.update(kw) or check_trickle_health.HealthResult(
+                exit_code=0, progress_ok=True, liveness_ok=True,
+                progress_output='', liveness_output='',
+                census_ok=True, census_output='', escalated=False,
+                reason='synthetic healthy reason',
+            ),
+        )
+
+        check_trickle_health.main([
+            '--project-id', 'dark_factory', '--max-unadvanced-census-fires', '5',
+        ])
+
+        assert seen['max_unadvanced_census_fires'] == 5
 
     def test_config_only_is_accepted_by_main(self, tmp_path, monkeypatch):
         """``--config`` alone is a valid arity and stays one: the REVIEW
@@ -187,7 +251,8 @@ class TestCli:
             check_trickle_health, 'run_health_check',
             lambda **kw: seen.update(kw) or check_trickle_health.HealthResult(
                 exit_code=0, progress_ok=True, liveness_ok=True,
-                progress_output='', liveness_output='', escalated=False,
+                progress_output='', liveness_output='',
+                census_ok=True, census_output='', escalated=False,
                 reason='synthetic healthy reason',
             ),
         )
@@ -205,7 +270,8 @@ class TestCli:
             check_trickle_health, 'run_health_check',
             lambda **kw: check_trickle_health.HealthResult(
                 exit_code=1, progress_ok=False, liveness_ok=True,
-                progress_output='', liveness_output='', escalated=False,
+                progress_output='', liveness_output='',
+                census_ok=True, census_output='', escalated=False,
                 reason='synthetic failure reason',
             ),
         )
@@ -221,7 +287,8 @@ class TestCli:
             check_trickle_health, 'run_health_check',
             lambda **kw: check_trickle_health.HealthResult(
                 exit_code=0, progress_ok=True, liveness_ok=True,
-                progress_output='', liveness_output='', escalated=False,
+                progress_output='', liveness_output='',
+                census_ok=True, census_output='', escalated=False,
                 reason='synthetic healthy reason',
             ),
         )
@@ -270,8 +337,6 @@ def _seed_state(project_id, *, outcomes, last_recorded_at=None):
     recorder that stopped) is seeded without hand-writing one: keeping the
     real writer in the loop is why these tests cannot drift from recorder
     output."""
-    from datetime import date
-
     counters = {
         'productive': (0, dict(selected_count=2)),
         'barren': (0, dict(budget_skipped=4)),
@@ -294,12 +359,15 @@ def _seed_state(project_id, *, outcomes, last_recorded_at=None):
             total_records=sum(full.values()),
             # Passed explicitly, not left to record_run's defaults: without
             # them pyright matches this `**full` spread (a dict[str, int])
-            # against the bool-typed `commit_made`/`budget_suppressed`
-            # parameters and errors. Mirrors
+            # against the bool-typed `commit_made`/`budget_suppressed`/`capped`/
+            # `scheduled` parameters and errors. Mirrors
             # `test_trickle_state.py::_record`, which spreads a counter dict
             # the same way and stays type-clean for exactly this reason.
             commit_made=False,
             budget_suppressed=False,
+            capped=False,
+            scheduled=False,
+            census=None,
             **full,
         )
     return doc
@@ -320,6 +388,7 @@ class TestEscalation:
         config_path = _write_project_config(tmp_path, project_id='dark_factory')
         kwargs.setdefault('progress_runner', _ok)
         kwargs.setdefault('liveness_runner', _ok)
+        kwargs.setdefault('census_runner', _ok)
         result = check_trickle_health.run_health_check(
             project_id='dark_factory',
             config_path=config_path,
@@ -380,6 +449,43 @@ class TestEscalation:
         assert result.exit_code == 1, 'still loud'
         assert result.escalated is False
         assert envelopes == []
+
+    def test_a_census_only_failure_posts_exactly_one_envelope(self, tmp_path):
+        """Nothing else escalates an unadvanced-fire streak, so the
+        progress probe's suppression rules do not apply to this one."""
+        result, envelopes = self._posted(
+            tmp_path, census_runner=_fails('CENSUS-MARKER fired unadvanced'),
+        )
+
+        assert result.exit_code == 1
+        assert result.escalated is True
+        assert len(envelopes) == 1
+        arguments = envelopes[0][1]['params']['arguments']
+        assert 'census' in arguments['summary']
+        assert 'progress' not in arguments['summary']
+        detail = arguments['detail']
+        assert '--- check_census_progress.py output ---\nCENSUS-MARKER' in detail
+        assert ' '.join(check_trickle_health.census_progress_argv(
+            'dark_factory',
+            max_unadvanced_census_fires=(
+                trickle_state.DEFAULT_MAX_UNADVANCED_CENSUS_FIRES
+            ),
+        )) in detail
+
+    def test_a_census_failure_posts_on_the_nightly_barren_edge_night(
+        self, tmp_path,
+    ):
+        _seed_state('dark_factory', outcomes=['barren'] * 3)
+
+        result, envelopes = self._posted(
+            tmp_path,
+            progress_runner=_fails('ERROR: barren streak'),
+            census_runner=_fails('ERROR: census fired unadvanced'),
+            max_barren_runs=3,
+        )
+
+        assert result.exit_code == 1
+        assert len(envelopes) == 1
 
     def test_two_green_probes_post_nothing(self, tmp_path):
         result, envelopes = self._posted(tmp_path)
@@ -553,6 +659,7 @@ class TestEscalation:
                 config_path=config_path,
                 progress_runner=_fails('ERROR: barren streak'),
                 liveness_runner=_ok,
+                census_runner=_ok,
                 poster=_boom,
             )
 
@@ -568,6 +675,7 @@ class TestEscalation:
             config_path=tmp_path / 'nope' / 'legibility.yaml',
             progress_runner=_fails('ERROR: barren streak'),
             liveness_runner=_ok,
+            census_runner=_ok,
             poster=lambda url, envelope: None,
         )
 
@@ -623,7 +731,7 @@ class TestProjectIdResolution:
         self, tmp_path
     ):
         """THE regression test."""
-        progress_calls, liveness_calls = [], []
+        progress_calls, liveness_calls, census_calls = [], [], []
         config_path = _write_project_config(tmp_path, project_id='proj_a')
 
         check_trickle_health.run_health_check(
@@ -631,16 +739,19 @@ class TestProjectIdResolution:
             config_path=config_path,
             progress_runner=self._recorder(progress_calls),
             liveness_runner=self._recorder(liveness_calls),
+            census_runner=self._recorder(census_calls),
             poster=lambda url, envelope: None,
         )
 
         assert progress_calls == ['proj_a']
         assert liveness_calls == ['proj_a']
+        assert census_calls == ['proj_a']
         # Asserted separately and deliberately: '' is the sentinel this fix
         # deletes, and asserting only the positive would still pass if a
         # future change reintroduced a DIFFERENT falsy default.
         assert '' not in progress_calls
         assert '' not in liveness_calls
+        assert '' not in census_calls
 
     def test_config_only_on_a_healthy_project_is_quiet(self, tmp_path):
         """The operator-visible consequence, end to end."""
@@ -652,6 +763,7 @@ class TestProjectIdResolution:
             config_path=config_path,
             progress_runner=_ok,
             liveness_runner=_ok,
+            census_runner=_ok,
             poster=lambda url, envelope: envelopes.append(envelope),
         )
 
@@ -670,7 +782,7 @@ class TestProjectIdResolution:
         resolves ``--config`` FIRST for the CONFIG, but never had to
         arbitrate a project id — so the rule is stated here rather than
         assumed from the sibling."""
-        progress_calls, liveness_calls = [], []
+        progress_calls, liveness_calls, census_calls = [], [], []
         config_path = _write_project_config(tmp_path, project_id='proj_a')
 
         check_trickle_health.run_health_check(
@@ -678,11 +790,13 @@ class TestProjectIdResolution:
             config_path=config_path,
             progress_runner=self._recorder(progress_calls),
             liveness_runner=self._recorder(liveness_calls),
+            census_runner=self._recorder(census_calls),
             poster=lambda url, envelope: None,
         )
 
         assert progress_calls == ['dark_factory']
         assert liveness_calls == ['dark_factory']
+        assert census_calls == ['dark_factory']
 
     def test_the_envelope_names_the_project_that_was_actually_probed(
         self, tmp_path
@@ -708,6 +822,7 @@ class TestProjectIdResolution:
             config_path=config_path,
             progress_runner=_fails('ERROR: never recorded a run'),
             liveness_runner=_ok,
+            census_runner=_ok,
             poster=lambda url, envelope: envelopes.append(envelope),
         )
 
@@ -736,7 +851,7 @@ class TestProjectIdResolution:
         that cannot run is not evidence of health — applies a fortiori to a
         probe that was never invoked."""
         envelopes = []
-        progress_calls, liveness_calls = [], []
+        progress_calls, liveness_calls, census_calls = [], [], []
         config_path = tmp_path / 'nope' / 'legibility.yaml'
 
         result = check_trickle_health.run_health_check(
@@ -744,6 +859,7 @@ class TestProjectIdResolution:
             config_path=config_path,
             progress_runner=self._recorder(progress_calls),
             liveness_runner=self._recorder(liveness_calls),
+            census_runner=self._recorder(census_calls),
             poster=lambda url, envelope: envelopes.append(envelope),
         )
 
@@ -752,6 +868,7 @@ class TestProjectIdResolution:
         assert envelopes == []
         assert progress_calls == [], 'the progress probe must never be invoked'
         assert liveness_calls == [], 'the liveness probe must never be invoked'
+        assert census_calls == [], 'the census probe must never be invoked'
         assert str(config_path) in result.reason, (
             'the journal line must distinguish a misconfigured invocation '
             'from a genuine probe failure'
@@ -768,6 +885,7 @@ class TestProjectIdResolution:
             config_path=config_path,
             progress_runner=_fails('ERROR: never recorded a run'),
             liveness_runner=_ok,
+            census_runner=_ok,
             poster=lambda url, envelope: envelopes.append(envelope),
         )
 
@@ -792,11 +910,11 @@ class TestTheDefaultRunnersReallyExecute:
     of those assertions green while the 04:30 timer failed nightly in
     production — shipped, bound, and quietly broken.
 
-    Only the PROGRESS probe is executed for real. It reads one JSON file
-    and never shells out, so ``conftest.py::_isolate_legibility_trickle_state``
-    is sufficient isolation and the subprocess inherits that same root. The
-    liveness probe runs ``systemctl``, which no test in this directory may
-    touch.
+    Only the PROGRESS and CENSUS probes are executed for real. They read
+    JSON files and never shell out, so
+    ``conftest.py::_isolate_legibility_trickle_state`` is sufficient
+    isolation and the subprocess inherits that same root. The liveness
+    probe runs ``systemctl``, which no test in this directory may touch.
     """
 
     _THRESHOLDS = dict(max_barren_runs=3, max_age_hours=72, max_failed_runs=2)
@@ -836,6 +954,31 @@ class TestTheDefaultRunnersReallyExecute:
             "own summary of it"
         )
 
+    def test_the_default_census_runner_executes_the_real_probe(self, tmp_path):
+        census_state = tmp_path / 'census-state.json'
+        census_state.write_text(json.dumps({'last_census_at': '2026-08-02'}))
+        for day in (1, 2, 3):
+            trickle_state.record_run(
+                'dark_factory',
+                target_date=date(2026, 9, day),
+                recorded_at=datetime.now(UTC),
+                exit_code=0, total_records=0, zero_signal_dropped=0,
+                dedupe_collapsed=0, below_sampling_cut=0, budget_skipped=0,
+                selected_count=0,
+                census=trickle_state.CensusObservation(
+                    fired=True, last_census_at='2026-08-02',
+                    census_state_path=str(census_state),
+                ),
+            )
+
+        returncode, output = check_trickle_health._default_census_runner(
+            'dark_factory', max_unadvanced_census_fires=3,
+        )
+
+        assert returncode == 1, output
+        assert 'consecutive' in output
+        assert 'usage:' not in output
+
     def test_run_health_check_defaults_to_the_real_progress_probe(
         self, tmp_path
     ):
@@ -849,6 +992,7 @@ class TestTheDefaultRunnersReallyExecute:
             project_id='proj_defaults_e2e',
             config_path=tmp_path / 'absent' / 'legibility.yaml',
             liveness_runner=_ok,
+            census_runner=_ok,
             poster=lambda url, envelope: None,
         )
 

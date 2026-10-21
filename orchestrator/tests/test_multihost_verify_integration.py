@@ -62,6 +62,7 @@ from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _gate_fixtures import gated_remote_runner
 from _merge_lane_fakes import (
     FakeVerifier,
     VerifyScript,
@@ -87,8 +88,8 @@ from orchestrator.merge_lane.liveness import (
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
 )
-from orchestrator.merge_queue import PRODUCTION_CLOCK, MergeRequest
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import PRODUCTION_CLOCK, MergeRequest
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     DriftDetector,
@@ -1813,6 +1814,52 @@ class TestUnreachableHostCapstone:
                 req_a.result, label='A resolves past the PARK',
             )).status != 'done'
 
+    async def test_a_slot_parked_outside_the_lane_is_unparked_by_the_backstop_without_a_restart(
+        self, host_git_ops: GitOps, host_config: OrchestratorConfig,
+    ) -> None:
+        """A PARK the lane never recorded still recovers, with no restart.
+
+        A caller outside the merge lane -- a host pool sharing the allocator --
+        parks the laptop through the allocator's own ``cancel_and_release``.
+        Nothing tracks or quarantines it, so the tracker-driven reprobe sweep
+        cannot see it.  The ``_slots``-driven backstop must free it once it
+        probes clean, and must declare no recovery for capacity that was never
+        declared lost.
+        """
+        escalations = _HostEscalationQueue()
+        events = _RecordingEventStore()
+        laptop = _FlakyRemoteRunner(reachable=False)
+
+        async def no_sleep(_secs: float) -> None:
+            return None
+
+        async with _lane_with_remote(
+            host_git_ops, host_config, laptop,
+            verifier=FakeVerifier(), escalation_queue=escalations, event_store=events,
+        ) as (lane, _queue):
+            alloc = _inject_two_host_allocator(lane, laptop)
+            lease = alloc.acquire_remote()
+            assert lease is not None and lease.name == 'leo-laptop'
+            await alloc.cancel_and_release(lease, sleep=no_sleep, max_attempts=1)
+
+            row = _host_row(lane, 'leo-laptop')
+            assert row['slot_state'] == 'parked', row
+            assert row['quarantine_class'] is None and row['streak'] is None, (
+                f'precondition: the PARK must be untracked by the lane: {row!r}'
+            )
+
+            laptop.reachable = True
+            await _until(
+                lambda: _host_row(lane, 'leo-laptop').get('slot_state') == 'free',
+                what='the backstop sweep to un-PARK the untracked laptop',
+            )
+
+            relet = alloc.acquire_remote()
+            assert relet is not None and relet.name == 'leo-laptop'
+            await alloc.release(relet)
+            assert events.events_of(EventType.verify_host_recovered) == [], events.events
+            assert escalations.submitted == [], escalations.submitted
+
     async def test_stop_leaves_no_lane_background_task_running(
         self, host_git_ops: GitOps, host_config: OrchestratorConfig,
     ) -> None:
@@ -1928,7 +1975,7 @@ def _xcheck_config(*, project_root: Path, cross_check: bool = True) -> Orchestra
 
 def _xcheck_req(config: OrchestratorConfig, *, task_files=('src/foo.py',), worktree=None):
     """A minimal MergeRequest for _run_post_merge_verify cross-check tests."""
-    from orchestrator.merge_queue import MergeRequest
+    from orchestrator.merge_lane.worker import MergeRequest
 
     loop = asyncio.get_running_loop()
     return MergeRequest(
@@ -1949,7 +1996,7 @@ def _xcheck_git_ops() -> MagicMock:
     mock.get_main_sha = AsyncMock(return_value='main-sha')
     mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
     mock.cleanup_merge_worktree = AsyncMock()
-    mock.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+    mock.create_ephemeral_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
     return mock
 
 
@@ -1989,7 +2036,7 @@ class TestPerLandCrossCheck:
         halt + BORN-AT-L2 escalation + event (task 2886 fix 3)."""
         from unittest.mock import Mock
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2055,7 +2102,7 @@ class TestPerLandCrossCheck:
         one flaky local verify cannot block every merge lane fleet-wide)."""
         from unittest.mock import Mock
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2111,7 +2158,7 @@ class TestPerLandCrossCheck:
         """fix 3 ordering: the synchronous halt MUST precede the escalation submit and the
         blocked return, so no FURTHER adoption can occur before a human looks."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2156,7 +2203,7 @@ class TestPerLandCrossCheck:
         """fix 3 None-safety: non-production callers omit halt_hook (default None) — the
         divergence still withholds the land + files a born-at-L2 escalation, no crash."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2190,7 +2237,7 @@ class TestPerLandCrossCheck:
     async def test_agree_local_pass_proceeds_and_emits_verdict_parity_ok(self, tmp_path):
         """knob ON, remote PASS + local PASS -> proceeds (None) + verdict_parity_ok."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2223,7 +2270,7 @@ class TestPerLandCrossCheck:
     async def test_knob_off_never_constructs_local_runner_byte_identical(self, tmp_path):
         """knob OFF -> the local cross-check runner is NEVER constructed (byte-identical)."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=False)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2257,7 +2304,7 @@ class TestPerLandCrossCheck:
     async def test_local_runner_unavailable_is_inconclusive_and_trusts_remote(self, tmp_path):
         """knob ON, local cross-check raises RunnerUnavailable -> inconclusive + trust remote green."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2289,7 +2336,7 @@ class TestPerLandCrossCheck:
     async def test_trivial_remote_pass_skips_cross_check(self, tmp_path):
         """knob ON, remote returns a TRIVIAL pass -> cross-check SKIPPED (no suite ran to compare)."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2327,7 +2374,7 @@ class TestPerLandCrossCheck:
     async def test_local_dispatch_path_skips_cross_check_entirely(self, tmp_path):
         """runner is None (local dispatch): the cross-check branch never runs."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2389,7 +2436,6 @@ class TestTwoHostFalseGreenCapstone:
         import json
 
         from orchestrator.verify_runner import (
-            RemoteRunner,
             build_merge_verify_spec,
             result_to_json,
             run_merge_verify_on_worktree,
@@ -2424,7 +2470,7 @@ class TestTwoHostFalseGreenCapstone:
                 return (0, '', '')
             return next(_it)
 
-        runner = RemoteRunner(
+        runner = gated_remote_runner(
             name='leo-laptop', ssh_host='leo-laptop.local', git_remote='origin',
             cwd='/repo', run=fake_run, id_factory=lambda: 'cap-id',
         )
@@ -2615,7 +2661,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
         "not recorded" case drivable.
         """
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)

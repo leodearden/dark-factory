@@ -32,9 +32,10 @@ hour.  This is not hypothetical — it is the trap the task's METHOD NOTE calls
 out.
 
 The rule this module enforces: **bucket by parsing, never by SQL string
-comparison against a ``datetime('now')`` literal.**  ``utc_hour_bucket`` is the
-single place that parsing happens; every reader in this module and the rollup
-in ``event_buffer.cleanup_drained`` route through it.
+comparison against a ``datetime('now')`` literal.**  Bucketing happens in one
+place, ``_hour_key`` over an instant from ``_parse_utc``, which
+``utc_hour_bucket`` composes; every reader in this module and the rollup in
+``event_buffer.cleanup_drained`` route through them.
 """
 
 from __future__ import annotations
@@ -44,9 +45,10 @@ import json
 import sqlite3
 import sys
 from collections import Counter
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 __all__ = [
     'FITTED_CYCLE_FIXED_SECONDS',
@@ -62,6 +64,7 @@ __all__ = [
     'DRAIN_MODES',
     'classify_run',
     'drain_stats',
+    'inflow_concentration',
     'inflow_daily',
     'remediation_duty_cycle',
     'inflow_hourly',
@@ -88,10 +91,20 @@ def utc_hour_bucket(ts: str) -> str:
             garbage into a plausible-looking wrong hour would silently corrupt
             the measurement, so this fails loudly instead.
     """
+    return _hour_key(_parse_utc(ts))
+
+
+def _hour_key(instant: datetime) -> str:
+    """An aware UTC instant's hour key, ``'YYYY-MM-DDTHH'``."""
+    return instant.strftime('%Y-%m-%dT%H')
+
+
+def _parse_utc(ts: str) -> datetime:
+    """Parse an ISO8601 timestamp to an aware UTC instant; naive means UTC."""
     parsed = datetime.fromisoformat(ts)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC).strftime('%Y-%m-%dT%H')
+    return parsed.astimezone(UTC)
 
 
 def _connect_ro(db_path: str | Path) -> sqlite3.Connection:
@@ -198,17 +211,8 @@ def _arrival_counts(
                     continue
                 counts[(row['hour_bucket'], row['event_type'])] += row['event_count']
 
-        if _table_exists(conn, 'event_buffer'):
-            for row in conn.execute(
-                'SELECT timestamp, event_type FROM event_buffer WHERE project_id = ?',
-                (project_id,),
-            ):
-                # Bucket in Python.  Never filter these by a SQL comparison
-                # against a datetime('now') literal — see the METHOD NOTE.
-                bucket = utc_hour_bucket(row['timestamp'])
-                if floor is not None and bucket < floor:
-                    continue
-                counts[(bucket, row['event_type'])] += 1
+        for live in _live_rows(conn, project_id, floor):
+            counts[(live.hour_bucket, live.event_type)] += 1
     finally:
         conn.close()
 
@@ -269,11 +273,140 @@ def inflow_daily(
 
     return {
         'daily': {day: daily[day] for day in sorted(daily)},
-        'composition': {
-            etype: composition[etype]
-            for etype in sorted(composition, key=lambda e: (-composition[e], e))
-        },
+        'composition': _ranked_counts(composition),
         'total_events': sum(daily.values()),
+    }
+
+
+def _ranked_counts(counts: Counter[str]) -> dict[str, int]:
+    """``counts`` as a dict ordered largest first, ties broken by name."""
+    return {key: counts[key] for key in sorted(counts, key=lambda k: (-counts[k], k))}
+
+
+def _payload_task_id(payload: str) -> str | None:
+    """The task id a stored payload names, as a string; None when it names none.
+
+    A payload that is not JSON names no task: attribution is advisory, so one
+    bad row is counted as unattributed rather than taking the report down.
+    Writers emit int or str ids, so only those are attributed: ``str()`` of a
+    float or a bool would mint a key ('7.0', 'True') that never merges with
+    the task's real id.
+    """
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    task_id = decoded.get('task_id') if isinstance(decoded, dict) else None
+    if isinstance(task_id, bool) or not isinstance(task_id, int | str):
+        return None
+    return str(task_id)
+
+
+class _LiveRow(NamedTuple):
+    """One live ``event_buffer`` row, its timestamp parsed once."""
+
+    instant: datetime
+    hour_bucket: str
+    event_type: str
+    payload: str
+
+
+def _live_rows(
+    conn: sqlite3.Connection,
+    project_id: str,
+    floor: str | None,
+) -> Iterator[_LiveRow]:
+    """Every live ``event_buffer`` row for the project, of ANY status, at or after ``floor``.
+
+    The one reader of live rows.  It buckets in Python and never filters by a
+    SQL comparison against a ``datetime('now')`` literal (the METHOD NOTE).
+    """
+    if not _table_exists(conn, 'event_buffer'):
+        return
+    for timestamp, event_type, payload in conn.execute(
+        'SELECT timestamp, event_type, payload FROM event_buffer WHERE project_id = ?',
+        (project_id,),
+    ):
+        instant = _parse_utc(timestamp)
+        bucket = _hour_key(instant)
+        if floor is None or bucket >= floor:
+            yield _LiveRow(instant, bucket, event_type, payload)
+
+
+def _widen(
+    window: tuple[datetime, datetime] | None,
+    instant: datetime,
+) -> tuple[datetime, datetime]:
+    """``window`` stretched to cover ``instant``; no window yet starts at it."""
+    if window is None:
+        return (instant, instant)
+    return (min(window[0], instant), max(window[1], instant))
+
+
+def inflow_concentration(
+    db_path: str | Path,
+    project_id: str,
+    since: str | None = None,
+    top_n: int = 10,
+) -> dict[str, Any]:
+    """Which task ids a project's live inflow comes from, largest first.
+
+    Covers LIVE ``event_buffer`` rows only, because only they carry a payload:
+    ``cleanup_drained`` rolls a swept row up to (project, hour, event_type) and
+    its task id is gone.  That loses nothing that matters — while a backlog
+    exists the buffered rows ARE the backlog — but a burst that was already
+    swept is unattributable, so the window bounds state what was covered.
+
+    Args:
+        db_path: Path to reconciliation.db (opened read-only).
+        project_id: Project to report on.
+        since: Optional inclusive floor (see :func:`inflow_hourly`).
+        top_n: How many tasks to report.
+
+    Returns:
+        ``{'window_start', 'window_end', 'live_events', 'unattributed_events',
+        'top_tasks': [{'task_id', 'events', 'share', 'composition'}]}``.  The
+        window bounds are the earliest and latest UTC instants counted (None
+        with no rows).  ``share`` is against ALL live rows, task-less ones
+        included, so it reads directly as a fraction of inflow.  Ties order by
+        task id, so the truncation is deterministic.
+
+    Raises:
+        ValueError: On a malformed stored timestamp, like every reader here.
+    """
+    window: tuple[datetime, datetime] | None = None
+    live_events = 0
+    unattributed = 0
+    per_task: dict[str, Counter[str]] = {}
+
+    conn = _connect_ro(db_path)
+    try:
+        for live in _live_rows(conn, project_id, _normalise_since(since)):
+            window = _widen(window, live.instant)
+            live_events += 1
+            task_id = _payload_task_id(live.payload)
+            if task_id is None:
+                unattributed += 1
+                continue
+            per_task.setdefault(task_id, Counter())[live.event_type] += 1
+    finally:
+        conn.close()
+
+    ranked = sorted(per_task.items(), key=lambda item: (-item[1].total(), item[0]))
+    return {
+        'window_start': window[0].isoformat() if window else None,
+        'window_end': window[1].isoformat() if window else None,
+        'live_events': live_events,
+        'unattributed_events': unattributed,
+        'top_tasks': [
+            {
+                'task_id': task_id,
+                'events': types.total(),
+                'share': types.total() / live_events,
+                'composition': _ranked_counts(types),
+            }
+            for task_id, types in ranked[:top_n]
+        ],
     }
 
 
@@ -716,7 +849,10 @@ def _retention_note() -> str:
         'that delete transaction, so from then on arrival history is durable '
         'and exact. Inflow from before the rollup landed was destroyed by that '
         'delete and is unrecoverable — treat any window extending back past '
-        'the rollup as truncated, not as a period of low inflow.'
+        'the rollup as truncated, not as a period of low inflow. Per-task '
+        'concentration reads payloads, which only live event_buffer rows '
+        'carry, so it covers the window printed with it (the current backlog '
+        'plus drained rows not yet swept), never the rolled-up history.'
     )
 
 
@@ -745,7 +881,9 @@ def build_report(
         (the :func:`drain_stats` payload), ``remediation_duty_cycle``,
         ``sustainable_events_per_day``, ``capacity_verdict``,
         ``remediation_free_events_per_day``,
-        ``remediation_free_capacity_verdict`` and ``retention_note``.
+        ``remediation_free_capacity_verdict``, ``concentration`` (the
+        :func:`inflow_concentration` payload, live rows only) and
+        ``retention_note``.
 
         TWO capacity figures, each with its own verdict:
 
@@ -814,6 +952,7 @@ def build_report(
         'capacity_verdict': verdict,
         'remediation_free_events_per_day': remediation_free,
         'remediation_free_capacity_verdict': remediation_free_verdict,
+        'concentration': inflow_concentration(db_path, project_id, effective_since),
         'retention_note': _retention_note(),
     }
 
@@ -838,6 +977,7 @@ def _format_report(report: dict[str, Any]) -> str:
                  f'{len(inflow["hourly"])} hour(s)')
     for etype, n in inflow['composition'].items():
         lines.append(f'           {etype}: {n}')
+    lines.extend(_format_concentration(report['concentration']))
 
     lines.append('drain:')
     for mode in DRAIN_MODES:
@@ -884,6 +1024,23 @@ def _format_report(report: dict[str, Any]) -> str:
     lines.append('')
     lines.append(report['retention_note'])
     return '\n'.join(lines)
+
+
+def _format_concentration(section: dict[str, Any]) -> list[str]:
+    """The readable per-task lines, headed by the live-row window they cover."""
+    if section['live_events'] == 0:
+        return ['by task: no live event_buffer rows to attribute']
+    lines = [
+        f'by task: {section["live_events"]} live event_buffer row(s), '
+        f'{section["window_start"]} .. {section["window_end"]}',
+    ]
+    for entry in section['top_tasks']:
+        lines.append(
+            f'           task {entry["task_id"]}: {entry["events"]} '
+            f'({entry["share"]:.1%})')
+    if section['unattributed_events']:
+        lines.append(f'           unattributed: {section["unattributed_events"]}')
+    return lines
 
 
 def _build_parser() -> argparse.ArgumentParser:

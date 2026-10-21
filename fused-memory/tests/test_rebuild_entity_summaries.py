@@ -29,6 +29,7 @@ from _fm_helpers import (
 )
 
 from fused_memory.backends.graphiti_client import (
+    _ACTIVE_EDGE_PREDICATE,
     INCOMPLETE_CENSUS_UNAVAILABLE,
     INCOMPLETE_SHORT_READ,
     INCOMPLETE_STRUCTURAL_KINDS,
@@ -3107,6 +3108,56 @@ class TestStructuralRefusalNeverBlanksSummaries:
 
         backend.update_node_summary.assert_not_awaited()
         assert backend.update_node_summary.await_count == 0
+
+
+# ---------------------------------------------------------------------------
+# task 4714: the bulk rebuild and the single-entity refresh read the SAME
+# population — otherwise the two summary generators diverge for one entity
+# ---------------------------------------------------------------------------
+
+class TestBulkAndSingleRefreshShareTheEdgePopulation:
+    """Both summary generators must select edges by the same predicate.
+
+    ``rebuild_entity_summaries`` (bulk, via ``get_all_valid_edges``) and
+    ``refresh_entity_summary`` (single, via ``get_valid_edges_for_node``) write
+    to the SAME ``summary`` property.  If their predicates drift apart, which
+    facts an entity's summary contains depends on which code path last touched
+    it — the bulk pass and a targeted refresh would disagree about the same
+    entity, and each would silently overwrite the other.  The population both
+    reads return on a real server is pinned by
+    tests/test_refresh_entity_summary.py::TestActiveEdgePopulationLiveFalkorDB.
+    """
+
+    @pytest.mark.asyncio
+    async def test_both_reads_use_the_shared_active_edge_predicate(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        graph = _DualCorpusGraph(
+            node_rows=[['u1', 'Task 99', 'stale']],
+            edge_rows=[['u1', 'e1', 'Task 99 depends on Task 98', 'DEPENDS_ON']],
+        )
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.update_node_summary = AsyncMock()
+
+        # The bulk path's whole-graph edge read...
+        await backend.get_all_valid_edges(group_id='test')
+        bulk = [q for q in graph.queries if 'RELATES_TO' in q]
+
+        graph.queries.clear()
+        # ...and the single-entity refresh.  _DualCorpusGraph's edge corpus is
+        # 4-column (bulk shape); get_valid_edges_for_node reads columns 0..2, so
+        # the rows are harmless here — the claim under test is the predicate.
+        await backend.refresh_entity_summary(
+            'u1', group_id='test', name='Task 99', old_summary='stale'
+        )
+        single = [q for q in graph.queries if 'RELATES_TO' in q]
+
+        assert bulk, 'no RELATES_TO read recorded for the bulk path'
+        assert single, 'no RELATES_TO read recorded for the refresh path'
+        for query in bulk + single:
+            assert _ACTIVE_EDGE_PREDICATE in query, query
+            assert 'expired_at' not in query, query  # restored edges stay (esc-4714-9)
 
 
 # ---------------------------------------------------------------------------

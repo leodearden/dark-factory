@@ -1047,7 +1047,7 @@ class TestConsolidationAutoLeavesAreGreenTier:
     Modelled on ``TestMem0UpdateLeavesAreGreenTier`` above, in the stronger
     ``TestWriteTriageJudgeLeavesAreGreenTier`` form: the expected leaf set is
     DERIVED from ``ConsolidationAutoConfig.model_fields`` rather than restated,
-    so a FOURTEENTH leaf added later without a ``reload.py`` registration fails
+    so a FIFTEENTH leaf added later without a ``reload.py`` registration fails
     HERE instead of silently degrading to restart-only.
 
     Two leaves make the section's green tier load-bearing rather than
@@ -1058,12 +1058,12 @@ class TestConsolidationAutoLeavesAreGreenTier:
     running server.
 
     UNLIKE its sibling classes here, this one does NOT pair the classification
-    with a live-read resolver test, because on this branch there is no consumer
-    to read: the executor is task delta, the proposal tool task gamma, the
-    provenance bar task epsilon. The live-read half of reload.py's
-    reload-safety rule is discharged by those tasks and their own tests. What
-    IS assertable now — and asserted below — is the diff/apply behaviour and
-    that a held reference to the shared submodel observes the flip.
+    with a live-read resolver test: the live-read consumer is
+    ``reconciliation/consolidation_auto_executor.py::run_auto_consolidation``
+    (with ``server/tools.py::propose_consolidation``), and the live-read half
+    of reload.py's reload-safety rule is discharged by their own tests. What
+    is asserted here is the diff/apply behaviour and that a held reference to
+    the shared submodel observes the flip.
     """
 
     #: Discovered rather than restated — see the class docstring.
@@ -1082,6 +1082,7 @@ class TestConsolidationAutoLeavesAreGreenTier:
         'max_auto_per_cycle': 1,
         'max_gate_filings_per_cycle': 0,
         'backlog_multiplier': 2,
+        'canonical_absent_bonus': 3.0,
         'refusal_streak_threshold': 3,
         'slug_collision_jaccard': 0.8,
         'proposal_ttl_hours': 24,
@@ -1094,7 +1095,7 @@ class TestConsolidationAutoLeavesAreGreenTier:
 
     def test_the_schema_actually_declares_the_leaves(self):
         """Guards the derivation itself: an empty set would pass vacuously."""
-        assert len(self.LEAVES) == 13, self.LEAVES
+        assert len(self.LEAVES) == 14, self.LEAVES
 
     def test_every_leaf_is_allowlisted(self):
         expected = {f'consolidation_auto.{name}' for name in self.LEAVES}

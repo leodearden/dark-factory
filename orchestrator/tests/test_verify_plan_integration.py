@@ -95,7 +95,7 @@ from orchestrator.b3_gate import ABORT, FRESH, POST_MERGE_RED_MAIN_REASON_PREFIX
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WorktreeKind, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     MergeRequest,
     QueuedBranch,
     _DryRunInvestigationHandles,
@@ -788,7 +788,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
     for real.
 
     RED until step-16 imports _run_post_merge_verify/_DryRunInvestigationHandles
-    from orchestrator.merge_queue, check_proposal/ABORT from
+    from orchestrator.merge_lane.worker, check_proposal/ABORT from
     orchestrator.b3_gate, BlockClass from orchestrator.unblock_types,
     VerifyResult from orchestrator.verify, and _RecordingScheduler/
     _make_agent_result from test_dry_run_unblock (cross-file convention
@@ -828,7 +828,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
             reqs.append(req)
             with (
                 patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
                     new=AsyncMock(return_value=(False, '')),
                 ),
                 patch(

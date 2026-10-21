@@ -200,12 +200,23 @@ _TREE_SITTER_GENERATE_RE = re.compile(r'tree-sitter generate', re.MULTILINE)
 # does not apply here.
 # ---------------------------------------------------------------------------
 
-# ENOSPC markers reused VERBATIM from merge_queue._ENOSPC_MARKERS (single
-# grounded vocabulary shared with merge_queue's _verify_hit_enospc and
-# git_ops's disk-pressure detection) — do not invent new ENOSPC strings;
-# extend that constant instead if a new grounded sample appears. Matched
-# case-insensitively against the whole output, same as _verify_hit_enospc.
-_ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
+# The OS's own ENOSPC renderings: the strerror (Python, git, bash, ld, Node)
+# and Rust's "(os error 28)" suffix. A bare ENOSPC token is how tests, ids and
+# log lines NAME the condition, so it is not evidence (task 7032).
+_DISK_FULL_OS_ERROR_MARKERS = ('no space left on device', 'os error 28')
+
+
+def reports_disk_full(text: str) -> bool:
+    """Does *text* carry an OS error report of a full disk (ENOSPC)?
+
+    The one disk-full text predicate, shared by ``_classify_environmental``,
+    ``git_ops.py::_worktree_add_failure_is_retryable`` and
+    ``merge_lane/worker.py::_verify_hit_enospc``. Known residual: a failing
+    test whose own message quotes the full phrase still reads as disk-full.
+    """
+    folded = text.casefold()
+    return any(marker in folded for marker in _DISK_FULL_OS_ERROR_MARKERS)
+
 
 # Linker SIGBUS-on-full-disk (git_ops.py: "proceeding into an ENOSPC build
 # that SIGBUSes the linker") — a real secondary disk-full mode where the
@@ -381,33 +392,25 @@ _SLOT_ACQUIRE_DEADLINE_RE = re.compile(
 # note above (cf. `_SLOT_ACQUIRE_DEADLINE_RE`, `verify._match_clock_marker`):
 # run_all emits two leading spaces, and verify output is aggregated from
 # wrappers that routinely indent captured sub-output. It adopts the shape
-# already source-verified in `offline_lane._INFRA_RESULT_FAIL_RE`, widened to
-# PASS|FAIL|SKIP, and stops before any trailing
-# ` [flaky: passed on serial retry]` suffix (run_all.sh:1792).
+# already source-verified in `offline_lane_runs.py::INFRA_RESULT_RE`, and stops
+# before any trailing ` [flaky: passed on serial retry]` suffix (run_all.sh:1792).
 #
 # ---> SIBLING ENCODING, KEEP IN SYNC (review amendment #4). This is the
 # SECOND in-repo encoding of run_all.sh's per-suite RESULT framing; the other
-# is `offline_lane._INFRA_RESULT_FAIL_RE` (offline_lane.py:102), which parses
-# the same lines for the infra confirmation runner. They intentionally
-# DIVERGE in three ways, none of them accidental:
+# is `offline_lane_runs.py::INFRA_RESULT_RE`, which parses the same lines into
+# the offline lane's infra run records. Both match PASS|FAIL|SKIP, leave the
+# tail open and capture the name as `[^)]+`. They DIVERGE in one way, not by
+# accident:
 #
-#   * TAIL — offline_lane end-anchors (`\s*$`); this one does NOT, because the
-#     close may carry run_all's ` [flaky: ...]` suffix. Traced consequence of
-#     the open tail here: a close can only ever match EARLIER, which only ever
-#     SHRINKS a redaction window — i.e. it stays in the fail-safe direction.
-#   * SEPARATORS — offline_lane uses `\s*` between tokens; this one requires
-#     the literal single spaces run_all actually emits. Stricter, and correct
-#     per the ANCHORING CONTRACT: a looser separator is another way for quoted
-#     assertion prose to impersonate the producer.
-#   * NAME — offline_lane uses `.+?`; this one uses `[^)]+`, which cannot run
-#     past the closing paren into a ` [flaky: ...]` suffix.
+#   * SEPARATORS — offline_lane_runs uses `\s*` between tokens; this one
+#     requires the literal single spaces run_all actually emits. Stricter, and
+#     correct per the ANCHORING CONTRACT: a looser separator is another way for
+#     quoted assertion prose to impersonate the producer.
 #
 # Neither site is generated from the other, so a future run_all framing change
 # must be fixed in BOTH. This cross-reference exists so that is discoverable
 # from either end. If a THIRD consumer ever appears, lift the patterns into
-# one small shared module rather than adding a fourth copy. (The reciprocal
-# `cf. verify_classify._RUN_ALL_SUITE_CLOSE_RE` comment in offline_lane.py is
-# NOT in task 4492's lock scope and is filed as follow-up work.)
+# one small shared module rather than adding a fourth copy.
 _RUN_ALL_SUITE_OPEN_RE = re.compile(r'^--- Running: (?P<name>.+?) ---[ \t]*$')
 _RUN_ALL_SUITE_CLOSE_RE = re.compile(
     r'^[ \t]*RESULT: (?P<verdict>PASS|FAIL|SKIP) \((?P<name>[^)]+)\)'
@@ -641,17 +644,62 @@ def is_interpreter_missing_workspace_packages(output: str) -> bool:
     rather than raising — a classifier must never be the thing that fails.
     """
     unresolved = unresolved_top_level_modules(output)
-    return (
-        len(unresolved) >= _MIN_DISTINCT_UNRESOLVED_IMPORTS
-        and bool(unresolved & _BASELINE_WORKSPACE_MODULES)
+    return _has_broad_unresolved_imports(unresolved) and bool(
+        unresolved & _BASELINE_WORKSPACE_MODULES
     )
+
+
+def is_partially_provisioned_venv_type_failure(
+    type_output: str, *, test_tool: ToolKind, test_leg_passed: bool,
+) -> bool:
+    """True when a type-check failure shows pyright reading a cold ``.venv``
+    that was still being populated, corroborated by the same run's passing
+    PYTEST leg — an environment fault, not a branch defect.
+
+    Task 6127 / esc-6021-3. Measured signature: 164 reportMissingImports over
+    seven DISTINCT top-level third-party modules on a docs-only merge, while
+    every test leg passed. pytest resolved, because shared's ``uv run``
+    installed it first, so the task-3367 sentinel misses this shape; the
+    member-specific packages had not landed yet.
+
+    DISCRIMINATOR CONTRACT — all three conditions must hold:
+
+      1. *test_leg_passed*: the same venv imported those packages at runtime,
+         so pyright's view was stale rather than the dependency set wrong.
+         This corroboration replaces the 3367 sentinel;
+      2. *test_tool* is ``ToolKind.PYTEST``: only a Python test run imports
+         anything, so a passing ``true``, JS-only or wrapped test command
+         corroborates nothing. A skipped leg resolves ``ToolKind.OPAQUE``;
+      3. at least ``_MIN_DISTINCT_UNRESOLVED_IMPORTS`` DISTINCT top-level
+         modules are unresolved — the floor shared with 3367, so a branch
+         adding one or two undeclared imports still blames the branch.
+
+    Purity of reportMissingImports is deliberately NOT required: the measured
+    log carried consequential reportAttributeAccessIssue and
+    reportOptionalMemberAccess errors alongside the imports.
+
+    Residual gap: a passing pytest leg vouches only for the modules it
+    imported, so a type command covering code no test imports (a whole
+    subproject, or a new untested module) gets no real corroboration.
+
+    Pure and total: any input returns a bool rather than raising.
+    """
+    return (
+        test_leg_passed
+        and test_tool is ToolKind.PYTEST
+        and _has_broad_unresolved_imports(unresolved_top_level_modules(type_output))
+    )
+
+
+def _has_broad_unresolved_imports(unresolved: frozenset[str]) -> bool:
+    return len(unresolved) >= _MIN_DISTINCT_UNRESOLVED_IMPORTS
 
 
 def unresolved_top_level_modules(output: str) -> frozenset[str]:
     """Distinct TOP-LEVEL module names reported unresolved in *output*.
 
-    The one place ``_UNRESOLVED_IMPORT_RE`` is applied — both the predicate
-    above and verify.py's loud log (which reports the count) read the signature
+    The one place ``_UNRESOLVED_IMPORT_RE`` is applied — both predicates above
+    and verify.py's loud logs (which report the count) read the signature
     through this helper, so there is never a second copy of the regex.
     """
     return frozenset(
@@ -962,8 +1010,7 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     #      stays load-bearing; scoping changes WHICH TEXT each arm reads,
     #      never the order they are tried in.
     scoped = _redact_passed_suite_blocks(output)
-    lower = scoped.lower()
-    if any(marker in lower for marker in _ENOSPC_MARKERS):
+    if reports_disk_full(scoped):
         return FailureCategory.DISK_FULL
     if _LINKER_CONTEXT_RE.search(scoped) and _LINKER_SIGNAL_RE.search(scoped):
         return FailureCategory.DISK_FULL

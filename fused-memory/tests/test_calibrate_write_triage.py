@@ -2958,7 +2958,7 @@ def _retrieval_with_parents(
 class TestComputeRecallAtKAliasesAndPopulation:
     """Production parity (task's retrieval-recall leaf): rotated-canonical
     resolution and the child-hoist rule mirroring
-    write_triage.py::_canonical_id_of."""
+    write_triage.py::canonical_id_of."""
 
     def test_default_behaviour_is_byte_identical_to_the_legacy_call(self) -> None:
         """No aliases, no count_absent_as_miss kwarg: must match the original
@@ -3026,7 +3026,7 @@ class TestComputeRecallAtKAliasesAndPopulation:
         self, aliases, count_absent_as_miss,
     ) -> None:
         """Production files a sighting/amendment winner against its parent
-        (write_triage.py::_canonical_id_of), and the judge eval's
+        (write_triage.py::canonical_id_of), and the judge eval's
         canonical_in_slate counts it the same way. So the hoist is not an
         alias feature: it holds under every alias map and every population."""
         retrievals = [

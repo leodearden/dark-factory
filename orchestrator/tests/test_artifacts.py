@@ -17,6 +17,7 @@ from shared import safe_io
 
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
+    PLAN_TASK_TEXT_FP_KEY,
     ArtifactWriteError,
     ReviewAggregation,
     TaskArtifacts,
@@ -406,6 +407,40 @@ class TestPlanProvenance:
         assert updated['task_id'] == 'task-1'
         assert updated['analysis'] == 'Some analysis'
         assert len(updated['steps']) == 1
+
+    def test_stamp_plan_provenance_writes_the_task_text_fingerprint(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('session-abc123', task_text_fp='tfp:new')
+        updated = artifacts.read_plan()
+        assert updated[PLAN_TASK_TEXT_FP_KEY] == 'tfp:new'
+        assert updated['_session_id'] == 'session-abc123'
+        assert '_created_at' in updated
+
+    def test_stamp_plan_provenance_fingerprint_overwrites_a_stale_one(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan({**VALID_PLAN_WITH_STEPS, PLAN_TASK_TEXT_FP_KEY: 'tfp:old'})
+        artifacts.stamp_plan_provenance('session-abc123', task_text_fp='tfp:new')
+        assert artifacts.read_plan()[PLAN_TASK_TEXT_FP_KEY] == 'tfp:new'
+
+    def test_stamp_plan_provenance_without_fingerprint_keeps_the_existing_one(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('planner', task_text_fp='tfp:authored')
+        artifacts.stamp_plan_provenance('implementer-iteration')
+        updated = artifacts.read_plan()
+        assert updated[PLAN_TASK_TEXT_FP_KEY] == 'tfp:authored'
+        assert updated['_session_id'] == 'implementer-iteration'
+
+    def test_stamp_plan_provenance_without_fingerprint_adds_none(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('session-abc123')
+        assert PLAN_TASK_TEXT_FP_KEY not in artifacts.read_plan()
 
     def test_validate_plan_owner_true_for_matching_session(self, artifacts: TaskArtifacts):
         artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
@@ -1817,6 +1852,58 @@ class TestMetaRootDerivation:
         assert TaskArtifacts.meta_root_for(Path('/other/base'), 'task-42') == (
             Path('/other/base/.task-meta/task-42')
         )
+
+
+class TestReadLaneTaskId:
+    """`read_lane_task_id` resolves lane -> task off `metadata.json` ONLY, and
+    a missing, undecodable, corrupt or malformed file is a miss, never a raise.
+    """
+
+    @pytest.fixture
+    def meta_root(self, tmp_path: Path) -> Path:
+        root = tmp_path / '.task-meta' / '_lane-0'
+        root.mkdir(parents=True)
+        return root
+
+    def test_returns_task_id_from_metadata_json(self, meta_root: Path):
+        (meta_root / 'metadata.json').write_text(json.dumps({
+            'task_id': '5069',
+            'title': 'T',
+            'created_at': '2026-09-02T00:00:00+00:00',
+        }))
+        assert TaskArtifacts.read_lane_task_id(meta_root) == '5069'
+
+    def test_missing_meta_root_returns_none(self, tmp_path: Path):
+        meta_root = tmp_path / '.task-meta' / '_lane-0'
+        assert not meta_root.exists()
+        assert TaskArtifacts.read_lane_task_id(meta_root) is None
+
+    def test_missing_metadata_json_returns_none(self, meta_root: Path):
+        assert TaskArtifacts.read_lane_task_id(meta_root) is None
+
+    @pytest.mark.parametrize('payload', [
+        b'{not json',
+        b'\xff\xfe{"task_id": "5069"}',
+        b'["a", "b"]',
+        b'{"title": "T"}',
+        b'{"task_id": ""}',
+        b'{"task_id": {"nested": 1}}',
+        b'{"task_id": true}',
+    ], ids=[
+        'corrupt-json', 'non-utf8', 'non-dict', 'no-task-id', 'empty-task-id',
+        'dict-task-id', 'bool-task-id',
+    ])
+    def test_unusable_metadata_returns_none(self, meta_root: Path, payload: bytes):
+        (meta_root / 'metadata.json').write_bytes(payload)
+        assert TaskArtifacts.read_lane_task_id(meta_root) is None
+
+    def test_integer_task_id_is_coerced_to_str(self, meta_root: Path):
+        (meta_root / 'metadata.json').write_text(json.dumps({'task_id': 5069}))
+        assert TaskArtifacts.read_lane_task_id(meta_root) == '5069'
+
+    def test_plan_json_is_not_consulted(self, meta_root: Path):
+        (meta_root / 'plan.json').write_text(json.dumps({'task_id': '5069'}))
+        assert TaskArtifacts.read_lane_task_id(meta_root) is None
 
 
 class TestMetaRootConstructor:

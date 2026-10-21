@@ -494,7 +494,8 @@ async def fetch_pins_recovery(
     """Fan ``get_pending_escalations`` out to every escalation URL concurrently.
 
     Returns ``{project_label: {escalation_id: [task_ids]} | None}``, with the
-    labels taken verbatim from *escalation_urls* (project basenames, matching
+    labels taken verbatim from *escalation_urls* (project label —
+    ``dashboard/project_labels.py::ProjectLabels`` — matching
     ``shape_merge_queue`` and ``get_merge_halt_status``).  Every configured
     label is always present in the result: one project's failure never sinks
     another's, because each probe is isolated.

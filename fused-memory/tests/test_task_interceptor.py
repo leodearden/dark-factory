@@ -1516,6 +1516,162 @@ async def test_curator_combine_refusal_records_claimed_reason(
     assert rec['old']['status'] == 'pending'
 
 
+def _combine_into_target_50() -> CuratorDecision:
+    """A combine aimed at target '50' (title 'Test Task'), averting 'Unified parser work'."""
+    return CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Test Task',
+        rewritten_task=RewrittenTask(
+            title='Unified parser work',
+            description='Combined',
+            details='d',
+            files_to_modify=[],
+            priority='medium',
+        ),
+        justification='same concern',
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'target_metadata',
+    [
+        {'branch_base_sha': 'a' * 40, 'files': ['src/parser.py']},
+        json.dumps({'branch_base_sha': 'a' * 40}),
+    ],
+    ids=['dict', 'json-string'],
+)
+async def test_curator_combine_target_with_branch_base_sha_refuses(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+    caplog,
+    target_metadata,
+):
+    """A pending, unclaimed target that already owns a branch is not rewritten (task 7199).
+
+    Rewriting it retitles a task whose branch the title-as-identity guard then
+    quarantines (tasks 4917, 5140), so the candidate is created as its own task.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'pending',
+            'title': 'Test Task',
+            'claimant_run_id': None,
+            'metadata': target_metadata,
+        }
+    )
+    curator_interceptor._curator = _mock_curator(_combine_into_target_50())
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
+
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.update_task.assert_not_called()
+    taskmaster.add_task.assert_called_once()
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec['refused_reason'] == 'target_has_branch'
+    assert rec['target_id'] == '50'
+    assert rec['old']['status'] == 'pending'
+    assert rec['old']['title'] == 'Test Task'
+    assert rec['new']['title'] == 'Unified parser work'
+    assert any(
+        r.levelno == logging.WARNING
+        and '50' in r.getMessage()
+        and 'branch_base_sha' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'target_extra',
+    [
+        {},
+        {'metadata': None},
+        {'metadata': {}},
+        {'metadata': {'files': ['src/parser.py']}},
+        {'metadata': {'branch_base_sha': ''}},
+        {'metadata': {'branch_base_sha': '   '}},
+        {'metadata': {'branch_base_sha': None}},
+        {'metadata': ['branch_base_sha']},
+        {'metadata': 'not json'},
+    ],
+    ids=[
+        'no-metadata-key',
+        'metadata-none',
+        'metadata-empty-dict',
+        'metadata-without-sha',
+        'sha-empty',
+        'sha-whitespace',
+        'sha-none',
+        'metadata-non-dict',
+        'metadata-unparseable-string',
+    ],
+)
+async def test_curator_combine_blank_or_unreadable_branch_base_sha_still_combines(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+    target_extra,
+):
+    """Only a non-blank branch_base_sha string refuses; absent, blank or unreadable does not (task 7199)."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '50', 'status': 'pending', 'title': 'Test Task', **target_extra}
+    )
+    curator_interceptor._curator = _mock_curator(_combine_into_target_50())
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
+
+    taskmaster.update_task.assert_called_once()
+    assert result['action'] == 'combine'
+    assert result['id'] == '50'
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    assert 'refused_reason' not in records[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('status', 'claimant_run_id', 'expected_reason'),
+    [
+        ('in-progress', 'run-abc:sess-1:4242', 'target_not_pending'),
+        ('pending', 'run-abc:sess-1:4242', 'target_claimed'),
+    ],
+    ids=['not-pending-wins', 'claimed-wins'],
+)
+async def test_curator_combine_branch_refusal_does_not_reclassify_existing_refusals(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+    status,
+    claimant_run_id,
+    expected_reason,
+):
+    """The branch check runs after status and claimant, keeping the existing target_not_pending / target_claimed populations unchanged (task 7199)."""
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': status,
+            'title': 'Test Task',
+            'claimant_run_id': claimant_run_id,
+            'metadata': {'branch_base_sha': 'a' * 40},
+        }
+    )
+    curator_interceptor._curator = _mock_curator(_combine_into_target_50())
+
+    await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
+
+    taskmaster.update_task.assert_not_called()
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    assert records[0]['refused_reason'] == expected_reason
+
+
 @pytest.mark.asyncio
 async def test_curator_combine_success_record_carries_no_refused_reason(
     curator_interceptor,
@@ -3291,9 +3447,19 @@ async def test_done_gate_does_not_fire_for_non_done_transitions(
 
     for status in ('blocked', 'cancelled', 'deferred'):
         taskmaster.set_task_status.reset_mock()
-        result = await interceptor.set_task_status('5', status, '/project')
+        taskmaster.set_status_and_stamp_audit.reset_mock()
+        deferral = (
+            {'kind': 'until_condition', 'condition': 'done gate non-done transitions'}
+            if status == 'deferred' else None
+        )
+        result = await interceptor.set_task_status('5', status, '/project', deferral=deferral)
         assert 'error' not in result, f'gate should not fire on {status}'
-        taskmaster.set_task_status.assert_called_once()
+        # An entry into deferred writes its record atomically with the status.
+        writer = (
+            taskmaster.set_status_and_stamp_audit if status == 'deferred'
+            else taskmaster.set_task_status
+        )
+        writer.assert_called_once()
 
 
 # ── Tests for done_provenance gate ─────────────────────────────────────────
@@ -12025,7 +12191,7 @@ async def test_planning_mode_persists_human_decomposed_metadata(
     interceptor_facade,
     taskmaster,
 ):
-    """planning_mode injects human_decomposed=True into the metadata sent to tm.add_task."""
+    """planning_mode injects human_decomposed=True and the planning deferral record."""
     await interceptor_facade.submit_task(
         '/project',
         title='X',
@@ -12033,7 +12199,9 @@ async def test_planning_mode_persists_human_decomposed_metadata(
     )
     metadata_arg = taskmaster.add_task.call_args.kwargs.get('metadata')
     assert metadata_arg is not None
-    assert json.loads(metadata_arg) == {'human_decomposed': True}
+    decoded = json.loads(metadata_arg)
+    assert decoded.pop('deferral')['kind'] == 'planning'
+    assert decoded == {'human_decomposed': True}
 
 
 @pytest.mark.asyncio
@@ -12049,6 +12217,7 @@ async def test_planning_mode_merges_caller_metadata(
         metadata={'source': 'planning-session', 'files': ['m1', 'm2']},
     )
     decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+    assert decoded.pop('deferral')['kind'] == 'planning'
     assert decoded == {
         'source': 'planning-session',
         'files': ['m1', 'm2'],
@@ -12069,6 +12238,7 @@ async def test_planning_mode_accepts_metadata_json_string(
         metadata='{"escalation_id": "esc-1"}',
     )
     decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+    assert decoded.pop('deferral')['kind'] == 'planning'
     assert decoded == {'escalation_id': 'esc-1', 'human_decomposed': True}
 
 
@@ -12195,6 +12365,58 @@ async def test_planning_mode_candidate_key_collision_returns_combined(
         'combined': True,
         'planning_mode': True,
     }
+
+
+_SUBMIT_TASK_RESPONSES = json.loads(
+    (
+        Path(__file__).parents[2] / 'shared' / 'tests' / 'fixtures' / 'submit_task_responses.json'
+    ).read_text()
+)['cases']
+_LIVE_SUBMIT_TASK_CASES = [
+    name for name, case in _SUBMIT_TASK_RESPONSES.items() if case.get('live')
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case_name', _LIVE_SUBMIT_TASK_CASES)
+async def test_submit_task_returns_the_fixture_payload(
+    case_name,
+    interceptor_facade,
+    taskmaster,
+):
+    """The real ``submit_task`` returns each live payload pinned in
+    ``shared/tests/fixtures/submit_task_responses.json`` — the same file the
+    orchestrator's ``Scheduler.submit_task`` tests parse.  Every value, error text
+    included, is compared exactly; only generated ids are compared by shape.
+    """
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    expected = _SUBMIT_TASK_RESPONSES[case_name]['payload']
+    submit: dict[str, Any] = {'title': 'T'}
+    if case_name == 'planning_create':
+        submit['planning_mode'] = True
+    elif case_name == 'planning_collision_terminal':
+        submit['planning_mode'] = True
+        taskmaster.add_task.side_effect = DuplicateCandidateKeyError(
+            existing_id=int(expected['task_id']), existing_status=expected['status'],
+        )
+    elif case_name == 'tool_error_structured':
+        await interceptor_facade.close()
+    elif case_name == 'tool_error_add_task_raised':
+        submit['planning_mode'] = True
+        taskmaster.add_task.side_effect = RuntimeError(expected['error'])
+
+    actual = await interceptor_facade.submit_task('/project', **submit)
+
+    assert actual.keys() == expected.keys()
+    generated = {'ticket': lambda v: v.startswith('tkt_')}
+    if case_name == 'planning_create':
+        generated['task_id'] = lambda v: isinstance(v, str) and bool(v)
+    for key, value in actual.items():
+        if key in generated:
+            assert generated[key](value), (key, value)
+        else:
+            assert value == expected[key], key
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -12940,7 +13162,7 @@ async def _wired_journal(interceptor, path):
 async def _only_row(journal, operation: str) -> dict:
     """The single write_ops row for *operation*, via the public reader."""
     rows = [
-        row for row in await journal.get_ops_since('1970-01-01')
+        row for row in await journal.get_stored_ops_since('1970-01-01')
         if row['operation'] == operation
     ]
     assert len(rows) == 1, rows

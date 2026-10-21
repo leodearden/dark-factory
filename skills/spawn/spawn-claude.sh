@@ -235,12 +235,12 @@ fi
 #      all, so discriminator 1 does not exist yet and whichever event
 #      arrives first would capture the record. That window is WIDE --
 #      measured over the live fleet, median ~27s, p90 ~141s -- and nothing
-#      bounds it. So session_hooks._owner_ppid_verdict compares the owning
-#      claude's DIRECT PARENT against the pid this script exports from
-#      inside $inner. That is a parent-EQUALITY test on one process, not an
-#      ancestry test, and it needs no persisted state, so it works from the
-#      very first event. It also covers CLAUDE_SPAWN_MODE=sibling records,
-#      which resolve_sibling() flips to `running` at launch and which a
+#      bounds it. So session_ownership_probes.EventProbes.owner_ppid_verdict
+#      compares the owning claude's DIRECT PARENT against the pid this script
+#      exports from inside $inner. That is a parent-EQUALITY test on one
+#      process, not an ancestry test, and it needs no persisted state, so it
+#      works from the very first event. It also covers CLAUDE_SPAWN_MODE=sibling
+#      records, which resolve_sibling() flips to `running` at launch and which a
 #      status-based guard would therefore never match.
 #
 # Both probes are FAIL-SOFT in the same direction: whenever ownership can be
@@ -257,8 +257,8 @@ fi
 #     becomes reapable after that process exits -- "reapable", not "reaped":
 #     reap_stale_records' stale_pid rule ALSO requires
 #     NON_TERMINAL_HEARTBEAT_TTL of silence, and where /proc is unavailable
-#     _nested_claude_liveness_pid falls back to os.getsid(0), the terminal's
-#     session leader, which outlives the nested claude;
+#     EventProbes.nested_claude_liveness_pid falls back to os.getsid(0), the
+#     terminal's session leader, which outlives the nested claude;
 #   * the discriminator survives /clear. Claude Code re-mints session_id in
 #     place there, so the owning session's own SessionStart would look like a
 #     mismatch -- session_hooks keys off the SessionStart-only `source` field
@@ -501,7 +501,7 @@ sanitize_env='for _v in ${!CLAUDE_SPAWN_@}; do unset "$_v"; done; unset _v; '
 # list with traps and a trailing `ec=$?`), the owning claude's DIRECT PARENT is
 # always exactly this pid, on every backend branch. A nested claude started from
 # inside the session has some other parent (its agent's Bash-tool shell), so it
-# mismatches. See session_hooks._owner_ppid_verdict.
+# mismatches. See session_ownership_probes.EventProbes.owner_ppid_verdict.
 #
 # NOT launcher_pid: this script's own $$ is not even in the owning claude's
 # ancestry under a detached emulator (gnome-terminal reparents the payload to

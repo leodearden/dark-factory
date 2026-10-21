@@ -103,12 +103,15 @@ The breaker itself is a pure read/decide component; the Harness pass owns all si
 | `hosts` | list\[dict\] | Per-verify-host state: `{name, is_local, slot_state: free\|busy\|parked\|null, quarantined, quarantine_class: ru\|divergence\|null, unavailable_since, unavailable_secs, streak, reason}` (task 3275) |
 
 `hosts` is what makes an under-full `verifying N/M hosts` line diagnosable — it
-has four possible causes, each with its own discriminator: **RU-quarantine**
+has five possible causes, each with its own discriminator: **RU-quarantine**
 (`quarantine_class == 'ru'` — auto-recovers via `_reprobe_quarantined_hosts`);
 **divergence-quarantine** (`quarantine_class == 'divergence'` — held for verdict
-parity, operator-cleared only); **leaked slot** (`slot_state` `busy`/`parked`
-with no matching `occupancy.inflight_by_host` occupant); and **free and never
-asked for** (`slot_state == 'free'`, `quarantined == false`). `unavailable_since`
+parity, operator-cleared only); **untracked PARK** (`slot_state == 'parked'`
+with `quarantine_class == null` — a cancel failed and its probe gave up;
+auto-recovers via `HostAllocator.reprobe_parked_slots` once the host probes
+clean); **leaked slot** (`slot_state == 'busy'` with no matching
+`occupancy.inflight_by_host` occupant); and **free and never asked for**
+(`slot_state == 'free'`, `quarantined == false`). `unavailable_since`
 / `unavailable_secs` / `streak` / `reason` are populated whenever the host is
 RU-tracked, independent of quarantine, so a host accumulating failures below the
 quarantine threshold is visible too — `unavailable_since` is an absolute epoch
@@ -135,16 +138,18 @@ occupant when two entries share a host.
 
 ## 7. As-built symbol map
 
-> **Where the code lives (task 5036, PRD `plans/merge-lane-quality-prd.md` ζ2).** The lane is the
-> package `orchestrator/src/orchestrator/merge_lane/`; Location cells below are relative to it
-> unless they name another file. The old `orchestrator.merge_*` module paths
-> (`orchestrator/src/orchestrator/merge_queue.py`, `merge_types.py`, `merge_gates.py`, …) are now
-> thin module aliases that resolve to the new modules, and task 5037 deletes them — cite the
-> new paths. The façade `orchestrator.merge_lane` (`merge_lane/__init__.py`) lazily exports the
-> public surface (`MergeLane`, the request entry points, the value types, the reason constants,
-> the ports). `merge_queue.py` became `worker.py`; the other `merge_`-prefixed modules dropped the
-> prefix. `git_ops.py`, `lane_lifecycle.py`, `warm_lane_pool.py`, `offline_lane.py`,
-> `recover_main.py` and `suffix_graph.py` stayed outside the package.
+> **Where the code lives (tasks 5036 and 5037, PRD `plans/merge-lane-quality-prd.md` ζ2 and η).**
+> The lane is the package `orchestrator/src/orchestrator/merge_lane/`; Location cells below are
+> relative to it unless they name another file. The old `orchestrator.merge_*` module paths
+> (`merge_queue`, `merge_types`, `merge_gates`, … directly under `orchestrator`) were deleted by
+> task 5037 and no aliases remain, so importing one raises `ModuleNotFoundError`.
+> Importers use `orchestrator.merge_lane.<submodule>`, or the façade `orchestrator.merge_lane`
+> (`merge_lane/__init__.py`) for the names it exports: the public surface (`MergeLane`, the
+> request entry points, the value types, the reason constants, the ports). `merge_queue.py`
+> became `worker.py`; the other `merge_`-prefixed modules dropped the prefix. Every lane module
+> logs under the one logger name `orchestrator.merge_lane`. `git_ops.py`, `lane_lifecycle.py`,
+> `warm_lane_pool.py`, `offline_lane.py`, `recover_main.py` and `suffix_graph.py` stayed outside
+> the package.
 
 | Symbol | Location | Description |
 |--------|----------|-------------|
@@ -164,6 +169,12 @@ occupant when two entries share a host.
 | `_run_no_landings_breaker_pass()` | harness.py | Harness pass that acts on `BreakerTrip`: calls `force_halt_scheduler` + files L2-INFO escalation |
 | `classify_and_merge()` | merge_lane/worker.py | Shared pre-merge guard + merge + drop-guard pipeline (branch-presence → already-merged → merge → conflict/non-conflict-failure → drop-guard), returning `MergedOk \| Decided`; `SpeculativeMergeWorker._merger_loop` and `SpeculativeMergeWorker._remerge` both delegate to it instead of each running its own duplicated inline copy (MQ-refactor task κ, task 1995) |
 | `patch_content_contained()` | merge_lane/landing_evidence.py | Patch-id containment check: True iff every commit in `head` is already present in `upstream` (moved out of the worker, task 5036) |
+| `MemberRedriver` | merge_lane/member_redrive.py | Per-member re-drive of parked train members: on-main fork, landing-evidence attribution, un-stack off an unlanded train base. Serves both the coalesce derail/unwind path and abandoned-member recovery (extracted from the worker, task 4737) |
+| `MemberRedriveOutcome` | merge_lane/member_redrive.py | What the redriver decided for each member (`NOT_PARKED`, `NOT_ON_MAIN`, `ON_MAIN_ATTRIBUTED`, `ON_MAIN_UNATTRIBUTED`, `PROVENANCE_CONFLICT_MEMOIZED`, `STALE_EVIDENCE`, `ERRORED`, `HELD_BY_LIVE_TRAIN`); exported by the façade (task 4737) |
+| `train_member_ids_in_custody()` | merge_lane/worker.py | Members of every train the worker still holds, i.e. every live (non-retired) registry entry (task 4737) |
+| `InFlightMergeRegistry.task_ids_in_flight()` | merge_lane/types.py | The task id each live registered merge request was submitted under, from submit until its future resolves; the abandoned-member sweep reads it so a parked member with a live single request is owned (task 7022) |
+| `redrive_abandoned_members()` | merge_lane/worker.py | Re-drives members no train holds through `MemberRedriver`, using the worker's own train callbacks; a member still in custody is refused as `HELD_BY_LIVE_TRAIN` (task 4737) |
+| `AbandonedMemberSweep` | merge_deferred_recovery.py (outside the package) | Finds merge-deferred members with no owner on two consecutive passes, re-drives them through the lane and files one `merge_deferred_abandoned` record per target: an `info` L0 receipt when recovered, a pinning `blocking` L1 when not. Last step of `harness.py::Harness._run_stranded_reconcile_pass` (task 4737; runbook: OPERATIONS.md § "Abandoned merge-deferred members") |
 
 ### 7.1 merge_lane/types.py — request/outcome/item/entry types + registries (MQ-refactor task α)
 
@@ -231,7 +242,13 @@ parameter, the γ2 auto-chain through `_GenerationChainContext`.
 | `_check_plan_files_touched_in_branch()` | merge_lane/gates.py | Pre-merge Decision-1: every declared plan file must be touched on the branch |
 | `_check_post_merge_equivalence()` | merge_lane/gates.py | Post-merge Decision-2: branch-touched paths must match the advanced main tree |
 | `_rebase_delta_touched_overlap()` | merge_lane/gates.py | Intersection of branch-touched and intervening-rebase-delta files (fail-closed) |
-| `_reverify_rebased_tree()` | merge_lane/gates.py | Disjoint-delta re-verify gate; delegates to `_run_post_merge_verify` when overlapping |
+| `_reverify_rebased_tree()` | merge_lane/gates.py | Disjoint-delta re-verify gate; records each decision as a `merge_reverify_gate` event, and delegates to `_run_post_merge_verify` (forwarding `event_store`) when it fires |
+| `_decide_reverify_gate()` | merge_lane/gates.py | Classifies a rebased tree into a `ReverifyGateDecision` (same tree, disjoint, untrusted disjoint, overlap, unknown overlap) without verifying |
+| `_log_reverify_gate_decision()` | merge_lane/gates.py | One log line per gate decision: INFO for a skip, WARNING for a fire |
+| `GateClearance` | merge_lane/reverify_gate_decision.py | Why a rebased tree cleared the gate: `same_tree`, `disjoint` or `reverified` (task 6647; moved from gates.py by task 5064) |
+| `ReverifyGateReason` | merge_lane/reverify_gate_decision.py | Every way the gate decides; its `_SKIP_CLEARANCE` map is the one home of skip-vs-fire |
+| `ReverifyGateDecision` | merge_lane/reverify_gate_decision.py | The facts one gate decision was made on; `event_data()` is the `merge_reverify_gate` payload |
+| `emit_reverify_gate_decision()` | merge_lane/reverify_gate_decision.py | Writes a decision as a `merge_reverify_gate` event (no-op without a store) |
 | `_check_post_merge_pyright()` | merge_lane/gates.py | Post-merge Decision-3: unscoped package-wide type-check against the advanced main SHA |
 | `_resolve_second_parent()` | merge_lane/gates.py | Second parent (`sha^2`) of a `--no-ff` merge commit, for equivalence-gate tip resolution |
 | `_commit_is_linear()` | merge_lane/gates.py | True iff a commit has ≤1 parent (task-1928 worktree-HEAD-fallback fail-safe gate) |
@@ -350,9 +367,13 @@ dataclass and its `EMPTY_SUFFIX_CONFLICT_GRAPH` sentinel — were extracted verb
 This module stayed OUTSIDE the `orchestrator/merge_lane/` package (task 5036).
 
 Unlike α–γ's pure function/type extractions, this module also introduces a NEW owning class.
-`SuffixConflictTracker` takes a live `GitOps` reference plus three narrow accessor callables —
-`lane_buffers`, `frozen_prefix`, `frozen_prefix_tip` — instead of a worker reference, so it is
-fully unit-testable without a `SpeculativeMergeWorker`. `SpeculativeMergeWorker` owns exactly one
+`SuffixConflictTracker` takes five narrow re-reading accessor callables — `git_ops`,
+`lane_buffers`, `frozen_prefix`, `frozen_prefix_tip`, `retire_item` — instead of a worker
+reference, so it is fully unit-testable without a `SpeculativeMergeWorker`. A bounce escalation
+removes the request from the lane buffer it was found in and retires it from the worker's
+lifecycle registry through the required `retire_item` (wired to
+`SpeculativeMergeWorker._retire_item`) before resolving it `blocked`, so it never lingers in the
+census as queued. `SpeculativeMergeWorker` owns exactly one
 instance (`self._suffix_tracker`, constructed immediately after `self._lane_buffers` in
 `__init__`) and delegates to it via 4 get/set `@property` descriptors that preserve the worker's
 original attribute names (`_suffix_conflict_graph`, `_suffix_conflict_signature`,
@@ -364,18 +385,17 @@ zero churn.
 
 **Reach-back convention:** the two tracker methods resolve the three worker-resident constants
 they read (`MERGE_LANES`, `MERGE_BOUNCE_CAP`, `NEEDS_REBASE_REASON_PREFIX`, all in
-`merge_lane/worker.py`) through a function-local deferred `from orchestrator.merge_queue import
-<name>` import (the `orchestrator.merge_queue` alias, until task 5037 re-points it at
-`orchestrator.merge_lane.worker`) rather than a top-level import, keeping `suffix_graph.py` free of
+`merge_lane/worker.py`) through a function-local deferred `from orchestrator.merge_lane.worker
+import <name>` import rather than a top-level import, keeping `suffix_graph.py` free of
 any top-level import of the worker (which would be a cycle, since the worker imports this module).
 
 | Symbol | Location | Description |
 |--------|----------|--------------|
 | `SuffixConflictGraph` | suffix_graph.py | Immutable conflict graph over the unfrozen suffix (moved verbatim from the monolith, now `merge_lane/worker.py`) |
 | `EMPTY_SUFFIX_CONFLICT_GRAPH` | suffix_graph.py | Sentinel empty `SuffixConflictGraph` for the default/zero-suffix case (moved verbatim) |
-| `SuffixConflictTracker` | suffix_graph.py | Owns `graph` / `signature` / `last_known_main_sha` / `bounce_registry`; constructed with `git_ops` + `lane_buffers`/`frozen_prefix`/`frozen_prefix_tip` callables |
+| `SuffixConflictTracker` | suffix_graph.py | Owns `graph` / `signature` / `last_known_main_sha` / `bounce_registry`; constructed with `git_ops`/`lane_buffers`/`frozen_prefix`/`frozen_prefix_tip`/`retire_item` callables |
 | `SuffixConflictTracker.recompute()` | suffix_graph.py | Recompute and store the conflict graph over the unfrozen suffix (debounced, fail-open); `SpeculativeMergeWorker.recompute_suffix_conflict_graph()` delegates here |
-| `SuffixConflictTracker.bounce_conflicting_suffix_items()` | suffix_graph.py | Graph-time disk-free bounce of the younger conflicting item (cap/escalation/TOCTOU); `SpeculativeMergeWorker._bounce_conflicting_suffix_items()` delegates here |
+| `SuffixConflictTracker.bounce_conflicting_suffix_items()` | suffix_graph.py | Graph-time disk-free bounce of the younger conflicting item (cap/escalation/TOCTOU); an escalation retires the item via `retire_item`; `SpeculativeMergeWorker._bounce_conflicting_suffix_items()` delegates here |
 
 ### 7.7 MergeWorker retirement — one merge worker, in production and in the tests (MQ-refactor task ν, merge-lane-quality δ)
 

@@ -30,6 +30,10 @@ import json
 from pathlib import Path
 
 import pytest
+from _pyright_import_fixtures import (
+    PARTIALLY_PROVISIONED_TYPE_OUTPUT,
+    unresolved_import_lines,
+)
 
 from orchestrator import verify_classify
 from orchestrator.verify_categories import (
@@ -2900,27 +2904,33 @@ class TestSummarizeChecksThreadsToolIdentity:
 # ---------------------------------------------------------------------------
 
 
-def _unresolved_import_lines(*modules: str, path: str = 'src/fused_memory/server.py') -> str:
-    """Render *modules* in pyright's REAL unresolved-import line shape.
-
-    Captured verbatim during the task-3367 reproduction, e.g.::
-
-        /repo/src/fused_memory/server.py:12:8 - error: Import "pytest" could
-        not be resolved (reportMissingImports)
-    """
-    return '\n'.join(
-        f'  /repo/{path}:{i + 8}:8 - error: Import "{mod}" could not be '
-        f'resolved (reportMissingImports)'
-        for i, mod in enumerate(modules)
-    )
-
-
 # The observed false-red: the baseline sentinel `pytest` is unresolved
 # alongside many other workspace third-party packages, because the resolved
 # interpreter is not this worktree's .venv at all.
-PHANTOM_MISSING_IMPORTS = _unresolved_import_lines(
+PHANTOM_MISSING_IMPORTS = unresolved_import_lines(
     'pytest', 'pydantic', 'aiosqlite', 'openai', 'qdrant_client'
 )
+
+# pyright errors from rules other than reportMissingImports: branch defects.
+OTHER_PYRIGHT_RULES_OUTPUT = (
+    '  /repo/src/a.py:3:9 - error: Argument of type "int" cannot be '
+    'assigned to parameter "x" (reportArgumentType)\n'
+    '  /repo/src/b.py:4:9 - error: Cannot access attribute "foo" for '
+    'class "Bar" (reportAttributeAccessIssue)\n'
+    '  /repo/src/c.py:5:9 - error: "baz" is not a known attribute of '
+    'module "qux" (reportAttributeAccessIssue)\n'
+    '  /repo/src/d.py:6:9 - error: Expression of type "None" is '
+    'incompatible (reportAssignmentType)\n'
+    '  /repo/src/e.py:7:9 - error: No overloads for "get" match '
+    '(reportCallIssue)\n'
+)
+
+NON_PYRIGHT_TEXTS = [
+    'Traceback (most recent call last):\n  File "t.py", line 1\nImportError: x\n',
+    'src/a.py:1:1: F401 [*] `os` imported but unused\nFound 1 error.\n',
+    'error: could not compile `foo` (lib) due to 1 previous error\n',
+    '\x00\x01 not even text — Import " could not be resolved (\n',
+]
 
 
 class TestInterpreterMissingWorkspacePackages:
@@ -2947,7 +2957,7 @@ class TestInterpreterMissingWorkspacePackages:
         five dotted paths that all belong to two top-level packages and must
         not.
         """
-        five_distinct_tops = _unresolved_import_lines(
+        five_distinct_tops = unresolved_import_lines(
             'pytest',
             'graphiti_core.nodes',
             'qdrant_client.models',
@@ -2958,7 +2968,7 @@ class TestInterpreterMissingWorkspacePackages:
             five_distinct_tops
         )
 
-        two_distinct_tops = _unresolved_import_lines(
+        two_distinct_tops = unresolved_import_lines(
             'pytest',
             'qdrant_client.models',
             'qdrant_client.http',
@@ -2972,7 +2982,7 @@ class TestInterpreterMissingWorkspacePackages:
     def test_single_genuine_missing_dependency_is_not_environmental(self) -> None:
         """A real branch defect must stay RED, never be excused as environmental."""
         assert not verify_classify.is_interpreter_missing_workspace_packages(
-            _unresolved_import_lines('brand_new_lib')
+            unresolved_import_lines('brand_new_lib')
         )
 
     def test_many_distinct_modules_without_the_sentinel_is_not_environmental(self) -> None:
@@ -2983,7 +2993,7 @@ class TestInterpreterMissingWorkspacePackages:
         it as a dev dependency, so a healthy env ALWAYS resolves it.
         """
         assert not verify_classify.is_interpreter_missing_workspace_packages(
-            _unresolved_import_lines(
+            unresolved_import_lines(
                 'pydantic', 'aiosqlite', 'openai', 'qdrant_client', 'graphiti_core'
             )
         )
@@ -2993,29 +3003,11 @@ class TestInterpreterMissingWorkspacePackages:
 
     def test_other_pyright_rules_are_not_environmental(self) -> None:
         """Only reportMissingImports counts — other pyright rules are branch defects."""
-        other_rules = (
-            '  /repo/src/a.py:3:9 - error: Argument of type "int" cannot be '
-            'assigned to parameter "x" (reportArgumentType)\n'
-            '  /repo/src/b.py:4:9 - error: Cannot access attribute "foo" for '
-            'class "Bar" (reportAttributeAccessIssue)\n'
-            '  /repo/src/c.py:5:9 - error: "baz" is not a known attribute of '
-            'module "qux" (reportAttributeAccessIssue)\n'
-            '  /repo/src/d.py:6:9 - error: Expression of type "None" is '
-            'incompatible (reportAssignmentType)\n'
-            '  /repo/src/e.py:7:9 - error: No overloads for "get" match '
-            '(reportCallIssue)\n'
+        assert not verify_classify.is_interpreter_missing_workspace_packages(
+            OTHER_PYRIGHT_RULES_OUTPUT
         )
-        assert not verify_classify.is_interpreter_missing_workspace_packages(other_rules)
 
-    @pytest.mark.parametrize(
-        'text',
-        [
-            'Traceback (most recent call last):\n  File "t.py", line 1\nImportError: x\n',
-            'src/a.py:1:1: F401 [*] `os` imported but unused\nFound 1 error.\n',
-            'error: could not compile `foo` (lib) due to 1 previous error\n',
-            '\x00\x01 not even text — Import " could not be resolved (\n',
-        ],
-    )
+    @pytest.mark.parametrize('text', NON_PYRIGHT_TEXTS)
     def test_arbitrary_non_pyright_text_returns_false_without_raising(
         self, text: str
     ) -> None:
@@ -3073,7 +3065,7 @@ class TestInterpreterMisresolutionClassifiesEnvTransient:
 
     def test_single_genuine_missing_import_is_not_excused_as_environmental(self) -> None:
         """A real branch defect keeps its pre-existing category, never ENV_TRANSIENT."""
-        genuine = _unresolved_import_lines('brand_new_lib')
+        genuine = unresolved_import_lines('brand_new_lib')
         assert (
             verify_classify.classify_failure(ToolKind.OPAQUE, 1, genuine, False)
             != FailureCategory.ENV_TRANSIENT
@@ -3088,6 +3080,64 @@ class TestInterpreterMisresolutionClassifiesEnvTransient:
         member is introduced; ENV_TRANSIENT already carries precisely this policy.
         """
         assert FailureCategory.ENV_TRANSIENT in INFRA_TRANSIENT_CATEGORIES
+
+
+# ---------------------------------------------------------------------------
+# task 6127: a partially provisioned cold .venv (esc-6021-3)
+# ---------------------------------------------------------------------------
+
+class TestPartiallyProvisionedVenvTypeFailure:
+    """Pins ``is_partially_provisioned_venv_type_failure`` — task 6127.
+
+    pyright read a cold ``.venv`` that was still being populated: pytest
+    resolved, member-specific third-party packages did not.  A passing PYTEST
+    leg in the same run is the corroboration that the dependency set is fine.
+    """
+
+    @staticmethod
+    def _holds(
+        type_output: str, *, test_tool: ToolKind = ToolKind.PYTEST, test_leg_passed: bool = True,
+    ) -> bool:
+        return verify_classify.is_partially_provisioned_venv_type_failure(
+            type_output, test_tool=test_tool, test_leg_passed=test_leg_passed,
+        )
+
+    def test_measured_shape_with_passing_pytest_leg_is_partially_provisioned_venv(self) -> None:
+        assert self._holds(PARTIALLY_PROVISIONED_TYPE_OUTPUT)
+
+    def test_same_output_without_test_corroboration_is_not(self) -> None:
+        """A failed test leg gives no runtime proof that the packages import."""
+        assert not self._holds(PARTIALLY_PROVISIONED_TYPE_OUTPUT, test_leg_passed=False)
+
+    @pytest.mark.parametrize('test_tool', [t for t in ToolKind if t is not ToolKind.PYTEST])
+    def test_passing_non_pytest_test_leg_gives_no_corroboration(self, test_tool: ToolKind) -> None:
+        """A passing ``true``, JS-only or wrapped test command imported no Python
+        packages that pytest can vouch for, so it cannot excuse the branch."""
+        assert not self._holds(PARTIALLY_PROVISIONED_TYPE_OUTPUT, test_tool=test_tool)
+
+    def test_measured_shape_escapes_the_3367_interpreter_predicate(self) -> None:
+        """Why task 3367 missed it: the pytest sentinel resolved."""
+        assert not verify_classify.is_interpreter_missing_workspace_packages(
+            PARTIALLY_PROVISIONED_TYPE_OUTPUT
+        )
+        assert 'pytest' not in verify_classify.unresolved_top_level_modules(
+            PARTIALLY_PROVISIONED_TYPE_OUTPUT
+        )
+
+    def test_single_genuine_missing_import_with_passing_tests_is_not(self) -> None:
+        assert not self._holds(unresolved_import_lines('brand_new_lib'))
+
+    def test_floor_is_the_shared_distinct_module_floor(self) -> None:
+        four = ('graphiti_core', 'qdrant_client', 'openai', 'falkordb')
+        assert not self._holds(unresolved_import_lines(*four))
+        assert self._holds(unresolved_import_lines(*four, 'mem0'))
+
+    def test_other_pyright_rules_only_is_not(self) -> None:
+        assert not self._holds(OTHER_PYRIGHT_RULES_OUTPUT)
+
+    @pytest.mark.parametrize('text', [*NON_PYRIGHT_TEXTS, ''])
+    def test_arbitrary_non_pyright_text_returns_false_without_raising(self, text: str) -> None:
+        assert self._holds(text) is False
 
 
 # ---------------------------------------------------------------------------

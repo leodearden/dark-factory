@@ -13,10 +13,12 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
     DependencyResult,
     GetTasksResult,
+    MetadataLookupResult,
     RemoveTaskResult,
     SetTaskStatusResult,
     StatusWriteNotPersistedResult,
@@ -67,6 +69,21 @@ class TaskBackendProtocol(Protocol):
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict: ...
+
+    async def find_tasks_by_metadata(
+        self,
+        project_root: str,
+        key: str,
+        value: str | int | None = None,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: bool = False,
+    ) -> MetadataLookupResult:
+        """One page of tasks whose top-level ``metadata[key]`` matches; see plans/task-metadata-lookup-prd.md."""
+        ...
 
     async def get_statuses_raw(
         self,
@@ -275,6 +292,13 @@ class TaskBackendProtocol(Protocol):
         transaction as the write: admit the payload only when the key's presence
         and JSON value match the stored row exactly, and refuse a payload
         carrying the key when the stored blob does not parse.
+
+        **Implementations MUST reject a metadata payload that is not a JSON
+        object** (unparseable text, or JSON that decodes to an array, null,
+        string, number or boolean) in every ``metadata_mode``, by raising (e.g.
+        ``MetadataNotAnObjectError``), before the row lookup.  Such a payload
+        has no keys to merge; treating it as a last-write-wins replacement
+        wiped the whole stored blob, ``done_provenance`` included (task 6130).
 
         The ``status`` param is kept in the signature as a **reject-trap**: it
         preserves the ``status=None`` passthrough that ``server/tools.py`` and

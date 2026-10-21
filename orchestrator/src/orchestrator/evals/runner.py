@@ -85,13 +85,11 @@ logger = logging.getLogger(__name__)
 # LOUD rather than park a campaign for two weeks". That rationale does not
 # survive contact with the gate:
 #
-#   A SHORT BOUND NEVER PREVENTED THE PARK. When every account is capped,
-#   `before_invoke` reaches `self._open.clear(); await self._open.wait()`
-#   (usage_gate.py) — unbounded, released only by a real cap reset or a
-#   successful resume probe. Freeing a campaign slot therefore buys no
-#   progress: the next cell parks in that same wait. The old bound only decided
-#   how many IN-FLIGHT cells were destroyed on the way to parking; the campaign
-#   parked either way. Worst of both.
+#   A SHORT BOUND DID NOT PREVENT THE PARK. When every account was capped,
+#   `before_invoke` parked unbounded, released only by a real cap reset or a
+#   successful resume probe, so the old bound only decided how many IN-FLIGHT
+#   cells were destroyed on the way to parking. Since task 4002 the bound
+#   reaches that park too (below); the next point stands on its own.
 #
 #   AND TAINTING IS STRICTLY MORE EXPENSIVE THAN WAITING. A cap lands MID-cell,
 #   after the architect has already spent real money (γ1 mean: $8.88 banked per
@@ -111,9 +109,8 @@ logger = logging.getLogger(__name__)
 # accounts typically sit uncapped against the WEEKLY cap and are hit repeatedly
 # against their 5-HOUR caps, giving short all-capped windows regularly plus one
 # long window each week. 1800 s cannot skate a 5-hour window; 48 h skates it
-# with large margin. A weekly exhaustion outlasts even this bound — but per the
-# park analysis above, no value of this constant makes that case loud, so the
-# choice costs nothing there.
+# with large margin. A weekly exhaustion outlasts even this bound, and taints
+# the cells it catches.
 #
 # Deliberately NO `max_cap_retries` companion (unchanged): a fixed count scales
 # the wrong way, since cooldown doubles per full cycle through the pool, so a
@@ -122,24 +119,29 @@ logger = logging.getLogger(__name__)
 # AllAccountsCappedException from one chokepoint, so the handler below is
 # correct either way.
 #
-# WHAT THIS BOUND STILL DOES NOT COVER. `cap_wait_sanity_secs` is consulted at
-# exactly one place, `_check_cap_wait`, which runs in the cap-hit branch AFTER
-# an invocation returned and was classified as a cap. It bounds cap-RETRY
-# patience and nothing else — the unbounded `_open.wait()` above is out of its
-# reach, and raising it does not change that. That remains true, and it is why
-# the park needed a separate remedy rather than a bigger number here.
+# THE BOUND NOW COVERS THE PARK TOO (task 4002). `invoke_with_cap_retry`
+# forwards the time left on this same deadline to the gate as its park
+# allowance, so an all-capped window longer than 48 h taints the cell
+# (AllAccountsCappedException, chained from the gate's PoolFrozen) instead of
+# parking to the reset. The value is unchanged and remains the eval owner's
+# call (esc-4002-1).
 #
-# THE PARK IS NO LONGER SILENT (task 4945). It is still unbounded — by design,
-# since no wall-clock value makes a weekly exhaustion loud without also
-# aborting the 5-hour windows this constant exists to skate — but it now
-# ANNOUNCES itself: `shared/usage_gate.py::UsageGate.before_invoke` emits a
-# throttled `all_capped_park` WARNING carrying elapsed seconds, the account
-# count and the soonest expected reopen, for as long as the pool stays frozen.
-# So a parked campaign is distinguishable from a hung one by reading the log,
-# which is the "fail loud" the original comment wanted — delivered as
-# visibility rather than as an abort, because aborting a park throws away
-# banked spend that `--resume` would otherwise recover.
+# THE PARK IS NOT SILENT (task 4945): while it lasts,
+# `shared/usage_gate.py::UsageGate.before_invoke` emits a throttled
+# `all_capped_park` WARNING carrying elapsed seconds, the account count and the
+# soonest expected reopen, so a parked campaign is distinguishable from a hung
+# one.
 _EVAL_CAP_WAIT_SANITY_SECS = 48 * 3600
+
+
+def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
+    """The ONLY MCP an eval architect may reach: plan-tools, strictly scoped.
+
+    The PAIR is the invariant (task 4757). A plan-tools config without the
+    strict flag still ambient-merges the worktree's tracked ``.mcp.json``, i.e.
+    the live escalation (:8102) and fused-memory (:8002) servers.
+    """
+    return {'mcp_config': _inject_plan_tools_mcp(None, worktree), 'strict_mcp_config': True}
 
 
 async def _build_eval_usage_gate(orch_config: OrchestratorConfig) -> UsageGate | None:
@@ -804,7 +806,9 @@ async def run_architect_eval(
     isolation + token savings). The architect runs with THIS candidate's
     model/backend/effort/env_overrides, not the hardcoded opus-high the
     implementer path pins. Its prompt ends with the replay frame, and the cell
-    is stamped ``replay_frame`` (docs/eval-replay-frame.md).
+    is stamped ``replay_frame`` (docs/eval-replay-frame.md). The architect
+    reaches plan-tools and no other MCP server (:func:`architect_eval_mcp_scope`);
+    ``evals/profile.py::EVAL_PROFILE`` documents the workflow-path counterpart.
 
     The produced plan is scored two ways: :func:`judge_plan_quality` (the LLM
     judge, against the REAL landed reference diff
@@ -1065,11 +1069,6 @@ async def run_architect_eval(
         #    candidate's model/backend/effort/env_overrides.
         briefing = ReplayFramedBriefingAssembler(orch_config, base_commit=pre)
         prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
-        # Wire plan-tools MCP via the SAME production seam real dispatch uses
-        # (workflow._invoke): relocated meta_root + direct-interpreter launch.
-        # strict_mcp_config stays default False so the ambient .mcp.json
-        # escalation/fused-memory servers still merge, mirroring _invoke.
-        mcp_config = _inject_plan_tools_mcp(None, worktree)
 
         async def _timed_invoke(**kwargs) -> AgentResult:
             """Bound ONE attempt by the operator's --timeout, and bank its spend.
@@ -1126,6 +1125,11 @@ async def run_architect_eval(
         # unchanged. `backend` moves to the wrapper's own keyword-only
         # parameter, which forwards it into the dispatched call because a
         # custom invoke_fn is supplied.
+        #
+        # The architect is scoped to plan-tools ONLY (architect_eval_mcp_scope):
+        # plan-tools is wired through the SAME production seam real dispatch
+        # uses (relocated meta_root + direct-interpreter launch), and the strict
+        # flag drops the ambient .mcp.json's live production servers.
         result = await invoke_with_cap_retry(
             usage_gate,
             f'Architect eval {task_id} × {config.name}',
@@ -1142,7 +1146,7 @@ async def run_architect_eval(
             disallowed_tools=ARCHITECT.disallowed_tools or None,
             effort=config.effort or 'high',
             env_overrides=config.env_overrides or None,
-            mcp_config=mcp_config,
+            **architect_eval_mcp_scope(worktree),
         )
         # arch_cost_usd is banked inside _timed_invoke (every attempt), not
         # read off `result` (the last attempt only) — see its docstring. The
@@ -2231,10 +2235,11 @@ class _StubMcpSession:
 
     Handles every tool the eval ``Scheduler`` dispatches via ``dispatch_tool``:
     ``set_task_status``, ``get_task``, ``get_tasks``, ``get_statuses``,
-    ``update_task``, ``set_task_claimant``, ``get_external_statuses`` (plus
-    ``add_dependency``, stubbed defensively though not yet dispatched).  The
-    ``test_scheduler_dispatch_literal_tripwire`` guard asserts every dispatched
-    literal has a branch here.  Any other tool name raises ``NotImplementedError``.
+    ``update_task``, ``set_task_claimant``, ``get_external_statuses``,
+    ``submit_task`` (plus ``add_dependency``, stubbed defensively though not
+    yet dispatched).  The ``test_scheduler_dispatch_literal_tripwire`` guard
+    asserts every dispatched literal has a branch here.  Any other tool name
+    raises ``NotImplementedError``.
     """
 
     def __init__(self) -> None:
@@ -2266,7 +2271,8 @@ class _StubMcpSession:
 
         Supported tools: ``set_task_status``, ``get_task``, ``get_tasks``,
         ``get_statuses``, ``update_task``, ``set_task_claimant``,
-        ``get_external_statuses``, ``add_dependency``.  Unknown tool names raise
+        ``get_external_statuses``, ``submit_task``, ``add_dependency``.  Unknown
+        tool names raise
         ``NotImplementedError``.
 
         .. note::
@@ -2319,6 +2325,14 @@ class _StubMcpSession:
             deps = arguments.get('deps', [])
             mapping = {d: 'done' for d in deps}
             return self._envelope(json.dumps(mapping))
+        if name == 'submit_task':
+            # Scheduler.submit_task files tasks for machine filers (auto-eval,
+            # the flake ledger). An eval run must create none, so the answer is
+            # the server's structured refusal, which parses to SubmitFailed.
+            return self._envelope(json.dumps({
+                'error': 'eval runs file no tasks',
+                'error_type': 'EvalStubRefusal',
+            }))
         if name == 'add_dependency':
             # Not currently dispatched by scheduler.py; added defensively per
             # task spec so a future dispatch site is already stubbed. Echo the id

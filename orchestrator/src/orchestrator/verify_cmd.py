@@ -628,8 +628,9 @@ def _segment_invokes_tool(segment: str, keyword: str) -> bool:
 def keyword_truncation_end(head: str, end: int) -> int:
     """Extend a keyword-match end offset across an npx ``@<version>`` suffix.
 
-    Task 3931 / esc-3805-1. Both scopers — ``verify._scope_to_keyword`` and
-    ``verify_plan._scope_prefix_to_keyword`` — truncate their matched segment
+    Task 3931 / esc-3805-1. The scoper —
+    ``verify_plan.py::scope_prefix_to_keyword``, which
+    ``verify._scope_to_keyword`` renders — truncates its matched segment
     to everything up to and including the first occurrence of the keyword,
     historically with the BYTE-OFFSET slice ``head[: idx + len(keyword)]``.
     That slice cuts mid-token at the ``@`` of a pinned npx package spec, so
@@ -638,10 +639,6 @@ def keyword_truncation_end(head: str, end: int) -> int:
     whether the parser could carry it. A gate spelled as pinned therefore ran
     whatever npx last cached — MEASURED byte-identical output for the pinned
     and unpinned fleet chains.
-
-    Both callers route through this one helper for the same reason they route
-    through ``split_chain_tail``: their lockstep is STRUCTURAL, not a
-    convention kept by hand.
 
     THE BOUNDARY RULE, and why it is this narrow. The extension applies ONLY
     when the very next character is ``@`` — the npm package-spec version
@@ -790,8 +787,9 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
     re-emits it as a leading ``cd X &&``. A caller that re-renders a parsed
     head WITHOUT ``strip_cwd`` must therefore additionally refuse to carry a
     tail when ``parsed.cwd_rel is not None`` — see ``verify._reproject_str``,
-    the only such caller. The two scopers apply ``strip_cwd``, so their
-    ``cwd_rel`` is always ``None`` by render time.
+    the only such caller. The scoper (``verify_plan.py::scope_prefix_to_keyword``,
+    and its string rendering ``verify._scope_to_keyword``) applies
+    ``strip_cwd``, so its ``cwd_rel`` is always ``None`` by render time.
     """
     if keyword not in _TAIL_PRESERVING_KEYWORDS:
         return raw, ''
@@ -868,13 +866,14 @@ def describe_dropped_clauses(
 
     The companion to ``has_unpreserved_chain_clauses``, and DIAGNOSTIC-ONLY in
     exactly the same sense: between them they supply the count, the text and
-    the classification for one log record (``verify_plan.log_dropped_chain_
-    clauses``) and feed no control-flow decision anywhere. Pure, so this module
-    stays logging-free.
+    the classification for one log record
+    (``verify_plan._log_dropped_chain_clauses``) and feed no control-flow
+    decision anywhere. Pure, so this module stays logging-free.
 
-    *retained* is the CALLER'S truncation point — ``head[: idx + len(keyword)]``
-    — and must be a prefix of *raw*. Passing it in rather than re-deriving it
-    is deliberate: both scopers already compute that exact slice as the
+    *retained* is the CALLER'S truncation point — the
+    ``keyword_truncation_end``-bounded prefix — and must be a prefix of *raw*.
+    Passing it in rather than re-deriving it is deliberate: the scoper
+    already computes that exact slice as the
     argument to ``parse_config_command``, and re-deriving it here would fork
     the truncation rule into a second place free to drift from the first.
 
@@ -1957,7 +1956,10 @@ def serial_pytest(cmd: VerifyCmd, ini_addopts: Sequence[str] = ()) -> VerifyCmd:
     invocation recovers independently. No-ops unless ``cmd.tool is
     ToolKind.PYTEST`` (covers OPAQUE and every other tool — P1). This is the
     recovery task 2045 proved for a shared-venv-mutation transient, where
-    xdist has vanished from the venv.
+    xdist has vanished from the venv. ``-p no:xdist`` also unregisters xdist's
+    fixtures (``worker_id``, ``testrun_uid``), so a test requesting one ERRORs
+    at setup; ``verify.py::reproduced_failures`` says what such an ERROR
+    confirms.
 
     *ini_addopts* is the RAW ``addopts`` of the config pytest will read for
     this command, supplied by the caller
@@ -2100,8 +2102,10 @@ def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
     rewritten, rather than risking a mis-scoped injection into an
     unstructured shell string.
 
-    That no-op used to be reachable from the two scopers, which would hand
-    back a raw-retained chain whenever ``split_chain_tail`` preserved a tail
+    That no-op used to be reachable from the scoper
+    (``verify_plan.py::scope_prefix_to_keyword``, and its string rendering
+    ``verify._scope_to_keyword``), which would hand back a raw-retained
+    chain whenever ``split_chain_tail`` preserved a tail
     — so the run simply collected no junit (B3), silently. Task 3218 closed
     that route: ``'pytest'`` is off ``_TAIL_PRESERVING_KEYWORDS``, so a
     chained pytest slot now comes back structured and injectable. The
@@ -2131,7 +2135,7 @@ def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
     regex-rewrite branch here, so a recognised-but-unstructurable
     ``&&``-chained pytest command is left byte-identical rather than
     rewritten. As with ``with_junitxml``, task 3218 made that no-op
-    unreachable via the two scopers — the pytest slot is off the gate's
+    unreachable via the scoper — the pytest slot is off the gate's
     tail-preservation allowlist, so it now yields a structured command.
 
     The α confirm gate injects this AFTER ``serial_pytest``'s

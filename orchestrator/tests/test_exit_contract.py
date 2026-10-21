@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from _orch_helpers import ExitContractViolationCollector
+from _probe_session import run_probe_session
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
@@ -340,13 +341,8 @@ class TestRecordExitVerdict:
 
 @pytest.fixture
 def collector():
-    collector = ExitContractViolationCollector()
-    logger = logging.getLogger(_LOGGER)
-    logger.addHandler(collector)
-    try:
+    with ExitContractViolationCollector.listening() as collector:
         yield collector
-    finally:
-        logger.removeHandler(collector)
 
 
 class TestExitContractViolationCollector:
@@ -384,6 +380,47 @@ class TestExitContractViolationCollector:
         assert len(guards) == 1
         _record(_violation())
         assert len(guards[0].violations) == 1
+
+    def test_the_suite_wide_guard_hears_the_recorder_when_orchestrator_logs_only_errors(
+        self, caplog,
+    ):
+        """One ordinary ``orchestrator``=ERROR setting must not blind the
+        guard: the would-violate is a WARNING, which a logger inheriting ERROR
+        never creates."""
+        caplog.set_level(logging.ERROR, logger='orchestrator')
+        recorder_logger = logging.getLogger(record_exit_verdict.__module__)
+        guards = [
+            h for h in recorder_logger.handlers
+            if isinstance(h, ExitContractViolationCollector)
+        ]
+        assert len(guards) == 1
+        _record(_violation())
+        assert len(guards[0].violations) == 1
+
+
+_GUARD_PROBE = Path(__file__).with_name('_exit_contract_guard_probe.py')
+#: The probe's leak finishes on its first cancel, so it can only fail by
+#: hanging; the bound is loose.
+_GUARD_PROBE_KILL_SECS = 60
+
+
+def test_a_violation_logged_while_a_leaked_task_is_drained_fails_the_test_that_leaked_it(
+    tmp_path: Path,
+):
+    """A leaked run() whose exit is logged while conftest.py's
+    ``_drain_leaked_tasks`` cancels it must fail the test that leaked it, not
+    be dropped because the guard already tore down, and not be blamed on the
+    next test.  Runs the probe in a REAL nested session under the shipped
+    conftest, mirroring test_leaked_task_drain.py."""
+    run = run_probe_session(
+        _GUARD_PROBE, basetemp=tmp_path / 'probe-basetemp',
+        kill_secs=_GUARD_PROBE_KILL_SECS, backstop_secs=_GUARD_PROBE_KILL_SECS * 4,
+    )
+    output = run.stdout[-4000:] + run.stderr[-2000:]
+    assert run.returncode != 0, output
+    assert 'ERROR at teardown of test_leaks_a_run_that_exits_while_drained' in run.stdout, output
+    assert 'spec §5 exit contract' in run.stdout, output
+    assert '2 passed, 1 error' in run.stdout, output
 
 
 def test_enforce_flag_ships_dark():

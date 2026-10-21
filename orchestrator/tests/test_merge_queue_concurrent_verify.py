@@ -65,14 +65,14 @@ from _orch_helpers import (
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
-from orchestrator.merge_lane.worker import MERGE_WORKER_SHUTDOWN_REASON
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
+    MERGE_WORKER_SHUTDOWN_REASON,
     MergeOutcome,
     MergeRequest,
     RealMergeItem,
     SpeculativeMergeWorker,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease
 
@@ -923,15 +923,13 @@ def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
 # Disposition fail-open predicate (task 3980 amendment) — the companion guard
 # to _fake_verify_result above, and deliberately colocated with it.
 #
-# The classifier has TWO fail-open sites, on two different loggers, both
-# emitting the same substring:
-#   1. merge_disposition.py:710-719 — the classifier's own internal fail-open,
-#      logger 'orchestrator.merge_disposition'.
-#   2. merge_queue.py:994-1001 — `_classify_disposition_for_outcome`'s
-#      belt-and-suspenders catch for anything site 1 re-raises past, logger
-#      'orchestrator.merge_queue'.
-# Keying on the shared substring catches both; filtering by a single logger
-# name silently excludes site 2.
+# The classifier has TWO fail-open sites, both emitting the same substring on
+# the lane's one logger, 'orchestrator.merge_lane':
+#   1. merge_lane/disposition.py — the classifier's own internal fail-open.
+#   2. merge_lane/worker.py::_classify_disposition_for_outcome — the
+#      belt-and-suspenders catch for anything site 1 re-raises past.
+# Keying on the shared substring catches both; filtering by any narrower
+# signal than that silently excludes one of them.
 #
 # Lives HERE rather than in test_merge_speculation.py so there is exactly one
 # predicate for one production invariant. Task 3980 first wrote a second copy
@@ -939,7 +937,7 @@ def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
 # file's older inline version keyed on a longer substring that matched only
 # site 1. Two copies of a drift-detector is how the drift gets back in.
 _FAIL_OPEN_SUBSTRING = 'degrading to INDETERMINATE (fail-open, I3)'
-_FAIL_OPEN_LOGGERS = ('orchestrator.merge_disposition', 'orchestrator.merge_queue')
+_FAIL_OPEN_LOGGERS = ('orchestrator.merge_lane',)
 
 
 def _fail_open_records(
@@ -1163,12 +1161,12 @@ class TestRunPostMergeVerifyRunnerParam:
         mock.get_main_sha = AsyncMock(return_value='main-sha')
         mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
         mock.cleanup_merge_worktree = AsyncMock()
-        mock.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+        mock.create_ephemeral_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
         return mock
 
     async def test_remote_runner_dispatched_when_runner_provided(self, tmp_path: Path) -> None:
         """runner=<fake remote> → pool is [runner], fake.run_merge_verify called."""
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         fake_remote = _make_fake_remote('laptop')
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
@@ -1188,7 +1186,7 @@ class TestRunPostMergeVerifyRunnerParam:
 
     async def test_runner_none_uses_local_runner_byte_identical(self, tmp_path: Path) -> None:
         """runner=None (default) → LocalRunner pool, byte-identical to today."""
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
         req = _make_request('t2', 'task/t2', tmp_path, config)
@@ -1208,7 +1206,7 @@ class TestRunPostMergeVerifyRunnerParam:
     async def test_merge_verify_event_carries_runner_name_when_remote(self, tmp_path: Path) -> None:
         """merge_verify event runner field == injected runner's name, not 'local'."""
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         fake_remote = _make_fake_remote('laptop')
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
@@ -1283,7 +1281,8 @@ class TestInflightStateAttrs:
 
     def test_inflight_entry_importable(self) -> None:
         """InflightEntry is importable from merge_queue."""
-        from orchestrator.merge_queue import InflightEntry  # noqa: F401 (import check)
+        from orchestrator.merge_lane.worker import InflightEntry
+        assert isinstance(InflightEntry, type)
 
 
 # ---------------------------------------------------------------------------
@@ -1307,7 +1306,7 @@ class TestRunInflightVerifyHappyPath:
         content: str,
     ):
         """Helper: create a branch, merge it to main, return (req, item)."""
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
         req = MergeRequest(
@@ -1441,7 +1440,7 @@ class TestRunInflightVerifyAbortPoll:
         content: str,
     ):
         """Create a merged SpeculativeItem on the given branch."""
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
@@ -1644,7 +1643,7 @@ class TestRunInflightVerifyRunnerUnavailable:
         filename: str,
         content: str,
     ):
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
@@ -1755,7 +1754,7 @@ class TestFinalizeInflightPass:
         filename: str,
         content: str,
     ):
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
@@ -1787,7 +1786,7 @@ class TestFinalizeInflightPass:
 
     def _make_pass_entry(self, item, lease, was_speculative: bool = False):
         """Build an InflightEntry representing a completed, passing verify."""
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_lane.worker import InflightEntry
         return InflightEntry(
             item=item,
             lease=lease,
@@ -2050,7 +2049,7 @@ class TestFinalizeInflightNonPass:
         filename: str,
         content: str,
     ):
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
@@ -2089,7 +2088,7 @@ class TestFinalizeInflightNonPass:
         already_delivered: bool = False,
     ):
         """Build a DecidedItem with immediate_outcome (no real merge)."""
-        from orchestrator.merge_queue import DecidedItem
+        from orchestrator.merge_lane.worker import DecidedItem
 
         loop = asyncio.get_running_loop()
         req = MergeRequest(
@@ -2121,7 +2120,7 @@ class TestFinalizeInflightNonPass:
 
     def _make_fail_entry(self, item, lease, fail_outcome, merge_wt_val):
         """Build an InflightEntry with a verify_task that returns a FAIL result."""
-        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult
+        from orchestrator.merge_lane.worker import InflightEntry, InflightVerifyResult
 
         async def _fake_fail_verify():
             return InflightVerifyResult(
@@ -2141,7 +2140,7 @@ class TestFinalizeInflightNonPass:
 
     def _make_sentinel_entry(self, item, lease, sentinel_status, merge_wt_val=None):
         """Build an InflightEntry with a verify_task returning a DROPPED/REQUEUED sentinel."""
-        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult
+        from orchestrator.merge_lane.worker import InflightEntry, InflightVerifyResult
 
         async def _fake_sentinel_verify():
             return InflightVerifyResult(
@@ -2276,7 +2275,7 @@ class TestFinalizeInflightNonPass:
 
         RED: current code asserts merge_wt is not None → AssertionError.
         """
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_lane.worker import InflightEntry
 
         conflict_outcome = MergeOutcome('conflict', reason='merge conflict')
         req, item = self._make_passthrough_item(
@@ -2307,7 +2306,7 @@ class TestFinalizeInflightNonPass:
 
         RED: current code raises AssertionError before reaching _n_failed.
         """
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_lane.worker import InflightEntry
 
         conflict_outcome = MergeOutcome('conflict', reason='conflict')
         req, item = self._make_passthrough_item(
@@ -2334,7 +2333,7 @@ class TestFinalizeInflightNonPass:
 
         RED: same AssertionError as above.
         """
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_lane.worker import InflightEntry
 
         am_outcome = MergeOutcome('already_merged')
         req, item = self._make_passthrough_item(
@@ -2361,7 +2360,7 @@ class TestFinalizeInflightNonPass:
 
         RED: current code raises AssertionError before reaching the delivery check.
         """
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_lane.worker import InflightEntry
 
         conflict_outcome = MergeOutcome('conflict', reason='conflict')
         req, item = self._make_passthrough_item(
@@ -2561,7 +2560,7 @@ class TestSingleHostSerialByteIdentical:
         RED: old loop never writes self._n_failed → stays False after conflict.
         GREEN: step-16 restructured loop → _finalize_inflight sets self._n_failed=True.
         """
-        from orchestrator.merge_queue import DecidedItem
+        from orchestrator.merge_lane.worker import DecidedItem
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -3130,7 +3129,7 @@ class TestChainInvalidationUnderOverlap:
         mirroring the RUNNER_UNAVAILABLE sibling template
         (merge_queue.py:10532-10543).
         """
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         # ── N's local verify: gated (fails when gate_a_release is set) ──────
         gate_a_release = asyncio.Event()
@@ -3215,7 +3214,7 @@ class TestChainInvalidationUnderOverlap:
         outcome_b: MergeOutcome | None = None
 
         with patch(
-            'orchestrator.merge_queue._alarm_illegal_lifecycle_transition',
+            'orchestrator.merge_lane.worker._alarm_illegal_lifecycle_transition',
             _spy_illegal_alarm,
         ):
             worker_task = asyncio.create_task(worker.run())
@@ -3570,7 +3569,7 @@ class TestStopDrainsInflight:
         GREEN (step-24): stop() cancels each verify_task, resolves each
         pending req.result with the shutdown outcome.
         """
-        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult
+        from orchestrator.merge_lane.worker import InflightEntry, InflightVerifyResult
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -3639,7 +3638,7 @@ class TestStopDrainsInflight:
         RED: tasks remain running after stop() (not cancelled).
         GREEN (step-24): tasks are cancelled by stop().
         """
-        from orchestrator.merge_queue import DecidedItem, InflightEntry, InflightVerifyResult
+        from orchestrator.merge_lane.worker import DecidedItem, InflightEntry, InflightVerifyResult
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -3687,7 +3686,7 @@ class TestStopDrainsInflight:
         RED: _redispatch items are not drained; their futures stay pending.
         GREEN (step-24): _redispatch drained + futures resolved.
         """
-        from orchestrator.merge_queue import DecidedItem
+        from orchestrator.merge_lane.worker import DecidedItem
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -3734,7 +3733,7 @@ class TestSnapshotInflight:
         RED: second item's task_id ('snap-b') NOT in entries.
         GREEN: both 'snap-a' and 'snap-b' in entries (with state 'verifying').
         """
-        from orchestrator.merge_queue import DecidedItem, InflightEntry
+        from orchestrator.merge_lane.worker import DecidedItem, InflightEntry
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -3799,7 +3798,7 @@ class TestSnapshotInflight:
 
         GREEN both before and after step-24 (byte-identical oracle).
         """
-        from orchestrator.merge_queue import DecidedItem, InflightEntry
+        from orchestrator.merge_lane.worker import DecidedItem, InflightEntry
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -3844,7 +3843,7 @@ class TestSnapshotInflight:
         head (back-compat); additional _inflight entries appear only in
         'entries'.
         """
-        from orchestrator.merge_queue import DecidedItem, InflightEntry
+        from orchestrator.merge_lane.worker import DecidedItem, InflightEntry
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -3910,7 +3909,7 @@ class TestFinalizeInflightWarmResultsThreading:
         filename: str,
         content: str,
     ):
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
@@ -3956,7 +3955,7 @@ class TestFinalizeInflightWarmResultsThreading:
         RED: the PASS branch hardcodes _warm_results = {} so the captured arg
         at index 4 is always {} regardless of vr.warm_results.
         """
-        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult
+        from orchestrator.merge_lane.worker import InflightEntry, InflightVerifyResult
         from orchestrator.verify_runner import HostLease
 
         req, item = await self._make_merged_item(
@@ -3998,7 +3997,7 @@ class TestFinalizeInflightWarmResultsThreading:
 
         shadow_mock = AsyncMock()
         with patch(
-            'orchestrator.merge_queue._maybe_schedule_shadow_compare', shadow_mock,
+            'orchestrator.merge_lane.worker._maybe_schedule_shadow_compare', shadow_mock,
         ):
             advanced = await worker._finalize_inflight(entry)
 
@@ -4022,7 +4021,7 @@ class TestFinalizeInflightWarmResultsThreading:
         warm_results came from the local _run_inflight_verify path already stored
         in vr; without a verify_task there is no vr, so {} is correct.
         """
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_lane.worker import InflightEntry
         from orchestrator.verify_runner import HostLease
 
         req, item = await self._make_merged_item(
@@ -4046,7 +4045,7 @@ class TestFinalizeInflightWarmResultsThreading:
 
         shadow_mock = AsyncMock()
         with patch(
-            'orchestrator.merge_queue._maybe_schedule_shadow_compare', shadow_mock,
+            'orchestrator.merge_lane.worker._maybe_schedule_shadow_compare', shadow_mock,
         ):
             advanced = await worker._finalize_inflight(entry)
 
@@ -4239,7 +4238,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         content: str,
     ):
         """Create a merged SpeculativeItem on the given branch."""
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
@@ -4499,7 +4498,7 @@ class TestStopDrainFiresRemoteCancel:
              → remote_cancels_while_live stays [].
         GREEN (step-2): _abort_remote_verify fires while live=True → [1].
         """
-        from orchestrator.merge_queue import DecidedItem, InflightEntry
+        from orchestrator.merge_lane.worker import DecidedItem, InflightEntry
         from orchestrator.verify_runner import HostLease
 
         gate_release = asyncio.Event()
@@ -5458,7 +5457,7 @@ class TestVerifyTeardownChokepoint:
         skip the abort altogether, which is the direction the abort-only
         form of this guard left open.
         """
-        import orchestrator.merge_queue as _mq  # module-local import convention
+        import orchestrator.merge_lane.worker as _mq  # module-local import convention
 
         offenders = _teardown_chokepoint_offenders(Path(_mq.__file__).read_text())
         assert offenders == [], (
@@ -6012,7 +6011,7 @@ class TestRedispatchSpeculativeConservation:
         degrade to its fail-open path while processing this test's failing
         VerifyResult double — see the caplog guard at the end of this test.
         """
-        caplog.set_level(logging.WARNING, logger='orchestrator.merge_disposition')
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_lane')
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
         verifier = _GatedVerifier(
@@ -6202,7 +6201,7 @@ class TestRedispatchSpeculativeConservation:
         # predicate above. The inline version this replaces keyed on a longer
         # substring ('internal error; degrading to ...') that matched only
         # merge_disposition.py:711, so the second fail-open site
-        # (merge_queue.py:1000, logger 'orchestrator.merge_queue') could swallow
+        # (worker.py::_classify_disposition_for_outcome) could swallow
         # the same defect here undetected.
         fail_open_records = _fail_open_records(caplog.records)
         assert fail_open_records == [], (
@@ -6258,7 +6257,7 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
         merge_result path works — mirrors TestFinalizeInflightPass /
         TestFinalizingHeadLifecycle's identically-named per-class helper.
         """
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         req = _make_request(branch, branch, wt, config)
@@ -6278,7 +6277,7 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
     async def test_speculation_accounting_clean_throughout_speculative_finalize_head_await(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             InflightVerifyResult,
             ItemLifecycleState,
@@ -6418,7 +6417,7 @@ class TestFakeVerifyResultFidelity:
         RED (pre task-3477 step-2): NameError: name '_fake_verify_result' is
         not defined.
         """
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             _extract_failing_tests_and_candidate_files,
         )
 

@@ -13,10 +13,12 @@ machine-readable form; :mod:`check_trickle_progress` reads it. A quiet
 night is recorded AS quiet and never alarms, so decision 7's stated
 rationale is satisfied rather than circumvented.
 
-Division of labour between the two probes:
+Division of labour between the probes:
 
 - ``check_trickle_liveness.sh``  — did the UNIT RUN? (systemd unit state)
 - ``check_trickle_progress.py``  — did SIGNAL FLOW? (this state file)
+- ``check_census_progress.py``   — did a FIRED census advance census-state?
+  (this state file + census-state.json)
 
 STDLIB-ONLY IMPORTS ARE A HARD CONSTRAINT, NOT A STYLE PREFERENCE.
 ``check_trickle_progress.py`` imports this module and, when bound as a
@@ -40,13 +42,16 @@ that let a suppressed night read like a quiet one for 14 nights
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import logging
 import os
 import pwd
 import tempfile
-from datetime import UTC, date, datetime
+from collections.abc import Iterable, Mapping
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +70,9 @@ fallback, so no reader can MIS-READ a document that lacks it. Bumping
 would make every live state file on every project read ``malformed`` on
 the first post-deploy probe — one guaranteed false alarm per project,
 plus a reset streak — which is precisely the degradation this module
-exists to close.
+exists to close. ``capped`` and ``retry_backlog`` (task 5678), and
+``last_scheduled_target_date`` (task 6548), are further additive fields
+under the same rule.
 
 THE RULE FOR THE NEXT PERSON: bump only for a change that would make an
 OLD reader MIS-READ a NEW document. Adding a field an old reader ignores
@@ -419,6 +426,276 @@ def recorded_age_hours(doc) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Retry backlog — the target dates still owed a run
+# ---------------------------------------------------------------------------
+
+RETRY_MAX_AGE_DAYS = 7
+"""Age in days past which an owed target date is abandoned.
+
+At :data:`RETRIES_PER_NIGHT` retries per finished night, oldest first,
+every date of a k-night outage is retried at age k+1, so, when every
+later night finishes, an outage of up to ``RETRY_MAX_AGE_DAYS - 1``
+nights is fully recovered and a longer one loses only its oldest dates.
+On the same condition a systemd outage of up to ``RETRY_MAX_AGE_DAYS``
+missed elapses is fully recovered, since its catch-up pass covers the
+last date itself. Each later night that does not finish retries nothing,
+so it costs the oldest owed date. A module constant, not a
+``legibility.yaml`` field, for the same bare-``python3`` reason as
+:data:`DEFAULT_MAX_BARREN_RUNS`."""
+
+RETRY_MAX_ATTEMPTS = 3
+"""Unfinished passes of one date (its scheduled pass plus retries) after
+which it is abandoned, so a date that fails deterministically cannot hold
+the head of the oldest-first queue until it ages out. It counts unfinished
+passes only, so a date no pass ran gets this many retries."""
+
+RETRIES_PER_NIGHT = 1
+"""Retry passes one invocation runs after its own scheduled pass finished.
+It bounds the extra spend to one night's, and it is the rate the
+:data:`RETRY_MAX_AGE_DAYS` recovery bound is derived from."""
+
+
+class RetryFold(NamedTuple):
+    """The backlog after folding one pass, and what that fold abandoned."""
+
+    backlog: dict[date, int]
+    abandoned: dict[date, int]
+
+
+class NeverRun(NamedTuple):
+    """The target dates a scheduled pass jumped over: the ``owed`` ones
+    still inside the age window, oldest first, and how many older ones
+    ``expired`` before any pass could run them."""
+
+    owed: tuple[date, ...]
+    expired: int
+
+
+def finished(*, exit_code: int, capped: bool) -> bool:
+    """Whether a pass completed: a clean exit the usage cap did not defer."""
+    return exit_code == 0 and not capped
+
+
+def owes_retry(*, exit_code: int, capped: bool, commit_made: bool) -> bool:
+    """Whether a pass leaves its target date owed a run: it did not
+    finish, and it landed nothing."""
+    return not commit_made and not finished(exit_code=exit_code, capped=capped)
+
+
+def parse_retry_backlog(raw: object) -> dict[date, int]:
+    """Read a recorded ``retry_backlog`` ({ISO date: unfinished attempts}).
+
+    Never raises. A non-mapping gives an empty backlog, and an entry whose
+    key is not an ISO date or whose count is not a non-negative int is
+    dropped: a damaged backlog under-reports, like a lost streak."""
+    if not isinstance(raw, dict):
+        return {}
+    backlog: dict[date, int] = {}
+    for key, attempts in raw.items():
+        owed = _parse_iso_date(key)
+        if owed is not None and _is_attempt_count(attempts):
+            backlog[owed] = attempts
+    return backlog
+
+
+def _parse_iso_date(raw: object) -> date | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _is_attempt_count(raw: object) -> bool:
+    return isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0
+
+
+def _oldest_in_window(today: date) -> date:
+    return today - timedelta(days=RETRY_MAX_AGE_DAYS)
+
+
+def _within_window(owed: date, today: date) -> bool:
+    return owed >= _oldest_in_window(today)
+
+
+def never_run_dates(
+    last_scheduled: date | None, *, target_date: date, today: date
+) -> NeverRun:
+    """The target dates no scheduled pass ran: strictly after the last
+    scheduled pass's target and strictly before this one's. Only those
+    inside the age window on *today* are listed; older ones would be
+    abandoned on arrival, so they are counted, never listed."""
+    if last_scheduled is None:
+        return NeverRun(owed=(), expired=0)
+    gap_start = last_scheduled + timedelta(days=1)
+    owed_start = min(max(gap_start, _oldest_in_window(today)), target_date)
+    return NeverRun(
+        owed=tuple(
+            owed_start + timedelta(days=n)
+            for n in range((target_date - owed_start).days)
+        ),
+        expired=max(0, (owed_start - gap_start).days),
+    )
+
+
+def fold_retry_backlog(
+    backlog: Mapping[date, int],
+    *,
+    target_date: date,
+    owes_retry: bool,
+    today: date,
+    never_run: Iterable[date] = (),
+) -> RetryFold:
+    """Fold one pass of *target_date* into a copy of *backlog*.
+
+    Each *never_run* date not already owed enters with 0 attempts. An
+    unfinished pass adds its date or counts one more attempt; a finished
+    pass removes it. Every entry then outside the age window, or at
+    :data:`RETRY_MAX_ATTEMPTS`, moves to ``abandoned``."""
+    folded = dict(backlog)
+    for owed in never_run:
+        folded.setdefault(owed, 0)
+    if owes_retry:
+        folded[target_date] = folded.get(target_date, 0) + 1
+    else:
+        folded.pop(target_date, None)
+    kept = {
+        owed: attempts
+        for owed, attempts in folded.items()
+        if _within_window(owed, today) and attempts < RETRY_MAX_ATTEMPTS
+    }
+    abandoned = {
+        owed: attempts for owed, attempts in folded.items() if owed not in kept
+    }
+    return RetryFold(backlog=kept, abandoned=abandoned)
+
+
+def select_due_retries(
+    backlog: Mapping[date, int],
+    *,
+    today: date,
+    limit: int = RETRIES_PER_NIGHT,
+) -> tuple[date, ...]:
+    """The owed dates to retry now: in-window only, oldest first, at most
+    *limit*."""
+    due = sorted(owed for owed in backlog if _within_window(owed, today))
+    return tuple(due[:limit])
+
+
+def due_retries(doc, *, today: date) -> tuple[date, ...]:
+    """The owed dates a recorded document makes due now, per :func:`select_due_retries`."""
+    if not isinstance(doc, dict):
+        return ()
+    return select_due_retries(
+        parse_retry_backlog(doc.get('retry_backlog')), today=today
+    )
+
+
+def _serialize_retry_backlog(backlog: Mapping[date, int]) -> dict[str, int]:
+    return {owed.isoformat(): backlog[owed] for owed in sorted(backlog)}
+
+
+# ---------------------------------------------------------------------------
+# The census-fire streak — did the census each FIRE launched advance
+# census-state?
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class CensusObservation:
+    """One night's census-trigger fact, as :func:`record_run` receives it.
+
+    ``last_census_at`` is the census-state value the trigger was evaluated
+    against, read BEFORE any launch: the launch is synchronous, so a census
+    that lands has already rewritten census-state by the time the night is
+    recorded. ``None`` means census-state had no value (never censused)."""
+
+    fired: bool
+    last_census_at: str | None
+    census_state_path: str
+
+
+@dataclasses.dataclass(frozen=True)
+class CensusFireStreak:
+    """``fires`` consecutive recorded nights on which the trigger FIRED
+    against one unchanged ``last_census_at`` at one ``census_state_path``,
+    starting on the target_date ``since``."""
+
+    fires: int
+    last_census_at: str | None
+    census_state_path: str
+    since: str
+
+
+def read_census_fire_streak(doc) -> CensusFireStreak | None:
+    """The ONE parser of a recorded ``census_fire_streak`` object, shared by
+    :func:`record_run`'s fold and ``check_census_progress.py``.
+
+    ``None`` for an absent, null or unusable streak. ``fires`` must be a
+    real int (not a bool) of at least 1."""
+    raw = doc.get('census_fire_streak') if isinstance(doc, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    fires = raw.get('fires')
+    anchor = raw.get('last_census_at')
+    path = raw.get('census_state_path')
+    since = raw.get('since')
+    if not isinstance(fires, int) or isinstance(fires, bool) or fires < 1:
+        return None
+    if anchor is not None and not isinstance(anchor, str):
+        return None
+    if not isinstance(path, str) or not isinstance(since, str):
+        return None
+    return CensusFireStreak(
+        fires=fires, last_census_at=anchor, census_state_path=path, since=since,
+    )
+
+
+def read_last_census_at(path: Path) -> tuple[str, object]:
+    """``('missing', None)``, ``('malformed', None)`` or ``('ok', raw
+    last_census_at)`` for census-state.json at *path*: the ONE read shared
+    by the nightly's pre-launch anchor and ``check_census_progress.py``'s
+    live comparison, so the two sides of its exact-equality test agree.
+
+    QUIET: ``census_trigger.load_census_state`` owns the malformed WARNING
+    for this file. Timestamps are deliberately not validated: the trigger
+    never FIREs on a malformed census-state, so no streak can be anchored
+    on one."""
+    if not path.exists():
+        return 'missing', None
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return 'malformed', None
+    if not isinstance(data, dict):
+        return 'malformed', None
+    return 'ok', data.get('last_census_at')
+
+
+def _fold_census_fire_streak(
+    prev: CensusFireStreak | None,
+    census: CensusObservation | None,
+    target_date: date,
+) -> CensusFireStreak | None:
+    if census is None:
+        return prev
+    if not census.fired:
+        return None
+    if (
+        prev is not None
+        and prev.last_census_at == census.last_census_at
+        and prev.census_state_path == census.census_state_path
+    ):
+        return dataclasses.replace(prev, fires=prev.fires + 1)
+    return CensusFireStreak(
+        fires=1,
+        last_census_at=census.last_census_at,
+        census_state_path=census.census_state_path,
+        since=target_date.isoformat(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # record_run — the writer
 # ---------------------------------------------------------------------------
 
@@ -437,9 +714,22 @@ def record_run(
     applied: int = 0,
     commit_made: bool = False,
     budget_suppressed: bool = False,
+    capped: bool = False,
+    scheduled: bool = False,
+    census: CensusObservation | None,
 ) -> dict:
     """Classify this run, fold it into the running streak, and write the
     state file atomically. Returns the document it wrote.
+
+    The run is also folded into ``retry_backlog`` by
+    :func:`fold_retry_backlog`, so a date whose pass did not finish stays
+    owed a run.
+
+    A *scheduled* pass advances ``last_scheduled_target_date`` to its
+    target, never backwards, and owes, with 0 attempts, the
+    :func:`never_run_dates` since the previous scheduled pass. A manual
+    pass neither moves that cursor nor owes them, because it rewrites
+    ``target_date`` (the backfill case).
 
     ``recorded_at`` is an INJECTED parameter, not a ``datetime.now()``
     inside this function, so the whole module stays clock-injectable and
@@ -476,9 +766,19 @@ def record_run(
     double-fire it either.
 
     ``last_productive_at`` is stamped with ``recorded_at`` on a productive
-    run and carried forward UNCHANGED across barren and quiet runs. It is
+    run that :func:`finished` and carried forward UNCHANGED otherwise. It is
     the field an operator reads to answer "when did this pipeline last
-    actually do anything".
+    actually do anything", so a *capped* night, which built its digests and
+    coded none of them, still reads ``productive`` but is not stamped.
+
+    ``census_fire_streak`` counts consecutive FIREs against one unchanged
+    anchor (:class:`CensusObservation`): a FIRE with the streak's anchor and
+    path increments it, any other FIRE restarts it at 1, a NO-FIRE clears
+    it, and ``census=None`` (the trigger was not evaluated: the night failed
+    or was capped first) carries it forward, as ``failed`` carries the
+    barren streak. ``census`` is REQUIRED with no default, for the reason
+    :func:`classify_run` gives for ``exit_code``: a defaulted ``None`` would
+    silently blind ``check_census_progress.py`` into a permanent OK.
 
     A ``missing`` or ``malformed`` predecessor simply starts the streak at
     this run (and drops ``last_productive_at``): losing streak history
@@ -519,8 +819,20 @@ def record_run(
     )
 
     recorded_at_iso = recorded_at.isoformat()
-    if outcome == OUTCOME_PRODUCTIVE:
+    if outcome == OUTCOME_PRODUCTIVE and finished(exit_code=exit_code, capped=capped):
         last_productive_at = recorded_at_iso
+
+    cursor, never_run = _schedule_cursor(
+        project_id,
+        prev,
+        target_date=target_date,
+        today=recorded_at.date(),
+        scheduled=scheduled,
+    )
+
+    census_streak = _fold_census_fire_streak(
+        read_census_fire_streak(prev), census, target_date,
+    )
 
     doc = {
         'schema_version': STATE_SCHEMA_VERSION,
@@ -532,6 +844,7 @@ def record_run(
         'applied': applied,
         'commit_made': bool(commit_made),
         'budget_suppressed': bool(budget_suppressed),
+        'capped': bool(capped),
         'consecutive_barren_runs': (
             prev_streak + 1 if outcome == OUTCOME_BARREN
             else prev_streak if outcome == OUTCOME_FAILED
@@ -541,6 +854,12 @@ def record_run(
             prev_failed + 1 if outcome == OUTCOME_FAILED else 0
         ),
         'last_productive_at': last_productive_at,
+        'last_scheduled_target_date': cursor.isoformat() if cursor else None,
+        'census_fired': None if census is None else census.fired,
+        'census_fire_streak': (
+            None if census_streak is None
+            else dataclasses.asdict(census_streak)
+        ),
         'counters': {
             'total_records': total_records,
             'zero_signal_dropped': zero_signal_dropped,
@@ -549,8 +868,142 @@ def record_run(
             'budget_skipped': budget_skipped,
             'selected_count': selected_count,
         },
+        'retry_backlog': _next_retry_backlog(
+            project_id,
+            prev,
+            target_date=target_date,
+            recorded_at=recorded_at,
+            exit_code=exit_code,
+            capped=capped,
+            commit_made=commit_made,
+            never_run=never_run,
+        ),
     }
 
+    _write_state(path, doc)
+    return doc
+
+
+def _schedule_cursor(
+    project_id: str,
+    prev: dict | None,
+    *,
+    target_date: date,
+    today: date,
+    scheduled: bool,
+) -> tuple[date | None, tuple[date, ...]]:
+    """The schedule cursor to record, and the never-run dates this pass owes."""
+    prev_cursor = (
+        None if prev is None
+        else _parse_iso_date(prev.get('last_scheduled_target_date'))
+    )
+    if not scheduled:
+        return prev_cursor, ()
+    if prev_cursor is None:
+        return target_date, ()
+    gap = never_run_dates(prev_cursor, target_date=target_date, today=today)
+    if gap.expired:
+        _warn_expired_never_run(project_id, prev_cursor, gap.expired)
+    return max(prev_cursor, target_date), gap.owed
+
+
+def _warn_expired_never_run(
+    project_id: str, last_scheduled: date, expired: int
+) -> None:
+    first = last_scheduled + timedelta(days=1)
+    logger.warning(
+        'trickle retry backlog: abandoning %d never-run date(s) %s..%s for '
+        'project=%s, already past the %d-day window — their sightings are '
+        'permanently lost to the trickle',
+        expired,
+        first.isoformat(),
+        (first + timedelta(days=expired - 1)).isoformat(),
+        project_id,
+        RETRY_MAX_AGE_DAYS,
+    )
+
+
+def record_retry(
+    project_id: str,
+    *,
+    target_date: date,
+    recorded_at: datetime,
+    exit_code: int,
+    capped: bool,
+    commit_made: bool,
+) -> dict | None:
+    """Fold one RETRY pass of *target_date* into the recorded backlog.
+    Returns the document it wrote, or ``None`` when it wrote nothing.
+
+    A retry pass rewrites ONLY ``retry_backlog``, so the health record, and
+    the ``recorded_at`` freshness both probes read, keep describing the
+    scheduled night. With no readable predecessor there is no backlog to
+    fold into: it logs one WARNING and writes nothing."""
+    path = trickle_state_path(project_id)
+    status, prev = load_state(path)
+    if prev is None:
+        logger.warning(
+            'trickle state: cannot record retry of %s for project=%s: no '
+            'readable trickle state (%s)',
+            target_date.isoformat(),
+            project_id,
+            status,
+        )
+        return None
+
+    doc = {
+        **prev,
+        'retry_backlog': _next_retry_backlog(
+            project_id,
+            prev,
+            target_date=target_date,
+            recorded_at=recorded_at,
+            exit_code=exit_code,
+            capped=capped,
+            commit_made=commit_made,
+        ),
+    }
+    _write_state(path, doc)
+    return doc
+
+
+def _next_retry_backlog(
+    project_id: str,
+    prev: dict | None,
+    *,
+    target_date: date,
+    recorded_at: datetime,
+    exit_code: int,
+    capped: bool,
+    commit_made: bool,
+    never_run: tuple[date, ...] = (),
+) -> dict[str, int]:
+    today = recorded_at.date()
+    fold = fold_retry_backlog(
+        parse_retry_backlog(None if prev is None else prev.get('retry_backlog')),
+        target_date=target_date,
+        owes_retry=owes_retry(
+            exit_code=exit_code, capped=capped, commit_made=commit_made
+        ),
+        today=today,
+        never_run=never_run,
+    )
+    for owed, attempts in sorted(fold.abandoned.items()):
+        logger.warning(
+            'trickle retry backlog: abandoning %s for project=%s after %d '
+            'unfinished attempt(s), age %d day(s) (limits: %d attempts, %d '
+            'days) — its sightings are permanently lost to the trickle',
+            owed.isoformat(),
+            project_id,
+            attempts,
+            (today - owed).days,
+            RETRY_MAX_ATTEMPTS,
+            RETRY_MAX_AGE_DAYS,
+        )
+    return _serialize_retry_backlog(fold.backlog)
+
+
+def _write_state(path: Path, doc: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + '.tmp')
     try:
@@ -562,8 +1015,6 @@ def record_run(
         with contextlib.suppress(OSError):
             tmp_path.unlink()
         raise
-
-    return doc
 
 
 DEFAULT_MAX_BARREN_RUNS = 3
@@ -602,4 +1053,21 @@ anomaly on its own.
 A MODULE CONSTANT, NOT A ``legibility.yaml`` FIELD, for the same reason
 as its sibling above: reading that config would drag pydantic + PyYAML
 onto the bare-``python3`` predicate path this module must survive.
+"""
+
+DEFAULT_MAX_UNADVANCED_CENSUS_FIRES = 3
+"""Consecutive census-trigger FIREs against one unchanged ``last_census_at``
+before ``check_census_progress.py`` fails.
+
+WHY 3. One or two unadvanced fires can be a census deferred for usage
+headroom, which ``census.py``'s ``_defer`` already escalates at info. A
+census that DID advance blocks the trigger for the next ``floor_days``
+(stock 5) nights, so three consecutive unadvanced fires are persistent.
+The threshold bounds how many unadvanced paid censuses run BEFORE an
+operator is alerted, not how many run: nothing here stops the trigger, so
+every later FIRE still launches one until someone acts. A deferred census
+COUNTS toward the streak: nothing the pipeline records tells it apart.
+
+A MODULE CONSTANT, NOT A ``legibility.yaml`` FIELD, for the same reason
+as its siblings above.
 """

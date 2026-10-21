@@ -23,7 +23,7 @@
 // target's body runs before the importing file's own body, so `globalThis.window`
 // would still be unset when datum.js's top level ran. Every test therefore goes
 // through `loadDatumJs()` below, which shims the global FIRST and only then
-// loads the module via createRequire (the idiom data_poll.test.mjs::loadDataJs
+// loads the module via createRequire (the idiom _data_loader.mjs::loadDataJs
 // documents at length, mirrored in task_row_cells.test.mjs and
 // runtime_format.test.mjs).
 import { test } from 'node:test';

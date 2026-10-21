@@ -1,6 +1,6 @@
 """The merge gate's isolated re-run, end to end, against a REAL pytest.
 
-The ONE test in this area that lets ``confirm_isolated_rerun_verdict`` reach a
+The ONE file in this area whose tests let ``confirm_isolated_rerun_verdict`` reach a
 real ``run_verification`` and a real pytest subprocess. Every sibling suite —
 test_flake_discriminator.py, test_verify_merge_flake_suppression.py,
 test_verify_preexisting_main_break.py — patches ``run_verification`` out, which
@@ -27,9 +27,12 @@ suppression was off, and every unit test in the area was green.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shlex
+import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -46,6 +49,10 @@ from orchestrator.verify import VerifyResult, confirm_isolated_rerun_verdict
 #: command it built never ran it.
 PROBE_REL = 'pkg/tests/test_probe.py'
 PROBE_NODE_ID = f'{PROBE_REL}::test_ok'
+
+#: A probe that requests xdist's ``worker_id`` fixture.
+WORKER_ID_PROBE_REL = 'pkg/tests/test_probe_worker_id.py'
+WORKER_ID_PROBE_NODE_ID = f'{WORKER_ID_PROBE_REL}::test_uses_worker_id'
 
 
 def _make_worktree(tmp_path: Path) -> Path:
@@ -112,18 +119,24 @@ def _module_config() -> ModuleConfig:
     )
 
 
-def _failing_result() -> VerifyResult:
+def _failing_result(*, node_id: str = PROBE_NODE_ID, kind: str = 'FAILED') -> VerifyResult:
     """The load-shed failure the merge gate is asking the discriminator about."""
     return VerifyResult(
         passed=False,
-        test_output=f'FAILED {PROBE_NODE_ID}\n',
+        test_output=f'{kind} {node_id}\n',
         lint_output='',
         type_output='',
         summary='fail',
         category='test_failure',
-        cause_hint=f'FAILED {PROBE_NODE_ID}',
+        cause_hint=f'{kind} {node_id}',
         failing_leg_categories=['test_failure'],
     )
+
+
+def _write_worker_id_probe(worktree: Path) -> None:
+    probe = worktree / WORKER_ID_PROBE_REL
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    probe.write_text('def test_uses_worker_id(worker_id):\n    assert worker_id\n', encoding='utf-8')
 
 
 # Grouped so this file's real-subprocess probe lands on ONE xdist worker
@@ -174,3 +187,105 @@ def test_merge_gate_isolated_rerun_actually_runs_the_test(tmp_path):
     assert tokens[tokens.index('--timeout') + 1].isdigit(), (
         f'--timeout was severed from its value by the junitxml rewrite: {rendered!r}'
     )
+
+
+@pytest.mark.xdist_group('merge_gate_rerun_real_pytest')
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+def test_merge_gate_rerun_that_only_errors_at_setup_is_unconfirmable(tmp_path):
+    """Under xdist this body runs and ``worker_id`` is ``'gw<N>'``; the re-run's
+    ``-p no:xdist`` unregisters the fixture, so it ERRORs at setup with
+    "fixture 'worker_id' not found".  MEASURED before task 3880:
+    ``fails_in_isolation``.
+    """
+    _write_worker_id_probe(tmp_path)
+
+    suppression = asyncio.run(confirm_isolated_rerun_verdict(
+        tmp_path, _make_config(tmp_path), [_module_config()],
+        _failing_result(node_id=WORKER_ID_PROBE_NODE_ID),
+        call_site='merge_gate',
+    ))
+
+    rendered = f'verdict={suppression.verdict} reason={suppression.unconfirmable_reason!r}'
+    assert suppression.verdict is FlakeVerdict.unconfirmable, rendered
+    assert (suppression.unconfirmable_reason or '').startswith('rerun_setup_errors_only:'), rendered
+    assert suppression.test_ids == (WORKER_ID_PROBE_NODE_ID,), suppression.test_ids
+
+
+@pytest.mark.xdist_group('merge_gate_rerun_real_pytest')
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+def test_merge_gate_rerun_setup_error_reproduces_an_original_error(tmp_path, caplog):
+    """The control: an original that ERRORed too is reproduced, although it
+    names the test relative to the module and the re-run relative to the root.
+    The fail-closed exception path also answers ``fails_in_isolation``, so it
+    is ruled out by its WARNING."""
+    _write_worker_id_probe(tmp_path)
+    module_relative_id = WORKER_ID_PROBE_NODE_ID.removeprefix('pkg/')
+
+    with caplog.at_level(logging.WARNING, logger=verify_module.logger.name):
+        suppression = asyncio.run(confirm_isolated_rerun_verdict(
+            tmp_path, _make_config(tmp_path), [_module_config()],
+            _failing_result(node_id=module_relative_id, kind='ERROR'),
+            call_site='merge_gate',
+        ))
+
+    rendered = f'verdict={suppression.verdict} reason={suppression.unconfirmable_reason!r}'
+    assert suppression.verdict is FlakeVerdict.fails_in_isolation, rendered
+    unexpected = [r.getMessage() for r in caplog.records if 'unexpected error' in r.getMessage()]
+    assert not unexpected, unexpected
+
+
+GROUPED_PROBE_REL = 'pkg/tests/test_grouped_probe.py'
+_GROUPED_PROBE = '''\
+import os
+
+import pytest
+
+pytestmark = pytest.mark.xdist_group('probe_group')
+
+
+@pytest.mark.parametrize('p', ['1', 'a@b'])
+def test_ok(p):
+    assert os.environ.get('PROBE_FAIL') != '1'
+'''
+
+
+def _loadgroup_detect_output(worktree: Path) -> str:
+    """Real ``-n 2 --dist loadgroup`` output of the grouped probe, failing because PROBE_FAIL is set."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith('PYTEST_')}
+    env['PROBE_FAIL'] = '1'
+    completed = subprocess.run(
+        [
+            sys.executable, '-m', 'pytest', '-n', '2', '--dist', 'loadgroup', '-o', 'addopts=',
+            '-p', 'no:cacheprovider', '--rootdir', str(worktree), '-q', GROUPED_PROBE_REL,
+        ],
+        cwd=worktree, env=env, capture_output=True, text=True, check=False,
+    )
+    return completed.stdout + completed.stderr
+
+
+@pytest.mark.xdist_group('merge_gate_rerun_real_pytest')
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+def test_merge_gate_reruns_xdist_loadgroup_failures_by_their_plain_node_ids(tmp_path):
+    """Task 7091: a loadgroup run names each failure ``<id>@<group>``, which plain pytest reports 'not found'.
+
+    MEASURED RED before task 7091: ``fails_in_isolation``, the shape of all 52
+    suffixed merge_gate rows in the flake ledger.
+    """
+    worktree = _make_worktree(tmp_path)
+    (worktree / GROUPED_PROBE_REL).write_text(_GROUPED_PROBE, encoding='utf-8')
+    detect_output = _loadgroup_detect_output(worktree)
+    assert '@probe_group' in detect_output, (
+        f'xdist no longer suffixes loadgroup node ids as this test assumes:\n{detect_output}'
+    )
+    failing = replace(_failing_result(), test_output=detect_output)
+
+    suppression = asyncio.run(confirm_isolated_rerun_verdict(
+        worktree, _make_config(worktree), [_module_config()], failing, call_site='merge_gate',
+    ))
+
+    assert suppression.verdict is FlakeVerdict.passes_in_isolation, (
+        f'verdict={suppression.verdict} reason={suppression.unconfirmable_reason!r}'
+    )
+    assert suppression.test_ids == (
+        f'{GROUPED_PROBE_REL}::test_ok[1]', f'{GROUPED_PROBE_REL}::test_ok[a@b]',
+    ), suppression.test_ids
