@@ -19,6 +19,7 @@ have a fixed width.
 from __future__ import annotations
 
 import sys
+from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -32,8 +33,21 @@ import pytest
 import yaml
 from _canned_mcp import ByRoot, CannedMCP
 from _dashboard_helpers import HERMETIC_FUSED_MEMORY_URLS, build_dual_escalation_tree
+from _payload_fleet_history import (
+    BurndownShape,
+    MemoryOpsShape,
+    MemoryShape,
+    ReconShape,
+    seed_burndown_history,
+    seed_metrics_history,
+    seed_reconciliation,
+    seed_write_journal,
+)
 from _payload_fleet_seed import (
+    CostShape,
     EscalationShape,
+    seed_account_events,
+    seed_invocations,
     seed_merge_events,
     seed_pending_escalations,
     seed_resolved_history,
@@ -108,6 +122,20 @@ class FleetCensus:
       2,600 characters (``description`` is not shaped into a task row, but
       escalation cards embed it).
 
+    The sampled and billed histories were measured live on 2026-10-21, and
+    the fleet serves each within a few percent of it:
+
+    * costs (110,596 bytes at ``window=all``): spend on 189 of the 3,650
+      days, 23 (model, role) pairs, 9 accounts, the 200-event cap full;
+    * burndown (989,413 at ``window=90d``): the store reaches back 31 days
+      but holds gap rows, so a root's series averages 1,328 MEASURED rows;
+      the payload scales with that count, not the span;
+    * recon (35,216): 50 runs listed, 24 writing agents, 400 buffered events;
+    * memory (41,065): 173 memory projects, 18 WAL stores, a day of samples;
+    * curator (17,057): no pending tickets, every account capped all day;
+    * memory-graphs (1,722): 17 operations hourly; the journal's counts are
+      five digits a bucket live, a few rows here, a difference of bytes.
+
     Re-grow this census, rather than loosening a budget, whenever a budget
     raised for real growth would otherwise trip the sweep's slack rule.
     """
@@ -128,6 +156,11 @@ class FleetCensus:
     reconciliation_escalations: int
     merge_history_days: int
     live_queue_depth: int
+    costs: CostShape
+    burndown: BurndownShape
+    memory: MemoryShape
+    recon: ReconShape
+    memory_ops: MemoryOpsShape
 
 
 CENSUS = FleetCensus(
@@ -218,6 +251,42 @@ CENSUS = FleetCensus(
     reconciliation_escalations=62,
     merge_history_days=196,
     live_queue_depth=5,
+    costs=CostShape(
+        spend_days=189,
+        invocations_per_day=3,
+        model_roles=(
+            ('opus', 'architect'), ('opus', 'implementer'), ('opus', 'reviewer_comprehensive'),
+            ('opus', 'debugger'), ('opus', 'steward'), ('opus', 'merger'), ('opus', 'deep_reviewer'),
+            ('opus', 'escalation-watcher-auto'), ('sonnet', 'implementer'), ('sonnet', 'debugger'),
+            ('sonnet', 'escalation-watcher-auto'), ('sonnet', 'simple_task'), ('sonnet', 'unblock_auto'),
+            ('sonnet', 'resettled_adjudicator'), ('sonnet', 'module_tagger'),
+            ('sonnet', 'reviewer_test_analyst'), ('sonnet', 'reviewer_robustness'),
+            ('sonnet', 'reviewer_architect_reviewer'), ('sonnet', 'reviewer_reuse_auditor'),
+            ('sonnet', 'reviewer_performance'), ('haiku', 'module_tagger'),
+            ('claude-fable-5-1', 'merger'), ('claude-fable-5-1', 'steward'),
+        ),
+        curator_roles=('task_curator', 'task_curator_batch'),
+        accounts=('max-a', 'max-b', 'max-c', 'max-d', 'max-e', 'max-f', 'max-g', 'max-h', 'default'),
+        account_events=30,
+        cap_reason_len=80,
+    ),
+    burndown=BurndownShape(samples_per_root=1330, concurrency_cap=24),
+    memory=MemoryShape(
+        projects=173, project_id_len=21, graphiti_nodes=132_790, mem0_memories=85_425,
+        wal_stores=(
+            'task_backend', 'recon_journal', 'event_buffer', 'ticket_store', 'recon_ledger',
+            'write_journal', 'durable_queue', 'planned_episode_registry',
+        ),
+    ),
+    recon=ReconShape(runs=200, buffered_events=400, agents=24),
+    memory_ops=MemoryOpsShape(operations=(
+        ('get_task', 'read'), ('get_statuses', 'read'), ('get_tasks', 'read'),
+        ('get_external_statuses', 'read'), ('update_task', 'write'), ('search', 'read'),
+        ('add_memory', 'write'), ('set_task_status', 'write'), ('get_entity', 'read'),
+        ('add_dependency', 'write'), ('task_created', 'write'), ('delete_memory', 'write'),
+        ('add_system_record', 'write'), ('find_tasks_by_metadata', 'read'), ('task_combined', 'write'),
+        ('update_edge', 'write'), ('remove_dependency', 'write'),
+    )),
 )
 
 TERMINAL_WINDOW_ROOT = 'dark-factory'
@@ -420,16 +489,20 @@ class FleetMcp:
 
     Task reads go to one :class:`CannedMCP` per root through :class:`ByRoot`,
     so paging, status narrowing and lookups by id are the faithful ones. Every
-    other tool is answered from the root's generated tree. A tool the fleet
-    does not answer, or a root it does not hold, RAISES rather than answering
-    ``{}``: an empty answer would let a handler serve a near-empty payload that
-    only the slack rule would ever notice.
+    other tool is answered from the root's generated tree, or from
+    :class:`_ServerStatus` for fused-memory's reports of itself. A tool the
+    fleet does not answer, or a root it does not hold, RAISES rather than
+    answering ``{}``: an empty answer would let a handler serve a near-empty
+    payload that only the slack rule would ever notice. A fan-out that
+    swallows the raise as an offline server is still caught: every refused
+    tool is kept, and :func:`open_fleet_client` fails on any.
     """
 
     def __init__(
         self,
         fleet: FleetCensus,
         escalation_urls: Mapping[str, str],
+        fused_memory_urls: Sequence[str],
         *,
         now: datetime,
     ) -> None:
@@ -440,6 +513,7 @@ class FleetMcp:
             label: CannedMCP(tree.rows, tree.status_map(), status_page_size=2000)
             for label, tree in self._trees.items()
         })
+        server = _ServerStatus(fleet, fused_memory_urls, now=now)
         self._handlers = {
             'get_task_runtime_state': self._runtime_state,
             'get_scheduler_state': self._scheduler_state,
@@ -448,19 +522,30 @@ class FleetMcp:
             'get_pending_escalations': self._pending_escalations,
             'get_merge_queue': self._merge_queue,
             'get_merge_halt_status': self._merge_halt_status,
+            'list_tickets': self._pending_tickets,
+            'get_status': server.status,
+            'get_queue_stats': server.queue_stats,
+            'get_wal_status': server.wal_status,
+            'get_curator_state': server.curator_state,
         }
         self._live_queue_depth = fleet.live_queue_depth
+        self._refused: list[str] = []
 
     async def __call__(self, client, url, tool, args, **kwargs):
         if tool in _TASK_TOOLS:
             return await self._tasks(client, url, tool, args, **kwargs)
         handler = self._handlers.get(tool)
         if handler is None:
+            self._refused.append(tool)
             raise AssertionError(
                 f'the payload fleet answers no {tool!r}; answer it from the census in '
                 'dashboard/tests/_payload_fleet.py::FleetMcp',
             )
         return handler(url, args)
+
+    def refused(self) -> tuple[str, ...]:
+        """Every tool asked for that the fleet does not answer, in the order asked."""
+        return tuple(self._refused)
 
     def tree(self, label: str) -> _Tree:
         try:
@@ -537,6 +622,64 @@ class FleetMcp:
     def _pending_escalations(self, _url: str, _args: Mapping[str, Any]) -> list[dict[str, Any]]:
         """No record carries a pins_recovery annotation: a read that succeeded and pins nothing."""
         return []
+
+    def _pending_tickets(self, _url: str, args: Mapping[str, Any]) -> dict[str, Any]:
+        """The root's curator queue: empty, as every live root's was when the census was taken."""
+        tree = self._root_tree(args)
+        return {'count': 0, 'tickets': [], 'project_id': normalize_project_id(tree.census.label)}
+
+
+class _ServerStatus:
+    """What the fleet's one fused-memory server reports of itself: stores, write queue, WAL, curator gate.
+
+    A read addressed anywhere but the fleet's fused-memory URLs raises.
+    """
+
+    _UPTIME = timedelta(seconds=12_269)
+
+    def __init__(self, fleet: FleetCensus, urls: Sequence[str], *, now: datetime) -> None:
+        self._memory = fleet.memory
+        self._urls = frozenset(urls)
+        self._now = now
+        self._project_ids = [normalize_project_id(root.label) for root in fleet.roots]
+        self._account_count = len(fleet.costs.accounts)
+
+    def _check(self, url: str) -> None:
+        if url not in self._urls:
+            raise LookupError(f'the payload fleet runs no fused-memory server at {url!r}')
+
+    def status(self, url: str, _args: Mapping[str, Any]) -> dict[str, Any]:
+        self._check(url)
+        memory = self._memory
+        return {
+            'graphiti': {
+                'connected': True, 'node_count': memory.graphiti_nodes,
+                'edge_count': 3 * memory.graphiti_nodes, 'episode_count': memory.graphiti_nodes // 4,
+            },
+            'mem0': {'connected': True, 'memory_count': memory.mem0_memories},
+            'projects': memory.project_counts(),
+            'uptime_seconds': int(self._UPTIME.total_seconds()),
+            'started_at': (self._now - self._UPTIME).isoformat(),
+        }
+
+    def queue_stats(self, url: str, _args: Mapping[str, Any]) -> dict[str, Any]:
+        self._check(url)
+        return {'counts': {'pending': 0, 'retry': 0, 'dead': 1}, 'oldest_pending_age_seconds': None}
+
+    def wal_status(self, url: str, _args: Mapping[str, Any]) -> dict[str, Any]:
+        """One checkpoint row per store: the shared ones, then each project's overrides store."""
+        self._check(url)
+        stores = [*self._memory.wal_stores, *(f'overrides:{pid}' for pid in self._project_ids)]
+        checked = (self._now - timedelta(seconds=117)).isoformat()
+        return {'stores': {
+            store: {'ts': checked, 'busy': 0, 'log': 0, 'checkpointed': 0,
+                    'detail': f'{len(self._project_ids)} project(s)'}
+            for store in stores
+        }}
+
+    def curator_state(self, url: str, _args: Mapping[str, Any]) -> dict[str, Any]:
+        self._check(url)
+        return {'paused': False, 'paused_reason': None, 'soonest_open_at': None, 'account_count': self._account_count}
 
 
 def _event(at: datetime, task_id: str, event_type: str, data: Mapping[str, Any]) -> dict[str, Any]:
@@ -615,16 +758,22 @@ def _seed_escalations(
 def _seed_ledgers_and_stores(
     config: DashboardConfig, fleet: FleetCensus, substrate: FleetMcp, *, now: datetime,
 ) -> None:
-    """Each root's run ledger and task store, and the primary root's memory-eval artifacts.
+    """Each root's run ledger and task store, the curator's ledger and the memory-eval artifacts.
 
     A task store holds the root's whole tree. Its first ``claimed_terminal``
     finished tasks still carry a claimant: the violations /invariants lists.
+    Only a root whose orchestrator runs bills invocations and account events.
     """
     stale = (now - timedelta(hours=6)).isoformat()
-    for root, path in zip(fleet.roots, [config.project_root, *config.known_project_roots], strict=True):
+    paths = [config.project_root, *config.known_project_roots]
+    for index, (root, path) in enumerate(zip(fleet.roots, paths, strict=True)):
         rows = substrate.tree(root.label).rows
         runs_db = path / 'data' / 'orchestrator' / 'runs.db'
-        seed_task_results(runs_db, normalize_project_id(root.label), root.completed_hours, now=now)
+        project_id = normalize_project_id(root.label)
+        seed_task_results(runs_db, project_id, root.completed_hours, now=now)
+        if root.orchestrator_running:
+            seed_invocations(runs_db, project_id, fleet.costs, fleet.costs.model_roles, root.completed_hours, now=now)
+            seed_account_events(runs_db, project_id, fleet.costs, offset=index, now=now)
         if rows:
             seed_merge_events(
                 runs_db, [row['id'] for row in rows], root.merges, root.trains,
@@ -636,7 +785,30 @@ def _seed_ledgers_and_stores(
             task_row(int(row['id']), row['status'], *((f'run-fleet/{row["id"]}', stale) if row['id'] in claimed else ()))
             for row in rows
         ])
+    curator_pairs = [('opus', role) for role in fleet.costs.curator_roles]
+    seed_invocations(config.curator_events_db, 'dark_factory', fleet.costs, curator_pairs, 0, now=now)
     build_dual_escalation_tree(config.project_root)
+
+
+def _seed_histories(
+    config: DashboardConfig, fleet: FleetCensus, substrate: FleetMcp, *, now: datetime,
+) -> None:
+    """The sampled stores: burndown series, the metrics loop's samples, the recon store, the write journal."""
+    paths = [str(path) for path in (config.project_root, *config.known_project_roots)]
+    trees = {
+        path: Counter(TaskStatus(status) for status in substrate.tree(root.label).status_map().values())
+        for root, path in zip(fleet.roots, paths, strict=True)
+    }
+    seed_burndown_history(config.burndown_db, trees, fleet.burndown, now=now)
+    seed_metrics_history(
+        config.metrics_db, memory=fleet.memory, recon=fleet.recon,
+        running_roots=[path for root, path in zip(fleet.roots, paths, strict=True) if root.orchestrator_running],
+        merge_depth=fleet.live_queue_depth, now=now,
+    )
+    seed_reconciliation(
+        config.reconciliation_db, fleet.recon, [normalize_project_id(root.label) for root in fleet.roots], now=now,
+    )
+    seed_write_journal(config.write_journal_db, fleet.memory_ops, now=now)
 
 
 def _bindings_of(target: object, name: str, known: frozenset[str]) -> list[ModuleType]:
@@ -685,9 +857,10 @@ def open_fleet_client(fleet: FleetCensus = CENSUS) -> Iterator[TestClient]:
             fused_memory_urls=list(HERMETIC_FUSED_MEMORY_URLS),
         )
         now = datetime.now(UTC).replace(microsecond=0)
-        substrate = FleetMcp(fleet, config.escalation_urls, now=now)
+        substrate = FleetMcp(fleet, config.escalation_urls, config.fused_memory_urls, now=now)
         _seed_escalations(config, fleet, substrate, now=now)
         _seed_ledgers_and_stores(config, fleet, substrate, now=now)
+        _seed_histories(config, fleet, substrate, now=now)
         processes = _running_orchestrators(fleet, roots)
         with pytest.MonkeyPatch.context() as mp:
             for module in _bindings_of(mcp_tool_call, 'mcp_tool_call', _KNOWN_MCP_IMPORTERS):
@@ -703,3 +876,8 @@ def open_fleet_client(fleet: FleetCensus = CENSUS) -> Iterator[TestClient]:
                     yield client
             finally:
                 _clear_caches()
+        assert not substrate.refused(), (
+            f'the app asked the payload fleet for {sorted(set(substrate.refused()))}, which it does '
+            'not answer; a fan-out swallowed the refusal as an offline server, so some payload '
+            'was measured empty. Answer each from the census in dashboard/tests/_payload_fleet.py::FleetMcp'
+        )

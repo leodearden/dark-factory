@@ -1,14 +1,16 @@
 """The payload fleet's on-disk half: the files the routes read beside the MCP reads.
 
 ``_payload_fleet.py`` answers every MCP read from its census; the routes this
-module feeds read files instead: escalation queues and their archives, each
-root's run ledger, its task store and the memory-eval artifacts. Each seeder
-writes one family through the production writer or schema wherever one is
-importable, at the sizes its ``*Shape`` names, and knows nothing of MCP.
+module feeds read files instead: escalation queues and their archives, and
+each root's run ledger (task results, events, invocations and account
+events). The sampled histories live in ``_payload_fleet_history.py``. Each
+seeder writes one family through the production writer or schema wherever one
+is importable, at the sizes its ``*Shape`` names, and knows nothing of MCP.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from collections.abc import Sequence
@@ -20,6 +22,10 @@ from pathlib import Path
 from escalation.archive import archive_dir_for_date
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.cost_store import CostStore
+
+FLEET_RUN_ID = 'run-payload-fleet'
+"""The one orchestrator run every ledger row belongs to, so invocations join their task results."""
 
 
 def text(seed: str, length: int) -> str:
@@ -136,7 +142,7 @@ def seed_task_results(runs_db: Path, project_id: str, completed_hours: int, *, n
     runs_db.parent.mkdir(parents=True, exist_ok=True)
     rows = [
         (
-            'run-payload-fleet', str(hour), project_id, None, 'done', 0.5,
+            FLEET_RUN_ID, str(hour), project_id, None, 'done', 0.5,
             600_000 + (997 * hour) % 3_600_000, 3, 2, 1 + hour % 2, hour % 2, 0.0, int(hour % 9 == 0),
             (now - timedelta(hours=hour)).isoformat(),
         )
@@ -178,7 +184,7 @@ def seed_merge_events(
     span = timedelta(days=history_days)
     attempts = [
         (
-            (now - span * (n + 1) / (merges + 1)).isoformat(), 'run-payload-fleet', task_ids[n % len(task_ids)],
+            (now - span * (n + 1) / (merges + 1)).isoformat(), FLEET_RUN_ID, task_ids[n % len(task_ids)],
             'merge_attempt', 'merge', json.dumps({'outcome': _MERGE_OUTCOMES[n % len(_MERGE_OUTCOMES)]}),
             60_000 + (7_919 * n) % 1_800_000,
         )
@@ -186,7 +192,7 @@ def seed_merge_events(
     ]
     train_merges = [
         (
-            (now - timedelta(hours=6 * (n + 1))).isoformat(), 'run-payload-fleet', task_ids[n % len(task_ids)],
+            (now - timedelta(hours=6 * (n + 1))).isoformat(), FLEET_RUN_ID, task_ids[n % len(task_ids)],
             'train_merged', 'merge', json.dumps({
                 'train_id': f'coalesce-{task_ids[n % len(task_ids)]}-fleet',
                 'member_task_ids': [task_ids[(n + k) % len(task_ids)] for k in range(2)],
@@ -202,4 +208,125 @@ def seed_merge_events(
             'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, data, duration_ms) '
             'VALUES (?, ?, ?, ?, ?, ?, ?)',
             [*attempts, *train_merges],
+        )
+
+
+@dataclass(frozen=True)
+class CostShape:
+    """What the invocation ledgers hold: days of spend, who spent it, and the account events beside it.
+
+    ``model_roles`` are the (model, role) pairs orchestrator invocations bill
+    under; ``curator_roles`` bill the fused-memory curator's own ledger.
+    ``account_events`` is per orchestrator ledger, newest first.
+    """
+
+    spend_days: int
+    invocations_per_day: int
+    model_roles: tuple[tuple[str, str], ...]
+    curator_roles: tuple[str, ...]
+    accounts: tuple[str, ...]
+    account_events: int
+    cap_reason_len: int
+
+
+_ACCOUNT_EVENT_CYCLE = (
+    'failover', 'cap_hit', 'failover', 'cap_hit', 'failover', 'cap_hit', 'failover', 'cap_hit', 'resumed',
+)
+"""The live mix of account events: about four failovers and four cap hits to each resume."""
+
+_INVOCATION_COLUMNS = (
+    'run_id', 'task_id', 'project_id', 'account_name', 'model', 'role', 'cost_usd',
+    'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_create_tokens',
+    'duration_ms', 'capped', 'started_at', 'completed_at', 'model_id', 'capped_reason',
+)
+
+
+def _create_cost_tables(ledger: Path) -> None:
+    """Create *ledger*'s tables through its own writer, so its schema and migrations are the production ones."""
+    async def _open_and_close() -> None:
+        store = CostStore(ledger)
+        await store.open()
+        await store.close()
+
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    asyncio.run(_open_and_close())
+
+
+def _invocation(
+    n: int, project_id: str, shape: CostShape, pair: tuple[str, str], task_id: str | None, completed: datetime,
+) -> tuple[object, ...]:
+    model, role = pair
+    capped = n % 50 == 0
+    return (
+        FLEET_RUN_ID, task_id, project_id, shape.accounts[n % len(shape.accounts)], model, role,
+        round(20 + (7_919 * n) % 40_000 / 1_000, 4),
+        6_000 + n % 997, 40_000 + n % 9_973, 4_000_000 + n % 99_991, 150_000 + n % 9_967,
+        600_000 + (997 * n) % 3_600_000, int(capped),
+        (completed - timedelta(minutes=10)).isoformat(), completed.isoformat(),
+        f'claude-{model}-fleet', 'turns' if capped else None,
+    )
+
+
+def seed_invocations(
+    ledger: Path,
+    project_id: str,
+    shape: CostShape,
+    pairs: Sequence[tuple[str, str]],
+    completed_tasks: int,
+    *,
+    now: datetime,
+) -> None:
+    """``invocations_per_day`` invocations a day over the newest ``spend_days`` days, cycling *pairs*.
+
+    Each names one of the run's *completed_tasks* finished tasks (none when
+    it has none), so the model/role rollup joins it to a done outcome.
+    """
+    _create_cost_tables(ledger)
+    rows = []
+    for day in range(shape.spend_days):
+        for j in range(shape.invocations_per_day):
+            n = day * shape.invocations_per_day + j
+            task_id = str(1 + n % completed_tasks) if completed_tasks else None
+            completed = now - timedelta(days=day, minutes=5 + 37 * j)
+            rows.append(_invocation(n, project_id, shape, pairs[n % len(pairs)], task_id, completed))
+    with closing(sqlite3.connect(ledger)) as conn, conn:
+        conn.executemany(
+            f'INSERT INTO invocations ({", ".join(_INVOCATION_COLUMNS)}) '
+            f'VALUES ({", ".join("?" * len(_INVOCATION_COLUMNS))})',
+            rows,
+        )
+
+
+def _account_event_details(kind: str, shape: CostShape, account: int, now: datetime) -> str:
+    if kind == 'failover':
+        return json.dumps({'from': shape.accounts[account - 1], 'to': shape.accounts[account]})
+    if kind == 'cap_hit':
+        return json.dumps({
+            'reason': text('fleet usage limit reached', shape.cap_reason_len),
+            'resets_at': (now + timedelta(hours=11 + account)).isoformat(),
+        })
+    return json.dumps({'label': f'fleet probe #{account} confirmed'})
+
+
+def seed_account_events(ledger: Path, project_id: str, shape: CostShape, *, offset: int, now: datetime) -> None:
+    """``account_events`` account events, four minutes apart, newest first; *offset* staggers ledgers.
+
+    Every third cap hit names no project, as an account-wide cap does.
+    """
+    _create_cost_tables(ledger)
+    rows = []
+    for k in range(shape.account_events):
+        kind = _ACCOUNT_EVENT_CYCLE[k % len(_ACCOUNT_EVENT_CYCLE)]
+        account = (k + offset) % len(shape.accounts)
+        account_wide = kind == 'cap_hit' and k % 3 == 0
+        rows.append((
+            shape.accounts[account], kind, None if account_wide else project_id, FLEET_RUN_ID,
+            _account_event_details(kind, shape, account, now),
+            (now - timedelta(minutes=4 * k, seconds=23 * offset)).isoformat(),
+        ))
+    with closing(sqlite3.connect(ledger)) as conn, conn:
+        conn.executemany(
+            'INSERT INTO account_events (account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            rows,
         )
