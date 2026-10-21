@@ -10,7 +10,7 @@ from typing import Any, cast
 import pytest
 
 from escalation.models import Escalation, EvidenceEntry
-from escalation.sha_citations import cited_shas, resolve_cited_shas
+from escalation.sha_citations import MAX_CITED_SHAS_RESOLVED, cited_shas, resolve_cited_shas
 
 SHA_A = 'a7ceed6597'
 SHA_B = '570dc88ad6'
@@ -88,15 +88,38 @@ class TestResolveCitedShas:
         })
         esc = _esc(detail=f'{SHA_A} {FULL} {SHA_B}')
 
-        assert await resolve_cited_shas(esc, resolver) == [
+        result = await resolve_cited_shas(esc, resolver)
+
+        assert result.resolved == (
             {'cited': SHA_A, 'landed': 'a' * 40, 'subject': 'feat: a', 'method': 'patch-id'},
             {'cited': SHA_B, 'landed': 'b' * 40, 'subject': 'feat: b', 'method': 'subject'},
-        ]
+        )
+        assert result.skipped == ()
 
     @pytest.mark.asyncio
     async def test_resolves_each_distinct_token_once(self):
         resolver = _StubResolver({})
         esc = _esc(summary=SHA_A, detail=f'{SHA_A} {SHA_B}', evidence=[{'observation': SHA_B}])
 
-        assert await resolve_cited_shas(esc, resolver) == []
+        assert (await resolve_cited_shas(esc, resolver)).resolved == ()
         assert resolver.calls == [SHA_A, SHA_B]
+
+    @pytest.mark.asyncio
+    async def test_looks_up_only_the_first_max_tokens_and_returns_the_rest_skipped(self):
+        tokens = [f'{n:07x}' for n in range(MAX_CITED_SHAS_RESOLVED + 2)]
+        resolver = _StubResolver({})
+
+        result = await resolve_cited_shas(_esc(detail=' '.join(tokens)), resolver)
+
+        assert resolver.calls == tokens[:MAX_CITED_SHAS_RESOLVED]
+        assert result.skipped == tuple(tokens[MAX_CITED_SHAS_RESOLVED:])
+
+    @pytest.mark.asyncio
+    async def test_exactly_max_tokens_skips_none(self):
+        tokens = [f'{n:07x}' for n in range(MAX_CITED_SHAS_RESOLVED)]
+        resolver = _StubResolver({})
+
+        result = await resolve_cited_shas(_esc(detail=' '.join(tokens)), resolver)
+
+        assert resolver.calls == tokens
+        assert result.skipped == ()
