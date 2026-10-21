@@ -21,6 +21,7 @@ import inspect
 import json
 import logging
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -408,6 +409,73 @@ class TestRecordMergeFlakeSuppression:
         # None-safe all the way through: the streak still advances (it is a
         # module-global, not a store), and nothing raised.
         assert flake_recorder._merge_flake_suppression_streak == 1
+
+
+@pytest.mark.asyncio
+class TestRecordFlakeObservation:
+    """The observation-level entry point every gate shares; the merge-gate
+    adapter above is a B13 None check in front of it."""
+
+    async def _observe(self, s: FlakeSuppression, project_root: Path, **kwargs) -> None:
+        await flake_recorder.record_flake_observation(
+            s,
+            project_root=project_root,
+            project_id=_PROJECT_ID,
+            merge_sha=_MERGE_SHA,
+            task_id=_TASK_ID,
+            **kwargs,
+        )
+
+    async def test_a_main_probe_suppression_records_all_four_side_effects(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.event_store import EventType
+
+        es, q = _FakeEventStore(), _FakeEscalationQueue()
+        s = replace(_suppression(), call_site=FlakeCallSite.main_probe, runner='local')
+
+        await self._observe(s, tmp_path, event_store=es, escalation_queue=q)
+
+        rows = _occurrences(tmp_path)
+        assert {r.test_id for r in rows} == set(_IDS)
+        assert {r.call_site for r in rows} == {'main_probe'}
+        assert {(r.merge_sha, r.task_id) for r in rows} == {(_MERGE_SHA, _TASK_ID)}
+        assert {d.test_id for d in _due(tmp_path)} == set(_IDS)
+        assert [e[0] for e in es.emits] == [EventType.merge_flake_suppressed]
+        assert flake_recorder._merge_flake_suppression_streak == 1
+
+    @pytest.mark.parametrize(
+        'verdict', [FlakeVerdict.fails_in_isolation, FlakeVerdict.unconfirmable],
+    )
+    async def test_a_non_suppressing_observation_records_the_row_only(
+        self, tmp_path: Path, verdict: FlakeVerdict,
+    ) -> None:
+        es, q = _FakeEventStore(), _FakeEscalationQueue()
+        s = replace(_suppression(verdict), call_site=FlakeCallSite.main_probe)
+
+        await self._observe(s, tmp_path, event_store=es, escalation_queue=q)
+
+        assert {r.verdict for r in _occurrences(tmp_path)} == {str(verdict)}
+        assert _due(tmp_path) == []
+        assert es.emits == []
+        assert flake_recorder._merge_flake_suppression_streak == 0
+
+    async def test_the_merge_gate_adapter_records_exactly_what_the_observation_does(
+        self, tmp_path: Path,
+    ) -> None:
+        via_adapter, direct = tmp_path / 'adapter', tmp_path / 'direct'
+        es_a, es_d = _FakeEventStore(), _FakeEventStore()
+        s = _suppression()
+
+        await _record(_result(s), via_adapter, event_store=es_a)
+        await self._observe(s, direct, event_store=es_d)
+
+        def _shape(root: Path) -> list[tuple[str, str, str]]:
+            return sorted((r.test_id, r.verdict, r.call_site) for r in _occurrences(root))
+
+        assert _shape(via_adapter) == _shape(direct) != []
+        assert [e[0] for e in es_a.emits] == [e[0] for e in es_d.emits]
+
 
 
 class TestSuppressionStormStreak:

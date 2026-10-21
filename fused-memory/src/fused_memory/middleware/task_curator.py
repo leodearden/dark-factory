@@ -13,7 +13,11 @@ anchor + module-lock pool + embedding neighbors + dependency neighbors). See
 docs/reify-task-fragmentation-report-2026-04-11.txt for the motivating analysis.
 
 The curator is best-effort: any failure (embedder, Qdrant, LLM, taskmaster) degrades
-to ``action="create"`` so task creation is never blocked.
+to ``action="create"`` so task creation is never blocked. The one exception is an
+account pool that cannot serve — every account capped past the cap-retry patience,
+or none admissible at call start: that yields ``action="defer"``
+(:meth:`CuratorDecision.deferred`) for each LLM-bound candidate, which the
+interceptor parks for a later attempt instead of creating anything un-deduped.
 
 A timed-out LLM call is classified from its own transcript when the curator is gated
 (task 3995): a pre-turn stall (0 assistant turns) degrades to create and files a ZOT
@@ -48,7 +52,6 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from shared.cli_invoke import (
     AgentResult,
-    AllAccountsCappedException,
     TranscriptEvidence,
     claude_binary_spec,
     invoke_with_cap_retry,
@@ -72,6 +75,12 @@ from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.mcp_tools.scheduler_state import effective_lock_depth
 from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.curation_deferral import (
+    POOL_UNAVAILABLE_ERRORS,
+    DeferReason,
+    deferral_justification,
+    pool_defer_reason,
+)
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_dependencies
 
@@ -166,8 +175,9 @@ def exception_summary(exc: BaseException) -> str:
 # operator-curated YAML registry; the model must never be able to emit either.
 # 'refuse' in particular means "this candidate's premise is dead — create
 # NOTHING", which is deliberately distinct from 'drop' ("fold into existing
-# target task N", which requires a target).
-Action = Literal['drop', 'combine', 'create', 'route_deterministic', 'refuse']
+# target task N", which requires a target). 'defer' — "the pool could not serve,
+# judge this again later" — is built only by CuratorDecision.deferred.
+Action = Literal['drop', 'combine', 'create', 'route_deterministic', 'refuse', 'defer']
 
 _STATUS_RANK = {
     'pending': 0,
@@ -182,13 +192,11 @@ DEFAULT_PRIORITY = 'medium'  # canonical fallback used by both record_task and b
 if DEFAULT_PRIORITY not in _PRIORITY_RANK:
     raise ValueError(f'{DEFAULT_PRIORITY!r} not in _PRIORITY_RANK')
 
-# The curator is best-effort middleware: any AllAccountsCappedException triggers a
-# graceful-degradation handler (curate() → action='create', curate_batch() → re-raise
-# so the worker defers the whole batch via UsageGate.wait_for_open).  The shared
-# default of 14 days would silently convert that into a 14-day block on this
-# best-effort path — a real behavioural regression — so we override with a short
-# minutes-scale bound that preserves the fast-fail/defer contract.
-_CURATOR_CAP_WAIT_SANITY_SECS = 120.0  # 2 minutes; override for shared 14-day default
+# Expiry of this bound raises AllAccountsCappedException, which the curator turns
+# into a defer decision for every LLM-bound candidate, so the ticket is parked and
+# retried later. The shared default of 14 days would instead hold the ticket worker
+# for up to 14 days, so a minutes-scale bound keeps the defer fast.
+_CURATOR_CAP_WAIT_SANITY_SECS = 120.0
 
 # Stem of a gated curator's per-process CLAUDE_CONFIG_DIR. The dead-PID sweep
 # builds its prefix from the same constant, so the two cannot drift apart.
@@ -451,6 +459,30 @@ class CuratorDecision:
     # zero-output hang; never derived from ``justification``, which is shared.
     degraded_by_zot: bool = False
     zot_escalation_id: str | None = None
+    defer_reason: DeferReason | None = None
+
+    def __post_init__(self) -> None:
+        if (self.action == 'defer') != (self.defer_reason is not None):
+            raise ValueError(
+                "CuratorDecision.defer_reason must be set iff action == 'defer', got "
+                f'action={self.action!r} defer_reason={self.defer_reason!r}'
+            )
+
+    @classmethod
+    def deferred(
+        cls,
+        reason: DeferReason,
+        *,
+        pool_sizes: dict[str, int] | None = None,
+        latency_ms: int = 0,
+    ) -> CuratorDecision:
+        return cls(
+            action='defer',
+            defer_reason=reason,
+            justification=deferral_justification(reason),
+            pool_sizes=dict(pool_sizes or {}),
+            latency_ms=latency_ms,
+        )
 
     def to_log_fields(self) -> dict[str, Any]:
         return {
@@ -461,6 +493,7 @@ class CuratorDecision:
             'pool_sizes': self.pool_sizes,
             'latency_ms': self.latency_ms,
             'cost_usd': self.cost_usd,
+            'defer_reason': self.defer_reason,
         }
 
 
@@ -1787,7 +1820,8 @@ class TaskCurator:
         """Render a drop/combine/create decision for a candidate task.
 
         Best-effort: any internal failure returns a ``create`` decision with the
-        failure reason in ``justification``. Never raises.
+        failure reason in ``justification``, except an account pool that cannot
+        serve, which returns :meth:`CuratorDecision.deferred`. Never raises.
 
         *prepared* hands over a corpus the caller already assembled, so it is
         not assembled twice.  :meth:`curate_batch_prepared`'s size-1
@@ -1928,27 +1962,15 @@ class TaskCurator:
                 )
             else:
                 self._reset_degraded_streak(project_id)
-        except AllAccountsCappedException as exc:
-            logger.warning(
-                'task_curator: all accounts capped (%d retries in %.1fs) — deferring to create',
-                exc.retries, exc.elapsed_secs,
-            )
-            if self._escalator is not None:
-                await self._escalator.report_failure(
-                    project_root=project_root,
-                    project_id=project_id,
-                    justification=f'all-accounts-capped: {exc}',
-                    candidate_title=candidate.title,
-                    timed_out=False,
-                    duration_ms=int(exc.elapsed_secs * 1000),
-                )
-            decision = await self._degraded_create(
-                justification='all-accounts-capped',
+        except POOL_UNAVAILABLE_ERRORS as exc:
+            decision = CuratorDecision.deferred(
+                pool_defer_reason(exc),
                 pool_sizes=pool_sizes,
-                start=start,
-                candidate=candidate,
-                project_id=project_id,
-                project_root=project_root,
+                latency_ms=int((time.monotonic() - start) * 1000),
+            )
+            logger.warning(
+                'task_curator: account pool unavailable for %r — deferring: %s',
+                candidate.title, exc,
             )
         except CuratorFailureError as exc:
             zot_escalation_id: str | None = None
@@ -2378,11 +2400,6 @@ class TaskCurator:
                     to_llm_candidates, pools, pool_sizes_list, start,
                     project_id, project_root, withheld_list=withheld_list,
                 )
-            except AllAccountsCappedException:
-                # Cap exhaustion bubbles up so the caller (worker) can defer
-                # the whole batch instead of N×size-1 amplification of the
-                # cap-retry storm.
-                raise
             except Exception as exc:
                 # CancelledError (BaseException) is not caught here.  Anything
                 # else that escaped the bisect helper is unexpected — log and
@@ -2816,6 +2833,8 @@ class TaskCurator:
         return decision
 
     def _store_cache(self, payload_hash: str, decision: CuratorDecision) -> None:
+        if decision.action == 'defer':
+            return
         self._decision_cache[payload_hash] = (decision, time.monotonic())
 
     # ------------------------------------------------------------------
@@ -3286,6 +3305,7 @@ class TaskCurator:
             permission_mode='bypassPermissions',
             timeout_seconds=self._config.curator.timeout_seconds,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
+            park_on_frozen_pool=False,
             **self._ledger_kwargs('task_curator'),
             **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
@@ -3393,6 +3413,7 @@ class TaskCurator:
             permission_mode='bypassPermissions',
             timeout_seconds=timeout,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
+            park_on_frozen_pool=False,
             **self._ledger_kwargs('task_curator_batch'),
             **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
@@ -3480,6 +3501,9 @@ class TaskCurator:
     ) -> list[CuratorDecision]:
         """Try one batched LLM call; on :exc:`CuratorFailureError` bisect and retry each half.
 
+        Never raises a pool-unavailable error: an account pool that cannot
+        serve yields one :meth:`CuratorDecision.deferred` per candidate.
+
         Decisions returned to the caller are in **input-local space** for this
         invocation (positions 0..N-1 of the *candidates* arg).  The bisect
         remaps right-half ``batch_target_index`` values by ``+mid`` before
@@ -3488,8 +3512,9 @@ class TaskCurator:
 
         Failure-type branching:
 
-        * :exc:`AllAccountsCappedException` — re-raised (the caller defers
-          the whole batch instead of repeating the cap-retry storm N times).
+        * ``POOL_UNAVAILABLE_ERRORS`` — every candidate deferred, without
+          bisecting: smaller batches cannot cure a pool that cannot serve, and
+          each half would repeat the cap-retry wait.
         * :exc:`CuratorFailureError` — bisects.  Both recognised subtypes
           (``error_max_budget_usd``, ``error_empty_output``,
           ``error_max_turns``, …) and unknown subtypes shrink with smaller
@@ -3514,8 +3539,18 @@ class TaskCurator:
                 candidates, pools, pool_sizes_list, start,
                 project_id, project_root, withheld_list=censuses,
             )
-        except AllAccountsCappedException:
-            raise
+        except POOL_UNAVAILABLE_ERRORS as exc:
+            logger.warning(
+                'curate_batch: account pool unavailable for a size-%d batch — '
+                'deferring every candidate: %s',
+                n, exc,
+            )
+            latency_ms = int((time.monotonic() - start) * 1000)
+            reason = pool_defer_reason(exc)
+            return [
+                CuratorDecision.deferred(reason, pool_sizes=sizes, latency_ms=latency_ms)
+                for sizes in pool_sizes_list
+            ]
         except CuratorFailureError as exc:
             mid = n // 2
             logger.warning(

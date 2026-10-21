@@ -526,6 +526,26 @@ class ReconLedgerStore:
         )
         return [_record_from_row(row) for row in rows]
 
+    async def list_by_flag_type(
+        self, project_id: str, record_kind: str, flag_type: str, *, task_id: str = ''
+    ) -> list[ReconLedgerRecord]:
+        """Return every row of one ``(project, kind, task_id, flag_type)``.
+
+        Spans every ``run_id`` and every state; ordered by ``created_at`` then
+        ``run_id``. Served by the primary-key prefix. Returns raw records, as
+        :meth:`list_by_kind` does, and likewise does not filter on
+        ``expires_at``.
+        """
+        rows = await self._require_access().read_all(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = ? AND task_id = ? AND flag_type = ?
+            ORDER BY created_at, run_id
+            """,
+            (project_id, record_kind, task_id, flag_type),
+        )
+        return [_record_from_row(row) for row in rows]
+
     async def list_suppressions(self, project_id: str) -> list[ReconLedgerRecord]:
         """Return the active ``stage1_flag_suppression`` rows for a project."""
         return await self.list_by_kind(project_id, 'stage1_flag_suppression', 'active')

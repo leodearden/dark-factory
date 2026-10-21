@@ -24,7 +24,12 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from _filing_tools import call_blocker as _blocker
 from _filing_tools import call_info as _info
-from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
+from _merge_tool_calls import (
+    call_get_merge_queue,
+    call_merge_cancel,
+    call_merge_request,
+    call_merge_status,
+)
 from shared.merge_state import EPISTEMIC_STATES, MergeReason
 
 from escalation.dedupe import DedupeConfig
@@ -3796,6 +3801,115 @@ class TestBoundary9CancelRetire:
         with contextlib.suppress(asyncio.QueueEmpty):
             while True:
                 mq.get_nowait().result.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Task 3860 — a decided request reads the same on every merge surface
+# ---------------------------------------------------------------------------
+
+
+def _server_over_a_real_lane(tmp_path: Path) -> tuple:
+    """A merge server whose harness holds a REAL, never-run lane on its queue.
+
+    Not running the lane keeps every submitted request in the queue, which
+    is exactly where a request decided before the merger reaches it waits.
+
+    Returns (server, mq, event_store).
+    """
+    from orchestrator.config import GitConfig
+    from orchestrator.event_store import EventStore
+    from orchestrator.git_ops import GitOps
+    from orchestrator.merge_lane import MergeLane
+
+    store = EventStore(db_path=tmp_path / 'agree.db', run_id='agree')
+    server, mq, _reg, _, harness = _build_merge_server(tmp_path, event_store=store)
+    harness._merge_worker = MergeLane(
+        git_ops=GitOps(GitConfig(), tmp_path / 'repo'), queue=mq,
+    )
+    return server, mq, store
+
+
+def _listed(queue_view: dict[str, Any], request_id: str) -> list[dict[str, Any]]:
+    return [e for e in queue_view.get('entries', []) if e.get('request_id') == request_id]
+
+
+@pytest.mark.asyncio
+class TestDecidedRequestSurfacesAgree:
+    """``get_merge_queue``, ``merge_status`` and ``merge_cancel`` agree that a
+    request decided while still queued is finalized, never queued.
+
+    The lane's own snapshot is what all three read, so the agreement is
+    exercised end to end through a real lane rather than a scripted one.
+    """
+
+    async def test_waiterless_request_resolved_while_queued_is_finalized_everywhere(
+        self, tmp_path: Path,
+    ) -> None:
+        """The bounce-corpse verdict: a workflow-path or recovered request,
+        with no waiter on this server, resolved ``blocked`` before dispatch."""
+        from orchestrator.merge_lane import (
+            MergeOutcome,
+            MergeRequest,
+            QueuedBranch,
+            enqueue_merge_request,
+        )
+
+        server, mq, store = _server_over_a_real_lane(tmp_path)
+        req = MergeRequest(
+            task_id='A',
+            branch=QueuedBranch.parse('A', 'task/'),
+            worktree=tmp_path / 'wt-A',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=_make_orch_config(tmp_path / 'repo'),
+            result=asyncio.get_running_loop().create_future(),
+        )
+        rid = req.request_id
+        await enqueue_merge_request(mq, req, store)
+        req.result.set_result(MergeOutcome('blocked', reason='needs_rebase: decided'))
+        await asyncio.sleep(0)
+
+        status = await call_merge_status(server, request_id=rid)
+        queue_view = await call_get_merge_queue(server)
+        cancel = await call_merge_cancel(server, request_id=rid)
+
+        assert status.get('state') != 'queued' or 'position' not in status, (
+            'RECURRENCE-4: merge_status reports a queue position for a request the '
+            f'event store already holds as finalized: {status}'
+        )
+        assert _listed(queue_view, rid) == [], f'a finalized request is listed: {queue_view}'
+        assert queue_view['depth'] == 0, f'depth counts a finalized request: {queue_view}'
+        assert status['state'] == 'blocked', f'{status}'
+        assert status['source'] == 'event_store', f'{status}'
+        assert 'position' not in status, f'{status}'
+        assert cancel == {
+            'cancelled': False,
+            'state': 'blocked',
+            'reason': 'Request already finalized; cannot cancel.',
+        }, f'{cancel}'
+
+    async def test_cancelled_request_is_abandoned_everywhere(self, tmp_path: Path) -> None:
+        server, _mq, _store = _server_over_a_real_lane(tmp_path)
+
+        submitted = await call_merge_request(
+            server, task_id='C', branch='C', worktree=str(tmp_path / 'wt-C'), wait_secs=0,
+        )
+        assert submitted['status'] == 'queued', f'{submitted}'
+        rid = submitted['request_id']
+        cancel = await call_merge_cancel(server, request_id=rid)
+        assert cancel.get('cancelled') is True, f'{cancel}'
+        assert cancel.get('state') == 'abandoned', f'{cancel}'
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        queue_view = await call_get_merge_queue(server)
+        status = await call_merge_status(server, request_id=rid)
+
+        assert _listed(queue_view, rid) == [], f'a cancelled request is listed: {queue_view}'
+        assert queue_view['depth'] == 0, f'depth counts a cancelled request: {queue_view}'
+        assert status['state'] == 'abandoned', f'{status}'
+        assert 'position' not in status, f'{status}'
 
 
 # ---------------------------------------------------------------------------

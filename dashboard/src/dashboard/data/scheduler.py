@@ -85,7 +85,7 @@ from shared.scheduler_state import (
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import collect_tasks_with_counts
-from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success, project_label
+from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.task_snapshot import SnapshotHealth, classify
 from dashboard.data.utils import resolve_now
@@ -696,12 +696,12 @@ async def collect_scheduler_state(
                           ``rows`` and ``modules``: with no task rows, no
                           owner's liveness is known.
 
-    Snapshot data is joined to its root by position, so two roots sharing a
-    basename keep their own pin queue, park stacks and ``project_root``; the
-    label-keyed outputs (task rows, sparkline and recovery keys, module
-    contention) still collapse them.
+    Snapshot data is joined to its root by position. Every label-keyed output
+    is keyed by labels unique across the configured roots
+    (``dashboard/project_labels.py::ProjectLabels``).
     """
     effective_now = resolve_now(now)
+    labels = config.project_labels
     since = effective_now - timedelta(hours=1)
 
     # Fetch active tasks (for lock sets and titles).
@@ -717,7 +717,7 @@ async def collect_scheduler_state(
     # Determine which project roots still need querying
     roots_to_query = [
         root for root in config.all_project_roots
-        if project_label(root) not in offline_projects
+        if labels.of(root) not in offline_projects
     ]
 
     async def _one_project(root) -> tuple[SchedulerStateSnapshot | None, list[dict], list[dict]]:
@@ -751,7 +751,7 @@ async def collect_scheduler_state(
         *online-but-empty* so a legitimately quiescent project is never
         misclassified as offline.
         """
-        label = project_label(root)
+        label = labels.of(root)
 
         async def _fetch_events(
             url: str, event_types: list[str], limit: int, kind: str,
@@ -817,11 +817,7 @@ async def collect_scheduler_state(
         snapshot, skip_events, recovery_events = await first_success(
             config.fused_memory_urls,
             _call,
-            # String-identical to the former f'get_scheduler_state[{label}]' —
-            # fanout_label's basename form IS project_label's. Routed through
-            # the helper so all four fan-out sites share one definition of the
-            # per-project-root throttle-key convention (see its docstring).
-            log_label=fanout_label('get_scheduler_state', root),
+            log_label=fanout_label('get_scheduler_state', root, labels),
             offline_result=lambda errs: (None, [], []),
         )
         return snapshot, skip_events, recovery_events
@@ -846,7 +842,7 @@ async def collect_scheduler_state(
     # present-with-[] means "read succeeded, no sweeps", absent means offline.
     all_recovery_events: dict[str, list[dict]] = {}
 
-    # Paired by position: two roots may share a basename.
+    # Paired by position: the root, not its label, is each result's identity.
     for root, result in zip(roots_to_query, per_project_results, strict=True):
         if isinstance(result, BaseException):
             logger.warning(
@@ -854,7 +850,7 @@ async def collect_scheduler_state(
             )
             continue
         snapshot, skip_events, recovery_events = result
-        label = project_label(root)
+        label = labels.of(root)
 
         # None snapshot means every URL failed (offline); an empty one means
         # online-but-empty.
@@ -878,7 +874,7 @@ async def collect_scheduler_state(
             uid = task.get('id') or ''
             # uid format: 'project/T-NNN' → raw_id = 'NNN'
             try:
-                raw_id = uid.split('/T-', 1)[1]
+                raw_id = uid.rsplit('/T-', 1)[1]
             except (IndexError, AttributeError):
                 raw_id = uid
             enriched.append({

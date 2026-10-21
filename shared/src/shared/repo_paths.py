@@ -1,4 +1,8 @@
-"""repo_paths — resolve the dark-factory *tooling* checkout the orchestrator runs from.
+"""repo_paths — resolve the dark-factory *tooling* checkout this process's code runs from.
+
+Consumers: the orchestrator harness (the watcher's ``DARK_FACTORY_ROOT``
+export) and ``before_done.script_root='factory'`` (the fused-memory submit guard
+and the orchestrator's deterministic runner).
 
 Task 3605 (census 2026-08-02 §1.3; codebook ``entry-cand-20260722-3``).  A
 watcher rotation dispatched for a cross-project target (e.g. reify) is told by
@@ -14,7 +18,7 @@ module answers the question those sessions could not: *which checkout carries
 
 The answer is deliberately NOT ``OrchestratorConfig.project_root``.  That is the
 TARGET project being worked on; this is the dark-factory checkout whose code the
-orchestrator process is itself executing.  For a cross-project target the two are
+process is itself executing.  For a cross-project target the two are
 different repositories, and conflating them is the bug.
 """
 
@@ -57,24 +61,21 @@ def _validates(root: Path) -> bool:
 def _ascend_for_rearm_marker(start: Path | None = None) -> Path | None:
     """First ancestor of *start* that VALIDATES, or ``None``.
 
-    *start* defaults to this module's own file, so the running orchestrator
+    *start* defaults to this module's own file, so the running process
     resolves the checkout whose code it is itself executing — the same
     ``__file__``-anchored trick as
     `orchestrator.agents.skill_prompt.load_skill_system_prompt` and
-    `orchestrator.verify_runner.resolve_local_df_checkout`.
+    `orchestrator.deployed_sha.resolve_code_checkout`.
 
     The walk is keyed on ``_REARM_MARKER``, NOT on ``.git``, and that difference
-    is the point.  ``resolve_local_df_checkout`` answers "which is the first
+    is the point.  ``resolve_code_checkout`` answers "which is the first
     ancestor containing ``.git``" — a different question, and one whose answer
     can be wrong here in both directions: it terminates at the FIRST ``.git``
     ancestor, so a dark-factory checkout nested under an outer git repo (vendored
     tree, a repo-of-repos, an editable install under a parent workspace) resolves
     to that outer repo and the walk gives up, even though a valid tooling root
     sits right above it.  Ascending for the marker itself walks PAST any ancestor
-    that cannot serve a re-arm and keeps looking.  It also keeps this ~140-line
-    path utility from importing the 3k-line ``verify_runner`` (and, transitively,
-    the whole verify/RemoteRunner/sccache stack) for a ten-line ancestor walk —
-    a layering inversion, since repo_paths is the lower-level module.
+    that cannot serve a re-arm and keeps looking.
 
     Because every returned root has already passed `_validates`, callers may
     trust the result without re-checking the marker.
@@ -126,7 +127,7 @@ def rejected_dark_factory_root_override() -> str | None:
 
 
 def resolve_dark_factory_root() -> Path | None:
-    """The dark-factory tooling checkout this orchestrator is running from.
+    """The dark-factory tooling checkout this process is running from.
 
     Returns the checkout carrying ``scripts/watcher-rearm.sh`` — the value to
     export as ``DARK_FACTORY_ROOT`` into a spawned watcher rotation — or
@@ -149,7 +150,7 @@ def resolve_dark_factory_root() -> Path | None:
       2. Otherwise `_ascend_for_rearm_marker`'s ``__file__``-anchored walk for
          the first ancestor carrying the marker.  See that function for why the
          walk is keyed on the marker rather than reusing
-         `orchestrator.verify_runner.resolve_local_df_checkout`'s ``.git`` walk.
+         `orchestrator.deployed_sha.resolve_code_checkout`'s ``.git`` walk.
       3. Otherwise ``None``.
 
     A set-but-INVALID override is warned about and falls THROUGH to arm 2 rather

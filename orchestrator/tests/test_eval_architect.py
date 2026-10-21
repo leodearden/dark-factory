@@ -4161,11 +4161,9 @@ class TestArchitectEvalCapPatience:
         # default a per-task implementer legitimately inherits.
         #
         # The floor was 1800 s until 2026-08-25 (esc-3634-1), when it was raised
-        # to 48 h. A short bound never bought what it claimed: a fully-capped
-        # pool parks in the gate's own unbounded `_open.wait()` whatever this
-        # value is, so the bound only chose how many in-flight cells were
-        # tainted first — and tainting throws away mid-cell spend that
-        # `--resume` would otherwise carry across the account switch. The floor
+        # to 48 h: tainting throws away mid-cell spend that `--resume` would
+        # otherwise carry across the account switch. Since task 4002 this
+        # value also bounds the gate's park on a fully-capped pool. The floor
         # asserted here is the 5-hour account cap the bound must be able to
         # skate, with margin; the ceiling is still the 14-day default.
         assert runner._EVAL_CAP_WAIT_SANITY_SECS >= 6 * 3600

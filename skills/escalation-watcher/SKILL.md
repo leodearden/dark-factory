@@ -277,6 +277,16 @@ After `lease-claim` returns `acquired` or `proceed`, and before the first brief:
    does not mention: is it new since, or missed? Pins and HOLDs go into the sitting as `standing`
    records with their release predicates (see "Investigate before you `record`"). Traps stay in
    mind for the session and carry into your own handover while they still hold.
+
+   A **handed-off B3 merge** in the In flight section (`{task_id, escalation_id, request_id,
+   worktree}`) has no live owner: any resume-mode run polling it ended with the predecessor. If
+   `get_escalation(escalation_id)` still shows the escalation `pending`, launch
+   `unblock-low-risk` in resume mode for it once, exactly as the `handed_off` bullet of B3
+   "Completion handling" does, and track the `task_id` as in flight from then on. This launch
+   replaces a resume the stop cut off; it is not a second resume. Do not run `b3_gate check` or
+   `record-launch` first: `check` reports `already_attempted` for this task, and skipping on that
+   verdict would leave a live merge unwatched. If the escalation is no longer pending, whoever
+   took it owns the merge: launch nothing, and never `merge_cancel` it.
 4. Open the first brief, posted unprompted at launch (see "When it runs"), with the reconciliation:
    what carried forward, what the handover missed, and each correction where live state refutes
    it.
@@ -303,7 +313,10 @@ Four steps, in this order:
    Note every background sub-agent, spawned session and merge request still in flight; they go
    into the handover's in-flight section. A B3 `unblock-low-risk` sub-agent cut off by the stop is
    not relaunched by a successor: its `record-launch` marker makes `check` report
-   `already_attempted`.
+   `already_attempted`. A handed-off B3 merge whose resume has not yet returned is different:
+   record its `{task_id, escalation_id, request_id, worktree}` in the In flight section, whether
+   or not a resume-mode run was still polling at the stop. Step 3 of "Reading the predecessor's
+   handover at launch" says what the successor does with it.
 2. **Write the handover** (see "The handover file (`l2-handover.md`)"). It goes before the release,
    so a successor that claims the freed lease finds it complete.
 3. **Release the lease** with the `lease-release` verb under "Heartbeat + release" in "Claiming the
@@ -1104,18 +1117,21 @@ switches on and off. Three behavioural shifts:
        (`escalation/src/escalation/pins.py::classify_pins`; intended, Leo 2026-10-09). The sweep
        re-pends a parked task within a tick, as with esc-5708-3, reify esc-7881-5 and
        esc-4681-3 (16 s). Leave the escalation pending and **defer** the task:
-       1. `update_task(id, metadata={'x_deferral': {'escalation_id': '<esc-id>', 'until_condition':
-          'Leo rules <esc-id>', 'reason': '<one line>'}}, metadata_mode='merge')`;
-       2. `set_task_status(id, status='deferred')`;
-       3. confirm both with `get_task` about 30 s later.
+       1. `set_task_status(id, status='deferred', deferral={'kind': 'until_condition',
+          'condition': 'Leo rules <esc-id>', 'reason': '<one line>'})`, and confirm the response
+          echoes `deferral`. No echo means the fused-memory server predates the deferral gate
+          and the hold is unrecorded: fall back to `update_task(id, metadata={'x_deferral':
+          {'escalation_id': '<esc-id>', 'until_condition': 'Leo rules <esc-id>', 'reason':
+          '<one line>'}}, metadata_mode='merge')`, which the deferral migration maps, and
+          re-stamp with the call above after fused-memory restarts;
+       2. confirm with `get_task` about 30 s later that the task is `deferred` with its record.
 
        A deferral keeps a not-yet-running task out of dispatch. It does not stop a live run, and
        an info filer was told to keep driving, so leave an `in-progress` task alone (leave
        pending + digest). When the ruling lands, carry it out, then re-pend the task with
-       `set_task_status(id, status='pending')` unless the ruling says otherwise, and set
-       `x_deferral` to null. Once the deferral-record gate is live (task 6525), the record goes
-       in `set_task_status(..., deferral=...)` instead. Task 6579 makes it the typed
-       `until_escalation` kind. And
+       `set_task_status(id, status='pending')` unless the ruling says otherwise; that removes the
+       record. Task 6579 makes this hold the typed `until_escalation` kind. Recipe:
+       `docs/task-authoring.md` §9 "Deferring a task". And
    - File a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit
      Registry" below) — IN ADDITION to the follow-up task, so the parked decision surfaces in the
      cockpit decision queue.
@@ -1259,6 +1275,8 @@ serializes concurrent and restart races. Stash `{task_id, escalation_id, backgro
 your context. The escalation stays `pending` until the background sub-agent resolves it, so the
 *next* drain WILL re-find it — before the gate check for any task, check your context: if that
 `task_id` already has an in-flight or this-cycle-completed unblock-low-risk sub-agent, skip it.
+A task whose B3 run returned `handed_off` counts as in flight while its resume-mode run is
+outstanding.
 The durable rolling-24h merge cap is enforced by `b3_gate charge` inside the unblock-low-risk
 sub-agent immediately before its merge-submit — a charge refusal causes the sub-agent to ABORT.
 The watcher consults only `check`'s `cap_remaining` to skip launches that charge would refuse.
@@ -1318,7 +1336,28 @@ launch by `task_id` / background-task-id):
   mode; it waits for the human. If the abort reason indicates drift/staleness and the one-shot has
   not been used this cycle, route through the drift path once. Also file a DecisionRecord via
   `write-decision` carrying the abort reason as `--text` (see "Filing Parked Decisions to the
-  Cockpit Registry" below).
+  Cockpit Registry" below). A **resume-mode** `aborted` (see `handed_off` below) differs in two
+  ways. It never takes the drift path: the re-gate ends in `record-launch`, which can only report
+  `already_attempted` for this task. And when its reason is that the escalation is no longer
+  pending, write only the digest line and file no DecisionRecord: whoever took the escalation
+  owns it, and the merge carries on.
+- `outcome == "handed_off"`: neither a failure nor an abort. The merge `request_id` it returns
+  was picked up by the merge worker and is still live (merging or verifying); the sub-agent did
+  not cancel it, did not change the task status, and left the escalation pending. **Never
+  `merge_cancel` it**, and never submit another merge for that `task_id`: it is an in-flight
+  merge, so record its `{task_id, escalation_id, request_id}` per "Tracking in-flight merges". Launch
+  `unblock-low-risk` again as a NON-INTERACTIVE background sub-agent in **resume mode**, exactly
+  as B3 is launched above (`Agent` tool, general-purpose, `run_in_background: true`), pointing it
+  at the "Resuming a handed-off merge (resume mode)" subsection of
+  `skills/unblock-low-risk/SKILL.md` and passing `task_id`, `escalation_id`, `project_root`,
+  `worktree` and `request_id`. Do **not** run `b3_gate check` or `record-launch` for it: the slot
+  is already charged, and `check` would report `already_attempted`. Keep the `task_id` in flight
+  until that run completes; its completion is handled by this same list. **Resume once per B3
+  launch:** if a resume-mode run itself returns `handed_off` (its 3 h backstop expired with the
+  merge still live), do not resume again — leave the escalation pending, write the digest line,
+  and file a DecisionRecord via `write-decision` whose `--text` names the `request_id` and its
+  last state. Still never cancel. A resume-mode `merged` is handled by the `merged` bullet, and a
+  resume-mode `aborted` by the `aborted` bullet, including its resume-mode exceptions.
 
 The sub-agent re-checks the gate defensively and refuses anything not unambiguously low-risk; treat
 its abort as authoritative.
@@ -1340,12 +1379,16 @@ mode; AFK shift 3 manages it):
 - **Aborted**: `B3 <task_id> — aborted: <reason>`
 - **Drift-reinvestigated, second drift**: `B3 <task_id> — drift re-investigated; re-gate: drift-again → pending`
 - **Drift-reinvestigated, relaunched**: `B3 <task_id> — drift re-investigated; re-gate: fresh → launched`
+- **Handed off**: `B3 <task_id> — handed off: <request_id> still <state> at the polling ceiling → resume launched`
+- **Resume backstop**: `B3 <task_id> — resume backstop: <request_id> still <state> → pending (not cancelled)`
 
 `afk-digest.md` is **retained** (Fleet Cockpit C8) — it is not removed in this batch, but it is
 demoted to a generated history view: `data/return-brief.md`, the 05:30 return brief, is the
 primary pull-on-return surface that supersedes it, and it reads the cockpit decision queue (C5b),
 fed by `write-decision` (see "Filing Parked Decisions to the Cockpit Registry" above), for any of
-the above that left a decision open (i.e. every outcome except "Merged").
+the above that left a decision open (i.e. every outcome except "Merged", a first "Handed off",
+whose resume is still running, and a resume-mode "Aborted" on an escalation someone else already
+took).
 
 **When a line is derived from a triage ack.** If a digest line above, or a `write-decision --text`
 registry entry (see "Filing Parked Decisions to the Cockpit Registry" above), draws on an existing
@@ -2062,6 +2105,11 @@ Technical debt or cleanup discovered during development.
       # Record resolve["reason"] in the escalation resolution note.
       # Do NOT retry and do NOT record a task id.
       note_refused(resolve["reason"])
+  elif resolve["status"] == "awaiting_curation":
+      # Deliberately NOT in the tuple above: the ticket is parked with no
+      # task_id yet. Do NOT re-submit. Resolve the escalation with
+      # "queued for curation (ticket <ticket>)".
+      note_parked(ticket)
   elif resolve["status"] == "failed":
       # Record reason in escalation resolution note; skip this item.
       # See skills/_shared/ticket-failure-handling.md for the retryable/terminal reason matrix.
@@ -2226,7 +2274,9 @@ low anyway, stop (see "Stopping"): the handover carries forward what the next se
   only a compact verdict + recommended action — not the raw material
 - The low-risk auto-unblock sub-agent (`unblock-low-risk`) — run it in the **background**
   (`run_in_background: true`) so its full apply→verify→submit→poll cycle stays in its own context,
-  keeping the watch loop lean and responsive; it returns only a small JSON result when it completes
+  keeping the watch loop lean and responsive; it returns only a small JSON result when it completes.
+  After a `handed_off`, that cycle includes its resume-mode poll, also in the background, so the
+  watch loop never polls a B3 merge at top level
 - ANY other merge submission (e.g. retrying the land of a done-but-unmerged task) — submit
   top-level using the bounded submit→poll protocol; see "Merge Submissions — Bounded Submit, Then Poll"
 - Creating follow-up tasks (once you've decided what to create, have a sub-agent do the MCP calls)

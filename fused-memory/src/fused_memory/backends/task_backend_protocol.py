@@ -293,6 +293,13 @@ class TaskBackendProtocol(Protocol):
         and JSON value match the stored row exactly, and refuse a payload
         carrying the key when the stored blob does not parse.
 
+        **Implementations MUST reject a metadata payload that is not a JSON
+        object** (unparseable text, or JSON that decodes to an array, null,
+        string, number or boolean) in every ``metadata_mode``, by raising (e.g.
+        ``MetadataNotAnObjectError``), before the row lookup.  Such a payload
+        has no keys to merge; treating it as a last-write-wins replacement
+        wiped the whole stored blob, ``done_provenance`` included (task 6130).
+
         The ``status`` param is kept in the signature as a **reject-trap**: it
         preserves the ``status=None`` passthrough that ``server/tools.py`` and
         ``task_interceptor.py`` forward via ``**kwargs``, and it makes the

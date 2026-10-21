@@ -317,6 +317,37 @@ class TestClassifyFailureKnownRows:
         assert disp.escalate_to_human is True
         assert disp.category is FailureCategory.NONE
 
+    def test_recut_ruling_violation_blocks_and_escalates_to_human(self):
+        from datetime import UTC, datetime
+
+        from orchestrator.recut_ruling import RecutRuling, RecutRulingViolation
+        from orchestrator.unblock_types import BlockClass
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        ruling = RecutRuling('esc-2896-3/D11-A', datetime(2026, 8, 30, tzinfo=UTC))
+        exc = RecutRulingViolation(ruling, ('branch task/2896 exists',))
+        disp = classify_failure(exc)
+        assert disp.requeue_kind is RequeueKind.BLOCK
+        assert disp.escalate_to_human is True
+        assert disp.counts_against_requeue_cap is True
+        assert disp.block_class is BlockClass.AGENT_FAILURE
+        assert disp.category is FailureCategory.NONE
+        assert disp.reason_prefix == 'Re-cut ruling refused provisioning'
+
+    def test_unreadable_recut_ruling_blocks_and_escalates_to_human(self):
+        from orchestrator.recut_ruling import RecutRulingUnreadable
+        from orchestrator.unblock_types import BlockClass
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        exc = RecutRulingUnreadable('task 2896: ruled_at is not an ISO timestamp')
+        disp = classify_failure(exc)
+        assert disp.requeue_kind is RequeueKind.BLOCK
+        assert disp.escalate_to_human is True
+        assert disp.counts_against_requeue_cap is True
+        assert disp.block_class is BlockClass.AGENT_FAILURE
+        assert disp.category is FailureCategory.NONE
+        assert disp.reason_prefix == 'Re-cut ruling unreadable'
+
     def test_bare_exception_blocks_non_escalating_agent_failure(self):
         from orchestrator.unblock_types import BlockClass
         from orchestrator.verify_categories import FailureCategory

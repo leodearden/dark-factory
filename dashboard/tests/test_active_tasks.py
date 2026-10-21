@@ -619,7 +619,7 @@ async def test_no_task_row_carries_description_or_details(tmp_path, monkeypatch,
 
     active, snapshots = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     terminal = shape_terminal_rows(
-        root,
+        'prose',
         [task for task in shaped if task['status'] in ('done', 'cancelled')],
         now=datetime.now(UTC),
     )
@@ -3102,9 +3102,8 @@ class TestCollectTasksWithCountsConcurrency:
     ):
         """(g) Per-root results are paired by ROOT, never by display label.
 
-        ``_project_label`` is the directory BASENAME, so two configured roots
-        can share one (``/a/proj`` and ``/b/proj``). Keying the gathered
-        results by label collapses them: the survivor's rows are extended into
+        Two configured roots can share a directory basename (``/a/proj`` and
+        ``/b/proj``). Keying the gathered results by basename collapses them: the survivor's rows are extended into
         ``all_active`` TWICE — duplicate ``task_uid``s, which the React tab
         uses as its map key — and the other root's rows vanish with no
         offline or degraded marker naming them. That is silent DATA LOSS, and

@@ -149,8 +149,6 @@ _ALLOWED_RENAMERS = {
         'TestStdlibOnlySelfContainment. Do not "finish" this migration.',
     ('orchestrator/src/orchestrator/session_hooks.py', '_run_install'):
         'Out of task 3223 enumerated scope; left alone deliberately.',
-    ('orchestrator/src/orchestrator/verify_cancel.py', 'write_pgid_file'):
-        'Out of task 3223 enumerated scope; left alone deliberately.',
     ('escalation/src/escalation/queue.py', 'EscalationQueue._atomic_write_path'):
         'Out of task 3223 enumerated scope. This is the helper 3223 was MODELLED '
         'on (its durable= flag became fsync=); a follow-up may migrate it.',

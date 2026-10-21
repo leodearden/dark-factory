@@ -1208,7 +1208,7 @@ async def _run_cold_shadow_verify_suite(
     Returns:
         The suite-level :class:`VerifyResult` from the cold FULL-gate dispatch.
     """
-    wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
+    wt = await git_ops.create_ephemeral_verify_worktree(merge_commit)
     try:
         # FULL-GATE: task_files=None → the complete workspace suite on the cold
         # leg (verify.py workspace path).  A scoped/no-source spec would trivially
@@ -1243,7 +1243,7 @@ async def _run_cold_shadow_verify(
     """Run a from-scratch cold verify on *merge_commit* in a throwaway worktree.
 
     Creates an ephemeral ``_merge-<uuid>`` worktree at *merge_commit* via
-    :meth:`~orchestrator.git_ops.GitOps.create_throwaway_verify_worktree`,
+    :meth:`~orchestrator.git_ops.GitOps.create_ephemeral_verify_worktree`,
     runs the full merge verify (build_merge_verify_spec + VerifyRunnerPool
     dispatch — the same execution path as ``_run_post_merge_verify``), parses
     the per-test results from the output, and removes the throwaway worktree
@@ -1271,7 +1271,7 @@ async def _run_cold_shadow_verify(
         Per-test verdict map as returned by :func:`parse_per_test_results`.
         Empty dict if the cold verify produced no parseable test output.
     """
-    wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
+    wt = await git_ops.create_ephemeral_verify_worktree(merge_commit)
     try:
         # Hold THIS throwaway lane's flock for the duration of the verify
         # (task 3018).  Three things to know:
@@ -1299,7 +1299,7 @@ async def _run_cold_shadow_verify(
         # (iii) CONTENTION IS NOT A PRACTICAL FAILURE MODE here, so no
         #     MergeVerifyLeaseContended fail-safe branch is warranted: the
         #     `_merge-<uuid>` path was just minted by
-        #     create_throwaway_verify_worktree and is uncontended by
+        #     create_ephemeral_verify_worktree and is uncontended by
         #     construction — nobody else knows it.
         #
         # (iv) FLOCK ONLY, NO GLOBAL RENDEZVOUS (task 4189).  Because `wt` is

@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""scripts/legibility/check_trickle_health.py — the thing that RUNS the two
-trickle probes (task 4514).
+"""scripts/legibility/check_trickle_health.py — the thing that RUNS the three
+trickle probes (task 4514; the census probe since task 5783).
 
-THE WHOLE POINT IS THE CALLER, NOT THE VERDICT. Both probes already
-existed and both were correct; what did not exist was anything that ran
-them. Why that mattered, and what it left latent: OPERATIONS.md
+THE WHOLE POINT IS THE CALLER, NOT THE VERDICT. The first two probes
+already existed and were correct; what did not exist was anything that ran
+them. The third, ``check_census_progress.py``, asks whether a FIRED census
+advanced census-state. Why that mattered, and what it left latent: OPERATIONS.md
 §"Legibility trickle health probe (04:30)", which is the single home for
 this argument. Why THIS module is a separate systemd unit rather than a
 second ``ExecStart``: ``scripts/legibility-trickle-health@.service``,
 which is the file that change would be made in.
 
-IT EXECUTES THE PROBES; IT NEVER RE-IMPLEMENTS EITHER VERDICT. That is
+IT EXECUTES THE PROBES; IT NEVER RE-IMPLEMENTS ANY VERDICT. That is
 what keeps the no-lockstep-duplication rule (INV-5) true BY
 CONSTRUCTION — the exact drift that let a suppressed night read like a
 quiet one for 14 nights (2026-07-16..29) — lets
@@ -51,6 +52,9 @@ logger = logging.getLogger('legibility.check_trickle_health')
 
 PROGRESS_SCRIPT = Path(__file__).resolve().parent / 'check_trickle_progress.py'
 LIVENESS_SCRIPT = Path(__file__).resolve().parent / 'check_trickle_liveness.sh'
+CENSUS_PROGRESS_SCRIPT = (
+    Path(__file__).resolve().parent / 'check_census_progress.py'
+)
 
 DEFAULT_MAX_AGE_HOURS = 72
 """Freshness window handed to the progress probe, matching PRD task kappa's.
@@ -72,6 +76,9 @@ class HealthResult:
     affected by whether the escalation POST landed: ``escalated`` records
     that separately, because a down escalation server must not be able to
     mask a verdict.
+
+    Every ``*_ok`` field is REQUIRED: a defaulted ``True`` is how a future
+    constructor would silently pass a probe that never ran.
     """
 
     exit_code: int
@@ -79,6 +86,8 @@ class HealthResult:
     liveness_ok: bool
     progress_output: str
     liveness_output: str
+    census_ok: bool
+    census_output: str
     escalated: bool
     reason: str
 
@@ -104,6 +113,16 @@ def liveness_argv(project_id: str, *, hours: int) -> list[str]:
     than ``sys.executable``: it is a shell script, and its own header
     comment forbids changing its semantics."""
     return ['bash', str(LIVENESS_SCRIPT), project_id, str(hours)]
+
+
+def census_progress_argv(
+    project_id: str, *, max_unadvanced_census_fires: int,
+) -> list[str]:
+    """Build the argv that RUNS the census progress probe."""
+    return [
+        sys.executable, str(CENSUS_PROGRESS_SCRIPT), project_id,
+        str(max_unadvanced_census_fires),
+    ]
 
 
 def _run(argv: Sequence[str]) -> tuple[int, str]:
@@ -134,12 +153,16 @@ def _default_liveness_runner(project_id: str, **kwargs) -> tuple[int, str]:
     return _run(liveness_argv(project_id, **kwargs))
 
 
+def _default_census_runner(project_id: str, **kwargs) -> tuple[int, str]:
+    return _run(census_progress_argv(project_id, **kwargs))
+
+
 def _invoke(runner, project_id: str, **kwargs) -> tuple[bool, str]:
     """Call one probe *runner*, absorbing a raise into a failed verdict.
 
     The default runners already convert their own subprocess failures; this
     guard covers an INJECTED runner and any exception class the default
-    pair does not anticipate. Same reasoning either way: a probe that
+    runners do not anticipate. Same reasoning either way: a probe that
     cannot run is not a probe that passed."""
     try:
         returncode, output = runner(project_id, **kwargs)
@@ -151,18 +174,23 @@ def _invoke(runner, project_id: str, **kwargs) -> tuple[bool, str]:
     return returncode == 0, output
 
 
-def _build_reason(progress_ok: bool, liveness_ok: bool, project_id: str) -> str:
-    """One line naming BOTH probes' verdicts, always — an operator reading
-    a journal entry should never have to run the other one to find out."""
-    progress = 'ok' if progress_ok else 'FAILED'
-    liveness = 'ok' if liveness_ok else 'FAILED'
+def _verdict(ok: bool) -> str:
+    return 'ok' if ok else 'FAILED'
+
+
+def _build_reason(
+    progress_ok: bool, liveness_ok: bool, census_ok: bool, project_id: str,
+) -> str:
+    """One line naming EVERY probe's verdict, always — an operator reading
+    a journal entry should never have to run another one to find out."""
     headline = (
-        'legibility trickle health OK' if progress_ok and liveness_ok
+        'legibility trickle health OK'
+        if progress_ok and liveness_ok and census_ok
         else 'legibility trickle health DEGRADED'
     )
     return (
-        f'{headline} for {project_id}: progress={progress} '
-        f'liveness={liveness}'
+        f'{headline} for {project_id}: progress={_verdict(progress_ok)} '
+        f'liveness={_verdict(liveness_ok)} census={_verdict(census_ok)}'
     )
 
 
@@ -172,8 +200,8 @@ def _unresolved_result(config_path) -> HealthResult:
     A THIRD outcome, not a fabricated probe failure, and worded distinctly
     on purpose: an operator reading the journal must be able to tell a
     MISCONFIGURED INVOCATION from a broken pipeline. ``_build_reason`` is
-    for the two-probe case, so this line is composed separately rather
-    than widening that function with a third state.
+    for the probes-ran case, so this line is composed separately rather
+    than widening that function with another state.
 
     Non-zero because ``_invoke``'s own rule — a probe that cannot run is
     not evidence of health — applies a fortiori to a probe that was never
@@ -184,11 +212,13 @@ def _unresolved_result(config_path) -> HealthResult:
         liveness_ok=False,
         progress_output='',
         liveness_output='',
+        census_ok=False,
+        census_output='',
         escalated=False,
         reason=(
             f'legibility trickle health UNRESOLVED: no project id could be '
             f'resolved from config {config_path} and none was given, so '
-            f'NEITHER probe ran. Pass --project-id, or point --config at a '
+            f'NO probe ran. Pass --project-id, or point --config at a '
             f'readable legibility.yaml.'
         ),
     )
@@ -202,14 +232,18 @@ def run_health_check(
     max_age_hours: int = DEFAULT_MAX_AGE_HOURS,
     max_failed_runs: int = trickle_state.DEFAULT_MAX_FAILED_RUNS,
     liveness_hours: int = DEFAULT_MAX_AGE_HOURS,
+    max_unadvanced_census_fires: int = (
+        trickle_state.DEFAULT_MAX_UNADVANCED_CENSUS_FIRES
+    ),
     progress_runner=None,
     liveness_runner=None,
+    census_runner=None,
     poster=None,
 ) -> HealthResult:
-    """Run BOTH probes and aggregate them into ONE verdict.
+    """Run all three probes and aggregate them into ONE verdict.
 
-    NEVER SHORT-CIRCUITS. Both probes run even when the first fails,
-    because the operator needs both answers in one place and a progress
+    NEVER SHORT-CIRCUITS. Every probe runs even when an earlier one fails,
+    because the operator needs every answer in one place and a progress
     failure is very often EXPLAINED by the liveness one. The aggregation
     into a single ``HealthResult`` rather than one per probe mirrors
     ``run_nightly``'s "ONE escalation for the whole night, not one per
@@ -224,8 +258,8 @@ def run_health_check(
     ``''`` to both probes, yielding a guaranteed DEGRADED verdict and a
     spurious ``escalate_info`` for a perfectly healthy pipeline.
 
-    *progress_runner* / *liveness_runner* are the dependency-injection
-    seams, alongside *poster*. Each takes ``(project_id, **kwargs)`` and
+    *progress_runner* / *liveness_runner* / *census_runner* are the
+    dependency-injection seams, alongside *poster*. Each takes ``(project_id, **kwargs)`` and
     returns ``(returncode, output)``.
     """
     # Resolved ONCE, here, so every use below is a plain `project_id` — the
@@ -262,20 +296,30 @@ def run_health_check(
         project_id,
         hours=liveness_hours,
     )
+    census_ok, census_output = _invoke(
+        census_runner if census_runner is not None
+        else _default_census_runner,
+        project_id,
+        max_unadvanced_census_fires=max_unadvanced_census_fires,
+    )
 
     result = HealthResult(
-        exit_code=0 if (progress_ok and liveness_ok) else 1,
+        exit_code=0 if (progress_ok and liveness_ok and census_ok) else 1,
         progress_ok=progress_ok,
         liveness_ok=liveness_ok,
         progress_output=progress_output,
         liveness_output=liveness_output,
+        census_ok=census_ok,
+        census_output=census_output,
         escalated=False,
-        reason=_build_reason(progress_ok, liveness_ok, project_id),
+        reason=_build_reason(progress_ok, liveness_ok, census_ok, project_id),
     )
 
     # The escalation outcome NEVER changes exit_code: the non-zero exit is
-    # the authoritative loud signal whether or not the POST landed.
-    if not _load_and_decide(
+    # the authoritative loud signal whether or not the POST landed. A census
+    # failure ALWAYS posts: nothing else escalates an unadvanced-fire
+    # streak, so _should_escalate's suppressions have nothing to de-duplicate.
+    if census_ok and not _load_and_decide(
         project_id, progress_ok, max_barren_runs, max_age_hours,
     ):
         return result
@@ -293,6 +337,10 @@ def run_health_check(
             max_age_hours=max_age_hours, max_failed_runs=max_failed_runs,
         ),
         liveness_argv(project_id, hours=liveness_hours),
+        census_progress_argv(
+            project_id,
+            max_unadvanced_census_fires=max_unadvanced_census_fires,
+        ),
     )
     return replace(
         result,
@@ -358,18 +406,23 @@ def _build_escalation_arguments(
     ``legibility-trickle-<project_id>`` so the two escalation histories stay
     separately readable.
 
-    ONE envelope for the whole invocation, never one per probe: both
-    probes' captured output goes into a single detail, because which probe
-    failed is rarely the interesting question — the pair is.
+    ONE envelope for the whole invocation, never one per probe: every
+    probe's captured output goes into a single detail, because which probe
+    failed is rarely the interesting question — the set is.
 
-    *rerun* is the ``(progress_argv, liveness_argv)`` pair THIS invocation
-    actually ran, so the commands in the detail reproduce this verdict
-    exactly rather than approximating it with stock thresholds."""
+    *rerun* is the ``(progress_argv, liveness_argv, census_progress_argv)``
+    triple THIS invocation actually ran, so the commands in the detail
+    reproduce this verdict exactly rather than approximating it with stock
+    thresholds."""
     failed = [
-        name for name, ok in
-        (('progress', result.progress_ok), ('liveness', result.liveness_ok))
+        name for name, ok in (
+            ('progress', result.progress_ok),
+            ('liveness', result.liveness_ok),
+            ('census', result.census_ok),
+        )
         if not ok
     ]
+    rerun_lines = '\n'.join(f'  {" ".join(argv)}' for argv in rerun)
     return {
         'task_id': f'legibility-trickle-health-{project_id}',
         'agent_role': _ESCALATION_AGENT_ROLE,
@@ -385,9 +438,10 @@ def _build_escalation_arguments(
             f'{result.progress_output.strip() or "(no output)"}\n\n'
             f'--- check_trickle_liveness.sh output ---\n'
             f'{result.liveness_output.strip() or "(no output)"}\n\n'
+            f'--- check_census_progress.py output ---\n'
+            f'{result.census_output.strip() or "(no output)"}\n\n'
             f'Re-run by hand (the exact commands this probe ran):\n'
-            f'  {" ".join(rerun[0])}\n'
-            f'  {" ".join(rerun[1])}'
+            f'{rerun_lines}'
         ),
     }
 
@@ -540,8 +594,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='check_trickle_health.py',
         description=(
-            'Run both legibility trickle probes and report one verdict '
-            '(task 4514).'
+            'Run the three legibility trickle probes and report one '
+            'verdict (task 4514).'
         ),
     )
     parser.add_argument(
@@ -569,6 +623,12 @@ def build_parser() -> argparse.ArgumentParser:
         '--liveness-hours', type=int, default=DEFAULT_MAX_AGE_HOURS,
         help='Window handed to check_trickle_liveness.sh.',
     )
+    parser.add_argument(
+        '--max-unadvanced-census-fires', type=int,
+        default=trickle_state.DEFAULT_MAX_UNADVANCED_CENSUS_FIRES,
+        help='Consecutive census FIREs without an advance the census probe '
+             'tolerates.',
+    )
     return parser
 
 
@@ -591,6 +651,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_age_hours=args.max_age_hours,
         max_failed_runs=args.max_failed_runs,
         liveness_hours=args.liveness_hours,
+        max_unadvanced_census_fires=args.max_unadvanced_census_fires,
     )
     print(result.reason, file=sys.stderr if result.exit_code else sys.stdout)
     return result.exit_code

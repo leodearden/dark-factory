@@ -104,10 +104,9 @@ _SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
 # How often a FULLY-CAPPED park re-announces itself (task 4945). The park
 # below used to log once at INFO and then block on a bare `_open.wait()`
 # with no further output for as long as the freeze lasted, which made a
-# frozen pool indistinguishable from a hung run — the gap
-# orchestrator/evals/runner.py names, where cap_wait_sanity_secs bounds
-# only the post-invocation cap-RETRY branch and cannot see this wait at
-# all. 600s matches `cli_invoke._CAP_WAIT_LOG_INTERVAL_SECS`, whose
+# frozen pool indistinguishable from a hung run. It is also the longest single
+# wait of an unbounded park; a caller's `max_wait_secs` can only shorten it.
+# 600s matches `cli_invoke._CAP_WAIT_LOG_INTERVAL_SECS`, whose
 # `cap_wait` heartbeat this one deliberately mirrors: a park is measured
 # in hours, so ~10 min is frequent enough to prove liveness and rare
 # enough not to bury the signal. Deliberately an internal observability
@@ -474,12 +473,13 @@ class SessionBudgetExhausted(Exception):
 
 
 class PoolFrozen(Exception):
-    """No account is admissible and the caller asked not to park (task 6042).
+    """No account became admissible within the caller's park allowance.
 
-    Raised by :meth:`UsageGate.before_invoke` with ``park=False`` at the point
-    where the default would wait: every account capped and/or AUTH_FAILED, or
-    (for a scoped call) the scope exhausted on every account. A nightly
-    oneshot uses it to defer instead of hanging until a reset.
+    Raised by :meth:`UsageGate.before_invoke` once ``max_wait_secs`` is spent,
+    the allowance being zero for ``park=False`` (task 6042): every account
+    capped and/or AUTH_FAILED, or (for a scoped call) the scope exhausted on
+    every account. A nightly oneshot uses it to defer instead of hanging until
+    a reset.
 
     Deliberately NOT an ``AllAccountsCappedException``: a pool that is frozen
     because every account's credentials were rejected will not clear at any
@@ -506,6 +506,21 @@ class PoolFrozen(Exception):
             f'capped: {", ".join(capped_account_names) or "none"}; '
             f'auth-failed: {", ".join(auth_failed_account_names) or "none"}'
         )
+
+
+def _park_deadline(park: bool, max_wait_secs: float | None) -> float | None:
+    """When a caller's park allowance runs out on the monotonic clock, or
+    ``None`` for an unbounded park. ``park=False`` is the zero allowance."""
+    if not park:
+        return time.monotonic()
+    if max_wait_secs is None:
+        return None
+    return time.monotonic() + max(0.0, max_wait_secs)
+
+
+def _park_time_left(deadline: float | None) -> float | None:
+    """Seconds left before *deadline*, or ``None`` when the park is unbounded."""
+    return None if deadline is None else deadline - time.monotonic()
 
 
 class InvokeSlot:
@@ -767,7 +782,8 @@ class UsageGate:
     # in `before_invoke` when a lease is finally served — the moment the park
     # actually ends — so elapsed_s measures how long the pool has been unable
     # to serve ANYONE, and cleared again when the LAST parked caller is
-    # cancelled or errors out (see `_wait_for_any_account_to_reopen`), so an
+    # cancelled, errors out or reaches its deadline (see
+    # `_wait_for_any_account_to_reopen`), so an
     # abandoned park cannot bequeath its clock to an unrelated later one.
     # `_park_waiters` exists only to make "the last one" answerable: a
     # cancelled waiter must not reset the clock of a park its siblings are
@@ -1251,7 +1267,11 @@ class UsageGate:
         return None
 
     async def before_invoke(
-        self, scope: str | None = None, *, park: bool = True,
+        self,
+        scope: str | None = None,
+        *,
+        park: bool = True,
+        max_wait_secs: float | None = None,
     ) -> AccountLease | None:
         """Block until at least one account is available. Return its lease.
 
@@ -1269,11 +1289,13 @@ class UsageGate:
         the scope predicate and the scope-wait fall-through are both guarded on
         ``scope is not None``.
 
-        *park* (task 6042): ``False`` raises :class:`PoolFrozen` at the point
-        where the default would wait — after the reset sweeps freed nothing,
-        and before EITHER park (the per-scope waiter or the ``_open`` freeze).
-        For a caller that must defer rather than wait out a reset; the
-        default ``True`` is unchanged.
+        *max_wait_secs* bounds BOTH parks (the per-scope waiter and the
+        ``_open`` freeze) by one deadline taken at entry. Once it passes, the
+        next pass re-runs selection and the reset sweeps, so an account that
+        reopens right at the deadline is still served, and only then raises
+        :class:`PoolFrozen`. *park* ``False`` (task 6042) is the zero allowance:
+        it raises before parking at all. The default, ``park=True`` with no
+        ``max_wait_secs``, parks until an account reopens.
         """
         # Session budget check
         if (
@@ -1287,6 +1309,7 @@ class UsageGate:
                 'No OAuth accounts available — configure accounts or provide credentials'
             )
 
+        park_deadline = _park_deadline(park, max_wait_secs)
         # Find first non-capped account (works with 1 or N)
         while True:
             async with self._lock:
@@ -1312,7 +1335,8 @@ class UsageGate:
                 if self._refresh_scope_capped(scope):
                     continue
                 if not self.is_paused:
-                    if not park:
+                    park_left = _park_time_left(park_deadline)
+                    if park_left is not None and park_left <= 0:
                         raise self._pool_frozen(scope)
                     # Fleet is NOT frozen — at least one account is generally
                     # serviceable, only this scope is exhausted. Park on the
@@ -1353,6 +1377,8 @@ class UsageGate:
                     # already set and would return at once.)
                     if any(a.probe_in_flight for a in self._accounts):
                         sleep_for = min(sleep_for, _SCOPE_WAIT_REPOLL_CEIL_SECS)
+                    if park_left is not None:
+                        sleep_for = min(sleep_for, park_left)
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(evt.wait(), timeout=sleep_for)
                     continue
@@ -1371,42 +1397,42 @@ class UsageGate:
             # the for-loop above just confirmed every account is non-AVAILABLE
             # and non-PROBING, so clearing here is always correct regardless of
             # how _open drifted.
-            if not park:
+            park_left = _park_time_left(park_deadline)
+            if park_left is not None and park_left <= 0:
                 raise self._pool_frozen(None)
             logger.info('All accounts capped — waiting for any to reopen')
             self._open.clear()
-            await self._wait_for_any_account_to_reopen()
+            await self._wait_for_any_account_to_reopen(park_deadline)
 
     def _pool_frozen(self, scope: str | None) -> PoolFrozen:
         """The :class:`PoolFrozen` describing this gate right now."""
         return PoolFrozen(
             account_count=self.account_count,
-            capped_account_names=tuple(a.name for a in self._accounts if a.capped),
+            capped_account_names=self.capped_account_names,
             auth_failed_account_names=self.auth_failed_account_names,
             scope=scope,
         )
 
-    async def _wait_for_any_account_to_reopen(self) -> None:
-        """Block until ``_open`` is set, announcing the park as it waits.
+    async def _wait_for_any_account_to_reopen(self, deadline: float | None) -> None:
+        """Block until ``_open`` is set or *deadline* passes, announcing the
+        park as it waits.
 
-        SEMANTICS ARE THOSE OF ``await self._open.wait()``, unchanged: this
-        returns only once an account reopens, and every ``TimeoutError`` is
-        suppressed and retried. The heartbeat is PURELY ADDITIVE — it alters
-        neither what ``before_invoke`` returns nor when it unblocks.
+        *deadline* is the caller's park deadline on the monotonic clock, or
+        ``None`` for an unbounded park. Returning at the deadline leaves the
+        raise to ``before_invoke``, which first re-runs selection. The
+        heartbeat is PURELY ADDITIVE — it alters neither what
+        ``before_invoke`` returns nor when it unblocks.
 
         WHY THE PARK NEEDS A VOICE. Before task 4945 the caller logged one
         INFO line and then blocked here with no further output for however
         long the pool stayed frozen, so a parked campaign and a hung process
-        produced identical logs. ``orchestrator/evals/runner.py`` names this
-        gap explicitly: its ``cap_wait_sanity_secs`` bound is consulted only
-        in the cap-RETRY branch, AFTER an invocation returned, and so cannot
-        see this wait at all. Evals now share the fleet pool rather than
+        produced identical logs. Evals now share the fleet pool rather than
         holding a private reserve (ruling 2026-08-30, tasks 4741/4945),
         which makes a fully-capped park a routine outcome rather than an
         exotic one.
 
         NEVER TIGHT-SPINS. Each iteration waits on the event with a strictly
-        positive timeout — the same
+        positive timeout, the lesser of the interval and the time left — the same
         ``asyncio.wait_for`` + ``contextlib.suppress(TimeoutError)`` shape
         the scoped park above uses — so a frozen pool costs one wakeup per
         interval, not a burned core.
@@ -1447,8 +1473,9 @@ class UsageGate:
         that ended long ago, and suppress its first heartbeat for up to a
         full interval — both of them precisely the failures this helper
         exists to fix. So the clock is cleared on the way out of an abandoned
-        park too, guarded by ``_park_waiters`` so a cancelled waiter cannot
-        reset a park its siblings are still inside. The staleness check at
+        park too, and of one that reached its deadline, guarded by
+        ``_park_waiters`` so a departing waiter cannot reset a park its
+        siblings are still inside. The staleness check at
         ENTRY is the backstop for the residue no local handler can see: a
         cancellation that lands at one of the caller's OTHER awaits, between
         two re-entries of this helper. Entry is also the only place it
@@ -1494,6 +1521,9 @@ class UsageGate:
                 self._park_last_logged_at = None
             while not self._open.is_set():
                 now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    self._release_park_clock()
+                    return
                 if self._park_started_at is None:
                     self._park_started_at = now
                 if (
@@ -1507,6 +1537,8 @@ class UsageGate:
                                 'event': 'all_capped_park',
                                 'elapsed_s': round(now - self._park_started_at, 1),
                                 'account_count': self.account_count,
+                                'capped_accounts': list(self.capped_account_names),
+                                'auth_failed_accounts': list(self.auth_failed_account_names),
                                 'soonest_open_at': (
                                     self.soonest_resets_at.isoformat()
                                     if self.soonest_resets_at
@@ -1517,35 +1549,44 @@ class UsageGate:
                         )
                     )
                     self._park_last_logged_at = now
+                wait_for = _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
+                if deadline is not None:
+                    wait_for = min(wait_for, deadline - now)
                 with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        self._open.wait(),
-                        timeout=_ALL_CAPPED_PARK_LOG_INTERVAL_SECS,
-                    )
+                    await asyncio.wait_for(self._open.wait(), timeout=wait_for)
         except BaseException:
             # Abandoned park: cancellation (the routine case — callers wrap
             # `before_invoke` in `asyncio.wait_for`) or an error out of the
             # wait. `BaseException` because CancelledError is not an
             # Exception, and it is re-raised untouched — this handler changes
-            # nothing about control flow, only the clock. Clear ONLY if no
-            # sibling is still parked: the timestamps are shared, and a
-            # frozen pool typically has many waiters, so an unguarded clear
-            # would restart a live park's elapsed_s every time any one of
-            # them was cancelled.
-            if self._park_waiters <= 1:
-                self._park_started_at = None
-                self._park_last_logged_at = None
+            # nothing about control flow, only the clock.
+            self._release_park_clock()
             raise
         finally:
             self._park_waiters -= 1
 
+    def _release_park_clock(self) -> None:
+        """Clear the shared heartbeat clock as a parked caller leaves, unless a
+        sibling is still parked: a frozen pool typically has many waiters, so
+        an unguarded clear would restart a live park's elapsed_s every time
+        any one of them left."""
+        if self._park_waiters <= 1:
+            self._park_started_at = None
+            self._park_last_logged_at = None
+
     @contextlib.asynccontextmanager
-    async def invoke_slot(self, scope: str | None = None, *, park: bool = True):
+    async def invoke_slot(
+        self,
+        scope: str | None = None,
+        *,
+        park: bool = True,
+        max_wait_secs: float | None = None,
+    ):
         """Acquire an account slot, releasing the probe lock on any exit path.
 
-        *park* is forwarded to :meth:`before_invoke`: ``False`` raises
-        :class:`PoolFrozen` out of the ``async with`` instead of waiting, before
-        any account is claimed.
+        *park* and *max_wait_secs* are forwarded to :meth:`before_invoke`: a
+        spent park allowance raises :class:`PoolFrozen` out of the
+        ``async with``, before any account is claimed.
 
         Yields an :class:`InvokeSlot` whose ``token`` and ``account_name``
         are ready to use.  On exit, if neither :meth:`~InvokeSlot.detect_cap_hit`
@@ -1570,7 +1611,9 @@ class UsageGate:
                     break          # probe settled by confirm
                 # any other exit path (continue, exception): auto-released
         """
-        lease = await self.before_invoke(scope=scope, park=park)
+        lease = await self.before_invoke(
+            scope=scope, park=park, max_wait_secs=max_wait_secs,
+        )
         slot = InvokeSlot(self, lease, scope=scope)
         try:
             yield slot
@@ -2934,6 +2977,11 @@ class UsageGate:
     def auth_failed_account_names(self) -> tuple[str, ...]:
         """Names of the accounts currently AUTH_FAILED, in roster order."""
         return tuple(acct.name for acct in self._accounts if acct.auth_failed)
+
+    @property
+    def capped_account_names(self) -> tuple[str, ...]:
+        """Names of the accounts currently capped, in roster order."""
+        return tuple(acct.name for acct in self._accounts if acct.capped)
 
     @property
     def soonest_resets_at(self) -> datetime | None:

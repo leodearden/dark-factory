@@ -43,6 +43,8 @@ UNDO_ACTION = 'undo'
 class RunSource(StrEnum):
     CORPUS = 'corpus'
     ADJUDICATOR = 'adjudicator'
+    #: A plan whose heals rest on the deterministic rows alone.
+    DETERMINISTIC = 'deterministic'
     UNDO = 'undo'
 
 
@@ -432,7 +434,8 @@ class LinkHealLedger:
         return matches[0] if matches else None
 
     def is_undo_suppressed(self, planned: PlannedAction) -> bool:
-        """An undo took this heal back for this pair at these text hashes."""
+        """An undo took this heal back for this pair at these text hashes, whatever basis
+        planned either: an undo takes back an action on a pair, not a basis."""
         rows = self._same_heal(planned, states=[ActionState.UNDONE.value])
         return any(
             row.planned.pre_image.parent_id == planned.pre_image.parent_id for row in rows

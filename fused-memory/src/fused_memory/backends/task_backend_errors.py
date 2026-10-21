@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from shared.task_deferral import DeferralRefusalCode
+
 TASKMASTER_TOOL_ERROR: str = 'TASKMASTER_TOOL_ERROR'
 TASKMASTER_UNAVAILABLE: str = 'TASKMASTER_UNAVAILABLE'
 
@@ -242,6 +244,95 @@ class DoneProvenanceWriteAuthorityError(TaskmasterError):
         return done_provenance_via_update_task_error(self.task_id)
 
 
+_DEFERRAL_WRITE_AUTHORITY_HINT = (
+    "Only set_task_status(status='deferred', deferral={...}) writes metadata.deferral, "
+    'and only leaving deferred removes it; update_task and submit_task may not add, '
+    'alter or remove it (an unchanged echo of the stored record is accepted). '
+    "Recipe: docs/task-authoring.md §9 'Deferring a task'."
+)
+
+
+class DeferralWriteAuthorityError(TaskmasterError):
+    """Raised when a metadata writer would add, alter or remove ``metadata.deferral``.
+
+    The status choke point is the record's only writer (PRD
+    plans/deferral-flip-condition-prd.md decision 3). Call :meth:`to_error_dict`
+    for the wire shape.
+    """
+
+    def __init__(self, task_id: str | None, path: str = 'metadata.deferral') -> None:
+        self.task_id = task_id
+        self.path = path
+        super().__init__('TASKMASTER_TOOL_ERROR', _DEFERRAL_WRITE_AUTHORITY_HINT)
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': DeferralRefusalCode.WRITE_AUTHORITY.value,
+            'task_id': self.task_id,
+            'path': self.path,
+            'hint': _DEFERRAL_WRITE_AUTHORITY_HINT,
+        }
+
+
+_METADATA_NOT_AN_OBJECT_HINT = (
+    'update_task metadata must be a JSON object: a dict, or a JSON string '
+    'that encodes one. Nothing was written. Under merge/additive, send an '
+    "object of just the keys to set; under metadata_mode='replace', send the "
+    'complete blob as an object, carrying any stored done_provenance through '
+    'verbatim.'
+)
+
+
+def metadata_not_an_object_error(task_id: str | None, received: str) -> dict[str, Any]:
+    """Canonical rejection shape for ``update_task`` calls whose ``metadata``
+    payload is not a JSON object.
+
+    The stable promise across every surface is the ERROR CODE: callers branch
+    on ``error == 'metadata_not_an_object'``. ``received`` names what was sent
+    (see :class:`MetadataNotAnObjectError`). The ``hint`` is prose for the
+    caller reading the failure and may grow.
+    """
+    return {
+        'success': False,
+        'error': 'metadata_not_an_object',
+        'task_id': task_id,
+        'received': received,
+        'hint': _METADATA_NOT_AN_OBJECT_HINT,
+    }
+
+
+class MetadataNotAnObjectError(TaskmasterError):
+    """Raised when an ``update_task`` metadata payload is not a JSON object.
+
+    Such a payload has no keys to merge, and treating it as a last-write-wins
+    replacement wiped the whole stored blob, ``done_provenance`` included
+    (task 6130). Subclasses :class:`TaskmasterError` with the
+    ``TASKMASTER_TOOL_ERROR`` code so existing ``TaskmasterError``
+    catchers/assertions keep working unchanged; call :meth:`to_error_dict`
+    for the canonical wire shape.
+
+    Attributes:
+        task_id: The task the rejected write targeted (``None`` if not supplied).
+        received: ``'invalid_json'`` for a payload ``json.loads`` rejects;
+            otherwise the JSON type it decoded to: ``'array'``, ``'null'``,
+            ``'string'``, ``'number'`` or ``'boolean'``.
+    """
+
+    def __init__(self, task_id: str | None, received: str) -> None:
+        self.task_id = task_id
+        self.received = received
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR',
+            f'Refusing an update_task metadata payload that is not a JSON '
+            f'object (received: {received}); nothing was written. '
+            f'{_METADATA_NOT_AN_OBJECT_HINT}',
+        )
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return metadata_not_an_object_error(self.task_id, self.received)
+
+
 class AppendUnsupportedFieldError(TaskmasterError):
     """Raised when ``update_task`` combines ``append=True`` with a REPLACE-ONLY column.
 
@@ -305,7 +396,10 @@ __all__ = [
     'TaskNotFoundError',
     'StatusWriteAuthorityError',
     'DoneProvenanceWriteAuthorityError',
+    'DeferralWriteAuthorityError',
+    'MetadataNotAnObjectError',
     'AppendUnsupportedFieldError',
     'status_via_update_task_error',
     'done_provenance_via_update_task_error',
+    'metadata_not_an_object_error',
 ]

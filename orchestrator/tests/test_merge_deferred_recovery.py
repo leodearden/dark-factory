@@ -4,7 +4,8 @@ Part 1 pins the pure ownership discriminator in
 ``orchestrator/src/orchestrator/merge_deferred_recovery.py``: who, if anyone,
 still owns a parked member, and what recovering an abandoned one targets.
 Part 2 drives ``AbandonedMemberSweep.run_pass`` against a fake lane and task
-store and a real escalation queue.  Part 3 is the regression for members a
+store, a real in-flight merge registry fed through the real ``merge_request``
+chokepoint, and a real escalation queue.  Part 3 is the regression for members a
 restart left parked: real git, a real merge worker and the real train
 callbacks.
 """
@@ -12,7 +13,7 @@ callbacks.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,6 +29,7 @@ from test_git_ops_unstack import _commit_files, _init_repo, _make_git_ops, _rev_
 from test_merge_lane_member_redrive import add_unlanded, land_attributed
 from test_merge_lane_parked_custody import held_train_request, until_custody
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import build_train_callback_factory
 from orchestrator.merge_deferred_recovery import (
@@ -42,8 +44,17 @@ from orchestrator.merge_deferred_recovery import (
     owner_of,
     recovery_targets,
 )
-from orchestrator.merge_lane import MemberRedriveOutcome
-from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+from orchestrator.merge_lane import (
+    InFlightMergeRegistry,
+    MemberRedriveOutcome,
+    MergeOutcome,
+    MergeRequest,
+    QueuedBranch,
+)
+from orchestrator.merge_lane.worker import (
+    SpeculativeMergeWorker,
+    coalesce_or_enqueue_merge_request,
+)
 from orchestrator.scheduler import train_order_key
 
 NOW = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
@@ -70,9 +81,36 @@ def _peer(tid: str, train_id: str, order: int, status: str = 'merge-deferred') -
     return TrainPeer(task_id=tid, status=status, train=DeclaredTrainRef(train_id, (0, order)))
 
 
+def single_request(config: OrchestratorConfig, tid: str) -> MergeRequest:
+    """A single (not a train) merge request for *tid*'s branch."""
+    prefix = config.git.branch_prefix
+    return MergeRequest(
+        task_id=tid,
+        branch=QueuedBranch.parse(f'{prefix}{tid}', prefix),
+        worktree=config.project_root / '.worktrees' / tid,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+    )
+
+
+async def submit_single(
+    registry: InFlightMergeRegistry, req: MergeRequest, intake: asyncio.Queue | None = None,
+) -> None:
+    """Submit *req* the way the ``merge_request`` MCP tool does; nothing drains a
+    fresh *intake*, so the request stays queued."""
+    dispatch = await coalesce_or_enqueue_merge_request(
+        asyncio.Queue() if intake is None else intake, req, None, registry,
+    )
+    assert dispatch.dispatched
+
+
 def _view(
     *,
     custody: Iterable[str] = (),
+    singles: Iterable[str] = (),
     workflow: Iterable[str] = (),
     external: Iterable[str] = (),
     peers: Iterable[TrainPeer] = (),
@@ -82,6 +120,7 @@ def _view(
         trains.setdefault(peer.train.train_id, []).append(peer)
     return OwnershipView(
         custody=frozenset(custody),
+        single_requests=frozenset(singles),
         workflow_held=frozenset(workflow),
         externally_held=frozenset(external),
         declared_trains={tid: tuple(members) for tid, members in trains.items()},
@@ -153,6 +192,13 @@ class TestTrainPeerFromTask:
 class TestOwnerOf:
     def test_custody(self) -> None:
         assert owner_of(_member('a'), _view(custody=['a'])) is ParkedOwner.TRAIN_CUSTODY
+
+    def test_a_live_single_request_owns_its_member(self) -> None:
+        assert owner_of(_member('a'), _view(singles=['a'])) is ParkedOwner.SINGLE_REQUEST
+
+    def test_a_peer_with_a_live_single_keeps_its_declared_train_active(self) -> None:
+        view = _view(peers=[_peer('d0', 'T', 0), _peer('d1', 'T', 1)], singles=['d0'])
+        assert owner_of(_member('d1', 'T', 1), view) is ParkedOwner.TRAIN_PEER_ACTIVE
 
     def test_workflow(self) -> None:
         assert owner_of(_member('a'), _view(workflow=['a'])) is ParkedOwner.WORKFLOW
@@ -235,6 +281,7 @@ class _FakeLane:
     outcomes: dict[str, MemberRedriveOutcome] = field(default_factory=dict)
     raises_for: set[str] = field(default_factory=set)
     calls: list[tuple[list[str], bool]] = field(default_factory=list)
+    during_redrive: dict[str, Callable[[], Awaitable[None]]] = field(default_factory=dict)
 
     def train_member_ids_in_custody(self) -> frozenset[str]:
         return frozenset(self.custody)
@@ -243,6 +290,9 @@ class _FakeLane:
         self, label: str, member_ids: Sequence[str], *, strip_unlanded_base: bool,
     ) -> dict[str, MemberRedriveOutcome]:
         self.calls.append((list(member_ids), strip_unlanded_base))
+        for mid in member_ids:
+            if (hook := self.during_redrive.get(mid)) is not None:
+                await hook()
         if self.raises_for & set(member_ids):
             raise RuntimeError('lane exploded')
         return {
@@ -282,11 +332,14 @@ class _Sweep:
     lane: _FakeLane
     tasks: _FakeTasks
     queue: EscalationQueue | None
+    config: OrchestratorConfig
+    requests: InFlightMergeRegistry = field(default_factory=InFlightMergeRegistry)
     sweep: AbandonedMemberSweep = field(default_factory=AbandonedMemberSweep)
 
     async def run(self, *, lane: Any = ...):
         return await self.sweep.run_pass(
             lane=self.lane if lane is ... else lane,
+            requests=self.requests,
             tasks=self.tasks,
             escalations=self.queue,
             claimant_ttl=TTL,
@@ -309,6 +362,7 @@ def sweep(tmp_path: Path) -> _Sweep:
         lane=_FakeLane(),
         tasks=_FakeTasks(rows=[_row('a')]),
         queue=EscalationQueue(tmp_path / 'esc'),
+        config=OrchestratorConfig(project_root=tmp_path),
     )
 
 
@@ -508,6 +562,7 @@ class TestOwnership:
         sweep = _Sweep(
             lane=_FakeLane(), tasks=_FakeTasks(rows=[_row('a')]),
             queue=_UnreadableQueue(tmp_path / 'esc'),
+            config=OrchestratorConfig(project_root=tmp_path),
         )
         await sweep.run()
         report = await sweep.run()
@@ -591,6 +646,65 @@ class TestOwnership:
         assert sweep.redriven() == []
 
 
+@pytest.mark.asyncio
+class TestLiveSingleRequest:
+    """A merge-deferred task whose single merge request is live (task 7022)."""
+
+    @pytest.fixture
+    def carry(self, sweep: _Sweep) -> _Sweep:
+        sweep.tasks.rows = [_row('c', claimant_run_id='run-dead')]
+        return sweep
+
+    async def test_a_queued_single_holds_its_member_across_two_passes(
+        self, carry: _Sweep,
+    ) -> None:
+        await submit_single(carry.requests, single_request(carry.config, 'c'))
+
+        await carry.run()
+        report = await carry.run()
+
+        assert carry.redriven() == []
+        assert carry.filed('c') == []
+        assert report.owners[ParkedOwner.SINGLE_REQUEST] == 1
+        assert 'c' not in report.suspects
+
+    @pytest.mark.parametrize('resolve', ['blocked', 'merge_cancel'])
+    async def test_a_resolved_single_releases_its_member(
+        self, carry: _Sweep, resolve: str,
+    ) -> None:
+        req = single_request(carry.config, 'c')
+        await submit_single(carry.requests, req)
+        await carry.run()
+        await carry.run()
+
+        if resolve == 'blocked':
+            req.result.set_result(MergeOutcome('blocked', reason='main is red'))
+        else:
+            req.result.cancel()
+        await asyncio.sleep(0)
+        await carry.run()
+        report = await carry.run()
+
+        assert carry.redriven() == [(['c'], True)]
+        assert report.outcomes == {'c': MemberRedriveOutcome.NOT_ON_MAIN}
+        assert [(esc.level, esc.severity) for esc in carry.filed('c')] == [(0, 'info')]
+
+    async def test_a_single_submitted_mid_pass_is_not_redriven(self, carry: _Sweep) -> None:
+        carry.tasks.rows = [_row('a'), _row('b')]
+
+        async def submit_for_b() -> None:
+            await submit_single(carry.requests, single_request(carry.config, 'b'))
+
+        carry.lane.during_redrive['a'] = submit_for_b
+        await carry.run()
+        report = await carry.run()
+
+        assert carry.redriven() == [(['a'], True)]
+        assert set(report.outcomes) == {'a'}
+        assert carry.filed('b') == []
+        assert 'b' in report.suspects
+
+
 # ---------------------------------------------------------------------------
 # Part 3: members a restart left parked, against real collaborators
 # ---------------------------------------------------------------------------
@@ -661,22 +775,26 @@ class TestRecoveryAfterARestart:
         d1_tip = await _rev_parse(root, 'task/d1')
 
         sched = ParkedScheduler()
-        await sched.park('landed', 'unlanded', 'stacked', 'live1', 'live2')
+        await sched.park('landed', 'unlanded', 'stacked', 'live1', 'live2', 'carrier')
         await sched.park('d0', 'd1', train_id='train-d0-4737')
         queue = EscalationQueue(tmp_path / 'esc')
         intake: asyncio.Queue = asyncio.Queue()
         worker = SpeculativeMergeWorker(
             git_ops, intake, train_callback_factory=build_train_callback_factory(sched),
         )
+        registry = InFlightMergeRegistry()
         sweep = AbandonedMemberSweep()
 
         async def run_pass():
             return await sweep.run_pass(
-                lane=worker, tasks=sched, escalations=queue, claimant_ttl=TTL,
+                lane=worker, requests=registry, tasks=sched, escalations=queue,
+                claimant_ttl=TTL,
             )
 
         worker.halt_for_wip('test')
         await intake.put(held_train_request(git_ops, sched, 'train-live-4737', ['live1', 'live2']))
+        config = OrchestratorConfig(project_root=root, git=git_ops.config)
+        await submit_single(registry, single_request(config, 'carrier'), intake)
         parked = {tid: list(history) for tid, history in sched.statuses.items()}
         async with running_merge_worker(worker):
             await until_custody(worker, frozenset({'live1', 'live2'}))
@@ -691,20 +809,21 @@ class TestRecoveryAfterARestart:
             assert latest == {
                 'landed': 'done', 'unlanded': 'pending', 'stacked': 'pending',
                 'live1': 'merge-deferred', 'live2': 'merge-deferred',
-                'd0': 'merge-deferred', 'd1': 'pending',
+                'd0': 'merge-deferred', 'd1': 'pending', 'carrier': 'merge-deferred',
             }
             assert sched.provenance['landed']['kind'] == 'found_on_main'
             assert not await git_ops.is_ancestor(unlanded_commit, 'task/stacked')
             assert await _rev_parse(root, 'task/d1') == d1_tip
-            for tid in ('live1', 'live2', 'd0'):
+            for tid in ('live1', 'live2', 'd0', 'carrier'):
                 assert sched.statuses[tid] == parked[tid]
             for tid in ('landed', 'unlanded', 'stacked', 'd1'):
                 assert _abandoned_records(queue, tid) == [(0, 'info')]
-            for tid in ('d0', 'live1', 'live2'):
+            for tid in ('d0', 'live1', 'live2', 'carrier'):
                 assert queue.get_by_task(tid, status='pending') == []
 
             third = await run_pass()
 
         assert third.owners[ParkedOwner.TRAIN_PEER_ACTIVE] == 1
+        assert third.owners[ParkedOwner.SINGLE_REQUEST] == 1
         assert third.outcomes == {}
         assert sched.statuses['d0'] == parked['d0']

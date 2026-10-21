@@ -13,10 +13,12 @@ machine-readable form; :mod:`check_trickle_progress` reads it. A quiet
 night is recorded AS quiet and never alarms, so decision 7's stated
 rationale is satisfied rather than circumvented.
 
-Division of labour between the two probes:
+Division of labour between the probes:
 
 - ``check_trickle_liveness.sh``  — did the UNIT RUN? (systemd unit state)
 - ``check_trickle_progress.py``  — did SIGNAL FLOW? (this state file)
+- ``check_census_progress.py``   — did a FIRED census advance census-state?
+  (this state file + census-state.json)
 
 STDLIB-ONLY IMPORTS ARE A HARD CONSTRAINT, NOT A STYLE PREFERENCE.
 ``check_trickle_progress.py`` imports this module and, when bound as a
@@ -40,6 +42,7 @@ that let a suppressed night read like a quiet one for 14 nights
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -594,6 +597,105 @@ def _serialize_retry_backlog(backlog: Mapping[date, int]) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# The census-fire streak — did the census each FIRE launched advance
+# census-state?
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class CensusObservation:
+    """One night's census-trigger fact, as :func:`record_run` receives it.
+
+    ``last_census_at`` is the census-state value the trigger was evaluated
+    against, read BEFORE any launch: the launch is synchronous, so a census
+    that lands has already rewritten census-state by the time the night is
+    recorded. ``None`` means census-state had no value (never censused)."""
+
+    fired: bool
+    last_census_at: str | None
+    census_state_path: str
+
+
+@dataclasses.dataclass(frozen=True)
+class CensusFireStreak:
+    """``fires`` consecutive recorded nights on which the trigger FIRED
+    against one unchanged ``last_census_at`` at one ``census_state_path``,
+    starting on the target_date ``since``."""
+
+    fires: int
+    last_census_at: str | None
+    census_state_path: str
+    since: str
+
+
+def read_census_fire_streak(doc) -> CensusFireStreak | None:
+    """The ONE parser of a recorded ``census_fire_streak`` object, shared by
+    :func:`record_run`'s fold and ``check_census_progress.py``.
+
+    ``None`` for an absent, null or unusable streak. ``fires`` must be a
+    real int (not a bool) of at least 1."""
+    raw = doc.get('census_fire_streak') if isinstance(doc, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    fires = raw.get('fires')
+    anchor = raw.get('last_census_at')
+    path = raw.get('census_state_path')
+    since = raw.get('since')
+    if not isinstance(fires, int) or isinstance(fires, bool) or fires < 1:
+        return None
+    if anchor is not None and not isinstance(anchor, str):
+        return None
+    if not isinstance(path, str) or not isinstance(since, str):
+        return None
+    return CensusFireStreak(
+        fires=fires, last_census_at=anchor, census_state_path=path, since=since,
+    )
+
+
+def read_last_census_at(path: Path) -> tuple[str, object]:
+    """``('missing', None)``, ``('malformed', None)`` or ``('ok', raw
+    last_census_at)`` for census-state.json at *path*: the ONE read shared
+    by the nightly's pre-launch anchor and ``check_census_progress.py``'s
+    live comparison, so the two sides of its exact-equality test agree.
+
+    QUIET: ``census_trigger.load_census_state`` owns the malformed WARNING
+    for this file. Timestamps are deliberately not validated: the trigger
+    never FIREs on a malformed census-state, so no streak can be anchored
+    on one."""
+    if not path.exists():
+        return 'missing', None
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return 'malformed', None
+    if not isinstance(data, dict):
+        return 'malformed', None
+    return 'ok', data.get('last_census_at')
+
+
+def _fold_census_fire_streak(
+    prev: CensusFireStreak | None,
+    census: CensusObservation | None,
+    target_date: date,
+) -> CensusFireStreak | None:
+    if census is None:
+        return prev
+    if not census.fired:
+        return None
+    if (
+        prev is not None
+        and prev.last_census_at == census.last_census_at
+        and prev.census_state_path == census.census_state_path
+    ):
+        return dataclasses.replace(prev, fires=prev.fires + 1)
+    return CensusFireStreak(
+        fires=1,
+        last_census_at=census.last_census_at,
+        census_state_path=census.census_state_path,
+        since=target_date.isoformat(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # record_run — the writer
 # ---------------------------------------------------------------------------
 
@@ -614,6 +716,7 @@ def record_run(
     budget_suppressed: bool = False,
     capped: bool = False,
     scheduled: bool = False,
+    census: CensusObservation | None,
 ) -> dict:
     """Classify this run, fold it into the running streak, and write the
     state file atomically. Returns the document it wrote.
@@ -668,6 +771,15 @@ def record_run(
     actually do anything", so a *capped* night, which built its digests and
     coded none of them, still reads ``productive`` but is not stamped.
 
+    ``census_fire_streak`` counts consecutive FIREs against one unchanged
+    anchor (:class:`CensusObservation`): a FIRE with the streak's anchor and
+    path increments it, any other FIRE restarts it at 1, a NO-FIRE clears
+    it, and ``census=None`` (the trigger was not evaluated: the night failed
+    or was capped first) carries it forward, as ``failed`` carries the
+    barren streak. ``census`` is REQUIRED with no default, for the reason
+    :func:`classify_run` gives for ``exit_code``: a defaulted ``None`` would
+    silently blind ``check_census_progress.py`` into a permanent OK.
+
     A ``missing`` or ``malformed`` predecessor simply starts the streak at
     this run (and drops ``last_productive_at``): losing streak history
     degrades to UNDER-reporting, never to a crash inside the nightly run.
@@ -718,6 +830,10 @@ def record_run(
         scheduled=scheduled,
     )
 
+    census_streak = _fold_census_fire_streak(
+        read_census_fire_streak(prev), census, target_date,
+    )
+
     doc = {
         'schema_version': STATE_SCHEMA_VERSION,
         'project_id': project_id,
@@ -739,6 +855,11 @@ def record_run(
         ),
         'last_productive_at': last_productive_at,
         'last_scheduled_target_date': cursor.isoformat() if cursor else None,
+        'census_fired': None if census is None else census.fired,
+        'census_fire_streak': (
+            None if census_streak is None
+            else dataclasses.asdict(census_streak)
+        ),
         'counters': {
             'total_records': total_records,
             'zero_signal_dropped': zero_signal_dropped,
@@ -932,4 +1053,21 @@ anomaly on its own.
 A MODULE CONSTANT, NOT A ``legibility.yaml`` FIELD, for the same reason
 as its sibling above: reading that config would drag pydantic + PyYAML
 onto the bare-``python3`` predicate path this module must survive.
+"""
+
+DEFAULT_MAX_UNADVANCED_CENSUS_FIRES = 3
+"""Consecutive census-trigger FIREs against one unchanged ``last_census_at``
+before ``check_census_progress.py`` fails.
+
+WHY 3. One or two unadvanced fires can be a census deferred for usage
+headroom, which ``census.py``'s ``_defer`` already escalates at info. A
+census that DID advance blocks the trigger for the next ``floor_days``
+(stock 5) nights, so three consecutive unadvanced fires are persistent.
+The threshold bounds how many unadvanced paid censuses run BEFORE an
+operator is alerted, not how many run: nothing here stops the trigger, so
+every later FIRE still launches one until someone acts. A deferred census
+COUNTS toward the streak: nothing the pipeline records tells it apart.
+
+A MODULE CONSTANT, NOT A ``legibility.yaml`` FIELD, for the same reason
+as its siblings above.
 """

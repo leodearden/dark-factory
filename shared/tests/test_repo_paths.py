@@ -1,4 +1,4 @@
-"""Tests for orchestrator.repo_paths — dark-factory tooling-root resolution.
+"""Tests for shared.repo_paths — dark-factory tooling-root resolution.
 
 Task 3605 (census 2026-08-02 §1.3, codebook entry-cand-20260722-3): the watcher
 rotation spawn must inject DARK_FACTORY_ROOT so a cross-project rotation can run
@@ -21,13 +21,13 @@ from unittest.mock import patch
 
 import pytest
 
-from orchestrator.repo_paths import (
+from shared.repo_paths import (
     DARK_FACTORY_ROOT_ENV,
     rejected_dark_factory_root_override,
     resolve_dark_factory_root,
 )
 
-_LOGGER_NAME = 'orchestrator.repo_paths'
+_LOGGER_NAME = 'shared.repo_paths'
 
 #: The ascent seam.  Patched by every test that is really about ENV-OVERRIDE
 #: semantics, so those tests assert an exact path rather than depending on
@@ -36,7 +36,7 @@ _LOGGER_NAME = 'orchestrator.repo_paths'
 #: layout the None branch exists for — an unpatched ascent legitimately returns
 #: None and an unpatched fallthrough test would fail for a reason unrelated to
 #: what it claims to test.
-_ASCENT = 'orchestrator.repo_paths._ascend_for_rearm_marker'
+_ASCENT = 'shared.repo_paths._ascend_for_rearm_marker'
 
 
 def _make_fake_checkout(base: Path) -> Path:
@@ -93,14 +93,14 @@ class TestResolveDarkFactoryRoot:
         """The walk is keyed on the MARKER, so an inner `.git` cannot terminate it.
 
         Regression pin for the reason this module does not reuse
-        verify_runner.resolve_local_df_checkout: that helper returns the FIRST
+        deployed_sha.resolve_code_checkout: that helper returns the FIRST
         ancestor containing `.git` and stops.  Under a dark-factory checkout
         nested inside an outer git repo (vendored tree, repo-of-repos, an
         editable install under a parent workspace) the first `.git` hit carries
         no watcher-rearm.sh, and terminating there would resolve to None even
         though a perfectly good tooling root sits directly above it.
         """
-        from orchestrator.repo_paths import _ascend_for_rearm_marker
+        from shared.repo_paths import _ascend_for_rearm_marker
 
         df_root = _make_fake_checkout(tmp_path / 'df')
         inner = df_root / 'vendor' / 'inner-repo'
@@ -115,7 +115,7 @@ class TestResolveDarkFactoryRoot:
         self, tmp_path: Path
     ) -> None:
         """A tree with no marker anywhere above it resolves to None, not to `/`."""
-        from orchestrator.repo_paths import _ascend_for_rearm_marker
+        from shared.repo_paths import _ascend_for_rearm_marker
 
         # tmp_path has no scripts/watcher-rearm.sh at any level up to `/`.
         assert _ascend_for_rearm_marker(start=tmp_path) is None

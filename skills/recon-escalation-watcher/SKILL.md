@@ -562,6 +562,9 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
        # dead. This is a SUCCESS, not a failure: do NOT retry (a retry just
        # re-hits the same guard) and do NOT record a task id.
        resolve_issue(..., action='close_only', resolution="Ticket <res['reason']>")   # res["reason"] already reads "refused (no task created): ..."
+   elif res["status"] == "awaiting_curation":
+       # Parked for curation: no task_id yet, NOT a failure. Do NOT re-submit.
+       resolve_issue(..., action='resume', resolution="Queued for curation (ticket <sub['ticket']>)")
    elif res["status"] == "failed":
        # Retryable (`server_restart`, `timeout`): apply
        # _shared/ticket-failure-handling.md's retry policy (retry

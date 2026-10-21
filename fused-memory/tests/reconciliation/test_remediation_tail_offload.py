@@ -28,9 +28,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import shlex
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -65,20 +68,21 @@ PROJECT_ROOT = '/tmp/test-project'
 
 TICK_SECONDS = 0.005
 
-#: How long each stubbed blocking primitive sleeps, in the thread it should be
-#: running in — a margin over scheduler jitter, not a timing the code relies on.
-SCAN_BLOCK_SECONDS = 1.0
-PROBE_BLOCK_SECONDS = 1.0
+#: How long each stubbed slow primitive takes, off the loop where it belongs —
+#: a margin over scheduler jitter, not a timing the code relies on.
+SCAN_BLOCK_SECONDS = 2.0
+PROBE_BLOCK_SECONDS = 2.0
+GIT_BLOCK_SECONDS = 2.0
 
 
 def _max_gap_ceiling(blocked_seconds: float) -> float:
     """The longest loop stall tolerated while *blocked_seconds* of work runs.
 
     A call held on the loop thread stalls it for at least *blocked_seconds*;
-    offloaded, the worst gap is only scheduler jitter.  Half the block splits
-    the two.
+    offloaded, the worst gap is only scheduler jitter.  Three quarters of the
+    block sits between the two.
     """
-    return blocked_seconds / 2
+    return blocked_seconds * 0.75
 
 
 # ── Local harness scaffolding (mirrors tests/test_harness.py) ────────────────
@@ -357,7 +361,7 @@ class TestArchiveScanLeavesTheLoop:
     async def test_loop_keeps_ticking_while_the_archive_is_scanned(
         self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
     ):
-        """A second of scan must not cost the loop a second of silence.
+        """Seconds of scan must not cost the loop seconds of silence.
 
         Task 901 reads as live so nothing escalates: `_escalate` still fsyncs
         on the loop (task 5270), and under load that stall would be measured
@@ -455,8 +459,7 @@ class TestArchiveScanLeavesTheLoop:
 # ── SITE 2: the live-workflow git probes ─────────────────────────────────────
 
 
-def _stub_probe(monkeypatch, probed: list, *, live_ids: frozenset[str] = frozenset(),
-                block: float = PROBE_BLOCK_SECONDS):
+def _stub_detector(monkeypatch, probed: list, *, live_ids: frozenset[str], block: float):
     """Replace the live-workflow detector with a slow stub that records ids.
 
     Stands in for ``is_workflow_live_for_task``, a coroutine since task 3778
@@ -471,6 +474,42 @@ def _stub_probe(monkeypatch, probed: list, *, live_ids: frozenset[str] = frozens
         return str(tid) in live_ids
 
     monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', _is_live)
+
+
+def _stub_probe(monkeypatch, probed: list, *, live_ids: frozenset[str] = frozenset(),
+                block: float = PROBE_BLOCK_SECONDS):
+    """``_stub_detector``, with the worktree index the pass hoists stubbed out too.
+
+    The real index spawns a ``git worktree list`` inside the measured window.
+    ``TestHoistedWorktreeIndexLeavesTheLoop`` is the one test that keeps it.
+    """
+
+    async def _no_worktree_index(_project_root):
+        return {}
+
+    _stub_detector(monkeypatch, probed, live_ids=live_ids, block=block)
+    monkeypatch.setattr(harness_module, 'worktree_index_kwargs', _no_worktree_index)
+
+
+def _slow_git_first_on_path(monkeypatch, tmp_path: Path, *, block: float) -> Path:
+    """Put a ``git`` that takes *block* seconds first on PATH; return its call log.
+
+    Every invocation appends its arguments to the log, sleeps, then answers
+    with an empty successful listing, which reads as a known-empty worktree
+    index.
+    """
+    bin_dir = tmp_path / 'slow-git-bin'
+    bin_dir.mkdir()
+    call_log = tmp_path / 'slow-git-calls'
+    git = bin_dir / 'git'
+    git.write_text(
+        '#!/bin/sh\n'
+        f'echo "$*" >> {shlex.quote(str(call_log))}\n'
+        f'sleep {block}\n'
+    )
+    git.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
+    return call_log
 
 
 class TestLiveWorkflowProbesLeaveTheLoopAndAreMemoised:
@@ -648,6 +687,45 @@ class TestRoutedTargetGateUsesTheSameMemo:
         assert probed == ['901', '902'], (
             f'expected 902 to be probed once (as a cited id) and then served from '
             f'the memo to the routed-target gate, got {probed}'
+        )
+
+
+class TestHoistedWorktreeIndexLeavesTheLoop:
+    """The one ``git worktree list`` the pass hoists must not hold the loop.
+
+    This test keeps the real ``worktree_index_kwargs`` and makes ``git``
+    itself slow, so a hoist that spawned git blockingly, through any spawn
+    API, would stall the loop for the whole of git's run.
+    """
+
+    @pytest.mark.asyncio
+    async def test_loop_keeps_ticking_while_the_worktree_index_is_listed(
+        self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
+    ):
+        """Task 901 reads as live so nothing escalates: `_escalate` still
+        fsyncs on the loop (task 5270), and under load that stall would be
+        measured instead of git's."""
+        git_calls = _slow_git_first_on_path(monkeypatch, tmp_path, block=GIT_BLOCK_SECONDS)
+        _stub_scan(monkeypatch, [], block=0.0)
+        _stub_detector(monkeypatch, [], live_ids=frozenset({'901'}), block=0.0)
+        _, _, run_pass = await _prepare_pass(
+            journal=journal, event_buffer=event_buffer, memory_service=memory_service,
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+            findings=[_finding_citing('901')],
+            cited_tasks=[_in_progress_task('901')],
+        )
+
+        ticks, worst = await _worst_loop_stall(run_pass())
+
+        assert git_calls.exists() and 'worktree list' in git_calls.read_text(), (
+            'the hoisted worktree list never reached git — the index is not exercised'
+        )
+        assert ticks, 'the ticker never ran — the measurement is vacuous'
+        assert worst < _max_gap_ceiling(GIT_BLOCK_SECONDS), (
+            f'the event loop stalled for {worst * 1000:.0f}ms during the pass; '
+            f'the hoisted worktree list is spawning git inline on the loop '
+            f'(git takes {GIT_BLOCK_SECONDS * 1000:.0f}ms, so a stall at or above '
+            f'that is git holding the loop thread)'
         )
 
 

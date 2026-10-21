@@ -73,6 +73,19 @@ carries the inputs the context-complete reviewer briefing (ruling D2, task
 The loader is tolerant: a fixture without `context` loads with
 `CorpusDiff.context is None`, and `save()` omits the key for it.
 
+Every panel runs in its own scratch clone
+(`checkout.py::fixture_checkout`). The clone is a `git clone --shared` of the
+fixture's source repository, detached at `base_sha`, with the stored diff
+applied and committed, so HEAD is the reviewed tree and HEAD^ is its base.
+Every arm, diff-only included, runs at the clone root, and the clone is
+removed when the panel ends. A context-complete (`d2`) arm needs two things:
+
+- `context`: `runner.py::run_trial` refuses a corpus lacking it before it
+  spends anything;
+- a materialisable base: a fixture with `base_sha: null`, or a diff that
+  `git apply` rejects, is skipped for that arm and logged, with no result. The
+  diff-only arm still reviews it, without the change applied.
+
 ## Split (train / selection / test, 2:1:7)
 
 Every diff carries a `split`, assigned by `mining.assign_split(diff_ids, seed)`

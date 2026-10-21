@@ -24,14 +24,35 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
 from orchestrator.verify import VerifyResult
+
+# Lever C explicitly OFF for the drift tests that are not about it (task 4537).
+#
+# conftest.py::_isolate_orch_config is AUTOUSE and pins ORCH_CONFIG_PATH at this
+# repo's OWN dark-factory-orchestrator.yaml, which DECLARES verify_env_probes.
+# A real OrchestratorConfig built in a test therefore INHERITS them, and
+# orchestrator/src/orchestrator/merge_lane/drift.py::_run_drift_check calls
+# check_env with no `local_run` — so the
+# local fingerprint is captured through verify_runner.py::env_probe_local_run,
+# i.e. real create_subprocess_exec calls against whatever is on PATH (npx, uv,
+# node, python3, plus the hardcoded rustc/cargo/sccache), none of them
+# timeout-bounded and npx reaching the npm registry on a cold cache.
+#
+# check_env probes the remote FIRST, so these tests' MagicMock remote fails the
+# capture before any of that happens.  Relying on that would be relying on an
+# accident of the fake, and it still logs a WARNING traceback per test.  Saying
+# "no probes" out loud keeps them hermetic on purpose and by construction — the
+# guard order in check_env makes an empty list return before it touches a host.
+_LEVER_C_OFF: list = []
 
 
 def test_merge_drift_exports_moved_public_symbols() -> None:
@@ -325,7 +346,7 @@ class TestDriftCheckFullGateSpecNoDerivation:
         from orchestrator.verify_runner import HostAllocator
 
         git_ops = MagicMock()
-        git_ops.create_throwaway_verify_worktree = AsyncMock(
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(
             return_value=Path('/repo/_throwaway')
         )
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -339,8 +360,10 @@ class TestDriftCheckFullGateSpecNoDerivation:
         req.config = OrchestratorConfig(
             project_root=tmp_path,
             verify_runners=[  # type: ignore[arg-type]
-                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin',
+                 'df_checkout_path': '/df'},
             ],
+            verify_env_probes=_LEVER_C_OFF,
         )
 
         pass_result = VerifyResult(
@@ -400,12 +423,574 @@ class TestDriftCheckFullGateSpecNoDerivation:
 
 
 # ---------------------------------------------------------------------------
+# task 4537 step-15: env-divergence detection wired into the LIVE drift path
+# ---------------------------------------------------------------------------
+
+_ENV_PROBE_CONFIG: Any = [{'key': 'pyright', 'argv': ['npx', 'pyright', '--version']}]
+
+# Measured on the two real hosts 2026-08-20: the workstation and leo-laptop
+# resolve DIFFERENT unpinned pyright builds through bare `npx pyright`.
+_LOCAL_PROBE_OUTPUT = {'npx pyright --version': 'pyright 1.1.403\n'}
+_REMOTE_PROBE_OUTPUT_MATCHING = dict(_LOCAL_PROBE_OUTPUT)
+_REMOTE_PROBE_OUTPUT_SKEWED = {'npx pyright --version': 'pyright 1.1.377\n'}
+
+
+def _make_env_probe_seam(outputs):
+    """async (argv, *, cwd=None) probe seam driven by a joined-argv → stdout map.
+
+    Records every argv it is handed on ``.issued`` so a test can assert that
+    the OPERATOR-declared probe reached the host, rather than some hardcoded
+    set.  An unmapped command returns rc=127 — the 'command not found' rc
+    capture_env_fingerprint normalises a local ENOENT to — so the Rust probes
+    read as uniformly-absent on both sides instead of raising.
+    """
+    issued: list[list[str]] = []
+
+    async def run(argv, *, cwd=None):
+        issued.append(list(argv))
+        joined = ' '.join(argv)
+        if joined in outputs:
+            return (0, outputs[joined], '')
+        return (127, '', f'{argv[0]}: command not found')
+
+    recording: Any = run
+    recording.issued = issued
+    return recording
+
+
+async def _unscoped_seam_tripwire(argv, *, cwd=None):
+    """Stand-in for ``_default_subprocess_run`` that must never be called.
+
+    ``check_env`` routes its LOCAL capture through
+    ``verify_runner.env_probe_local_run`` (the ``_target_subprocess_env``
+    scrub), NOT through ``capture_env_fingerprint``'s own
+    ``_default_subprocess_run`` default, which passes no ``env=`` and so
+    inherits the orchestrator daemon's ``uv run`` venv activation.  Patching
+    the fallback with this keeps the wiring tests off the real machine either
+    way, and turns a routing regression into a legible failure instead of a
+    surprise `npx pyright --version` against the npm registry.
+    """
+    raise AssertionError(
+        'the local env probe was issued through _default_subprocess_run — the '
+        "unscoped seam that inherits the daemon's venv activation, under which "
+        f'`python3` resolves .venv/bin/python3 — for argv={argv!r}'
+    )
+
+
+class _RecordingEventStore(EventStore):
+    """Records (event_type, data) pairs — the drift path's None-safe sink.
+
+    Subclasses EventStore (skipping its __init__, so no sqlite file is opened)
+    rather than duck-typing it: ``_run_drift_check``'s ``event_store``
+    parameter is declared ``EventStore | None``, and pyright over ``tests`` is
+    clause 2 of this repo's merge-verify type gate.  Same shape as the
+    pre-existing ``_FakeEventStore`` stand-ins in this file.
+    """
+
+    def __init__(self) -> None:
+        object.__init__(self)
+        self.emitted: list[tuple] = []
+
+    def emit(
+        self,
+        event_type: EventType,
+        *,
+        task_id: str | None = None,
+        phase: str | None = None,
+        role: str | None = None,
+        data: dict | None = None,
+        cost_usd: float | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
+        self.emitted.append((event_type, data or {}))
+
+    def types(self) -> list:
+        return [t for t, _ in self.emitted]
+
+    def data_for(self, event_type) -> list[dict]:
+        return [d for t, d in self.emitted if t == event_type]
+
+
+class _RecordingEscalationQueue:
+    """EscalationQueue stand-in with faithful has_open_l1 dedup semantics."""
+
+    def __init__(self) -> None:
+        self.submitted: list = []
+        self._seq = 0
+
+    def make_id(self, task_id):
+        self._seq += 1
+        return f'esc-{task_id}-{self._seq}'
+
+    def submit(self, esc):
+        self.submitted.append(esc)
+
+    def has_open_l1(self, task_id, *, category=None):
+        return any(
+            e.task_id == task_id
+            and e.level == 1
+            and e.status == 'pending'
+            and (category is None or e.category == category)
+            for e in self.submitted
+        )
+
+
+@pytest.mark.asyncio
+class TestDriftCheckEnvDivergenceWiring:
+    """_run_drift_check actually RUNS the env check — the wiring 4537 exists for.
+
+    EnvFingerprint / capture_env_fingerprint / compare_env_fingerprints were
+    tested for months with zero production callers.  These tests assert BOTH
+    arms through the live path: a matching pair emits the faithful outcome and
+    files nothing, a perturbed pair emits divergence naming the dimension and
+    the probe and files exactly one escalation.  A test of the matching arm
+    alone would be passed by a detector that never fires.
+    """
+
+    async def _run(self, tmp_path, *, remote_output, probes=_ENV_PROBE_CONFIG):
+        """Drive _run_drift_check with a 2-host pool and controllable probes.
+
+        Returns (event_store, escalation_queue, local_seam, remote_seam).
+        """
+        from orchestrator.merge_lane.drift import _run_drift_check
+        from orchestrator.verify_runner import HostAllocator
+
+        git_ops = MagicMock()
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(
+            return_value=Path('/repo/_throwaway')
+        )
+        git_ops.cleanup_merge_worktree = AsyncMock()
+
+        req = MagicMock()
+        req.task_id = 'task-env-drift'
+        req.task_files = None
+        req.module_configs = []
+        req.config = OrchestratorConfig(
+            project_root=tmp_path, verify_env_probes=probes,
+        )
+
+        pass_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        remote_seam = _make_env_probe_seam(remote_output)
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
+        fake_remote.env_probe_run = MagicMock(return_value=remote_seam)
+        allocator = HostAllocator([fake_remote], quarantine=set())
+
+        local_seam = _make_env_probe_seam(_LOCAL_PROBE_OUTPUT)
+        event_store = _RecordingEventStore()
+        escalation_queue = _RecordingEscalationQueue()
+
+        with (
+            patch(
+                'orchestrator.merge_lane.worker.run_scoped_verification',
+                AsyncMock(return_value=pass_result),
+            ),
+            # The LOCAL host is probed through check_env's scoped seam
+            # (_target_subprocess_env + cwd=$HOME); patching it keeps the test
+            # off the real machine.  The unscoped fallback is patched with a
+            # tripwire so a routing regression fails loudly rather than
+            # silently spawning the probes for real.
+            patch('orchestrator.verify_runner.env_probe_local_run', local_seam),
+            patch(
+                'orchestrator.verify_runner._default_subprocess_run',
+                _unscoped_seam_tripwire,
+            ),
+        ):
+            await _run_drift_check(
+                git_ops, req, 'commit-sha', escalation_queue, event_store, set(),
+                allocator=allocator, verifier=PRODUCTION_VERIFIER,
+            )
+        return event_store, escalation_queue, local_seam, remote_seam
+
+    async def test_matching_hosts_emit_env_parity_and_file_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.event_store import EventType
+
+        event_store, queue, _, _ = await self._run(
+            tmp_path, remote_output=_REMOTE_PROBE_OUTPUT_MATCHING,
+        )
+        assert EventType.verify_env_parity_ok in event_store.types()
+        assert EventType.verify_env_divergence not in event_store.types()
+        assert queue.submitted == []
+
+    async def test_matching_hosts_still_run_the_verdict_drift_check(
+        self, tmp_path: Path,
+    ) -> None:
+        """The pre-existing alarm keeps firing alongside the new one."""
+        from orchestrator.event_store import EventType
+
+        event_store, _, _, _ = await self._run(
+            tmp_path, remote_output=_REMOTE_PROBE_OUTPUT_MATCHING,
+        )
+        assert EventType.verdict_parity_ok in event_store.types()
+
+    async def test_skewed_probe_emits_divergence_naming_dimension_and_probe(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.event_store import EventType
+
+        event_store, _, _, _ = await self._run(
+            tmp_path, remote_output=_REMOTE_PROBE_OUTPUT_SKEWED,
+        )
+        payloads = event_store.data_for(EventType.verify_env_divergence)
+        assert len(payloads) == 1
+        data = payloads[0]
+        assert tuple(data['drift_dimensions']) == ('extra_probes',)
+        assert data['diverging_probes'] == {
+            'pyright': {'local': 'pyright 1.1.403', 'remote': 'pyright 1.1.377'}
+        }
+        assert EventType.verify_env_parity_ok not in event_store.types()
+
+    async def test_skewed_probe_files_exactly_one_escalation(
+        self, tmp_path: Path,
+    ) -> None:
+        _, queue, _, _ = await self._run(
+            tmp_path, remote_output=_REMOTE_PROBE_OUTPUT_SKEWED,
+        )
+        assert len(queue.submitted) == 1
+        esc = queue.submitted[0]
+        assert esc.category == 'verify_env_divergence'
+        assert esc.level == 1
+        blob = esc.summary + esc.detail
+        assert 'pyright' in blob
+        assert 'pyright 1.1.403' in blob
+        assert 'pyright 1.1.377' in blob
+
+    async def test_skewed_probe_does_not_quarantine_the_remote(
+        self, tmp_path: Path,
+    ) -> None:
+        """Fail-safe: env drift must not bench a verify host.
+
+        quarantine_set alone would NOT discriminate here — it is fed only by
+        detector.check()'s result, so a check_env that quarantined the remote
+        would leave it empty anyway (check() would then find no eligible
+        remote and go INCONCLUSIVE).  Mutation-tested: adding a quarantine
+        call to check_env leaves the set assertion green.  The load-bearing
+        assertion is that verdict_parity_ok is STILL emitted, which is only
+        possible if the remote was still eligible when check() ran.
+        """
+        quarantine_set: set[str] = set()
+        from orchestrator.merge_lane.drift import _run_drift_check
+        from orchestrator.verify_runner import HostAllocator
+
+        git_ops = MagicMock()
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(
+            return_value=Path('/repo/_throwaway')
+        )
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        req = MagicMock()
+        req.task_id = 'task-env-drift-noquarantine'
+        req.task_files = None
+        req.module_configs = []
+        req.config = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_env_probes=_ENV_PROBE_CONFIG,
+        )
+        pass_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
+        fake_remote.env_probe_run = MagicMock(
+            return_value=_make_env_probe_seam(_REMOTE_PROBE_OUTPUT_SKEWED)
+        )
+        allocator = HostAllocator([fake_remote], quarantine=set())
+        event_store = _RecordingEventStore()
+        with (
+            patch(
+                'orchestrator.merge_lane.worker.run_scoped_verification',
+                AsyncMock(return_value=pass_result),
+            ),
+            patch(
+                'orchestrator.verify_runner.env_probe_local_run',
+                _make_env_probe_seam(_LOCAL_PROBE_OUTPUT),
+            ),
+            patch(
+                'orchestrator.verify_runner._default_subprocess_run',
+                _unscoped_seam_tripwire,
+            ),
+        ):
+            await _run_drift_check(
+                git_ops, req, 'commit-sha', _RecordingEscalationQueue(),
+                event_store, quarantine_set, allocator=allocator, verifier=PRODUCTION_VERIFIER,
+            )
+        from orchestrator.event_store import EventType
+        assert quarantine_set == set()
+        assert EventType.verify_env_divergence in event_store.types(), (
+            'the env check must actually have fired, or the no-quarantine '
+            'assertion below is vacuous'
+        )
+        assert EventType.verdict_parity_ok in event_store.types(), (
+            'the remote was benched by the env check: the verdict drift check '
+            f'found no eligible remote.  emitted: {event_store.types()!r}'
+        )
+
+    async def test_operator_declared_argv_is_what_reaches_both_hosts(
+        self, tmp_path: Path,
+    ) -> None:
+        """The probe set comes from config, not from a hardcoded Rust list."""
+        _, _, local_seam, remote_seam = await self._run(
+            tmp_path,
+            remote_output=_REMOTE_PROBE_OUTPUT_MATCHING,
+            probes=[{'key': 'uv', 'argv': ['uv', '--version']}],
+        )
+        assert ['uv', '--version'] in local_seam.issued
+        assert ['uv', '--version'] in remote_seam.issued
+        assert ['npx', 'pyright', '--version'] not in remote_seam.issued
+
+    async def test_empty_probe_list_emits_no_env_event_and_probes_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        """The shipped default is inert: no env event, no host touched."""
+        from orchestrator.event_store import EventType
+
+        event_store, queue, local_seam, remote_seam = await self._run(
+            tmp_path, remote_output=_REMOTE_PROBE_OUTPUT_MATCHING, probes=[],
+        )
+        assert EventType.verify_env_parity_ok not in event_store.types()
+        assert EventType.verify_env_divergence not in event_store.types()
+        assert queue.submitted == []
+        assert local_seam.issued == []
+        assert remote_seam.issued == []
+        # ...and the pre-existing verdict check is untouched by all of that.
+        assert EventType.verdict_parity_ok in event_store.types()
+
+    async def test_unprobeable_remote_spawns_no_local_subprocess(
+        self, tmp_path: Path,
+    ) -> None:
+        """A remote whose probe seam is unusable must cost ZERO local spawns.
+
+        merge_drift's ``_run_drift_check`` calls ``check_env`` with NO
+        ``local_run``, so the local fingerprint is captured through
+        ``verify_runner.env_probe_local_run`` — real
+        ``create_subprocess_exec`` calls against whatever is on PATH (rustc,
+        cargo, sccache, plus every declared probe; ``npx`` reaches the npm
+        registry on a cold cache, and nothing applies a timeout).
+
+        That has to be reached only when a comparison is actually possible.
+        The remote here is a bare MagicMock — the shape every drift test that
+        predates Lever C uses — so its auto-mocked ``env_probe_run()`` returns
+        a non-awaitable and the remote capture cannot succeed.  Probing the
+        remote FIRST makes that discovery free; probing the local host first
+        spends seven unpinned external commands to build a fingerprint that is
+        then thrown away.
+        """
+        from orchestrator.merge_lane.drift import _run_drift_check
+        from orchestrator.verify_runner import HostAllocator
+
+        git_ops = MagicMock()
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(
+            return_value=Path('/repo/_throwaway')
+        )
+        git_ops.cleanup_merge_worktree = AsyncMock()
+
+        req = MagicMock()
+        req.task_id = 'task-env-drift-no-local-spawn'
+        req.task_files = None
+        req.module_configs = []
+        req.config = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_env_probes=_ENV_PROBE_CONFIG,
+        )
+
+        pass_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
+        allocator = HostAllocator([fake_remote], quarantine=set())
+
+        local_seam = _make_env_probe_seam(_LOCAL_PROBE_OUTPUT)
+        event_store = _RecordingEventStore()
+
+        with (
+            patch(
+                'orchestrator.merge_lane.worker.run_scoped_verification',
+                AsyncMock(return_value=pass_result),
+            ),
+            patch('orchestrator.verify_runner.env_probe_local_run', local_seam),
+            # Both local seams are stubbed: the assertion below is "no local
+            # spawn happened", and a stub on only ONE of them would let a
+            # regression satisfy it by spawning through the other for real.
+            patch(
+                'orchestrator.verify_runner._default_subprocess_run',
+                _unscoped_seam_tripwire,
+            ),
+        ):
+            await _run_drift_check(
+                git_ops, req, 'commit-sha', _RecordingEscalationQueue(), event_store,
+                set(), allocator=allocator, verifier=PRODUCTION_VERIFIER,
+            )
+
+        assert local_seam.issued == [], (
+            f'the local host was probed {len(local_seam.issued)} time(s) for a '
+            f'comparison that could never complete: {local_seam.issued!r} — on '
+            f'the production path these are unpinned, untimed external binaries'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 4537 step-17: the NEW env check must never break the OLD verdict check
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEnvCheckCannotBreakVerdictDriftCheck:
+    """A broken env probe must not take the pre-existing verdict alarm with it.
+
+    The verdict drift check is load-bearing: it is what catches a remote PASS
+    against a local trust-anchor FAIL, the split that lands unverified code on
+    main.  The env check is a brand-new detective bolted in front of it.  If
+    the two shared one try block, any failure in the new code — an ssh probe
+    hanging up, a malformed probe argv, a bug in check_env itself — would skip
+    detector.check() entirely and silently disarm the older alarm.
+
+    So the env check gets its OWN try/except, and this test is the proof.
+    """
+
+    async def test_env_check_exception_still_runs_the_verdict_check(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        import logging
+
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_lane.drift import _run_drift_check
+        from orchestrator.verify_runner import DriftDetector, HostAllocator
+
+        git_ops = MagicMock()
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(
+            return_value=Path('/repo/_throwaway')
+        )
+        git_ops.cleanup_merge_worktree = AsyncMock()
+
+        req = MagicMock()
+        req.task_id = 'task-env-check-blast-radius'
+        req.task_files = None
+        req.module_configs = []
+        req.config = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_env_probes=_ENV_PROBE_CONFIG,
+        )
+
+        pass_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
+        fake_remote.env_probe_run = MagicMock(
+            return_value=_make_env_probe_seam(_REMOTE_PROBE_OUTPUT_MATCHING)
+        )
+        allocator = HostAllocator([fake_remote], quarantine=set())
+        event_store = _RecordingEventStore()
+
+        async def _explode(*args, **kwargs):
+            raise RuntimeError('env probe seam blew up')
+
+        with (
+            patch(
+                'orchestrator.merge_lane.worker.run_scoped_verification',
+                AsyncMock(return_value=pass_result),
+            ),
+            patch.object(DriftDetector, 'check_env', _explode),
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
+        ):
+            await _run_drift_check(
+                git_ops, req, 'commit-sha', _RecordingEscalationQueue(),
+                event_store, set(), allocator=allocator, verifier=PRODUCTION_VERIFIER,
+            )
+
+        assert EventType.verdict_parity_ok in event_store.types(), (
+            'an exception from the NEW env check swallowed the PRE-EXISTING '
+            f'verdict drift check; emitted: {event_store.types()!r}'
+        )
+
+    async def test_env_check_exception_is_logged_at_warning(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Swallowed must not mean silent — a broken probe has to be visible."""
+        import logging
+
+        from orchestrator.merge_lane.drift import _run_drift_check
+        from orchestrator.verify_runner import DriftDetector, HostAllocator
+
+        git_ops = MagicMock()
+        git_ops.create_ephemeral_verify_worktree = AsyncMock(
+            return_value=Path('/repo/_throwaway')
+        )
+        git_ops.cleanup_merge_worktree = AsyncMock()
+
+        req = MagicMock()
+        req.task_id = 'task-env-check-logged'
+        req.task_files = None
+        req.module_configs = []
+        req.config = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_env_probes=_ENV_PROBE_CONFIG,
+        )
+
+        pass_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
+        fake_remote.env_probe_run = MagicMock(
+            return_value=_make_env_probe_seam(_REMOTE_PROBE_OUTPUT_MATCHING)
+        )
+        allocator = HostAllocator([fake_remote], quarantine=set())
+
+        async def _explode(*args, **kwargs):
+            raise RuntimeError('env probe seam blew up')
+
+        with (
+            patch(
+                'orchestrator.merge_lane.worker.run_scoped_verification',
+                AsyncMock(return_value=pass_result),
+            ),
+            patch.object(DriftDetector, 'check_env', _explode),
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify_runner'),
+        ):
+            await _run_drift_check(
+                git_ops, req, 'commit-sha', _RecordingEscalationQueue(),
+                _RecordingEventStore(), set(), allocator=allocator, verifier=PRODUCTION_VERIFIER,
+            )
+
+        env_warnings = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.verify_runner'
+            and r.levelno == logging.WARNING
+            and 'Env drift check failed' in r.getMessage()
+        ]
+        assert len(env_warnings) == 1, (
+            'expected exactly one env-specific WARNING naming the env check; '
+            f'saw: {[r.getMessage() for r in caplog.records]!r}'
+        )
+        assert env_warnings[0].exc_info is not None, (
+            'the warning must carry the traceback (exc_info=True) or a broken '
+            'probe is undiagnosable from the journal'
+        )
+        assert req.task_id in env_warnings[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
 # task 3018 (steps 11-12): a LIVE drift-check throwaway worktree must survive a
 # concurrent periodic reap.
 #
 # Sibling of TestColdShadowVerifyHoldsLaneLease in test_merge_shadow.py — the
 # drift detective creates its throwaway `_merge-<uuid>` worktree through the
-# very same `create_throwaway_verify_worktree` primitive and runs a full merge
+# very same `create_ephemeral_verify_worktree` primitive and runs a full merge
 # verify inside it, so it inherits the identical exposure: the tree is neither
 # registered in `_owned_merge_worktrees` (the reap's owned-ledger skip misses
 # it) nor touched by `_touch_owned_merge_worktrees` (its measured age is real
@@ -530,7 +1115,9 @@ class TestDriftCheckHoldsLaneLease:
         req.task_id = 'task-3018-drift-lease'
         req.task_files = ['src/foo.py']
         req.module_configs = []
-        req.config = OrchestratorConfig(project_root=drift_git_repo)
+        req.config = OrchestratorConfig(
+            project_root=drift_git_repo, verify_env_probes=_LEVER_C_OFF,
+        )
 
         with patch(
             'orchestrator.merge_lane.worker.run_scoped_verification', _reaping_scoped,

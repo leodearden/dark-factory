@@ -8,6 +8,8 @@ Commands:
     smoke          Run baseline panel on 1 diff (step 2)
     calibrate      Run scorer on 3 diffs for human inspection (step 3)
     corpus-sanity  Run baseline on all 15 diffs and score (step 4)
+    campaign       Run arms x fixtures x N trials and reduce them; ``--briefing
+                   diff-only,d2`` adds a context-complete arm per variant
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
+
+from orchestrator.agents.review_briefing import ReviewBriefing
 
 if TYPE_CHECKING:
     from .corpus import CorpusManifest
@@ -1151,12 +1155,42 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
 _CAMPAIGN_DEFAULT_CONFIG = Path('/home/leo/src/dark-factory/dark-factory-orchestrator.yaml')
 
 
+def _parse_briefings(
+    _ctx: click.Context, _param: click.Parameter, value: str,
+) -> list[ReviewBriefing]:
+    """The generations to run, each once; the diff-only incumbent leads whenever d2 is measured.
+
+    Every arm is paired against the first arm's first generation, so a repeat
+    would collide on its result paths and a leading d2 would pair d2 against itself.
+    """
+    valid = [b.value for b in ReviewBriefing]
+    names = [name.strip() for name in value.split(',') if name.strip()]
+    unknown = [name for name in names if name not in valid]
+    if unknown or not names:
+        raise click.BadParameter(
+            f'{", ".join(unknown) or "(none)"}: each must be one of {", ".join(valid)}',
+        )
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise click.BadParameter(f'each generation runs once; repeated: {", ".join(repeated)}')
+    briefings = [ReviewBriefing(name) for name in names]
+    if ReviewBriefing.CONTEXT_COMPLETE in briefings and briefings[0] is not ReviewBriefing.DIFF_ONLY:
+        raise click.BadParameter(
+            f'{ReviewBriefing.DIFF_ONLY.value} must come first: it is the incumbent '
+            f'{ReviewBriefing.CONTEXT_COMPLETE.value} is paired against',
+        )
+    return briefings
+
+
 @cli.command('campaign')
 @click.option('--results-dir', required=True, type=click.Path(path_type=Path),
               help='Campaign root; per-trial panel results and scores checkpoint under it')
 @click.option('--trials', default=3, type=int, help='Independent repeats per arm (replication by fixture)')
 @click.option('--split', default='test', help='Corpus split to run (train|selection|test|all)')
 @click.option('--arms', default=None, help='Comma-separated variant names (default: FABLE_EVIDENCE_VARIANTS)')
+@click.option('--briefing', 'briefings', default=ReviewBriefing.DIFF_ONLY.value, callback=_parse_briefings,
+              help='Comma-separated reviewer briefing generations, each run once for every arm '
+                   '(diff-only | d2; default: diff-only; diff-only first whenever d2 is listed)')
 @click.option('--diff-cap', default=None, type=int,
               help='Diff truncation in chars (default: runner.DIFF_CAP_CHARS; 0 lifts the cap)')
 @click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
@@ -1165,10 +1199,14 @@ _CAMPAIGN_DEFAULT_CONFIG = Path('/home/leo/src/dark-factory/dark-factory-orchest
 @click.option('--config', 'config_path', default=str(_CAMPAIGN_DEFAULT_CONFIG),
               type=click.Path(path_type=Path), help='Orchestrator config supplying usage_cap accounts')
 def campaign(
-    results_dir: Path, trials: int, split: str, arms: str | None, diff_cap: int | None,
+    results_dir: Path, trials: int, split: str, arms: str | None,
+    briefings: list[ReviewBriefing], diff_cap: int | None,
     max_parallel: int, pool: bool, config_path: Path,
 ) -> None:
     """Run the Fable evidence campaign: every arm x every fixture x N trials.
+
+    Each arm runs once per ``--briefing`` generation; the first arm's first
+    generation is the incumbent every other arm is paired against.
 
     Panel results checkpoint to ``<results-dir>/trial-<n>/`` and scores to
     ``<results-dir>/trial-<n>/scores/``, so a killed campaign resumes
@@ -1182,14 +1220,15 @@ def campaign(
         from . import campaign as reduce
         from .runner import DIFF_CAP_CHARS, run_trial
         from .scorer import score_panel_run
-        from .variants import FABLE_EVIDENCE_VARIANTS
+        from .variants import FABLE_EVIDENCE_VARIANTS, campaign_arms
 
         manifest = _load_corpus()
         corpus = manifest if split == 'all' else _select_split(manifest, split)
         by_name = {v.name: v for v in FABLE_EVIDENCE_VARIANTS}
-        variants = (
+        variants = campaign_arms(
             [by_name[a.strip()] for a in arms.split(',') if a.strip()]
-            if arms else list(FABLE_EVIDENCE_VARIANTS)
+            if arms else FABLE_EVIDENCE_VARIANTS,
+            briefings,
         )
         incumbent = variants[0].name
         cap = DIFF_CAP_CHARS if diff_cap is None else diff_cap
@@ -1208,7 +1247,8 @@ def campaign(
 
             click.echo(click.style(
                 f'Campaign: {len(variants)} arms x {len(corpus.diffs)} diffs ({split}) x {trials} trials, '
-                f'diff cap {cap or "lifted"}, pool={"on" if usage_gate else "off"}',
+                f'briefings {",".join(briefings)}, diff cap {cap or "lifted"}, '
+                f'pool={"on" if usage_gate else "off"}',
                 bold=True,
             ))
             blocking_gt = {d.diff_id: {g.id for g in d.blocking_issues()} for d in corpus.diffs}

@@ -38,7 +38,6 @@ from _eval_write_triage_fixtures import cli_mod as _mod
 from _eval_write_triage_fixtures import corpus as _corpus
 from _eval_write_triage_fixtures import crossed_retrieved_plan as _crossed_retrieved_plan
 from _eval_write_triage_fixtures import live as _live
-from _eval_write_triage_fixtures import live_judge_mod as _live_judge
 from _eval_write_triage_fixtures import one_cluster_corpus as _one_cluster_corpus
 from _eval_write_triage_fixtures import rec as _rec
 from _eval_write_triage_fixtures import scored as _scored
@@ -46,6 +45,8 @@ from _eval_write_triage_fixtures import scoring_mod as _scoring
 from _eval_write_triage_fixtures import slate as _slate
 from _eval_write_triage_fixtures import wording_mod as _wording
 
+from fused_memory.models.enums import SourceStore
+from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -53,6 +54,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
     OUTCOME_STORED,
 )
+from fused_memory.server.write_triage_judge import JudgePromptElisions, judge_prompt_elisions
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'eval_write_triage_judge.py'
 
@@ -1080,7 +1082,7 @@ class TestTheAttachTargetIsTheJudgedCandidate:
     """A judged attach lands on the candidate the verdict NAMED, hoisted.
 
     `write_triage.py::_apply_judge_verdict` files a middle-band attach against
-    `_canonical_id_of(named record)`, and against the band winner only when
+    `canonical_id_of(named record)`, and against the band winner only when
     the verdict named nothing. The row's `attach_target_*` describe that
     record, so `score_attachments` scores production's attach.
     """
@@ -1272,11 +1274,13 @@ class TestApplyFieldChars:
     def test_zero_means_no_elision_rather_than_everything_elided(self) -> None:
         config = self._config()
         text = 'x' * 20_000
-        slate = [types.SimpleNamespace(id='a', content=text)]
+        slate = [MemoryResult(id='a', content=text, source_store=SourceStore.mem0)]
         assert _mod().apply_field_chars(config, 0) == 0
         width = self._resolved(config)
         assert width >= len(text)
-        assert _live_judge()._elision_flags(text, slate, width) == (False, {'a': False})
+        assert judge_prompt_elisions(text, slate, field_chars=width) == JudgePromptElisions(
+            entry=False, candidates={'a': False},
+        )
 
     def test_a_negative_width_is_refused_rather_than_recorded(self) -> None:
         """The resolver would fall back to the default, so provenance would lie."""
@@ -1291,11 +1295,6 @@ class TestApplyFieldChars:
         before = config.write_triage.judge_field_chars
         assert _mod().apply_field_chars(config, None) == self._resolved(config) == 4_000
         assert config.write_triage.judge_field_chars == before
-
-    def test_the_elision_flags_follow_the_width(self) -> None:
-        long_text = 'y' * 5_000
-        slate = [types.SimpleNamespace(id='a', content=long_text)]
-        assert _live_judge()._elision_flags(long_text, slate, 1_200) == (True, {'a': True})
 
 
 # ---------------------------------------------------------------------------

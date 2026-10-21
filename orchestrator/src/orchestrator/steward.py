@@ -1340,7 +1340,7 @@ class TaskSteward:
         reesc = EscModel(
             id=self.escalation_queue.make_id(self.task_id),
             task_id=self.task_id,
-            agent_role='steward',
+            agent_role=STEWARD.name,
             severity=escalation.severity,
             category=escalation.category,
             summary=f'Steward re-escalation: {reason}',

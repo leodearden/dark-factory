@@ -253,8 +253,9 @@ the budget.
 
 `fold(feed)` up to `watermark_seq`: `{project_id, feed_version, watermark_seq, as_of, head,
 engagement_version, degraded, factory, prds: {prd_path: …}, tasks: {task_id: …}, in_flight: [{task_id,
-phase, since}], branches, tree, revealed: [{path, commit, lines}], criteria: {run_kind: …}, recent:
-[last 200 events]}`. Rewritten atomically after every pass that appended.
+phase, since}], branches, tree, revealed: [{path, commit, lines}], criteria: {run_kind: …},
+criteria_declared: {id: …}, recent: [last 200 events]}`. Each `criteria_declared` event replaces the
+whole `criteria_declared` map. Rewritten atomically after every pass that appended.
 
 ### 7.4 `in/inbox.jsonl` (portal → publisher)
 

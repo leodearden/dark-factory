@@ -422,7 +422,7 @@ async def _make_ephemeral_worktree(git_ops: GitOps) -> Path:
     REAL registered git worktree (a plain ``mkdir()``'d directory always
     yields 'failed' -- see that module's test_non_worktree_directory_returns_failed).
     """
-    return await git_ops.create_throwaway_verify_worktree(await _head_sha(git_ops.project_root))
+    return await git_ops.create_ephemeral_verify_worktree(await _head_sha(git_ops.project_root))
 
 
 # ---------------------------------------------------------------------------

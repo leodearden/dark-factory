@@ -27,7 +27,7 @@ These are characterization pins, expected to pass on write: a failure means
 git's behaviour moved.  Prose greps of the runbook are deliberately absent;
 see ``orchestrator/tests/test_roles_ancestry_check.py``'s module docstring.
 Every fixture repo carries the esc-3072-3 isolation guards through
-:func:`_new_repo` and :func:`_git_env`.
+``_ladder_git.py::new_repo`` and ``_ladder_git.py::git_env``.
 
 DELIBERATE DIVERGENCE, do not "restore" the agreement assertion.
 ``orchestrator/src/orchestrator/git_ops.py::GitOps.landing_merge_for`` runs the
@@ -39,98 +39,26 @@ that the runbook form and production agree.
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
-from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
+from _ladder_git import commit, git, git_rc, new_repo
 
 TASK_ID = 'T'
 
 _PINNED_DATE = '2020-01-01T00:00:00 +0000'
 
-# Deterministic identity + no signing, so subjects and shas are stable and
-# the tests never depend on the developer's git config.
-_GIT_ENV_ARGS = [
-    '-c', 'user.name=Test',
-    '-c', 'user.email=test@test.com',
-    '-c', 'commit.gpgsign=false',
-]
-
-# DUPLICATION, deliberately not extracted yet.  ``_GIT_ENV_ARGS``, ``_git``,
-# ``_git_rc``, ``_commit`` and ``_new_repo`` share their shape with the helpers
-# in ``test_citation_gate_positive_arm.py``, but that sibling has no date
-# pinning, writes one fixed file, and applies neither
-# ``_orch_helpers.py::git_env_with_ceiling`` nor
-# ``_orch_helpers.py::assert_isolated_git_repo``.  If a THIRD real-git module for
-# this ladder appears, lift these five -- in the form below -- into a shared
-# fixture module beside ``_orch_helpers.py`` rather than adding a third copy.
-
-
-def _git_env(root: Path, date: str | None = None) -> dict[str, str]:
-    """Env for git in *root*, discovery capped at *root* (esc-3072-3).
-
-    Rationale: ``_orch_helpers.py::git_env_with_ceiling``.  *date* pins both
-    committer and author date.
-    """
-    env = git_env_with_ceiling(root)
-    if date is not None:
-        env['GIT_COMMITTER_DATE'] = date
-        env['GIT_AUTHOR_DATE'] = date
-    return env
-
-
-def _git(root: Path, *args: str, date: str | None = None) -> str:
-    """Run git in *root*; return stripped stdout, raising on non-zero.
-
-    *date* as in :func:`_git_env`.
-    """
-    return subprocess.run(
-        ['git', *_GIT_ENV_ARGS, *args],
-        cwd=root, check=True, capture_output=True, text=True, env=_git_env(root, date),
-    ).stdout.strip()
-
-
-def _git_rc(root: Path, *args: str) -> int:
-    """Run git in *root* and return only its exit code."""
-    return subprocess.run(
-        ['git', *_GIT_ENV_ARGS, *args],
-        cwd=root, capture_output=True, text=True, env=_git_env(root),
-    ).returncode
-
-
-def _commit(root: Path, subject: str, filename: str, date: str | None = None) -> str:
-    """Write *filename*, commit it with *subject*, and return the new sha.
-
-    Each branch writes its OWN file so the sibling merges below never
-    conflict -- a conflict would abort the fixture mid-build and the test
-    would pin a history other than the one it describes.
-    """
-    (root / filename).write_text(f'{subject}\n')
-    _git(root, 'add', filename)
-    _git(root, 'commit', '-m', subject, date=date)
-    return _git(root, 'rev-parse', 'HEAD')
-
-
-def _new_repo(root: Path) -> None:
-    """Create *root* as a repository root, then pre-flight it (esc-3072-3).
-
-    Rationale: ``_orch_helpers.py::assert_isolated_git_repo``; asserting here
-    means a test added later cannot forget it.
-    """
-    root.mkdir()
-    _git(root, 'init', '-b', 'main')
-    assert_isolated_git_repo(root)
+# Real-git fixture helpers shared with this ladder's other pins: ``_ladder_git.py``.
 
 
 def _candidate_date_ordered(root: Path, tid: str) -> str:
     """The rc=0 arm's candidate query WITHOUT ``--topo-order``: date-ordered."""
-    out = _git(root, 'rev-list', '--ancestry-path', '--merges', f'task/{tid}..main')
+    out = git(root, 'rev-list', '--ancestry-path', '--merges', f'task/{tid}..main')
     return out.split('\n')[-1] if out else ''
 
 
 def _candidate_topo(root: Path, tid: str) -> str:
     """The rc=0 arm's candidate query WITH ``--topo-order`` (the fix)."""
-    out = _git(
+    out = git(
         root, 'rev-list', '--topo-order', '--ancestry-path', '--merges', f'task/{tid}..main',
     )
     return out.split('\n')[-1] if out else ''
@@ -138,7 +66,7 @@ def _candidate_topo(root: Path, tid: str) -> str:
 
 def _contained_before(root: Path, tid: str, rev: str) -> int:
     """The arm's ``contained-before`` rc for candidate expression *rev*."""
-    return _git_rc(root, 'merge-base', '--is-ancestor', f'task/{tid}', rev)
+    return git_rc(root, 'merge-base', '--is-ancestor', f'task/{tid}', rev)
 
 
 def test_clock_skew_makes_the_date_ordered_candidate_query_pick_the_wrong_merge(
@@ -160,35 +88,35 @@ def test_clock_skew_makes_the_date_ordered_candidate_query_pick_the_wrong_merge(
     ``tail -1`` is X, the merge that actually brought the branch in.
     """
     root = tmp_path / 'repo'
-    _new_repo(root)
+    new_repo(root)
 
-    _commit(root, 'base', 'base.txt', date='2020-01-01T00:00:00 +0000')
+    commit(root, 'base', 'base.txt', date='2020-01-01T00:00:00 +0000')
 
-    _git(root, 'checkout', '-b', f'task/{TASK_ID}')
-    _commit(root, 'work', 'work.txt', date='2020-01-02T00:00:00 +0000')
+    git(root, 'checkout', '-b', f'task/{TASK_ID}')
+    commit(root, 'work', 'work.txt', date='2020-01-02T00:00:00 +0000')
 
     # X: the merge that brings task/T in -- committer date skewed NEW
     # (01-10), later than both sibling branch commits below.
-    _git(root, 'checkout', 'main')
-    _git(
+    git(root, 'checkout', 'main')
+    git(
         root, 'merge', '--no-ff', f'task/{TASK_ID}', '-m', f'Merge task/{TASK_ID} into main',
         date='2020-01-10T00:00:00 +0000',
     )
-    x = _git(root, 'rev-parse', 'HEAD')
+    x = git(root, 'rev-parse', 'HEAD')
 
     # f1 and f2 BOTH fork from X, so X has two children in the walk.
-    _git(root, 'checkout', '-b', 'f1', x)
-    _commit(root, 'f1work', 'f1.txt', date='2020-01-03T00:00:00 +0000')
-    _git(root, 'checkout', '-b', 'f2', x)
-    _commit(root, 'f2work', 'f2.txt', date='2020-01-05T00:00:00 +0000')
+    git(root, 'checkout', '-b', 'f1', x)
+    commit(root, 'f1work', 'f1.txt', date='2020-01-03T00:00:00 +0000')
+    git(root, 'checkout', '-b', 'f2', x)
+    commit(root, 'f2work', 'f2.txt', date='2020-01-05T00:00:00 +0000')
 
-    _git(root, 'checkout', 'main')
-    _git(root, 'merge', '--no-ff', 'f1', '-m', 'Merge f1 into main',
-         date='2020-01-04T00:00:00 +0000')
-    mf1 = _git(root, 'rev-parse', 'HEAD')
-    _git(root, 'merge', '--no-ff', 'f2', '-m', 'Merge f2 into main',
-         date='2020-01-20T00:00:00 +0000')
-    mf2 = _git(root, 'rev-parse', 'HEAD')
+    git(root, 'checkout', 'main')
+    git(root, 'merge', '--no-ff', 'f1', '-m', 'Merge f1 into main',
+        date='2020-01-04T00:00:00 +0000')
+    mf1 = git(root, 'rev-parse', 'HEAD')
+    git(root, 'merge', '--no-ff', 'f2', '-m', 'Merge f2 into main',
+        date='2020-01-20T00:00:00 +0000')
+    mf2 = git(root, 'rev-parse', 'HEAD')
 
     assert len({x, mf1, mf2}) == 3, 'fixture must build three distinct merge commits'
 
@@ -236,32 +164,32 @@ def test_same_second_commits_make_the_date_ordered_candidate_query_pick_the_wron
     so the pin would pass vacuously.
     """
     root = tmp_path / 'repo'
-    _new_repo(root)
+    new_repo(root)
 
-    _commit(root, 'base', 'base.txt', date=_PINNED_DATE)
-    _git(root, 'checkout', '-b', f'task/{TASK_ID}')
-    _commit(root, 'work', 'work.txt', date=_PINNED_DATE)
+    commit(root, 'base', 'base.txt', date=_PINNED_DATE)
+    git(root, 'checkout', '-b', f'task/{TASK_ID}')
+    commit(root, 'work', 'work.txt', date=_PINNED_DATE)
 
-    _git(root, 'checkout', 'main')
-    _git(
+    git(root, 'checkout', 'main')
+    git(
         root, 'merge', '--no-ff', f'task/{TASK_ID}', '-m', f'Merge task/{TASK_ID} into main',
         date=_PINNED_DATE,
     )
-    x = _git(root, 'rev-parse', 'HEAD')
+    x = git(root, 'rev-parse', 'HEAD')
 
-    _git(root, 'checkout', '-b', 'f1', x)
-    _commit(root, 'f1work', 'f1.txt', date=_PINNED_DATE)
-    _git(root, 'checkout', '-b', 'f2', x)
-    _commit(root, 'f2work', 'f2.txt', date=_PINNED_DATE)
+    git(root, 'checkout', '-b', 'f1', x)
+    commit(root, 'f1work', 'f1.txt', date=_PINNED_DATE)
+    git(root, 'checkout', '-b', 'f2', x)
+    commit(root, 'f2work', 'f2.txt', date=_PINNED_DATE)
 
-    _git(root, 'checkout', 'main')
-    _git(root, 'merge', '--no-ff', 'f1', '-m', 'Merge f1 into main', date=_PINNED_DATE)
-    mf1 = _git(root, 'rev-parse', 'HEAD')
-    _commit(root, 'a', 'a.txt', date=_PINNED_DATE)
-    _commit(root, 'b', 'b.txt', date=_PINNED_DATE)
-    _git(root, 'merge', '--no-ff', 'f2', '-m', 'Merge f2 into main', date=_PINNED_DATE)
+    git(root, 'checkout', 'main')
+    git(root, 'merge', '--no-ff', 'f1', '-m', 'Merge f1 into main', date=_PINNED_DATE)
+    mf1 = git(root, 'rev-parse', 'HEAD')
+    commit(root, 'a', 'a.txt', date=_PINNED_DATE)
+    commit(root, 'b', 'b.txt', date=_PINNED_DATE)
+    git(root, 'merge', '--no-ff', 'f2', '-m', 'Merge f2 into main', date=_PINNED_DATE)
 
-    committer_dates = set(_git(root, 'log', '--all', '--format=%ct').split('\n'))
+    committer_dates = set(git(root, 'log', '--all', '--format=%ct').split('\n'))
     assert len(committer_dates) == 1, (
         'every commit must share one committer-date second: this pin is about ties, not skew'
     )
@@ -281,37 +209,37 @@ def test_same_second_commits_make_the_date_ordered_candidate_query_pick_the_wron
 
 def _build_branch_side_landing(root: Path) -> None:
     """Land ``task/T`` by a merge made on the branch side, fast-forwarded onto main."""
-    _new_repo(root)
-    _commit(root, 'base', 'base.txt', date=_PINNED_DATE)
-    _git(root, 'checkout', '-b', f'task/{TASK_ID}')
-    _commit(root, 'work', 'work.txt', date=_PINNED_DATE)
-    _git(root, 'checkout', 'main')
-    _commit(root, 'side', 'side.txt', date=_PINNED_DATE)
+    new_repo(root)
+    commit(root, 'base', 'base.txt', date=_PINNED_DATE)
+    git(root, 'checkout', '-b', f'task/{TASK_ID}')
+    commit(root, 'work', 'work.txt', date=_PINNED_DATE)
+    git(root, 'checkout', 'main')
+    commit(root, 'side', 'side.txt', date=_PINNED_DATE)
 
-    _git(root, 'checkout', '-b', 'integ', f'task/{TASK_ID}')
-    _git(root, 'merge', '--no-ff', 'main', '-m', 'Merge', date=_PINNED_DATE)
-    _git(root, 'checkout', 'main')
-    assert _git_rc(root, 'merge-base', '--is-ancestor', f'task/{TASK_ID}', 'main') == 1, (
+    git(root, 'checkout', '-b', 'integ', f'task/{TASK_ID}')
+    git(root, 'merge', '--no-ff', 'main', '-m', 'Merge', date=_PINNED_DATE)
+    git(root, 'checkout', 'main')
+    assert git_rc(root, 'merge-base', '--is-ancestor', f'task/{TASK_ID}', 'main') == 1, (
         'task/T must not be on main yet, so the branch-side merge is what brings it in'
     )
-    _git(root, 'merge', '--ff-only', 'integ')
+    git(root, 'merge', '--ff-only', 'integ')
 
 
 def _build_fast_forward_then_unrelated_merge(root: Path) -> None:
     """Land ``task/T`` by fast-forward, then merge an unrelated branch on main."""
-    _new_repo(root)
-    _commit(root, 'base', 'base.txt', date=_PINNED_DATE)
-    _git(root, 'checkout', '-b', f'task/{TASK_ID}')
-    _commit(root, 'work', 'work.txt', date=_PINNED_DATE)
-    _git(root, 'checkout', '-b', 'f1', 'main')
-    _commit(root, 'side', 'side.txt', date=_PINNED_DATE)
+    new_repo(root)
+    commit(root, 'base', 'base.txt', date=_PINNED_DATE)
+    git(root, 'checkout', '-b', f'task/{TASK_ID}')
+    commit(root, 'work', 'work.txt', date=_PINNED_DATE)
+    git(root, 'checkout', '-b', 'f1', 'main')
+    commit(root, 'side', 'side.txt', date=_PINNED_DATE)
 
-    _git(root, 'checkout', 'main')
-    _git(root, 'merge', '--ff-only', f'task/{TASK_ID}')
-    assert _git(root, 'rev-parse', 'main') == _git(root, 'rev-parse', f'task/{TASK_ID}'), (
+    git(root, 'checkout', 'main')
+    git(root, 'merge', '--ff-only', f'task/{TASK_ID}')
+    assert git(root, 'rev-parse', 'main') == git(root, 'rev-parse', f'task/{TASK_ID}'), (
         'task/T must land with NO merge commit, so the later merge is unrelated to it'
     )
-    _git(root, 'merge', '--no-ff', 'f1', '-m', 'Merge', date=_PINNED_DATE)
+    git(root, 'merge', '--no-ff', 'f1', '-m', 'Merge', date=_PINNED_DATE)
 
 
 def test_a_branch_side_landing_is_the_same_history_as_a_fast_forward_then_an_unrelated_merge(
@@ -331,13 +259,13 @@ def test_a_branch_side_landing_is_the_same_history_as_a_fast_forward_then_an_unr
     _build_fast_forward_then_unrelated_merge(b)
 
     for ref in ('main', f'task/{TASK_ID}'):
-        assert _git(a, 'rev-parse', ref) == _git(b, 'rev-parse', ref), (
+        assert git(a, 'rev-parse', ref) == git(b, 'rev-parse', ref), (
             f'the two stories must be one commit graph, sha for sha, at {ref} -- that is '
             'why no git query can tell them apart'
         )
 
     candidate = _candidate_topo(a, TASK_ID)
-    assert candidate == _git(a, 'rev-parse', 'main')
+    assert candidate == git(a, 'rev-parse', 'main')
     assert _contained_before(a, TASK_ID, f'{candidate}^1') == 0, (
         'the task tip is ^1, so the arm takes its "do not stamp" exit -- wrong for story '
         'A, right for story B'
@@ -358,22 +286,22 @@ def test_a_merge_created_on_main_puts_main_at_caret_1(tmp_path: Path) -> None:
     pins exists only where merge direction is unknown.
     """
     root = tmp_path / 'repo'
-    _new_repo(root)
+    new_repo(root)
 
-    _commit(root, 'base', 'base.txt')
-    _git(root, 'checkout', '-b', f'task/{TASK_ID}')
-    _commit(root, 'work', 'work.txt')
-    task_tip = _git(root, 'rev-parse', f'task/{TASK_ID}')
+    commit(root, 'base', 'base.txt')
+    git(root, 'checkout', '-b', f'task/{TASK_ID}')
+    commit(root, 'work', 'work.txt')
+    task_tip = git(root, 'rev-parse', f'task/{TASK_ID}')
 
-    _git(root, 'checkout', 'main')
-    mainadv = _commit(root, 'mainadv', 'main.txt')
-    _git(root, 'merge', '--no-ff', f'task/{TASK_ID}', '-m', f'Merge task/{TASK_ID} into main')
-    merge = _git(root, 'rev-parse', 'HEAD')
+    git(root, 'checkout', 'main')
+    mainadv = commit(root, 'mainadv', 'main.txt')
+    git(root, 'merge', '--no-ff', f'task/{TASK_ID}', '-m', f'Merge task/{TASK_ID} into main')
+    merge = git(root, 'rev-parse', 'HEAD')
 
-    assert _git(root, 'rev-parse', f'{merge}^1') == mainadv, (
+    assert git(root, 'rev-parse', f'{merge}^1') == mainadv, (
         'a merge created on main has main-just-before-the-merge as its first parent'
     )
-    assert _git(root, 'rev-parse', f'{merge}^2') == task_tip
+    assert git(root, 'rev-parse', f'{merge}^2') == task_tip
 
     candidate = _candidate_topo(root, TASK_ID)
     assert candidate == merge
@@ -397,24 +325,24 @@ def test_a_stacked_branch_that_merged_main_first_hides_the_landing_merge(
     branch stacked on a task branch that merged main in).
     """
     root = tmp_path / 'repo'
-    _new_repo(root)
+    new_repo(root)
 
-    _commit(root, 'base', 'base.txt')
-    _git(root, 'checkout', '-b', f'task/{TASK_ID}')
-    _commit(root, 'work', 'work.txt')
-    _git(root, 'checkout', '-b', 'task/S')
-    _commit(root, 'swork', 's.txt')
+    commit(root, 'base', 'base.txt')
+    git(root, 'checkout', '-b', f'task/{TASK_ID}')
+    commit(root, 'work', 'work.txt')
+    git(root, 'checkout', '-b', 'task/S')
+    commit(root, 'swork', 's.txt')
 
-    _git(root, 'checkout', 'main')
-    _commit(root, 'mainadv', 'm.txt')
-    _git(root, 'checkout', 'task/S')
-    _git(root, 'merge', '--no-ff', 'main', '-m', 'Y')
-    y = _git(root, 'rev-parse', 'HEAD')
+    git(root, 'checkout', 'main')
+    commit(root, 'mainadv', 'm.txt')
+    git(root, 'checkout', 'task/S')
+    git(root, 'merge', '--no-ff', 'main', '-m', 'Y')
+    y = git(root, 'rev-parse', 'HEAD')
 
-    _git(root, 'checkout', 'main')
-    _commit(root, 'mainadv2', 'm2.txt')
-    _git(root, 'merge', '--no-ff', 'task/S', '-m', 'Z')
-    z = _git(root, 'rev-parse', 'HEAD')
+    git(root, 'checkout', 'main')
+    commit(root, 'mainadv2', 'm2.txt')
+    git(root, 'merge', '--no-ff', 'task/S', '-m', 'Z')
+    z = git(root, 'rev-parse', 'HEAD')
 
     assert _candidate_topo(root, TASK_ID) == y, (
         'the oldest descendant merge is the stacked branch\'s sync merge, not the landing'
@@ -454,22 +382,22 @@ def test_an_already_landed_branch_yields_the_arms_legitimate_rc0_verdict(
     which the citation gate below the arm exists to catch.
     """
     root = tmp_path / 'repo'
-    _new_repo(root)
+    new_repo(root)
 
-    base = _commit(root, 'base', 'base.txt')
-    _git(root, 'branch', f'task/{TASK_ID}')  # left AT base; never advanced
+    base = commit(root, 'base', 'base.txt')
+    git(root, 'branch', f'task/{TASK_ID}')  # left AT base; never advanced
 
-    _git(root, 'checkout', '-b', 'f1')
-    _commit(root, 'f1work', 'f1.txt')
-    _git(root, 'checkout', 'main')
-    _git(root, 'merge', '--no-ff', 'f1', '-m', 'Merge f1 into main')
-    mf1 = _git(root, 'rev-parse', 'HEAD')
+    git(root, 'checkout', '-b', 'f1')
+    commit(root, 'f1work', 'f1.txt')
+    git(root, 'checkout', 'main')
+    git(root, 'merge', '--no-ff', 'f1', '-m', 'Merge f1 into main')
+    mf1 = git(root, 'rev-parse', 'HEAD')
 
-    assert _git(root, 'rev-parse', f'task/{TASK_ID}') == base, (
+    assert git(root, 'rev-parse', f'task/{TASK_ID}') == base, (
         'the branch must still sit at its creation point -- that is what makes it '
         'already contained in main, which is the precondition for a legitimate rc=0'
     )
-    assert _git(root, 'rev-parse', f'{mf1}^1') == base, (
+    assert git(root, 'rev-parse', f'{mf1}^1') == base, (
         'the unrelated merge was created on main, so its first parent is '
         'main-just-before-it, which already contains the branch'
     )
@@ -500,29 +428,29 @@ def _build_train(root: Path, *, rebase_rewrites: bool) -> str:
     replay has nothing to move and the member's own commits survive
     verbatim into main.
     """
-    _new_repo(root)
-    _commit(root, 'base', 'base.txt')
+    new_repo(root)
+    commit(root, 'base', 'base.txt')
 
     if not rebase_rewrites:
         # main advances FIRST, so the member is already atop main and the
         # pre-merge rebase has nothing to rewrite.
-        _commit(root, 'mainmoved', 'moved.txt')
+        commit(root, 'mainmoved', 'moved.txt')
 
-    _git(root, 'checkout', '-b', 'task/M')
-    _commit(root, 'mwork', 'm.txt')
+    git(root, 'checkout', '-b', 'task/M')
+    commit(root, 'mwork', 'm.txt')
 
     if rebase_rewrites:
         # main advances AFTER the member forked, so the rebase replays it.
-        _git(root, 'checkout', 'main')
-        _commit(root, 'mainmoved', 'moved.txt')
+        git(root, 'checkout', 'main')
+        commit(root, 'mainmoved', 'moved.txt')
 
-    _git(root, 'checkout', '-b', 'task/TIP', 'task/M')
-    _commit(root, 'tipwork', 'tip.txt')
-    _git(root, 'rebase', '--onto', 'main', 'task/M~1', 'task/TIP')
+    git(root, 'checkout', '-b', 'task/TIP', 'task/M')
+    commit(root, 'tipwork', 'tip.txt')
+    git(root, 'rebase', '--onto', 'main', 'task/M~1', 'task/TIP')
 
-    _git(root, 'checkout', 'main')
-    _git(root, 'merge', '--no-ff', 'task/TIP', '-m', 'Merge task/TIP into main')
-    return _git(root, 'rev-parse', 'HEAD')
+    git(root, 'checkout', 'main')
+    git(root, 'merge', '--no-ff', 'task/TIP', '-m', 'Merge task/TIP into main')
+    return git(root, 'rev-parse', 'HEAD')
 
 
 def test_the_ordinary_coalesce_absorbed_member_can_never_reach_the_rc0_arm(
@@ -543,7 +471,7 @@ def test_the_ordinary_coalesce_absorbed_member_can_never_reach_the_rc0_arm(
     root = tmp_path / 'repo'
     _build_train(root, rebase_rewrites=True)
 
-    assert _git_rc(root, 'merge-base', '--is-ancestor', 'task/M', 'main') == 1, (
+    assert git_rc(root, 'merge-base', '--is-ancestor', 'task/M', 'main') == 1, (
         'the rebase rewrote the member\'s shas and its own ref was never advanced, so '
         'it cannot be an ancestor of main -- rc=1, and the rc=0 arm is unreachable'
     )
@@ -564,7 +492,7 @@ def test_the_no_op_rebase_member_is_the_shape_that_reaches_the_rc0_arm(
     root = tmp_path / 'repo'
     tip_merge = _build_train(root, rebase_rewrites=False)
 
-    assert _git_rc(root, 'merge-base', '--is-ancestor', 'task/M', 'main') == 0, (
+    assert git_rc(root, 'merge-base', '--is-ancestor', 'task/M', 'main') == 0, (
         'with a no-op rebase the member\'s own commits are genuinely contained in the '
         'group merge, so ancestry exits 0 and the rc=0 arm IS reached'
     )

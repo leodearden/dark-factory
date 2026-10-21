@@ -90,6 +90,7 @@ resolve = resolve_ticket(ticket=submit_result["ticket"], project_root=project_ro
 | `created` | `filed:<task_id>` |
 | `combined` | `filed:<task_id>`, `dedup_step: "3"` |
 | `refused` | stays `open`; record `resolve["reason"]`; do not retry |
+| `awaiting_curation` | `filed:<ticket>` (parked; no task id yet); do not re-submit |
 | `failed` | stays `open`; record the reason; retry only per the shared doc's retryable matrix |
 
 Every filed task has a concrete title, the evidence, the expected fix and the finding metadata. When one fix must land before another (wiring before the test of the wiring), add the edge with `add_dependency` after both resolve.

@@ -574,6 +574,72 @@ def _drive_replan_into_lock_conflict(
     return workflow, scheduler
 
 
+def _wire_simple_task_run(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    task_assignment: TaskAssignment,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    simple_widens: bool,
+    conflict: BlastRadiusResult,
+) -> tuple[TaskWorkflow, FakeScheduler, AgentStub]:
+    """Wire a real run() for a declared-simple task.  When *simple_widens*,
+    the SIMPLE_TASK agent completes a plan whose files reach a module the
+    task does not lock; otherwise it writes nothing and gives up.  Any
+    architect that runs afterwards widens the same way, and the scheduler
+    reports every widen as *conflict*."""
+    stub = _WideningArchitectStub()
+    simple = replace(task_assignment, task={
+        **task_assignment.task,
+        'metadata': {**task_assignment.task['metadata'], 'complexity': 'simple'},
+    })
+    workflow, scheduler = _build_workflow(config, git_ops, simple, stub)
+    scheduler.blast_radius_result = conflict
+
+    async def _invoke(**kwargs: Any) -> AgentResult:
+        if 'You are a SIMPLE_TASK agent' not in kwargs['system_prompt']:
+            return await stub.invoke_agent(**kwargs)
+        stub.calls.append('simple_task')
+        if simple_widens:
+            cwd: Path = kwargs['cwd']
+            root = TaskArtifacts(cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)).root
+            root.mkdir(parents=True, exist_ok=True)
+            plan = {
+                **PLAN, '_schema_version': 1,
+                'files': ['lib.py', 'locked_module.py'],
+                'steps': [
+                    {**step, 'status': 'done', 'commit': 'abc123'}
+                    for step in PLAN['steps']
+                ],
+            }
+            (root / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+        return AgentResult(success=True, output='Simple task done', cost_usd=0.30)
+
+    monkeypatch.setattr('orchestrator.workflow.invoke_agent', _invoke)
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_scoped_verification',
+        AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+    )
+    return workflow, scheduler, stub
+
+
+def _drive_simple_task_into_lock_conflict(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    task_assignment: TaskAssignment,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict: BlastRadiusResult,
+) -> tuple[TaskWorkflow, FakeScheduler]:
+    """Wire a real run() whose SIMPLE_TASK agent completes a plan that
+    widens its scope into a blast-radius lock conflict the scheduler reports
+    as *conflict*."""
+    workflow, scheduler, _stub = _wire_simple_task_run(
+        config, git_ops, task_assignment, monkeypatch,
+        simple_widens=True, conflict=conflict,
+    )
+    return workflow, scheduler
+
+
 @pytest.mark.asyncio
 class TestStateMachineLegalityAndConsistency:
     """Boundary rows 5-6 (PRD §9): ``WorkflowStateMachine``/``STATE_TO_STATUS``
@@ -904,7 +970,8 @@ class TestStateMachineLegalityAndConsistency:
     @pytest.mark.parametrize(('drive', 'detail_prefix'), [
         (_drive_plan_into_lock_conflict, 'Plan expansion blocked'),
         (_drive_replan_into_lock_conflict, 'Replan expansion blocked'),
-    ], ids=['plan', 'replan'])
+        (_drive_simple_task_into_lock_conflict, 'SIMPLE_TASK plan expansion blocked'),
+    ], ids=['plan', 'replan', 'simple'])
     async def test_row6_lock_conflict_with_dead_repend_is_store_unavailable(
         self, drive, detail_prefix, enforce,
         config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
@@ -945,8 +1012,12 @@ class TestStateMachineLegalityAndConsistency:
         assert queue.get_by_task(workflow.task_id) == []
 
     @pytest.mark.parametrize(
-        'drive', [_drive_plan_into_lock_conflict, _drive_replan_into_lock_conflict],
-        ids=['plan', 'replan'],
+        'drive', [
+            _drive_plan_into_lock_conflict,
+            _drive_replan_into_lock_conflict,
+            _drive_simple_task_into_lock_conflict,
+        ],
+        ids=['plan', 'replan', 'simple'],
     )
     async def test_row6_lock_conflict_with_healthy_repend_is_consistent(
         self, drive, config, git_ops, task_assignment, monkeypatch, caplog,
@@ -968,6 +1039,45 @@ class TestStateMachineLegalityAndConsistency:
         assert _exit_contract_records(caplog, 'store_unavailable') == []
         assert _exit_contract_records(caplog, 'violation') == []
         assert _exit_contract_events(event_store) == []
+
+    async def test_row6_simple_task_give_up_falls_through_to_the_architect(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """A SIMPLE_TASK agent that writes no plan gives up: the run drops
+        its plan and runs the architect, whose own widen then conflicts."""
+        workflow, _scheduler, stub = _wire_simple_task_run(
+            config, git_ops, task_assignment, monkeypatch,
+            simple_widens=False, conflict=BlastRadiusResult(applied=False),
+        )
+
+        report = await workflow.run()
+
+        assert stub.calls == ['simple_task', 'architect']
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert report.detail.startswith('Plan expansion blocked')
+
+    async def test_row6_simple_task_lock_conflict_runs_nothing_after_the_conflict(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """The scheduler re-pended the row and dropped every lock, so the
+        dispatch ends at the conflict: no architect, no implementer, no
+        second status write — and the stamped plan survives for the next
+        dispatch."""
+        workflow, scheduler, stub = _wire_simple_task_run(
+            config, git_ops, task_assignment, monkeypatch,
+            simple_widens=True, conflict=BlastRadiusResult(applied=False),
+        )
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert report.reason == 'plan_blast_radius_lock_conflict'
+        assert stub.calls == ['simple_task']
+        assert scheduler.statuses[workflow.task_id].count('pending') == 1
+        assert workflow.artifacts is not None
+        plan = workflow.artifacts.read_plan()
+        assert plan['steps']
+        assert plan['_session_id']
 
     async def test_row6_failed_bypass_reopen_is_store_unavailable(
         self, config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
@@ -1024,8 +1134,8 @@ class TestStateMachineLegalityAndConsistency:
 
         Neither dispatch site may read CANCELLED as "keep going": the plan
         site must not fall through toward EXECUTE, and the simple-task site
-        must not mistake it for its REQUEUED fall-through sentinel and head
-        for an architect.  Either move leaves the absorbing CANCELLED state,
+        must not mistake it for its give-up fall-through and head for an
+        architect.  Either move leaves the absorbing CANCELLED state,
         which crashes the run.
         """
         from orchestrator.scheduler import TerminalExitRejection

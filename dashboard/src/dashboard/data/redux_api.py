@@ -13,7 +13,6 @@ from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from shared.timestamps import parse_timestamp_or_warn
@@ -36,13 +35,13 @@ from dashboard.data.datum import (
     validate_datum,
 )
 from dashboard.data.escalation_corpus import EscalationView
-from dashboard.data.mcp_fanout import project_label
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now
 from dashboard.data.write_journal import MemoryOps
+from dashboard.project_labels import ProjectLabels, basename_label
 
 # ---------------------------------------------------------------------------
 # ORCHESTRATORS + PROJECTS
@@ -52,15 +51,18 @@ from dashboard.data.write_journal import MemoryOps
 def shape_orchestrators(
     orchestrators: Iterable[Mapping[str, Any]],
     *,
-    known_project_roots: Iterable[str | Path] = (),
+    labels: ProjectLabels,
     running_spark: Mapping[str, list] | None = None,
 ) -> dict[str, Any]:
     """Return ``{ORCHESTRATORS: [...], PROJECTS: [...]}`` for the API.
 
     ``orchestrators`` is the raw list from
-    :func:`dashboard.data.orchestrator.discover_orchestrators`.  ``known_project_roots``
-    is the union of configured roots; projects without a running orchestrator
-    are still surfaced (with ``active: False``).  ``running_spark`` is an
+    :func:`dashboard.data.orchestrator.discover_orchestrators`.  Every project
+    is named by its project label (``dashboard/project_labels.py::ProjectLabels``),
+    and ``labels.roots`` are the configured roots: a project without a running
+    orchestrator is still surfaced (with ``active: False``).  A running
+    orchestrator's root outside them is labelled alongside them
+    (``ProjectLabels.including``), so no two projects share an id.  ``running_spark`` is an
     optional ``{labels, values}`` time-series of the total running-orchestrator
     count over the last day, surfaced as ``ORCHESTRATORS_SPARK``.
 
@@ -87,18 +89,18 @@ def shape_orchestrators(
     its project's census Datum, whose state and reason travel with the count.
     """
     orchestrators = list(orchestrators)
+    active_roots = {str(o.get('project_root') or '') for o in orchestrators}
+    named = labels.including(active_roots)
     out_orchs: list[dict] = []
-    active_roots: set[str] = set()
     for o in orchestrators:
         pids = o.get('pids') or []
         primary_pid = pids[0] if pids else None
         project_root = o.get('project_root') or ''
-        active_roots.add(str(project_root))
         orch_entry: dict = {
             'pid': primary_pid,
             'pids': list(pids),
-            'label': o.get('label') or project_label(project_root),
-            'project': project_label(project_root),
+            'label': o.get('label') or named.of(project_root),
+            'project': named.of(project_root),
             'project_root': str(project_root),
             'running': bool(o.get('running')),
             'started': o.get('started') or '',
@@ -114,11 +116,11 @@ def shape_orchestrators(
     # whether an orchestrator is currently running for that root.
     seen: set[str] = set()
     out_projects: list[dict] = []
-    for root in (*active_roots, *(str(r) for r in known_project_roots)):
+    for root in (*active_roots, *(str(r) for r in labels.roots)):
         if root in seen:
             continue
         seen.add(root)
-        name = project_label(root)
+        name = named.of(root)
         out_projects.append({
             'id': name,
             'name': name,
@@ -510,6 +512,7 @@ def _shape_outcomes(raw: Mapping[str, Any] | None) -> dict[str, Any]:
 def shape_merge_queue(
     per_project: Mapping[str, Mapping[str, Any]],
     *,
+    labels: ProjectLabels,
     served_at: datetime,
     active_sparks: Mapping[str, Mapping[str, list]] | None = None,
     halt_status: Mapping[str, Mapping[str, Any]] | None = None,
@@ -517,7 +520,8 @@ def shape_merge_queue(
     """Return ``{MERGE_QUEUE: {project_label: {...}}, served_at}``.
 
     The aggregator already returns one entry per project; we relabel the keys
-    from absolute project_root paths to short basenames so the React side can
+    from absolute project_root paths to each root's project label
+    (``dashboard/project_labels.py::ProjectLabels``) so the React side can
     match against ``PROJECTS[].name``.  Per project: ``depth`` (renamed from
     ``depth_timeseries``), ``outcomes``, ``latency`` (whose ``with_duration``
     and ``without_duration`` sum to the outcomes total), ``recent``,
@@ -539,7 +543,7 @@ def shape_merge_queue(
     ``active_sparks`` (optional) is ``in_queue``'s sampled history, keyed by
     absolute project_root path, surfaced as ``active_spark`` per label.
 
-    ``halt_status`` (optional) is keyed by project basename and carries
+    ``halt_status`` (optional) is keyed by project label and carries
     ``{wired, halted, owner_esc_id, offline}`` per orchestrator. Missing
     projects fall back to ``{offline: True}`` so the UI can render an Offline
     pill on every panel.
@@ -558,7 +562,7 @@ def shape_merge_queue(
     out: dict[str, dict] = {}
     for pid, data in per_project.items():
         spark = sparks.get(pid) or _EMPTY_SERIES
-        label = project_label(pid)
+        label = labels.of(pid)
         out[label] = {
             'depth': dict(data.get('depth_timeseries') or {'labels': [], 'values': []}),
             'outcomes': _shape_outcomes(data.get('outcomes')),
@@ -653,7 +657,7 @@ def shape_costs(
         models_list = list(models)
         sums = _sum_models(models_list)
         by_project_list.append({
-            'project': project_label(pid),
+            'project': basename_label(pid),
             'total': round(sum(sums.values()), 4),
             **{k: round(v, 4) for k, v in sums.items()},
         })
@@ -887,7 +891,7 @@ def shape_performance(
 ) -> dict[str, Any]:
     """Each project's cards Datum beside its hour-bucketed histories, as served at *served_at*.
 
-    Output: ``{PERFORMANCE: {project_label: {cards, time_centiles_history,
+    Output: ``{PERFORMANCE: {project_basename: {cards, time_centiles_history,
     one_pass_history, escalation_history}}, PERFORMANCE_LISTING, served_at}``,
     where ``cards`` is the project's wire Datum from
     :func:`dashboard.data.performance.aggregate_performance_cards` and
@@ -911,7 +915,7 @@ def shape_performance(
     for pid, datum in listing.cards.items():
         validate_datum(datum, served_at)
         h = history.get(pid) or {}
-        out[project_label(pid)] = {
+        out[basename_label(pid)] = {
             'cards': datum.to_wire(),
             'time_centiles_history': dict(h.get('time_centiles_history') or empty_centiles),
             'one_pass_history': dict(h.get('one_pass_history') or empty_pair),
@@ -981,11 +985,15 @@ _NO_FORECAST = _Provenance(None, DatumState.UNKNOWN, _NO_FORECAST_REASON)
 def shape_burndown(
     series_by_project: Mapping[str, Mapping[str, Any]],
     *,
+    labels: ProjectLabels,
     served_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Build ``{BURNDOWN, BURNDOWN_BY_PROJECT}`` from per-project series.
 
-    ``BURNDOWN_BY_PROJECT`` is keyed by project basename.  Both blocks carry
+    ``BURNDOWN_BY_PROJECT`` is keyed by project label
+    (``dashboard/project_labels.py::ProjectLabels``); a series for a root
+    outside *labels* is labelled alongside them (``ProjectLabels.including``),
+    so no series overwrites another.  Both blocks carry
     one series per :data:`_BURNDOWN_KEYS` key (the nine census members and
     the rows' in-progress split), two served Datums — ``latest`` and
     ``forecast`` — and a parity block.  Per-project blocks also carry
@@ -1056,7 +1064,8 @@ def shape_burndown(
     aggregate banner is not left hunting for which one.
     """
     served_at = resolve_now(served_at)
-    raw = {project_label(pid): series for pid, series in series_by_project.items()}
+    named = labels.including(series_by_project)
+    raw = {named.of(pid): series for pid, series in series_by_project.items()}
     filled = {pid: _with_split(series) for pid, series in raw.items()}
     completions = {pid: compute_window_completion(series) for pid, series in raw.items()}
     provenance, aggregate_provenance = _burndown_provenance(

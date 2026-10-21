@@ -41,7 +41,6 @@ import os
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 import httpx
@@ -52,6 +51,8 @@ import httpx
 # 3.13 or newer"), while accepting and APPLYING the typing_extensions
 # spelling at the same pin. Declared directly in pyproject.toml (task 5018).
 from typing_extensions import TypeVar as TypeVarD
+
+from dashboard.project_labels import ProjectLabels
 
 logger = logging.getLogger(__name__)
 
@@ -350,19 +351,9 @@ def describe_exc(exc: BaseException) -> str:
     return f'{type(exc).__name__}: {text}' if text else type(exc).__name__
 
 
-def project_label(project_root: str | os.PathLike[str]) -> str:
-    """Render *project_root* as the short project name the UI labels it with.
-
-    The basename, falling back to the full string for a root with no basename
-    (``'/'``) so a label can never degrade to empty. This is the dashboard's
-    single definition of that rule: :func:`fanout_label` composes it, and the
-    data modules import it rather than re-deriving it.
-    """
-    root_str = str(project_root)
-    return Path(root_str).name or root_str
-
-
-def fanout_label(base: str, project_root: str | os.PathLike[str]) -> str:
+def fanout_label(
+    base: str, project_root: str | os.PathLike[str], labels: ProjectLabels,
+) -> str:
     """Compose a per-project-root fan-out log label, ``'base[project-name]'``.
 
     **Every fan-out caller parameterized by project_root MUST compose its
@@ -383,25 +374,13 @@ def fanout_label(base: str, project_root: str | os.PathLike[str]) -> str:
     A collapsed key also erases the diagnosis: the message names only the
     shared URL, so the operator cannot tell *which* project_root is down.
 
-    The discriminator is :func:`project_label` — the same helper the data
-    modules label project chips with, so operator log labels are the same
-    string as the chips the UI already renders. ``mcp_fanout``, the leaf of this
-    cluster, is the helper's home (see :func:`project_label`) and this
-    docstring is the single place the convention is written down.
-
-    **The guarantee above assumes project-root basenames are distinct.** Two
-    configured roots sharing one (``/srv/team-a/app`` and ``/srv/team-b/app``,
-    or two checkouts both named ``dark-factory``) collapse back onto a single
-    key and reintroduce both failure modes described above. That assumption is
-    pre-existing and system-wide rather than introduced here — ``redux_api``
-    keys its whole per-project payload on the same basename, as do the
-    scheduler's per-label joins — so this helper
-    inherits it deliberately instead of diverging from every other project
-    label the dashboard renders. For ``list_tickets`` the unambiguous full root
-    is in any case still in the message body (metrics appends
-    ``(project_root=...)``).
+    The discriminator is the root's project label in *labels*
+    (``dashboard/project_labels.py::ProjectLabels``), unique across the
+    configured roots, so same-basename roots keep independent streaks and an
+    operator log label is the same string as the project chip the UI renders.
+    This docstring is the single place the convention is written down.
     """
-    return f'{base}[{project_label(project_root)}]'
+    return f'{base}[{labels.of(project_root)}]'
 
 
 def log_fanout_failure(log_label: str, url: str, exc: BaseException) -> None:

@@ -12,7 +12,6 @@ import enum
 import logging
 from dataclasses import replace
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,7 +25,6 @@ from dashboard.data.active_tasks import (
     shape_terminal_rows,
 )
 from dashboard.data.datum import Datum, DatumContractError, DatumState, validate_datum
-from dashboard.data.mcp_fanout import project_label
 from dashboard.data.task_snapshot import (
     FRESHNESS_BOUND_SECONDS,
     SnapshotFailure,
@@ -120,9 +118,7 @@ async def _terminal_window(
     otherwise fine, and an empty success reads as "this project has no
     terminal tasks", which is a measurement nobody made.
     """
-    root = next(
-        (r for r in config.all_project_roots if project_label(r) == label), None
-    )
+    root = config.project_labels.root_for(label)
     if root is None:
         return Datum(
             None, None, DatumState.UNKNOWN,
@@ -140,7 +136,7 @@ async def _terminal_window(
     if window.value is None:
         return window
     return replace(
-        window, value=shape_terminal_rows(Path(root), window.value, now=served_at),
+        window, value=shape_terminal_rows(label, window.value, now=served_at),
     )
 
 

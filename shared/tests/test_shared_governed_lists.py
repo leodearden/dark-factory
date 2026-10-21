@@ -153,7 +153,7 @@ BLESSED_TASK_METADATA_KEYS = governed_exceptions(
     'accepts without an unknown-key warning.',
     sorted(_BLESSED_METADATA_KEYS),
     default=Debt(TaskRef(5603)),
-    default_covers=52,
+    default_covers=55,
 )
 
 LEGACY_RETRY_LEDGER_COUNTER_KEYS = governed_exceptions(

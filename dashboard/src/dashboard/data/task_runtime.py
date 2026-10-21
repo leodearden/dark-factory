@@ -208,7 +208,7 @@ async def fetch_task_runtime(
     """Probe every escalation URL concurrently; return ``{label: TaskRuntimeSnapshot}``.
 
     Per-project labels match the keys used elsewhere in the dashboard
-    (project basename — see ``mcp_fanout.project_label``). A failure
+    (project label — ``dashboard/project_labels.py::ProjectLabels``). A failure
     degrades that project's entry to ``TaskRuntimeSnapshot(offline=True,
     offline_reason=...)`` so the caller can render an honest ``—`` rather
     than a fabricated zero, AND say which fault domain produced it —

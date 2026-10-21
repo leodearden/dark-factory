@@ -778,7 +778,7 @@ class TestOwnerAttribution:
 
         (row,) = _sub(_build(config, active), 'reconciliation')['escalations']
 
-        assert row['project'] == 'proj'
+        assert row['project'] == 'b/proj'
         assert row['project_root'] == str(other.resolve())
 
     def test_a_reconciliation_row_active_nowhere_has_no_owner(self, tmp_path):
