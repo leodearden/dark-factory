@@ -988,3 +988,14 @@ class TestCommittedSolarSoakOrigins:
         census = _committed_origins()['census_fidelity']
 
         assert {'solar', 'dark_factory_reify'} <= set(census)
+
+    def test_the_population_tallies_every_exclusion_the_loader_applies(self):
+        population = _committed_origins()['provenance']['population']
+        excluded = population['excluded']
+
+        assert set(excluded) == {reason.value for reason in _mod().Exclusion}
+        for reason, entry in excluded.items():
+            assert entry['count'] == len(entry['memory_ids']), reason
+        tallied = [memory_id for entry in excluded.values() for memory_id in entry['memory_ids']]
+        assert len(tallied) == len(set(tallied))
+        assert population['attached'] <= population['writes']
