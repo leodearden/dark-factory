@@ -66,7 +66,6 @@ CONDITION: Final = 'the upstream 2.0 release ships'
 STALE_CONDITION: Final = 'the vendor answers the support ticket'
 CARRIED_REASON: Final = 'folded into the carrier'
 STAMPED_BY: Final = 'claude-task-6527-fixture'
-INVALID_RECORD_JSON: Final[Mapping[str, Any]] = {'kind': 'carried_by'}
 
 
 @dataclass(frozen=True)
@@ -129,6 +128,13 @@ def _held_by_session_rows(now: datetime, live_holder: ProcessIdentity) -> tuple[
     )
 
 
+def _invalid_record(now: datetime) -> dict[str, Any]:
+    """A carried_by record with its carrier removed, so exactly one field fails to parse."""
+    record = record_to_json(CarriedByDeferral(carrier_task_id=CARRIER_LIVE, **_stamp(now)))
+    del record['carrier_task_id']
+    return record
+
+
 def _unattended_rows(now: datetime) -> tuple[FixtureRow, ...]:
     fresh = PlanningDeferral(**_stamp(now - timedelta(hours=1)))
     stale = PlanningDeferral(**_stamp(now - timedelta(hours=25)))
@@ -139,7 +145,7 @@ def _unattended_rows(now: datetime) -> tuple[FixtureRow, ...]:
         _deferred(PLANNING_FRESH, 'hold: planning batch', fresh),
         _deferred(PLANNING_STALE, 'hold: planning batch gone stale', stale),
         _deferred(LEGACY, 'hold: legacy', legacy),
-        FixtureRow(INVALID, TaskStatus.DEFERRED, 'hold: invalid record', INVALID_RECORD_JSON),
+        FixtureRow(INVALID, TaskStatus.DEFERRED, 'hold: invalid record', _invalid_record(now)),
         FixtureRow(UNRECORDED, TaskStatus.DEFERRED, 'hold: no record', None),
     )
 

@@ -46,6 +46,10 @@ from _deferral_fixture import (
     raw_rows,
     status_map,
 )
+from shared.process_identity import Liveness, ProcessIdentity, capture
+from shared.task_deferral import HeldBySessionDeferral, record_to_json
+from shared.task_statuses import TaskStatus
+
 from dashboard.data.deferral_summary import (
     UNREAD,
     HoldReads,
@@ -54,10 +58,6 @@ from dashboard.data.deferral_summary import (
     read_liveness,
     session_holders,
 )
-from shared.process_identity import Liveness, ProcessIdentity, capture
-from shared.task_deferral import HeldBySessionDeferral, record_to_json
-from shared.task_statuses import TaskStatus
-
 from dashboard.data.task_snapshot import acquire_snapshot
 
 STRAY_HELD = 191
