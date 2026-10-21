@@ -4999,9 +4999,11 @@ def create_server(
         entry's ``observation`` for 7-40 hex SHA tokens and maps each one a
         rebase orphaned to its landed twin on main (patch-id first, then a
         unique exact subject; never a guess).  Returns ``{escalation_id,
-        resolved_shas: [{cited, landed, subject, method}]}``, in cited order.
-        A token absent from ``resolved_shas`` is already on main, is not a
-        commit, or has no twin.
+        resolved_shas: [{cited, landed, subject, method}], skipped_shas}``,
+        both in cited order.  Only the first
+        ``escalation.sha_citations.MAX_CITED_SHAS_RESOLVED`` distinct tokens
+        are looked up; ``skipped_shas`` lists the rest, unresolved.  A looked-up token absent from ``resolved_shas`` is
+        already on main, is not a commit, or has no twin.
 
         Read-only: the record is never rewritten, and ``get_escalation`` /
         ``get_task_escalations`` are unchanged — they still show the SHAs as
@@ -5015,9 +5017,11 @@ def create_server(
         esc = await asyncio.to_thread(queue.get, escalation_id)
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
+        citations = await resolve_cited_shas(esc, git_ops)
         return {
             'escalation_id': esc.id,
-            'resolved_shas': await resolve_cited_shas(esc, git_ops),
+            'resolved_shas': list(citations.resolved),
+            'skipped_shas': list(citations.skipped),
         }
 
     # --- Interactive warm-worktree tools (PRD β / task 2011) ---
