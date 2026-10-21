@@ -172,7 +172,7 @@ def _cursor(
     return next(
         (
             updated_at
-            for (_, _, _, updated_at, *_), item in zip(reversed(rows), reversed(projected))
+            for (_, _, _, updated_at, *_), item in zip(reversed(rows), reversed(projected), strict=True)
             if isinstance(item, TaskRow)
         ),
         since,
