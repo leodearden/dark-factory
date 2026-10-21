@@ -223,6 +223,13 @@ class TestUnreadReferents:
         assert summary['state'] == HoldState.UNKNOWN
         assert summary['needs_human'] is None
 
+    def test_only_an_unread_holder_needs_a_human(self, rows):
+        """The shared model has LIVENESS_UNKNOWN and no reason for an unread carrier."""
+        carrier = _summary(rows[CLOSABLE], UNREAD)
+        holder = _summary(rows[HELD_LIVE], UNREAD)
+        assert carrier['state'] == holder['state'] == HoldState.UNKNOWN
+        assert (carrier['needs_human'], holder['needs_human']) == (None, 'liveness_unknown')
+
     def test_unread_reads_neither_referent(self, rows, live_holder):
         assert _summary(rows[CLOSABLE], UNREAD)['label'] == (
             'parked: carried by #900 (carrier status unknown)'

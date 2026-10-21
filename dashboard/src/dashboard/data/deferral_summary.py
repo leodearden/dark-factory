@@ -3,6 +3,11 @@
 The kinds, the records and the needs-human verdict are ``shared.task_deferral``'s;
 this module only words them. The texts are
 ``plans/deferral-flip-condition-prd.md`` decision 10's.
+
+A hold whose referent was not read is drawn UNKNOWN. Only an unread holder
+also needs a human, because only it has a shared-model reason
+(LIVENESS_UNKNOWN). An unread carrier has none, and an unmeasured status map
+must not read as 'carrier missing', so it gets no verdict.
 """
 
 from __future__ import annotations
@@ -10,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import StrEnum
+from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, assert_never
@@ -77,7 +82,7 @@ _CARRIER_QUALIFIERS: Final[Mapping[NeedsHumanReason | None, str]] = {
     NeedsHumanReason.ORPHANED: ' (orphaned)',
     NeedsHumanReason.CARRIER_MISSING: ' (carrier missing)',
 }
-_CARRIER_UNMEASURED: Final = ' (carrier status unknown)'
+_CARRIER_NOT_READ_QUALIFIER: Final = ' (carrier status unknown)'
 _LIVENESS_WORDS: Final[Mapping[Liveness | None, str]] = {
     Liveness.ALIVE: 'live',
     Liveness.DEAD: 'lost, releasing',
@@ -105,14 +110,26 @@ class HoldSummary:
         }
 
 
+class _NotRead(Enum):
+    NOT_READ = 'not_read'
+
+
+_CARRIER_NOT_READ: Final = _NotRead.NOT_READ
+
+
 @dataclass(frozen=True)
 class _Referents:
-    """What one hold points at, as read. Only a carried_by or held_by_session hold has any."""
+    """``needs_human``'s two referent arguments for one hold; each kind ignores the other one.
 
-    carrier_status: TaskStatus | None = None
+    Attributes:
+        carrier_status: ``None`` when the carrier is absent from a measured
+            status map; ``_CARRIER_NOT_READ`` when the map was not measured.
+        liveness: ``None`` when the holder was not read, as the shared model
+            spells it.
+    """
+
+    carrier_status: TaskStatus | _NotRead | None = None
     liveness: Liveness | None = None
-    carrier_unmeasured: bool = False
-    holder_unread: bool = False
 
 
 def _is_deferred(task: Mapping[str, Any]) -> bool:
@@ -149,7 +166,7 @@ def read_liveness(
 
 def _carrier_referents(record: CarriedByDeferral, reads: HoldReads) -> _Referents:
     if reads.carrier_statuses is None:
-        return _Referents(carrier_unmeasured=True)
+        return _Referents(carrier_status=_CARRIER_NOT_READ)
     status = reads.carrier_statuses.get(record.carrier_task_id)
     return _Referents(carrier_status=None if status is None else TaskStatus(status))
 
@@ -158,21 +175,21 @@ def _referents(task_id: int, record: Deferral | InvalidRecord, reads: HoldReads)
     if isinstance(record, CarriedByDeferral):
         return _carrier_referents(record, reads)
     if isinstance(record, HeldBySessionDeferral):
-        read = reads.holder_liveness.get(task_id)
-        return _Referents(liveness=read, holder_unread=read is None)
+        return _Referents(liveness=reads.holder_liveness.get(task_id))
     return _Referents()
 
 
 def _verdict(
     record: Deferral | InvalidRecord, referents: _Referents, now: datetime
 ) -> NeedsHumanReason | None:
-    if referents.carrier_unmeasured:
+    if referents.carrier_status is _CARRIER_NOT_READ:
         return None
     return needs_human(record, now, referents.carrier_status, referents.liveness)
 
 
 def _state(verdict: NeedsHumanReason | None, referents: _Referents) -> HoldState:
-    if referents.carrier_unmeasured or referents.holder_unread:
+    holder_unread = verdict is NeedsHumanReason.LIVENESS_UNKNOWN
+    if referents.carrier_status is _CARRIER_NOT_READ or holder_unread:
         return HoldState.UNKNOWN
     return HoldState.HELD if verdict is None else HoldState.NEEDS_HUMAN
 
@@ -182,7 +199,9 @@ def _utc_minute(moment: datetime) -> str:
 
 
 def _carrier_qualifier(verdict: NeedsHumanReason | None, referents: _Referents) -> str:
-    return _CARRIER_UNMEASURED if referents.carrier_unmeasured else _CARRIER_QUALIFIERS[verdict]
+    if referents.carrier_status is _CARRIER_NOT_READ:
+        return _CARRIER_NOT_READ_QUALIFIER
+    return _CARRIER_QUALIFIERS[verdict]
 
 
 def _lapse_clause(record: UntilConditionDeferral) -> str:
