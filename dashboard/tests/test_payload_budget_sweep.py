@@ -42,6 +42,15 @@ _TASK_SUBSTRATE_REQUESTS: tuple[tuple[str, Mapping[str, str]], ...] = (
     ('/api/v2/dashboard/orchestrators', {}),
 )
 
+_CORPUS_AND_ARTIFACT_REQUESTS: tuple[tuple[str, Mapping[str, str]], ...] = (
+    ('/api/v2/dashboard/escalations', {}),
+    ('/api/v2/dashboard/escalation-analytics', {}),
+    ('/api/v2/dashboard/invariants', {}),
+    ('/api/v2/dashboard/performance', {'window': 'all'}),
+    ('/api/v2/dashboard/merge-queue', {'window': 'all'}),
+    ('/api/v2/dashboard/memory-evals', {}),
+)
+
 
 def _entry(path: str, query: Mapping[str, str]) -> EndpointBudget:
     wanted = (path, tuple(sorted(query.items())))
@@ -51,7 +60,10 @@ def _entry(path: str, query: Mapping[str, str]) -> EndpointBudget:
     raise LookupError(f'payload_budgets.json has no entry for {path} with query {dict(query)}')
 
 
-_SWEPT = tuple(_entry(path, query) for path, query in _TASK_SUBSTRATE_REQUESTS)
+_SWEPT = tuple(
+    _entry(path, query)
+    for path, query in (*_TASK_SUBSTRATE_REQUESTS, *_CORPUS_AND_ARTIFACT_REQUESTS)
+)
 
 
 @pytest.fixture(scope='module')
