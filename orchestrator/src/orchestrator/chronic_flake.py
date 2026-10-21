@@ -589,7 +589,7 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
 
     UNWRAPS ITERATIVELY, and that is the whole correctness of it.  The
     production shape is TWO layers deep, not one: ``dispatch_tool`` hands back
-    ``McpSession._raw_call``'s JSON-RPC BODY verbatim —
+    ``shared.mcp_session.McpSession.call``'s JSON-RPC BODY verbatim —
     ``{'jsonrpc': '2.0', 'id': N, 'result': {'content': [{'type': 'text',
     'text': '{"statuses": …}'}], 'structuredContent': {…}, 'isError': False}}``
     — so a single step lands on the INNER RESULT, whose keys are

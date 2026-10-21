@@ -15,9 +15,9 @@ from enum import Enum
 from typing import Any
 
 from shared.briefing_queries import BriefingQuerySpec, BriefingScope, queries_for
+from shared.mcp_session import is_timeout_failure
 
 from orchestrator.mcp_lifecycle import (
-    is_timeout_failure,
     mcp_call,
     tool_error_text,
     tool_text_blocks,

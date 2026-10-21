@@ -27,6 +27,7 @@ from shared.locking import (
     normalize_lock,
 )
 from shared.mcp_envelope import parse_tool_result, resolver_failed
+from shared.mcp_idempotency import maybe_inject_client_op_id
 from shared.project_layout import scheduler_state_json
 from shared.psi import PsiSample, read_psi_sample
 from shared.scheduler_state import (
@@ -842,6 +843,7 @@ class McpSessionLike(Protocol):
         self,
         name: str,
         arguments: dict,
+        *,
         timeout: float = ...,
     ) -> dict: ...
 
@@ -3235,7 +3237,9 @@ class Scheduler:
         supplies them — e.g. the dispatch-time pending->in-progress stamp —
         so every existing caller's wire payload is unaffected. Injected into
         ``arguments`` before the retry loop so a transient retry resends the
-        same claimant stamp rather than silently dropping it.
+        same claimant stamp rather than silently dropping it. ``client_op_id``
+        is minted there too, so fused-memory replays an outer retry of a
+        write it already applied rather than applying it twice (task 2712).
 
         **Caller identity.** Every write sends ``agent_id`` =
         ``ORCHESTRATOR_MCP_IDENTITY``, placed before the retry loop for the
@@ -3279,6 +3283,7 @@ class Scheduler:
             )
             return
 
+        maybe_inject_client_op_id('tools/call', {'name': 'set_task_status', 'arguments': arguments})
         backoffs = fm_retry_backoffs()
         attempts = len(backoffs) + 1
         last_rejection: str | None = None
