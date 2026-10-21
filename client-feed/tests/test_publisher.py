@@ -2,6 +2,7 @@
 
 import logging
 import shutil
+import threading
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -37,7 +38,13 @@ from client_feed.contract import (
 from client_feed.feed_io import CURSOR_FILENAME, Cursor, OutDir, read_feed_lines
 from client_feed.fold import fold
 from client_feed.policy import Policy
-from client_feed.publisher import UNKNOWN_MERGE_GRACE, PassReport, run_pass
+from client_feed.publisher import (
+    TASKS_RESCAN_PASSES,
+    UNKNOWN_MERGE_GRACE,
+    PassReport,
+    publish,
+    run_pass,
+)
 from client_feed.validate import validate_out_dir
 
 PROJECT = 'acme'
@@ -615,4 +622,44 @@ def test_a_restart_without_a_crash_reemits_nothing_but_a_heartbeat(project: Proj
     (heartbeat,) = feed(project)[len(first) :]
     assert isinstance(heartbeat, Heartbeat)
     assert heartbeat.watermark_seq == first[-1].seq
+    assert_valid(project)
+
+
+class StopAfterWaits(threading.Event):
+    """A stop Event that never sleeps and is set by the `waits`-th wait between passes."""
+
+    def __init__(self, waits: int) -> None:
+        super().__init__()
+        self._left = waits
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self._left -= 1
+        if self._left == 0:
+            self.set()
+        return self.is_set()
+
+
+def test_publish_rereads_every_task_on_its_first_pass_and_then_every_rescan_cadence(
+    project: Project,
+) -> None:
+    passes: list[datetime] = []
+
+    def clock() -> datetime:
+        passes.append(NOW)
+        if len(passes) == 2:
+            project.tasks.add(13, title='Late', status='pending', updated_at='2026-10-21T08:00:00.000Z')
+        return NOW
+
+    publish(project.policy, stop=StopAfterWaits(TASKS_RESCAN_PASSES + 1), clock=clock)
+
+    lines = feed(project)
+    assert len(passes) == TASKS_RESCAN_PASSES + 1
+    assert [line.task_id for line in lines if isinstance(line, TaskUpserted)] == [7, 9, 13]
+    (late_at,) = (
+        index for index, line in enumerate(lines)
+        if isinstance(line, TaskUpserted) and line.task_id == 13
+    )
+    passes_before = sum(isinstance(line, Heartbeat) for line in lines[:late_at])
+    assert passes_before == TASKS_RESCAN_PASSES
+    assert stored_cursor(project).tasks_updated_at == UPDATED_9
     assert_valid(project)
