@@ -19,6 +19,8 @@ from typing import Any
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.server.write_triage import AttachGuard
+
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 
 _PARENT = '11111111-1111-4111-8111-111111111111'
@@ -399,3 +401,196 @@ class TestCosParentAxis:
 
     def test_a_stored_write_has_no_parent_cosine(self):
         assert _axis('cos_parent', _stored()) is _mod().CosParentBucket.NOT_ATTACHED
+
+
+# --- origin tables, census fidelity, guard residual -------------------------
+
+
+@functools.cache
+def _stats() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'write_triage_stats.py', mod_name='write_triage_stats')
+
+
+def _kn(k: int, n: int) -> dict[str, Any]:
+    return {'k': k, 'n': n, 'rate': _stats().rate(k, n), 'wilson95': _stats().wilson95(k, n)}
+
+
+def _verdict(name: str | None) -> Any:
+    return None if name is None else _mod().Verdict(name)
+
+
+_GROUPS = {'solar': frozenset({'solar_challenge', 'solar_challenge_platform'}), 'df': frozenset({'dark_factory'})}
+
+
+def _census_population() -> list[Any]:
+    """Judge-band attaches unless noted; w6 is restate-band; w10 is stored."""
+    return [
+        _write(memory_id='w1', outcome='contested', verdict=_verdict('contested_misfile'), retarget_named_id=_PARENT),
+        _write(memory_id='w2', outcome='contested', verdict=_verdict('correct')),
+        _write(memory_id='w3', outcome='contested', verdict=_verdict('unclear')),
+        _write(memory_id='w4', outcome='contested'),
+        _write(memory_id='w5', outcome='amended', verdict=_verdict('misfile')),
+        _write(memory_id='w6', outcome='restated', max_cosine=0.95, slate=(_entry(_PARENT, 0.95),),
+               verdict=_verdict('correct')),
+        _write(memory_id='w7', project='solar_challenge_platform', outcome='contested',
+               verdict=_verdict('false_contested')),
+        _write(memory_id='w8', project='solar_challenge_platform', outcome='contested', verdict=_verdict('pending')),
+        _write(memory_id='w9', project='dark_factory', outcome='contested', verdict=_verdict('correct')),
+        _stored(memory_id='w10', project='dark_factory'),
+    ]
+
+
+class TestOriginTables:
+    def _tables(self) -> dict[str, Any]:
+        return _mod().origin_tables(_census_population(), _GROUPS, _routing())
+
+    def test_every_origin_axis_has_a_table_per_group(self):
+        tables = self._tables()
+
+        assert set(tables) == set(_mod().ORIGIN_AXES)
+        assert all(set(by_group) == set(_GROUPS) for by_group in tables.values())
+
+    def test_misfile_counts_only_rated_attaches_per_outcome_and_cell(self):
+        kept = self._tables()['retarget']['solar']['kept']
+
+        # w2 correct + w7 false_contested rated; w3 unclear, w4 unrated, w8 pending are not.
+        assert kept['contested'] == {'attaches': 5, 'misfile': _kn(0, 2)}
+        assert kept['amended'] == {'attaches': 1, 'misfile': _kn(1, 1)}
+        assert kept['restated'] == {'attaches': 1, 'misfile': _kn(0, 1)}
+
+    def test_contested_misfile_and_misfile_both_count_as_misfile(self):
+        tables = self._tables()
+
+        assert tables['retarget']['solar']['moved']['contested']['misfile'] == _kn(1, 1)
+        assert tables['band']['solar']['judge']['amended']['misfile'] == _kn(1, 1)
+
+    def test_an_empty_cell_reports_no_rate_rather_than_zero(self):
+        moved = self._tables()['retarget']['solar']['moved']
+
+        assert moved['amended'] == {'attaches': 0, 'misfile': {'k': 0, 'n': 0, 'rate': None, 'wilson95': None}}
+
+    def test_every_interval_is_the_wilson_interval_of_its_own_counts(self):
+        band = self._tables()['band']['solar']['judge']['contested']['misfile']
+
+        assert band == _kn(1, 3)
+        assert band['wilson95'] == _stats().wilson95(1, 3)
+
+    def test_stored_writes_are_not_attaches_and_open_no_cell(self):
+        tables = self._tables()
+
+        assert set(tables['retarget']['df']) == {'kept'}
+        assert tables['band']['df']['judge']['contested'] == {'attaches': 1, 'misfile': _kn(0, 1)}
+
+    def test_the_restate_band_cell_holds_the_restate_band_attach(self):
+        restated = self._tables()['band']['solar']['restated']
+
+        assert restated['restated'] == {'attaches': 1, 'misfile': _kn(0, 1)}
+        assert restated['contested']['attaches'] == 0
+
+
+class TestCensusFidelity:
+    def test_contested_misfile_over_rated_contested_per_group(self):
+        census = _mod().census_fidelity(_census_population(), _GROUPS)
+
+        assert census == {'solar': _kn(1, 3), 'df': _kn(0, 1)}
+
+
+class TestGroups:
+    def test_the_census_groups_are_solar_with_scoping_intake_and_dark_factory_with_reify(self):
+        groups = _mod().GROUPS
+
+        assert groups == {
+            'solar': frozenset({'solar_challenge', 'solar_challenge_platform', 'scoping_intake'}),
+            'dark_factory_reify': frozenset({'dark_factory', 'reify'}),
+        }
+
+    def test_every_project_gets_a_row_of_its_own_after_the_named_groups(self):
+        writes = [_write(project='reify'), _stored(project='pump_web_ui')]
+
+        groups = _mod().groups_with_projects(_GROUPS, writes)
+
+        assert list(groups) == ['solar', 'df', 'pump_web_ui', 'reify']
+        assert groups['reify'] == frozenset({'reify'})
+
+    def test_a_group_name_that_shadows_a_project_is_refused(self):
+        with pytest.raises(ValueError, match='reify'):
+            _mod().groups_with_projects({'reify': frozenset({'dark_factory'})}, [_write(project='reify')])
+
+
+def _guard(*, floor: float | None = 0.60, gap: float | None = 0.05) -> AttachGuard:
+    return AttachGuard(min_parent_cosine=floor, hoist_max_cosine_gap=gap)
+
+
+def _below_floor(**overrides: Any) -> Any:
+    return _write(
+        outcome='amended', max_cosine=0.55, slate=(_entry(_PARENT, 0.55),), cos_parent=0.55, **overrides,
+    )
+
+
+def _judged_hoist_past_the_gap(**overrides: Any) -> Any:
+    return _write(
+        outcome='contested', max_cosine=0.75, retarget_named_id=_CHILD_OF_PARENT, cos_parent=0.62,
+        slate=(_entry(_OTHER, 0.75), _entry(_CHILD_OF_PARENT, 0.72, parent=_PARENT, kind='sighting')),
+        **overrides,
+    )
+
+
+def _restated_hoist_past_the_gap(**overrides: Any) -> Any:
+    return _write(
+        outcome='restated', max_cosine=0.95, cos_parent=0.85,
+        slate=(_entry(_CHILD_OF_PARENT, 0.95, parent=_PARENT, kind='sighting'),), **overrides,
+    )
+
+
+def _residual(writes: list[Any], guard: Any | None = None) -> dict[str, Any]:
+    return _mod().guard_residual(writes, guard or _guard(), _routing(), {'solar': frozenset({'solar_challenge'})})['solar']
+
+
+class TestGuardResidual:
+    def test_a_rated_misfile_below_the_parent_floor_is_removed(self):
+        amended = _residual([_below_floor(verdict=_verdict('misfile'))])['amended']
+
+        assert amended['removed'] == 1
+        assert amended['removed_by_reason'] == {'below_min_parent_cosine': 1}
+        assert amended['rated_misfiles_removed'] == 1
+        assert amended['misfile_after'] == _kn(0, 0)
+
+    def test_a_judged_hoist_more_than_the_gap_below_its_source_is_removed(self):
+        contested = _residual([_judged_hoist_past_the_gap(verdict=_verdict('contested_misfile'))])['contested']
+
+        assert contested['removed'] == 1
+        assert contested['removed_by_reason'] == {'hoist_cosine_gap': 1}
+
+    def test_the_same_gap_in_the_restate_band_is_not_removed(self):
+        restated = _residual([_restated_hoist_past_the_gap(verdict=_verdict('misfile'))])['restated']
+
+        assert restated['removed'] == 0
+        assert restated['misfile_after'] == _kn(1, 1)
+
+    def test_a_guard_rule_switched_off_removes_nothing(self):
+        contested = _residual([_judged_hoist_past_the_gap()], _guard(gap=None))['contested']
+
+        assert contested['removed'] == 0
+
+    def test_the_residual_is_misfile_k_of_n_over_the_rated_attaches_that_survive(self):
+        residual = _residual([
+            _below_floor(memory_id='g1', verdict=_verdict('misfile')),
+            _judged_hoist_past_the_gap(memory_id='g2', verdict=_verdict('contested_misfile')),
+            _restated_hoist_past_the_gap(memory_id='g3', verdict=_verdict('misfile')),
+            _write(memory_id='g4', outcome='contested', verdict=_verdict('correct')),
+            _write(memory_id='g5', outcome='contested', verdict=_verdict('contested_misfile')),
+            _below_floor(memory_id='g6'),
+            _write(memory_id='g7', outcome='contested', cos_parent=0.5, verdict=_verdict('correct')),
+            _stored(memory_id='g8'),
+        ])
+
+        assert residual['contested'] == {
+            'attaches': 4, 'removed': 2,
+            'removed_by_reason': {'below_min_parent_cosine': 1, 'hoist_cosine_gap': 1},
+            'rated_misfiles_removed': 1, 'rated_non_misfiles_removed': 1,
+            'misfile_before': _kn(2, 4), 'misfile_after': _kn(1, 2),
+        }
+        assert residual['amended']['attaches'] == 2
+        assert residual['amended']['removed'] == 2
+        assert residual['amended']['misfile_before'] == _kn(1, 1)
+        assert residual['restated']['misfile_after'] == _kn(1, 1)
