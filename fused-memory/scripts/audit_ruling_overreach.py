@@ -58,7 +58,6 @@ from fused_memory.backends.graphiti_client import (
     PagedRead,
     _paged_ro_query,
 )
-from fused_memory.models.enums import MemoryCategory
 from fused_memory.reconciliation.task_filter import (
     is_batch_plan_framing,
     is_proposed_resolution_framing,
@@ -196,16 +195,11 @@ def attribute_edges(edges: Iterable[Edge]) -> Attribution:
 # SPOT); this script evaluates it over Episode records.
 
 
-def _category_of(episode: Episode) -> MemoryCategory | None:
-    try:
-        return MemoryCategory(episode.source.category)
-    except ValueError:
-        return None
-
-
 def _episode_adapter(name: str) -> Callable[[Episode], bool]:
     holds = EPISODE_CLASSIFIERS[name]
-    return lambda episode: holds(_category_of(episode), episode.content or '')
+    return lambda episode: holds(
+        overreach_guard.category_of(episode.source.category), episode.content or '',
+    )
 
 
 CLASSIFIERS: Mapping[str, Callable[[Episode], bool]] = MappingProxyType({
@@ -227,7 +221,9 @@ def stratum_of(episode: Episode) -> str | None:
 
 
 def matching_classifiers(episode: Episode) -> tuple[str, ...]:
-    return overreach_guard.matching_classifiers(_category_of(episode), episode.content or '')
+    return overreach_guard.matching_classifiers(
+        overreach_guard.category_of(episode.source.category), episode.content or '',
+    )
 
 
 @dataclass(frozen=True)

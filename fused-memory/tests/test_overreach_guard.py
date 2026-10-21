@@ -27,6 +27,7 @@ from fused_memory.services.overreach_guard import (
     JudgeEdge,
     JudgeReplyError,
     build_judge_prompt,
+    category_of,
     is_guarded_category,
     judge_edges,
     matching_classifiers,
@@ -46,6 +47,15 @@ class TestClassPredicate:
 
     def test_an_unknown_category_is_out_of_class(self) -> None:
         assert is_guarded_category(None) is False
+
+    @pytest.mark.parametrize('category', list(MemoryCategory))
+    def test_a_category_value_decodes_to_its_member(self, category: MemoryCategory) -> None:
+        assert category_of(category.value) is category
+        assert category_of(category) is category
+
+    @pytest.mark.parametrize('value', [None, '', 'bogus', 'Decisions_And_Rationale', 7])
+    def test_an_absent_or_unknown_value_decodes_to_none(self, value: Any) -> None:
+        assert category_of(value) is None
 
     def test_the_class_is_exactly_the_decisions_category(self) -> None:
         assert frozenset({MemoryCategory.decisions_and_rationale}) == GUARDED_CATEGORIES

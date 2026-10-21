@@ -25,6 +25,14 @@ from fused_memory.models.enums import MemoryCategory
 GUARDED_CATEGORIES: frozenset[MemoryCategory] = frozenset({MemoryCategory.decisions_and_rationale})
 
 
+def category_of(value: Any) -> MemoryCategory | None:
+    """*value* as a MemoryCategory; an absent or unknown value is None, which no predicate guards."""
+    try:
+        return MemoryCategory(value)
+    except ValueError:
+        return None
+
+
 def is_guarded_category(category: MemoryCategory | None) -> bool:
     return category in GUARDED_CATEGORIES
 
@@ -251,9 +259,7 @@ async def judge_edges(
 ) -> tuple[EdgeJudgement, ...]:
     """Label every one of *edges* with ONE LLM call; no edges means no call.
 
-    Catches nothing. The caller owns fail-open: services/overreach_shadow.py
-    records nothing for a failed judgement and never fails the write, and
-    scripts/eval_overreach_judge.py counts an unjudged edge against recall.
+    Catches nothing; the caller owns fail-open.
     """
     if not edges:
         return ()

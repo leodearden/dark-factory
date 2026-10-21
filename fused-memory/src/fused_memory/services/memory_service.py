@@ -1494,14 +1494,6 @@ def _encode_referents(resolution: ReferentResolution) -> dict[str, Any]:
 _ABSENT = object()
 
 
-def _decode_memory_category(value: Any) -> MemoryCategory | None:
-    """The overreach shadow's class key; an absent or unknown value is out of class."""
-    try:
-        return MemoryCategory(value)
-    except ValueError:
-        return None
-
-
 def _decode_referents(
     payload: dict[str, Any],
 ) -> tuple[ReferentSet, str, ReferentSet | None]:
@@ -6078,7 +6070,7 @@ class MemoryService:
         # _dual_write_callback, every fact derived from it).
         unverified_claim = bool(payload.pop('unverified_claim', False))
         # task 6137: the overreach shadow's class key, on the same channel.
-        memory_category = _decode_memory_category(payload.pop('memory_category', None))
+        memory_category = overreach_guard.category_of(payload.pop('memory_category', None))
         # task 3561: rows enqueued BEFORE the fix still carry the fatal 'uuid'
         # key, and the durable queue outlives the deploy that removed it — so
         # the defect would survive its own fix for as long as the backlog does
