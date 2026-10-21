@@ -139,7 +139,7 @@ async def render_payload(tmp_path, dummy_client, monkeypatch) -> dict[str, Any]:
 
 def test_collected_holds_render_in_the_tasks_tab_with_the_shared_count(render_payload, tmp_path):
     counts = render_payload['expected_needs_human']
-    assert sorted(counts.values()) == [1, 10], (
+    assert len(set(counts.values())) == 2 and 0 not in counts.values(), (
         f'the fixture must give the two projects distinct, non-zero counts: {counts}'
     )
     payload_path = tmp_path / 'deferral_render_payload.json'
