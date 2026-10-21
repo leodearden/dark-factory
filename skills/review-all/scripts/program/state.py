@@ -941,12 +941,17 @@ def _locked_append(
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _parse_ledger_op(raw: object) -> LedgerOp:
+    try:
+        return LedgerOp(raw)
+    except ValueError:
+        raise LedgerRefused(f'unknown ledger op {raw!r} (known: {", ".join(LEDGER_OPS)})') from None
+
+
 def check_ledger_line(line: Mapping[str, Any]) -> None:
     """Refuse a ledger line its op does not describe (LEDGER_OPS plus the common fields)."""
-    op = line.get('op')
-    spec = LEDGER_OPS.get(op) if isinstance(op, str) else None
-    if spec is None:
-        raise LedgerRefused(f'unknown ledger op {op!r} (known: {", ".join(LEDGER_OPS)})')
+    op = _parse_ledger_op(line.get('op'))
+    spec = LEDGER_OPS[op]
     with_common = replace(spec, required=spec.required | LEDGER_COMMON_FIELDS)
     _check_fields(with_common, line, f'{op} line')
     seq = line['seq']

@@ -244,8 +244,7 @@ def _accepted_arguments(tool: str, arguments: Mapping[str, Any], behaviour: Beha
 
 def _tool_result(params: Mapping[str, Any], behaviour: Behaviour) -> dict[str, Any]:
     name = params.get('name')
-    tool = _TOOLS.get(name) if isinstance(name, str) else None
-    if tool is None:
+    if not isinstance(name, str) or (tool := _TOOLS.get(name)) is None:
         return {'content': [{'type': 'text', 'text': f'Unknown tool: {name}'}], 'isError': True}
     try:
         arguments = _accepted_arguments(name, params.get('arguments') or {}, behaviour)
@@ -338,7 +337,7 @@ class McpHandler(BaseHTTPRequestHandler):
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or '').partition('\n')[0])
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=0)
     parser.add_argument('--store', type=Path, required=True)
