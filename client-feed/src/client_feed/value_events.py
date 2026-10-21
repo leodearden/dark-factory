@@ -2,17 +2,35 @@
 
 from __future__ import annotations
 
+import math
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import datetime
-from typing import Any
+from typing import Any, Final
 
-from client_feed.contract import FeedEvent, FeedState, PrdUpserted, TaskStatus, TaskUpserted
+from client_feed.contract import (
+    Branch,
+    BranchSnapshot,
+    FactoryState,
+    FeedEvent,
+    FeedState,
+    FileKind,
+    PrdUpserted,
+    RevealBudget,
+    TaskStatus,
+    TaskUpserted,
+    TreeFile,
+    TreeSnapshot,
+)
 from client_feed.feed_io import Stamp, payload
-from client_feed.sources.events import OpenEscalations
+from client_feed.policy import Policy, matches_any
+from client_feed.sources.events import FactoryStatus, OpenEscalations
 from client_feed.sources.prds import PrdText, summarize_prd
 from client_feed.sources.tasks import TaskRow, waiting_on
+from client_feed.sources.tree import VisibleTree
+
+IDLE_RESOLUTION_SECONDS: Final = 60
 
 
 def _differs(recorded: FeedEvent | None, said: Mapping[str, Any]) -> bool:
@@ -100,3 +118,60 @@ def prd_events(
         if _differs(state.prds.get(prd_path), said):
             events.append(PrdUpserted(**stamp(now), **said))
     return tuple(events)
+
+
+def _by_the_minute(when: datetime | None) -> int | None:
+    return None if when is None else math.floor(when.timestamp() / IDLE_RESOLUTION_SECONDS)
+
+
+def _quiet_time_key(status: FactoryStatus | FactoryState) -> tuple[object, ...]:
+    """The scheduler facts exactly, the quiet time to the minute: idle_seconds moves on every pass."""
+    idle = None if status.idle_seconds is None else status.idle_seconds // IDLE_RESOLUTION_SECONDS
+    return (status.scheduler, status.since, _by_the_minute(status.last_event_at), idle)
+
+
+def factory_event(
+    status: FactoryStatus, *, state: FeedState, stamp: Stamp, now: datetime
+) -> FactoryState | None:
+    """The factory status, unless the state already says it to the minute."""
+    if state.factory is not None and _quiet_time_key(state.factory) == _quiet_time_key(status):
+        return None
+    return FactoryState(**stamp(now), **asdict(status))
+
+
+def branch_event(
+    branches: Sequence[Branch], *, state: FeedState, stamp: Stamp, now: datetime
+) -> BranchSnapshot | None:
+    """Every task branch, unless the state already holds exactly these."""
+    branches = tuple(branches)
+    if state.branches is not None and state.branches.branches == branches:
+        return None
+    return BranchSnapshot(**stamp(now), branches=branches)
+
+
+def _budget(policy: Policy, files: Sequence[TreeFile]) -> RevealBudget:
+    """PRD §4.12 with no delivered commit and no reveal granted: the proportion of every counted line."""
+    uncounted = (*policy.free_globs, *policy.never_reveal_globs)
+    counted = sum(
+        file.lines
+        for file in files
+        if file.kind is FileKind.PRODUCTION and not matches_any(uncounted, file.path)
+    )
+    return RevealBudget(
+        proportion=policy.reveal_proportion,
+        counted_lines=counted,
+        budget_lines=math.floor(policy.reveal_proportion * counted),
+        spent_lines=0,
+        floor_lines=policy.reveal_floor_lines,
+    )
+
+
+def tree_event(tree: VisibleTree, *, policy: Policy, stamp: Stamp, now: datetime) -> TreeSnapshot:
+    """The visible tree at a new main head, with its reveal budget."""
+    return TreeSnapshot(
+        **stamp(now),
+        commit=tree.commit,
+        totals=tree.totals,
+        files=tree.files,
+        budget=_budget(policy, tree.files),
+    )
