@@ -20,12 +20,13 @@ import asyncio
 import dataclasses
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
-from orchestrator.event_store import EventStore
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.types import MergeRequest
 from orchestrator.verify_runner import (
@@ -46,6 +47,13 @@ if TYPE_CHECKING:
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 logger = logging.getLogger('orchestrator.merge_lane')
+
+# How long a due drift check waits for both host slots before it defers.  It
+# must outlast the landing merge's own host lease, which
+# merge_lane/worker.py::SpeculativeMergeWorker._finalize_inflight releases only
+# in its finally, after this land hook, refresh_warm_base and the CAS walk.
+_DRIFT_HOST_SETTLE_SECS = 600.0
+_DRIFT_HOST_POLL_SECS = 5.0
 
 
 def _build_remote_runners(
@@ -233,6 +241,75 @@ class _HeldHostLeases:
             await self._allocator.release(self._held.pop())
 
 
+async def _try_acquire_drift_hosts(
+    allocator: HostAllocator, local_factory: Callable[[], LocalRunner],
+) -> tuple[HostLease, HostLease] | None:
+    """One all-or-nothing attempt: (local, remote) leases, or None holding neither."""
+    remote = allocator.acquire_remote()
+    if remote is None:
+        return None
+    local = allocator.acquire_local(local_factory)
+    if local is None:
+        await allocator.release(remote)
+        return None
+    return local, remote
+
+
+async def _acquire_drift_hosts(
+    allocator: HostAllocator,
+    local_factory: Callable[[], LocalRunner],
+    *,
+    settle_secs: float,
+    poll_secs: float,
+) -> tuple[HostLease, HostLease] | None:
+    """Both host slots, retried for *settle_secs*; None if they never came free.
+
+    A waiting check holds no slot.  ``settle_secs=0`` makes exactly one attempt.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + settle_secs
+    while True:
+        leases = await _try_acquire_drift_hosts(allocator, local_factory)
+        if leases is not None or loop.time() >= deadline:
+            return leases
+        await asyncio.sleep(poll_secs)
+
+
+def _report_drift_deferral(
+    event_store: EventStore | None,
+    req: MergeRequest,
+    merge_commit: str,
+    allocator: HostAllocator,
+    consecutive: int,
+) -> None:
+    """Log the deferral (INFO for the first of a run, DEBUG after) and emit its event."""
+    hosts = allocator.host_states()
+    logger.log(
+        logging.INFO if consecutive == 1 else logging.DEBUG,
+        'Drift check deferred for task %s / commit %s: host slots stayed busy '
+        '(%d consecutive deferral(s)); re-armed for the next landing. Hosts: %s',
+        req.task_id, merge_commit, consecutive, hosts,
+    )
+    if event_store is not None:
+        event_store.emit(
+            EventType.drift_check_deferred,
+            task_id=req.task_id,
+            data={
+                'merge_sha': merge_commit,
+                'consecutive_deferrals': consecutive,
+                'hosts': hosts,
+            },
+        )
+
+
+def _report_drift_start(req: MergeRequest, merge_commit: str, cleared: int) -> None:
+    if cleared:
+        logger.info(
+            'Drift check for task %s / commit %s running after %d deferred landing(s)',
+            req.task_id, merge_commit, cleared,
+        )
+
+
 async def _run_drift_check(
     git_ops: GitOps,
     req: MergeRequest,
@@ -244,6 +321,9 @@ async def _run_drift_check(
     verifier: VerifyPort,
     allocator: HostAllocator,
     on_unavailable: RunnerUnavailableSink | None = None,
+    state_path: Path | None = None,
+    host_settle_secs: float = _DRIFT_HOST_SETTLE_SECS,
+    host_poll_secs: float = _DRIFT_HOST_POLL_SECS,
 ) -> None:
     """Drift detective control: run DriftDetector.check in a throwaway worktree.
 
@@ -367,18 +447,19 @@ async def _run_drift_check(
                     task_id=req.task_id,
                 )
 
-            local_lease = allocator.acquire_local(_local_factory)
-            remote_lease = allocator.acquire_remote()
-            held.hold(local_lease, remote_lease)
-            if local_lease is None or remote_lease is None:
-                logger.debug(
-                    'Drift check skipped for task %s: host slots unavailable '
-                    '(local_free=%s, remote_free=%s)',
-                    req.task_id,
-                    local_lease is not None,
-                    remote_lease is not None,
+            leases = await _acquire_drift_hosts(
+                allocator, _local_factory,
+                settle_secs=host_settle_secs, poll_secs=host_poll_secs,
+            )
+            if leases is None:
+                _report_drift_deferral(
+                    event_store, req, merge_commit, allocator,
+                    _record_drift_deferral(state_path),
                 )
                 return
+            held.hold(*leases)
+            _report_drift_start(req, merge_commit, _record_drift_start(state_path))
+            local_lease, remote_lease = leases
             pool = VerifyRunnerPool(
                 [local_lease.runner, remote_lease.runner],
                 event_store=event_store,
