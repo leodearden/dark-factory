@@ -460,3 +460,28 @@ def test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched(
         f'the session did not create its private basetemp {suite.basetemp}.\n'
         f'{_captured(result)}'
     )
+
+
+@pytest.mark.parametrize(
+    'extra',
+    [('--basetemp={}',), ('--basetemp', '{}'), ('-q',)],
+    ids=['basetemp-joined', 'basetemp-separate', 'quiet'],
+)
+def test_an_argument_other_than_a_restart_flag_is_refused_before_any_session_starts(
+    tmp_path: pathlib.Path, extra: tuple[str, ...],
+) -> None:
+    smuggled = tmp_path / 'elsewhere'
+    args = tuple(arg.format(smuggled) for arg in extra)
+    suite = _write_suite(
+        tmp_path,
+        ini=_RECORDER_INI,
+        sources={'test_records_temproot.py': _TEMPROOT_RECORDER_MODULE},
+    )
+
+    with pytest.raises(ValueError, match=re.escape(RESTART_FLAG_PREFIX)) as refused:
+        _run_synthetic_suite(suite, *args)
+
+    assert args[0] in str(refused.value)
+    assert not suite.basetemp.exists(), 'a session started anyway'
+    assert not smuggled.exists(), 'a session started anyway'
+    assert not (suite.root / 'seen-temproot').exists(), 'a session started anyway'
