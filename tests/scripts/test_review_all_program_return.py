@@ -222,12 +222,13 @@ def test_a_filed_key_outside_the_streams_keys_after_amendments(reader: Any) -> N
     text = _mutated('S1.decompose.json', _set_filed(1, keys=['fk-0000000000b1']))
     found = _contradictions(_validate(text, reader, AUTHORED))
     assert any('fk-0000000000b1' in reason for reason in found['filed[1].keys[0]'])
-    amended = (*AUTHORED, {
-        'seq': 3, 'at': '2026-10-19T12:00:00Z', 'by': 'lead', 'op': 'amend_stream',
-        'stream': 'S1', 'field': 'keys', 'change': 'add', 'value': 'fk-0000000000b1',
-        'ruling': 'D1',
-    })
-    assert _validate(text, reader, amended).ok
+    moved = [
+        {'seq': seq, 'at': '2026-10-19T12:00:00Z', 'by': 'lead', 'op': 'amend_stream',
+         'stream': stream, 'field': 'keys', 'change': change, 'value': 'fk-0000000000b1',
+         'ruling': 'D1'}
+        for seq, stream, change in ((3, 'S1', 'add'), (4, 'S2', 'remove'))
+    ]
+    assert _validate(text, reader, (*AUTHORED, *moved)).ok
 
 
 def test_a_filed_task_of_another_run_is_a_contradiction(reader: Any) -> None:
