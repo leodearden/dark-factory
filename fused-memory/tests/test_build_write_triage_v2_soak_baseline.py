@@ -10,6 +10,7 @@ import functools
 import json
 import sqlite3
 import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -759,6 +760,10 @@ class _Bundle:
     def shard_files(self) -> dict[str, bytes]:
         return {path.name: path.read_bytes() for path in (self.scratch / 'shards').iterdir()}
 
+    def run(self, command: str, *extra: str) -> int:
+        return _mod().main([command, '--bundle', str(self.dir), '--scratch', str(self.scratch),
+                            *extra])
+
 
 def _triple(item: dict[str, str]) -> tuple[str, str, str]:
     return (item['entry_id'], item['target_id'], item['basis'])
@@ -873,18 +878,230 @@ class TestTheShardsCommand:
         assert 'digest' not in output.lower()
 
 
-class TestRatingVolume:
-    def _key_item(self, entry: str, basis: str = 'current', *, anchor: bool = False) -> dict[str, Any]:
-        return {'entry_id': entry, 'target_id': 'p1', 'basis': basis, 'anchor': anchor}
+Answer = dict[str, Any]
+Rule = Callable[[dict[str, str]], Answer]
 
-    def test_counts_distinct_pairs_per_basis_apart_from_anchors(self) -> None:
-        key_items = [
-            self._key_item('open'), self._key_item('open'), self._key_item('open-too'),
-            self._key_item('settled', anchor=True),
-            self._key_item('open', 'attach_time'), self._key_item('settled', 'attach_time'),
-        ]
-        assert _mod().rating_volume(key_items) == {
-            'rated_current_pairs': 2, 'anchor_pairs': 1, 'attach_time_pairs': 2,
+
+def _conflict_yes(text: dict[str, str]) -> Answer:
+    return {'home': 'YES', 'conflict': 'YES', 'scope': 'CENTRAL', 'action_changing': 'YES',
+            'conflict_quote': {'parent': text['parent_text'], 'child': text['child_text']}}
+
+
+def _loss_yes(text: dict[str, str]) -> Answer:
+    return {'home': 'YES', 'conflict': 'NO', 'loss': 'YES', 'loss_spans': [text['child_text']]}
+
+
+def _no_loss(_: dict[str, str]) -> Answer:
+    return {'home': 'YES', 'conflict': 'NO', 'loss': 'NO'}
+
+
+def _misfiled(_: dict[str, str]) -> Answer:
+    return {'home': 'NO', 'conflict': 'NO'}
+
+
+HONEST: dict[str, Rule] = {'c-i-c0': _conflict_yes, 'c-i-r0': _loss_yes}
+"""Each entry's answer when a test does not override it; any other entry is misfiled."""
+
+
+def _rate(bundle: _Bundle, overrides: dict[tuple[str, tuple[str, str, str]], Rule] | None = None) -> None:
+    """Write a fake rater's JSONL for each shard without one, quoting verbatim from texts.json.
+
+    *overrides* maps a (role, (entry, target, basis)) to the rule its line follows.
+    """
+    key = bundle.key()
+    texts = {_triple(row): row for row in json.loads((bundle.scratch / 'texts.json').read_text())}
+    ratings = bundle.scratch / 'ratings'
+    ratings.mkdir(exist_ok=True)
+    for name, spec in key['shards'].items():
+        path = ratings / f'{name}.jsonl'
+        if path.exists():
+            continue
+        lines = []
+        for item_id in spec['items']:
+            keyed = _triple(key['items'][item_id])
+            rule = (overrides or {}).get((spec['role'], keyed)) or HONEST.get(keyed[0], _misfiled)
+            lines.append({'id': item_id, **rule(texts[keyed]), 'reason': 'names both claims'})
+        path.write_text(''.join(json.dumps(line) + '\n' for line in lines))
+
+
+def _jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _item_holding(key: dict[str, Any], shard_name: str, keyed: tuple[str, str, str]) -> str:
+    [item_id] = [item for item in key['shards'][shard_name]['items']
+                 if _triple(key['items'][item]) == keyed]
+    return item_id
+
+
+def _primary_shard_of(key: dict[str, Any], keyed: tuple[str, str, str]) -> str:
+    [name] = [name for name in _shards_holding(key, keyed)
+              if key['shards'][name]['role'] == 'primary']
+    return name
+
+
+CORPUS_FILES = ('items.jsonl', 'verdicts.jsonl', 'strata.json', 'derivation.json')
+
+
+class TestTheRatingRounds:
+    @pytest.fixture
+    def bundle(self, tmp_path: Path) -> _Bundle:
+        bundle = _Bundle(tmp_path)
+        assert bundle.shards() == 0
+        return bundle
+
+    @pytest.fixture
+    def out(self, tmp_path: Path) -> Path:
+        return tmp_path / 'out'
+
+    def _assemble(self, bundle: _Bundle, out: Path) -> int:
+        return bundle.run('assemble', '--out-dir', str(out))
+
+    def test_assemble_refuses_a_shard_without_ratings(self, bundle: _Bundle, out: Path) -> None:
+        _rate(bundle)
+        (bundle.scratch / 'ratings' / 'second_00.jsonl').unlink()
+        with pytest.raises(ValueError, match='second_00'):
+            self._assemble(bundle, out)
+        assert not out.exists()
+
+    def test_assemble_refuses_an_item_without_its_line(self, bundle: _Bundle, out: Path) -> None:
+        _rate(bundle)
+        key = bundle.key()
+        item_id = _item_holding(key, 'second_00', _current('i-c0'))
+        path = bundle.scratch / 'ratings' / 'second_00.jsonl'
+        path.write_text(''.join(json.dumps(line) + '\n' for line in _jsonl(path)
+                                if line['id'] != item_id))
+        with pytest.raises(ValueError, match=rf'second_00.*{item_id}'):
+            self._assemble(bundle, out)
+
+    def test_an_unfound_quote_is_reasked_and_the_new_line_supersedes_it(
+        self, bundle: _Bundle, out: Path,
+    ) -> None:
+        keyed = _current('i-c0')
+
+        def unfound(text: dict[str, str]) -> Answer:
+            answer = _conflict_yes(text)
+            return {**answer, 'conflict_quote': {**answer['conflict_quote'], 'child': 'not in it'}}
+
+        _rate(bundle, {('primary', keyed): unfound})
+        key = bundle.key()
+        item_id = _item_holding(key, _primary_shard_of(key, keyed), keyed)
+        with pytest.raises(ValueError, match=rf'{item_id}.*conflict_quote\.child|conflict_quote\.child.*{item_id}'):
+            self._assemble(bundle, out)
+
+        assert bundle.run('reask') == 0
+        key = bundle.key()
+        reasks = {name: spec for name, spec in key['shards'].items() if name.startswith('reask_')}
+        assert list(reasks) == ['reask_01_primary']
+        spec = reasks['reask_01_primary']
+        assert (spec['role'], spec['rater'], spec['round'], len(spec['items'])) == (
+            'primary', 'opus-primary', 1, 1,
+        )
+        assert _shard_keyed(key, 'reask_01_primary') == {keyed}
+
+        _rate(bundle)
+        shard_files = bundle.shard_files()
+        assert bundle.run('reask') == 0
+        assert bundle.shard_files() == shard_files
+        assert self._assemble(bundle, out) == 0
+        [verdict] = [row for row in _jsonl(out / 'write_triage_v2_soak_verdicts.jsonl')
+                     if _triple(row) == keyed and row['rater'] == 'opus-primary']
+        assert verdict['batch'] == 'reask_01_primary'
+        assert verdict['conflict_quote'] == {'parent': 'parent text of i-c0',
+                                             'child': 'child text of i-c0'}
+        assert json.loads((out / 'write_triage_v2_soak_derivation.json').read_text())['reasked'] == 1
+
+    def test_third_rounds_name_a_fresh_rater_until_no_decisive_tie_is_left(
+        self, bundle: _Bundle, out: Path,
+    ) -> None:
+        tied = _current(_drawn('restated', 3)[1])
+        overrides = {('primary', tied): _conflict_yes, ('second', tied): _loss_yes,
+                     ('third', tied): _no_loss}
+        _rate(bundle, overrides)
+        for index in range(2):
+            assert bundle.run('third') == 0
+            key = bundle.key()
+            name = f'third_{index:02d}'
+            assert {**key['shards'][name], 'items': len(key['shards'][name]['items'])} == {
+                'role': 'third', 'rater': f'opus-third-{index:02d}', 'round': 0, 'items': 1,
+            }
+            assert _shard_keyed(key, name) == {tied}
+            _rate(bundle, overrides)
+        shard_files = bundle.shard_files()
+        assert bundle.run('third') == 0
+        assert bundle.shard_files() == shard_files
+        assert self._assemble(bundle, out) == 0
+
+    def test_assemble_writes_the_corpus_the_scorer_reads(self, bundle: _Bundle, out: Path) -> None:
+        _rate(bundle)
+        assert self._assemble(bundle, out) == 0
+        paths = {name: out / f'write_triage_v2_soak_{name}' for name in CORPUS_FILES}
+        assert sorted(path.name for path in out.iterdir()) == sorted(
+            path.name for path in paths.values())
+        recovered = [*ADJUDICATED, *_drawn('restated', 3),
+                     *(intent for intent in _drawn('amended', 3) if intent != bundle.missing)]
+        assert sorted(row['entry_id'] for row in _jsonl(paths['items.jsonl'])) == sorted(
+            f'c-{intent}' for intent in recovered)
+
+        key = bundle.key()
+        verdicts = _jsonl(paths['verdicts.jsonl'])
+        _rubric().resolve_judgements(verdicts)
+        assert sorted((*_triple(row), row['role']) for row in verdicts) == sorted(
+            (*keyed, role) for keyed in _keyed(key) for role in ('primary', 'second'))
+        loss_rows = [row for row in verdicts if row.get('loss') == 'YES']
+        assert loss_rows and all(row['digest'] == 'YES' for row in loss_rows)
+        assert [row for row in verdicts if 'non_consumed' in row] == []
+
+        assert json.loads(paths['strata.json'].read_text()) == dict(_mod().STRATA)
+        derivation = json.loads(paths['derivation.json'].read_text())
+        assert set(derivation) == {
+            'check', 'rows', 'held_rows', 'rating_volume', 'sample', 'unrecoverable',
+            'attach_time_unrecoverable', 'reasked', 'shards',
+        }
+        assert derivation['held_rows'] == []
+        assert derivation['rating_volume'] == {
+            'current': {'primary': 6, 'second': 6}, 'attach_time': {'primary': 1, 'second': 1},
+        }
+        assert derivation['sample'] == {
+            'restated-sample': {'adjudicated': 1, 'extension': 2, 'unrecoverable': 0},
+            'amended-sample': {'adjudicated': 0, 'extension': 2, 'unrecoverable': 1},
+            'contested-census': {'adjudicated': 1, 'extension': 0, 'unrecoverable': 0},
+        }
+        assert derivation['unrecoverable'] == key['unrecoverable']
+        assert derivation['attach_time_unrecoverable'] == []
+        assert derivation['reasked'] == 0
+        assert derivation['shards'] == {
+            name: {'rater': spec['rater'], 'role': spec['role'], 'round': spec['round'],
+                   'items': len(spec['items'])}
+            for name, spec in key['shards'].items()
+        }
+
+        score = load_script_module(SCRIPTS / 'score_write_triage_reader.py',
+                                   mod_name='score_write_triage_reader')
+        assert score.main([
+            '--items', str(paths['items.jsonl']), '--verdicts', str(paths['verdicts.jsonl']),
+            '--strata', str(paths['strata.json']),
+        ]) == 0
+
+
+class TestRatingVolume:
+    def test_counts_distinct_pairs_per_basis_and_role(self) -> None:
+        def item(entry: str, basis: str = 'current') -> dict[str, str]:
+            return {'entry_id': entry, 'target_id': 'p1', 'basis': basis}
+
+        key = {
+            'shards': {
+                'primary_00': {'role': 'primary', 'items': ['a', 'b']},
+                'reask_01_primary': {'role': 'primary', 'items': ['c']},
+                'second_00': {'role': 'second', 'items': ['d']},
+                'attach_primary_00': {'role': 'primary', 'items': ['e']},
+                'third_00': {'role': 'third', 'items': ['f']},
+            },
+            'items': {'a': item('e1'), 'b': item('e2'), 'c': item('e1'), 'd': item('e1'),
+                      'e': item('e1', 'attach_time'), 'f': item('e2')},
+        }
+        assert _mod().rating_volume(key) == {
+            'current': {'primary': 2, 'second': 1, 'third': 1}, 'attach_time': {'primary': 1},
         }
 
 
@@ -902,8 +1119,7 @@ class TestTheCli:
 
 class TestDecisiveTies:
     def _vote(self, entry: str, rater: str, role: str, **answers: str) -> dict[str, Any]:
-        return {'entry_id': entry, 'target_id': 'p1', 'basis': 'current', 'rater': rater,
-                'role': role, 'batch': 'b', **answers}
+        return {**_rated(entry, role=role, **answers), 'rater': rater, 'batch': 'b'}
 
     def test_names_only_pairs_a_tie_blocks(self) -> None:
         items = [_item(entry_id='tied'), _item(entry_id='calm'), _item(entry_id='harmless')]
