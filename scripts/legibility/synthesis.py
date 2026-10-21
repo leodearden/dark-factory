@@ -779,10 +779,15 @@ class SynthesisReport:
             return Outcome.SKIPPED
         return Outcome.UNAVAILABLE if isinstance(self.result, Unavailable) else Outcome.OK
 
+    @property
+    def calls(self) -> int:
+        """The synthesis model calls the run made: none for an empty brief."""
+        return 0 if self.result is None else 1
+
     def to_record(self) -> dict[str, Any]:
         return {
             "outcome": self.outcome.value,
-            "calls": 0 if self.result is None else 1,
+            "calls": self.calls,
             "reason": self.result.reason if isinstance(self.result, Unavailable) else None,
             "brief": self.brief.to_record(),
             "document": self.result.to_record() if isinstance(self.result, Synthesis) else None,

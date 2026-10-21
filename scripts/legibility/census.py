@@ -66,6 +66,7 @@ import logging
 import os
 import sys
 import tempfile
+import textwrap
 import time
 import traceback
 from collections.abc import Callable, Mapping, Sequence
@@ -1180,21 +1181,6 @@ SECTION_COST = "cost"
 Never rendered -- they exist so a caller can ask WHICH blocks a report
 carries and in what order without matching on the English inside them."""
 
-SYNTHESIS_NOT_APPLIED_NOTICE = (
-    "_The census does not parse this section: nothing proposed in it has been "
-    "applied to the codebook._"
-)
-"""Runner-authored first line of every ``## Synthesis`` body, until
-plans/census-incremental-prd.md L10 retires or reconciles it."""
-
-SYNTHESIS_PROPOSALS_HEADING = (
-    "Proposed codebook changes (not applied; act on by hand)"
-)
-"""The heading :func:`_synthesis_prompt` tells the model to put any proposed
-codebook change under, in place of the "inputs to the merger" claim earlier
-reports made."""
-
-
 @dataclass(frozen=True)
 class ReportSection:
     """One block of the census report, under a STABLE machine key.
@@ -1211,7 +1197,7 @@ class ReportSection:
     ``lines`` is the section's own slice of the report, including its own
     leading blank line, so :func:`join_report_sections` is a plain
     concatenation. A single element may itself be a multi-line blob (an
-    embedded ``matrix_md`` / ``synthesis_md``).
+    embedded ``matrix_md``).
 
     Convention, not invention: esc-3208-4, memories
     53e61951-0704-4436-94bd-bf12ae66c23b and
@@ -1349,7 +1335,7 @@ def build_census_record(
     force: bool,
     matrix_md: str,
     mining_result: MiningResult,
-    synthesis_md: str,
+    synthesis: Mapping[str, Any],
     project_root: str,
     filing: Mapping[str, Any],
     dispositions: Mapping[str, Any],
@@ -1372,7 +1358,8 @@ def build_census_record(
     *filing* is ``disposition.FilingReport.to_record``, *dispositions*
     ``disposition.OutcomeReport.to_record``, *screened*
     ``prescreen.ScreenReport.to_record``, *adjudication*
-    ``similarity.AdjudicationReport.to_record``, and *project_root* the observed
+    ``similarity.AdjudicationReport.to_record``, *synthesis*
+    ``synthesis.SynthesisReport.to_record``, and *project_root* the observed
     project their decisions and outcomes are reported against."""
     return {
         "record_version": CENSUS_RECORD_VERSION,
@@ -1391,7 +1378,7 @@ def build_census_record(
         "mass_rejection": _optional_asdict(mass_rejection),
         "dropped_verdicts": [asdict(record) for record in dropped_verdicts],
         "matrix_md": matrix_md,
-        "synthesis_md": synthesis_md,
+        "synthesis": dict(synthesis),
         "filing": dict(filing),
         "dispositions": dict(dispositions),
         "screened": dict(screened),
@@ -1602,10 +1589,7 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
     # immediately. The golden pins `matrix\n## Synthesis`; normalising this
     # during a refactor is the one plausible way to break byte-identity while
     # every structural assertion still passes.
-    emit(
-        SECTION_SYNTHESIS,
-        ["## Synthesis", "", SYNTHESIS_NOT_APPLIED_NOTICE, "", record["synthesis_md"]],
-    )
+    emit(SECTION_SYNTHESIS, synthesis.report_lines(record["synthesis"]))
 
     emit(SECTION_FINDINGS, census_findings.report_lines(record))
 
@@ -2001,24 +1985,59 @@ def _pending_cluster(cb: dict, queued: similarity.QueuedCluster) -> dict:
     )
 
 
-def _escalate_skipped_similarity(reason: str, *, project_id: str, escalate_fn) -> None:
-    """Say once, loudly, that this run's similarity stage was skipped. The
+def _escalate_once(*, stage: str, summary: str, detail: str, escalate_fn) -> None:
+    """Log *detail* at WARNING and file it as one info escalation. The
     escalation is best-effort: a raising *escalate_fn* never costs the run."""
-    detail = (
-        f"census: similarity stage skipped -- {reason}. No similarity attach and no queue "
-        "adjudication happened this run; the pending queue is unchanged, and the next run "
-        "retries the whole stage."
-    )
     logger.warning("%s", detail)
     try:
-        escalate_fn(
-            category="infra_issue",
-            severity="info",
-            summary=f"legibility census ({project_id}): similarity stage skipped -- {reason}",
-            detail=detail,
-        )
+        escalate_fn(category="infra_issue", severity="info", summary=summary, detail=detail)
     except Exception as exc:
-        logger.warning("census: similarity-skip escalation failed (best-effort): %s", exc)
+        logger.warning("census: %s escalation failed (best-effort): %s", stage, exc)
+
+
+def _escalate_skipped_similarity(reason: str, *, project_id: str, escalate_fn) -> None:
+    """Say once, loudly, that this run's similarity stage was skipped."""
+    _escalate_once(
+        stage="similarity-skip",
+        summary=f"legibility census ({project_id}): similarity stage skipped -- {reason}",
+        detail=(
+            f"census: similarity stage skipped -- {reason}. No similarity attach and no queue "
+            "adjudication happened this run; the pending queue is unchanged, and the next run "
+            "retries the whole stage."
+        ),
+        escalate_fn=escalate_fn,
+    )
+
+
+_SUMMARY_REASON_CHARS = 200
+"""How much of a refused synthesis reply's reason an escalation summary
+quotes; its detail carries all of it."""
+
+
+def _escalate_unavailable_synthesis(reason: str, *, project_id: str, escalate_fn) -> None:
+    """Say once, loudly, that this run's synthesis reply was refused."""
+    shown = textwrap.shorten(reason, _SUMMARY_REASON_CHARS, placeholder=" ...")
+    _escalate_once(
+        stage="synthesis-unavailable",
+        summary=f"legibility census ({project_id}): synthesis unavailable -- {shown}",
+        detail=(
+            f"census: synthesis unavailable -- {reason}. Nothing in the reply was applied; every "
+            "data section of the report is complete without it, and its ## Synthesis section "
+            "says synthesis was unavailable."
+        ),
+        escalate_fn=escalate_fn,
+    )
+
+
+def _synthesize(
+    brief: synthesis.Brief, *, synthesize_fn, model: str,
+) -> synthesis.Synthesis | synthesis.Unavailable | None:
+    """The validated synthesis of *brief*, or why the reply was refused; None,
+    with no call made, when *brief* is empty. A raising *synthesize_fn*
+    propagates (see :func:`_stage_headroom_gate`)."""
+    if brief.is_empty:
+        return None
+    return synthesis.parse(synthesize_fn(brief, model=model), brief)
 
 
 def _detect_mass_rejection(offered: int, verified: int, *, clusters: str, escalate_fn) -> MassRejection | None:
@@ -2762,8 +2781,6 @@ def run_census(
     verified) -> ``verify_fn``
     (Sonnet, ``census_verify``, asserts observations vs current main, never
     diagnoses -- lesson guards-assert-unverified-diagnoses) ->
-    ``synthesize_fn`` (Fable, ``census_synthesis`` -- clustering/prose ONLY
-    here) -> ``compute_matrix``/``render_matrix`` over verified sightings ->
     merge every mining record via ``codebook.apply_coding_records`` -> apply
     ``promote_candidate``/``reject_candidate`` for verified/rejected
     clusters (resolved to the merge's real candidate ids by title; a
@@ -2780,7 +2797,15 @@ def run_census(
     (``prescreen.load_instrument_findings``) -- and every entry sighted this run has the
     run appended to its ``last_seen_runs``; the similarity stage that screens,
     attaches and queues by embedding is plans/census-incremental-prd.md L7
-    (``similarity.build_view``) -> ``codebook.validate`` (raises and aborts BEFORE
+    (``similarity.build_view``) -> synthesis over this run's findings
+    (plans/census-incremental-prd.md L10): ``synthesis.Brief`` holds the keyed
+    entries this run created or re-observed, ``synthesize_fn`` (Fable,
+    ``census_synthesis``, tool-less) is called only when it is not empty, and
+    ``synthesis.parse`` validates its reply whole -- an invalid one is
+    "synthesis unavailable", one info escalation, and the run goes on -- then
+    its phase refinements reach the verified clusters and this run's new
+    entries -> ``compute_matrix``/``render_matrix`` over the refined verified
+    sightings -> ``codebook.validate`` (raises and aborts BEFORE
     anything is written, on an invalid merge) -> the route gate
     (``disposition.files``, contract §6: a structural verdict stays promoted
     and is listed under ## Structural, never filed) -> the singleton filing
@@ -2809,7 +2834,8 @@ def run_census(
     carrying no ticket id, is logged and reported, never counted in
     ``filed_ticket_ids``) -> each routed decision's C1 back-link onto its
     entry and the run's ``disposition.with_follow_ups``, then
-    ``disposition.resolve_tickets`` within its D7 budget ->
+    ``disposition.resolve_tickets`` within its D7 budget -> the synthesis
+    corrections, one coding record through ``codebook.apply_coding_records`` ->
     ``codebook.validate`` again (raises and aborts before any artifact is
     written) -> write the JSON record beside *report_path*
     (``build_census_record``) and the
@@ -3083,8 +3109,8 @@ def run_census(
             )
 
     # A cap detected INSIDE verification lands here. The except must sit so
-    # the abort returns BEFORE the mass-rejection detector, synthesize_fn,
-    # compute_matrix, the codebook merge and every write -- the whole point is
+    # the abort returns BEFORE the mass-rejection detector, the codebook merge,
+    # synthesize_fn, compute_matrix and every write -- the whole point is
     # that nothing is persisted, so no cap-poisoned cluster is ever recorded
     # as a verdict and last_census_at never advances past a window that was
     # not actually adjudicated.
@@ -3136,12 +3162,8 @@ def run_census(
         if isinstance(cluster.get("verdict"), verdict_mod.Verdict)
     )
 
-    synthesis_md = synthesize_fn(verified, model=config.models.census_synthesis)
     verified = [_with_finding(cluster, area_map) for cluster in verified]
     rejected = [_with_finding(cluster, area_map) for cluster in rejected]
-
-    verified_sightings = [s for cluster in verified for s in (cluster.get("sightings") or [])]
-    matrix_md = render_matrix(compute_matrix(verified_sightings))
 
     merge = codebook.apply_coding_records(
         codebook_dict, routed_records, invariant_slugs=invariant_slugs,
@@ -3186,10 +3208,12 @@ def run_census(
     key_attaches: list[prescreen.KeyAttach] = []
     surfaced_by_key: list[prescreen.Surfaced] = []
     re_observed: list[prescreen.ReObserved] = []
+    placed: list[tuple[dict, str | None]] = []
 
     for cluster in verified:
         cand_id = codebook.pending_titled(updated_codebook, cluster.get("title"))
         if cand_id is None:
+            placed.append((cluster, None))
             # A verify verdict this run PAID FOR that resolves to no pending
             # candidate. Post-4144 this is a normal outcome, not an anomaly
             # (see codebook.py::pending_titled); skipping it is still correct,
@@ -3253,6 +3277,7 @@ def run_census(
                 supersedes=placement.supersedes,
             )
             promoted.append(census_findings.Adjudication(entry_id, found, cluster.get("cause")))
+        placed.append((cluster, entry_id))
         if held is not None:
             held_back.append((held, entry_id))
         if files:
@@ -3302,16 +3327,57 @@ def run_census(
     for entry_id in fixed_entry_ids:
         updated_codebook = retire_entry(updated_codebook, entry_id)
 
-    updated_codebook, sighted = census_findings.mark_seen(
-        updated_codebook,
-        run_id=run_id,
-        sessions={record["session"] for record in mining_result.records if record.get("session")},
-    )
+    mined_sessions = {record["session"] for record in mining_result.records if record.get("session")}
+    updated_codebook, sighted = census_findings.mark_seen(updated_codebook, run_id=run_id, sessions=mined_sessions)
 
     _report_dropped_verdicts(
         dropped_verdicts,
         disposition_conflicts=merge.counts.candidate_disposition_conflicts,
     )
+
+    screen_report = prescreen.ScreenReport(
+        screen, tuple(surfaced_by_key), tuple(key_attaches), tuple(re_observed), instrument_findings,
+    )
+    adjudication_report = similarity.AdjudicationReport(
+        view, attached, unattached, offered, adjudicated, queue.inconclusive, queue_mass_rejection is not None,
+    )
+
+    # Synthesis (plans/census-incremental-prd.md L10, C6) runs here, after the
+    # key rule, the attaches and adjudication, so the brief's keys and its new
+    # / re-observed split are exact. Its phase refinements reach this run's
+    # verified clusters, which the matrix is rendered from, and the entries
+    # this run created, before the codebook is validated, filed from or
+    # written.
+    brief = synthesis.Brief.of(
+        run_id=run_id,
+        before=codebook_dict,
+        after=updated_codebook,
+        verdicts=promoted,
+        adopted={item.entry_id: item.adoption.external.run_id for item in re_observed},
+        run_sessions=mined_sessions,
+        counts={
+            "mined": len(mining_result.records),
+            "confirmed": len(verified),
+            "refuted": len(rejected),
+            **{f"screened_{rule}": count for rule, count in screen_report.counts().items()},
+            **adjudication_report.counts(),
+        },
+    )
+    synthesized = _synthesize(brief, synthesize_fn=synthesize_fn, model=config.models.census_synthesis)
+    if isinstance(synthesized, synthesis.Unavailable):
+        _escalate_unavailable_synthesis(synthesized.reason, project_id=project_id, escalate_fn=escalate_fn)
+    document = synthesized if isinstance(synthesized, synthesis.Synthesis) else synthesis.Synthesis()
+    standing_ids = {entry["id"] for entry in codebook_dict.get("entries") or []}
+    refined = synthesis.apply_refinements(
+        updated_codebook,
+        document,
+        clusters=placed,
+        created=[entry["id"] for entry in updated_codebook.get("entries") or [] if entry["id"] not in standing_ids],
+    )
+    updated_codebook = refined.codebook
+    matrix_md = render_matrix(compute_matrix(
+        [sighting for cluster in refined.clusters for sighting in cluster.get("sightings") or []],
+    ))
 
     _require_valid(updated_codebook, "merge")
 
@@ -3396,8 +3462,22 @@ def run_census(
     updated_codebook, resolutions = disposition.resolve_tickets(
         updated_codebook, store=task_store, run_id=run_id,
     )
-    # The backfill, back-links and resolutions changed the codebook after the
-    # merge check, so it is held to the schema again before any artifact.
+    # Synthesis corrections land after filing, so this run's title-keyed
+    # pairing and sighting counts read the codebook the run verified.
+    corrections = synthesis.corrections_record(document, run_id=run_id, date=date, project=project_id)
+    correction_counts = codebook.MergeCounts()
+    if corrections is not None:
+        corrected = codebook.apply_coding_records(updated_codebook, [corrections], invariant_slugs=invariant_slugs)
+        updated_codebook, correction_counts = corrected.codebook, corrected.counts
+    synthesis_report = synthesis.SynthesisReport(
+        brief=brief,
+        result=synthesized,
+        applied=synthesis.Applied.of(refined, correction_counts),
+        standing=synthesis.standing_count(codebook_dict, updated_codebook),
+    )
+    # The backfill, back-links, resolutions and corrections changed the
+    # codebook after the merge check, so it is held to the schema again before
+    # any artifact.
     _require_valid(updated_codebook, "filing")
     filing_report = disposition.FilingReport(disposal, resolutions, backfilled, structural)
     standings = disposition.task_standings(outcomes, disposal.resolved(resolutions).decisions)
@@ -3431,7 +3511,7 @@ def run_census(
         f"invoke calls: {config.models.census_miner} miner="
         f"{sum(s.total for s in mining_result.batch_stats)}, "
         f"{config.models.census_verify} verify={verify_calls}, "
-        f"{config.models.census_synthesis} synthesis=1, "
+        f"{config.models.census_synthesis} synthesis={synthesis_report.calls}, "
         f"{config.models.trickle} headroom-probe={probe_count[0]}"
     )
     if storm_batch_indices:
@@ -3440,12 +3520,6 @@ def run_census(
             f"{storm_batch_indices} (>50% coding failures -- degraded dup-rate "
             "signal, excluded from the saturation decision)"
         )
-    screen_report = prescreen.ScreenReport(
-        screen, tuple(surfaced_by_key), tuple(key_attaches), tuple(re_observed), instrument_findings,
-    )
-    adjudication_report = similarity.AdjudicationReport(
-        view, attached, unattached, offered, adjudicated, queue.inconclusive, queue_mass_rejection is not None,
-    )
     method = build_method(
         run_id=run_id,
         as_of_sha=as_of_sha,
@@ -3457,7 +3531,7 @@ def run_census(
         unverified=len(novel_clusters) - len(clusters_to_verify) + session_screened,
         miner_calls=sum(s.total for s in mining_result.batch_stats),
         verify_calls=verify_calls,
-        synthesis_calls=1,
+        synthesis_calls=synthesis_report.calls,
         probe_calls=probe_count[0],
         wall_clock_secs=round(time.monotonic() - started, 3),
         verify_normalisations=verify_normalisations,
@@ -3475,7 +3549,7 @@ def run_census(
         force=force,
         matrix_md=matrix_md,
         mining_result=mining_result,
-        synthesis_md=synthesis_md,
+        synthesis=synthesis_report.to_record(),
         project_root=project_root,
         filing=filing_report.to_record(),
         dispositions=dispositions_record,

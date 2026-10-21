@@ -25,6 +25,7 @@ import logging
 import math
 import re
 import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
@@ -3014,7 +3015,7 @@ _EMPTY_C6_DOCUMENT = json.dumps(
 """The valid C6 synthesis document that observes nothing."""
 
 
-def _make_fake_synthesize_fn(reply=_EMPTY_C6_DOCUMENT):
+def _make_fake_synthesize_fn(reply: str | Callable[[synthesis.Brief], str] = _EMPTY_C6_DOCUMENT):
     """Fake Fable `synthesize_fn(brief, *, model) -> str` seam. Returns
     *reply*, or ``reply(brief)`` when it is callable; records every call's
     (brief, model) in `.calls`."""
@@ -4844,7 +4845,7 @@ def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
     # assert instead what this path actually renders (nothing), rather than
     # adding a cap this test never passed just to force it to appear.
     assert outcome.stop_reason == "exhausted"
-    # Scoped to the Saturation section, not the whole report: synthesis_md,
+    # Scoped to the Saturation section, not the whole report: the synthesis,
     # matrix_md and the cost note are assembled elsewhere by other fakes, so
     # a whole-report check would fail this storm-detection test for reasons
     # that have nothing to do with storms or capped coverage.
@@ -11945,6 +11946,12 @@ def _c6_document(**lists) -> str:
 _DATA_SECTIONS = ("Findings", "Filed Tasks", "Screened", "Adjudication", "Origin x Manifestation Matrix")
 
 
+def _codebook_text_beside(kwargs) -> str:
+    """The persisted codebook with the run's own project root, which its
+    back-links carry, written as <root>."""
+    return kwargs["codebook_path"].read_text(encoding="utf-8").replace(kwargs["project_root"], "<root>")
+
+
 def test_run_census_row14_an_invalid_synthesis_is_unavailable_and_every_data_section_stands(tmp_path):
     escalate_fn = _make_fake_escalate_fn()
     invalid = _synthesis_kwargs(
@@ -11960,7 +11967,7 @@ def test_run_census_row14_an_invalid_synthesis_is_unavailable_and_every_data_sec
     assert "synthesis unavailable:" in _report_section(invalid_report, "Synthesis")
     for title in _DATA_SECTIONS:
         assert _report_section(invalid_report, title) == _report_section(valid_report, title), title
-    assert codebook.load(invalid["codebook_path"]) == codebook.load(valid["codebook_path"])
+    assert _codebook_text_beside(invalid) == _codebook_text_beside(valid)
     assert _run_record(invalid)["synthesis"]["outcome"] == "unavailable"
     [escalation] = escalate_fn.calls
     assert escalation["severity"] == "info"

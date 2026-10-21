@@ -37,6 +37,9 @@ from legibility import embeddings, unlanded
 from legibility_task_store_fake import FakeTaskStore
 
 _DATE = "2026-08-03"
+_EMPTY_SYNTHESIS = json.dumps(
+    {"new": [], "re_observed": [], "phase_refinements": [], "corrections": [], "notes": []},
+)
 _ONE_HOT_AXES = itertools.count()
 
 
@@ -87,7 +90,7 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
         selection_of=lambda: None,
         invoke=lambda prompt, model: "pong",
         verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
-        synthesize_fn=lambda verified, *, model: "No novel clusters this census.",
+        synthesize_fn=lambda brief, *, model: _EMPTY_SYNTHESIS,
         submit_fn=lambda payload: {"task_id": "t1"},
         task_store=FakeTaskStore(),
         escalate_fn=lambda **kw: None,
