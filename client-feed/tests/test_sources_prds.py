@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from _git_repo import Repo, make_repo
+
 from client_feed.sources.prds import PrdsRead, PrdText, read_prds, summarize_prd
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
