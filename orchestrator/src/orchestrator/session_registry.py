@@ -52,11 +52,12 @@ from typing import Any
 # _BARE_SHELL_ENTRYPOINTS in
 # test_session_registry.py::TestStdlibOnlySelfContainment, and mutation-tested
 # there via _MUST_BE_REJECTED.
-_CHECKOUT_SHARED_SRC = str(Path(__file__).resolve().parents[3] / 'shared' / 'src')
-if Path(_CHECKOUT_SHARED_SRC).is_dir() and _CHECKOUT_SHARED_SRC not in sys.path:
+if (
+    _CHECKOUT_SHARED_SRC := str(Path(__file__).resolve().parents[3] / 'shared' / 'src')
+) not in sys.path and Path(_CHECKOUT_SHARED_SRC).is_dir():
     sys.path.append(_CHECKOUT_SHARED_SRC)
 
-from shared.project_id import fold_project_token  # noqa: E402
+from shared.project_id import fold_project_token
 
 # ---------------------------------------------------------------------------
 # Schema / contract (PRD §6 G5): consumers import this; they never re-derive

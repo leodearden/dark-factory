@@ -13044,9 +13044,8 @@ class Harness:
             return
         assert HAS_ESCALATION  # narrows type: EscalationQueue and create_server are defined
 
-        self._escalation_queue = EscalationQueue(  # type: ignore[possibly-unbound]
-            escalation_queue_dir(self.config.project_root)
-        )
+        queue_dir = escalation_queue_dir(self.config.project_root)
+        self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-unbound]
         self._escalation_queue.set_notify_callback(self._on_escalation)
         self._escalation_queue.set_resolve_callback(self._on_escalation_resolved)
 
