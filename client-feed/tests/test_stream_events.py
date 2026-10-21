@@ -40,7 +40,7 @@ from client_feed.contract import (
     VerifyRun,
     VerifyTestResults,
 )
-from client_feed.feed_io import Stamp
+from client_feed.envelope import Stamp
 from client_feed.fold import fold
 from client_feed.sources.events import LandedCommit, PhaseChange, StreamEvent, VerifyVerdict
 from client_feed.sources.git import GitError, merge_stats

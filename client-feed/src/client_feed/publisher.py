@@ -27,7 +27,8 @@ from client_feed.contract import (
     NonNegativeInt,
     Source,
 )
-from client_feed.feed_io import Cursor, OutDir, Stamp
+from client_feed.envelope import Stamp
+from client_feed.feed_io import Cursor, OutDir
 from client_feed.fold import fold
 from client_feed.policy import Policy
 from client_feed.redact import redact_paths

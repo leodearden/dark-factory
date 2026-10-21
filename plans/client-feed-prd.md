@@ -478,7 +478,7 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     SIGTERM or SIGINT once its pass in progress completes. The loop runs on a worker thread, so the
     handler never sets the stop Event while its own thread holds that Event's lock
     (`client-feed/src/client_feed/cli.py::_publish_until_signalled`). δ's inbox tail is
-    `client-feed/src/client_feed/feed_io.py::read_inbox`, with its offset in `Cursor.inbox_offset`.
+    `client-feed/src/client_feed/inbox.py::read_inbox`, with its offset in `Cursor.inbox_offset`.
 
 ## 13. Open questions (tactical)
 

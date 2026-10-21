@@ -16,7 +16,6 @@ from client_feed.contract import (
     FactoryState,
     FeedEvent,
     Heartbeat,
-    RevealRequested,
     SchedulerState,
     TaskStatus,
     TaskUpserted,
@@ -24,14 +23,13 @@ from client_feed.contract import (
     parse_state,
     split_jsonl,
 )
+from client_feed.envelope import Stamp
 from client_feed.feed_io import (
     Cursor,
     FeedIoError,
     FeedIoProblem,
     OutDir,
-    Stamp,
     read_feed_lines,
-    read_inbox,
 )
 from client_feed.fold import ProjectMismatch, fold
 from client_feed.policy import OutDirRefused, PolicyError, PolicyProblem, load_policy
@@ -667,76 +665,3 @@ def test_read_feed_lines_reads_complete_lines_only_and_writes_nothing(out_dir: P
 
     assert read_feed_lines(out_dir) == tuple(written)
     assert _files(out_dir) == before
-
-
-def request_line(seq: int, path: str = 'core/src/a.py') -> bytes:
-    request = RevealRequested(seq=seq, at=at(seq), path=path)
-    return f'{request.model_dump_json()}\n'.encode()
-
-
-@pytest.fixture
-def in_dir(tmp_path: Path) -> Path:
-    path = tmp_path / 'in'
-    path.mkdir()
-    return path
-
-
-def test_the_inbox_is_read_to_its_last_complete_line(in_dir: Path) -> None:
-    first, second, third = request_line(1), request_line(2, 'core/src/b.py'), request_line(3)
-    inbox = in_dir / 'inbox.jsonl'
-    inbox.write_bytes(first + second + third[:10])
-
-    read = read_inbox(in_dir, offset=0)
-
-    assert [request.seq for request in read.requests] == [1, 2]
-    assert read.requests[1].path == 'core/src/b.py'
-    assert read.rejected == ()
-    assert read.offset == len(first + second)
-
-    inbox.write_bytes(first + second + third)
-    again = read_inbox(in_dir, offset=read.offset)
-
-    assert [request.seq for request in again.requests] == [3]
-    assert again.offset == len(first + second + third)
-
-
-def test_a_malformed_inbox_line_is_rejected_by_offset_and_the_tail_moves_on(in_dir: Path) -> None:
-    first, bad, last = request_line(1), b'{"seq": 2, "type": "reveal_requested"}\n', request_line(3)
-    (in_dir / 'inbox.jsonl').write_bytes(first + bad + last)
-
-    read = read_inbox(in_dir, offset=0)
-
-    assert [request.seq for request in read.requests] == [1, 3]
-    assert len(read.rejected) == 1
-    assert read.rejected[0].offset == len(first)
-    assert 'at' in read.rejected[0].detail
-    assert read.offset == len(first + bad + last)
-
-
-def test_a_missing_inbox_or_in_dir_has_no_requests(tmp_path: Path, in_dir: Path) -> None:
-    for directory in (in_dir, tmp_path / 'absent'):
-        read = read_inbox(directory, offset=7)
-
-        assert (read.requests, read.rejected, read.offset) == ((), (), 7)
-
-
-def test_a_symlinked_inbox_is_refused(in_dir: Path, outside: Path) -> None:
-    (in_dir / 'inbox.jsonl').symlink_to(outside)
-
-    with pytest.raises(FeedIoError) as caught:
-        read_inbox(in_dir, offset=0)
-
-    _assert_symlink_refusal(caught, 'inbox.jsonl')
-
-
-def test_an_offset_beyond_the_inbox_is_a_rewound_inbox(in_dir: Path) -> None:
-    (in_dir / 'inbox.jsonl').write_bytes(request_line(1))
-    size = (in_dir / 'inbox.jsonl').stat().st_size
-
-    with pytest.raises(FeedIoError) as caught:
-        read_inbox(in_dir, offset=size + 50)
-
-    assert caught.value.problem is FeedIoProblem.INBOX_REWOUND
-    assert caught.value.name == 'inbox.jsonl'
-    assert f'offset {size + 50}' in str(caught.value)
-    assert f'{size} bytes' in str(caught.value)

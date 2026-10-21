@@ -4,41 +4,35 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import itertools
 import logging
 import os
 import stat
 import tempfile
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Final, TypedDict
+from typing import Final
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from client_feed.contract import (
     FEED_FILENAME,
     FEED_MAJOR,
-    FEED_VERSION,
-    INBOX_FILENAME,
     STATE_FILENAME,
     CommitSha,
     ContractViolation,
-    EventHeader,
     FeedEvent,
     FeedLine,
     FeedState,
     NonNegativeInt,
-    RevealRequested,
     UnsupportedFeedVersion,
     feed_major,
     parse_feed_line,
-    parse_inbox_line,
     parse_state,
     split_jsonl,
 )
+from client_feed.envelope import Stamp
 from client_feed.fold import fold
 from client_feed.policy import require_usable_out_dir
 from client_feed.sources.tree import LineCounts
@@ -54,39 +48,6 @@ _TEMP_SUFFIX: Final = '.tmp'
 _SCAN_CHUNK: Final = 1 << 16
 
 _log = logging.getLogger(__name__)
-
-
-class Envelope(TypedDict):
-    """The envelope fields of one feed line, as keyword arguments to an event model."""
-
-    seq: int
-    at: datetime
-    project_id: str
-    feed_version: str
-
-
-_HEADER_FIELDS: Final = frozenset(EventHeader.model_fields)
-ENVELOPE_FIELDS: Final = _HEADER_FIELDS - {'type'}
-if Envelope.__required_keys__ != ENVELOPE_FIELDS:
-    raise TypeError(f'Envelope keys {sorted(Envelope.__required_keys__)} are not the envelope {sorted(ENVELOPE_FIELDS)}')
-
-
-def payload(event: FeedEvent) -> dict[str, Any]:
-    """What an event says: its fields other than its type and the envelope that places it in the feed."""
-    return {name: getattr(event, name) for name in type(event).model_fields if name not in _HEADER_FIELDS}
-
-
-class Stamp:
-    """The envelopes of one pass: seq allocated in call order from the first free seq."""
-
-    def __init__(self, *, project_id: str, first_seq: int) -> None:
-        self._project_id = project_id
-        self._seqs = itertools.count(first_seq)
-
-    def __call__(self, at: datetime) -> Envelope:
-        return Envelope(
-            seq=next(self._seqs), at=at, project_id=self._project_id, feed_version=FEED_VERSION
-        )
 
 
 class Cursor(BaseModel):
@@ -112,7 +73,7 @@ class FeedIoProblem(StrEnum):
 
 
 class FeedIoError(Exception):
-    """A write or read of out_dir refused because it would break one of the feed's invariants."""
+    """A write or read of out_dir, or a read of in_dir, refused because it would break one of the feed's invariants."""
 
     def __init__(self, *, problem: FeedIoProblem, name: str, detail: str) -> None:
         self.problem = problem
@@ -208,6 +169,25 @@ def _read_text(path: Path) -> str | None:
     except FileNotFoundError:
         return None
     return _decoded(data, path.name)
+
+
+@dataclass(frozen=True)
+class FileTail:
+    """A file's size when it was opened, and its bytes from the offset it was read from."""
+
+    size: int
+    data: bytes
+
+
+def read_tail(path: Path, *, offset: int) -> FileTail | None:
+    """`path` read from `offset` through one fd that refuses a symlink; None when there is no file."""
+    try:
+        with _opened(path, _READ_FLAGS) as fd:
+            size = os.fstat(fd).st_size
+            os.lseek(fd, offset, os.SEEK_SET)
+            return FileTail(size=size, data=_read_all(fd))
+    except FileNotFoundError:
+        return None
 
 
 def read_feed_lines(out_dir: Path, *, from_byte: int = 0) -> tuple[FeedLine, ...]:
@@ -485,58 +465,3 @@ class OutDir:
         self._cursor = committed
         self._uncommitted = ()
         self._feed_bytes = feed_bytes
-
-
-@dataclass(frozen=True)
-class RejectedInboxLine:
-    """A complete inbox line that is no reveal request: where it starts, and why it was refused."""
-
-    offset: int
-    detail: str
-
-
-@dataclass(frozen=True)
-class InboxRead:
-    """The requests on the inbox's complete lines past an offset, and the offset just after them."""
-
-    requests: tuple[RevealRequested, ...]
-    rejected: tuple[RejectedInboxLine, ...]
-    offset: int
-
-
-def _inbox_bytes(in_dir: Path, offset: int) -> bytes | None:
-    """The inbox's bytes from `offset` to its end; None when there is no inbox."""
-    try:
-        with _opened(in_dir / INBOX_FILENAME, _READ_FLAGS) as fd:
-            size = os.fstat(fd).st_size
-            if offset > size:
-                raise FeedIoError(
-                    problem=FeedIoProblem.INBOX_REWOUND,
-                    name=INBOX_FILENAME,
-                    detail=f'offset {offset} lies beyond its {size} bytes; the portal replaced it',
-                )
-            os.lseek(fd, offset, os.SEEK_SET)
-            return _read_all(fd)
-    except FileNotFoundError:
-        return None
-
-
-def _inbox_line(raw: bytes, *, line_no: int) -> RevealRequested:
-    return parse_inbox_line(_decoded(raw, INBOX_FILENAME), line_no=line_no)
-
-
-def read_inbox(in_dir: Path, *, offset: int) -> InboxRead:
-    """The reveal requests past `offset`; a malformed line is rejected, never raised, so it cannot stall the tail."""
-    data = _inbox_bytes(in_dir, offset)
-    if data is None:
-        return InboxRead(requests=(), rejected=(), offset=offset)
-    requests: list[RevealRequested] = []
-    rejected: list[RejectedInboxLine] = []
-    position = offset
-    for line_no, raw in enumerate(data[: data.rfind(b'\n') + 1].split(b'\n')[:-1], 1):
-        try:
-            requests.append(_inbox_line(raw, line_no=line_no))
-        except ContractViolation as exc:
-            rejected.append(RejectedInboxLine(offset=position, detail=exc.detail))
-        position += len(raw) + 1
-    return InboxRead(requests=tuple(requests), rejected=tuple(rejected), offset=position)

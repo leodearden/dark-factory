@@ -23,7 +23,7 @@ from client_feed.contract import (
     TreeFile,
     TreeSnapshot,
 )
-from client_feed.feed_io import Stamp, payload
+from client_feed.envelope import Stamp, payload
 from client_feed.policy import Policy, matches_any
 from client_feed.sources.events import FactoryStatus, OpenEscalations
 from client_feed.sources.prds import PrdText, summarize_prd

@@ -24,7 +24,7 @@ from client_feed.contract import (
     VerifyRun,
     VerifyTestResults,
 )
-from client_feed.feed_io import Stamp
+from client_feed.envelope import Stamp
 from client_feed.redact import redact_paths
 from client_feed.sources.archive import (
     ArchivedRun,

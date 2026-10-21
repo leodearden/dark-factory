@@ -23,7 +23,7 @@ from client_feed.contract import (
     TreeTotals,
     WaitingOn,
 )
-from client_feed.feed_io import Stamp
+from client_feed.envelope import Stamp
 from client_feed.fold import fold
 from client_feed.policy import Policy
 from client_feed.sources.events import FactoryStatus, OpenEscalation, OpenEscalations
