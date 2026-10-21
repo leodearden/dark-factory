@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import click
 from dotenv import load_dotenv
+from shared.project_layout import tasks_db
 
 from orchestrator.config import ConfigRequiredError, OrchestratorConfig, load_config
 from orchestrator.config_census_ignore import audit_census_ignore_entries
@@ -1517,9 +1518,7 @@ async def _run_eval_sample(*, since: str, target_low: int, target_high: int,
         found = await discover_completed_tasks(
             root, since=since, project=project, project_root=str(root),
         )
-        found = enrich_candidates_from_task_db(
-            found, root / '.taskmaster' / 'tasks' / 'tasks.db',
-        )
+        found = enrich_candidates_from_task_db(found, tasks_db(root))
         click.echo(f'discovered {len(found)} completed-task merge(s) in {project}')
         candidates.extend(found)
 
