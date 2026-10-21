@@ -98,7 +98,7 @@ def verify_runs(output: StreamOutput) -> list[VerifyRun]:
     return [event for event in output.events if isinstance(event, VerifyRun)]
 
 
-def test_results_of(output: StreamOutput) -> list[VerifyTestResults]:
+def results_of(output: StreamOutput) -> list[VerifyTestResults]:
     return [event for event in output.events if isinstance(event, VerifyTestResults)]
 
 
@@ -169,7 +169,7 @@ def test_no_secret_from_the_archive_reaches_the_events(tmp_path: Path) -> None:
 
     output = run(tmp_path, verify_enter(20, 0), verify_exit(21, 10))
 
-    assert test_results_of(output)
+    assert results_of(output)
     published = ''.join(event.model_dump_json() for event in output.events)
     for secret in (SECRET_MESSAGE, SECRET_TEXT, SECRET_CMD, SECRET_HINT):
         assert secret not in published
@@ -248,7 +248,7 @@ def test_a_merge_verdict_reads_the_archive_over_its_duration(tmp_path: Path) -> 
         commit=MERGE_SHA,
         legs=tuple(VerifyLeg(name=label, category='passed', rc=rc) for label, rc in GREEN),
     )
-    (results,) = test_results_of(output)
+    (results,) = results_of(output)
     assert (results.seq, results.run_key, results.at) == (2, 'merge-50', verdict.at)
     assert results.counts == CaseCounts(passed=2, failed=0, skipped=0, errored=0, truncated=0)
     assert len(output.events) == 2
@@ -274,7 +274,7 @@ def test_a_merge_verdict_without_a_duration_or_a_task_is_not_windowed(tmp_path: 
         ('merge-50', TASK_ID, None, NOT_RECORDED),
         ('merge-51', None, 10 * 60 * 1000, NOT_RECORDED),
     ]
-    assert test_results_of(output) == []
+    assert results_of(output) == []
     assert output.degraded == ()
 
 
@@ -300,5 +300,5 @@ def test_a_malformed_junit_leaves_a_merge_run_with_no_legs(tmp_path: Path) -> No
 
     (verify,) = verify_runs(output)
     assert (verify.run_key, verify.passed, verify.legs) == ('merge-50', True, NOT_RECORDED)
-    assert test_results_of(output) == []
+    assert results_of(output) == []
     assert [degradation.source for degradation in output.degraded] == [Source.ARCHIVE]
