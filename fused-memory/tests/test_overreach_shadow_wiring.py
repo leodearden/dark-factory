@@ -1,18 +1,22 @@
 """The overreach shadow's wiring into MemoryService and the config (task 6137).
 
-Write path: add_memory carries the resolved category on the durable-queue
-payload, _execute_graphiti_write pops it, and a guarded write submits ONE
-shadow job after the identity lock is released (design.md §6 'Lock
-placement'). Lifecycle: the shadow opens in initialize() and closes between the
-durable queue and graphiti. Config: the overreach_guard leaves hot-reload.
+Write path, end to end through the public surface: add_memory enqueues onto a
+real durable queue, the queue's workers run the write, and a guarded write is
+judged into the real sidecar that initialize() opened. Only the judge LLM and
+the graph are doubles. Lifecycle: the shadow opens in initialize() and closes
+between the durable queue and graphiti. Config: the overreach_guard leaves
+hot-reload.
 """
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _fm_helpers import install_identity_mocks
+import pytest_asyncio
+from _fm_helpers import install_identity_mocks, poll_until
 
 from fused_memory.config.reload import RELOADABLE_FIELDS, apply_reload
 from fused_memory.server.main import _MEMORY_CLOSE_STEP_TIMEOUT
@@ -24,60 +28,114 @@ from fused_memory.services.overreach_shadow import (
 )
 
 RULING = 'RULING (Leo, 2026-09-01, esc-1-2): the angular gate narrows to ANGLE only.'
+GROUP = 'dark_factory'
 
 
-@pytest.fixture
-def service(mock_config):
-    svc = MemoryService(mock_config)
+def _service(config) -> MemoryService:
+    svc = MemoryService(config)
     svc.graphiti = MagicMock()
+    svc.graphiti.initialize = AsyncMock()
+    svc.graphiti.close = AsyncMock()
     svc.graphiti.add_episode = AsyncMock(return_value=SimpleNamespace(
         episode=SimpleNamespace(uuid='ep-1'), edges=[SimpleNamespace(uuid='e1')],
     ))
-    svc.graphiti._require_client = MagicMock()
-    svc.graphiti.close = AsyncMock()
     install_identity_mocks(svc.graphiti)
     svc.mem0 = MagicMock()
     svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
     svc.mem0.close = AsyncMock()
+    return svc
+
+
+@pytest.fixture
+def service(mock_config):
+    svc = _service(mock_config)
     svc.durable_queue = MagicMock()
     svc.durable_queue.enqueue = AsyncMock(return_value=1)
-    svc.durable_queue.enqueue_batch = AsyncMock(return_value=[])
     svc.durable_queue.close = AsyncMock()
     return svc
 
 
-class _RecordingShadow(OverreachShadow):
-    """Records each submit and whether the group's identity lock was held at the time.
+class _ClosingShadow(OverreachShadow):
+    """Records its close into *order*, or raises from submit.
 
     Deliberately skips OverreachShadow.__init__: it has no store and no LLM.
     """
 
-    def __init__(self, svc: MemoryService, *, error: Exception | None = None,
-                 order: list[str] | None = None) -> None:
-        self.svc, self.error, self.order = svc, error, order
-        self.jobs: list[ShadowJob] = []
-        self.lock_held: list[bool] = []
+    def __init__(self, *, order: list[str] | None = None, error: Exception | None = None) -> None:
+        self.order, self.error = order, error
 
     def submit(self, job: ShadowJob) -> bool:
-        self.lock_held.append(self.svc.graphiti._identity_lock_for(job.graph).locked())
-        self.jobs.append(job)
-        if self.error is not None:
-            raise self.error
-        return True
+        raise self.error or AssertionError('this shadow is never submitted to')
 
     async def close(self) -> None:
         if self.order is not None:
             self.order.append('overreach_shadow')
 
 
-def _payload(**overrides):
-    payload = {
-        'name': 'memory_decisions_and_rationale', 'content': RULING, 'source': 'text',
-        'group_id': 'dark_factory', 'source_description': 'add_memory:decisions_and_rationale',
-        'memory_category': 'decisions_and_rationale',
-    }
-    payload.update(overrides)
-    return payload
+class _Graph:
+    """Each write mints one edge; the survivor read returns it, live."""
+
+    def __init__(self) -> None:
+        self.minted: dict[str, str] = {}
+
+    async def add_episode(self, *args: Any, **kwargs: Any) -> Any:
+        number = len(self.minted) + 1
+        episode, edge = f'ep-{number}', f'edge-{number}'
+        self.minted[edge] = episode
+        return SimpleNamespace(episode=SimpleNamespace(uuid=episode), edges=[SimpleNamespace(uuid=edge)])
+
+    async def get_edges_by_uuids(self, uuids, *, group_id):
+        return [
+            {'uuid': uuid, 'fact': f'fact of {uuid}', 'source_name': 'S', 'target_name': 'T',
+             'episodes': [self.minted[uuid]], 'active': True}
+            for uuid in uuids if uuid in self.minted
+        ]
+
+
+class _Judge:
+    """Labels every edge overreach, but only once released; records each call."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def generate_response(self, messages, response_model=None, max_tokens=None, **kwargs):
+        self.calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return {'judgements': [{'edge': 'E1', 'label': 'overreach', 'rationale': 'the whole span'}]}
+
+
+@pytest_asyncio.fixture
+async def live(mock_config):
+    """An initialized MemoryService: real queue, real shadow, real sidecar."""
+    mock_config.overreach_guard.shadow_enabled = True
+    mock_config.queue.workers_per_group = 2
+    svc = _service(mock_config)
+    graph, judge = _Graph(), _Judge()
+    svc.graphiti.add_episode = AsyncMock(side_effect=graph.add_episode)
+    svc.graphiti.get_edges_by_uuids = AsyncMock(side_effect=graph.get_edges_by_uuids)
+    with patch('fused_memory.services.overreach_shadow.build_llm_client', return_value=judge):
+        await svc.initialize()
+    yield SimpleNamespace(service=svc, judge=judge)
+    judge.release.set()
+    await svc.close()
+
+
+async def _completed(svc: MemoryService, count: int) -> None:
+    async def done() -> bool:
+        assert svc.durable_queue is not None
+        stats = await svc.durable_queue.get_stats()
+        return stats['counts'].get('completed') == count
+    await poll_until(done, message=f'the queue never completed {count} write(s)')
+
+
+async def _flagged(svc: MemoryService) -> list[str]:
+    assert svc.overreach_shadow is not None
+    await svc.overreach_shadow.drain()
+    page = await svc.overreach_shadow.overreach_flag_page(GROUP, 10)
+    return [flag.episode_uuid for flag in page.flags]
 
 
 # --------------------------------------------------------------------------- #
@@ -127,72 +185,87 @@ class TestMockConfigPinsTheShadowOff:
 # --------------------------------------------------------------------------- #
 
 
-class TestAddMemoryCarriesTheCategory:
+class TestTheWritePath:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('category', ['decisions_and_rationale', 'temporal_facts'])
-    async def test_the_payload_carries_the_resolved_category(self, service, category) -> None:
-        await service.add_memory(content=RULING, category=category, project_id='dark_factory')
-        payload = service.durable_queue.enqueue.call_args.kwargs['payload']
-        assert service.durable_queue.enqueue.call_args.kwargs['operation'] == 'add_memory_graphiti'
-        assert payload['memory_category'] == category
-
-    @pytest.mark.asyncio
-    async def test_add_episode_carries_no_category(self, service) -> None:
-        await service.add_episode(content=RULING, project_id='dark_factory')
-        assert 'memory_category' not in service.durable_queue.enqueue.call_args.kwargs['payload']
-
-
-class TestExecuteGraphitiWrite:
-    @pytest.mark.asyncio
-    async def test_a_guarded_write_submits_one_job_after_the_lock(self, service) -> None:
-        shadow = _RecordingShadow(service)
-        service.overreach_shadow = shadow
-        await service._execute_graphiti_write('add_memory_graphiti', _payload())
-        (job,) = shadow.jobs
-        assert (job.graph, job.episode_uuid, job.edge_uuids, job.content) == (
-            'dark_factory', 'ep-1', ('e1',), RULING,
+    async def test_a_decision_write_is_judged_into_the_sidecar(self, live) -> None:
+        live.judge.release.set()
+        await live.service.add_memory(
+            content=RULING, category='decisions_and_rationale', project_id=GROUP,
         )
-        assert 'category_decisions' in job.classifiers
-        assert shadow.lock_held == [False]
+        await _completed(live.service, 1)
+        assert await _flagged(live.service) == ['ep-1']
+        assert 'memory_category' not in live.service.graphiti.add_episode.await_args.kwargs
 
     @pytest.mark.asyncio
-    async def test_the_category_never_reaches_the_backend(self, service) -> None:
-        service.overreach_shadow = _RecordingShadow(service)
-        payload = _payload()
-        await service._execute_graphiti_write('add_memory_graphiti', payload)
-        assert 'memory_category' not in payload
-        assert 'memory_category' not in service.graphiti.add_episode.call_args.kwargs
+    async def test_a_slow_judge_holds_up_neither_its_write_nor_a_same_group_one(self, live) -> None:
+        svc = live.service
+        await svc.add_memory(content=RULING, category='decisions_and_rationale', project_id=GROUP)
+        await asyncio.wait_for(live.judge.entered.wait(), 10)
+        await svc.add_memory(content=RULING + ' Again.', category='decisions_and_rationale',
+                             project_id=GROUP)
+        await poll_until(lambda: svc.graphiti.add_episode.await_count == 2,
+                         message='the second write was serialized behind the first judge')
+        await _completed(svc, 2)
+        assert not live.judge.release.is_set()
+        live.judge.release.set()
+        assert await _flagged(svc) == ['ep-1', 'ep-2']
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('payload', [
-        pytest.param(_payload(memory_category='temporal_facts'), id='not-guarded'),
-        pytest.param({k: v for k, v in _payload().items() if k != 'memory_category'}, id='absent-key'),
-        pytest.param(_payload(memory_category='bogus'), id='unknown-value'),
+    async def test_another_category_is_not_judged(self, live) -> None:
+        await live.service.add_memory(content=RULING, category='temporal_facts', project_id=GROUP)
+        await _completed(live.service, 1)
+        assert (await _flagged(live.service), live.judge.calls) == ([], 0)
+
+    @pytest.mark.asyncio
+    async def test_add_episode_is_not_judged(self, live) -> None:
+        await live.service.add_episode(content=RULING, project_id=GROUP)
+        await _completed(live.service, 1)
+        assert (await _flagged(live.service), live.judge.calls) == ([], 0)
+
+    @pytest.mark.parametrize('category', [
+        pytest.param(None, id='enqueued-before-deploy'),
+        pytest.param('bogus', id='unknown-value'),
     ])
-    async def test_an_out_of_class_write_submits_nothing(self, service, payload) -> None:
-        shadow = _RecordingShadow(service)
-        service.overreach_shadow = shadow
-        await service._execute_graphiti_write('add_memory_graphiti', dict(payload))
-        assert shadow.jobs == []
+    @pytest.mark.asyncio
+    async def test_a_queued_row_without_a_known_category_is_not_judged(self, live, category) -> None:
+        payload: dict[str, Any] = {
+            'name': 'memory_decisions_and_rationale', 'content': RULING, 'source': 'text',
+            'group_id': GROUP, 'source_description': 'add_memory:decisions_and_rationale',
+        }
+        if category is not None:
+            payload['memory_category'] = category
+        assert live.service.durable_queue is not None
+        await live.service.durable_queue.enqueue(
+            group_id=GROUP, operation='add_memory_graphiti', payload=payload,
+        )
+        await _completed(live.service, 1)
+        assert (await _flagged(live.service), live.judge.calls) == ([], 0)
 
     @pytest.mark.asyncio
-    async def test_no_shadow_means_nothing_to_submit(self, service) -> None:
-        service.overreach_shadow = None
-        assert await service._execute_graphiti_write('add_memory_graphiti', _payload()) is not None
+    async def test_a_result_naming_no_episode_is_not_judged(self, live) -> None:
+        live.service.graphiti.add_episode = AsyncMock(return_value=None)
+        await live.service.add_memory(
+            content=RULING, category='decisions_and_rationale', project_id=GROUP,
+        )
+        await _completed(live.service, 1)
+        assert (await _flagged(live.service), live.judge.calls) == ([], 0)
 
+    @pytest.mark.parametrize('shadow', [
+        pytest.param(None, id='no-shadow'),
+        pytest.param(_ClosingShadow(error=RuntimeError('shadow down')), id='raising-submit'),
+    ])
     @pytest.mark.asyncio
-    async def test_a_none_result_submits_nothing(self, service) -> None:
-        shadow = _RecordingShadow(service)
-        service.overreach_shadow = shadow
-        service.graphiti.add_episode = AsyncMock(return_value=None)
-        await service._execute_graphiti_write('add_memory_graphiti', _payload())
-        assert shadow.jobs == []
-
-    @pytest.mark.asyncio
-    async def test_a_raising_submit_never_fails_the_write(self, service) -> None:
-        service.overreach_shadow = _RecordingShadow(service, error=RuntimeError('shadow down'))
-        result = await service._execute_graphiti_write('add_memory_graphiti', _payload())
-        assert result.episode.uuid == 'ep-1'
+    async def test_the_write_lands_whatever_the_shadow_does(self, live, shadow) -> None:
+        opened = live.service.overreach_shadow
+        live.service.overreach_shadow = shadow
+        try:
+            await live.service.add_memory(
+                content=RULING, category='decisions_and_rationale', project_id=GROUP,
+            )
+            await _completed(live.service, 1)
+        finally:
+            live.service.overreach_shadow = opened
+        assert live.service.graphiti.add_episode.await_count == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -206,7 +279,7 @@ class TestLifecycle:
         order: list[str] = []
         service.durable_queue.close = AsyncMock(side_effect=lambda: order.append('durable_queue'))
         service.graphiti.close = AsyncMock(side_effect=lambda: order.append('graphiti'))
-        service.overreach_shadow = _RecordingShadow(service, order=order)
+        service.overreach_shadow = _ClosingShadow(order=order)
         await service.close()
         assert order == ['durable_queue', 'overreach_shadow', 'graphiti']
 
