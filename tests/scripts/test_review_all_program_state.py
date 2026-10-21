@@ -14,12 +14,21 @@ import os
 import subprocess
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from review_all_program_fixture import FIXTURE_DIR, PROGRAM_DIR, REPO_ROOT, load_state
+from orchestrator.session_registry import SessionRecord
+from review_all_program_fixture import (
+    FIXTURE_DIR,
+    PROGRAM_DIR,
+    REPO_ROOT,
+    FakeStore,
+    load_state,
+    running_fake_store,
+)
+from sitting.ownership import parse_result_outcome
 
 from shared import task_statuses
 
@@ -578,3 +587,197 @@ def test_item_ref_refuses_malformed_text(text: str) -> None:
     with pytest.raises(state.StateError) as caught:
         state.ItemRef.parse(text)
     assert repr(text) in str(caught.value)
+
+
+# The fixture inventory: each B-row's preconditions (plans/review-all-program-tooling-prd.md
+# §Boundary-test sketch), read through state.py and the fake store. B1 is pinned by the
+# parse_program tests above, B3 by test_review_all_program_return.py's notes-over-cap and
+# absent-filed tests, B11 by test_review_all_program_store_reader.py's refusal tests.
+
+PROJECT_ROOT = '/review-all-fixture/project'
+RETURNS = FIXTURE_DIR / 'returns'
+SESSIONS = FIXTURE_DIR / 'sessions'
+AUTHORED = (_authored(1, 'S1'), _authored(2, 'S2'))
+
+
+@pytest.fixture(scope='module')
+def store() -> Iterator[FakeStore]:
+    with running_fake_store() as running:
+        yield running
+
+
+@pytest.fixture(scope='module')
+def reader(store: FakeStore) -> Any:
+    return state.StoreReader(store.url, PROJECT_ROOT)
+
+
+def _return(name: str, reader: Any, ledger: Any = AUTHORED) -> Any:
+    check = state.validate_return(
+        (RETURNS / name).read_text(), program=_program(), ledger=ledger, store=reader,
+    )
+    assert check.ok, check.rejections
+    return check.value
+
+
+def _program_rows(reader: Any) -> dict[int, Any]:
+    read = reader.program_tasks(RUN_ID, tuple(PRD_PATHS.values()))
+    return {row.task_id: row for row in read.rows}
+
+
+def _check_paths(row: Any) -> set[str]:
+    return {path for check in row.metadata.get('delivered_checks', ()) for path in check['paths']}
+
+
+def _record() -> dict[str, Any]:
+    return json.loads((FIXTURE_DIR / 'record.json').read_text())
+
+
+def test_b2_author_touches_paths_other_tasks_declare_and_anchor(reader: Any) -> None:
+    touches = set(_return('S1.author.json', reader).touches)
+    program_ids = set(_program_rows(reader))
+    declaring = {
+        row.task_id for row in reader.tasks_declaring_files(sorted(touches)).rows
+        if row.task_id not in program_ids
+    }
+    anchoring = {
+        row.task_id for row in reader.tasks_with_delivered_checks().rows
+        if row.task_id not in program_ids and _check_paths(row) & touches
+    }
+    assert declaring
+    assert anchoring - declaring
+
+
+def test_b4_s1_decompose_holds_gates_and_moves_anchored_paths(reader: Any) -> None:
+    decompose = _return('S1.decompose.json', reader)
+    [held] = decompose.held
+    assert state.SEAM_WAIT_KEYS.key in reader.task(held.task_id).rows[0].metadata
+    assert [f.task_id for f in decompose.filed if f.gate_dep] == [101]
+    checked = reader.tasks_with_delivered_checks().rows
+    [renamed] = [m for m in decompose.moves if m.to_path is not None]
+    assert any(
+        renamed.from_path in check['paths']
+        and any(symbol in (check['pattern'] or '') for symbol in renamed.symbols)
+        for row in checked for check in row.metadata['delivered_checks']
+    )
+    [deleted] = [m for m in decompose.moves if m.to_path is None]
+    assert any(deleted.from_path in _check_paths(row) for row in checked)
+
+
+def test_b5_a_program_task_is_unstreamed(reader: Any) -> None:
+    views = state.stream_views(_program(), AUTHORED)
+    streamed = {i: state.stream_of(row, views) for i, row in _program_rows(reader).items()}
+    assert streamed[107] == state.UNSTREAMED
+    assert streamed[108] == 'S3'
+    assert streamed[104] == 'S1'
+
+
+def _gate_facts(reader: Any) -> tuple[Any, dict[int, Any]]:
+    return reader.gate(RUN_ID).rows[0], _program_rows(reader)
+
+
+def test_b7_the_interim_gate_misses_one_high_leaf_and_carries_one_foreign_dep(
+    reader: Any,
+) -> None:
+    gate, program = _gate_facts(reader)
+    high = {i for i, row in program.items() if row.priority in {'high', 'critical'}}
+    assert high - set(gate.dependencies) == {106}
+    assert set(gate.dependencies) - set(program) == {201}
+    assert any('prd_path' in r.metadata and 'x_finding_run' not in r.metadata
+               for r in program.values())
+
+
+def test_b7_the_final_gate_depends_on_the_completion_gate_only() -> None:
+    with running_fake_store(store=FIXTURE_DIR / 'store-final.json') as running:
+        reader = state.StoreReader(running.url, PROJECT_ROOT)
+        [completion] = reader.completion_gate(RUN_ID).rows
+        gate, program = _gate_facts(reader)
+    assert gate.dependencies == (completion.task_id,)
+    assert any('prd_path' in r.metadata and 'x_finding_run' not in r.metadata
+               for r in program.values())
+
+
+def test_b7_the_final_store_differs_only_by_the_completion_gate() -> None:
+    interim = {t['id']: t for t in json.loads((FIXTURE_DIR / 'store.json').read_text())['tasks']}
+    final = {t['id']: t for t in json.loads((FIXTURE_DIR / 'store-final.json').read_text())['tasks']}
+    [added] = set(final) - set(interim)
+    assert set(interim) <= set(final)
+    assert final[added]['metadata']['trigger_chain']['role'] == 'completion_gate'
+    changed = {i for i in interim if interim[i] != final[i]}
+    assert changed == {110}
+    assert {**interim[110], 'dependencies': [added]} == final[110]
+
+
+def test_b8_handoff_inputs(reader: Any) -> None:
+    assert {'launched_from', 'fable_seats', 'yes'} <= set(_record()['method']['extra'])
+    held = reader.held_leaves(RUN_ID, tuple(PRD_PATHS.values())).rows
+    assert any(row.metadata[state.SEAM_WAIT_KEYS.key]['release_owner'] in _program().stream_ids
+               for row in held)
+    assert not (RETURNS / 'S3.decompose.json').exists()
+
+
+def test_b9_brief_inputs(reader: Any) -> None:
+    record = _record()
+    finding_keys = {finding['key'] for finding in record['findings']}
+    assert set(_program().stream('S1').keys) <= finding_keys
+    disputed = [f['calibration_disputes_verdict'] for f in record['findings']
+                if 'calibration_disputes_verdict' in f]
+    assert disputed and all({'to', 'note'} <= set(d) for d in disputed)
+    assert record['filings']
+    assert any(x.to == 'S2' for x in _return('S1.author.json', reader).xrefs)
+    _return('S2.author.json', reader)
+    held = reader.held_leaves(RUN_ID, tuple(PRD_PATHS.values())).rows
+    assert any(row.metadata[state.SEAM_WAIT_KEYS.key]['release_owner'] == 'S2' for row in held)
+
+
+SESSION_SCENARIOS = {
+    'checkpoint-running': ('running', 'in-progress'),
+    'final-exited': ('exited', 'done'),
+    'finished-idle': ('idle', 'done'),
+    'checkpoint-exited': ('exited', 'in-progress'),
+}
+
+
+def _header_lines(result_md: Path) -> list[str]:
+    lines = result_md.read_text().splitlines()
+    assert lines[0] == '---'
+    return lines[1:lines.index('---', 1)]
+
+
+@pytest.mark.parametrize('scenario', sorted(SESSION_SCENARIOS))
+def test_b10_session_records_and_result_headers(scenario: str) -> None:
+    status, outcome = SESSION_SCENARIOS[scenario]
+    record = SessionRecord.from_json((SESSIONS / scenario / 'record.json').read_text())
+    assert record.status == status
+    assert record.title.partition(':')[0] == record.role
+    result_md = SESSIONS / scenario / 'result.md'
+    if outcome == 'in-progress':
+        assert 'outcome: in-progress' in _header_lines(result_md)
+    else:
+        assert parse_result_outcome(result_md.read_text()) == outcome
+
+
+def test_b10_the_final_session_is_the_checkpoints_and_its_inbox_return_validates(
+    reader: Any,
+) -> None:
+    def record(scenario: str) -> Any:
+        return SessionRecord.from_json((SESSIONS / scenario / 'record.json').read_text())
+
+    running, final = record('checkpoint-running'), record('final-exited')
+    assert running.session_slug == final.session_slug
+    assert running.title == final.title == 'prd:fixture S3'
+    assert 'inbox/S3.author.json' in (SESSIONS / 'final-exited' / 'result.md').read_text()
+    _return('S3.author.json', reader)
+    with pytest.raises(json.JSONDecodeError):
+        SessionRecord.from_json((SESSIONS / 'unreadable' / 'record.json').read_text())
+
+
+def test_b16_the_sitting_inputs(reader: Any) -> None:
+    author = json.loads((RETURNS / 'S1.author.json').read_text())
+    amend = json.loads((RETURNS / 'S1.author.amend.json').read_text())
+    added = [q for q in amend['open_questions'] if q not in author['open_questions']]
+    assert len(added) == 1 and added[0]['source'] == 'critic'
+    assert {k: v for k, v in amend.items() if k != 'open_questions'} == {
+        k: v for k, v in author.items() if k != 'open_questions'
+    }
+    assert any(q.lead_rulable for q in _return('S1.author.json', reader).open_questions)
+    assert _return('S1.investigate-Q2.json', reader).item == added[0]['id']
