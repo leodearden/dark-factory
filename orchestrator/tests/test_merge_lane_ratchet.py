@@ -2736,7 +2736,7 @@ class TestAuthorizeRaiseCli:
 
     def test_ledger_defaults_to_the_committed_path(self) -> None:
         args = metrics._build_parser().parse_args(['--check'])
-        assert Path(args.ledger).name == 'merge_lane_ratchet_authorized_raises.json'
+        assert Path(args.ledger).name == 'merge_lane_ratchet_raises'
 
 
 class TestCliContract:
