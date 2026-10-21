@@ -11,7 +11,9 @@
 #   verify-p90-secs   <= 5400   (75% of the 7200s verify timeout -- margin gate)
 #
 # Reads a target orchestrator runs.db (the append-only sqlite event store; no
-# migration) over a trailing window, keyed on the truthful chain telemetry
+# migration) over the window (now - N days, now], its bounds rendered in
+# EventStore.emit's own UTC ISO-8601 layout so the lexical comparison against
+# events.timestamp is exact.  Keyed on the truthful chain telemetry
 # fields (merge_verify.chain_items >= 2 = a deep verify; merge_finalized.
 # landed_via_chain = items a chain landed).  Read-only: opened mode=ro, no writes.
 # verify_p90 reads merge_verify data['duration_ms']: the events.duration_ms
@@ -27,6 +29,7 @@
 # Usage:
 #   merge-deep-canary-predicate.sh --runs-db PATH [--window-days N]
 #       [--deep-fail-rate-max R] [--items-per-verify-min R] [--verify-p90-max-secs S]
+#       [--now EPOCH_SECS]   (the reference instant; defaults to the current time)
 set -euo pipefail
 
 usage() { echo "merge-deep-canary-predicate: $*" >&2; exit 2; }
@@ -36,6 +39,7 @@ WINDOW_DAYS="7"
 FAIL_MAX="0.35"
 ITEMS_MIN="1.3"
 P90_MAX="5400"
+NOW=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -44,6 +48,7 @@ while [ "$#" -gt 0 ]; do
         --deep-fail-rate-max)   [ "$#" -ge 2 ] || usage "missing value for $1"; FAIL_MAX="$2"; shift 2 ;;
         --items-per-verify-min) [ "$#" -ge 2 ] || usage "missing value for $1"; ITEMS_MIN="$2"; shift 2 ;;
         --verify-p90-max-secs)  [ "$#" -ge 2 ] || usage "missing value for $1"; P90_MAX="$2"; shift 2 ;;
+        --now)                  [ "$#" -ge 2 ] || usage "missing value for $1"; NOW="$2"; shift 2 ;;
         *) usage "unknown argument: $1" ;;
     esac
 done
@@ -51,10 +56,37 @@ done
 [ -n "$RUNS_DB" ] || usage "--runs-db is required"
 [ -f "$RUNS_DB" ] || usage "runs.db not found: $RUNS_DB"
 
-python3 - "$RUNS_DB" "$WINDOW_DAYS" "$FAIL_MAX" "$ITEMS_MIN" "$P90_MAX" <<'PY'
-import json, math, sqlite3, sys
-db, window = sys.argv[1], sys.argv[2]
-fail_max, items_min, p90_max = (float(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]))
+python3 - "$RUNS_DB" "$WINDOW_DAYS" "$FAIL_MAX" "$ITEMS_MIN" "$P90_MAX" "$NOW" <<'PY'
+import json, math, sqlite3, sys, time
+from datetime import datetime, timedelta, timezone
+db, raw_window, raw_fail_max, raw_items_min, raw_p90_max, raw_now = sys.argv[1:7]
+
+def usage_fault(message):
+    print(f"predicate: {message}", file=sys.stderr); sys.exit(2)
+
+def number(flag, raw):
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value):
+        usage_fault(f"{flag} must be a finite number; got {raw!r}")
+    return value
+
+window_days = number("--window-days", raw_window)
+if window_days <= 0:
+    usage_fault(f"--window-days must be > 0; got {raw_window!r}")
+fail_max = number("--deep-fail-rate-max", raw_fail_max)
+items_min = number("--items-per-verify-min", raw_items_min)
+p90_max = number("--verify-p90-max-secs", raw_p90_max)
+now_epoch = time.time() if raw_now == "" else number("--now", raw_now)
+
+try:
+    as_of = datetime.fromtimestamp(now_epoch, timezone.utc)
+    window_lo = (as_of - timedelta(days=window_days)).isoformat(timespec="microseconds")
+    window_hi = as_of.isoformat(timespec="microseconds")
+except (OverflowError, OSError, ValueError) as exc:
+    usage_fault(f"--now/--window-days put the window out of range: {exc}")
 
 try:
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -65,8 +97,8 @@ def load(evtype):
     try:
         rows = conn.execute(
             "SELECT data FROM events "
-            "WHERE event_type=? AND timestamp > datetime('now', ?) ORDER BY id",
-            (evtype, f"-{window} days"),
+            "WHERE event_type=? AND timestamp > ? AND timestamp <= ? ORDER BY id",
+            (evtype, window_lo, window_hi),
         ).fetchall()
     except sqlite3.Error as exc:
         print(f"predicate: query failed ({evtype}): {exc}", file=sys.stderr); sys.exit(2)
@@ -118,7 +150,7 @@ summary = " ".join(
     f"{name}={('n/a' if val is None else round(val, 4))}({'ok' if passed else 'FAIL'} {bound})"
     for (name, val, passed, bound) in checks
 )
-print(f"merge-deep-canary window_days={window} n_deep_verifies={n_deep}: {summary} -> "
+print(f"merge-deep-canary window_days={window_days:g} n_deep_verifies={n_deep}: {summary} -> "
       f"{'PASS' if ok else 'HOLD'}")
 sys.exit(0 if ok else 1)
 PY
