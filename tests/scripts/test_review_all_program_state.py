@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import fcntl
 import json
 import os
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -414,3 +416,165 @@ def test_fused_memory_url_without_a_source_names_both(
 def test_fused_memory_url_defaults_to_this_checkouts_mcp_json() -> None:
     expected = json.loads((REPO_ROOT / '.mcp.json').read_text())['mcpServers']['fused-memory']['url']
     assert state.fused_memory_url(environ={}) == expected
+
+
+def _ledger_bytes(home: Any) -> bytes:
+    return home.ledger.read_bytes()
+
+
+def test_append_ledger_creates_the_ledger_and_reads_it_back(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    state.append_ledger(home, [_authored(1, 'S1')])
+    assert [line['seq'] for line in state.read_ledger(home)] == [1]
+
+
+@pytest.mark.parametrize(('seq', 'expected', 'got'), [(1, 2, 1), (3, 2, 3)])
+def test_append_ledger_refuses_a_seq_that_is_not_the_next(
+    seq: int, expected: int, got: int, tmp_path: Path,
+) -> None:
+    home = state.Home(tmp_path)
+    state.append_ledger(home, [_authored(1, 'S1')])
+    with pytest.raises(state.LedgerRefused) as caught:
+        state.append_ledger(home, [_status(seq, 'S1', 'committed')])
+    assert f'expected seq {expected}' in str(caught.value)
+    assert f'got {got}' in str(caught.value)
+
+
+def test_append_ledger_is_all_or_nothing_and_never_rewrites(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    state.append_ledger(home, [_authored(1, 'S1')])
+    first = _ledger_bytes(home)
+    state.append_ledger(home, [_status(2, 'S1', 'committed'), _authored(3, 'S2')])
+    before = _ledger_bytes(home)
+    with pytest.raises(state.LedgerRefused, match='expected seq 5'):
+        state.append_ledger(home, [_status(4, 'S2', 'committed'), _status(6, 'S2', 'decomposed')])
+    assert _ledger_bytes(home) == before
+    state.append_ledger(home, [_line(4, 'note', text='wave 1 closed')])
+    assert _ledger_bytes(home).startswith(first)
+    assert [line['seq'] for line in state.read_ledger(home)] == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize(
+    ('line', 'named'),
+    [
+        (_line(1, 'rename_stream', stream='S1'), 'rename_stream'),
+        (_line(1, 'stream_status', stream='S1'), 'status'),
+        (_status(1, 'S1', 'bogus'), 'bogus'),
+        (_status(1, 'S1', 'authored', colour='blue'), 'colour'),
+    ],
+    ids=['unknown-op', 'missing-field', 'outside-enum', 'unknown-field'],
+)
+def test_append_ledger_refuses_a_line_its_op_does_not_describe(
+    line: dict[str, Any], named: str, tmp_path: Path,
+) -> None:
+    home = state.Home(tmp_path)
+    with pytest.raises(state.LedgerRefused, match=named):
+        state.append_ledger(home, [line])
+    assert not home.ledger.exists() or home.ledger.read_bytes() == b''
+
+
+def test_read_ledger_refuses_a_hand_edited_gap(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    home.ledger.write_text(
+        json.dumps(_authored(1, 'S1')) + '\n' + json.dumps(_status(3, 'S1', 'committed')) + '\n'
+    )
+    with pytest.raises(state.LedgerRefused, match='line 2'):
+        state.read_ledger(home)
+
+
+def test_append_ledger_waits_for_the_lock(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    state.append_ledger(home, [_authored(1, 'S1')])
+    before = _ledger_bytes(home)
+    failures: list[BaseException] = []
+
+    def append() -> None:
+        try:
+            state.append_ledger(home, [_status(2, 'S1', 'committed')])
+        except BaseException as exc:
+            failures.append(exc)
+
+    with home.ledger.open('a') as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        writer = threading.Thread(target=append)
+        writer.start()
+        writer.join(timeout=0.5)
+        assert writer.is_alive()
+        assert _ledger_bytes(home) == before
+        fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+    writer.join(timeout=10)
+    assert not writer.is_alive()
+    assert failures == []
+    assert [line['seq'] for line in state.read_ledger(home)] == [1, 2]
+
+
+def _ruling(ruling_id: str, ruled_by: str = 'human', **overrides: Any) -> dict[str, Any]:
+    return {
+        'id': ruling_id, 'ruled_by': ruled_by, 'date': '2026-10-19', 'stream': 'S1',
+        'item': 'Q1', 'question': 'Which module owns the seam?', 'ruling': 'alpha owns it',
+        'options': ['alpha', 'beta'], 'consequence': 'beta imports the contract',
+        'keys': ['fk-0000000000a1'], 'source': 'sitting 1', 'supersedes': None,
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize(
+    ('existing', 'ruled_by', 'expected'),
+    [
+        ([], 'human', 'D1'),
+        (['D1'], 'lead', 'L2'),
+        (['D1', 'L2'], 'lead (--yes)', 'L3'),
+        (['D1', 'L2'], 'human', 'D3'),
+    ],
+)
+def test_next_ruling_id_shares_one_counter_across_prefixes(
+    existing: list[str], ruled_by: str, expected: str,
+) -> None:
+    rulings = [_ruling(rid, 'human' if rid.startswith('D') else 'lead') for rid in existing]
+    assert state.next_ruling_id(rulings, state.RuledBy(ruled_by)) == expected
+
+
+def test_append_rulings_lands_the_next_id_and_reads_it_back(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    state.append_rulings(home, [_ruling('D1'), _ruling('L2', 'lead', options=[], consequence='')])
+    state.append_rulings(home, [_ruling('D3', supersedes='D1', answers=['S1:Q1'], reask=True)])
+    assert [r['id'] for r in state.read_rulings(home)] == ['D1', 'L2', 'D3']
+
+
+def test_append_rulings_refuses_an_id_out_of_sequence(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    with pytest.raises(state.LedgerRefused) as caught:
+        state.append_rulings(home, [_ruling('D1'), _ruling('D5')])
+    assert "expected id 'D2'" in str(caught.value)
+    assert "got 'D5'" in str(caught.value)
+
+
+@pytest.mark.parametrize(('field', 'empty'), [('options', []), ('consequence', '')])
+def test_a_human_ruling_needs_options_and_consequence(
+    field: str, empty: Any, tmp_path: Path,
+) -> None:
+    with pytest.raises(state.LedgerRefused, match=field):
+        state.append_rulings(state.Home(tmp_path), [_ruling('D1', **{field: empty})])
+
+
+def test_append_rulings_refuses_a_supersedes_naming_no_ruling(tmp_path: Path) -> None:
+    with pytest.raises(state.LedgerRefused, match='D7'):
+        state.append_rulings(state.Home(tmp_path), [_ruling('D1', supersedes='D7')])
+
+
+def test_append_rulings_refuses_an_answers_entry_that_is_no_item_ref(tmp_path: Path) -> None:
+    with pytest.raises(state.LedgerRefused, match='S1Q1'):
+        state.append_rulings(state.Home(tmp_path), [_ruling('D1', answers=['S1Q1'])])
+
+
+def test_item_ref_parses_and_formats_the_stream_question_form() -> None:
+    ref = state.ItemRef.parse('S1:Q2')
+    assert ref == state.ItemRef('S1', 'Q2')
+    assert str(ref) == 'S1:Q2'
+
+
+@pytest.mark.parametrize('text', ['', 'S1:', ':Q2', 'a:b:c'])
+def test_item_ref_refuses_malformed_text(text: str) -> None:
+    with pytest.raises(state.StateError) as caught:
+        state.ItemRef.parse(text)
+    assert repr(text) in str(caught.value)
