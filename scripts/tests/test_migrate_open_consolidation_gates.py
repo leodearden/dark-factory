@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import importlib.util
 import json
 import sqlite3
@@ -513,8 +514,7 @@ def seed_gate_escalation(
 ) -> str:
     queue = EscalationQueue(escalation_queue_dir(root))
     escalation_id = queue.make_id(str(task_id))
-    stamped = {'timestamp': timestamp} if timestamp is not None else {}
-    queue.submit(Escalation(
+    escalation = Escalation(
         id=escalation_id,
         task_id=str(task_id),
         agent_role='orchestrator-deterministic',
@@ -522,8 +522,10 @@ def seed_gate_escalation(
         category=category,
         summary='gate',
         level=2,
-        **stamped,
-    ))
+    )
+    if timestamp is not None:
+        escalation = dataclasses.replace(escalation, timestamp=timestamp)
+    queue.submit(escalation)
     return escalation_id
 
 
