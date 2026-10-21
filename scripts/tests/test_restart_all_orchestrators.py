@@ -2573,6 +2573,63 @@ def test_a_legacy_heartbeat_under_drain_behaves_exactly_as_before(tmp_path):
     assert ["--user", "restart", UNIT_R] in state["calls"], context
 
 
+def test_the_sweep_wide_ceiling_cuts_a_later_units_await_and_drops_the_rest_to_the_merge_idle_gate(
+    tmp_path,
+):
+    """Per-unit caps add up, so a sweep-wide ceiling counted from the first
+    unit's request bounds all verify-awaiting together (task 7297): a lapsed
+    fleet lease would let a second sweep start. Here UNIT_R drains in time,
+    the ceiling trips while UNIT_S is still verifying -- long before UNIT_S's
+    own cap -- and UNIT_SELF gets no request, so its heartbeat, verifying if
+    it were asked to drain but merge-idle by the old measure, reads idle."""
+    ceiling_secs = 8
+    bin_dir, state_path, fleet_dir, trace_path, env = _three_unit_drain_sweep(
+        tmp_path,
+        {
+            UNIT_R: _hb_drain([_verifying_entry(deadline_in=3600)]),
+            UNIT_S: _hb_drain([_verifying_entry(deadline_in=3600)]),
+            UNIT_SELF: {**_hb_drain([_verifying_entry(deadline_in=3600)]), "merge_idle": True},
+        },
+    )
+    env["ORCH_DRAIN_VERIFY_MAX_WAIT_SECS"] = "600"
+    env["ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS"] = str(ceiling_secs)
+
+    with _rewrites_on_gate_polls(
+        fleet_dir, UNIT_R, trace_path,
+        [_Rewrite(after="verifying", to=_hb_drain([]), polls=2)],
+    ):
+        result = _run_script(bin_dir, state_path, fleet_dir, "--drain", env=env, timeout=40)
+
+    polls = read_drain_poll_trace(trace_path)
+    context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == 0, context
+    out = result.stdout
+    trip_lines = [line for line in out.splitlines() if "sweep-wide drain verify-wait ceiling of" in line]
+    assert len(trip_lines) == 1 and trip_lines[0].startswith(
+        f"sweep-wide drain verify-wait ceiling of {ceiling_secs}s spent after "
+    ) and f", at {UNIT_S};" in trip_lines[0], (
+        f"the ceiling must be announced once, naming {UNIT_S}. {context}"
+    )
+    assert f"force-restarting {UNIT_S}: sweep-wide drain verify-wait ceiling spent" in out, context
+    assert "drain verify-wait cap of" not in out, (
+        f"no unit may reach its own per-unit cap. {context}"
+    )
+    assert polls.count(("verifying", UNIT_S)) >= 1, context
+    assert [p for p in polls if p[1] == UNIT_SELF] == [("idle", UNIT_SELF)], (
+        f"after the ceiling {UNIT_SELF} must be read by merge_idle alone. {context}"
+    )
+    assert f"awaiting in-flight merge verify on {UNIT_SELF}" not in out, context
+    assert f"requested a merge-admission drain on {UNIT_SELF}" not in out, context
+    held_at_each_restart = [
+        (unit, sorted(held)) for unit, held in _drain_observations(_load_state(state_path))
+    ]
+    assert held_at_each_restart == [
+        (UNIT_R, [f"{UNIT_R}.drain.json"]),
+        (UNIT_S, [f"{UNIT_S}.drain.json"]),
+        (UNIT_SELF, []),
+    ], context
+
+
 def test_a_failed_restart_still_removes_that_units_request(tmp_path):
     fleet_dir = tmp_path / "fleet"
     bin_dir, state_path = _make_fake_systemctl(
