@@ -16,6 +16,7 @@ const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
 const { tasksBannerNoticesFor } = window.DF_TASKS_OFFLINE_BANNER;
 const { invariantChipFor, chainChipFor } = window.DF_INVARIANT_CHIP;
+const { deferralCellState, deferralNeedsHumanChip } = window.DF_DEFERRAL_CELL;
 // Const exports renamed, function exports not: test_tab_tasks_prose.py::_LOAD_SAFETY_MECHANISM.
 const {
   projectCensus, projectRows, viewRows, snapshotRowsOver, unrequestedTerminalRows, terminalWindowProjects,
@@ -40,6 +41,19 @@ const INVARIANT_CHIP_TONE_T = {
 };
 
 // Persisted-state hook (same shape as elsewhere)
+// A deferred row's hold, drawn the same on its graph node and in the detail pane.
+function DeferralHold({ task }) {
+  const cell = deferralCellState(task);
+  if (!cell) return null;
+  return (
+    <div className="deferral" data-state={cell.state} title={cell.title}>
+      <span className="deferral-text">{cell.text}</span>
+      {cell.age && <span className="deferral-age">{cell.age}</span>}
+      {cell.needsHuman && <span className="deferral-human">needs human</span>}
+    </div>
+  );
+}
+
 function tasksPersistedState(key, def) {
   const [v, setV] = uS_T(() => {
     try { const r = localStorage.getItem(key); return r != null ? JSON.parse(r) : def; }
@@ -203,6 +217,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
           </span>
         </div>
         <div className="ttl">{t.title}</div>
+        <DeferralHold task={t} />
       </div>
     );
   }
@@ -300,6 +315,7 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, rows, terminal, selecte
   const filteredSig = uM_T(() => graphTasks.map(t =>
     `${t.id}:${t.status}:${t.prd || ''}:${t.title}:${t.started}:${t.completed || ''}:` +
     `${t.train ? `${t.train.id}/${t.train.order}` : ''}:` +
+    `${'deferral' in t ? JSON.stringify(t.deferral) : ''}:` +
     `${(t.deps || []).map(d => d.id + (d.done ? '1' : '0')).join(',')}`
   ).join('|'), [graphTasks]);
   // fullMembersByPrd (below) only feeds summarizePrdMembers, which looks at
@@ -551,6 +567,12 @@ function TaskDetail({ task, allTasks }) {
               columns; deliberately INDEPENDENT of `agent` below, which is only
               worktree presence and stays truthy after the agent dies. */}
           {(() => { const sb = strandBadgeState(task); return sb && <span className={sb.cls} style={{ marginLeft: sb.marginLeft }} title={sb.title}>{sb.label}</span>; })()}</span>
+        {deferralCellState(task) && (
+          <React.Fragment>
+            <span className="k">hold</span>
+            <DeferralHold task={task} />
+          </React.Fragment>
+        )}
         <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{(() => { const ac = agentCellState(task); return ac.color ? <span style={{ color: ac.color }}>{ac.text}</span> : ac.text; })()}</span>
         <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.loops)}</span>
         <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.attempts)}</span>
@@ -880,9 +902,15 @@ function TasksTab({ projectFilter, search }) {
             const groupByPrd = groupByPrdMap[p.id] === 'prd';
             const invariantChip = invariantChipFor(DF_T.INVARIANTS, p.id);
             const chainChip = chainChipFor(DF_T.INVARIANTS, p.id);
+            const deferralChip = deferralNeedsHumanChip(rows.value || []);
             const summary = (
               <>
                 {CENSUS_VIEWS_T.map(v => <Pip key={v.key} datum={census} color={CP_T[v.tone]} format={v.reading} />)}
+                {deferralChip && (
+                  <span className="mono deferral-chip" data-testid="tasks-deferral-needs-human" title={deferralChip.title}>
+                    {deferralChip.text}
+                  </span>
+                )}
                 {invariantChip && (
                   <span className="mono" data-testid="tasks-invariant-chip" title={invariantChip.title}
                         style={{ color: INVARIANT_CHIP_TONE_T[invariantChip.tone], fontSize: 10 }}>
