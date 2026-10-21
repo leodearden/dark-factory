@@ -29,7 +29,7 @@ next one for the dashboard.
 Each request has a wall-clock deadline, checked as each chunk of its body
 arrives, so a dashboard trickling a large body cannot hold the run. Every
 network operation is also capped by the same timeout, so a request ends
-within about twice it.
+within twice the timeout.
 """
 
 from __future__ import annotations

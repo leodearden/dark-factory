@@ -40,6 +40,7 @@ BASE_URL = 'http://dashboard.invalid:8080'
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO_ROOT / 'scripts' / 'check_dashboard_payload_budgets.sh'
 
+
 def _table(*entries: tuple[str, Mapping[str, str], int, list[list[str]]]) -> BudgetTable:
     return parse_budget_table(json.dumps({
         'schema_version': 1,
