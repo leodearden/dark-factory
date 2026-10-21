@@ -1521,7 +1521,8 @@ members re-enqueue at the written lane. The tool reports each write, so a
 failed one shows up and can be repeated by hand.
 
 `'high'` remains reserved for the **rare, gated hotfix / main-health class**
-(task 1689) — its three machine writers are all of that shape. Routine work
+(task 1689) — its three machine writers are all of that shape, and its fourth
+writer, the operator's `merge_relane`, is meant for the same class. Routine work
 declaring itself urgent starves the normal lane, which is the failure the
 reservation exists to prevent. The carrier census and the reason this key was
 blessed rather than typed are recorded beside the frozenset entry in

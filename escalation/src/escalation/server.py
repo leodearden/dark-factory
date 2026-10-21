@@ -5398,6 +5398,9 @@ def create_server(
         each write.  A ``written: False`` entry means that task will
         re-enqueue at its old lane, so set its ``metadata.merge_lane`` by
         hand.
+        If you relane a request seconds after it was enqueued, re-read
+        ``metadata_writes`` or ``get_task``: a workflow's whole-blob metadata
+        write at the enqueue boundary can race the ``merge_lane`` write.
 
         Returns ``{relaned, lane, request_id, from_lane, via_train, task_ids,
         metadata_writes, refusal, state}``

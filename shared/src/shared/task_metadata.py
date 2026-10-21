@@ -1301,7 +1301,9 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # offline_lane_filing.py::build_lane_fix_task_arguments` and
         # `::build_lane_command_task_arguments` (offline-lane fix tasks,
         # 'normal') and `orchestrator/src/orchestrator/workflow.py::
-        # TaskWorkflow::_spawn_main_health_fix_task` (fix-main brief, 'high');
+        # TaskWorkflow::_spawn_main_health_fix_task` (fix-main brief, 'high'),
+        # plus the operator tool `escalation/src/escalation/server.py::
+        # merge_relane` (task 5246, either value, on every task it re-lanes);
         # reader `orchestrator/src/orchestrator/merge_queue.py::
         # lane_for_task_metadata` -> `_normalize_lane`, consumed at
         # `orchestrator/src/orchestrator/workflow.py::TaskWorkflow::
