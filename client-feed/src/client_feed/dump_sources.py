@@ -1,4 +1,8 @@
-"""Every store source of one policy's root, read once, so an operator sees exactly what the publisher would read."""
+"""Every store source of one policy's root, so an operator sees what the publisher would read.
+
+Each source is read once on its own snapshot; a row may land between two of them, so the dump is not one
+consistent instant across stores.
+"""
 
 from __future__ import annotations
 
