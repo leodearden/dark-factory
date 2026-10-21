@@ -39,9 +39,10 @@ from client_feed.sources.events import (
     VerifyVerdict,
     read_review_counts,
 )
-from client_feed.sources.git import MergeStats, merge_stats
+from client_feed.sources.git import GitError, MergeStats, merge_stats
 
 VERIFY_PHASE: Final = 'verify'  # orchestrator/src/orchestrator/workflow_types.py::WorkflowState.VERIFY
+_MERGE_LANDED: Final = MergeLanded.model_fields['type'].default
 
 Identity: TypeAlias = tuple[str, str | int]
 
@@ -192,23 +193,65 @@ def _first_landings(stream: Sequence[StreamEvent]) -> dict[str, LandedCommit]:
     return first
 
 
+def _landing_identity(landing: LandedCommit) -> Identity:
+    """The identity of the merge_landed a landing becomes, known before it is built."""
+    return _MERGE_LANDED, landing.commit
+
+
+def _stats(root: Path, landing: LandedCommit, skip_unreadable_before: datetime | None) -> MergeStats | None:
+    """The landing's merge stats; None for a merge git cannot read that landed before the cutoff."""
+    try:
+        return merge_stats(root, landing.commit)
+    except GitError as exc:
+        if skip_unreadable_before is None or landing.at >= skip_unreadable_before:
+            raise
+        _log.error(
+            'skipping the landing of %s (event %d) at %s: git cannot read it (%s)',
+            landing.commit, landing.event_id, landing.at.isoformat(), exc.reason,
+        )
+        return None
+
+
 @dataclass(frozen=True)
 class _Landed:
-    """The merges a stream lands, each at its first landing, with what git and runs.db say of them."""
+    """The merges a stream lands, each at its first landing; stats only for those to emit, which git could read."""
 
     first: Mapping[str, LandedCommit]
     stats: Mapping[str, MergeStats]
     reviews: Mapping[int, ReviewCounts | NotRecorded]
+    skipped: int
 
 
-def _landed(root: Path, stream: Sequence[StreamEvent]) -> _Landed:
+def _landed(
+    root: Path,
+    stream: Sequence[StreamEvent],
+    published: AbstractSet[Identity],
+    skip_unreadable_before: datetime | None,
+) -> _Landed:
+    """Git read in landing order, before any archive, and only for landings not yet published."""
     first = _first_landings(stream)
-    task_ids = {task_id for landing in first.values() for task_id in landing.task_ids}
+    stats: dict[str, MergeStats] = {}
+    skipped = 0
+    for commit, landing in first.items():
+        if _landing_identity(landing) in published:
+            continue
+        read = _stats(root, landing, skip_unreadable_before)
+        if read is None:
+            skipped += 1
+        else:
+            stats[commit] = read
+    task_ids = {task_id for commit in stats for task_id in first[commit].task_ids}
     return _Landed(
-        first=first,
-        stats={commit: merge_stats(root, commit) for commit in first},
-        reviews=read_review_counts(root, task_ids),
+        first=first, stats=stats, reviews=read_review_counts(root, task_ids), skipped=skipped
     )
+
+
+def _skipped_landings(landed: _Landed) -> tuple[Degradation, ...]:
+    if not landed.skipped:
+        return ()
+    noun = 'landing' if landed.skipped == 1 else 'landings'
+    reason = f'skipped {landed.skipped} {noun} whose merge git cannot read'
+    return (Degradation(source=Source.GIT, reason=reason),)
 
 
 def _merge_landed(
@@ -216,7 +259,7 @@ def _merge_landed(
 ) -> StreamOutput:
     """A commit's merge_landed at its first landing; only a single task's merge has one review to report."""
     first = landed.first[landing.commit]
-    if first.event_id != landing.event_id:
+    if first.event_id != landing.event_id or first.commit not in landed.stats:
         return _EMPTY
     titled = (state.tasks.get(task_id) for task_id in first.task_ids)
     merge = MergeLanded(
@@ -243,13 +286,15 @@ def stream_events(
     max_cases: int,
     published: AbstractSet[Identity],
     stamp: Stamp,
+    skip_unreadable_before: datetime | None,
 ) -> StreamOutput:
     """The feed events of `stream` in id order, less those already `published`.
 
     A workflow_verify verdict adds none: its verify-phase exit reports the run. A GitError or StoreReadError
-    reading the landed merges propagates, so the caller holds the whole batch.
+    reading the landed merges propagates, so the caller holds the whole batch; but a merge git cannot read
+    that landed before `skip_unreadable_before` emits no merge_landed and is named in `degraded` instead.
     """
-    landed = _landed(root, stream)
+    landed = _landed(root, stream, published, skip_unreadable_before)
     verify_starts = _verify_starts(state)
     outputs: list[StreamOutput] = []
     for item in stream:
@@ -262,5 +307,5 @@ def stream_events(
     built = _joined(outputs)
     return StreamOutput(
         events=tuple(event for event in built.events if identity(event) not in published),
-        degraded=built.degraded,
+        degraded=(*_skipped_landings(landed), *built.degraded),
     )

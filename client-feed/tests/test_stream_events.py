@@ -1,5 +1,6 @@
 """Each runs.db stream row becomes its feed events once: phases, verify windows and merge verdicts, and landed merges."""
 
+import logging
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -99,6 +100,7 @@ def run(
     state: FeedState | None = None,
     published: frozenset[Identity] = frozenset(),
     first_seq: int = 1,
+    skip_unreadable_before: datetime | None = None,
 ) -> StreamOutput:
     return stream_events(
         root,
@@ -107,6 +109,7 @@ def run(
         max_cases=100,
         published=published,
         stamp=Stamp(project_id=PROJECT, first_seq=first_seq),
+        skip_unreadable_before=skip_unreadable_before,
     )
 
 
@@ -495,9 +498,57 @@ def test_an_event_already_published_is_not_emitted_again(landed: Landed) -> None
     assert seqs[0] >= 100
 
 
+UNKNOWN_SHA = 'e' * 40
+
+
 def test_a_merge_commit_unknown_to_git_raises(landed: Landed) -> None:
     with pytest.raises(GitError):
-        run(landed.root, landing(60, 'e' * 40, 7), state=state_holding_task_7())
+        run(landed.root, landing(60, UNKNOWN_SHA, 7), state=state_holding_task_7())
+
+
+def test_a_merge_landed_already_published_reads_nothing_from_git(landed: Landed) -> None:
+    output = run(
+        landed.root,
+        landing(60, UNKNOWN_SHA, 7),
+        state=state_holding_task_7(),
+        published=frozenset({('merge_landed', UNKNOWN_SHA)}),
+    )
+
+    assert output == StreamOutput(events=(), degraded=())
+
+
+def test_a_merge_unknown_to_git_that_landed_after_the_cutoff_still_raises(landed: Landed) -> None:
+    with pytest.raises(GitError):
+        run(
+            landed.root,
+            landing(60, UNKNOWN_SHA, 7, minutes=30),
+            state=state_holding_task_7(),
+            skip_unreadable_before=at(30),
+        )
+
+
+def test_a_merge_unknown_to_git_that_landed_before_the_cutoff_is_skipped_and_named(
+    landed: Landed, caplog: pytest.LogCaptureFixture
+) -> None:
+    unknown = landing(60, UNKNOWN_SHA, 7, minutes=30)
+    between = phase(61, 31, 'review', entered=True, task_id=9)
+    known = landing(62, landed.merge, 7, minutes=32)
+
+    with caplog.at_level(logging.ERROR, logger='client_feed.stream_events'):
+        output = run(
+            landed.root, unknown, between, known,
+            state=state_holding_task_7(), skip_unreadable_before=at(31),
+        )
+
+    after, merge = output.events
+    assert after == task_phase(1, between)
+    assert isinstance(merge, MergeLanded) and merge.commit == landed.merge
+    (degradation,) = output.degraded
+    assert degradation.source is Source.GIT
+    assert degradation.reason.startswith('skipped 1 landing whose merge git cannot read')
+    errors = [record.getMessage() for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert UNKNOWN_SHA in errors[0] and 'event 60' in errors[0]
 
 
 def test_an_unreadable_runs_db_raises(landed: Landed) -> None:

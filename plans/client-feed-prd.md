@@ -458,9 +458,19 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     increases.
   - (f) An archive file that cannot be read loses only that run's archived details: a task run is
     not emitted, a merge run's legs are `not_recorded`, and `archive` is named in `degraded`
-    (`client-feed/src/client_feed/stream_events.py::_archived`). A merge commit unknown to git holds
-    the whole events batch: `events_id` does not advance, and `git` is named in every heartbeat
-    until git knows the commit (`client-feed/src/client_feed/publisher.py::_stream_unit`). The
+    (`client-feed/src/client_feed/stream_events.py::_archived`). A merge commit git cannot read holds
+    the whole events batch: `events_id` does not advance, and `git` is named in every heartbeat.
+    The hold is bounded. Once the landing is more than `UNKNOWN_MERGE_GRACE` (one hour) old, and
+    only on a pass where git still reads main's head, it is skipped: no `merge_landed`, an ERROR
+    log naming the commit and the runs.db event id, and `skipped N landing(s) whose merge git
+    cannot read` under `git` (`client-feed/src/client_feed/publisher.py::_skip_unreadable_before`,
+    `client-feed/src/client_feed/stream_events.py::_stats`). The rule is stateless: a restart
+    neither resets nor extends it, and a broken repository never drops a landing. Git is read
+    lazily, in landing order and before any archive, and only for landings not already in the
+    uncommitted tail, so a held pass re-reads only the landings ahead of the one held
+    (`client-feed/src/client_feed/stream_events.py::_landed`). The stream read is not capped per
+    pass: one commit can land in more than one row, and `_first_landings` folds them only within
+    one read, so a batch boundary between them would publish a second `merge_landed`. The
     other failure rules: each source unit fails alone, and its typed error becomes
     `Degradation(source, redact_paths(str(exc)))` while any other exception propagates
     (`client-feed/src/client_feed/publisher.py::_guarded`). Unprojectable rows are named as

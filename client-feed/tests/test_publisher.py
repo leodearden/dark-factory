@@ -37,7 +37,7 @@ from client_feed.contract import (
 from client_feed.feed_io import CURSOR_FILENAME, Cursor, OutDir, read_feed_lines
 from client_feed.fold import fold
 from client_feed.policy import Policy
-from client_feed.publisher import PassReport, run_pass
+from client_feed.publisher import UNKNOWN_MERGE_GRACE, PassReport, run_pass
 from client_feed.validate import validate_out_dir
 
 PROJECT = 'acme'
@@ -441,6 +441,52 @@ def test_a_merge_unknown_to_git_holds_the_whole_events_batch(project: Project) -
     published = types_of(feed(project))
     assert not published & {'task_phase', 'verify_run', 'test_results', 'merge_landed'}
     assert {'task_upserted', 'branch_snapshot', 'tree_snapshot'} <= published
+    assert stored_cursor(project).events_id == 0
+    assert_valid(project)
+
+
+def errors_of(caplog: pytest.LogCaptureFixture) -> str:
+    return '\n'.join(
+        record.getMessage() for record in caplog.records if record.levelno == logging.ERROR
+    )
+
+
+def test_a_merge_git_cannot_read_is_skipped_once_it_landed_longer_ago_than_the_grace(
+    project: Project, caplog: pytest.LogCaptureFixture
+) -> None:
+    unknown_id = project.runs.emit(
+        'merge_finalized', at=at(31), task_id=9, phase='merge',
+        data={'state': 'done', 'merge_sha': UNKNOWN_SHA},
+    )
+    out = project.open()
+    run_pass(project.policy, out, now=NOW)
+    assert stored_cursor(project).events_id == 0
+    past_the_grace = at(31) + UNKNOWN_MERGE_GRACE + timedelta(minutes=1)
+
+    with caplog.at_level(logging.ERROR):
+        report = run_pass(project.policy, out, now=past_the_grace)
+
+    assert report.degraded == (
+        Degradation(source=Source.GIT, reason='skipped 1 landing whose merge git cannot read'),
+    )
+    assert [line.commit for line in feed(project) if isinstance(line, MergeLanded)] == [project.merge]
+    assert {'task_phase', 'verify_run', 'test_results'} <= types_of(feed(project))
+    assert stored_cursor(project).events_id == unknown_id
+    assert UNKNOWN_SHA in errors_of(caplog)
+    assert run_pass(project.policy, out, now=past_the_grace).degraded == ()
+    assert_valid(project)
+
+
+def test_a_merge_held_while_git_cannot_read_main_is_never_skipped(
+    project: Project, tmp_path: Path
+) -> None:
+    shutil.move(project.root / '.git', tmp_path / 'moved.git')
+    (project.root / '.git').write_text('gitdir: /nonexistent/gitdir\n')
+
+    report = run_pass(project.policy, project.open(), now=NOW + timedelta(days=30))
+
+    assert not any(degradation.reason.startswith('skipped') for degradation in report.degraded)
+    assert 'merge_landed' not in types_of(feed(project))
     assert stored_cursor(project).events_id == 0
     assert_valid(project)
 
