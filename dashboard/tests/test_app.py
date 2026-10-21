@@ -594,6 +594,9 @@ A literal rather than a derivation, so that adding a field to the wire is a
 deliberate edit here.
 """
 
+_DEFERRED_TASK_ROW_KEYS = _TASK_ROW_KEYS | {'deferral'}
+"""A deferred row's keys: every active row's plus ``deferral``, which no other row carries."""
+
 _RAW_ONLY_KEYS = frozenset({
     'description', 'priority', 'dependencies', 'metadata', 'updated_at',
 })
@@ -610,13 +613,20 @@ def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
     ``Datum[list[TaskRow]]``. The snapshot is now the rows' only exposure, so
     each one must carry exactly the shaped fields.
     """
+    from datetime import UTC
+
+    from shared.task_deferral import PlanningDeferral, record_to_json
     from test_task_snapshot import CannedMCP, _raw_row
 
     label = client.app.state.config.project_root.name
-    pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'blocked'))
+    pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'blocked'), (4, 'deferred'))
+    stamped = datetime.now(UTC)
+    planning = record_to_json(PlanningDeferral(deferred_at=stamped, stamped_at=stamped))
     canned = CannedMCP(
         rows=[
-            _raw_row(task_id, status, metadata={'files': ['a.py'], 'prd': 'plans/x.md'})
+            _raw_row(task_id, status, metadata={
+                'files': ['a.py'], 'prd': 'plans/x.md', 'deferral': planning,
+            })
             for task_id, status in pairs
         ],
         status_map=dict(pairs),
@@ -630,7 +640,8 @@ def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
     wire_rows = body['TASKS_SNAPSHOT'][label]['rows']['value']
     assert len(wire_rows) == len(pairs)
     for row in wire_rows:
-        assert set(row) == _TASK_ROW_KEYS, sorted(set(row) ^ _TASK_ROW_KEYS)
+        keys = _DEFERRED_TASK_ROW_KEYS if row['status'] == 'deferred' else _TASK_ROW_KEYS
+        assert set(row) == keys, sorted(set(row) ^ keys)
         assert not set(row) & _RAW_ONLY_KEYS
 
 
