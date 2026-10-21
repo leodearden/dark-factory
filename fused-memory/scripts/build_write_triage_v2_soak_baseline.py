@@ -14,10 +14,16 @@ Subcommands, run from ``fused-memory/``:
   primary and a second shard set over every pair, attach-time pairs in their
   own shards, plus ``key.json``, ``texts.json`` and ``rater_prompt.md`` into
   ``--scratch``. A re-run shards only what is not yet keyed.
-- ``third``: after the first ratings, write a shard holding exactly the pairs
-  whose decisive binaries are tied, for a third rater.
-- ``assemble``: map the ratings back through the key and write the committed
-  corpus: ``write_triage_v2_soak_{items.jsonl,verdicts.jsonl,strata.json,derivation.json}``.
+- ``reask``: write a shard per rater holding the lines whose quotes or spans
+  are not in the texts that rater saw. The rater's answer in the later round
+  supersedes the earlier line.
+- ``third``: write a shard holding exactly the pairs whose decisive binaries
+  are tied, for a new third rater each round.
+- ``assemble``: map the effective ratings back through the key and write the
+  committed corpus:
+  ``write_triage_v2_soak_{items.jsonl,verdicts.jsonl,strata.json,derivation.json}``.
+  ``third`` and ``assemble`` refuse while any evidence is unfound or any pair
+  lacks a primary or second answer.
 
 Rater output lives in ``<scratch>/ratings/<shard>.jsonl``, one line per item.
 """
@@ -718,16 +724,17 @@ class _Scratch:
                 first = sum(name.startswith(f'{prefix}{role}_') for name in key['shards'])
                 for name, members in plan_shards(pending, role=role, prefix=prefix, seed=seed,
                                                  first_index=first):
-                    self.write_shard(key, name, role, members)
+                    self.write_shard(key, name, members, role=role,
+                                     rater=f'{RATER_MODELS[role]}-{role}', round=0)
                     added.append(name)
         return added
 
-    def write_shard(self, key: dict[str, Any], name: str, role: str,
-                    entries: Sequence[ShardEntry]) -> None:
+    def write_shard(self, key: dict[str, Any], name: str, entries: Sequence[ShardEntry], *,
+                    role: str, rater: str, round: int) -> None:
         rendered = shard(entries, name=name)
         (self.root / 'shards').mkdir(parents=True, exist_ok=True)
         (self.root / 'shards' / f'{name}.txt').write_text(rendered.text)
-        key['shards'][name] = {'role': role, 'rater': f'{RATER_MODELS[role]}-{role}', 'round': 0,
+        key['shards'][name] = {'role': role, 'rater': rater, 'round': round,
                                'items': sorted(rendered.key)}
         key['items'].update({item_id: dict(pair) for item_id, pair in rendered.key.items()})
 
@@ -741,11 +748,32 @@ class _Scratch:
             for entry in sorted(entries, key=_entry_order)
         ])
 
-    def ratings(self, key: Mapping[str, Any]) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
+    def entries(self, soak: Iterable[_SoakItem]) -> dict[tuple[str, str, str], ShardEntry]:
+        """Each keyed pair and basis as its raters saw it, from ``texts.json``."""
+        projects = {soaked.item['entry_id']: soaked.item['project'] for soaked in soak}
+        return {
+            _keyed_order(record): ShardEntry(**record, project=projects[record['entry_id']])
+            for record in _read_json(self.root / 'texts.json')
+        }
+
+    def ratings(self, key: Mapping[str, Any], entries: Mapping[tuple[str, str, str], ShardEntry],
+                ) -> _Rated:
+        """Every rater's effective lines, checked against the texts each rater saw."""
+        lines: list[dict[str, Any]] = []
         for name, spec in sorted(key['shards'].items()):
-            rows += self._shard_ratings(name, spec, key['items'])
-        return rows
+            lines += self._shard_ratings(name, spec, key['items'])
+        rows = effective_ratings(lines)
+        item_ids = {
+            (name, *_keyed_order(key['items'][item_id])): item_id
+            for name, spec in key['shards'].items() for item_id in spec['items']
+        }
+        unfound = []
+        for row in rows:
+            entry = entries[_keyed_order(row)]
+            if problems := validate_rating(row, entry.child_text, entry.parent_text):
+                item_id = item_ids[row['batch'], *_keyed_order(row)]
+                unfound.append(_Unfound(row, item_id, tuple(problems)))
+        return _Rated(rows=rows, reasked=len(lines) - len(rows), unfound=unfound)
 
     def _shard_ratings(
         self, name: str, spec: Mapping[str, Any], items: Mapping[str, Mapping[str, str]],
@@ -768,11 +796,32 @@ class _Scratch:
                 _rubric.resolve_judgements([row])
             except ValueError as exc:
                 raise ValueError(f'{path}:{number}: {exc}') from exc
-            rows.append(row)
+            rows.append({**row, 'round': spec['round']})
         wrong = sorted(item for item in spec['items'] if seen[item] != 1)
         if wrong:
             raise ValueError(f'{path}: items without exactly one line: {wrong}')
         return rows
+
+
+@dataclass(frozen=True)
+class _Unfound:
+    """An effective rater line whose evidence is not in the texts its rater saw."""
+
+    row: Mapping[str, Any]
+    item_id: str
+    problems: tuple[str, ...]
+
+    def __str__(self) -> str:
+        return f'{self.row["batch"]} item {self.item_id}: {"; ".join(self.problems)}'
+
+
+@dataclass(frozen=True)
+class _Rated:
+    """The effective rater lines, how many earlier-round lines they superseded, and the unfound ones."""
+
+    rows: list[dict[str, Any]]
+    reasked: int
+    unfound: list[_Unfound]
 
 
 def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
@@ -802,66 +851,126 @@ def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _assembled(soak: Sequence[_SoakItem], rated_rows: Iterable[Mapping[str, Any]]) -> Assembly:
-    return assemble(
-        {soaked.pair: soaked.adjudication for soaked in soak}, rated_rows,
+@dataclass(frozen=True)
+class _Corpus:
+    """The scratch state of a fully rated soak, and its assembled verdict corpus."""
+
+    scratch: _Scratch
+    key: dict[str, Any]
+    bundle: _SoakBundle
+    soak: list[_SoakItem]
+    entries: Mapping[tuple[str, str, str], ShardEntry]
+    rated: _Rated
+    assembly: Assembly
+
+
+def _corpus(args: argparse.Namespace) -> _Corpus:
+    """The assembled corpus, refused while any evidence is unfound or any pair lacks a rater."""
+    bundle = _SoakBundle.read(args.bundle)
+    scratch = _Scratch(args.scratch)
+    key = scratch.load_key()
+    soak = bundle.keyed_items(key)
+    entries = scratch.entries(soak)
+    rated = scratch.ratings(key, entries)
+    if rated.unfound:
+        raise ValueError('rater evidence not found in the texts shown; run reask:\n'
+                         + '\n'.join(map(str, rated.unfound)))
+    rated_roles = {(*_keyed_order(row), row['role']) for row in rated.rows}
+    lacking = sorted(
+        (*keyed, role) for keyed in entries for role in _DOUBLE_RATED
+        if (*keyed, role) not in rated_roles
+    )
+    if lacking:
+        raise ValueError(f'pairs and bases without an effective primary or second line: {lacking}')
+    assembly = assemble(
+        {soaked.pair: soaked.adjudication for soaked in soak}, rated.rows,
         {soaked.item['entry_id']: soaked.child_text for soaked in soak},
     )
+    return _Corpus(scratch, key, bundle, soak, entries, rated, assembly)
+
+
+def _reask_command(args: argparse.Namespace) -> dict[str, Any]:
+    scratch = _Scratch(args.scratch)
+    key = scratch.load_key()
+    entries = scratch.entries(_SoakBundle.read(args.bundle).keyed_items(key))
+    unfound_by_rater: defaultdict[str, list[_Unfound]] = defaultdict(list)
+    for unfound in scratch.ratings(key, entries).unfound:
+        unfound_by_rater[unfound.row['rater']].append(unfound)
+    last_round = max(spec['round'] for spec in key['shards'].values())
+    written = {}
+    for round_, (rater, unfound) in enumerate(sorted(unfound_by_rater.items()), start=last_round + 1):
+        role = unfound[0].row['role']
+        name = f'reask_{round_:02d}_{role}'
+        scratch.write_shard(key, name, [entries[_keyed_order(line.row)] for line in unfound],
+                            role=role, rater=rater, round=round_)
+        written[name] = len(unfound)
+    if written:
+        scratch.save_key(key)
+    return {'unfound': sum(written.values()), 'shards': written}
 
 
 def _third_command(args: argparse.Namespace) -> dict[str, Any]:
-    scratch = _Scratch(args.scratch)
-    key = scratch.load_key()
-    soak = _SoakBundle.read(args.bundle).keyed_items(key)
-    assembly = _assembled(soak, scratch.ratings(key))
-    tied = set(decisive_ties([soaked.item for soaked in soak], assembly.verdicts))
-    name = f'third_{sum(spec["role"] == Role.THIRD for spec in key["shards"].values()):02d}'
-    entries = [soaked.entry(Basis.CURRENT) for soaked in soak if soaked.pair in tied]
+    corpus = _corpus(args)
+    tied = set(decisive_ties([soaked.item for soaked in corpus.soak], corpus.assembly.verdicts))
+    index = sum(spec['role'] == Role.THIRD for spec in corpus.key['shards'].values())
+    name = f'third_{index:02d}'
+    entries = [entry for (entry_id, target_id, basis), entry in sorted(corpus.entries.items())
+               if basis == Basis.CURRENT and (entry_id, target_id) in tied]
     if entries:
-        scratch.write_shard(key, name, Role.THIRD, entries)
-        scratch.save_key(key)
+        corpus.scratch.write_shard(corpus.key, name, entries, role=Role.THIRD,
+                                   rater=f'{RATER_MODELS[Role.THIRD]}-third-{index:02d}', round=0)
+        corpus.scratch.save_key(corpus.key)
     return {'tied_pairs': len(entries), 'shard': name if entries else None}
 
 
 def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
-    scratch = _Scratch(args.scratch)
-    key = scratch.load_key()
-    soak = _SoakBundle.read(args.bundle).keyed_items(key)
-    assembly = _assembled(soak, scratch.ratings(key))
+    corpus = _corpus(args)
+    key = corpus.key
     out: Path = args.out_dir
     out.mkdir(parents=True, exist_ok=True)
-    _write_jsonl(out / 'write_triage_v2_soak_items.jsonl', [soaked.item for soaked in soak])
-    _write_jsonl(out / 'write_triage_v2_soak_verdicts.jsonl', assembly.verdicts)
+    _write_jsonl(out / 'write_triage_v2_soak_items.jsonl', [soaked.item for soaked in corpus.soak])
+    _write_jsonl(out / 'write_triage_v2_soak_verdicts.jsonl', corpus.assembly.verdicts)
     _write_json(out / 'write_triage_v2_soak_strata.json', dict(STRATA))
     _write_json(out / 'write_triage_v2_soak_derivation.json', {
-        **assembly.derivation,
-        **rating_volume(list(key['items'].values())),
+        **corpus.assembly.derivation,
+        'rating_volume': rating_volume(key),
+        'sample': _sample(corpus.bundle, key),
+        'unrecoverable': key['unrecoverable'],
         'attach_time_unrecoverable': sorted(key['attach_time_unrecoverable']),
-        'shards': {name: {'rater': spec['rater'], 'items': len(spec['items'])}
+        'reasked': corpus.rated.reasked,
+        'shards': {name: {'rater': spec['rater'], 'role': spec['role'], 'round': spec['round'],
+                          'items': len(spec['items'])}
                    for name, spec in sorted(key['shards'].items())},
     })
-    return {'items': len(soak), 'verdicts': len(assembly.verdicts)}
+    return {'items': len(corpus.soak), 'verdicts': len(corpus.assembly.verdicts)}
 
 
-def rating_volume(key_items: Sequence[Mapping[str, Any]]) -> dict[str, int]:
-    """The distinct (entry, target) pairs the shards put before raters, by what they were for.
+def rating_volume(key: Mapping[str, Any]) -> dict[str, dict[str, int]]:
+    """The distinct (entry, target) pairs the scratch *key*'s shards put before each role, by basis."""
+    pairs: defaultdict[str, defaultdict[str, set[tuple[str, str]]]] = defaultdict(
+        lambda: defaultdict(set))
+    for spec in key['shards'].values():
+        for item_id in spec['items']:
+            item = key['items'][item_id]
+            pairs[item['basis']][spec['role']].add((item['entry_id'], item['target_id']))
+    return {basis: {role: len(rated) for role, rated in sorted(by_role.items())}
+            for basis, by_role in sorted(pairs.items())}
 
-    ``rated_current_pairs`` are the current-basis pairs whose v1 labels left a
-    decisive binary open, ``anchor_pairs`` the current-basis anchors v1 had
-    already settled, and ``attach_time_pairs`` the pairs re-read against the
-    parent's text at attach time. *key_items* are the scratch key's item entries.
-    """
-    def pairs(basis: str, *, anchor: bool) -> int:
-        return len({
-            (item['entry_id'], item['target_id']) for item in key_items
-            if item['basis'] == basis and item['anchor'] is anchor
-        })
 
-    return {
-        'rated_current_pairs': pairs(Basis.CURRENT, anchor=False),
-        'anchor_pairs': pairs(Basis.CURRENT, anchor=True),
-        'attach_time_pairs': pairs(Basis.ATTACH_TIME, anchor=False),
-    }
+_SAMPLE_COUNTS = ('adjudicated', 'extension', 'unrecoverable')
+
+
+def _sample(bundle: _SoakBundle, key: Mapping[str, Any]) -> dict[str, dict[str, int]]:
+    """Per stratum: the adjudicated items, the recovered extension items and the unrecoverable draws."""
+    counts = {stratum: Counter[str]() for stratum in STRATA}
+    for adjudication in bundle.adjudications.values():
+        counts[STRATUM_BY_OUTCOME[adjudication['outcome']]]['adjudicated'] += 1
+    unrecoverable = {row['intent_id'] for row in key['unrecoverable']}
+    for intent, record in key['extension'].items():
+        kind = 'unrecoverable' if intent in unrecoverable else 'extension'
+        counts[STRATUM_BY_OUTCOME[record['outcome']]][kind] += 1
+    return {stratum: {kind: counted[kind] for kind in _SAMPLE_COUNTS}
+            for stratum, counted in counts.items()}
 
 
 def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
@@ -913,7 +1022,7 @@ def _rater_prompt() -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ('shards', 'third', 'assemble'):
+    for name in ('shards', 'reask', 'third', 'assemble'):
         command = commands.add_parser(name)
         command.add_argument('--bundle', type=Path, required=True, metavar='DIR',
                              help="the soak bundle's correctness/ directory (read-only)")
@@ -940,6 +1049,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.history_db = args.history_db.expanduser()
         args.journal_db = args.journal_db.expanduser()
         summary = _shards_command(args)
+    elif args.command == 'reask':
+        summary = _reask_command(args)
     elif args.command == 'third':
         summary = _third_command(args)
     else:
