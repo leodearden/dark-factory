@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -27,16 +28,17 @@ from dashboard.payload_budgets import (
     parse_budget_table,
     render_overage,
 )
-from dashboard.payload_check import check_endpoints, main, parse_args
+from dashboard.payload_check import (
+    DEFAULT_TIMEOUT_SECONDS,
+    SUMMARY_MAX_CHARS,
+    check_endpoints,
+    main,
+    parse_args,
+)
 
 BASE_URL = 'http://dashboard.invalid:8080'
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO_ROOT / 'scripts' / 'check_dashboard_payload_budgets.sh'
-
-SUMMARY_MAX_CHARS = 400
-"""The note cap the deterministic runner applies to a predicate's trailing JSON line
-(orchestrator/src/orchestrator/deterministic_runner.py::_PREDICATE_NOTE_MAX_PAYLOAD_CHARS)."""
-
 
 def _table(*entries: tuple[str, Mapping[str, str], int, list[list[str]]]) -> BudgetTable:
     return parse_budget_table(json.dumps({
@@ -84,9 +86,11 @@ WITHIN = {
 }
 
 
-def _check(responder: Responder, table: BudgetTable = TABLE):
+def _check(
+    responder: Responder, table: BudgetTable = TABLE, deadline_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+):
     with httpx.Client(transport=httpx.MockTransport(responder)) as client:
-        return check_endpoints(client, BASE_URL, table)
+        return check_endpoints(client, BASE_URL, table, deadline_seconds=deadline_seconds)
 
 
 def _summary(report) -> dict:
@@ -211,6 +215,30 @@ def test_an_instrument_failure_exits_2_and_is_never_an_overage(failure, cause):
     summary = _summary(report)
     assert summary['over'] == []
     assert summary['failed'] == ['/api/v2/dashboard/tasks?projection=census']
+
+
+def test_a_response_trickling_past_its_deadline_is_abandoned_unmeasured():
+    chunks = 30
+    sent = 0
+
+    def trickle():
+        nonlocal sent
+        for _ in range(chunks):
+            time.sleep(0.1)
+            sent += 1
+            yield b' '
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith('/burndown'):
+            return httpx.Response(200, content=trickle())
+        return _serving(WITHIN)(request)
+
+    report = _check(respond, deadline_seconds=0.5)
+
+    assert sent < chunks, 'the trickling body was read to its end instead of abandoned at the deadline'
+    assert report.exit_code == 2
+    assert any('/api/v2/dashboard/burndown?window=90d' in line and 'deadline' in line for line in report.lines)
+    assert _summary(report)['failed'] == ['/api/v2/dashboard/burndown?window=90d']
 
 
 def test_an_overage_beside_an_instrument_failure_is_still_an_overage():
