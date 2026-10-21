@@ -25,6 +25,7 @@ from _merge_lane_fakes import (
     make_lane,
     running_lane,
 )
+from _orch_helpers import wait_responsive
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
@@ -234,7 +235,9 @@ class TestCancellable:
         )
         async with running_lane(lane):
             await queue.put(request)
-            await asyncio.wait_for(reverifying.wait(), _SCENE_TIMEOUT)
+            await wait_responsive(
+                reverifying.wait(), timeout=_SCENE_TIMEOUT, label='the gate re-verify to start holding'
+            )
             assert lane_state(lane, request.request_id) == 'gate_reverify'
 
             verdict = lane.cancel_request(request.request_id)
@@ -271,7 +274,9 @@ class TestCancellable:
         )
         async with running_lane(lane):
             await queue.put(request)
-            await asyncio.wait_for(reverifying.wait(), _SCENE_TIMEOUT)
+            await wait_responsive(
+                reverifying.wait(), timeout=_SCENE_TIMEOUT, label='the gate re-verify to start holding'
+            )
             [entry] = [
                 e for e in lane.snapshot()['entries']
                 if e['request_id'] == request.request_id
@@ -305,7 +310,9 @@ class TestRefused:
         monkeypatch.setattr(git_ops, 'advance_main', _held_advance)
         async with running_lane(lane) as run:
             await queue.put(request)
-            await asyncio.wait_for(advancing.wait(), _SCENE_TIMEOUT)
+            await wait_responsive(
+                advancing.wait(), timeout=_SCENE_TIMEOUT, label='the chain walk to reach its CAS advance'
+            )
             assert lane_state(lane, request.request_id) == 'finalizing'
 
             verdict = lane.cancel_request(request.request_id)
@@ -388,7 +395,9 @@ class TestRefused:
         for request in (first, second):
             queue.put_nowait(request)
         async with running_lane(lane) as run:
-            await asyncio.wait_for(stacking.wait(), _SCENE_TIMEOUT)
+            await wait_responsive(
+                stacking.wait(), timeout=_SCENE_TIMEOUT, label='the coalesce stack to start'
+            )
 
             verdict = lane.cancel_request(first.request_id)
             release.set()
