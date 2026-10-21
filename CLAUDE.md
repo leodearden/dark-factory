@@ -410,11 +410,14 @@ sweep overrunning `orchestrator_restart_lease_max_age_secs` loses the lease
 and degrades to the old collision, and the fused-memory tier has no lease at
 all — so read `--report`'s `FLEET-LEASE:` line rather than assuming.
 
-`--drain` (task 5371) is a two-stage drain: Stage A halts merge admission on
-every unit up front, Stage B restarts a unit only once no merge verify is in
-flight on any host (bounded by each verify's own timeout and
-`ORCH_DRAIN_VERIFY_MAX_WAIT_SECS`). Pre-5371 units and refused requests keep
-the old 600s merge-idle gate. The first sweep after a deploy of that code still
+`--drain` (task 5371, per unit since task 7297) is a two-stage drain: Stage A
+halts a unit's merge admission when the sweep reaches it; Stage B restarts it
+once none of its merge verifies is in flight (bounded by each verify's own
+timeout and a per-unit `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS`), and a sweep-wide
+ceiling `ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS`, counted from the first unit's
+request, force-restarts the unit being awaited and drops every later unit to
+the merge-idle gate once spent, so the sweep stays inside its 14400 s lease.
+Pre-5371 units and refused requests keep the old 600s merge-idle gate. The first sweep after a deploy of that code still
 meets old-code units. Detail: `OPERATIONS.md` §"Reading a drain".
 
 ## Working in the main checkout
