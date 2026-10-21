@@ -3225,9 +3225,9 @@ class DriftDetector:
     → no verdict; a remote's RunnerUnavailable is reported to the pool's
     ``on_unavailable`` sink so the merge worker benches it by kind.
 
-    The detector runs the two runners DIRECTLY (not via run_verdict_parity) so
-    it can distinguish RunnerUnavailable (transport ≠ divergence, Invariant 5)
-    from a genuine two-verdict disagreement.
+    The detector runs the two legs itself, concurrently (not via
+    run_verdict_parity), so it can distinguish RunnerUnavailable (transport ≠
+    divergence, Invariant 5) from a genuine two-verdict disagreement.
     """
 
     def __init__(
@@ -3256,8 +3256,21 @@ class DriftDetector:
         """
         return land_count > 0 and land_count % self._every_n_lands == 0
 
-    async def check(self, merge_sha: str, spec: MergeVerifySpec) -> DriftCheckResult:
-        """Run *merge_sha* on both runners and compare verdicts.
+    async def check(
+        self,
+        merge_sha: str,
+        spec: MergeVerifySpec,
+        *,
+        on_leg_done: Callable[[VerifyRunner], Awaitable[None]] | None = None,
+    ) -> DriftCheckResult:
+        """Run *merge_sha* on both runners at once and compare verdicts.
+
+        *on_leg_done* is awaited once per leg, with that leg's runner, as soon
+        as the leg ends (pass, fail or raise), so a caller can free that host
+        while the other leg still runs.  A remote RunnerUnavailable is reported
+        before its leg's *on_leg_done*.  A leg is never cancelled because its
+        sibling failed; an unexpected leg exception is raised once both legs
+        have ended.
 
         Returns DriftCheckResult.  Side-effects:
         - AGREE   → emit verdict_parity_ok event (None-safe), whose data carries
@@ -3272,18 +3285,12 @@ class DriftDetector:
         if local is None or remote is None:
             return DriftCheckResult(merge_sha=merge_sha, verdict=DriftVerdict.INCONCLUSIVE)
 
-        try:
-            local_result = await local.run_merge_verify(merge_sha, spec)
-        except RunnerUnavailable:
-            # Local transport failure also yields INCONCLUSIVE — symmetric with remote.
+        results = await self._run_legs(local, remote, merge_sha, spec, on_leg_done)
+        if results is None:
+            # No verdict ≠ divergence (Invariant 5): a closed/flaky host must
+            # never raise a false drift alarm.
             return DriftCheckResult(merge_sha=merge_sha, verdict=DriftVerdict.INCONCLUSIVE)
-        try:
-            remote_result = await remote.run_merge_verify(merge_sha, spec)
-        except RunnerUnavailable as exc:
-            # No verdict ≠ divergence (Invariant 5): a closed/flaky laptop must
-            # never raise a false drift alarm, but it is benched like any other.
-            self._pool.report_unavailable(remote.name, exc)
-            return DriftCheckResult(merge_sha=merge_sha, verdict=DriftVerdict.INCONCLUSIVE)
+        local_result, remote_result = results
 
         local_passed = local_result.passed
         remote_passed = remote_result.passed
@@ -3381,6 +3388,39 @@ class DriftDetector:
             escalated=escalated,
             quarantined=True,
         )
+
+    async def _run_legs(
+        self,
+        local: VerifyRunner,
+        remote: VerifyRunner,
+        merge_sha: str,
+        spec: MergeVerifySpec,
+        on_leg_done: Callable[[VerifyRunner], Awaitable[None]] | None,
+    ) -> tuple[VerifyResult, VerifyResult] | None:
+        """Both legs' results, or None when either leg's runner was unavailable."""
+
+        async def _leg(runner: VerifyRunner) -> VerifyResult:
+            try:
+                return await runner.run_merge_verify(merge_sha, spec)
+            except RunnerUnavailable as exc:
+                if runner is remote:
+                    # Benched BEFORE on_leg_done frees its slot, so nothing is
+                    # dispatched onto a host that just failed.
+                    self._pool.report_unavailable(runner.name, exc)
+                raise
+            finally:
+                if on_leg_done is not None:
+                    await on_leg_done(runner)
+
+        local_outcome, remote_outcome = await asyncio.gather(
+            _leg(local), _leg(remote), return_exceptions=True,
+        )
+        for outcome in (local_outcome, remote_outcome):
+            if isinstance(outcome, BaseException) and not isinstance(outcome, RunnerUnavailable):
+                raise outcome
+        if isinstance(local_outcome, BaseException) or isinstance(remote_outcome, BaseException):
+            return None
+        return local_outcome, remote_outcome
 
     async def check_env(
         self,

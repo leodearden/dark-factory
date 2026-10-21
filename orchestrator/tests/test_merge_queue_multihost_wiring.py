@@ -1361,14 +1361,13 @@ class TestDriftCheckTaskGCSafety:
         worker = self._make_worker_with_tasks(config)
 
         gate = asyncio.Event()
-        task_holder: list = []
+        drift_tasks: list = []
 
         # The real _run_drift_check is spawned: its local trust-anchor leg is a
         # runner double that parks on `gate`, so the detective is genuinely
         # in flight while the assertions below read the tracking set.  Nothing
         # about the spawn is stubbed.
         async def _gated_verify(*_args, **_kwargs):
-            task_holder.append(asyncio.current_task())
             await gate.wait()
             return _make_pass_result()
 
@@ -1386,15 +1385,15 @@ class TestDriftCheckTaskGCSafety:
             await asyncio.sleep(0)
 
             # (b) While in-flight: task must be strongly referenced in the set
-            assert len(worker._drift_check_tasks) == 1, (
+            drift_tasks = list(worker._drift_check_tasks)
+            assert len(drift_tasks) == 1, (
                 'drift-check task not in _drift_check_tasks while in-flight '
                 '— event loop may GC the detective mid-run'
             )
 
             # Release the gate and let the task run to completion
             gate.set()
-            if task_holder:
-                await asyncio.gather(*task_holder, return_exceptions=True)
+            await asyncio.gather(*drift_tasks, return_exceptions=True)
             await asyncio.sleep(0)  # flush done-callback
 
             # (c) After completion: done-callback must have discarded the task
@@ -1403,8 +1402,7 @@ class TestDriftCheckTaskGCSafety:
             )
         finally:
             gate.set()  # always unblock the coroutine even if assertions failed
-            if task_holder:
-                await asyncio.gather(*task_holder, return_exceptions=True)
+            await asyncio.gather(*drift_tasks, return_exceptions=True)
             await asyncio.sleep(0)
 
 
