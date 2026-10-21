@@ -181,29 +181,66 @@ def _mark_namespace_aliases(nodes: Iterable[ast.AST]) -> frozenset[str]:
     return frozenset(aliases)
 
 
-def _is_defect_spelling(node: ast.Attribute, aliases: frozenset[str]) -> bool:
-    """Whether *node* names the defect marker: ``<x>.mark.defect``, or ``defect`` on an *aliases* name."""
-    if node.attr != _DEFECT_MARKER:
-        return False
-    owner = node.value
-    return _is_mark_namespace(owner) or (isinstance(owner, ast.Name) and owner.id in aliases)
+def _spelled_marker(element: ast.expr, aliases: frozenset[str]) -> str | None:
+    """The marker *element* names, called or bare: NAME in ``<x>.mark.NAME``, or on an *aliases* name."""
+    if isinstance(element, ast.Call):
+        element = element.func
+    if not isinstance(element, ast.Attribute):
+        return None
+    owner = element.value
+    if _is_mark_namespace(owner) or (isinstance(owner, ast.Name) and owner.id in aliases):
+        return element.attr
+    return None
 
 
-def _defect_marks(tree: ast.Module) -> list[ast.expr]:
-    """Every defect-mark expression in *tree*, by position: each spelling's call, or the bare spelling.
+def _defect_marks(nodes: Sequence[ast.AST], aliases: frozenset[str]) -> list[ast.expr]:
+    """Every defect-mark expression among a module's *nodes*, by position: each spelling's call, or the bare spelling.
 
     Spellings through an alias of pytest or its mark namespace are included, so that
     :func:`_read_ref` makes each one a gap rather than letting it vanish.
     """
-    nodes = list(ast.walk(tree))
-    aliases = _mark_namespace_aliases(nodes)
     marks: dict[int, ast.expr] = {
-        id(node): node for node in nodes if isinstance(node, ast.Attribute) and _is_defect_spelling(node, aliases)
+        id(node): node
+        for node in nodes
+        if isinstance(node, ast.Attribute) and _spelled_marker(node, aliases) == _DEFECT_MARKER
     }
     for node in nodes:
         if isinstance(node, ast.Call) and id(node.func) in marks:
             marks[id(node.func)] = node
     return sorted(marks.values(), key=lambda mark: (mark.lineno, mark.col_offset))
+
+
+def _as_disabling(name: str | None) -> DisablingMark | None:
+    return DisablingMark(name) if name in _DISABLING_MARKS else None
+
+
+@dataclass(frozen=True)
+class _DisablingSpellings:
+    """Every way a module spells a skip or xfail mark, so that no spelling of one leaves a carrier runnable.
+
+    Besides ``<x>.mark.NAME``, a mark is spelled on any *aliases* name of pytest's mark namespace,
+    or by a name *bound* to such a spelling anywhere in the module.
+    """
+
+    aliases: frozenset[str]
+    bound: Mapping[str, DisablingMark]
+
+    @classmethod
+    def of_module(cls, nodes: Iterable[ast.AST], aliases: frozenset[str]) -> _DisablingSpellings:
+        bound: dict[str, DisablingMark] = {}
+        for node in nodes:
+            if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
+                disabling = _as_disabling(_spelled_marker(node.value, aliases))
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if disabling is not None:
+                    bound.update((target.id, disabling) for target in targets if isinstance(target, ast.Name))
+        return cls(aliases, MappingProxyType(bound))
+
+    def disabling(self, element: ast.expr) -> DisablingMark | None:
+        spelled = element.func if isinstance(element, ast.Call) else element
+        if isinstance(spelled, ast.Name):
+            return self.bound.get(spelled.id)
+        return _as_disabling(_spelled_marker(spelled, self.aliases))
 
 
 @dataclass(frozen=True)
@@ -213,10 +250,9 @@ class _ScopeMarks:
     defect_marks: tuple[ast.expr, ...] = ()
     disabled_by: frozenset[DisablingMark] = frozenset()
 
-    def with_elements(self, elements: Sequence[ast.expr]) -> _ScopeMarks:
-        named = [(element, marker_name(element)) for element in elements]
-        defect_marks = tuple(element for element, name in named if name == _DEFECT_MARKER)
-        disabled_by = frozenset(DisablingMark(name) for _, name in named if name in _DISABLING_MARKS)
+    def with_elements(self, elements: Sequence[ast.expr], spellings: _DisablingSpellings) -> _ScopeMarks:
+        defect_marks = tuple(element for element in elements if marker_name(element) == _DEFECT_MARKER)
+        disabled_by = frozenset(filter(None, map(spellings.disabling, elements)))
         return _ScopeMarks(self.defect_marks + defect_marks, self.disabled_by | disabled_by)
 
 
@@ -278,11 +314,21 @@ def _is_collected(lineage: tuple[ast.ClassDef, ...]) -> bool:
     return _test_flag(ancestor.body for ancestor in lineage)
 
 
-def _lineage_marks(lineage: tuple[ast.ClassDef, ...], scope: _ScopeMarks) -> _ScopeMarks:
+def _lineage_marks(
+    lineage: tuple[ast.ClassDef, ...], scope: _ScopeMarks, spellings: _DisablingSpellings
+) -> _ScopeMarks:
     """*scope* plus every lineage class's own marks: its pytestmark binding and its decorators."""
     for ancestor in lineage:
-        scope = scope.with_elements([*pytestmark_elements(ancestor.body), *ancestor.decorator_list])
+        scope = scope.with_elements([*pytestmark_elements(ancestor.body), *ancestor.decorator_list], spellings)
     return scope
+
+
+@dataclass(frozen=True)
+class _Module:
+    """What every scope of one module resolves against: its classes and its disabling-mark spellings."""
+
+    classes: Mapping[str, ast.ClassDef]
+    spellings: _DisablingSpellings
 
 
 @dataclass(frozen=True)
@@ -314,15 +360,16 @@ def _scope_items(
     members: Iterable[_Member],
     scope: _ScopeMarks,
     class_chain: tuple[str, ...],
-    module_classes: Mapping[str, ast.ClassDef],
+    module: _Module,
 ) -> Iterator[_Item]:
     """Each item pytest's default collection takes from a scope's *members*, named, with the marks reaching it."""
     for member in members:
         definition = member.definition
         if isinstance(definition, ast.ClassDef):
-            yield from _class_items(definition, member.classes, scope, class_chain, module_classes)
+            yield from _class_items(definition, member.classes, scope, class_chain, module)
         elif definition.name.startswith(_TEST_FUNCTION_PREFIX):
-            yield '::'.join((*class_chain, definition.name)), scope.with_elements(definition.decorator_list)
+            name = '::'.join((*class_chain, definition.name))
+            yield name, scope.with_elements(definition.decorator_list, module.spellings)
 
 
 def _class_items(
@@ -330,7 +377,7 @@ def _class_items(
     classes: Mapping[str, ast.ClassDef],
     enclosing: _ScopeMarks,
     class_chain: tuple[str, ...],
-    module_classes: Mapping[str, ast.ClassDef],
+    module: _Module,
 ) -> Iterator[_Item]:
     """The items of a collected Test class: its lineage's members and marks, named under its own chain."""
     if not node.name.startswith(_TEST_CLASS_PREFIX):
@@ -338,16 +385,17 @@ def _class_items(
     lineage = _lineage(node, classes)
     if not _is_collected(lineage):
         return
-    members = _members((ancestor.body for ancestor in lineage), module_classes)
-    yield from _scope_items(members, _lineage_marks(lineage, enclosing), (*class_chain, node.name), module_classes)
+    members = _members((ancestor.body for ancestor in lineage), module.classes)
+    scope = _lineage_marks(lineage, enclosing, module.spellings)
+    yield from _scope_items(members, scope, (*class_chain, node.name), module)
 
 
-def _module_items(body: Sequence[ast.stmt]) -> Iterator[_Item]:
+def _module_items(body: Sequence[ast.stmt], spellings: _DisablingSpellings) -> Iterator[_Item]:
     if not _test_flag((body,)):
         return iter(())
-    module_classes = _classes(_winning_definitions(body))
-    scope = _ScopeMarks().with_elements(pytestmark_elements(body))
-    return _scope_items(_members((body,), module_classes), scope, (), module_classes)
+    module = _Module(_classes(_winning_definitions(body)), spellings)
+    scope = _ScopeMarks().with_elements(pytestmark_elements(body), spellings)
+    return _scope_items(_members((body,), module.classes), scope, (), module)
 
 
 _Reading = str | EnumerationGap
@@ -381,9 +429,12 @@ def _non_static(
 
 
 def _enumerate_module(path: str, node_of: Callable[[str], NodeId], tree: ast.Module) -> FileEnumeration:
-    marks = _defect_marks(tree)
+    nodes = list(ast.walk(tree))
+    aliases = _mark_namespace_aliases(nodes)
+    marks = _defect_marks(nodes, aliases)
     readings = {id(mark): _read_ref(mark) for mark in marks}
-    carriers, reached = _carriers(_module_items(tree.body), readings, node_of)
+    spellings = _DisablingSpellings.of_module(nodes, aliases)
+    carriers, reached = _carriers(_module_items(tree.body, spellings), readings, node_of)
     gaps = tuple(reading for reading in readings.values() if isinstance(reading, EnumerationGap))
     return FileEnumeration(path, carriers, non_static=_non_static(marks, readings, reached), gaps=gaps)
 

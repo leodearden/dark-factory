@@ -735,6 +735,42 @@ def test_a_skip_or_xfail_mark_reaching_a_carrier_disables_it(mark, disabling, sc
     assert carrier.runnable is False
 
 
+_ALIASED_DISABLING_SPELLINGS = {
+    'from-pytest-import-mark': ('from pytest import mark', 'mark.skip', DisablingMark.SKIP),
+    'from-pytest-import-mark-as': ('from pytest import mark as m', "m.xfail(reason='x')", DisablingMark.XFAIL),
+    'import-pytest-as': ('import pytest as pt', "pt.mark.skipif(True, reason='x')", DisablingMark.SKIPIF),
+    'mark-namespace-assigned': ('MARK = pytest.mark', 'MARK.skip', DisablingMark.SKIP),
+    'name-bound-to-mark': ('SKIP = pytest.mark.skip', 'SKIP', DisablingMark.SKIP),
+    'name-bound-to-called-mark': ("XF = pytest.mark.xfail(reason='x')", 'XF', DisablingMark.XFAIL),
+    'name-bound-then-called': ('SKIPIF = pytest.mark.skipif', "SKIPIF(True, reason='x')", DisablingMark.SKIPIF),
+    'name-bound-through-alias': ('from pytest import mark\nSKIP = mark.skip', 'SKIP', DisablingMark.SKIP),
+}
+
+
+@pytest.mark.parametrize(
+    ('binding', 'mark', 'disabling'), _ALIASED_DISABLING_SPELLINGS.values(), ids=list(_ALIASED_DISABLING_SPELLINGS)
+)
+@pytest.mark.parametrize('scope', sorted(_DISABLING_SCOPES))
+def test_a_skip_or_xfail_spelled_through_an_alias_disables_the_carrier(binding, mark, disabling, scope):
+    template, name = _DISABLING_SCOPES[scope]
+    result = _enumerate(binding + '\n' + textwrap.dedent(template).format(mark=mark, ref=repr(REF_A)))
+    (carrier,) = result.carriers[REF_A]
+    assert carrier == Carrier(_node(name), frozenset({disabling}))
+    assert result.complete is True
+
+
+def test_a_name_bound_to_an_unrelated_mark_leaves_the_carrier_runnable():
+    result = _enumerate(f'''
+        SLOW = pytest.mark.slow
+
+        @SLOW
+        @pytest.mark.defect({REF_A!r})
+        def test_a():
+            pass
+    ''')
+    assert result.carriers == {REF_A: (_runnable('test_a'),)}
+
+
 def test_disabling_marks_from_every_scope_accumulate():
     result = _enumerate(f'''
         @pytest.mark.skip
