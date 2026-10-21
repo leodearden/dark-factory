@@ -14,6 +14,8 @@
 # migration) over a trailing window, keyed on the truthful chain telemetry
 # fields (merge_verify.chain_items >= 2 = a deep verify; merge_finalized.
 # landed_via_chain = items a chain landed).  Read-only: opened mode=ro, no writes.
+# verify_p90 reads merge_verify data['duration_ms']: the events.duration_ms
+# column is NULL for that event type.
 #
 # The DeterministicRunner decides by EXIT CODE ONLY -- it parses no stdout:
 #   0  canary healthy            -> task done (promote 6->32 proceeds)
@@ -50,7 +52,7 @@ done
 [ -f "$RUNS_DB" ] || usage "runs.db not found: $RUNS_DB"
 
 python3 - "$RUNS_DB" "$WINDOW_DAYS" "$FAIL_MAX" "$ITEMS_MIN" "$P90_MAX" <<'PY'
-import json, sqlite3, sys
+import json, math, sqlite3, sys
 db, window = sys.argv[1], sys.argv[2]
 fail_max, items_min, p90_max = (float(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]))
 
@@ -62,35 +64,41 @@ except sqlite3.Error as exc:
 def load(evtype):
     try:
         rows = conn.execute(
-            "SELECT data, duration_ms FROM events "
+            "SELECT data FROM events "
             "WHERE event_type=? AND timestamp > datetime('now', ?) ORDER BY id",
             (evtype, f"-{window} days"),
         ).fetchall()
     except sqlite3.Error as exc:
         print(f"predicate: query failed ({evtype}): {exc}", file=sys.stderr); sys.exit(2)
     out = []
-    for data, dur in rows:
+    for (data,) in rows:
         try:
             parsed = json.loads(data) if data else {}
         except json.JSONDecodeError:
             parsed = {}
-        out.append((parsed, dur))
+        out.append(parsed)
     return out
 
 mv = load("merge_verify")
 mf = load("merge_finalized")
 
 # A "deep" verify is one whose verified tree carried >= 2 chained items.
-deep = [(d, dur) for (d, dur) in mv if isinstance(d.get("chain_items"), int) and d["chain_items"] >= 2]
+deep = [d for d in mv if isinstance(d.get("chain_items"), int) and d["chain_items"] >= 2]
 n_deep = len(deep)
-n_fail = sum(1 for (d, _) in deep if not d.get("passed"))
+n_fail = sum(1 for d in deep if not d.get("passed"))
 fail_rate = (n_fail / n_deep) if n_deep else None
 
-landed = [d["landed_via_chain"] for (d, _) in mf
+landed = [d["landed_via_chain"] for d in mf
           if isinstance(d.get("landed_via_chain"), int) and d["landed_via_chain"] >= 1]
 items_per = (sum(landed) / n_deep) if n_deep else None   # items landed per deep verify run
 
-durs = sorted(dur / 1000.0 for (_, dur) in deep if isinstance(dur, (int, float)))
+def payload_secs(d):
+    ms = d.get("duration_ms")
+    if isinstance(ms, bool) or not isinstance(ms, (int, float)) or not math.isfinite(ms):
+        return None
+    return ms / 1000.0
+
+durs = sorted(s for s in map(payload_secs, deep) if s is not None)
 def pct(xs, q):
     if not xs:
         return None

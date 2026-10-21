@@ -109,7 +109,9 @@ class EventType(StrEnum):
     merge_attempt = 'merge_attempt'
     # The merge worker's POST-rebase verify verdict (task_id-keyed).  data:
     # {runner, merge_sha, passed, duration_ms, attempt, depth, speculative}
-    # (depth/speculative always-present, None when absent — task 2340), PLUS
+    # (depth/speculative always-present, None when absent — task 2340;
+    # duration_ms, the dispatch wall time in ms, rides in data ONLY: the
+    # events.duration_ms column stays NULL for this type), PLUS
     # two always-present retry-scope keys (task 2837, PRD verify-retry-
     # failed-only D5) derived from spec.verify_env — the D2 failed-only retry
     # contract the orchestrator ITSELF built and shipped to reify, NOT a reify

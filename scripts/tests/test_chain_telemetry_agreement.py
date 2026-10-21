@@ -106,7 +106,8 @@ class TestReaderAgreement:
             capture_output=True, text=True, timeout=_PREDICATE_TIMEOUT,
         )
 
-        # 1 is expected while the p90 leg has no duration signal (task 3190); 2 is an infra fault.
+        # 1 is expected: the 0.5 deep-fail rate exceeds the default 0.35 bound and the rows carry
+        # no duration; 2 is an infra fault.
         assert result.returncode in (0, 1), f'{result.returncode=} {result.stdout=} {result.stderr=}'
         n_deep = re.search(r'n_deep_verifies=(\d+)', result.stdout)
         fail_rate = re.search(r'deep_fail_rate=([^(]+)\(', result.stdout)
