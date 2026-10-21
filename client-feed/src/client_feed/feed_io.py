@@ -10,6 +10,7 @@ import os
 import stat
 import tempfile
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -21,6 +22,7 @@ from client_feed.contract import (
     FEED_FILENAME,
     FEED_MAJOR,
     FEED_VERSION,
+    INBOX_FILENAME,
     STATE_FILENAME,
     CommitSha,
     ContractViolation,
@@ -28,9 +30,11 @@ from client_feed.contract import (
     FeedLine,
     FeedState,
     NonNegativeInt,
+    RevealRequested,
     UnsupportedFeedVersion,
     feed_major,
     parse_feed_line,
+    parse_inbox_line,
     parse_state,
     split_jsonl,
 )
@@ -92,6 +96,7 @@ class FeedIoProblem(StrEnum):
     SYMLINK = 'symlink'
     CURSOR_AHEAD = 'cursor_ahead'
     ROTATION_TARGET_EXISTS = 'rotation_target_exists'
+    INBOX_REWOUND = 'inbox_rewound'
 
 
 class FeedIoError(Exception):
@@ -468,3 +473,58 @@ class OutDir:
         self._cursor = committed
         self._uncommitted = ()
         self._feed_bytes = feed_bytes
+
+
+@dataclass(frozen=True)
+class RejectedInboxLine:
+    """A complete inbox line that is no reveal request: where it starts, and why it was refused."""
+
+    offset: int
+    detail: str
+
+
+@dataclass(frozen=True)
+class InboxRead:
+    """The requests on the inbox's complete lines past an offset, and the offset just after them."""
+
+    requests: tuple[RevealRequested, ...]
+    rejected: tuple[RejectedInboxLine, ...]
+    offset: int
+
+
+def _inbox_bytes(in_dir: Path, offset: int) -> bytes | None:
+    """The inbox's bytes from `offset` to its end; None when there is no inbox."""
+    try:
+        with _opened(in_dir / INBOX_FILENAME, _READ_FLAGS) as fd:
+            size = os.fstat(fd).st_size
+            if offset > size:
+                raise FeedIoError(
+                    problem=FeedIoProblem.INBOX_REWOUND,
+                    name=INBOX_FILENAME,
+                    detail=f'offset {offset} lies beyond its {size} bytes; the portal replaced it',
+                )
+            os.lseek(fd, offset, os.SEEK_SET)
+            return _read_all(fd)
+    except FileNotFoundError:
+        return None
+
+
+def _inbox_line(raw: bytes, *, line_no: int) -> RevealRequested:
+    return parse_inbox_line(_decoded(raw, INBOX_FILENAME), line_no=line_no)
+
+
+def read_inbox(in_dir: Path, *, offset: int) -> InboxRead:
+    """The reveal requests past `offset`; a malformed line is rejected, never raised, so it cannot stall the tail."""
+    data = _inbox_bytes(in_dir, offset)
+    if data is None:
+        return InboxRead(requests=(), rejected=(), offset=offset)
+    requests: list[RevealRequested] = []
+    rejected: list[RejectedInboxLine] = []
+    position = offset
+    for line_no, raw in enumerate(data[: data.rfind(b'\n') + 1].split(b'\n')[:-1], 1):
+        try:
+            requests.append(_inbox_line(raw, line_no=line_no))
+        except ContractViolation as exc:
+            rejected.append(RejectedInboxLine(offset=position, detail=exc.detail))
+        position += len(raw) + 1
+    return InboxRead(requests=tuple(requests), rejected=tuple(rejected), offset=position)
