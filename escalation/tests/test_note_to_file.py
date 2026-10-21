@@ -15,7 +15,7 @@ from _filing_tools import call_info
 from escalation.action_effects import WORKFLOW_NONE, TaskEffect, effect_for
 from escalation.archive import archive_dir_for_date
 from escalation.models import KNOWN_SEVERITIES, NOTE_TO_FILE_CLASS, Escalation
-from escalation.queue import EscalationQueue
+from escalation.queue import EscalationQueue, ResolveOutcome, iter_all_escalation_paths
 from escalation.server import create_server
 
 CLAIMANT = 'run-1/sess-1/pid=7'
@@ -121,6 +121,108 @@ def _server(queue: EscalationQueue, *, status: str | None = 'in-progress') -> tu
 async def _file_note(queue: EscalationQueue, **overrides: Any) -> dict[str, Any]:
     server, _ = _server(queue)
     return await call_info(server, **{**_NOTE_FILING, **overrides})
+
+
+def _stored_bytes(queue: EscalationQueue, esc_id: str) -> bytes:
+    (path,) = [p for p in iter_all_escalation_paths(queue.queue_dir) if p.stem == esc_id]
+    return path.read_bytes()
+
+
+def _outcome() -> ResolveOutcome:
+    return {
+        'applied': True, 'prior_status': None, 'prior_resolved_by': None,
+        'late_resolution_captured': False, 'resolution_class_corrected': None,
+    }
+
+
+class TestEveryStampSiteRefusesAnUnpairedClass:
+    """resolve()'s pending and late-capture doors and resolve_issue refuse
+    NOTE_TO_FILE_CLASS on an ordinary record, and any other class on a note,
+    before anything is written."""
+
+    def test_resolve_refuses_the_class_on_a_pending_ordinary_record(self, queue):
+        resolved: list[Escalation] = []
+        queue.set_resolve_callback(resolved.append)
+        queue.submit(_note(note_to_file=False))
+        before = _stored_bytes(queue, 'esc-5751-1')
+        outcome = _outcome()
+
+        with pytest.raises(ValueError) as excinfo:
+            queue.resolve(
+                'esc-5751-1', 'r', resolved_by='interactive',
+                resolution_class=NOTE_TO_FILE_CLASS, outcome=outcome,
+            )
+
+        assert 'note_to_file=False' in str(excinfo.value)
+        assert repr(NOTE_TO_FILE_CLASS) in str(excinfo.value)
+        assert _stored_bytes(queue, 'esc-5751-1') == before
+        assert [esc.id for esc in queue.get_pending()] == ['esc-5751-1']
+        assert resolved == []
+        assert outcome['applied'] is False
+
+    def test_resolve_refuses_the_class_as_a_late_capture_correction(self, queue):
+        queue.submit(_note(note_to_file=False))
+        queue.dismiss_all_pending('sweep')
+        swept = queue.get('esc-5751-1')
+        assert swept is not None
+        assert (swept.status, swept.resolved_by, swept.resolution_class) == (
+            'dismissed', 'auto-dismissed', 'benign',
+        )
+        before = _stored_bytes(queue, 'esc-5751-1')
+
+        with pytest.raises(ValueError):
+            queue.resolve(
+                'esc-5751-1', 'a human finding', resolved_by='interactive',
+                resolution_class=NOTE_TO_FILE_CLASS,
+            )
+
+        assert _stored_bytes(queue, 'esc-5751-1') == before
+        reread = queue.get('esc-5751-1')
+        assert reread is not None
+        assert reread.late_resolutions == []
+        assert reread.resolution_class == 'benign'
+
+    def test_resolve_still_stamps_an_ordinary_class(self, queue):
+        queue.submit(_note(note_to_file=False))
+
+        resolved = queue.resolve('esc-5751-1', 'r', resolution_class='actionable')
+
+        assert resolved is not None
+        assert resolved.resolution_class == 'actionable'
+
+    @pytest.mark.asyncio
+    async def test_resolve_issue_refuses_the_class_on_an_ordinary_record(self, queue):
+        server, _ = _server(queue)
+        resolved: list[Escalation] = []
+        queue.set_resolve_callback(resolved.append)
+        queue.submit(_note(note_to_file=False))
+        before = _stored_bytes(queue, 'esc-5751-1')
+        tool = await server.get_tool('resolve_issue')
+
+        result = tool.fn(
+            'esc-5751-1', resolution='r', action='close_only',
+            resolved_by='interactive', resolution_class=NOTE_TO_FILE_CLASS,
+        )
+
+        assert result['code'] == 'invalid_resolution_class'
+        assert 'note_to_file=False' in result['error']
+        assert _stored_bytes(queue, 'esc-5751-1') == before
+        assert [esc.id for esc in queue.get_pending()] == ['esc-5751-1']
+        assert resolved == []
+
+    @pytest.mark.asyncio
+    async def test_resolve_issue_refuses_another_class_on_an_archived_note(self, queue):
+        note = await _file_note(queue)
+        before = _stored_bytes(queue, note['id'])
+        server, _ = _server(queue)
+        tool = await server.get_tool('resolve_issue')
+
+        result = tool.fn(
+            note['id'], resolution='r', action='close_only', resolution_class='actionable',
+        )
+
+        assert result['code'] == 'invalid_resolution_class'
+        assert _stored_bytes(queue, note['id']) == before
 
 
 class TestNoteToFileIsFiledResolved:
