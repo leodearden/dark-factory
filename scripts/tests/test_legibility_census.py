@@ -427,21 +427,25 @@ def test_mine_to_saturation_storm_batch_never_counts_as_saturated():
     assert len(result.batch_stats) == 4
 
     assert result.batch_stats[0].saturated is True
-    assert result.batch_stats[0].status == "ok"
+    assert isinstance(result.batch_stats[0].status, coder.CodingStatus)
+    assert result.batch_stats[0].status == coder.CodingStatus.OK
 
     storm = result.batch_stats[1]
     assert storm.total == 10
     assert storm.succeeded == 4
     assert storm.failed == 6
-    assert storm.status == "failure", "RunResult.status must be surfaced on BatchStats"
+    assert isinstance(storm.status, coder.CodingStatus)
+    assert storm.status == coder.CodingStatus.FAILURE, (
+        "RunResult.status must be surfaced on BatchStats"
+    )
     assert storm.dup_rate == pytest.approx(1.0), "dup_rate is still recorded for visibility"
     assert storm.saturated is False, "a storm batch must never satisfy saturation"
 
     # post-storm-reset: TWO fresh consecutive real-saturated batches are needed to stop
     assert result.batch_stats[2].saturated is True
-    assert result.batch_stats[2].status == "ok"
+    assert result.batch_stats[2].status == coder.CodingStatus.OK
     assert result.batch_stats[3].saturated is True
-    assert result.batch_stats[3].status == "ok"
+    assert result.batch_stats[3].status == coder.CodingStatus.OK
 
 
 # ---------------------------------------------------------------------------
@@ -1683,16 +1687,30 @@ def _storm_capped_mining_result():
         batch_stats=[
             mod.BatchStats(
                 index=0, total=10, succeeded=10, failed=0, dup_rate=0.1,
-                saturated=False, status="ok",
+                saturated=False, status=coder.CodingStatus.OK,
             ),
             mod.BatchStats(
                 index=1, total=10, succeeded=4, failed=6, dup_rate=1.0,
-                saturated=False, status="failure",
+                saturated=False, status=coder.CodingStatus.FAILURE,
             ),
         ],
         stop_reason="capped",
         max_batches=2,
     )
+
+
+def test_batch_status_reads_back_from_a_census_record_as_a_coding_status():
+    """The record stores the status as its JSON string; reading the record
+    back yields the enum again, and the report renders the same either way."""
+    record = _census_record(mining_result=_storm_capped_mining_result())
+    restored = json.loads(json.dumps(record))
+
+    statuses = [mod.BatchStats(**stats).status for stats in restored["mining"]["batch_stats"]]
+
+    assert [s for s in restored["mining"]["batch_stats"] if s["status"] == "failure"]
+    assert all(isinstance(status, coder.CodingStatus) for status in statuses)
+    assert statuses == [coder.CodingStatus.OK, coder.CodingStatus.FAILURE]
+    assert mod.census_report_sections(restored) == mod.census_report_sections(record)
 
 
 def _section(sections, key):
