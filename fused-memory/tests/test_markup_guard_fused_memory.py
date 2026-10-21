@@ -1568,19 +1568,28 @@ class TestPreservationIsUnconditional:
         ],
     )
     @pytest.mark.asyncio
-    async def test_every_corpus_refusal_of_add_memory_is_preserved(self, tmp_path, specimen):
+    async def test_no_corpus_payload_of_add_memory_is_lost(self, tmp_path, specimen):
         spool = MarkupResidueSpool(tmp_path / 'spool')
         server, mock_service = _build_guarded_server(
             known_projects={self._UNRELATED: str(tmp_path / 'other')},
             residue_floor=spool.preserve,
         )
 
-        payload = await self._refuse(server, 'add_memory', self._arguments(specimen))
+        with pytest.raises(ToolError) as exc_info:
+            await server._tool_manager.call_tool('add_memory', self._arguments(specimen))
 
+        payload = _payload(exc_info)
+        mock_service.add_memory.assert_not_awaited()
+        if payload['error_type'] == 'mcp_markup_detected':
+            # A specimen recorded against an older add_memory schema can be
+            # repaired by the live one (measured: one predates ``session_id``).
+            # The caller then holds its payload in ``repaired_call``.
+            assert payload['repaired_call']['content'] in specimen['value']
+            return
+        assert payload['error_type'] == 'mcp_markup_unrepairable', payload
         assert payload['escalation_id'] is not None, payload
         assert _spooled(tmp_path / 'spool', payload['escalation_id']) == specimen['value']
         assert 'NOTHING WAS PRESERVED' not in payload['hint']
-        mock_service.add_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_registered_project_named_only_in_the_residue_files_into_its_queue(
