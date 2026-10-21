@@ -2639,16 +2639,22 @@ class TestAlreadyLandedGateTickView:
         assert [r['event_type'] for r in rows] == [EventType.recovery_vetoed.value]
         assert rows[0]['data']['reason'] == 'escalation_pinned'
 
-    async def test_the_harness_wires_a_reader_that_reads_git_ops_at_call_time(
+    async def test_the_consult_reads_its_view_through_the_late_bound_git_ops(
         self, tmp_path,
     ) -> None:
         h = Harness(OrchestratorConfig(project_root=tmp_path))
-        reader = h.scheduler._callbacks.read_already_landed_tick_view
-        assert reader is not None
+        branch = f'{h.git_ops.config.branch_prefix}9'
         git_ops_double = MagicMock(spec=GitOps)
-        git_ops_double.list_local_branches = AsyncMock(return_value=frozenset({'task/9'}))
+        git_ops_double.config = h.git_ops.config
+        git_ops_double.list_local_branches = AsyncMock(return_value=frozenset({'main'}))
+        git_ops_double.find_merge_marker = AsyncMock(return_value=None)
         h.git_ops = git_ops_double
 
-        view = await reader()
+        gated = await h.scheduler._consult_already_landed([{'id': '9', 'metadata': {}}])
 
-        assert view == AlreadyLandedTickView(local_branches=frozenset({'task/9'}))
+        assert gated == set()
+        git_ops_double.list_local_branches.assert_awaited_once_with()
+        git_ops_double.find_merge_marker.assert_awaited_once_with(
+            branch, gate_on_existing_ref=False,
+        )
+        git_ops_double.resolve_branch_sha.assert_not_awaited()
