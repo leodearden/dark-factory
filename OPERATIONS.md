@@ -1860,26 +1860,14 @@ inside one 8-hour window.** Two corrections measured 2026-08-24/25:
   the one exit no trap can catch — costs at most one delayed window rather
   than wedging the fleet.
 
-  **Still not guaranteed.** The 14400s bound was derived from the common
-  long `--drain` sweep (~13,300s: the whole 11400s
-  `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` verify-wait cap, plus 7 x (30s verify +
-  120s grace) and 7 x 120s unknown-grace); it was 7200s while the worst sweep
-  was one busy unit burning the 600s-to-4500s busy grace. Since task 7297 the
-  verify-wait cap counts per unit from that unit's own request, so waits on
-  different units add up instead of overlapping; what keeps the sweep inside
-  the lease is the sweep-wide ceiling `ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS`
-  (default 11400), counted from the first unit's drain request. It bounds
-  everything the sweep does up to the moment it trips, on the wall clock. After
-  it, the unit being awaited is restarted at once and each later unit costs only
-  its restart verification (at most 30s + 120s grace) plus the merge-idle gate:
-  nothing if idle, up to 120s unknown-grace if its heartbeat is stale or
-  absent, up to the 600s busy grace if busy. With six units after the trip, all
-  stale: 11400 + 150 + 6 x 270 = 13,170s < 14400s. Units left on the busy
-  branch after the ceiling are the remaining exposure: each adds up to ~600s
-  more, so three or more of them can still overrun it. Units on the legacy
-  merge-idle gate (pre-5371 code, or a refused request) still add up to the
-  600s busy grace each, so two of them on top of a capped verify wait overrun
-  it. A sweep that overruns it loses its lease
+  **Still not guaranteed.** The lease max-age is fixed, and a `--drain` sweep
+  is kept inside it by the sweep-wide verify-wait ceiling, whose default is
+  derived to fit under it in one place:
+  `scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS`.
+  One residual remains: a unit that never acknowledges its drain request while
+  merge-busy (pre-5371 code, or a refused request) waits out its busy grace
+  after the ceiling, and enough of them overrun the lease. A sweep that
+  overruns it loses its lease
   mid-sweep and degrades to exactly the pre-4755 collision. And the
   **fused-memory tier has no lease at all** — `fused_memory_staleness_pass`
   can still collide with its own in-flight `restart-fused-memory.sh`, because
@@ -1903,14 +1891,17 @@ meanwhile. **Stage B**: the script classifies the heartbeat
 
 - `idle` — acknowledged, halted, nothing in flight: restart.
 - `verifying` — a merge verify is inside its own deadline: wait, with no busy
-  grace, until it finishes, goes `overdue`, or the cap
-  `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` (default 11400, counted from this unit's
-  own request) expires, or the sweep-wide ceiling
-  `ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS` (default 11400, counted from the
-  first unit's request) is spent. The ceiling trips once per sweep, with the
-  line `sweep-wide drain verify-wait ceiling of …s spent after …s, at <unit>`:
-  that unit is force-restarted, and every later unit gets no drain request
-  and goes through the merge-idle gate, as before 5371.
+  grace, until it finishes, goes `overdue`, or the per-unit cap
+  `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` (counted from this unit's own request)
+  expires, or the sweep-wide ceiling `ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS`
+  (counted from sweep start) is spent. At the defaults the ceiling binds first:
+  it is the smaller of the two and starts earlier, so the per-unit cap matters
+  only when set lower. The ceiling trips once per sweep, with the line
+  `sweep-wide drain verify-wait ceiling of …s spent after …s, at <unit>; this
+  and later units are force-restarted at their first acknowledged poll`. From
+  then on every unit still gets its drain request, so its lane halts while the
+  sweep is on it, and is restarted as soon as it acknowledges: at once if
+  `verifying`, instead of awaited.
 - `overdue` — every in-flight verify is past its own command timeout: restart
   at once.
 - `busy` / `refused` — not acknowledged yet, or the unit declined the request:
