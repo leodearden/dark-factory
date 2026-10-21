@@ -12,6 +12,7 @@ from fused_memory.middleware.curation_deferral import (
     POOL_UNAVAILABLE_ERRORS,
     CurationRetryPolicy,
     DeferReason,
+    backlog_remediation,
     backlog_severity,
     dedupe_skipped_marker,
     pool_defer_reason,
@@ -117,7 +118,12 @@ class TestPoolDeferReason:
 
     def test_reason_values_are_the_wire_strings(self):
         assert [reason.value for reason in DeferReason] == [
-            'all-accounts-capped', 'accounts-auth-failed',
+            'all-accounts-capped',
+            'accounts-auth-failed',
+            'llm-failed',
+            'corpus-failed',
+            'zero-output-breaker-open',
+            'curator-raised',
         ]
 
 
@@ -128,9 +134,37 @@ class TestBacklogSeverity:
     def test_an_auth_failed_backlog_is_blocking_because_it_never_self_heals(self):
         assert backlog_severity(DeferReason.ACCOUNTS_AUTH_FAILED) == 'blocking'
 
+    @pytest.mark.parametrize(
+        'reason',
+        [DeferReason.LLM_FAILED, DeferReason.CORPUS_FAILED, DeferReason.CURATOR_RAISED],
+    )
+    def test_a_curator_outage_backlog_is_blocking_because_none_is_known_to_heal(self, reason):
+        assert backlog_severity(reason) == 'blocking'
+
+    def test_a_breaker_backlog_is_info_because_the_breaker_closes_after_its_cooldown(self):
+        assert backlog_severity(DeferReason.ZERO_OUTPUT_BREAKER_OPEN) == 'info'
+
     @pytest.mark.parametrize('reason', list(DeferReason))
     def test_every_reason_has_a_severity(self, reason):
         assert backlog_severity(reason) in ('info', 'blocking')
+
+
+class TestBacklogRemediation:
+    @pytest.mark.parametrize('reason', list(DeferReason))
+    def test_every_reason_has_a_remediation(self, reason):
+        remediation = backlog_remediation(reason)
+
+        assert isinstance(remediation, str)
+        assert remediation
+
+    @pytest.mark.parametrize(
+        'pool_reason', [DeferReason.ALL_ACCOUNTS_CAPPED, DeferReason.ACCOUNTS_AUTH_FAILED],
+    )
+    @pytest.mark.parametrize('outage_reason', [DeferReason.LLM_FAILED, DeferReason.CORPUS_FAILED])
+    def test_a_curator_outage_is_not_told_to_restore_the_account_pool(
+        self, pool_reason, outage_reason,
+    ):
+        assert backlog_remediation(outage_reason) != backlog_remediation(pool_reason)
 
 
 class TestDedupeSkippedMarker:
