@@ -1,4 +1,4 @@
-"""Tests for write_triage_reader_rubric.py — the one definition of write-triage rubric v2.
+"""Tests for write_triage_reader_rubric.py — the one definition of write-triage rubric v2.1.
 
 Reached only through the public surface: ``resolve_judgements`` (the verdict
 row contract and per-binary majority), ``derive`` (the derivation table) and
@@ -24,14 +24,25 @@ def _mod() -> types.ModuleType:
     return load_script_module(SCRIPT_PATH, mod_name='write_triage_reader_rubric')
 
 
+_QUOTE = {'parent': 'the record says A', 'child': 'the write says B'}
+_SPANS = ['a detail the reader needs']
+
+
 def _row(
     entry: str = 'e1', target: str = 't1', *, basis: str = 'current', rater: str = 'r1',
     role: str = 'primary', batch: str = 'b1', **answers: Any,
 ) -> dict[str, Any]:
-    return {
+    """A verdict row; a rater row's YES conflict and YES loss carry default evidence."""
+    row = {
         'entry_id': entry, 'target_id': target, 'basis': basis, 'rater': rater,
         'role': role, 'batch': batch, **answers,
     }
+    if role != 'derived':
+        if answers.get('conflict') == 'YES':
+            row.setdefault('conflict_quote', dict(_QUOTE))
+        if answers.get('loss') == 'YES':
+            row.setdefault('loss_spans', list(_SPANS))
+    return row
 
 
 def _resolved(rows: list[dict[str, Any]], binary: str, *, basis: str = 'current') -> Any:
@@ -55,10 +66,11 @@ class TestTheVerdictRowContract:
         ('loss', 'yes'),
         ('conflict', 'CENTRAL'),
         ('scope', 'YES'),
+        ('action_changing', 'CENTRAL'),
         ('digest', 'SECONDARY'),
     ])
     def test_an_unknown_word_is_refused_naming_it(self, field: str, value: str) -> None:
-        row = _row(home='YES', loss='YES', conflict='YES')
+        row = _row(home='YES', conflict='NO', loss='YES')
         row[field] = value
         with pytest.raises(ValueError, match=f"row 0.*e1.*t1.*{field}.*'{value}'"):
             _mod().resolve_judgements([row])
@@ -77,7 +89,8 @@ class TestTheVerdictRowContract:
     def test_digest_without_a_yes_loss_is_refused(self) -> None:
         with pytest.raises(ValueError, match="row 0.*digest.*loss.*'UNCLEAR'"):
             _mod().resolve_judgements([
-                _row(loss='UNCLEAR', unclear_reason='cut mid-number', digest='NO'),
+                _row(home='YES', conflict='NO', loss='UNCLEAR', unclear_reason='cut mid-number',
+                     digest='NO'),
             ])
 
     @pytest.mark.parametrize('reason', [None, '', '   '])
@@ -94,7 +107,7 @@ class TestTheVerdictRowContract:
 
     def test_a_rater_voting_twice_on_one_pair_and_basis_is_refused(self) -> None:
         with pytest.raises(ValueError, match="row 1.*'r1'"):
-            _mod().resolve_judgements([_row(home='YES'), _row(loss='NO')])
+            _mod().resolve_judgements([_row(home='YES'), _row(conflict='NO')])
 
     def test_one_rater_may_rate_both_bases(self) -> None:
         rubric = _mod()
@@ -118,8 +131,9 @@ class TestPerBinaryResolution:
         assert _resolved(rows, 'home') == _mod().Resolved.TIED
 
     def test_unclear_abstains(self) -> None:
-        rows = [_row(loss='YES'),
-                _row(rater='r2', loss='UNCLEAR', unclear_reason='cut at the number')]
+        rows = [_row(home='YES', conflict='NO', loss='YES'),
+                _row(rater='r2', home='YES', conflict='NO', loss='UNCLEAR',
+                     unclear_reason='cut at the number')]
         assert _resolved(rows, 'loss') == _mod().Resolved.YES
 
     def test_all_unclear_resolves_unclear(self) -> None:
@@ -131,7 +145,7 @@ class TestPerBinaryResolution:
         assert _resolved([_row(home='YES')], 'conflict') is None
 
     def test_only_rows_carrying_a_binary_vote_on_it(self) -> None:
-        rows = [_row(home='YES'), _row(rater='r2', loss='NO')]
+        rows = [_row(home='YES'), _row(rater='r2', conflict='NO')]
         assert _resolved(rows, 'home') == _mod().Resolved.YES
 
     def test_scope_resolves_central_or_secondary(self) -> None:
@@ -146,18 +160,177 @@ class TestPerBinaryResolution:
         assert _resolved(rows, 'scope') == _mod().Resolved.TIED
 
     def test_digest_resolves_like_any_binary(self) -> None:
-        rows = [_row(loss='YES', digest='NO')]
+        rows = [_row(home='YES', conflict='NO', loss='YES', digest='NO')]
         assert _resolved(rows, 'digest') == _mod().Resolved.NO
 
-    def test_a_derived_row_counts_as_one_vote(self) -> None:
-        rows = [_row(rater='v1', role='derived', home='YES'), _row(home='NO')]
-        assert _resolved(rows, 'home') == _mod().Resolved.TIED
+    def test_a_derived_row_is_the_only_vote_on_the_binary_it_fixes(self) -> None:
+        rows = [_row(rater='v1', role='derived', home='YES'),
+                _row(home='NO', non_consumed=['home'])]
+        assert _resolved(rows, 'home') == _mod().Resolved.YES
+
+    def test_action_changing_resolves_by_majority(self) -> None:
+        rows = [_row(conflict='YES', action_changing='YES'),
+                _row(rater='r2', conflict='YES', action_changing='NO'),
+                _row(rater='r3', conflict='YES', action_changing='YES')]
+        assert _resolved(rows, 'action_changing') == _mod().Resolved.YES
+
+    def test_an_action_changing_split_is_tied(self) -> None:
+        rows = [_row(conflict='YES', action_changing='YES'),
+                _row(rater='r2', conflict='YES', action_changing='NO')]
+        assert _resolved(rows, 'action_changing') == _mod().Resolved.TIED
 
     def test_the_two_bases_never_mix(self) -> None:
         rows = [_row(home='YES'), _row(rater='r2', home='YES'),
                 _row(basis='attach_time', home='NO')]
         assert _resolved(rows, 'home') == _mod().Resolved.YES
         assert _resolved(rows, 'home', basis='attach_time') == _mod().Resolved.NO
+
+
+class TestTheFollowUps:
+    def test_each_follow_up_names_the_answers_it_needs_on_its_row(self) -> None:
+        rubric = _mod()
+        binary, answer = rubric.Binary, rubric.Answer
+        assert {follow_up: dict(needs) for follow_up, needs in rubric.FOLLOW_UPS.items()} == {
+            binary.LOSS: {binary.HOME: answer.YES, binary.CONFLICT: answer.NO},
+            binary.SCOPE: {binary.CONFLICT: answer.YES},
+            binary.ACTION_CHANGING: {binary.CONFLICT: answer.YES},
+            binary.DIGEST: {binary.LOSS: answer.YES},
+        }
+
+    @pytest.mark.parametrize(('answers', 'needed', 'found'), [
+        ({'conflict': 'NO'}, "home 'YES'", 'None'),
+        ({'home': 'NO', 'conflict': 'NO'}, "home 'YES'", "'NO'"),
+        ({'home': 'YES', 'conflict': 'YES'}, "conflict 'NO'", "'YES'"),
+        ({'home': 'YES'}, "conflict 'NO'", 'None'),
+    ])
+    def test_loss_is_asked_only_after_home_yes_and_conflict_no(
+        self, answers: dict[str, str], needed: str, found: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=f"row 0.*e1.*t1.*loss 'NO' needs {needed}, got {found}"):
+            _mod().resolve_judgements([_row(**answers, loss='NO')])
+
+    @pytest.mark.parametrize('loss', ['YES', 'NO', 'UNCLEAR'])
+    def test_loss_on_a_row_with_home_yes_and_conflict_no_is_accepted(self, loss: str) -> None:
+        rows = [_row(home='YES', conflict='NO', loss=loss, unclear_reason='cut at the number')]
+        assert _resolved(rows, 'loss') == _mod().Resolved(loss)
+
+    @pytest.mark.parametrize('conflict', [None, 'NO', 'UNCLEAR'])
+    def test_action_changing_without_a_yes_conflict_is_refused(self, conflict: str | None) -> None:
+        answers = {} if conflict is None else {'conflict': conflict}
+        row = _row(home='YES', **answers, action_changing='YES', unclear_reason='cut')
+        with pytest.raises(ValueError, match=f"row 0.*action_changing 'YES' needs conflict 'YES', got {conflict!r}"):
+            _mod().resolve_judgements([row])
+
+
+class TestTheEvidenceContract:
+    @pytest.mark.parametrize('role', ['primary', 'second', 'third'])
+    def test_a_rater_yes_conflict_needs_a_conflict_quote(self, role: str) -> None:
+        row = _row(role=role, conflict='YES')
+        del row['conflict_quote']
+        with pytest.raises(ValueError, match='row 0.*e1.*t1.*conflict.*conflict_quote'):
+            _mod().resolve_judgements([row])
+
+    @pytest.mark.parametrize('quote', [
+        'the record says A',
+        {},
+        {'parent': 'the record says A'},
+        {'child': 'the write says B'},
+        {'parent': '', 'child': 'the write says B'},
+        {'parent': 'the record says A', 'child': '   '},
+        {'parent': 'the record says A', 'child': 3},
+        None,
+    ])
+    def test_a_malformed_conflict_quote_is_refused(self, quote: Any) -> None:
+        with pytest.raises(ValueError, match='row 0.*conflict_quote'):
+            _mod().resolve_judgements([_row(conflict='YES', conflict_quote=quote)])
+
+    @pytest.mark.parametrize('role', ['primary', 'second', 'third'])
+    def test_a_rater_yes_loss_needs_loss_spans(self, role: str) -> None:
+        row = _row(role=role, home='YES', conflict='NO', loss='YES')
+        del row['loss_spans']
+        with pytest.raises(ValueError, match='row 0.*e1.*t1.*loss.*loss_spans'):
+            _mod().resolve_judgements([row])
+
+    @pytest.mark.parametrize('spans', [
+        'a detail', [], [''], ['a detail', '  '], ['a detail', 3], None, {'span': 'a detail'},
+    ])
+    def test_malformed_loss_spans_are_refused(self, spans: Any) -> None:
+        row = _row(home='YES', conflict='NO', loss='YES', loss_spans=spans)
+        with pytest.raises(ValueError, match='row 0.*loss_spans'):
+            _mod().resolve_judgements([row])
+
+    def test_a_digest_needs_loss_spans_on_its_row(self) -> None:
+        row = _row(rater='v1', role='derived', home='YES', conflict='NO', loss='YES', digest='YES')
+        with pytest.raises(ValueError, match='row 0.*digest.*loss_spans'):
+            _mod().resolve_judgements([row])
+
+    def test_a_derived_row_needs_no_evidence(self) -> None:
+        rows = [_row(rater='v1', role='derived', conflict='YES'),
+                _row('e2', rater='v1', role='derived', home='YES', conflict='NO', loss='YES')]
+        judgements = _mod().resolve_judgements(rows)
+        assert len(judgements) == 2
+
+    def test_rater_evidence_is_accepted(self) -> None:
+        rows = [_row(conflict='YES'), _row('e2', home='YES', conflict='NO', loss='YES', digest='NO')]
+        assert len(_mod().resolve_judgements(rows)) == 2
+
+
+class TestNonConsumedAnswers:
+    @pytest.mark.parametrize(('non_consumed', 'named'), [
+        (['house'], 'house'),
+        (['conflict'], 'conflict'),
+        (['home', 'home'], 'home'),
+        ('home', 'home'),
+    ])
+    def test_a_malformed_non_consumed_list_is_refused_naming_the_binary(
+        self, non_consumed: Any, named: str,
+    ) -> None:
+        rows = [_row(rater='v1', role='derived', home='YES', conflict='NO'),
+                _row(home='YES', non_consumed=non_consumed)]
+        with pytest.raises(ValueError, match=f"row 1.*e1.*t1.*non_consumed.*'{named}'"):
+            _mod().resolve_judgements(rows)
+
+    def test_non_consumed_on_a_derived_row_is_refused(self) -> None:
+        row = _row(rater='v1', role='derived', home='YES', non_consumed=['home'])
+        with pytest.raises(ValueError, match="row 0.*non_consumed.*'home'.*derived"):
+            _mod().resolve_judgements([row])
+
+    def test_a_non_consumed_binary_no_derived_row_fixes_is_refused(self) -> None:
+        rows = [_row(rater='v1', role='derived', conflict='NO'),
+                _row(home='NO', conflict='NO', non_consumed=['home', 'conflict'])]
+        with pytest.raises(ValueError, match="row 1.*e1.*t1.*'r1'.*non_consumed.*'home'"):
+            _mod().resolve_judgements(rows)
+
+    def test_a_voting_rater_answer_on_a_derived_binary_is_refused(self) -> None:
+        rows = [_row(home='NO', conflict='NO', non_consumed=['conflict']),
+                _row(rater='v1', role='derived', home='YES', conflict='NO')]
+        with pytest.raises(ValueError, match="row 0.*e1.*t1.*'r1'.*home.*derived"):
+            _mod().resolve_judgements(rows)
+
+    def test_the_cross_row_rules_read_only_the_same_pair_key(self) -> None:
+        rows = [_row(rater='v1', role='derived', home='YES'),
+                _row(basis='attach_time', home='NO'),
+                _row('e2', home='NO')]
+        assert _resolved(rows, 'home', basis='attach_time') == _mod().Resolved.NO
+
+    def test_a_non_consumed_answer_is_recorded_and_does_not_vote(self) -> None:
+        rubric = _mod()
+        rows = [_row(rater='v1', role='derived', home='YES', conflict='NO'),
+                _row(home='NO', conflict='NO', non_consumed=['home', 'conflict'])]
+        judgement = rubric.resolve_judgements(rows)[rubric.PairKey('e1', 't1', rubric.Basis.CURRENT)]
+        rated = next(vote for vote in judgement.votes if vote.rater == 'r1')
+        assert rated.non_consumed == {rubric.Binary.HOME, rubric.Binary.CONFLICT}
+        assert dict(rated.answers) == {}
+        assert judgement.answer(rubric.Binary.HOME) == rubric.Resolved.YES
+        assert judgement.answer(rubric.Binary.CONFLICT) == rubric.Resolved.NO
+
+    def test_a_partly_non_consumed_row_votes_with_the_rest(self) -> None:
+        rows = [_row(rater='v1', role='derived', home='NO'),
+                _row(home='YES', conflict='NO', loss='YES', non_consumed=['home']),
+                _row(rater='r2', home='YES', conflict='NO', loss='YES', non_consumed=['home'])]
+        assert _resolved(rows, 'loss') == _mod().Resolved.YES
+        assert _resolved(rows, 'conflict') == _mod().Resolved.NO
+        assert _resolved(rows, 'home') == _mod().Resolved.NO
 
 
 def _judged(target: str, *votes: dict[str, str]) -> Any:
