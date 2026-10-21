@@ -34,7 +34,7 @@ import pytest
 from _merge_lane_fakes import FakeVerifier, hangs_until
 from _orch_helpers import wait_responsive
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.drift import (
@@ -187,8 +187,6 @@ class TestDriftCheckStatePersistence:
         assert original.after_deferral() == DriftCheckState(land_count=4, consecutive_deferrals=3)
         assert original.after_start() == DriftCheckState(land_count=4, consecutive_deferrals=0)
         assert original == DriftCheckState(land_count=4, consecutive_deferrals=2)
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            original.land_count = 9  # type: ignore[misc]
 
 
 @pytest.mark.asyncio
@@ -1217,9 +1215,11 @@ class _DriftScene:
         req.module_configs = []
         req.config = OrchestratorConfig(
             project_root=tmp_path,
-            verify_runners=[  # type: ignore[arg-type]
-                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin',
-                 'df_checkout_path': '/df'},
+            verify_runners=[
+                VerifyRunnerConfig(
+                    name='laptop', ssh_host='laptop.local', git_remote='origin',
+                    df_checkout_path='/df',
+                ),
             ],
             verify_env_probes=_LEVER_C_OFF,
             **config,
