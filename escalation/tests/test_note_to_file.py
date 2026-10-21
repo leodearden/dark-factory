@@ -123,6 +123,12 @@ async def _file_note(queue: EscalationQueue, **overrides: Any) -> dict[str, Any]
     return await call_info(server, **{**_NOTE_FILING, **overrides})
 
 
+async def _resolve_issue(server, escalation_id: str, **kw: Any) -> dict[str, Any]:
+    """``resolve_issue`` is a SYNC tool, so ``tool.fn`` returns directly."""
+    tool = await server.get_tool('resolve_issue')
+    return tool.fn(escalation_id, **kw)
+
+
 def _stored_bytes(queue: EscalationQueue, esc_id: str) -> bytes:
     (path,) = [p for p in iter_all_escalation_paths(queue.queue_dir) if p.stem == esc_id]
     return path.read_bytes()
@@ -197,10 +203,9 @@ class TestEveryStampSiteRefusesAnUnpairedClass:
         queue.set_resolve_callback(resolved.append)
         queue.submit(_note(note_to_file=False))
         before = _stored_bytes(queue, 'esc-5751-1')
-        tool = await server.get_tool('resolve_issue')
 
-        result = tool.fn(
-            'esc-5751-1', resolution='r', action='close_only',
+        result = await _resolve_issue(
+            server, 'esc-5751-1', resolution='r', action='close_only',
             resolved_by='interactive', resolution_class=NOTE_TO_FILE_CLASS,
         )
 
@@ -215,10 +220,9 @@ class TestEveryStampSiteRefusesAnUnpairedClass:
         note = await _file_note(queue)
         before = _stored_bytes(queue, note['id'])
         server, _ = _server(queue)
-        tool = await server.get_tool('resolve_issue')
 
-        result = tool.fn(
-            note['id'], resolution='r', action='close_only', resolution_class='actionable',
+        result = await _resolve_issue(
+            server, note['id'], resolution='r', action='close_only', resolution_class='actionable',
         )
 
         assert result['code'] == 'invalid_resolution_class'
