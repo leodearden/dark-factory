@@ -74,6 +74,7 @@ from escalation.models import (
     Escalation,
     EvidenceEntry,
     max_severity,
+    note_to_file_class_conflict,
 )
 from escalation.note_to_file import file_note_to_file, note_to_file_refusal
 from escalation.pins import classify_pins
@@ -2323,9 +2324,11 @@ def create_server(
         against ``escalation.models.RESOLUTION_CLASSES`` before any gate runs
         or the record is touched; an unrecognised value returns
         ``{'error': ..., 'code': 'invalid_resolution_class'}`` with NO record
-        change. Written only at resolution — never author-supplied
-        otherwise. Not forwarded to the ``park`` action (the record stays
-        open at L2, unclassified until eventually resolved).
+        change. A class that conflicts with the record's ``note_to_file``
+        flag (``escalation.models.note_to_file_class_conflict``) returns the
+        same code, also with no record change. Written only at resolution —
+        never author-supplied otherwise. Not forwarded to the ``park`` action
+        (the record stays open at L2, unclassified until eventually resolved).
 
         **A resolve on an ALREADY-AUTO-DISMISSED record does NOT take effect**
         (task 4495).  ``queue.resolve``'s status check is an atomic
@@ -2538,6 +2541,10 @@ def create_server(
         rec = queue.get(escalation_id)
         if rec is None:
             return {'error': f'Escalation {escalation_id} not found'}
+        if resolution_class is not None and (
+            conflict := note_to_file_class_conflict(rec, resolution_class)
+        ):
+            return {'error': conflict, 'code': 'invalid_resolution_class'}
 
         # D7 effective ceiling: an identity mapped in ROLE_LEVEL_ALLOWLIST is
         # AUTHORITATIVE — a present X-Escalation-Levels header may only

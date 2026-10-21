@@ -715,9 +715,10 @@ class Escalation:
     project_id: str | None = None
     # NOTE TO FILE (plans/plan-deviation-recording-prd.md D2) — a filer-declared
     # record that requests nothing: never pending (EscalationQueue.submit), and
-    # filed by EscalationQueue.submit_resolved, which refuses this flag without
-    # NOTE_TO_FILE_CLASS and that class without this flag.  Zero migration via
-    # the from_dict filter.
+    # filed by EscalationQueue.submit_resolved.  Every resolution-class stamp
+    # site refuses this flag without NOTE_TO_FILE_CLASS, and that class without
+    # this flag, via note_to_file_class_conflict.  Zero migration via the
+    # from_dict filter.
     note_to_file: bool = False
 
     def to_dict(self) -> dict:
@@ -733,3 +734,14 @@ class Escalation:
     @classmethod
     def from_json(cls, text: str) -> Escalation:
         return cls.from_dict(json.loads(text))
+
+
+def note_to_file_class_conflict(escalation: Escalation, resolution_class: str | None) -> str | None:
+    """Why *escalation* cannot carry *resolution_class* under the note-to-file pairing, else None."""
+    if escalation.note_to_file == (resolution_class == NOTE_TO_FILE_CLASS):
+        return None
+    return (
+        f'escalation {escalation.id}: note_to_file={escalation.note_to_file} with '
+        f'resolution_class={resolution_class!r}; {NOTE_TO_FILE_CLASS!r} is stamped on a '
+        'note_to_file record and on nothing else'
+    )
