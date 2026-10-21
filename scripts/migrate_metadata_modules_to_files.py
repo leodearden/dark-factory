@@ -120,6 +120,8 @@ CALL_RETRY_ATTEMPTS = 3
 #: Seconds, multiplied by the attempt number for a linear backoff. Module-level
 #: rather than a literal so a test can set it to 0 instead of sleeping.
 CALL_RETRY_BACKOFF_S = 1.0
+#: Seconds every request gets unless :meth:`FusedMemoryClient.call_tool` is given its own.
+DEFAULT_CALL_TIMEOUT_S = 30.0
 
 
 def _flatten_tasks(tasks_payload: Any) -> list[dict]:
@@ -148,13 +150,17 @@ class FusedMemoryClient:
     #: Override it in a subclass — do NOT restate `_initialize` to change it.
     _client_name: str = 'migrate-metadata'
 
-    def __init__(self, server_url: str):
+    def __init__(self, server_url: str, *, transport: httpx.AsyncBaseTransport | None = None):
+        """*transport* is the httpx transport the client sends through, so a test can pass ``httpx.MockTransport``."""
         self._url = server_url.rstrip('/')
+        self._transport = transport
         self._client: httpx.AsyncClient | None = None
         self._session_id: str | None = None
 
     async def __aenter__(self) -> FusedMemoryClient:
-        self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        self._client = httpx.AsyncClient(
+            timeout=DEFAULT_CALL_TIMEOUT_S, follow_redirects=True, transport=self._transport
+        )
         self._session_id = uuid.uuid4().hex
         await self._initialize()
         return self
