@@ -1,5 +1,7 @@
 """One publisher pass: every source read as its own unit, the events built in a fixed order, a heartbeat last."""
 
+import logging
+import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -8,9 +10,11 @@ import pytest
 from _archive_files import junit_xml, passed, red, write_junit, write_plan, write_summary
 from _git_repo import Repo, make_repo
 from _stores import RunsDb, TasksDb
+from shared.project_layout import runs_db, tasks_db
 
 from client_feed.contract import (
     BranchSnapshot,
+    Degradation,
     FactoryState,
     FeedLine,
     Heartbeat,
@@ -18,6 +22,7 @@ from client_feed.contract import (
     PrdUpserted,
     ReviewCounts,
     SchedulerState,
+    Source,
     TaskPhase,
     TaskStatus,
     TaskUpserted,
@@ -295,3 +300,146 @@ def test_the_report_carries_what_the_pass_appended(project: Project) -> None:
     count = len(FIRST_PASS_TYPES)
     assert first == PassReport(appended=count, watermark_seq=count, degraded=())
     assert second == PassReport(appended=1, watermark_seq=count + 1, degraded=())
+
+
+NOT_A_DATABASE = b'this is not a sqlite database at all' * 100
+UNKNOWN_SHA = 'e' * 40
+
+
+def assert_valid(project: Project) -> None:
+    assert validate_out_dir(project.out_dir, expected_project_id=PROJECT).ok
+
+
+def types_of(lines: tuple[FeedLine, ...]) -> set[str]:
+    return {line.type for line in lines}
+
+
+def last_heartbeat(project: Project) -> Heartbeat:
+    heartbeat = feed(project)[-1]
+    assert isinstance(heartbeat, Heartbeat)
+    return heartbeat
+
+
+def warnings_of(caplog: pytest.LogCaptureFixture) -> str:
+    return '\n'.join(
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    )
+
+
+def test_an_unreadable_runs_db_is_named_events_and_every_other_source_still_publishes(
+    project: Project, caplog: pytest.LogCaptureFixture
+) -> None:
+    runs_db(project.root).write_bytes(NOT_A_DATABASE)
+
+    with caplog.at_level(logging.WARNING):
+        report = run_pass(project.policy, project.open(), now=NOW)
+
+    (degradation,) = last_heartbeat(project).degraded
+    assert degradation.source is Source.EVENTS
+    assert runs_db(project.root).relative_to(project.root).as_posix() in degradation.reason
+    assert '/home/' not in degradation.reason
+    assert str(project.root.parent) not in degradation.reason
+    assert report.degraded == (degradation,)
+    published = types_of(feed(project))
+    assert {'task_upserted', 'branch_snapshot', 'tree_snapshot', 'prd_upserted'} <= published
+    assert not published & {'task_phase', 'verify_run', 'merge_landed'}
+    assert stored_cursor(project).events_id == 0
+    assert 'events' in warnings_of(caplog)
+    assert_valid(project)
+
+
+def test_a_restored_runs_db_publishes_the_held_stream_and_rewaits_the_escalated_task(
+    project: Project,
+) -> None:
+    good = runs_db(project.root).read_bytes()
+    runs_db(project.root).write_bytes(NOT_A_DATABASE)
+    out = project.open()
+    run_pass(project.policy, out, now=NOW)
+    held = feed(project)
+    (task_9,) = (line for line in held if isinstance(line, TaskUpserted) and line.task_id == 9)
+    assert task_9.waiting_on is WaitingOn.FACTORY
+    assert_valid(project)
+    runs_db(project.root).write_bytes(good)
+
+    report = run_pass(project.policy, out, now=NOW, rescan_tasks=False)
+
+    recovered = feed(project)[len(held) :]
+    assert report.degraded == ()
+    assert {'task_phase', 'verify_run', 'merge_landed'} <= types_of(recovered)
+    upserts = [line for line in recovered if isinstance(line, TaskUpserted)]
+    assert [(task.task_id, task.waiting_on) for task in upserts] == [(9, WaitingOn.LEO)]
+    assert stored_cursor(project).events_id == project.last_stream_id
+    assert_valid(project)
+
+
+def test_a_missing_tasks_db_is_named_tasks_and_the_events_and_git_still_publish(
+    project: Project,
+) -> None:
+    tasks_db(project.root).unlink()
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    (degradation,) = report.degraded
+    assert degradation.source is Source.TASKS
+    assert 'missing' in degradation.reason
+    published = types_of(feed(project))
+    assert {'task_phase', 'verify_run', 'merge_landed', 'branch_snapshot', 'tree_snapshot'} <= published
+    assert 'task_upserted' not in published
+    assert stored_cursor(project).tasks_updated_at is None
+    assert_valid(project)
+
+
+def test_skipped_rows_are_named_with_their_counts_and_the_other_rows_publish(
+    project: Project, caplog: pytest.LogCaptureFixture
+) -> None:
+    project.runs.emit('merge_verify', at=at(31), task_id=7, phase='merge', data='{not json')
+    project.tasks.add(12, title='Odd', status='exploding', updated_at='2026-10-21T09:45:00.000Z')
+
+    with caplog.at_level(logging.WARNING):
+        report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert report.degraded == (
+        Degradation(source=Source.EVENTS, reason='skipped 1 rows: malformed_payload=1'),
+        Degradation(source=Source.TASKS, reason='skipped 1 rows: unknown_status=1'),
+    )
+    assert [line.type for line in feed(project)] == FIRST_PASS_TYPES
+    logged = warnings_of(caplog)
+    assert 'malformed_payload' in logged and 'unknown_status' in logged
+    assert_valid(project)
+
+
+def test_a_merge_unknown_to_git_holds_the_whole_events_batch(project: Project) -> None:
+    project.runs.emit(
+        'merge_finalized', at=at(31), task_id=9, phase='merge',
+        data={'state': 'done', 'merge_sha': UNKNOWN_SHA},
+    )
+    out = project.open()
+
+    first = run_pass(project.policy, out, now=NOW)
+    second = run_pass(project.policy, out, now=NOW)
+
+    assert [degradation.source for degradation in first.degraded] == [Source.GIT]
+    assert second.degraded == first.degraded
+    published = types_of(feed(project))
+    assert not published & {'task_phase', 'verify_run', 'test_results', 'merge_landed'}
+    assert {'task_upserted', 'branch_snapshot', 'tree_snapshot'} <= published
+    assert stored_cursor(project).events_id == 0
+    assert_valid(project)
+
+
+def test_an_unusable_git_directory_is_named_git_and_the_heartbeat_has_no_head(
+    project: Project, tmp_path: Path
+) -> None:
+    shutil.move(project.root / '.git', tmp_path / 'moved.git')
+    (project.root / '.git').write_text('gitdir: /nonexistent/gitdir\n')
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert last_heartbeat(project).head is None
+    assert report.degraded
+    assert {degradation.source for degradation in report.degraded} == {Source.GIT}
+    published = types_of(feed(project))
+    assert 'task_upserted' in published
+    assert not published & {'branch_snapshot', 'tree_snapshot'}
+    assert stored_cursor(project).head is None
+    assert_valid(project)
