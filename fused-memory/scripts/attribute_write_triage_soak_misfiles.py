@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Where the 2026-10-19 write-triage soak's misfiles came from, per project (task 7147).
+
+Purpose
+-------
+The soak census measured contested misfiles at 0.42 on the solar projects
+against 0.23 on dark_factory + reify. This script splits the soak's writes
+along named origin axes (band, hoist, retarget, record class, cosine to the
+filed parent), so a per-group misfile rate can be read off each cell.
+
+Every axis that depends on routing CALLS the production routing:
+``write_triage.decide_band`` for the band, and ``select_judge_candidates``
+over the band winner for the judge slate. Slates are fed to them as
+synthetic ``MemoryResult`` records carrying ``store_score``, ``kind`` and,
+for a child, ``parent_id``. A second copy of a routing rule here would drift
+from the live path without anything failing.
+
+Inputs
+------
+An evidence directory holding the soak seats' joined rows:
+
+- ``duplicates/records.jsonl``: one row per write, with ``nn_triage``, the
+  triage-scope max cosine, on stored and attached writes alike;
+- ``team/A/attaches_axes.json``: one row per triage-made attach, with its
+  20-record slate, retarget, filed parent and adjudicated verdict.
+
+Read-only rule
+--------------
+The evidence is read and never written. :func:`load_soak_writes` is the only
+function that reads it; everything else is pure.
+
+Usage
+-----
+Run from ``fused-memory/``::
+
+    uv run python scripts/attribute_write_triage_soak_misfiles.py \
+        --evidence-dir /home/leo/src/dark-factory/data/write-triage-soak-2026-10-19 \
+        --project-report solar_challenge=calibration/write_triage_calibration_report_solar_challenge.json \
+        --out calibration/write_triage_solar_soak_origins.json
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import types
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any
+
+from fused_memory.models.enums import SourceStore
+from fused_memory.models.memory import MemoryResult
+from fused_memory.server.grouped_read import PARENT_ID_KEY
+from fused_memory.server.write_triage import (
+    OUTCOME_JUDGE,
+    OUTCOME_RESTATED,
+    OUTCOME_STORED,
+    TRIAGE_OUTCOMES,
+    BandDecision,
+    decide_band,
+)
+from fused_memory.server.write_triage_judge import select_judge_candidates
+
+_SCRIPTS = Path(__file__).resolve().parent
+
+
+def _load_script(path: Path, mod_name: str) -> types.ModuleType:
+    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
+    cached = sys.modules.get(mod_name)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {path}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    return module
+
+
+if TYPE_CHECKING:
+    import write_triage_stats as _stats
+else:
+    _stats = _load_script(_SCRIPTS / 'write_triage_stats.py', 'write_triage_stats')
+
+RECORDS_FILE = Path('duplicates') / 'records.jsonl'
+ATTACHES_FILE = Path('team') / 'A' / 'attaches_axes.json'
+EVIDENCE_FILES = (RECORDS_FILE, ATTACHES_FILE)
+
+_SOAK_WINDOW = 'soak'
+_STANDALONE_CLASS = 'standalone'
+_CHILD_CLASS = 'child'
+_ATTACH_OUTCOMES = TRIAGE_OUTCOMES - {OUTCOME_STORED}
+_COMPLETION_SOURCE = 'orchestrator_completion'
+NOT_ATTACHED = 'not_attached'
+
+
+class SoakEvidenceError(ValueError):
+    """An evidence row this script cannot read honestly; names the row."""
+
+
+class Verdict(StrEnum):
+    """A soak adjudication verdict (``correctness/adjudications.jsonl``)."""
+
+    CORRECT = 'correct'
+    CORRECT_OVERLABEL_BENIGN = 'correct_overlabel_benign'
+    MISFILE = 'misfile'
+    CONTESTED_MISFILE = 'contested_misfile'
+    FALSE_CONTESTED = 'false_contested'
+    RIGHT_SUBJECT_WRONG_LABEL_HIDES_DETAIL = 'right_subject_wrong_label_hides_detail'
+    RIGHT_SUBJECT_WRONG_LABEL_HIDES_DISPUTE = 'right_subject_wrong_label_hides_dispute'
+    UNCLEAR = 'unclear'
+    PENDING = 'pending'
+
+
+class Exclusion(StrEnum):
+    """Why a soak write row is not in the analysed population."""
+
+    NO_TRIAGE_COSINE = 'no_triage_cosine'
+    CALLER_DECLARED_CHILD = 'caller_declared_child'
+
+
+class Band(StrEnum):
+    """The band ``decide_band`` routes a write's max cosine to."""
+
+    RESTATED = OUTCOME_RESTATED
+    JUDGE = OUTCOME_JUDGE
+    STORED = OUTCOME_STORED
+
+
+class Hoist(StrEnum):
+    """Whether an attach landed on the record that matched, or on its parent."""
+
+    DIRECT = 'direct'
+    VIA_CHILD = 'via_child'
+    NOT_ATTACHED = NOT_ATTACHED
+
+
+class Retarget(StrEnum):
+    """Whether the judge moved the attach off the band winner."""
+
+    MOVED = 'moved'
+    KEPT = 'kept'
+    NOT_ATTACHED = NOT_ATTACHED
+
+
+class RecordClass(StrEnum):
+    """What kind of writer produced the attached record."""
+
+    COMPLETION_LEDGER = 'completion_ledger'
+    TASK_STAMPED = 'task_stamped'
+    UNTASKED = 'untasked'
+
+
+class CosParentBucket(StrEnum):
+    """The attached write's cosine to its filed parent, bucketed on the routing edges."""
+
+    BELOW_T_LOW = 'below_t_low'
+    T_LOW_TO_0_65 = 't_low_to_0.65'
+    FROM_0_65_TO_0_75 = '0.65_to_0.75'
+    FROM_0_75_TO_T_HIGH = '0.75_to_t_high'
+    AT_OR_ABOVE_T_HIGH = 'at_or_above_t_high'
+    NOT_ATTACHED = NOT_ATTACHED
+
+
+@dataclass(frozen=True)
+class SlateEntry:
+    """One retrieved candidate: its cosine to the write and the canonical it groups under."""
+
+    id: str
+    cosine: float
+    canonical_id: str
+    kind: str | None
+
+
+@dataclass(frozen=True)
+class SoakWrite:
+    """One triage-routed soak write; the attach fields stay empty for a stored write."""
+
+    memory_id: str
+    project: str
+    category: str
+    outcome: str
+    max_cosine: float
+    slate: tuple[SlateEntry, ...] = ()
+    parent_id: str | None = None
+    cos_parent: float | None = None
+    retarget_named_id: str | None = None
+    verdict: Verdict | None = None
+    child_source: str | None = None
+    child_task_id: str | None = None
+
+    @property
+    def attached(self) -> bool:
+        return self.outcome != OUTCOME_STORED
+
+
+@dataclass(frozen=True)
+class SoakPopulation:
+    """The analysed writes, and the ids of every soak row left out, by reason."""
+
+    writes: tuple[SoakWrite, ...]
+    excluded: Mapping[Exclusion, tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class Routing:
+    """The write-path routing configuration a write is classified under."""
+
+    t_high: float | None
+    t_low: float | None
+    judge_candidate_count: int
+
+
+# --- loading (the only I/O) -------------------------------------------------
+
+
+def load_soak_writes(evidence_dir: Path) -> SoakPopulation:
+    """Read the soak evidence under *evidence_dir* into a parsed population."""
+    records = [
+        json.loads(line)
+        for line in (evidence_dir / RECORDS_FILE).read_text().splitlines()
+        if line.strip()
+    ]
+    attaches = json.loads((evidence_dir / ATTACHES_FILE).read_text())
+    return _population(records, attaches)
+
+
+def _population(records: Iterable[dict], attaches: Iterable[dict]) -> SoakPopulation:
+    soak = [
+        record for record in records
+        if record['window'] == _SOAK_WINDOW and record['class'] in (_STANDALONE_CLASS, _CHILD_CLASS)
+    ]
+    attach_by_child = _attaches_by_child(soak, attaches)
+    writes: list[SoakWrite] = []
+    excluded: dict[Exclusion, list[str]] = {reason: [] for reason in Exclusion}
+    for record in soak:
+        reason = _exclusion_of(record, attach_by_child)
+        if reason is None:
+            writes.append(_soak_write(record, attach_by_child.get(record['memory_id'])))
+        else:
+            excluded[reason].append(record['memory_id'])
+    return SoakPopulation(
+        writes=tuple(writes),
+        excluded=MappingProxyType({reason: tuple(ids) for reason, ids in excluded.items()}),
+    )
+
+
+def _attaches_by_child(soak: list[dict], attaches: Iterable[dict]) -> dict[str, dict]:
+    child_ids = {record['memory_id'] for record in soak if record['class'] == _CHILD_CLASS}
+    by_child: dict[str, dict] = {}
+    for attach in attaches:
+        if attach['child_id'] not in child_ids:
+            raise SoakEvidenceError(
+                f"attach row {attach['child_id']} has no soak child record in {RECORDS_FILE}",
+            )
+        by_child[attach['child_id']] = attach
+    return by_child
+
+
+def _exclusion_of(record: dict, attach_by_child: Mapping[str, dict]) -> Exclusion | None:
+    if record.get('nn_triage') is None:
+        return Exclusion.NO_TRIAGE_COSINE
+    if record['class'] == _CHILD_CLASS and record['memory_id'] not in attach_by_child:
+        return Exclusion.CALLER_DECLARED_CHILD
+    return None
+
+
+def _soak_write(record: dict, attach: dict | None) -> SoakWrite:
+    if attach is None:
+        return SoakWrite(
+            memory_id=record['memory_id'], project=record['project'],
+            category=record['category'], outcome=OUTCOME_STORED,
+            max_cosine=float(record['nn_triage']),
+        )
+    return SoakWrite(
+        memory_id=record['memory_id'],
+        project=record['project'],
+        category=record['category'],
+        outcome=_attach_outcome(attach),
+        max_cosine=float(record['nn_triage']),
+        slate=tuple(_slate_entry(entry) for entry in attach.get('slate20') or ()),
+        parent_id=attach['parent_id'],
+        cos_parent=attach['cos_parent'],
+        retarget_named_id=attach.get('rt_named'),
+        verdict=_verdict(attach),
+        child_source=attach['child_source'],
+        child_task_id=attach['child_task_id'],
+    )
+
+
+def _attach_outcome(attach: dict) -> str:
+    outcome = attach['outcome']
+    if outcome not in _ATTACH_OUTCOMES:
+        raise SoakEvidenceError(f"unknown attach outcome {outcome!r} on attach row {attach['child_id']}")
+    return outcome
+
+
+def _verdict(attach: dict) -> Verdict | None:
+    raw = attach.get('verdict')
+    if raw is None:
+        return None
+    try:
+        return Verdict(raw)
+    except ValueError:
+        raise SoakEvidenceError(f"unknown verdict {raw!r} on attach row {attach['child_id']}") from None
+
+
+def _slate_entry(entry: dict) -> SlateEntry:
+    return SlateEntry(
+        id=entry['id'], cosine=float(entry['cos']), canonical_id=entry['canon'], kind=entry['kind'],
+    )
+
+
+# --- production routing over synthetic results ------------------------------
+
+
+def _as_result(entry: SlateEntry) -> MemoryResult:
+    """*entry* as the search result production routing reads its cosine and parentage from."""
+    metadata: dict[str, Any] = {'store_score': entry.cosine, 'kind': entry.kind}
+    if entry.canonical_id != entry.id:
+        metadata[PARENT_ID_KEY] = entry.canonical_id
+    return MemoryResult(id=entry.id, content='', source_store=SourceStore.mem0, metadata=metadata)
+
+
+def _decide(entries: Iterable[SlateEntry], routing: Routing) -> BandDecision:
+    return decide_band(
+        [_as_result(entry) for entry in entries], t_high=routing.t_high, t_low=routing.t_low,
+    )
+
+
+# --- origin axes ------------------------------------------------------------
+
+
+def band_of(write: SoakWrite, routing: Routing) -> Band:
+    """The band *write*'s max cosine routes to under *routing*."""
+    probe = SlateEntry(id=write.memory_id, cosine=write.max_cosine, canonical_id=write.memory_id, kind=None)
+    return Band(_decide((probe,), routing).outcome)
+
+
+def hoist_of(write: SoakWrite, routing: Routing) -> Hoist:
+    """Did *write* attach to the record that matched it, or was it hoisted to that record's parent?
+
+    A retarget or a restate-band attach has one known source record: the
+    judge's named id, or ``decide_band``'s winner. It was hoisted exactly when
+    the soak filed the write under some other id. The filed parent is read off
+    the soak rather than off the slate's ``canon``, which was re-read after
+    the soak and can since have changed. A judged attach went via a child when
+    its parent was not on the judge's slate.
+    """
+    if not write.attached:
+        return Hoist.NOT_ATTACHED
+    if write.retarget_named_id is not None:
+        return _hoist(write.parent_id != write.retarget_named_id)
+    winner = _decide(write.slate, routing)
+    if band_of(write, routing) is Band.RESTATED:
+        return _hoist(write.parent_id != winner.winner_id)
+    judge_slate = select_judge_candidates(
+        [_as_result(entry) for entry in write.slate],
+        routing.judge_candidate_count,
+        canonical_id=winner.canonical_id,
+    )
+    return _hoist(all(result.id != write.parent_id for result in judge_slate))
+
+
+def _hoist(via_child: bool) -> Hoist:
+    return Hoist.VIA_CHILD if via_child else Hoist.DIRECT
+
+
+def retarget_of(write: SoakWrite, routing: Routing) -> Retarget:
+    """Did the judge move *write*'s attach off the band winner?"""
+    if not write.attached:
+        return Retarget.NOT_ATTACHED
+    return Retarget.MOVED if write.retarget_named_id is not None else Retarget.KEPT
+
+
+def record_class_of(write: SoakWrite, routing: Routing) -> RecordClass:
+    """Completion-ledger, task-stamped or untasked writer of *write*."""
+    if write.child_source == _COMPLETION_SOURCE:
+        return RecordClass.COMPLETION_LEDGER
+    return RecordClass.TASK_STAMPED if write.child_task_id else RecordClass.UNTASKED
+
+
+def cos_parent_bucket_of(write: SoakWrite, routing: Routing) -> CosParentBucket:
+    """*write*'s cosine to its filed parent, bucketed lower-inclusive on the routing edges."""
+    if write.cos_parent is None:
+        return CosParentBucket.NOT_ATTACHED
+    floors = (
+        (routing.t_high, CosParentBucket.AT_OR_ABOVE_T_HIGH),
+        (0.75, CosParentBucket.FROM_0_75_TO_T_HIGH),
+        (0.65, CosParentBucket.FROM_0_65_TO_0_75),
+        (routing.t_low, CosParentBucket.T_LOW_TO_0_65),
+    )
+    return next(
+        (bucket for floor, bucket in floors if floor is not None and write.cos_parent >= floor),
+        CosParentBucket.BELOW_T_LOW,
+    )
+
+
+Axis = Callable[[SoakWrite, Routing], StrEnum]
+
+ORIGIN_AXES: Mapping[str, Axis] = MappingProxyType({
+    'band': band_of,
+    'hoist': hoist_of,
+    'retarget': retarget_of,
+    'record_class': record_class_of,
+    'cos_parent': cos_parent_bucket_of,
+})

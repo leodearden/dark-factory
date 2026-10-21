@@ -336,6 +336,12 @@ class TestHoistAxis:
 
         assert _axis('hoist', write) is _mod().Hoist.DIRECT
 
+    def test_a_restate_band_write_filed_away_from_its_winner_is_via_child_whatever_the_slate_says(self):
+        # The slate was re-read after the soak; the filed parent is the soak's own record.
+        write = _write(outcome='restated', max_cosine=0.95, slate=(_entry(_OTHER, 0.95),))
+
+        assert _axis('hoist', write) is _mod().Hoist.VIA_CHILD
+
     def test_a_child_kind_without_a_parent_link_is_not_hoisted(self):
         write = _write(outcome='restated', max_cosine=0.95, slate=(_entry(_PARENT, 0.95, kind='amendment'),))
 
