@@ -202,3 +202,98 @@ class TestCurateDefersOnCuratorOutage:
 
         escalator.report_consecutive_degraded.assert_awaited_once()
         assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
+
+
+async def _curate_batch(
+    curator: TaskCurator, bundles: list[PreparedCandidate], project_id: str = 'p',
+) -> list[CuratorDecision]:
+    return await asyncio.wait_for(
+        curator.curate_batch_prepared(bundles, project_id, '/x'), DEADLINE_SECS,
+    )
+
+
+async def _empty_corpus(*_args, **_kwargs):
+    return [], dict(EMPTY_POOL_SIZES), PoolWithheld()
+
+
+class TestBatchDefersOnCuratorOutage:
+    @pytest.mark.asyncio
+    async def test_a_failed_corpus_bundle_defers_and_stays_out_of_the_prompt(self):
+        curator = _curator(_escalator())
+        batch = [
+            prepared('Healthy alpha'),
+            prepared('Broken beta', corpus_error='qdrant down'),
+            prepared('Healthy gamma'),
+        ]
+        invoke = AsyncMock(return_value=agent_result({'decisions': [
+            {'candidate_index': 0, 'action': 'create', 'justification': 'new alpha'},
+            {'candidate_index': 1, 'action': 'create', 'justification': 'new gamma'},
+        ]}))
+
+        with patch(INVOKE, new=invoke):
+            decisions = await _curate_batch(curator, batch)
+
+        assert [d.action for d in decisions] == ['create', 'defer', 'create']
+        assert decisions[1].defer_reason is DeferReason.CORPUS_FAILED
+        assert [decisions[0].justification, decisions[2].justification] == [
+            'new alpha', 'new gamma',
+        ]
+        invoke.assert_awaited_once()
+        assert 'Broken beta' not in invoke.await_args.kwargs['prompt']
+
+    @pytest.mark.asyncio
+    async def test_an_open_breaker_defers_every_llm_bound_candidate(self):
+        curator = _curator(_escalator())
+        await _open_breaker(curator)
+        invoke = AsyncMock(return_value=zot_agent_result())
+
+        with patch(INVOKE, new=invoke):
+            decisions = await _curate_batch(
+                curator, [prepared('Alpha'), prepared('Beta'), prepared('Alpha')],
+            )
+
+        assert [d.action for d in decisions] == ['defer', 'defer', 'drop']
+        assert {decisions[0].defer_reason, decisions[1].defer_reason} == {
+            DeferReason.ZERO_OUTPUT_BREAKER_OPEN,
+        }
+        assert decisions[2].batch_target_index == 0
+        invoke.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_breaker_deferrals_neither_advance_nor_reset_the_degraded_streak(self):
+        escalator = _escalator()
+        cooldown = 0.2
+        curator = _curator(escalator, breaker_cooldown=cooldown)
+        unusable = agent_result({'action': 'bogus'})
+
+        with patch(INVOKE, new=AsyncMock(return_value=unusable)):
+            for i in range(4):
+                assert (await _curate(curator, prepared(f'T{i}'))).degraded
+        await _open_breaker(curator, project_id='q')
+        decisions = await _curate_batch(curator, [prepared('Alpha'), prepared('Beta')])
+        assert [d.action for d in decisions] == ['defer', 'defer']
+        escalator.report_consecutive_degraded.assert_not_awaited()
+
+        await asyncio.sleep(cooldown * 1.5)
+        with patch(INVOKE, new=AsyncMock(return_value=unusable)):
+            await _curate(curator, prepared('T5'))
+
+        escalator.report_consecutive_degraded.assert_awaited_once()
+        assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
+
+    @pytest.mark.asyncio
+    async def test_failed_bisect_leaves_defer(self):
+        curator = _curator(_escalator())
+        batch_failed = AgentResult(
+            success=False, output='boom', subtype='error_max_turns', cost_usd=0.0,
+        )
+        invoke = AsyncMock(side_effect=[batch_failed, _max_turns(), _max_turns()])
+
+        with patch(INVOKE, new=invoke), \
+             patch.object(curator, '_build_corpus', side_effect=_empty_corpus):
+            decisions = await _curate_batch(curator, [prepared('Alpha'), prepared('Beta')])
+
+        assert [(d.action, d.defer_reason) for d in decisions] == [
+            ('defer', DeferReason.LLM_FAILED), ('defer', DeferReason.LLM_FAILED),
+        ]
+        assert invoke.await_count == 3
