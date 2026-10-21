@@ -69,7 +69,6 @@ from fused_memory.services.completion_claim_gate import (
     extract_completion_claims,
 )
 from fused_memory.services.overreach_guard import EPISODE_CLASSIFIERS, LABELS
-from fused_memory.services.overreach_guard import HEAD_CHARS as HEAD_CHARS
 
 # --------------------------------------------------------------------------- #
 # Records
