@@ -1700,17 +1700,26 @@ def _storm_capped_mining_result():
 
 
 def test_batch_status_reads_back_from_a_census_record_as_a_coding_status():
-    """The record stores the status as its JSON string; reading the record
-    back yields the enum again, and the report renders the same either way."""
+    """run_census renders the report from the record's JSON text, which
+    stores the status as its string; BatchStats.from_record reads it back
+    as the enum, and the report renders the same either way."""
     record = _census_record(mining_result=_storm_capped_mining_result())
     restored = json.loads(json.dumps(record))
 
-    statuses = [mod.BatchStats(**stats).status for stats in restored["mining"]["batch_stats"]]
+    batches = [mod.BatchStats.from_record(stats) for stats in restored["mining"]["batch_stats"]]
 
-    assert [s for s in restored["mining"]["batch_stats"] if s["status"] == "failure"]
-    assert all(isinstance(status, coder.CodingStatus) for status in statuses)
-    assert statuses == [coder.CodingStatus.OK, coder.CodingStatus.FAILURE]
+    assert batches == _storm_capped_mining_result().batch_stats
+    assert all(isinstance(batch.status, coder.CodingStatus) for batch in batches)
     assert mod.census_report_sections(restored) == mod.census_report_sections(record)
+
+
+def test_a_census_record_batch_status_outside_coding_status_is_rejected():
+    record = _census_record(mining_result=_storm_capped_mining_result())
+    restored = json.loads(json.dumps(record))
+    restored["mining"]["batch_stats"][1]["status"] = "stormy"
+
+    with pytest.raises(ValueError, match="stormy"):
+        mod.census_report_sections(restored)
 
 
 def _section(sections, key):

@@ -258,9 +258,12 @@ class BatchStats:
     saturated: bool
     status: coder.CodingStatus = coder.CodingStatus.OK
 
-    def __post_init__(self) -> None:
-        # A census record read back from JSON carries the status as its string.
-        self.status = coder.CodingStatus(self.status)
+    @classmethod
+    def from_record(cls, stats: Mapping[str, Any]) -> BatchStats:
+        """The batch as the census record holds it (:func:`build_census_record`),
+        its status a JSON string; one outside ``coder.CodingStatus`` raises
+        ``ValueError``."""
+        return cls(**{**stats, "status": coder.CodingStatus(stats["status"])})
 
 
 @dataclass
@@ -1426,7 +1429,7 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
             f"{CENSUS_RECORD_VERSION}, the only shape census_report_sections renders"
         )
     mining = record["mining"]
-    batch_stats = [BatchStats(**stats) for stats in mining["batch_stats"]]
+    batch_stats = [BatchStats.from_record(stats) for stats in mining["batch_stats"]]
     stop_reason = mining["stop_reason"]
     max_batches = mining["max_batches"]
     verify_coverage = _from_record(VerifyCoverage, record["verify_coverage"])
