@@ -44,6 +44,7 @@ import importlib.util
 import json
 import sys
 import types
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -51,14 +52,19 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import PARENT_ID_KEY
 from fused_memory.server.write_triage import (
+    OUTCOME_AMENDED,
+    OUTCOME_CONTESTED,
     OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
+    AttachGuard,
+    AttachRefusal,
     BandDecision,
     decide_band,
 )
@@ -98,8 +104,15 @@ _SOAK_WINDOW = 'soak'
 _STANDALONE_CLASS = 'standalone'
 _CHILD_CLASS = 'child'
 _ATTACH_OUTCOMES = TRIAGE_OUTCOMES - {OUTCOME_STORED}
+_REPORTED_OUTCOMES = (OUTCOME_CONTESTED, OUTCOME_AMENDED, OUTCOME_RESTATED)
 _COMPLETION_SOURCE = 'orchestrator_completion'
 NOT_ATTACHED = 'not_attached'
+
+#: The soak census's own grouping: 'solar' is the group that measured 98/232.
+GROUPS: Mapping[str, frozenset[str]] = MappingProxyType({
+    'solar': frozenset({'solar_challenge', 'solar_challenge_platform', 'scoping_intake'}),
+    'dark_factory_reify': frozenset({'dark_factory', 'reify'}),
+})
 
 
 class SoakEvidenceError(ValueError):
@@ -118,6 +131,10 @@ class Verdict(StrEnum):
     RIGHT_SUBJECT_WRONG_LABEL_HIDES_DISPUTE = 'right_subject_wrong_label_hides_dispute'
     UNCLEAR = 'unclear'
     PENDING = 'pending'
+
+
+_MISFILE_VERDICTS = frozenset({Verdict.CONTESTED_MISFILE, Verdict.MISFILE})
+_UNRATED_VERDICTS = frozenset({Verdict.UNCLEAR, Verdict.PENDING})
 
 
 class Exclusion(StrEnum):
@@ -200,6 +217,15 @@ class SoakWrite:
     @property
     def attached(self) -> bool:
         return self.outcome != OUTCOME_STORED
+
+    @property
+    def rated(self) -> bool:
+        """Did an adjudicator reach a verdict? ``unclear`` and ``pending`` did not."""
+        return self.verdict is not None and self.verdict not in _UNRATED_VERDICTS
+
+    @property
+    def misfiled(self) -> bool:
+        return self.verdict in _MISFILE_VERDICTS
 
 
 @dataclass(frozen=True)
@@ -357,21 +383,38 @@ def hoist_of(write: SoakWrite, routing: Routing) -> Hoist:
     """
     if not write.attached:
         return Hoist.NOT_ATTACHED
-    if write.retarget_named_id is not None:
-        return _hoist(write.parent_id != write.retarget_named_id)
-    winner = _decide(write.slate, routing)
-    if band_of(write, routing) is Band.RESTATED:
-        return _hoist(write.parent_id != winner.winner_id)
+    if write.retarget_named_id is not None or band_of(write, routing) is Band.RESTATED:
+        return _hoist(write.parent_id != _attach_source(write, routing).id)
     judge_slate = select_judge_candidates(
         [_as_result(entry) for entry in write.slate],
         routing.judge_candidate_count,
-        canonical_id=winner.canonical_id,
+        canonical_id=_decide(write.slate, routing).canonical_id,
     )
     return _hoist(all(result.id != write.parent_id for result in judge_slate))
 
 
 def _hoist(via_child: bool) -> Hoist:
     return Hoist.VIA_CHILD if via_child else Hoist.DIRECT
+
+
+@dataclass(frozen=True)
+class _AttachSource:
+    id: str | None
+    cosine: float | None
+
+
+def _attach_source(write: SoakWrite, routing: Routing) -> _AttachSource:
+    """The slate record *write*'s attach derived from: the judge's named id, else the band winner.
+
+    For a judged attach that the judge did not retarget this is an
+    approximation: the judge may have named a sibling of the winner that
+    hoists to the same canonical.
+    """
+    source_id = write.retarget_named_id
+    if source_id is None:
+        source_id = _decide(write.slate, routing).winner_id
+    cosine = next((entry.cosine for entry in write.slate if entry.id == source_id), None)
+    return _AttachSource(id=source_id, cosine=cosine)
 
 
 def retarget_of(write: SoakWrite, routing: Routing) -> Retarget:
@@ -413,3 +456,130 @@ ORIGIN_AXES: Mapping[str, Axis] = MappingProxyType({
     'record_class': record_class_of,
     'cos_parent': cos_parent_bucket_of,
 })
+
+
+# --- tables -----------------------------------------------------------------
+
+
+def shipped_write_path() -> tuple[Routing, AttachGuard]:
+    """The routing and attach guard the shipped ``write_triage`` config puts in force."""
+    triage = FusedMemoryConfig().write_triage
+    routing = Routing(
+        t_high=triage.t_high, t_low=triage.t_low, judge_candidate_count=triage.judge_candidate_count,
+    )
+    guard = AttachGuard(
+        min_parent_cosine=triage.min_parent_cosine, hoist_max_cosine_gap=triage.hoist_max_cosine_gap,
+    )
+    return routing, guard
+
+
+def groups_with_projects(
+    groups: Mapping[str, frozenset[str]], writes: Iterable[SoakWrite],
+) -> dict[str, frozenset[str]]:
+    """*groups*, then one single-project group per project in *writes*."""
+    projects = sorted({write.project for write in writes})
+    shadowing = [name for name in groups if name in projects and groups[name] != {name}]
+    if shadowing:
+        raise ValueError(f'group names {shadowing} shadow a project of the same name')
+    return {**groups, **{project: frozenset({project}) for project in projects}}
+
+
+def k_of_n(k: int, n: int) -> dict[str, Any]:
+    """*k* of *n* with its rate and Wilson 95% interval; both None for an empty sample."""
+    return {'k': k, 'n': n, 'rate': _stats.rate(k, n), 'wilson95': _stats.wilson95(k, n)}
+
+
+def _misfile_k_of_n(writes: Iterable[SoakWrite]) -> dict[str, Any]:
+    rated = [write for write in writes if write.rated]
+    return k_of_n(sum(write.misfiled for write in rated), len(rated))
+
+
+def origin_tables(
+    writes: Iterable[SoakWrite], groups: Mapping[str, frozenset[str]], routing: Routing,
+) -> dict[str, Any]:
+    """Per axis, group and cell: attaches and misfile k/n for each attach outcome."""
+    attached = [write for write in writes if write.attached]
+    return {
+        axis: _axis_table([(classify(write, routing).value, write) for write in attached], groups)
+        for axis, classify in ORIGIN_AXES.items()
+    }
+
+
+def _axis_table(
+    classified: list[tuple[str, SoakWrite]], groups: Mapping[str, frozenset[str]],
+) -> dict[str, Any]:
+    return {
+        name: _cell_table([(cell, write) for cell, write in classified if write.project in projects])
+        for name, projects in groups.items()
+    }
+
+
+def _cell_table(classified: list[tuple[str, SoakWrite]]) -> dict[str, Any]:
+    by_cell: defaultdict[str, list[SoakWrite]] = defaultdict(list)
+    for cell, write in classified:
+        by_cell[cell].append(write)
+    return {
+        cell: {
+            outcome: _attach_summary([write for write in by_cell[cell] if write.outcome == outcome])
+            for outcome in _REPORTED_OUTCOMES
+        }
+        for cell in sorted(by_cell)
+    }
+
+
+def _attach_summary(writes: list[SoakWrite]) -> dict[str, Any]:
+    return {'attaches': len(writes), 'misfile': _misfile_k_of_n(writes)}
+
+
+def census_fidelity(writes: Iterable[SoakWrite], groups: Mapping[str, frozenset[str]]) -> dict[str, Any]:
+    """Contested misfile over rated contested attaches per group: the census headline's figure."""
+    contested = [write for write in writes if write.outcome == OUTCOME_CONTESTED]
+    return {
+        name: _misfile_k_of_n(write for write in contested if write.project in projects)
+        for name, projects in groups.items()
+    }
+
+
+def guard_residual(
+    writes: Iterable[SoakWrite],
+    guard: AttachGuard,
+    routing: Routing,
+    groups: Mapping[str, frozenset[str]],
+) -> dict[str, Any]:
+    """What *guard* would have refused of each group's attaches, and the misfile rate left over."""
+    judged = [(write, _refusals(write, guard, routing)) for write in writes if write.attached]
+    return {
+        name: {
+            outcome: _residual_summary([
+                (write, refusals) for write, refusals in judged
+                if write.project in projects and write.outcome == outcome
+            ])
+            for outcome in _REPORTED_OUTCOMES
+        }
+        for name, projects in groups.items()
+    }
+
+
+def _refusals(write: SoakWrite, guard: AttachGuard, routing: Routing) -> frozenset[AttachRefusal]:
+    source = _attach_source(write, routing)
+    return guard.refusals(
+        source_cosine=source.cosine,
+        target_cosine=write.cos_parent,
+        hoisted=write.parent_id != source.id,
+        judged=band_of(write, routing) is Band.JUDGE,
+    )
+
+
+def _residual_summary(judged: list[tuple[SoakWrite, frozenset[AttachRefusal]]]) -> dict[str, Any]:
+    removed = [(write, refusals) for write, refusals in judged if refusals]
+    rated_removed = [write for write, _ in removed if write.rated]
+    reasons = Counter(reason.value for _, refusals in removed for reason in refusals)
+    return {
+        'attaches': len(judged),
+        'removed': len(removed),
+        'removed_by_reason': dict(sorted(reasons.items())),
+        'rated_misfiles_removed': sum(write.misfiled for write in rated_removed),
+        'rated_non_misfiles_removed': sum(not write.misfiled for write in rated_removed),
+        'misfile_before': _misfile_k_of_n(write for write, _ in judged),
+        'misfile_after': _misfile_k_of_n(write for write, refusals in judged if not refusals),
+    }

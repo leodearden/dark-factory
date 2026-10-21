@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.server.write_triage import AttachGuard
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
@@ -594,3 +595,17 @@ class TestGuardResidual:
         assert residual['amended']['removed'] == 2
         assert residual['amended']['misfile_before'] == _kn(1, 1)
         assert residual['restated']['misfile_after'] == _kn(1, 1)
+
+
+class TestShippedWritePath:
+    def test_the_routing_and_guard_are_read_from_the_shipped_write_triage_config(self):
+        triage = FusedMemoryConfig().write_triage
+
+        routing, guard = _mod().shipped_write_path()
+
+        assert routing == _mod().Routing(
+            t_high=triage.t_high, t_low=triage.t_low, judge_candidate_count=triage.judge_candidate_count,
+        )
+        assert guard == AttachGuard(
+            min_parent_cosine=triage.min_parent_cosine, hoist_max_cosine_gap=triage.hoist_max_cosine_gap,
+        )
