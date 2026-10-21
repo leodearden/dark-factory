@@ -72,8 +72,12 @@ carry no triage cosine and the loader excludes them (`no_triage_cosine`, 6
 rows in all): solar loses one misfile and one correct, dark_factory one
 misfile. The loader also excludes 47 soak children that triage never
 routed: the caller set `parent_id`/`kind` itself, and every one lacks the
-triage metadata signature (`caller_declared_child`). The excluded ids are in
-the JSON's `provenance.population.excluded`.
+triage metadata signature (`caller_declared_child`). It excludes 2 more
+whose judge retarget names an id absent from their re-read slate20, so
+their source cosine is unknown (`retarget_off_slate`). Both are
+solar_challenge amended attaches and unrated, so no rate moves. The
+`no_slate` and `no_parent_cosine` reasons exclude none. The excluded ids are
+in the JSON's `provenance.population.excluded`.
 
 Per project, the gap holds in both solar projects: solar_challenge
 59/131 = 0.45 [0.37, 0.54] and solar_challenge_platform 38/97 = 0.39
@@ -185,12 +189,10 @@ solar write differently.
   retarget, the guard replay and the restate-band hoist take the band winner
   as the attach source. The judge may in fact have named a sibling that
   hoists to the same canonical.
-- **Exclusions.** 6 writes have no triage cosine, and 47 are
-  caller-declared children (section 2). An attach the axes cannot read in
-  full is excluded too, with its reason tallied, rather than routed on a
-  defaulted value. Two solar_challenge amended attaches, both unrated, are
-  retargets that name an id missing from their slate (`retarget_off_slate`),
-  so their source cosine is unknown. Five attach rows have no slate and no
+- **Exclusions.** 6 writes have no triage cosine, 47 are caller-declared
+  children, and 2 retarget off their slate (section 2). An attach the axes
+  cannot read in full is excluded with its reason tallied, rather than
+  routed on a defaulted value. Five attach rows have no slate and no
   cosine to their parent. Their children were deleted after the soak, so
   their records also lack a triage cosine. They are counted once, under
   `no_triage_cosine`, and the `no_slate` and `no_parent_cosine` tallies are
