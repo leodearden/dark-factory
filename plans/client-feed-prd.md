@@ -405,6 +405,25 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     task); a task with no valid row gives `not_recorded`
     (`client-feed/src/client_feed/sources/events.py::read_review_counts`).
 
+- 2026-10-21, from β1's review amendments (task 6968). These bind γ (6970):
+  - (e) The tasks cursor (`client-feed/src/client_feed/sources/tasks.py::read_tasks`) is the last
+    projected row's raw `updated_at`. A skipped row never moves it, so it is read again until a
+    projected row passes it. The cursor is not exactly-once. Rows are ordered as the store spells
+    `updated_at` (`.mmmZ` beside microsecond `+00:00`), and the next read takes rows strictly after
+    the cursor. So a row stamped at or before the cursor (the producer stamps to the millisecond),
+    but committed after the read, is missed until that task is next written. If γ needs every
+    write, it re-reads with `since=None` on some cadence and emits only rows that differ from its
+    folded state.
+  - (f) `client-feed/src/client_feed/cli.py` is no longer vendorable: `dump-sources` pulls in
+    `yaml`, `shared.project_layout` and git through `policy` and the sources.
+    `client-feed/tests/test_import_boundary.py` still lists `cli` in `VENDORABLE_MODULES` and
+    passes, because it checks only each direct import's root package. That file is outside β1's
+    scope; ticket tkt_0RW1SJ7XHC6R7VVTB1AERS60T7 drops `cli` from the set.
+  - (g) `client-feed/tests/_stores.py` copies the producers' DDL by hand, citing each by
+    path::symbol. Nothing executable catches drift, so a renamed producer column would leave the
+    fixture tests green and a live read failing. The risk is accepted: `client-feed dump-sources`
+    against a live root is the check.
+
 ## 13. Open questions (tactical)
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
