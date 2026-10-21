@@ -1400,9 +1400,12 @@ class MarkupGuardMiddleware(Middleware):
             # beside a payload the caller still holds; this is the only
             # surviving copy of data that may never be resent.
             'raw_value': value,
+            # What the record CARRIES, never where it went: it is built before
+            # any sink runs, and a host that preserves it nowhere dumps it to a
+            # log line, where a preservation claim would be false.
             'summary': (
                 f'Unrepairable MCP envelope markup in {name}.{param} — the '
-                'call was refused and its payload preserved here'
+                'call was refused; this record carries its full raw payload'
             ),
             'suggested_action': (
                 'Recover the raw_value for the caller if it is still needed, '
@@ -1523,8 +1526,8 @@ class MarkupGuardMiddleware(Middleware):
                 'raw_value': raw,
                 'summary': (
                     f'Recovered {name}.{field} could not be typed against its '
-                    f'declared schema — the call was forwarded WITHOUT it and '
-                    f'the value preserved here'
+                    f'declared schema — the call was forwarded WITHOUT it; '
+                    f'this record carries its full raw payload'
                 ),
                 'suggested_action': (
                     f'Recover the raw_value into {name}.{field} if it is still '

@@ -322,13 +322,16 @@ def _floor_residue(
     return locator
 
 
-def _log_unpreserved(record: dict[str, Any]) -> None:
-    """Tier 3: no tier held *record*, so the log line carries it."""
+def _log_unpreserved(record: dict[str, Any], *, floor_wired: bool) -> None:
+    """Tier 3: no tier held *record*, so this log line carries it."""
+    floor = 'the residue floor failed' if floor_wired else 'no residue floor is wired'
     logger.error(
-        'markup_guard_residue: refused an unrepairable call and could NOT '
-        'file its payload (project=%r), so THIS LOG LINE is the only copy '
-        'and the caller was handed a null escalation_id: %r; %s',
-        record.get('project'), record, MARKUP_RECURRENCE_ROUTING,
+        'markup_guard_residue: refused an unrepairable %s.%s and preserved its '
+        'payload nowhere durable by this process: no queue took it '
+        '(project=%r) and %s. The caller was told to keep its own copy. '
+        'Record: %r; %s',
+        record.get('tool'), record.get('field'), record.get('project'), floor,
+        record, MARKUP_RECURRENCE_ROUTING,
     )
 
 
@@ -455,7 +458,7 @@ def install_markup_guard(
         if escalation_id is None:
             escalation_id = _floor_residue(record, residue_floor)
         if escalation_id is None:
-            _log_unpreserved(record)
+            _log_unpreserved(record, floor_wired=residue_floor is not None)
         return escalation_id
 
     def _escalation_sink(record: dict[str, Any]) -> str | None:
