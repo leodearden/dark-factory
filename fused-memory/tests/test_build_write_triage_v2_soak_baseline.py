@@ -7,6 +7,7 @@ not a package), lazily through ``_mod()``.
 from __future__ import annotations
 
 import functools
+import json
 import sqlite3
 import types
 from pathlib import Path
@@ -14,8 +15,6 @@ from typing import Any
 
 import pytest
 from _fm_helpers import load_script_module
-
-from fused_memory.server.grouped_read import _digest
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 
@@ -498,23 +497,42 @@ class TestAssemble:
         ]
 
 
+CREATED = '2026-10-10T00:00:00+00:00'
+
+
+def _attach(
+    intent: str, outcome: str, *, triage_sig: bool = True, category: str = 'procedural_knowledge',
+    **meta: Any,
+) -> dict[str, Any]:
+    """An attaches_soak.json row: the child's text, and its parent and supersessions in ``meta``."""
+    return {
+        'intent_id': intent, 'write_op_id': f'op-{intent}', 'project': 'df',
+        'agent': 'claude-test', 'category': category, 'content': f'child text of {intent}',
+        'meta': {'parent_id': f'p-{intent}', 'kind': 'amendment', 'category': category, **meta},
+        'created_at': CREATED, 'source': 'mcp_tool', 'op': 'add_memory', 'outcome': outcome,
+        'triage_sig': triage_sig,
+    }
+
+
+def _item_row(attach: dict[str, Any], **overrides: Any) -> dict[str, Any]:
+    flags: dict[str, Any] = {
+        'child_memory_id': 'c1', 'high_band': False, 'via_sibling': False,
+        'parent_category': 'procedural_knowledge', 'parent_edited_after_attach': False,
+    }
+    return _mod().item_row(attach, **{**flags, **overrides})
+
+
 class TestItemRow:
     @pytest.mark.parametrize(('high_band', 'band'), [(True, 'restated'), (False, 'judge'),
                                                      (None, None)])
     def test_band_comes_from_the_high_band_flag(self, high_band: bool | None, band: str | None) -> None:
-        row = _mod().item_row(
-            _adjudication('SAME', outcome='restated'), high_band=high_band,
-            parent_category='procedural_knowledge', child_metadata={},
-        )
-        assert row['band'] == band
+        assert _item_row(_attach('i1', 'restated'), high_band=high_band)['band'] == band
 
     def test_carries_the_scorer_contract(self) -> None:
-        adjudication = _adjudication(
-            'EXTENDS', outcome='amended', likely_via_sibling=True, parent_edited_after_attach=True,
-        )
-        assert _mod().item_row(
-            adjudication, high_band=False, parent_category='observations_and_summaries',
-            child_metadata={'supersedes': ['p1', 'p9'], 'kind': 'amendment'},
+        attach = _attach('i1', 'amended', parent_id='p1', supersedes=['p1', 'p9'])
+        assert _item_row(
+            attach, via_sibling=True, parent_category='observations_and_summaries',
+            parent_edited_after_attach=True,
         ) == {
             'entry_id': 'c1', 'outcome': 'amended', 'target_id': 'p1', 'earlier_ids': [],
             'band': 'judge', 'project': 'df', 'stratum': 'amended-sample',
@@ -527,11 +545,9 @@ class TestItemRow:
         ('contested', 'contested-census'),
     ])
     def test_a_stratum_per_outcome(self, outcome: str, stratum: str) -> None:
-        row = _mod().item_row(
-            _adjudication('SAME', outcome=outcome), high_band=False,
-            parent_category=None, child_metadata={},
-        )
+        row = _item_row(_attach('i1', outcome), parent_category=None, via_sibling=None)
         assert row['stratum'] == stratum
+        assert row['via_sibling'] is None
         assert row['cross_category'] is None
         assert row['supersedes_target'] is False
 
@@ -558,10 +574,9 @@ class TestShard:
         assert parent[:4001] not in shard.text
         assert child[:4000] + f'…[truncated, {len(child)} chars total]' in shard.text
 
-    def test_shows_the_production_digest(self) -> None:
-        shard, child, _ = self._shard()
-        assert f'--- CHILD DIGEST:\n{_digest(child)}\n' in shard.text
-        assert '--- CHILD DIGEST:\nshort\n' in shard.text
+    def test_shows_no_digest_because_raters_are_not_asked_digest(self) -> None:
+        shard, _, _ = self._shard()
+        assert 'DIGEST' not in shard.text
 
     def test_item_ids_are_opaque_and_the_key_maps_them_back(self) -> None:
         shard, _, _ = self._shard()
@@ -576,6 +591,286 @@ class TestShard:
     def test_an_attach_time_item_says_so(self) -> None:
         shard, _, _ = self._shard()
         assert 'basis=attach_time' in shard.text
+
+
+POPULATION = frozenset(f'i{index:02d}' for index in range(30))
+SAMPLED = frozenset({'i00', 'i01', 'i02'})
+
+
+class TestExtendSample:
+    def _draw(self, total: int, *, sampled: frozenset[str] = SAMPLED, seed: str = 's') -> list[str]:
+        return _mod().extend_sample(POPULATION, sampled, total, seed=seed)
+
+    def test_draws_new_ids_up_to_the_total(self) -> None:
+        drawn = self._draw(10)
+        assert len(drawn) == 7
+        assert len(set(drawn)) == 7
+        assert set(drawn) <= POPULATION - SAMPLED
+
+    def test_counts_only_sampled_ids_inside_the_population(self) -> None:
+        assert len(self._draw(5, sampled=frozenset({'i00', 'elsewhere'}))) == 4
+
+    def test_the_same_seed_gives_the_same_draw(self) -> None:
+        assert self._draw(10) == self._draw(10)
+        assert self._draw(10) != self._draw(10, seed='other')
+
+    def test_a_larger_total_extends_the_smaller_draw(self) -> None:
+        assert self._draw(15)[:7] == self._draw(10)
+
+    @pytest.mark.parametrize('total', [3, 2, 0])
+    def test_a_total_already_sampled_draws_nothing(self, total: int) -> None:
+        assert self._draw(total) == []
+
+    def test_a_total_beyond_the_population_is_refused(self) -> None:
+        with pytest.raises(ValueError, match=r'31.*30|30.*31'):
+            self._draw(31)
+
+
+def _entries(count: int) -> list[Any]:
+    builder = _mod()
+    return [
+        builder.ShardEntry(f'e{index:02d}', f't{index:02d}', 'current', 'df', 'child', 'parent')
+        for index in range(count)
+    ]
+
+
+class TestPlanShards:
+    def _plan(self, entries: list[Any], role: str = 'primary', **overrides: Any) -> list[Any]:
+        options: dict[str, Any] = {'prefix': '', 'seed': 7, 'first_index': 0, **overrides}
+        return _mod().plan_shards(entries, role=role, **options)
+
+    def test_every_entry_lands_in_exactly_one_shard_of_at_most_shard_size(self) -> None:
+        builder = _mod()
+        assert builder.SHARD_SIZE == 40
+        entries = _entries(95)
+        plan = self._plan(entries)
+        planned = [entry for _, members in plan for entry in members]
+        assert sorted(planned, key=lambda entry: entry.entry_id) == entries
+        assert all(len(members) <= builder.SHARD_SIZE for _, members in plan)
+
+    def test_names_count_from_the_first_index(self) -> None:
+        assert [name for name, _ in self._plan(_entries(50))] == ['primary_00', 'primary_01']
+        assert [name for name, _ in self._plan(_entries(50), 'second', prefix='attach_',
+                                               first_index=3)] == [
+            'attach_second_03', 'attach_second_04',
+        ]
+
+    def test_each_role_reads_the_entries_in_its_own_order(self) -> None:
+        def order(role: str) -> list[str]:
+            return [entry.entry_id for _, members in self._plan(_entries(50), role)
+                    for entry in members]
+
+        assert order('primary') != order('second')
+
+    def test_the_plan_is_deterministic(self) -> None:
+        assert self._plan(_entries(50)) == self._plan(list(reversed(_entries(50))))
+
+    def test_every_rater_is_opus(self) -> None:
+        assert dict(_mod().RATER_MODELS) == {'primary': 'opus', 'second': 'opus', 'third': 'opus'}
+
+
+ADJUDICATED = {'i-r0': 'restated', 'i-c0': 'contested'}
+RESTATED = ['i-r1', 'i-r2', 'i-r3', 'i-r4']
+AMENDED = ['i-a1', 'i-a2', 'i-a3', 'i-a4']
+NOT_TRIAGED = 'i-x'
+ATTACH_TIME_PARENT = 'the parent as it read when the child was written'
+
+
+def _drawn(outcome: str, total: int) -> list[str]:
+    """The extension the builder must draw: ``extend_sample`` seeded with ``'<seed>:<outcome>'``."""
+    population = {'restated': {'i-r0', *RESTATED}, 'amended': set(AMENDED)}[outcome]
+    return _mod().extend_sample(population, set(ADJUDICATED), total, seed=f'7:{outcome}')
+
+
+class _Bundle:
+    """A synthetic soak bundle: two adjudicated attaches and eight that may extend the sample.
+
+    The first drawn restated extension item's parent was edited after attach,
+    and the first drawn amended one has no write op in the journal.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.edited = _drawn('restated', 3)[0]
+        self.missing = _drawn('amended', 3)[0]
+        self.dir = root / 'bundle'
+        self.dir.mkdir()
+        attaches = [_attach(intent, outcome) for intent, outcome in ADJUDICATED.items()]
+        attaches += [_attach(intent, 'restated') for intent in RESTATED]
+        attaches += [_attach(intent, 'amended') for intent in AMENDED]
+        attaches.append(_attach(NOT_TRIAGED, 'restated', triage_sig=False))
+        adjudications = [
+            _adjudication('SAME', outcome='restated', **self._identity('i-r0')),
+            _adjudication('CORRECTS', dispute='genuine_correction', action_changing=True,
+                          **self._identity('i-c0')),
+        ]
+        (self.dir / 'adjudications.jsonl').write_text(
+            ''.join(json.dumps(row) + '\n' for row in adjudications))
+        self._json('attaches_soak.json', attaches)
+        self._json('parents.json', {
+            f'p-{row["intent_id"]}': [{'collection': 'fused_df', 'payload': {
+                'data': f'parent text of {row["intent_id"]}', 'category': 'procedural_knowledge',
+            }}] for row in attaches
+        })
+        self._json('hoist.json', {
+            row['intent_id']: {'high_band': row['outcome'] == 'restated', 'likely_via_sibling': False}
+            for row in attaches
+        })
+        self._json('parent_edited_after_attach.json', [self.edited])
+        self.journal = self._journal(root / 'journal.db', [
+            row for row in attaches if row['intent_id'] != self.missing
+        ])
+        self.history = _history_db(root / 'history.db', [
+            (f'p-{self.edited}', ATTACH_TIME_PARENT, f'parent text of {self.edited}', 'UPDATE',
+             '2026-10-12T00:00:00+00:00'),
+        ])
+        self.scratch = root / 'scratch'
+
+    @staticmethod
+    def _identity(intent: str) -> dict[str, Any]:
+        return {'child_intent_id': intent, 'child_memory_id': f'c-{intent}',
+                'parent_id': f'p-{intent}', 'created_at': CREATED}
+
+    def _json(self, name: str, value: Any) -> None:
+        (self.dir / name).write_text(json.dumps(value))
+
+    @staticmethod
+    def _journal(path: Path, attaches: list[dict[str, Any]]) -> Path:
+        connection = sqlite3.connect(path)
+        connection.execute('CREATE TABLE write_ops (id TEXT PRIMARY KEY, result_summary TEXT)')
+        for row in attaches:
+            connection.execute('INSERT INTO write_ops VALUES (?, ?)', (
+                row['write_op_id'], json.dumps({'memory_ids': [f'c-{row["intent_id"]}'],
+                                                'stores': ['mem0']}),
+            ))
+        connection.commit()
+        connection.close()
+        return path
+
+    def shards(self, *, restated: int = 3, amended: int = 3) -> int:
+        return _mod().main([
+            'shards', '--bundle', str(self.dir), '--history-db', str(self.history),
+            '--journal-db', str(self.journal), '--scratch', str(self.scratch), '--seed', '7',
+            '--restated-total', str(restated), '--amended-total', str(amended),
+        ])
+
+    def key(self) -> dict[str, Any]:
+        return json.loads((self.scratch / 'key.json').read_text())
+
+    def shard_files(self) -> dict[str, bytes]:
+        return {path.name: path.read_bytes() for path in (self.scratch / 'shards').iterdir()}
+
+
+def _triple(item: dict[str, str]) -> tuple[str, str, str]:
+    return (item['entry_id'], item['target_id'], item['basis'])
+
+
+def _keyed(key: dict[str, Any]) -> set[tuple[str, str, str]]:
+    return {_triple(item) for item in key['items'].values()}
+
+
+def _shard_keyed(key: dict[str, Any], name: str) -> set[tuple[str, str, str]]:
+    return {_triple(key['items'][item]) for item in key['shards'][name]['items']}
+
+
+def _shards_holding(key: dict[str, Any], keyed: tuple[str, str, str]) -> list[str]:
+    return sorted(name for name in key['shards'] if keyed in _shard_keyed(key, name))
+
+
+def _current(intent: str) -> tuple[str, str, str]:
+    return (f'c-{intent}', f'p-{intent}', 'current')
+
+
+class TestTheShardsCommand:
+    @pytest.fixture
+    def bundle(self, tmp_path: Path) -> _Bundle:
+        bundle = _Bundle(tmp_path)
+        assert bundle.shards() == 0
+        return bundle
+
+    def test_records_each_drawn_extension_item(self, bundle: _Bundle) -> None:
+        assert bundle.key()['extension'] == {
+            **{intent: {'outcome': 'restated', 'child_memory_id': f'c-{intent}'}
+               for intent in _drawn('restated', 3)},
+            **{intent: {'outcome': 'amended',
+                        'child_memory_id': None if intent == bundle.missing else f'c-{intent}'}
+               for intent in _drawn('amended', 3)},
+        }
+        assert NOT_TRIAGED not in bundle.key()['extension']
+
+    def test_an_unrecoverable_item_is_recorded_and_not_replaced(self, bundle: _Bundle) -> None:
+        key = bundle.key()
+        assert [row['intent_id'] for row in key['unrecoverable']] == [bundle.missing]
+        assert key['unrecoverable'][0]['reason']
+        keyed_targets = {target for _, target, _ in _keyed(key)}
+        undrawn = set(AMENDED) - set(_drawn('amended', 3))
+        assert {f'p-{intent}' for intent in {bundle.missing} | undrawn} & keyed_targets == set()
+
+    def test_every_pair_and_basis_is_in_one_primary_and_one_second_shard(
+        self, bundle: _Bundle,
+    ) -> None:
+        key = bundle.key()
+        recovered = [*ADJUDICATED, *_drawn('restated', 3),
+                     *(intent for intent in _drawn('amended', 3) if intent != bundle.missing)]
+        attach_time = (f'c-{bundle.edited}', f'p-{bundle.edited}', 'attach_time')
+        assert _keyed(key) == {_current(intent) for intent in recovered} | {attach_time}
+        for keyed in _keyed(key):
+            roles = sorted(key['shards'][name]['role'] for name in _shards_holding(key, keyed))
+            assert roles == ['primary', 'second'], keyed
+        for name, spec in key['shards'].items():
+            assert spec == {'role': spec['role'], 'rater': f'opus-{spec["role"]}', 'round': 0,
+                            'items': spec['items']}
+
+    def test_attach_time_pairs_sit_only_in_attach_shards(self, bundle: _Bundle) -> None:
+        key = bundle.key()
+        for keyed in _keyed(key):
+            attach_shards = [name.startswith('attach_') for name in _shards_holding(key, keyed)]
+            assert attach_shards == [keyed[2] == 'attach_time'] * 2, keyed
+
+    def test_texts_hold_each_pair_and_basis_as_its_raters_saw_it(self, bundle: _Bundle) -> None:
+        texts = json.loads((bundle.scratch / 'texts.json').read_text())
+        by_keyed = {(row['entry_id'], row['target_id'], row['basis']): row for row in texts}
+        assert len(texts) == len(by_keyed)
+        assert set(by_keyed) == _keyed(bundle.key())
+        assert by_keyed[_current('i-c0')] == {
+            'entry_id': 'c-i-c0', 'target_id': 'p-i-c0', 'basis': 'current',
+            'child_text': 'child text of i-c0', 'parent_text': 'parent text of i-c0',
+        }
+        edited = by_keyed[f'c-{bundle.edited}', f'p-{bundle.edited}', 'attach_time']
+        assert edited['parent_text'] == ATTACH_TIME_PARENT
+        assert edited['child_text'] == f'child text of {bundle.edited}'
+
+    def test_a_rerun_writes_nothing_new(self, bundle: _Bundle) -> None:
+        shard_files, key_bytes = bundle.shard_files(), (bundle.scratch / 'key.json').read_bytes()
+        assert bundle.shards() == 0
+        assert bundle.shard_files() == shard_files
+        assert (bundle.scratch / 'key.json').read_bytes() == key_bytes
+
+    def test_a_larger_total_adds_shards_only_for_the_new_pairs(self, bundle: _Bundle) -> None:
+        shard_files, earlier = bundle.shard_files(), bundle.key()
+        assert bundle.shards(amended=4) == 0
+        key = bundle.key()
+        added = _drawn('amended', 4)[3]
+        assert set(key['extension']) == set(earlier['extension']) | {added}
+        files = bundle.shard_files()
+        assert {name: files[name] for name in shard_files} == shard_files
+        assert set(files) - set(shard_files) == {'primary_01.txt', 'second_01.txt'}
+        for name in ('primary_01', 'second_01'):
+            assert _shard_keyed(key, name) == {_current(added)}
+
+    def test_a_smaller_total_than_already_drawn_is_refused(self, bundle: _Bundle) -> None:
+        key_bytes = (bundle.scratch / 'key.json').read_bytes()
+        with pytest.raises(ValueError, match='extension'):
+            bundle.shards(amended=2)
+        assert (bundle.scratch / 'key.json').read_bytes() == key_bytes
+
+    def test_the_rater_prompt_asks_for_evidence_and_not_digest(self, bundle: _Bundle) -> None:
+        prompt = (bundle.scratch / 'rater_prompt.md').read_text()
+        brief = _mod().BRIEF_PATH.read_text()
+        assert brief in prompt
+        output = prompt.split(brief, 1)[1]
+        for field in ('conflict_quote', 'loss_spans', 'action_changing'):
+            assert field in output
+        assert 'digest' not in output.lower()
 
 
 class TestRatingVolume:
@@ -600,7 +895,7 @@ class TestTheCli:
         with pytest.raises(SystemExit):
             _mod().main([
                 'shards', '--bundle', str(bundle), '--history-db', str(tmp_path / 'h.db'),
-                '--scratch', str(bundle / 'scratch'),
+                '--journal-db', str(tmp_path / 'j.db'), '--scratch', str(bundle / 'scratch'),
             ])
         assert list(bundle.iterdir()) == []
 
