@@ -21,7 +21,8 @@ plan), tickets would otherwise sit or terminalise silently in
 4. **Curation backlog.** One folded ``infra_issue`` per
    ``(project_id, defer_reason)`` once a parked ticket there has survived a
    retry, under :func:`curation_backlog_anchor`, with the reason's
-   :func:`~fused_memory.middleware.curation_deferral.backlog_severity`.
+   :func:`~fused_memory.middleware.curation_deferral.backlog_severity` and
+   :func:`~fused_memory.middleware.curation_deferral.backlog_remediation`.
 
 Routing parallels :mod:`curator_escalator`:
 
@@ -64,7 +65,11 @@ from typing import TYPE_CHECKING, Final
 from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware._folded_escalation import file_folded_escalation
-from fused_memory.middleware.curation_deferral import DeferReason, backlog_severity
+from fused_memory.middleware.curation_deferral import (
+    DeferReason,
+    backlog_remediation,
+    backlog_severity,
+)
 from fused_memory.models.scope import build_known_projects_map
 from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
 
@@ -113,6 +118,16 @@ _CURATION_BACKLOG_DETAIL_TICKETS: Final = 20
 
 def curation_backlog_anchor(reason: DeferReason) -> str:
     return f'{CURATION_BACKLOG_ANCHOR}-{reason}'
+
+
+def _curation_backlog_action(reason: DeferReason) -> str:
+    envelope = (
+        'These submissions are parked and retried automatically on backoff until the '
+        'curator reaches a verdict; nothing is lost and nothing should be re-submitted.'
+    )
+    if backlog_severity(reason) == 'blocking':
+        envelope += ' This outage will not clear by itself.'
+    return f'{envelope} {backlog_remediation(reason)}'
 
 
 def is_dedup_outage(health: DedupHealth, cfg: DedupOutageDetectorConfig) -> bool:
@@ -489,13 +504,7 @@ class TicketJanitor:
                 'max_attempts': backlog.max_attempts,
                 'tickets': tickets,
             }),
-            suggested_action=(
-                "The task curator's account pool cannot judge these submissions, so they "
-                'are parked and retried automatically on backoff until it can; nothing is '
-                'lost and nothing should be re-submitted. A blocking record means the pool '
-                'will not recover by itself: restore the curator accounts named by the '
-                'defer reason.'
-            ),
+            suggested_action=_curation_backlog_action(backlog.defer_reason),
             logger=logger,
             log_label='ticket_janitor',
             context=f'curation backlog {backlog.project_id}/{backlog.defer_reason}',
