@@ -167,34 +167,6 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         retries FRESH (resume_on_cap_hit=
 #                                         False).
 #
-# orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 172800 s (48 h).
-#   (run_architect_eval invocation)       RAISED from 1800 s on 2026-08-25
-#                                         (esc-3634-1).  It is the one caller in
-#                                         this table that does NOT take the
-#                                         short house value, deliberately.  A
-#                                         cap lands MID-cell after real spend,
-#                                         which --resume preserves across the
-#                                         account switch: waiting is ~free,
-#                                         while tainting discards that spend and
-#                                         pays it again on the re-run.  48 h
-#                                         skates the 5-hour account caps that
-#                                         produce the common short all-capped
-#                                         windows.  Since task 4002 it also
-#                                         bounds the gate park, so an
-#                                         all-capped window longer than 48 h
-#                                         taints the cell rather than parking
-#                                         to the reset (esc-4002-1).
-#                                         AllAccountsCappedException
-#                                         is still caught and recorded as a
-#                                         `cap_exhausted:` marker on the cell
-#                                         (tainted, so the cell is EXCLUDED from
-#                                         the reported mean rather than scored a
-#                                         fabricated 0.0), never raised.  No
-#                                         max_cap_retries: cooldown doubles per
-#                                         pool cycle, so a fixed count would
-#                                         give a BIGGER account pool LESS
-#                                         wall-clock patience.
-#
 # scripts/legibility/session_runner.py    NO patience at all: park_on_frozen_
 #   (nightly legibility trickle + census, pool=False + max_cap_retries=
 #    every LLM call they make)            gate.account_count.  The contract is
