@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import itertools
 import os
+import stat
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -26,12 +28,14 @@ from client_feed.contract import (
     parse_state,
 )
 from client_feed.fold import fold
+from client_feed.policy import require_usable_out_dir
 from client_feed.sources.tree import LineCounts
 
 CURSOR_FILENAME: Final = 'cursor.json'
 FILE_MODE: Final = 0o640
 
 _APPEND_FLAGS: Final = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+_READ_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 class Envelope(TypedDict):
@@ -72,6 +76,7 @@ class Cursor(BaseModel):
 
 class FeedIoProblem(StrEnum):
     SEQ_NOT_INCREASING = 'seq_not_increasing'
+    SYMLINK = 'symlink'
 
 
 class FeedIoError(Exception):
@@ -84,22 +89,55 @@ class FeedIoError(Exception):
         super().__init__(f'{name} refused ({problem}): {detail}')
 
 
+def _symlink_refused(name: str) -> FeedIoError:
+    return FeedIoError(
+        problem=FeedIoProblem.SYMLINK,
+        name=name,
+        detail=f'{name} is a symlink; the writer never follows or replaces one',
+    )
+
+
+@contextlib.contextmanager
+def _opened(path: Path, flags: int, mode: int = FILE_MODE) -> Iterator[int]:
+    """An fd on `path`, opened with flags that carry O_NOFOLLOW; a symlink is refused, never followed."""
+    try:
+        fd = os.open(path, flags, mode)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise _symlink_refused(path.name) from exc
+        raise
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
 def _write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
         view = view[os.write(fd, view) :]
 
 
+def _read_all(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    while chunk := os.read(fd, 1 << 20):
+        chunks.append(chunk)
+    return b''.join(chunks)
+
+
 def _append(path: Path, data: bytes) -> int:
     """Append `data` in one write sequence and fsync it; the file's size afterwards."""
-    fd = os.open(path, _APPEND_FLAGS, FILE_MODE)
-    try:
+    with _opened(path, _APPEND_FLAGS) as fd:
         os.fchmod(fd, FILE_MODE)
         _write_all(fd, data)
         os.fsync(fd)
         return os.fstat(fd).st_size
-    finally:
-        os.close(fd)
+
+
+def _require_not_symlink(path: Path) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            raise _symlink_refused(path.name)
 
 
 def _atomic_write(out_dir: Path, name: str, text: str) -> None:
@@ -112,6 +150,7 @@ def _atomic_write(out_dir: Path, name: str, text: str) -> None:
             os.fsync(fd)
         finally:
             os.close(fd)
+        _require_not_symlink(out_dir / name)
         os.replace(temp, out_dir / name)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
@@ -121,14 +160,16 @@ def _atomic_write(out_dir: Path, name: str, text: str) -> None:
 
 def _read_text(path: Path) -> str | None:
     try:
-        return path.read_text(encoding='utf-8')
+        with _opened(path, _READ_FLAGS) as fd:
+            return _read_all(fd).decode('utf-8')
     except FileNotFoundError:
         return None
 
 
 def _feed_size(out_dir: Path) -> int:
     try:
-        return os.lstat(out_dir / FEED_FILENAME).st_size
+        with _opened(out_dir / FEED_FILENAME, _READ_FLAGS) as fd:
+            return os.fstat(fd).st_size
     except FileNotFoundError:
         return 0
 
@@ -166,6 +207,7 @@ class OutDir:
     @classmethod
     def open(cls, out_dir: Path, *, project_id: str) -> OutDir:
         """out_dir's state and cursor as the last commit left them."""
+        require_usable_out_dir(out_dir)
         cursor_text = _read_text(out_dir / CURSOR_FILENAME)
         cursor = Cursor() if cursor_text is None else Cursor.model_validate_json(cursor_text)
         state_text = _read_text(out_dir / STATE_FILENAME)
