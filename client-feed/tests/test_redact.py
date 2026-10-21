@@ -2,7 +2,7 @@
 
 import pytest
 
-from client_feed.redact import PATH_PLACEHOLDER, redact_paths
+from client_feed.redact import redact_paths
 
 REDACTED = [
     ('/home/leo/x', '[path]'),
@@ -12,6 +12,13 @@ REDACTED = [
     ("root='/home/leo/src/reify' x", "root='[path]' x"),
     ('/tmp/x', '[path]'),
     ('POST /api/v2/x proxy', 'POST [path] proxy'),
+    ('root=/opt/acme/src x', 'root=[path] x'),
+    ('--config=/srv/a/b', '--config=[path]'),
+    ('PATH=/usr/local/bin:/usr/bin', 'PATH=[path]'),
+    ('dir:/etc/passwd', 'dir:[path]'),
+    ('a,/srv/secret/x', 'a,[path]'),
+    ('HOME=~/notes/x', 'HOME=[path]'),
+    ('https://example.com/home/x', '[path]'),
 ]
 
 KEPT = [
@@ -21,16 +28,16 @@ KEPT = [
     'a / b',
     'and/or',
     'https://example.com/a',
+    'https://example.com/a/b/c',
+    'http://localhost:8000/api/v2',
+    'k=v/w',
+    'ratio 3:2,1/2',
     'Run /review-briefing now',
     '/home',
     '/opt/',
     '/',
     '~/',
 ]
-
-
-def test_the_placeholder_is_spelled_once() -> None:
-    assert PATH_PLACEHOLDER == '[path]'
 
 
 @pytest.mark.parametrize(('text', 'expected'), REDACTED)
