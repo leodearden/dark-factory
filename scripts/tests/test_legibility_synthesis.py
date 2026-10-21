@@ -568,3 +568,136 @@ def test_the_standing_count_is_open_entries_that_stood_and_gained_no_session():
     _entry_by_id(after, "entry-retired-now")["status"] = "retired"
 
     assert synthesis.standing_count(before, after) == 2
+
+
+# ---------------------------------------------------------------------------
+# The run record's synthesis value and the ## Synthesis section
+# ---------------------------------------------------------------------------
+
+def _ok_report() -> synthesis.SynthesisReport:
+    result = synthesis.parse(json.dumps(_document(re_observed=[_re_item(), _re_item(key=_key(_ANCHOR_MATCHED), sessions=[], changed=[])])), _brief())
+    assert isinstance(result, synthesis.Synthesis)
+    return synthesis.SynthesisReport(
+        brief=_brief(),
+        result=result,
+        applied=synthesis.Applied(clusters_refined=1, entries_refined=1, corrections_applied=1),
+        standing=1,
+    )
+
+
+def _golden_ok() -> str:
+    return (
+        "## Synthesis\n"
+        "\n"
+        "- applied: 1 phase refinement(s) to 1 cluster(s) and 1 new entr(ies); 1 correction(s) applied, 0 skipped\n"
+        "- standing, no new evidence: 1\n"
+        "- invariant violations this run: inv-a 1, inv-b 1\n"
+        "- unkeyed entries re-observed: 1\n"
+        "\n"
+        "### New\n"
+        "\n"
+        f'- {_key(_ANCHOR_NEW)} "title of {_NEW_ID}": h does two jobs\n'
+        "\n"
+        "### Re-observed\n"
+        "\n"
+        f'- {_key(_ANCHOR_ATTACHED)} "title of entry-attached" (gained s-run-1): severity low → medium (it recurred)\n'
+        f'- {_key(_ANCHOR_MATCHED)} "title of entry-matched" (gained s-run-2): no change stated\n'
+        f'- {_key(_ANCHOR_ADOPTED)} "title of {_ADOPTED_ID}" (adopted from {_EXTERNAL_RUN}; gained s-run-5): '
+        "no change stated\n"
+        "\n"
+        "### Phase Refinements\n"
+        "\n"
+        f"- {_key(_ANCHOR_NEW)}: origin merge, manifested review (a merge made it)\n"
+        "\n"
+        "### Corrections\n"
+        "\n"
+        '- entry-matched: cause "a truer cause" (the framing was refuted)\n'
+        "\n"
+        "### Notes\n"
+        "\n"
+        "- unverified: a.py and b.py share a cause (evidence: both name f)"
+    )
+
+
+def test_an_ok_record_renders_the_golden_synthesis_section():
+    assert "\n".join(synthesis.report_lines(_ok_report().to_record())) == _golden_ok()
+
+
+def test_an_unavailable_record_renders_the_briefs_data_and_says_nothing_was_applied():
+    record = synthesis.SynthesisReport(
+        brief=_brief(), result=synthesis.Unavailable("reply is not a JSON object: x"),
+        applied=synthesis.Applied(), standing=1,
+    ).to_record()
+
+    assert "\n".join(synthesis.report_lines(record)) == (
+        "## Synthesis\n"
+        "\n"
+        "- applied: nothing; synthesis unavailable: reply is not a JSON object: x\n"
+        "- standing, no new evidence: 1\n"
+        "- invariant violations this run: inv-a 1, inv-b 1\n"
+        "- unkeyed entries re-observed: 1\n"
+        "\n"
+        "### New\n"
+        "\n"
+        f'- {_key(_ANCHOR_NEW)} "title of {_NEW_ID}"\n'
+        "\n"
+        "### Re-observed\n"
+        "\n"
+        f'- {_key(_ANCHOR_ATTACHED)} "title of entry-attached" (gained s-run-1)\n'
+        f'- {_key(_ANCHOR_MATCHED)} "title of entry-matched" (gained s-run-2)\n'
+        f'- {_key(_ANCHOR_ADOPTED)} "title of {_ADOPTED_ID}" (adopted from {_EXTERNAL_RUN}; gained s-run-5)'
+    )
+    assert (record["outcome"], record["calls"]) == ("unavailable", 1)
+
+
+def test_a_skipped_record_says_no_call_was_made():
+    empty = _brief(after=_before(), verdicts=[], adopted={})
+    record = synthesis.SynthesisReport(brief=empty, result=None, applied=synthesis.Applied(), standing=4).to_record()
+
+    assert "\n".join(synthesis.report_lines(record)) == (
+        "## Synthesis\n"
+        "\n"
+        "- applied: nothing; no synthesis call was made, since nothing was new or re-observed this run\n"
+        "- standing, no new evidence: 4\n"
+        "- invariant violations this run: none\n"
+        "- unkeyed entries re-observed: 0\n"
+        "\n"
+        "### New\n"
+        "\n"
+        "_none this run._\n"
+        "\n"
+        "### Re-observed\n"
+        "\n"
+        "_none this run._"
+    )
+    assert (record["outcome"], record["calls"], record["document"], record["reason"]) == ("skipped", 0, None, None)
+
+
+def test_the_record_carries_the_outcome_document_and_applied_counts():
+    record = _ok_report().to_record()
+
+    assert (record["outcome"], record["calls"], record["reason"], record["standing"]) == ("ok", 1, None, 1)
+    assert record["brief"] == _brief().to_record()
+    assert record["document"]["phase_refinements"] == [_refinement()]
+    assert record["applied"] == {
+        "clusters_refined": 1,
+        "entries_refined": 1,
+        "corrections_applied": 1,
+        "correction_skipped": 0,
+        "skipped_unknown_entry": 0,
+    }
+
+
+def test_applied_counts_come_from_the_refinement_and_the_merge():
+    refined = synthesis.Refined(codebook={}, clusters=(), clusters_refined=2, entries_refined=1)
+    counts = codebook.MergeCounts(corrections_applied=3, correction_skipped=1, skipped_unknown_entry=2)
+
+    assert synthesis.Applied.of(refined, counts) == synthesis.Applied(2, 1, 3, 1, 2)
+
+
+def test_the_record_renders_the_same_after_a_json_round_trip():
+    record = _ok_report().to_record()
+    reloaded = json.loads(json.dumps(record))
+
+    assert reloaded == record
+    assert synthesis.report_lines(reloaded) == synthesis.report_lines(record)
