@@ -1569,14 +1569,13 @@ recovery_emission:
 # of this file alone does not auto-fire a fleet restart. Activation is the
 # separate τ deterministic-deploy capstone task.
 merge_verify_breadth: "full"
-# Same-tree gate skip (task 6647) stays OFF: these gate legs read HEAD's git
-# history, so a byte-identical tree under a new parent can turn them red —
-#   fused-memory/tests/test_read_transform_selection_regeneration.py::TestEveryCommittedFixtureStampIsOnThisHistory::test_every_stamp_is_an_ancestor_of_head
-#   fused-memory/tests/arm_harness/test_lme_control_artifacts.py::test_every_run_is_pinned_to_one_code_sha_and_the_committed_corpus
-#   fused-memory/tests/arm_harness/test_lme_embedding_artifacts.py::test_the_candidates_preregistration_sha_carries_the_doc_and_precedes_head
-#   fused-memory/tests/arm_harness/test_lme_screening_artifacts.py::test_one_preregistration_sha_that_carries_the_doc_and_is_on_this_history
-#   dashboard/tests/test_index_html.py::test_redux_cache_buster_is_newer_than_merge_base
-merge_gate_history_pure: false
+# Same-tree gate (tasks 6647, 7248). The pytest marker reads_git_history
+# selects every gate test that reads the checkout's git history; on a rebase
+# whose tree is byte-identical to the verified one, only those tests re-run,
+# through the leg below. tests/scripts/test_merge_gate_history_leg.py keeps the
+# marks, this leg's segments and the flag in step.
+merge_gate_history_pure: true
+merge_gate_history_test_command: "uv run --directory fused-memory pytest tests/ -m 'reads_git_history and not integration' --tb=short -q --timeout=300 && uv run --directory orchestrator pytest tests/ -m 'reads_git_history and not warm_lane_bash' --tb=short -q --timeout=300 && uv run --directory dashboard pytest tests/ -m reads_git_history --tb=short -q --timeout=300"
 merge_train_former_enabled: true
 merge_train_coalesce_enabled: true
 merge_train_max_members: 3

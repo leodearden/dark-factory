@@ -1267,17 +1267,27 @@ takes no arguments: it always re-reads that process's own
   switch, it only ever ADDS one verify before an advance, and it cannot
   split an in-flight merge's breadth. Contrast its **restart-only**
   neighbour `merge_verify_breadth`, which does change breadth mid-merge.
-- `merge_gate_history_pure` (task 6647; default `false`). Declares that every
-  leg of the project's merge gate judges the tree alone, reading no git
-  history. Only then does `merge_lane/gates.py::_reverify_rebased_tree` skip
-  the re-verify of a rebased tree byte-identical to the tree that just passed
-  (`gate_clearance: same_tree` on the `gate_retry` row, which records the
-  outcome; the gate's decision itself, skip or fire, is its
-  `merge_reverify_gate` row, `reason: same_tree`). Dark-factory ships it
-  `false`: several of its legs read HEAD's history (named in
-  `dark-factory-orchestrator.yaml` beside the key). Green-tier for the same
-  reason as the bullet above: read per gate evaluation, and it only decides
-  whether one more verify runs.
+- `merge_gate_history_pure` (tasks 6647, 7248; default `false`). Declares that
+  every leg of the project's merge gate judges the tree alone, except the
+  tests `merge_gate_history_test_command` selects. Only then does
+  `merge_lane/gates.py::_reverify_rebased_tree` forgo the full re-verify of a
+  rebased tree byte-identical to the tree that just passed. With no history
+  leg declared the gate skips (`merge_reverify_gate` row `reason: same_tree`,
+  `gate_retry` row `gate_clearance: same_tree`). Dark-factory ships it `true`
+  with a history leg, so a same-tree rebase runs only that leg (`reason:
+  same_tree_history_leg`, `gate_clearance: history_leg`); a red leg blocks the
+  merge exactly as a red re-verify does. Green-tier for the same reason as the
+  bullet above: read per gate evaluation, and it only decides whether one more
+  verify runs.
+- `merge_gate_history_test_command` (task 7248; default unset). The shell
+  command, run from the merge worktree root, that runs exactly the gate's
+  history-reading tests. Dark-factory's leg runs the `reads_git_history`
+  marker per owning package;
+  `tests/scripts/test_merge_gate_history_leg.py::test_every_history_reader_in_the_gate_is_accounted_for`
+  fails on an unmarked reader, and
+  `tests/scripts/test_merge_gate_history_leg.py::test_the_leg_runs_exactly_the_roots_that_own_marked_tests`
+  keeps the leg's segments on the packages that own marked tests. Green-tier
+  for the same reason as `merge_gate_history_pure`.
 - `merge_deep.chain_cap` (the deep merge-ahead chain cap — see
   [§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap);
   `0` is the shipped default and the feature's kill switch). Green-tier on
