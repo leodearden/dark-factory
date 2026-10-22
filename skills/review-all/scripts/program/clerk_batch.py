@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import enum
 import itertools
 import json
@@ -455,8 +456,178 @@ def write(home: state.Home, *, accept: Sequence[str], scan: bool) -> int:
     return 0
 
 
+@dataclass(frozen=True)
+class ResultEntry:
+    """One action the clerk's result file reports: its id, its state, and why (None for applied)."""
+
+    action_id: str
+    state: state.ActionResultState
+    why: str | None
+
+
+def _batch_of(result_path: Path) -> tuple[state.Home, int]:
+    """The run home and batch number whose result file *result_path* is, by state's naming rule."""
+    path = result_path.resolve()
+    home = state.Home(path.parent.parent)
+    if home.program_json.is_file():
+        for number in itertools.count(1):
+            files = home.batch_files(number)
+            if not files.actions.exists():
+                break
+            if files.result == path:
+                return home, number
+    raise state.StateError(f'{result_path} is the result file of no batch in a run home')
+
+
+def _batch_ids(batch_file: Path) -> tuple[str, ...]:
+    """The batch's action ids, in its order."""
+    try:
+        return tuple(action['id'] for action in json.loads(batch_file.read_text())['actions'])
+    except (KeyError, TypeError, ValueError) as bad:
+        raise state.StateError(f'{batch_file}: cannot read its action ids: {bad!r}') from None
+
+
+def _text_fields(
+    item: Mapping[str, Any], where: str, names: Sequence[str], violations: list[str],
+) -> bool:
+    """Whether *item* carries exactly *names*, each a non-empty string; each fault is named."""
+    faults = [f'{where}.{name}: is required, a non-empty string' for name in names
+              if not isinstance(item.get(name), str) or not item[name]]
+    faults += [f'{where}.{name}: is no field of a result entry' for name in sorted(set(item) - set(names))]
+    violations += faults
+    return not faults
+
+
+def _result_entry(
+    item: Any, where: str, result_state: state.ActionResultState, violations: list[str],
+) -> ResultEntry | None:
+    if not _explained(result_state):
+        if isinstance(item, str) and item:
+            return ResultEntry(item, result_state, None)
+        violations.append(f'{where}: must be an action id, a non-empty string; got {item!r}')
+        return None
+    if not isinstance(item, Mapping):
+        violations.append(f'{where}: must be an object {{id, {WHY}}}; got {item!r}')
+        return None
+    if not _text_fields(item, where, ('id', WHY), violations):
+        return None
+    return ResultEntry(item['id'], result_state, item[WHY])
+
+
+def _listed(data: Mapping[str, Any], key: str, violations: list[str]) -> list[tuple[str, Any]]:
+    """Each item of list *key*, with its field path; a missing key is reported by the caller."""
+    value = data.get(key, [])
+    if not isinstance(value, list):
+        violations.append(f'{key}: must be a list; got {value!r}')
+        return []
+    return [(f'{key}[{index}]', item) for index, item in enumerate(value)]
+
+
+@dataclass(frozen=True)
+class ClerkResult:
+    entries: tuple[ResultEntry, ...]
+    dirtied: tuple[str, ...]
+
+
+def _parse_result(text: str) -> ClerkResult | list[str]:
+    """The result file's entries and dirtied paths, or every violation of its form."""
+    try:
+        data = json.loads(text)
+    except ValueError as bad:
+        return [f'is not JSON: {bad}']
+    if not isinstance(data, Mapping):
+        return [f'must be a JSON object; got {data!r}']
+    keys = {*RESULT_LISTS, DIRTIED}
+    violations = [f'{key}: is required' for key in sorted(keys - data.keys())]
+    violations += [f'{key}: is no key of a result file' for key in sorted(data.keys() - keys)]
+    entries = [
+        _result_entry(item, where, result_state, violations)
+        for key, result_state in RESULT_LISTS.items() for where, item in _listed(data, key, violations)
+    ]
+    dirtied = []
+    for where, item in _listed(data, DIRTIED, violations):
+        if isinstance(item, str) and item:
+            dirtied.append(item)
+        else:
+            violations.append(f'{where}: must be a path, a non-empty string; got {item!r}')
+    if violations:
+        return violations
+    return ClerkResult(tuple(entry for entry in entries if entry is not None), tuple(dirtied))
+
+
+def _sorted_entries(
+    entries: Sequence[ResultEntry], batch_ids: Collection[str],
+    results: Mapping[str, Mapping[str, Any]], number: int,
+) -> tuple[list[ResultEntry], list[str]]:
+    """The entries to record, and a refusal naming each id the batch lacks, the ledger already
+    records, or the result names more than once."""
+    by_id: dict[str, list[ResultEntry]] = {}
+    for entry in entries:
+        by_id.setdefault(entry.action_id, []).append(entry)
+    recorded, refusals = [], []
+    for action_id, named in by_id.items():
+        if action_id not in batch_ids:
+            why = f'not an action of batch-{number}'
+        elif action_id in results:
+            why = _recorded(results[action_id])
+        elif len(named) > 1:
+            why = 'named in ' + ' and '.join(_RESULT_KEY[entry.state] for entry in named)
+        else:
+            recorded += named
+            continue
+        refusals.append(f'{action_id}: {why}')
+    return recorded, refusals
+
+
+def _result_fields(entry: ResultEntry, number: int) -> dict[str, Any]:
+    return {'id': entry.action_id, 'state': str(entry.state), 'batch': number, 'detail': entry.why}
+
+
+def _print_ingested(
+    number: int, recorded: Sequence[ResultEntry], refusals: Sequence[str],
+    unmentioned: Sequence[str], dirtied: Sequence[str],
+) -> None:
+    counts = collections.Counter(entry.state for entry in recorded)
+    print(f'batch {number}: recorded ' + ', '.join(
+        f'{result_state} {counts[result_state]}' for result_state in RESULT_LISTS.values()
+    ))
+    for refusal in refusals:
+        print(f'refused: {refusal}', file=sys.stderr)
+    for action_id in unmentioned:
+        print(f'{action_id}: no result; it stays unapplied and goes into the next batch')
+    if dirtied:
+        print('dirtied, for the wave commit:')
+    for path in dirtied:
+        print(f'  {path}')
+
+
+def ingest(result_path: Path) -> int:
+    """Record the clerk's result for its batch; exit 1 when the file or any id is refused."""
+    home, number = _batch_of(result_path)
+    batch_ids = _batch_ids(home.batch_files(number).actions)
+    parsed = _parse_result(result_path.read_text(encoding='utf-8'))
+    if not isinstance(parsed, ClerkResult):
+        print(f'refused: {result_path} is malformed; nothing is recorded:', file=sys.stderr)
+        for violation in parsed:
+            print(f'  {violation}', file=sys.stderr)
+        return 1
+    with home_writer.locked(home) as snapshot:
+        recorded, refusals = _sorted_entries(
+            parsed.entries, batch_ids, _results_by_id(snapshot.ledger), number,
+        )
+        if recorded:
+            home_writer.append(home, home_writer.stamp(snapshot, BY, [
+                (state.LedgerOp.ACTION_RESULT, _result_fields(entry, number)) for entry in recorded
+            ], ()))
+    named = {entry.action_id for entry in parsed.entries}
+    unmentioned = [action_id for action_id in batch_ids if action_id not in named]
+    _print_ingested(number, recorded, refusals, unmentioned, parsed.dirtied)
+    return 1 if refusals else 0
+
+
 class Command(enum.StrEnum):
     WRITE = 'write'
+    INGEST = 'ingest'
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -474,14 +645,20 @@ def _parser() -> argparse.ArgumentParser:
         '--accept', action='extend', nargs='+', default=[], metavar='ID',
         help='batch these needs-human actions too: a human accepted them',
     )
+    ingest_command = commands.add_parser(
+        Command.INGEST, help="record the clerk's result file for its batch in the ledger",
+    )
+    ingest_command.add_argument('result', type=Path, help='a batch-<n>.result.json of a run home')
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command == Command.INGEST:
+            return ingest(args.result)
         return write(state.run_home(args.run), accept=args.accept, scan=args.scan)
-    except state.StateError as refused:
+    except (state.StateError, OSError) as refused:
         print(f'refused: {refused}', file=sys.stderr)
         return 1
 
