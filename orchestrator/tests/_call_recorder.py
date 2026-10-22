@@ -30,13 +30,16 @@ class BlockingCall(ThreadRecordingCall[T]):
         super().__init__(returns)
         self._entered = threading.Event()
         self._released = threading.Event()
-        self._returned = threading.Event()
+        self._exited = threading.Event()
 
     def __call__(self) -> T:
         returns = super().__call__()
         self._entered.set()
-        self._released.wait(timeout=_CEILING_SECS)
-        self._returned.set()
+        try:
+            if not self._released.wait(timeout=_CEILING_SECS):
+                raise AssertionError(f'call not released within {_CEILING_SECS:g}s')
+        finally:
+            self._exited.set()
         return returns
 
     def release(self) -> None:
@@ -44,7 +47,7 @@ class BlockingCall(ThreadRecordingCall[T]):
 
     @property
     def blocked(self) -> bool:
-        return self._entered.is_set() and not self._returned.is_set()
+        return self._entered.is_set() and not self._exited.is_set()
 
     async def entered(self) -> None:
         if not await asyncio.to_thread(self._entered.wait, _CEILING_SECS):
