@@ -52,6 +52,7 @@ class EscalationCategory(StrEnum):
     MCP_MARKUP_WRITE_STORM = 'mcp_markup_write_storm'
     MEM0_IN_PLACE_UPDATE_STORM = 'mem0_in_place_update_storm'
     MEMORY_METADATA_UNKNOWN_KEY_STORM = 'memory_metadata_unknown_key_storm'
+    MERGE_CANCELLED_BY_OPERATOR = 'merge_cancelled_by_operator'
     MERGE_COALESCE_LIVE_ORIGINAL = 'merge_coalesce_live_original'
     MERGE_DEFERRED_ABANDONED = 'merge_deferred_abandoned'
     MERGE_ERROR = 'merge_error'
