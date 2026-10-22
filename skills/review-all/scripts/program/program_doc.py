@@ -284,6 +284,53 @@ def render_text(template: Path, home: HomeRead, store: StoreFacts) -> str:
         raise state.StateError(f'{template}: {malformed}') from None
 
 
+def headings(text: str) -> tuple[str, ...]:
+    """The doc's ``## `` heading lines, exactly as written."""
+    return tuple(line for line in text.splitlines() if line.startswith('## '))
+
+
+@dataclass(frozen=True)
+class HeadingCheck:
+    """A render's headings against the published doc's: what it drops, and what the allowances cover."""
+
+    allowed: tuple[str, ...]
+    refused: tuple[str, ...]
+    unused: tuple[str, ...]
+
+    @property
+    def passed(self) -> bool:
+        return not self.refused and not self.unused
+
+
+def check_headings(published: str | None, rendered: str, allowances: Sequence[str]) -> HeadingCheck:
+    """Each published heading the render loses must be named by an allowance, and each allowance used."""
+    kept = set(headings(rendered))
+    dropped = () if published is None else tuple(
+        dict.fromkeys(heading for heading in headings(published) if heading not in kept)
+    )
+    return HeadingCheck(
+        allowed=tuple(heading for heading in dropped if heading in allowances),
+        refused=tuple(heading for heading in dropped if heading not in allowances),
+        unused=tuple(a for a in dict.fromkeys(allowances) if a not in dropped),
+    )
+
+
+def _published_text(program: state.Program) -> str | None:
+    published = state.published_doc(program)
+    return published.read_text(encoding='utf-8') if published.exists() else None
+
+
+def _report_refusal(check: HeadingCheck, published: Path, *, exists: bool) -> None:
+    for heading in check.refused:
+        print(f'refused: the render drops {heading} from {published}; '
+              f'--allow-drop "{heading}" lets it go', file=sys.stderr)
+    where = str(published) if exists else f'{published}, which does not exist yet'
+    for allowance in check.unused:
+        print(f'refused: --allow-drop "{allowance}" names a heading the render does not drop '
+              f'from {where}', file=sys.stderr)
+    print('nothing written', file=sys.stderr)
+
+
 def _write_atomic(path: Path, data: bytes) -> None:
     """Write *path* through a temp file in its own directory, so a reader never sees half of it."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -307,12 +354,38 @@ def _write_render(home: HomeRead, text: str) -> Path:
     return doc
 
 
-def _render(args: argparse.Namespace) -> Exit:
+@dataclass(frozen=True)
+class Render:
+    """A render written into the home, and the store read it was made from."""
+
+    home: HomeRead
+    store: StoreFacts
+    doc: Path
+
+
+def _checked_render(args: argparse.Namespace) -> Render | None:
+    """Render, check the headings against the published doc, and write; None when refused."""
     home = program_facts.read_home(args.run)
     store = program_facts.read_store(state.open_reader(home.run.program), home)
-    doc = _write_render(home, render_text(TEMPLATE, home, store))
+    program = home.run.program
+    text = render_text(args.template or TEMPLATE, home, store)
+    published = _published_text(program)
+    check = check_headings(published, text, args.allow_drop or ())
+    if not check.passed:
+        _report_refusal(check, state.published_doc(program), exists=published is not None)
+        return None
+    doc = _write_render(home, text)
+    for heading in check.allowed:
+        print(f'dropped {heading} (allowed by --allow-drop)')
     print(f'rendered {doc} (snapshot {home.run.home.render_state_dir})')
-    print(f'store read {store.measured_at}')
+    return Render(home, store, doc)
+
+
+def _render(args: argparse.Namespace) -> Exit:
+    render = _checked_render(args)
+    if render is None:
+        return Exit.REFUSED
+    print(f'store read {render.store.measured_at}')
     return Exit.DONE
 
 
@@ -322,6 +395,11 @@ def _parser() -> argparse.ArgumentParser:
         epilog='exit codes: ' + '; '.join(f'{int(c)} {says}' for c, says in _EXIT_MEANINGS.items()),
     )
     parser.add_argument('--run', required=True, help='the run id whose home the doc is rendered from')
+    parser.add_argument('--template', type=Path, metavar='PATH',
+                        help=f'render through PATH instead of {TEMPLATE.name}')
+    parser.add_argument('--allow-drop', action='append', metavar='HEADING',
+                        help='let the render lose this exact "## " heading of the published doc; '
+                             'repeat once per heading')
     return parser
 
 
