@@ -16,6 +16,7 @@ from typing import Final, TypeVar
 
 from pydantic import BaseModel, ConfigDict
 
+from client_feed.budget import counted_set
 from client_feed.contract import (
     Branch,
     Degradation,
@@ -291,7 +292,10 @@ def run_pass(
     factory = None if store is None else factory_event(store.factory, state=view, stamp=stamp, now=now)
     branches = None if git is None else branch_event(git.branches, state=view, stamp=stamp, now=now)
     tree = None if git is None or git.tree is None else git.tree
-    snapshot = None if tree is None else tree_event(tree, policy=policy, stamp=stamp, now=now)
+    snapshot = None
+    if tree is not None:
+        budget = counted_set(policy, tree.files).budget([file.path for file in view.revealed])
+        snapshot = tree_event(tree, budget=budget, stamp=stamp, now=now)
     prds = prd_events(
         tasks=view.tasks.values(),
         state=view,

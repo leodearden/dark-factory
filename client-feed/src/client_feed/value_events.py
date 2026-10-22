@@ -9,7 +9,6 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Final
 
-from client_feed.budget import counted_set
 from client_feed.contract import (
     Branch,
     BranchSnapshot,
@@ -20,11 +19,9 @@ from client_feed.contract import (
     RevealBudget,
     TaskStatus,
     TaskUpserted,
-    TreeFile,
     TreeSnapshot,
 )
 from client_feed.envelope import Stamp, payload
-from client_feed.policy import Policy
 from client_feed.sources.events import FactoryStatus, OpenEscalations
 from client_feed.sources.prds import PrdText, summarize_prd
 from client_feed.sources.tasks import TaskRow, waiting_on
@@ -162,17 +159,19 @@ def branch_event(
     return BranchSnapshot(**stamp(now), branches=branches)
 
 
-def _budget(policy: Policy, files: Sequence[TreeFile]) -> RevealBudget:
-    """PRD §4.12 with no delivered commit and no reveal granted: the proportion of every counted line."""
-    return counted_set(policy, files).budget(())
-
-
-def tree_event(tree: VisibleTree, *, policy: Policy, stamp: Stamp, now: datetime) -> TreeSnapshot:
+def tree_event(
+    tree: VisibleTree, *, budget: RevealBudget, stamp: Stamp, now: datetime
+) -> TreeSnapshot:
     """The visible tree at a new main head, with its reveal budget."""
     return TreeSnapshot(
-        **stamp(now),
-        commit=tree.commit,
-        totals=tree.totals,
-        files=tree.files,
-        budget=_budget(policy, tree.files),
+        **stamp(now), commit=tree.commit, totals=tree.totals, files=tree.files, budget=budget
     )
+
+
+def budget_event(
+    budget: RevealBudget, *, state: FeedState, stamp: Stamp, now: datetime
+) -> TreeSnapshot | None:
+    """The state's tree again with a changed reveal budget: a budget is only ever said inside a tree snapshot."""
+    if state.tree is None or state.tree.budget == budget:
+        return None
+    return TreeSnapshot(**stamp(now), **{**payload(state.tree), 'budget': budget})
