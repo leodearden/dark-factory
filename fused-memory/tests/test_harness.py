@@ -6538,6 +6538,81 @@ async def test_run_full_cycle_post_completion_cancellation_keeps_run_completed(
     assert _pending_recon_failures(esc_queue) == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('resume_after_restart', [False, True])
+async def test_run_full_cycle_cancellation_after_the_completion_commit_keeps_run_completed(
+    journal, event_buffer, mock_memory_service, tmp_path, resume_after_restart,
+):
+    """A cancellation reaching run_full_cycle after complete_run(run_id,
+    'completed') has committed (aiosqlite lands a commit whose awaiter was
+    cancelled) still propagates, but never relabels the durably completed run
+    nor restores its drained events."""
+    harness, esc_queue = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    harness.config.resume_after_restart = resume_after_restart
+    await event_buffer.push(_make_event())
+
+    entered = asyncio.Event()
+    original_complete_run = journal.complete_run
+
+    async def complete_run_then_stall(run_id, status):
+        if status != 'completed':
+            return await original_complete_run(run_id, status)
+        await original_complete_run(run_id, status)
+        entered.set()
+        await asyncio.sleep(999)
+
+    journal.complete_run = complete_run_then_stall
+    restore_spy = AsyncMock(side_effect=event_buffer.restore_drained)
+    event_buffer.restore_drained = restore_spy
+
+    outer = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    await _cancel_once_entered(outer, entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.status == 'completed'
+    assert '_error' not in row.stage_reports
+    assert row.id not in {r.id for r in await journal.get_interrupted_runs()}
+    restore_spy.assert_not_awaited()
+    assert len(await event_buffer.get_drained_events('test-project', row.id)) == 1
+    assert (await journal.get_watermark('test-project')).last_full_run_id == row.id
+    assert _pending_recon_failures(esc_queue) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('resume_after_restart', 'row_status', 'buffered_after'),
+    [(False, 'failed', 1), (True, 'interrupted', 0)],
+)
+async def test_run_full_cycle_cancellation_relabels_when_the_completion_read_fails(
+    journal, event_buffer, mock_memory_service, tmp_path,
+    resume_after_restart, row_status, buffered_after,
+):
+    """The cancelled arm's read of whether the journal already records the run
+    completed is best-effort: when it fails, a run cancelled before completion
+    is relabelled exactly as it would be without that read."""
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    harness.config.resume_after_restart = resume_after_restart
+    await event_buffer.push(_make_event())
+    _fail_first_call(journal, 'is_run_completed', _sqlite_busy_error)
+    entered = asyncio.Event()
+    harness.stages[0].run = _stalling_stage_run(entered)
+
+    outer = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    await _cancel_once_entered(outer, entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.status == row_status
+    assert await event_buffer.count_buffered('test-project') == buffered_after
+
+
 def _lock_restore_drained(event_buffer) -> None:
     async def restore_drained(project_id, run_id=None, *, include_unattributed=False):
         raise _sqlite_busy_error()
