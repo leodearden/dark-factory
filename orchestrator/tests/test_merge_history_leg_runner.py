@@ -39,6 +39,7 @@ def _passing_leg(tmp_path: Path) -> tuple[Path, str]:
     return worktree, command
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_a_passing_leg_passes_without_the_per_test_ids_a_bare_run_collects(
     tmp_path: Path,
