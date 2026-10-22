@@ -81,8 +81,8 @@ class TestHarnessReportRecordsReviewOutcome:
 
         line = _review_line(report)
 
-        assert re.search(r'\b0\b', line)
-        assert re.search(r'\b1\s+skipped\b|\bskipped\W*1\b', line)
+        assert re.search(r'\b0\s+ran\b', line)
+        assert re.search(r'\b1\s+skipped\b', line)
 
     def test_to_dict_carries_the_skipped_count_beside_the_existing_keys(self) -> None:
         report = HarnessReport()

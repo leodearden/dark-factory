@@ -152,7 +152,7 @@ from orchestrator.recovery_emission import (
     veto_signature,
 )
 from orchestrator.recovery_pins import records_pin_recovery
-from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewOutcome, ReviewReport
+from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.run_store import RunStore
@@ -1163,7 +1163,7 @@ class HarnessReport:
         return self.review_checkpoints + self.review_checkpoints_skipped
 
     def record_review(self, review: ReviewReport) -> None:
-        if review.outcome is not ReviewOutcome.RAN:
+        if not review.ran:
             self.review_checkpoints_skipped += 1
             return
         self.review_checkpoints += 1
@@ -12143,9 +12143,9 @@ class Harness:
     async def _account_review(self, review_report: ReviewReport, label: str) -> None:
         """Tally a finished review, then tag the tasks it created with modules."""
         self.report.record_review(review_report)
-        if review_report.outcome is not ReviewOutcome.RAN:
+        if not review_report.ran:
             logger.warning(
-                '%s %s: %s — trigger kept for the next checkpoint',
+                '%s %s: %s, not counted as a run',
                 label, review_report.review_id, review_report.outcome.value,
             )
             return

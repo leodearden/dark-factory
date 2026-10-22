@@ -117,6 +117,10 @@ class ReviewReport:
     parse_failed: bool = False
     phase1_working_tree: Phase1WorkingTree | None = None
 
+    @property
+    def ran(self) -> bool:
+        return self.outcome is ReviewOutcome.RAN
+
 
 class ReviewCheckpoint:
     """Coordinates periodic deep review checkpoints during an orchestrator run.
@@ -178,7 +182,7 @@ class ReviewCheckpoint:
         """Run a focused review scoped to modules that merged since the last checkpoint."""
         modules = list(self._merged_modules)
         report = await self._run_review('focused', modules)
-        if report.outcome is ReviewOutcome.RAN:
+        if report.ran:
             self._last_review_at_merge = self._merge_count
             self._merged_modules.clear()
         self._reports.append(report)
@@ -211,7 +215,7 @@ class ReviewCheckpoint:
     async def run_full(self) -> ReviewReport:
         """Run a full review of the entire project."""
         report = await self._run_review('full', [])
-        if report.outcome is ReviewOutcome.RAN:
+        if report.ran:
             self._last_review_at_merge = self._merge_count
             # Record full-review trackers so should_run_full() re-closes the gate.
             self._last_full_review_time = time.monotonic()
