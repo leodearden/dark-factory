@@ -2451,7 +2451,7 @@ class TestAwaitStewardCompletionReturnsOutcome:
         ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardResolved(resolution_text='fixed it')
 
@@ -2470,7 +2470,7 @@ class TestAwaitStewardCompletionReturnsOutcome:
         ))
         wf.scheduler.get_status = AsyncMock(return_value=status)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardTerminalDecision(new_status=TaskStatus(status))
 
@@ -2487,7 +2487,7 @@ class TestAwaitStewardCompletionReturnsOutcome:
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf._worktree_has_wip_commits = AsyncMock(return_value=wip)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=wip)
 
@@ -2534,7 +2534,7 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=False)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
         assert wf._steward_outcome_channel.empty(), (
@@ -2559,7 +2559,7 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
             return_value=[MagicMock(id='L1')],
         )
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
         wf.escalation_queue.get_by_task.assert_called_once_with(
@@ -2581,7 +2581,7 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=False)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardResolved(resolution_text='fixed it')
 
@@ -2604,7 +2604,7 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
             return_value=[MagicMock(id='L1')],
         )
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
 
@@ -2623,7 +2623,7 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardTerminalDecision(new_status=TaskStatus.DONE)
 

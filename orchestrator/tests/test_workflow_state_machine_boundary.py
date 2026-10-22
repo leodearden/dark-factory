@@ -1492,7 +1492,7 @@ class TestStewardOutcomeRouting:
         ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardResolved(resolution_text='fixed the flaky import')
 
@@ -1538,7 +1538,7 @@ class TestStewardOutcomeRouting:
         ))
         wf.scheduler.get_status = AsyncMock(return_value=status)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardTerminalDecision(new_status=TaskStatus(status))
 

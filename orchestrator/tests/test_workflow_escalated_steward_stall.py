@@ -657,7 +657,7 @@ class TestStaleOutcomeHygiene:
         assert await scheduler.get_status(task_assignment.task_id) not in (
             'done', 'cancelled', 'deferred',
         ), 'a terminal status would short-circuit _await_steward_completion'
-        outcome = await asyncio.wait_for(workflow._await_steward_completion(), 10)
+        outcome = await asyncio.wait_for(workflow._await_steward_completion(escalation_id=None), 10)
 
         assert isinstance(outcome, StewardInterrupted), (
             f'nothing is published in this second cycle, so the grace period '

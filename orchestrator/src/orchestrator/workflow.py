@@ -3672,7 +3672,7 @@ class TaskWorkflow:
             )
         # Wait for steward to finish any pending work (suggestion triage, etc.)
         await self._ensure_steward_started()
-        await self._await_steward_completion(skip_if_idle=True)
+        await self._await_steward_completion(escalation_id=None, skip_if_idle=True)
         return await self._finalise_merged_done()
 
     async def _resume_merge_retry_if_pending(
@@ -17126,7 +17126,7 @@ class TaskWorkflow:
             # Give the steward a chance to resolve the escalation
             await self._ensure_steward_started()
             if self._steward:
-                outcome = await self._await_steward_completion()
+                outcome = await self._await_steward_completion(escalation_id=None)
 
                 async def _requeue() -> WorkflowOutcome:
                     if self.event_store:
@@ -18457,11 +18457,110 @@ class TaskWorkflow:
         )
         return most_severe
 
+    @staticmethod
+    def _in_wait_scope(
+        publication: PublishedStewardOutcome, escalation_id: str | None,
+    ) -> bool:
+        """Whether *publication* may end a steward wait scoped to *escalation_id*
+        (``None`` = unscoped) — THE scope rule of task 5563."""
+        return escalation_id is None or publication.escalation_id == escalation_id
+
+    def _in_scope_burst(
+        self,
+        channel: asyncio.Queue[PublishedStewardOutcome],
+        first: PublishedStewardOutcome,
+        *,
+        escalation_id: str | None,
+    ) -> list[StewardOutcome]:
+        """*first* plus every publication already queued behind it, reduced to
+        the outcomes in the wait's scope; each one out of scope is logged and
+        discarded (never re-buffered — no later waiter would read it)."""
+        burst = [first]
+        while True:
+            try:
+                burst.append(channel.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        in_scope: list[StewardOutcome] = []
+        for publication in burst:
+            if self._in_wait_scope(publication, escalation_id):
+                in_scope.append(publication.outcome)
+                continue
+            logger.info(
+                'Task %s: discarding steward outcome published for escalation '
+                '%s while waiting on %s: %r',
+                self.task_id, publication.escalation_id, escalation_id,
+                publication.outcome,
+            )
+        return in_scope
+
+    async def _receive_steward_outcome(
+        self,
+        channel: asyncio.Queue[PublishedStewardOutcome],
+        *,
+        escalation_id: str | None,
+        timeout: float,
+    ) -> StewardOutcome | None:
+        """Race the channel against the soft-cancel event until an in-scope
+        outcome arrives, returning the most severe of its burst, or ``None`` on
+        cancel or once *timeout* has elapsed since the call.
+
+        Out-of-scope publications do not move the deadline.  A publication
+        still wins a tie with the cancel event.
+        """
+        if self._cancel_event.is_set():
+            return None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while (remaining := deadline - loop.time()) > 0:
+            get_wait = asyncio.create_task(channel.get())
+            cancel_wait = asyncio.create_task(self._cancel_event.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    {get_wait, cancel_wait},
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                for t in (get_wait, cancel_wait):
+                    if not t.done():
+                        t.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await t
+            if get_wait in done:
+                in_scope = self._in_scope_burst(
+                    channel, get_wait.result(), escalation_id=escalation_id,
+                )
+                if in_scope:
+                    return max(in_scope, key=self._outcome_severity)
+                continue
+            if cancel_wait in done:
+                logger.info(
+                    f'Task {self.task_id}: cancel-event fired during steward grace — '
+                    f'exiting completion wait'
+                )
+                return None
+            break
+        logger.warning(
+            f'Task {self.task_id}: steward completion timed out after '
+            f'{timeout:.0f}s with no outcome published for {escalation_id or "any escalation"}'
+        )
+        return None
+
     async def _await_steward_completion(
-        self, *, skip_if_idle: bool = False,
+        self, *, escalation_id: str | None, skip_if_idle: bool = False,
     ) -> StewardOutcome:
         """Wait for the steward to publish an outcome, with a grace period
         (task 2248 / W9-delta, SO-1).
+
+        *escalation_id* scopes the wait (task 5563): only an outcome the
+        steward published about that escalation ends it.  One published about
+        any other escalation — typically an older L0 the steward was still
+        working when this one was filed — is logged and discarded, and the
+        wait runs on to its original deadline.  ``None`` is the explicit
+        unscoped mode, where any publication ends the wait.  The argument is
+        required rather than defaulted so every caller chooses its scope; the
+        rule itself lives in :meth:`_in_wait_scope`.
 
         *skip_if_idle* (task 3170) is passed by the post-merge success tail,
         whose contract is "give queued steward work a chance to finish" rather
@@ -18529,10 +18628,11 @@ class TaskWorkflow:
         real (non-cancel) grace-timeout still derives wip normally.
 
         Two extra layers close the multi-outcome silent-requeue gap (review
-        fix): (1) once an outcome is obtained, any further outcomes already
-        sitting on the channel (the serial steward published a burst within
-        this same grace window) are drained non-blockingly and reduced to
-        the most severe via :meth:`_outcome_severity`.  (2) before returning
+        fix): (1) once an in-scope outcome is obtained, any further outcomes
+        already sitting on the channel (the serial steward published a burst
+        within this same grace window) are drained non-blockingly and the
+        in-scope ones reduced to the most severe via
+        :meth:`_outcome_severity`.  (2) before returning
         a requeue-producing outcome (:meth:`_outcome_requeues`), the
         escalation queue's ``has_open_l1`` is re-checked as a source-of-truth
         backstop — catching the publish-timing race where a follow-on L1 was
@@ -18558,47 +18658,9 @@ class TaskWorkflow:
             f'Task {self.task_id}: waiting up to {timeout:.0f}s for steward completion'
         )
 
-        outcome: StewardOutcome | None = None
-        deadline = asyncio.get_event_loop().time() + timeout
-        remaining = deadline - asyncio.get_event_loop().time()
-        if not self._cancel_event.is_set() and remaining > 0:
-            get_wait = asyncio.create_task(channel.get())
-            cancel_wait = asyncio.create_task(self._cancel_event.wait())
-            try:
-                done, _pending = await asyncio.wait(
-                    {get_wait, cancel_wait},
-                    timeout=remaining,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            finally:
-                for t in (get_wait, cancel_wait):
-                    if not t.done():
-                        t.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await t
-            if get_wait in done:
-                most_severe: StewardOutcome = get_wait.result().outcome
-                # Drain any further outcomes the serial steward already
-                # published in this same grace window and reduce to the
-                # most severe (review fix — see class docstring above).
-                while True:
-                    try:
-                        next_outcome: StewardOutcome = channel.get_nowait().outcome
-                    except asyncio.QueueEmpty:
-                        break
-                    if self._outcome_severity(next_outcome) > self._outcome_severity(most_severe):
-                        most_severe = next_outcome
-                outcome = most_severe
-            elif cancel_wait in done:
-                logger.info(
-                    f'Task {self.task_id}: cancel-event fired during steward grace — '
-                    f'exiting completion wait'
-                )
-            else:
-                logger.warning(
-                    f'Task {self.task_id}: steward completion timed out after '
-                    f'{timeout:.0f}s with no outcome published'
-                )
+        outcome = await self._receive_steward_outcome(
+            channel, escalation_id=escalation_id, timeout=timeout,
+        )
 
         # Single fresh read of the store — a terminal/deferred status always
         # wins, regardless of what (if anything) the channel produced.

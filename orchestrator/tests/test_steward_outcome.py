@@ -171,7 +171,7 @@ class TestAwaitStewardCompletionCancelSafety:
         wf._cancel_event.set()
 
         outcome = await asyncio.wait_for(
-            wf._await_steward_completion(), timeout=2,
+            wf._await_steward_completion(escalation_id=None), timeout=2,
         )
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
@@ -193,7 +193,7 @@ class TestAwaitStewardCompletionCancelSafety:
 
         asyncio.create_task(_do_cancel())
         outcome = await asyncio.wait_for(
-            wf._await_steward_completion(), timeout=2,
+            wf._await_steward_completion(escalation_id=None), timeout=2,
         )
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
@@ -210,7 +210,7 @@ class TestAwaitStewardCompletionCancelSafety:
         wf._worktree_has_wip_commits = AsyncMock(return_value=True)
 
         outcome = await asyncio.wait_for(
-            wf._await_steward_completion(), timeout=2,
+            wf._await_steward_completion(escalation_id=None), timeout=2,
         )
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=True)
@@ -251,7 +251,7 @@ class TestAwaitStewardCompletionOverrideDismissesOrphanL0:
 
         wf.escalation_queue.get_by_task = MagicMock(side_effect=_get_by_task)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
         wf.escalation_queue.resolve.assert_called_once()
@@ -280,7 +280,7 @@ class TestAwaitStewardCompletionOverrideDismissesOrphanL0:
             return_value=[MagicMock(id='L1')],
         )
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
         wf.escalation_queue.resolve.assert_not_called()
