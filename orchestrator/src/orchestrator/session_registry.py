@@ -69,7 +69,8 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 1
 
 # 3: LeaseHolder.record_slug and DecisionRecord.record_slug (task 4237).
-SCHEMA_MINOR = 3
+# 4: SessionRecord.self_exit (task 7179).
+SCHEMA_MINOR = 4
 """Additive-extension counter for this module's contract (Fleet Cockpit C1,
 plans/fleet-cockpit-prd.md §6.1). A CODE-LEVEL signal only -- never persisted
 per-record. Bump this when a new backward-compatible (optional/defaulted)
@@ -328,6 +329,9 @@ class SessionRecord:
         ``session_hooks._env_slug_is_owned``. A non-int, bool, or
         non-positive value in a record body reads back as None instead of
         surviving unchanged (see ``_coerce_owner_pid``).
+    self_exit: true when the spawn was launched with CLAUDE_SPAWN_SELF_EXIT=1;
+        stamped at ``launching`` and preserved by every later
+        read-modify-write. Anything but a JSON true reads back as False.
     """
 
     session_slug: str
@@ -351,6 +355,7 @@ class SessionRecord:
     question: Question | None = field(default=None, kw_only=True)
     claude_session_id: str | None = field(default=None, kw_only=True)
     claude_owner_pid: int | None = field(default=None, kw_only=True)
+    self_exit: bool = field(default=False, kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain, JSON-scalar-only dict (status as its wire string)."""
@@ -376,6 +381,7 @@ class SessionRecord:
             'question': self.question.to_dict() if self.question is not None else None,
             'claude_session_id': self.claude_session_id,
             'claude_owner_pid': self.claude_owner_pid,
+            'self_exit': self.self_exit,
         }
 
     @classmethod
@@ -404,6 +410,7 @@ class SessionRecord:
             question=Question.from_dict(question_data) if isinstance(question_data, dict) else None,
             claude_session_id=_coerce_session_id(data.get('claude_session_id')),
             claude_owner_pid=_coerce_owner_pid(data.get('claude_owner_pid')),
+            self_exit=data.get('self_exit') is True,
         )
 
     def to_json(self) -> str:
@@ -4357,6 +4364,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
     cwd = env.get('CLAUDE_SPAWN_CWD') or os.getcwd()
     launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
     launcher_pid = int(launcher_pid_raw) if launcher_pid_raw else os.getpid()
+    self_exit = env.get('CLAUDE_SPAWN_SELF_EXIT') == '1'
 
     identity = parse_spawn_identity(env, title, prompt, cwd)
     slug = build_session_slug(identity.role, identity.project, identity.task_id, launcher_pid)
@@ -4376,6 +4384,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
         start_ts=datetime.now(UTC).isoformat(),
         result_file=str(record_dir / RESULT_FILENAME),
         transcript_path=transcript_path_for_cwd(cwd),
+        self_exit=self_exit,
     )
     write_record(record)
     with contextlib.suppress(Exception):
