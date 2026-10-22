@@ -948,9 +948,9 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     absent), whereas ``exclude_none`` now omits the key entirely in that
     case.  All known consumers (``task_interceptor.py`` and this module's
     tests) read it via ``.get('pid')``, so a missing key and an explicit
-    ``None`` are observationally identical there; extra fields such as
-    ``transient_unit`` / ``fire_delay_secs`` survive via ``DoneProvenance``'s
-    ``extra='allow'``.
+    ``None`` are observationally identical there. ``transient_unit`` and
+    ``fire_delay_secs`` are declared, typed fields of ``DoneProvenance``, so
+    a wrongly-typed value raises here too.
 
     ``kind``/``**fields`` are intentionally loosely typed (``str``/``object``):
     the six call sites forward heterogeneous field subsets, so pyright's

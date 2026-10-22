@@ -152,9 +152,29 @@ marked `done` on the strength of an unverified claim.
 | `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required; `stamped_at` written server-side (see below) |
 | `deterministic-deploy` | `DeterministicRunner` cross-unit deploy completed | — |
 | `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run` | — |
-| `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | `escalation_id` **required** — cites the resolving gate escalation, recorded verbatim (no cross-service lookup) |
+| `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | `escalation_id` **required on write** — cites the resolving gate escalation, recorded verbatim (no cross-service lookup) |
 | `deterministic-milestone` | A `kind='predicate'` milestone check exited `0` | — |
 | `operational-verified` | A `normal`-task no-code operational ask closed via a resolved escalation, not a merge | `escalation_id` **and** `note` required |
+
+The per-kind contract has one home:
+`shared/src/shared/task_metadata.py::DoneProvenance`. It holds the kind
+vocabulary, the fields each kind requires, and the evidence fields a `done`
+write records for each kind; the table above summarises it. Three rules hold
+for every kind:
+
+- **Blank means absent.** A whitespace-only value counts as missing, so
+  `commit: "  "` fails a `commit` requirement. Surrounding whitespace is
+  trimmed before the value is recorded.
+- **Evidence is type-checked, not filtered.** A wrongly-typed field such as
+  `pid: "abc"` or `fire_delay_secs: "soon"` refuses the whole write with
+  `done_provenance_invalid`; it is not silently dropped. A well-typed field
+  the kind does not record (for example `pid` on `merged`) is discarded.
+- **The `deterministic-gate` `escalation_id` requirement is write-time
+  only.** New `done` writes must carry it, while stored blobs written before
+  task 5241, which lack it, still read without a schema warning.
+
+A caller that fails a caller bar below is refused on its identity before the
+payload's shape is checked.
 
 `operational-verified` is commitless like the `deterministic-*` kinds, so
 it is likewise exempt from the reopen-freshness gate (which only inspects
