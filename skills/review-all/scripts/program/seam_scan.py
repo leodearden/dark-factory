@@ -8,6 +8,7 @@ writes nothing. Direction, Owner and Status stay ``?`` for the author's G4 rulin
 from __future__ import annotations
 
 import argparse
+import enum
 import json
 import sys
 from collections.abc import Iterable, Mapping, Sequence
@@ -18,6 +19,17 @@ from typing import Any, NamedTuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import state
+
+
+class Exit(enum.IntEnum):
+    LISTED = 0
+    UNSCANNED = 2
+
+
+_EXIT_MEANINGS: Mapping[Exit, str] = {
+    Exit.LISTED: 'the candidates, or the none-line, are listed',
+    Exit.UNSCANNED: 'the scan could not run (usage, run home, author return, or store)',
+}
 
 G4_COLUMNS = ('Other PRD', 'Direction', 'Seam mechanism', 'Owner', 'Status')
 UNRULED = '?'
@@ -40,8 +52,10 @@ class SeamCandidate:
 
 
 class Scan(NamedTuple):
+    """The candidates, and when the store was first read for them; None when it was not read."""
+
     candidates: tuple[SeamCandidate, ...]
-    measured_at: str
+    measured_at: str | None
 
 
 @dataclass(frozen=True)
@@ -66,13 +80,38 @@ def _load_run(run_id: str) -> Run:
     return Run(home, program, ledger, tuple(v.prd_path for v in views.values() if v.prd_path))
 
 
-def _author_return(run: Run, stream: str, reader: state.StoreReader) -> state.PrdReturn:
-    path = run.home.returns_file(stream, state.Pass.AUTHOR)
+def _require_stream(program: state.Program, stream: str) -> None:
+    if stream not in program.stream_ids:
+        raise state.StateError(
+            f'{stream} is not a stream of {program.run_id}; its streams are '
+            f'{", ".join(program.stream_ids)}'
+        )
+
+
+def _parsed_return(run: Run, path: Path, reader: state.StoreReader) -> state.PrdReturn:
     check = state.validate_return(
         path.read_text(), program=run.program, ledger=run.ledger, store=reader,
     )
-    assert check.value is not None
+    if check.value is None:
+        raise state.StateError(
+            f'{path} is not a valid return: ' + '; '.join(str(r) for r in check.rejections)
+        )
     return check.value
+
+
+def _author_return(run: Run, stream: str, reader: state.StoreReader) -> state.PrdReturn:
+    """The stream's applied author return, the single home of its touches."""
+    path = run.home.returns_file(stream, state.Pass.AUTHOR)
+    if not path.is_file():
+        raise state.StateError(
+            f'{stream} has no applied author return ({path} absent); seam_scan reads its touches'
+        )
+    ret = _parsed_return(run, path, reader)
+    if (ret.stream, ret.pass_) != (stream, state.Pass.AUTHOR):
+        raise state.StateError(
+            f'{path} carries the {ret.stream} {ret.pass_} return, not the {stream} author return'
+        )
+    return ret
 
 
 def _listed(value: Any) -> Sequence[Any]:
@@ -111,7 +150,8 @@ def _candidates(
 
 
 def _scan(reader: state.StoreReader, run: Run, touches: Sequence[str]) -> Scan:
-    """The candidates, and when the store was first read for them."""
+    if not touches:
+        return Scan((), None)
     reads = (
         reader.program_tasks(run.program.run_id, run.prd_paths),
         reader.tasks_declaring_files(touches),
@@ -142,8 +182,8 @@ def _candidate_line(candidate: SeamCandidate) -> str:
 
 
 def _report(ret: state.PrdReturn, scan: Scan) -> None:
-    print(f'seam_scan: {ret.stream} ({ret.prd_path}) touches {len(ret.touches)} paths; '
-          f'store read {scan.measured_at}')
+    read = 'store not read' if scan.measured_at is None else f'store read {scan.measured_at}'
+    print(f'seam_scan: {ret.stream} ({ret.prd_path}) touches {len(ret.touches)} paths; {read}')
     print(_table_row(G4_COLUMNS))
     print(_table_row(['---'] * len(G4_COLUMNS)))
     for candidate in scan.candidates:
@@ -153,19 +193,31 @@ def _report(ret: state.PrdReturn, scan: Scan) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=(__doc__ or '').partition('\n')[0])
+    parser = argparse.ArgumentParser(
+        description=(__doc__ or '').partition('\n')[0],
+        epilog='exit codes: ' + '; '.join(f'{int(e)} {m}' for e, m in _EXIT_MEANINGS.items()),
+    )
     parser.add_argument('stream', help='the stream whose applied author return to scan')
     parser.add_argument('--run', required=True, help='the run id whose home holds the return')
     return parser
 
 
+def _scan_stream(run_id: str, stream: str) -> Exit:
+    run = _load_run(run_id)
+    _require_stream(run.program, stream)
+    reader = state.open_reader(run.program)
+    ret = _author_return(run, stream, reader)
+    _report(ret, _scan(reader, run, ret.touches))
+    return Exit.LISTED
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    run = _load_run(args.run)
-    reader = state.open_reader(run.program)
-    ret = _author_return(run, args.stream, reader)
-    _report(ret, _scan(reader, run, ret.touches))
-    return 0
+    try:
+        return _scan_stream(args.run, args.stream)
+    except (state.StateError, OSError) as failed:
+        print(f'seam_scan: cannot scan: {failed}', file=sys.stderr)
+        return Exit.UNSCANNED
 
 
 if __name__ == '__main__':
