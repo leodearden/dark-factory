@@ -20,6 +20,14 @@ import home_writer
 import state
 
 
+class Anchor(enum.StrEnum):
+    """How a check anchors a move: its ``paths`` name the move's ``from``, or only its
+    ``pattern`` names a moved symbol."""
+
+    PATH = 'path'
+    SYMBOL = 'symbol'
+
+
 @dataclass(frozen=True)
 class Impact:
     task: int
@@ -27,6 +35,7 @@ class Impact:
     kind: Any
     from_path: str
     to_path: str | None
+    anchor: Anchor
 
 
 def _checks(row: state.TaskRow) -> Iterator[tuple[int, Mapping[str, Any]]]:
@@ -43,24 +52,26 @@ def _check_name(entry: Mapping[str, Any], index: int) -> str:
     return name if isinstance(name, str) and name else f'delivered_checks[{index}]'
 
 
-def _anchors(entry: Mapping[str, Any], move: state.Move) -> bool:
+def _anchor(entry: Mapping[str, Any], move: state.Move) -> Anchor | None:
     paths = entry.get('paths')
-    named = isinstance(paths, list | tuple) and move.from_path in [
+    if isinstance(paths, list | tuple) and move.from_path in [
         path for path in paths if isinstance(path, str)
-    ]
+    ]:
+        return Anchor.PATH
     pattern = entry.get('pattern')
-    return named or (
-        isinstance(pattern, str) and any(symbol and symbol in pattern for symbol in move.symbols)
-    )
+    if isinstance(pattern, str) and any(symbol and symbol in pattern for symbol in move.symbols):
+        return Anchor.SYMBOL
+    return None
 
 
 def impact_scan(moves: Sequence[state.Move], rows: Sequence[state.TaskRow]) -> tuple[Impact, ...]:
     """Each (move, task, check) whose check names the move's ``from`` in ``paths`` or whose ``pattern`` contains a moved symbol."""
     ordered = sorted(rows, key=lambda row: row.task_id)
     return tuple(
-        Impact(row.task_id, _check_name(entry, index), entry.get('kind'), move.from_path, move.to_path)
+        Impact(row.task_id, _check_name(entry, index), entry.get('kind'), move.from_path,
+               move.to_path, anchor)
         for move in moves for row in ordered for index, entry in _checks(row)
-        if _anchors(entry, move)
+        if (anchor := _anchor(entry, move)) is not None
     )
 
 
@@ -139,8 +150,7 @@ _RECIPES: Mapping[state.LeadActionOp, str] = types.MappingProxyType({
         'untouched; (2) the sidecar yaml that '
         '`shared/src/shared/capability_manifest.py::sidecar_path` names for the task\'s '
         '`metadata.prd_path`, when it has one; (3) that sidecar\'s md twin. Edit the two files '
-        f'on disk under the project root and list both in `{DIRTIED}`. A check whose `paths` '
-        f'does not list the old path matched on a moved symbol only: `{_KEPT}`.'
+        f'on disk under the project root and list both in `{DIRTIED}`.'
     ),
     state.LeadActionOp.RELEASE: (
         '`target` lists the ids the held leaf waits on; `text` is the contract as delivered. In '
@@ -258,6 +268,16 @@ def _prompt(program: state.Program, files: state.BatchFiles, number: int) -> str
 
 
 DELETED_PATH = 'check anchors a deleted path'
+SYMBOL_ONLY = 'check names a moved symbol in its pattern but not the old path in its paths'
+
+
+def _held_for_human(impact: Impact) -> str | None:
+    """Why the repath of *impact* is a judgement call, or None when the clerk applies it as given."""
+    if impact.to_path is None:
+        return DELETED_PATH
+    if impact.anchor is Anchor.SYMBOL:
+        return SYMBOL_ONLY
+    return None
 
 
 @dataclass(frozen=True)
@@ -327,17 +347,19 @@ def _checked_rows(program: state.Program, pending: Sequence[_DecomposeReturn]) -
 
 
 def _repath_fields(ret: _DecomposeReturn, impact: Impact) -> dict[str, Any]:
-    anchor = f'check {impact.check} (kind {impact.kind}) anchors {impact.from_path}'
+    named = (f'anchors {impact.from_path}' if impact.anchor is Anchor.PATH
+             else f'names a symbol moved from {impact.from_path}')
     moved = ', which the stream deletes' if impact.to_path is None else f', moved to {impact.to_path}'
     return {
         'lead_op': str(state.LeadActionOp.REPATH), 'task': impact.task, 'target': impact.to_path,
-        'text': anchor + moved, 'needs_human': impact.to_path is None, 'return': ret.name,
+        'text': f'check {impact.check} (kind {impact.kind}) {named}{moved}',
+        'needs_human': _held_for_human(impact) is not None, 'return': ret.name,
     }
 
 
-def _kept_for_human(action_id: str) -> dict[str, Any]:
+def _kept_for_human(action_id: str, why: str) -> dict[str, Any]:
     return {'id': action_id, 'state': str(state.ActionResultState.KEPT_FOR_HUMAN), 'batch': None,
-            'detail': DELETED_PATH}
+            'detail': why}
 
 
 _Entry = tuple[state.LedgerOp, Mapping[str, Any]]
@@ -355,18 +377,20 @@ def _scan_lines(
     snapshot: home_writer.Snapshot, pending: Sequence[_DecomposeReturn],
     rows: Sequence[state.TaskRow],
 ) -> tuple[dict[str, Any], ...]:
-    """Per return: one repath action per impact, a kept-for-human result for each deleted path,
-    then the return's ``scanned`` line naming every action minted for it."""
+    """Per return: one repath action per impact, a kept-for-human result for each impact held
+    for a human, then the return's ``scanned`` line naming every action minted for it."""
     lines: list[dict[str, Any]] = []
     for ret in pending:
         impacts = impact_scan(ret.moves, rows)
         actions = _stamped(snapshot, lines, [
             (state.LedgerOp.ACTION, _repath_fields(ret, impact)) for impact in impacts
         ])
+        held = [(action['id'], _held_for_human(impact))
+                for action, impact in zip(actions, impacts, strict=True)]
         lines += actions
         lines += _stamped(snapshot, lines, [
-            *((state.LedgerOp.ACTION_RESULT, _kept_for_human(action['id']))
-              for action, impact in zip(actions, impacts, strict=True) if impact.to_path is None),
+            *((state.LedgerOp.ACTION_RESULT, _kept_for_human(action_id, why))
+              for action_id, why in held if why is not None),
             (state.LedgerOp.SCANNED, {'return': ret.name, 'repaths': [a['id'] for a in actions]}),
         ])
     return tuple(lines)

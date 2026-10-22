@@ -101,6 +101,16 @@ def test_the_fixture_check_matching_by_path_and_by_symbol_is_one_impact() -> Non
     assert impacts == [(203, 'old-thing-defined', 'grep', OLD, NEW)]
 
 
+def test_a_check_naming_the_path_is_anchored_by_path_and_one_naming_a_symbol_only_by_symbol() -> None:
+    rows = [
+        _row(203, _fixture_checks(203)),
+        _row(206, [_check('symbol-only', kind='grep', paths=['src/other.py'],
+                          pattern=r'^class OldThing\b')]),
+    ]
+    anchors = [(i.task, i.anchor) for i in clerk.impact_scan([_move(OLD, NEW, 'OldThing')], rows)]
+    assert anchors == [(203, 'path'), (206, 'symbol')]
+
+
 def test_a_deleted_path_is_an_impact_with_no_new_path() -> None:
     row = _row(204, _fixture_checks(204), status='in-progress')
     assert _impacts([_move(REMOVED, None)], [row]) == [
@@ -376,10 +386,16 @@ def _without_text(line: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in line.items() if key != 'text'}
 
 
-def _repath(action_id: str, seq: int, task: int, target: str | None, ret: str) -> dict[str, Any]:
+def _repath(
+    action_id: str, seq: int, task: int, target: str | None, ret: str, *, needs_human: bool = False,
+) -> dict[str, Any]:
     return {'seq': seq, 'by': 'clerk_batch.py', 'op': 'action', 'id': action_id,
-            'lead_op': 'repath', 'task': task, 'target': target, 'needs_human': target is None,
+            'lead_op': 'repath', 'task': task, 'target': target, 'needs_human': needs_human,
             'return': ret}
+
+
+def _kept(action_id: str, seq: int, why: str) -> dict[str, Any]:
+    return {'seq': seq, 'by': 'clerk_batch.py', **_action_result(action_id, 'kept-for-human', None, why)}
 
 
 def _scanned_home(env: ProgramEnv, store: FakeStore) -> tuple[Any, subprocess.CompletedProcess[str]]:
@@ -398,9 +414,8 @@ def test_b4_the_scan_ledgers_one_repath_per_anchored_check_and_a_deleted_path_fo
     appended = _appended(home, len(BASE_LEDGER))
     assert [_without_text(line) for line in appended] == [
         _repath('A4', 6, 203, NEW, S1_DECOMPOSE),
-        _repath('A5', 7, 204, None, S1_DECOMPOSE),
-        {'seq': 8, 'by': 'clerk_batch.py', 'op': 'action_result', 'id': 'A5',
-         'state': 'kept-for-human', 'batch': None, 'detail': 'check anchors a deleted path'},
+        _repath('A5', 7, 204, None, S1_DECOMPOSE, needs_human=True),
+        _kept('A5', 8, 'check anchors a deleted path'),
         {'seq': 9, 'by': 'clerk_batch.py', 'op': 'scanned', 'return': S1_DECOMPOSE,
          'repaths': ('A4', 'A5')},
     ]
@@ -438,17 +453,27 @@ def test_a_return_with_no_moves_is_scanned_with_nothing_and_no_store_read(env: P
     ]
 
 
-def test_an_amended_return_is_scanned_for_its_new_moves_only(
-    env: ProgramEnv, store: FakeStore,
-) -> None:
+def _scanned_amendment(
+    env: ProgramEnv, store: FakeStore, move: Mapping[str, Any],
+) -> tuple[Any, int, subprocess.CompletedProcess[str]]:
+    """The scanned base home, its S1 decompose amended to add *move*, then scanned again; the
+    ledger's length between the two scans."""
     home, first = _scanned_home(env, store)
     assert first.returncode == 0, _output(first)
     amended = json.loads((FIXTURE_RETURNS / 'S1.decompose.json').read_text())
-    amended['moves'].append({'from': SEAM, 'to': SEAM_V2, 'symbols': []})
+    amended['moves'].append(dict(move))
     (home.root / S1_AMEND).write_text(json.dumps(amended))
     _append(home, [_status('decomposed', S1_AMEND)])
     scanned = len(state.read_ledger(home))
-    proc = _write(dataclasses.replace(env, store_url=store.url), '--scan')
+    return home, scanned, _write(dataclasses.replace(env, store_url=store.url), '--scan')
+
+
+def test_an_amended_return_is_scanned_for_its_new_moves_only(
+    env: ProgramEnv, store: FakeStore,
+) -> None:
+    home, scanned, proc = _scanned_amendment(
+        env, store, {'from': SEAM, 'to': SEAM_V2, 'symbols': []},
+    )
     assert proc.returncode == 0, _output(proc)
     appended = _appended(home, scanned)
     assert [_without_text(line) for line in appended] == [
@@ -457,6 +482,25 @@ def test_an_amended_return_is_scanned_for_its_new_moves_only(
          'repaths': ('A6',)},
     ]
     assert 'seam-contract-defined' in appended[0]['text']
+
+
+def test_a_check_matching_a_moved_symbol_only_is_kept_for_a_human_and_never_batched(
+    env: ProgramEnv, store: FakeStore,
+) -> None:
+    home, scanned, proc = _scanned_amendment(
+        env, store,
+        {'from': 'src/fixture/seam_impl.py', 'to': SEAM_V2, 'symbols': ['seam_contract']},
+    )
+    assert proc.returncode == 0, _output(proc)
+    appended = _appended(home, scanned)
+    assert [_without_text(line) for line in appended] == [
+        _repath('A6', scanned + 1, 202, SEAM_V2, S1_AMEND, needs_human=True),
+        _kept('A6', scanned + 2, clerk.SYMBOL_ONLY),
+        {'seq': scanned + 3, 'by': 'clerk_batch.py', 'op': 'scanned', 'return': S1_AMEND,
+         'repaths': ('A6',)},
+    ]
+    assert 'seam-contract-defined' in appended[0]['text']
+    assert [action['id'] for action in _batch(home, 2)['actions']] == ['A1', 'A2', 'A4']
 
 
 def test_a_move_to_scan_with_no_store_writes_nothing(env: ProgramEnv) -> None:
