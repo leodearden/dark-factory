@@ -679,6 +679,10 @@ carries the brief. Check "Always ask — keyed on record content" below first: i
    lease operation that stays forbidden.
 9. Launching a retain-and-tag, zero-deletion `/curate-fused-memories` sitting for consolidation
    gates (ratified 2026-09-25).
+10. Closing a `__stale_l0_strand_sweep__` record with `close_only` once each stranded note it
+    names has been recovered from `data/escalations/archive/<date>/` and routed: appended to a
+    `pending` owner task (line 5), or filed to the owner task of its class. The resolution names
+    where each note went (Leo, 2026-10-22, on scoping_intake's esc-__stale_l0_strand_sweep__-6).
 
 #### Always ask — keyed on record content
 
