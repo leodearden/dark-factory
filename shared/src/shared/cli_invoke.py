@@ -21,7 +21,7 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard, TypeVar
 
 from shared.cost_store import CapReason
 from shared.proc_group import snapshot_process_group, terminate_process_group
-from shared.process_cost import ProcessCostBasis, derive_process_cost
+from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
@@ -2253,13 +2253,15 @@ def _backend_window_wait_secs(resets_at: datetime | None, hits: int, now: dateti
 def _reset_for_fresh_retry(invoke_kwargs: dict[str, Any], original_prompt: str) -> None:
     """Switch the retry loop to a fresh (non-resume) invocation.
 
-    Drops the resume session, restores the real task prompt, and regenerates a
-    pre-allocated session_id *when one was set* — the prior failed attempt may have
-    already committed that UUID to disk, and reusing it on a fresh `--session-id`
-    makes the CLI exit instantly with 'Session ID … is already in use'
-    (the 2026-05-26 reify-3604 wedge). Callers that pass no session_id keep none.
+    Drops the resume session and its prior total, restores the real task
+    prompt, and regenerates a pre-allocated session_id *when one was set* — the
+    prior failed attempt may have already committed that UUID to disk, and
+    reusing it on a fresh `--session-id` makes the CLI exit instantly with
+    'Session ID … is already in use' (the 2026-05-26 reify-3604 wedge).
+    Callers that pass no session_id keep none.
     """
     invoke_kwargs.pop('resume_session_id', None)
+    invoke_kwargs.pop('resume_prior_total_cost_usd', None)
     invoke_kwargs['prompt'] = original_prompt
     if invoke_kwargs.get('session_id'):
         invoke_kwargs['session_id'] = str(uuid.uuid4())
@@ -3210,6 +3212,16 @@ async def invoke_with_cap_retry(
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         resume_or_fresh = 'fresh (no resumable progress)'
                     else:
+                        prior = next_resume_prior(
+                            armed_session_id=invoke_kwargs.get('resume_session_id'),
+                            armed_prior_usd=invoke_kwargs.get('resume_prior_total_cost_usd'),
+                            result_session_id=result.session_id,
+                            result_reported_total_usd=result.reported_total_cost_usd,
+                        )
+                        if prior is None:
+                            invoke_kwargs.pop('resume_prior_total_cost_usd', None)
+                        else:
+                            invoke_kwargs['resume_prior_total_cost_usd'] = prior
                         invoke_kwargs['resume_session_id'] = result.session_id
                         invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
                         # Distinguish a VERIFIED resume from an unverified one:
