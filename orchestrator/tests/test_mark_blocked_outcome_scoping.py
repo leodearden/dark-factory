@@ -15,16 +15,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
+from _git_fixtures import seed_repo
+from _workflow_helpers import (
+    GIT_REPO_SEED,
+    FakeBriefing,
+    FakeMcp,
+    FakeScheduler,
+    _config,
+    _make_git_ops,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from orchestrator.config import GitConfig, OrchestratorConfig, UnblockAutoConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.config import UnblockAutoConfig
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.workflow_types import PublishedStewardOutcome, StewardResolved
@@ -36,34 +42,7 @@ FOLD_FINGERPRINT = 'fp-5563'
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
-    return repo
-
-
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'lib.py').write_text('def greet(name): return name\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
-def _config(git_repo: Path, *, completion_timeout: float) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        project_root=git_repo,
-        max_concurrent_tasks=1,
-        steward_completion_timeout=completion_timeout,
-        unblock_auto=UnblockAutoConfig(enabled=False),
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    )
+    return seed_repo(tmp_path / 'repo', GIT_REPO_SEED)
 
 
 @pytest.fixture
@@ -105,22 +84,25 @@ def _submit_l0(
 
 def _make_busy_on_older_l0_steward(
     queue: EscalationQueue, older_id: str, *, then_resolve_new: bool,
-) -> tuple[Callable[[Path, Path | None], object], list]:
-    """A steward that is still working the OLDER L0 when ``_mark_blocked`` waits.
+) -> type:
+    """A steward class still working the OLDER L0 when ``_mark_blocked`` waits.
 
     It resolves *older_id* first and publishes that outcome tagged with
     *older_id*, as ``TaskSteward`` does.  With *then_resolve_new* it then
     resolves every other pending L0, publishing one envelope per record tagged
     with that record's own id.
 
-    Returns the factory and the list every built instance is appended to, so
-    teardown can stop them without reaching into the workflow.
+    The class is itself the ``steward_factory``; every built instance lands in
+    ``instances``, so teardown can stop them without reaching into the workflow.
     """
 
     class _FakeSteward:
-        def __init__(self) -> None:
+        instances: list[_FakeSteward] = []
+
+        def __init__(self, wt_path: Path, cfg_dir: Path | None) -> None:  # noqa: ARG002
             self._outcome_channel: asyncio.Queue[PublishedStewardOutcome] | None = None
             self._work: asyncio.Task | None = None
+            _FakeSteward.instances.append(self)
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
@@ -153,26 +135,23 @@ def _make_busy_on_older_l0_steward(
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._work
 
-    built: list[_FakeSteward] = []
-
-    def factory(wt_path: Path, cfg_dir: Path | None) -> _FakeSteward:  # noqa: ARG001
-        steward = _FakeSteward()
-        built.append(steward)
-        return steward
-
-    return factory, built
+    return _FakeSteward
 
 
 async def _build_workflow(
     git_repo: Path,
     assignment: TaskAssignment,
     queue: EscalationQueue,
-    steward_factory: Callable[[Path, Path | None], object],
+    steward_factory: type,
     *,
     completion_timeout: float,
 ) -> tuple[TaskWorkflow, FakeScheduler]:
-    config = _config(git_repo, completion_timeout=completion_timeout)
-    git_ops = GitOps(config.git, config.project_root)
+    config = _config(
+        git_repo,
+        steward_completion_timeout=completion_timeout,
+        unblock_auto=UnblockAutoConfig(enabled=False),
+    )
+    git_ops = _make_git_ops(git_repo)
     scheduler = FakeScheduler()
     workflow = TaskWorkflow(
         assignment=assignment,
@@ -199,8 +178,8 @@ def _new_l0_ids(queue: EscalationQueue, *known: str) -> list[str]:
     ]
 
 
-async def _stop_all(built: list) -> None:
-    for steward in built:
+async def _stop_all(steward_cls: type) -> None:
+    for steward in steward_cls.instances:
         await steward.stop()
 
 
@@ -213,11 +192,11 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
     ):
         queue = EscalationQueue(tmp_path / 'queue')
         older = _submit_l0(queue, category='design_concern', summary='older blocker')
-        factory, built = _make_busy_on_older_l0_steward(
+        steward_cls = _make_busy_on_older_l0_steward(
             queue, older.id, then_resolve_new=False,
         )
         workflow, scheduler = await _build_workflow(
-            git_repo, task_assignment, queue, factory, completion_timeout=0.5,
+            git_repo, task_assignment, queue, steward_cls, completion_timeout=0.5,
         )
 
         try:
@@ -229,7 +208,7 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
                 10,
             )
         finally:
-            await _stop_all(built)
+            await _stop_all(steward_cls)
 
         assert outcome == WorkflowOutcome.BLOCKED, (
             "the older L0's StewardResolved must not end the wait for the new L0"
@@ -249,11 +228,11 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
     ):
         queue = EscalationQueue(tmp_path / 'queue')
         older = _submit_l0(queue, category='design_concern', summary='older blocker')
-        factory, built = _make_busy_on_older_l0_steward(
+        steward_cls = _make_busy_on_older_l0_steward(
             queue, older.id, then_resolve_new=True,
         )
         workflow, _scheduler = await _build_workflow(
-            git_repo, task_assignment, queue, factory, completion_timeout=5.0,
+            git_repo, task_assignment, queue, steward_cls, completion_timeout=5.0,
         )
 
         try:
@@ -264,7 +243,7 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             [new_id] = _new_l0_ids(queue, older.id)
             new_status_at_return = queue.get(new_id).status  # type: ignore[union-attr]
         finally:
-            await _stop_all(built)
+            await _stop_all(steward_cls)
 
         assert outcome == WorkflowOutcome.REQUEUED
         assert new_status_at_return == 'resolved', (
@@ -280,11 +259,11 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             queue, category=FOLD_CATEGORY, summary='inherited break',
             dedupe_fingerprint=FOLD_FINGERPRINT,
         )
-        factory, built = _make_busy_on_older_l0_steward(
+        steward_cls = _make_busy_on_older_l0_steward(
             queue, older.id, then_resolve_new=True,
         )
         workflow, _scheduler = await _build_workflow(
-            git_repo, task_assignment, queue, factory, completion_timeout=5.0,
+            git_repo, task_assignment, queue, steward_cls, completion_timeout=5.0,
         )
 
         try:
@@ -298,7 +277,7 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             )
             parent_status_at_return = queue.get(parent.id).status  # type: ignore[union-attr]
         finally:
-            await _stop_all(built)
+            await _stop_all(steward_cls)
 
         assert _new_l0_ids(queue, older.id, parent.id) == [], (
             'precondition: the filing must have folded into the parent'
