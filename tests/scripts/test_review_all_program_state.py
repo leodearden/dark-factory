@@ -85,7 +85,7 @@ def test_wire_constants() -> None:
     )
     assert set(state.LEDGER_OPS) == {
         'stream_status', 'amend_stream', 'amend_program', 'xref', 'action',
-        'action_result', 'scanned', 'note', 'commit',
+        'action_result', 'scanned', 'note', 'commit', 'question',
     }
     active = tuple(sorted(str(s) for s in task_statuses.ACTIVE))
     assert active == state.NON_TERMINAL_STATUSES
@@ -514,6 +514,48 @@ def test_append_ledger_refuses_a_line_its_op_does_not_describe(
     home = state.Home(tmp_path)
     with pytest.raises(state.LedgerRefused, match=named):
         state.append_ledger(home, [line])
+    assert not home.ledger.exists() or home.ledger.read_bytes() == b''
+
+
+_DROPPED = object()
+
+
+def _question(seq: int, **overrides: Any) -> dict[str, Any]:
+    fields = {
+        'stream': 'S1', 'id': 'Q2', 'question': 'Does beta own the retry budget?',
+        'options': ['beta owns it', 'alpha owns it'], 'recommendation': 'beta owns it',
+        'needs_human': True, 'lead_rulable': False, 'source': 'critic',
+        'return': 'returns/S1.author.amend-1.json', **overrides,
+    }
+    return _line(seq, 'question', **{k: v for k, v in fields.items() if v is not _DROPPED})
+
+
+def test_append_ledger_accepts_a_question_line(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    state.append_ledger(home, [_question(1)])
+    (line,) = state.read_ledger(home)
+    assert line['op'] == 'question'
+    assert (line['stream'], line['id'], line['source']) == ('S1', 'Q2', 'critic')
+    assert line['return'] == 'returns/S1.author.amend-1.json'
+
+
+@pytest.mark.parametrize(
+    ('overrides', 'named'),
+    [
+        ({'source': 'reviewer'}, ['source']),
+        ({'recommendation': _DROPPED}, ['recommendation', 'is required']),
+        ({'answer': 'beta owns it'}, ['answer']),
+    ],
+    ids=['source-outside-enum', 'missing-recommendation', 'unknown-field'],
+)
+def test_append_ledger_refuses_a_malformed_question_line(
+    overrides: dict[str, Any], named: list[str], tmp_path: Path,
+) -> None:
+    home = state.Home(tmp_path)
+    with pytest.raises(state.LedgerRefused) as caught:
+        state.append_ledger(home, [_question(1, **overrides)])
+    for text in named:
+        assert text in str(caught.value)
     assert not home.ledger.exists() or home.ledger.read_bytes() == b''
 
 
