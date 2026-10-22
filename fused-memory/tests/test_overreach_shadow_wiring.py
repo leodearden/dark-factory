@@ -124,11 +124,13 @@ async def live(mock_config):
 
 
 async def _completed(svc: MemoryService, count: int) -> None:
+    """Every queued row has completed, at least *count* of them: add_episode queues a follow-up."""
     async def done() -> bool:
         assert svc.durable_queue is not None
-        stats = await svc.durable_queue.get_stats()
-        return stats['counts'].get('completed') == count
-    await poll_until(done, message=f'the queue never completed {count} write(s)')
+        counts = (await svc.durable_queue.get_stats())['counts']
+        live_states = {state for state, rows in counts.items() if rows}
+        return live_states == {'completed'} and counts['completed'] >= count
+    await poll_until(done, message=f'the queue never settled with {count} completed write(s)')
 
 
 async def _flagged(svc: MemoryService) -> list[str]:
