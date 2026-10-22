@@ -24,13 +24,11 @@ Rater output lives in ``<scratch>/ratings/<shard>.jsonl``, one line per item.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import math
 import random
 import sqlite3
 import sys
-import types
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import closing
@@ -48,32 +46,15 @@ from fused_memory.server.write_triage import (
     OUTCOME_JUDGE,
     OUTCOME_RESTATED,
 )
+from fused_memory.utils.script_loader import load_script
 
 _SCRIPTS = Path(__file__).resolve().parent
-
-
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
 
 
 if TYPE_CHECKING:
     import write_triage_reader_rubric as _rubric
 else:
-    _rubric = _load_script(_SCRIPTS / 'write_triage_reader_rubric.py', 'write_triage_reader_rubric')
+    _rubric = load_script(_SCRIPTS / 'write_triage_reader_rubric.py', 'write_triage_reader_rubric')
 
 Binary = _rubric.Binary
 Answer = _rubric.Answer
