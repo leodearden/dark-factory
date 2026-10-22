@@ -632,6 +632,7 @@ def _run_spawn(
     timeout: int = 30,
     title: str = "",
     scale_timeout: bool = True,
+    prompt_args: tuple[str, ...] = ("test prompt",),
 ) -> subprocess.CompletedProcess[bytes]:
     """Invoke spawn-claude.sh and return its completed process.
 
@@ -658,7 +659,7 @@ def _run_spawn(
     """
     budget = _spawn_run_budget(timeout) if scale_timeout else timeout
     return subprocess.run(
-        [str(SPAWN_SCRIPT), str(cwd), "false", title, "test prompt"],
+        [str(SPAWN_SCRIPT), str(cwd), "false", title, *prompt_args],
         env=env,
         capture_output=True,
         timeout=budget,
@@ -1069,16 +1070,133 @@ def test_no_emulator_found_yields_126(tmp_path: pathlib.Path) -> None:
     )
 
 
-def test_bad_usage_yields_2(tmp_path: pathlib.Path) -> None:
-    """Passing wrong number of arguments must exit 2."""
+@pytest.mark.parametrize("tail", [
+    ["only-one-arg"],
+    ["{cwd}", "false", "t", "--prompt-file"],
+    ["{cwd}", "false", "t", "--prompt-file", "{brief}", "extra"],
+    ["{cwd}", "false", "t", "--not-the-flag", "{brief}"],
+])
+def test_bad_usage_yields_2(tmp_path: pathlib.Path, tail: list[str]) -> None:
+    """A wrong argument count, or a fifth argument without --prompt-file before it, must exit 2."""
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+    _write_foreground_terminal(bin_dir, "xterm")
+    brief = tmp_path / "brief.md"
+    brief.write_text("a brief\n")
+    argv = [arg.format(cwd=tmp_path, brief=brief) for arg in tail]
+
     result = subprocess.run(
-        [str(SPAWN_SCRIPT), "only-one-arg"],
+        [str(SPAWN_SCRIPT), *argv],
+        env=_base_env(bin_dir, "xterm"),
         capture_output=True,
         timeout=_spawn_run_budget(5),
     )
     assert result.returncode == 2, (
         f"Bad usage must yield 2, got {result.returncode}"
     )
+
+
+# ===========================================================================
+# --prompt-file: a pointer prompt names the brief instead of carrying it
+# ===========================================================================
+# tmux refuses a command longer than this many bytes (measured); a brief of
+# any size must stay under it because only its path reaches the launcher.
+_TMUX_COMMAND_LIMIT = 16_240
+
+
+def _assert_refused_before_launch(
+    result: subprocess.CompletedProcess[bytes], env: dict[str, str], capture_file: pathlib.Path,
+) -> str:
+    assert result.returncode == 2, f"stderr: {result.stderr.decode()}"
+    assert not capture_file.exists(), "claude must never run on a refused --prompt-file"
+    assert not list(pathlib.Path(env["CLAUDE_FLEET_ROOT"]).glob("sessions/*/record.json")), (
+        "a refused --prompt-file must write no session record"
+    )
+    return result.stderr.decode()
+
+
+def test_prompt_file_launches_a_pointer_prompt_recorded_as_the_prompt(
+    tmp_path: pathlib.Path,
+) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_prompt.txt"
+    _write_fake_claude_capturing_prompt(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    brief = tmp_path / "briefs" / "S1.author.md"
+    brief.parent.mkdir()
+    marker = "UNIQUE-BRIEF-MARKER-7179"
+    brief.write_text(f"# S1 author brief\n{marker}\n")
+
+    result = _run_spawn(env, tmp_path, prompt_args=("--prompt-file", str(brief)))
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    record = session_registry.SessionRecord.from_json(
+        _find_one_record(pathlib.Path(env["CLAUDE_FLEET_ROOT"])).read_text()
+    )
+    captured = capture_file.read_text()
+    assert str(brief) in record.prompt
+    assert marker not in record.prompt
+    assert marker not in captured
+    assert captured.startswith(record.prompt)
+    assert record.result_file and record.result_file in captured
+
+
+def test_prompt_file_launcher_command_does_not_grow_with_the_brief(
+    tmp_path: pathlib.Path,
+) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+    command_log = tmp_path / "tmux_command_lengths.log"
+    _write_fake_tmux(bin_dir, tmp_path / "tmux_used", command_log=command_log)
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    env["CLAUDE_SPAWN_PROJECT"] = "proj"
+    brief = tmp_path / "briefs" / "S1.author.md"
+    brief.parent.mkdir()
+    big_brief = "b" * 65_536
+
+    for content in ("s" * 1024, big_brief):
+        brief.write_text(content)
+        result = _run_spawn(env, tmp_path, prompt_args=("--prompt-file", str(brief)))
+        assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    result = _run_spawn(env, tmp_path, prompt_args=(big_brief,))
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    small, large, inline = (int(line) for line in command_log.read_text().split())
+    assert small < _TMUX_COMMAND_LIMIT
+    assert large < _TMUX_COMMAND_LIMIT
+    assert abs(large - small) < 64, "only pid digits in the slug may differ between the two pointer launches"
+    assert inline > len(big_brief), "the measurement must see an inlined prompt's size"
+
+
+def test_prompt_file_relative_path_is_refused(tmp_path: pathlib.Path) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_prompt.txt"
+    _write_fake_claude_capturing_prompt(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    (tmp_path / "briefs").mkdir()
+    (tmp_path / "briefs" / "S1.author.md").write_text("a brief\n")
+
+    result = _run_spawn(env, tmp_path, prompt_args=("--prompt-file", "briefs/S1.author.md"))
+
+    stderr = _assert_refused_before_launch(result, env, capture_file)
+    assert "absolute" in stderr and "briefs/S1.author.md" in stderr
+
+
+def test_prompt_file_missing_file_is_refused(tmp_path: pathlib.Path) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_prompt.txt"
+    _write_fake_claude_capturing_prompt(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    missing = tmp_path / "briefs" / "absent.md"
+
+    result = _run_spawn(env, tmp_path, prompt_args=("--prompt-file", str(missing)))
+
+    stderr = _assert_refused_before_launch(result, env, capture_file)
+    assert str(missing) in stderr
 
 
 # ===========================================================================
@@ -2826,7 +2944,10 @@ def test_spawn_omits_wm_title_export_when_title_empty(tmp_path: pathlib.Path) ->
 
 
 def _write_fake_tmux(
-    bin_dir: pathlib.Path, marker: pathlib.Path, target: str = "fleet-proj:0"
+    bin_dir: pathlib.Path,
+    marker: pathlib.Path,
+    target: str = "fleet-proj:0",
+    command_log: pathlib.Path | None = None,
 ) -> None:
     """Write a fake ``tmux`` binary (Fleet Cockpit C6 tmux lane).
 
@@ -2842,7 +2963,13 @@ def _write_fake_tmux(
     and exit 0 -- so the command substitution ``$(tmux ...)`` in
     spawn-claude.sh returns almost immediately while the payload keeps
     running in the background, matching a real `tmux new-window` call.
+    With *command_log*, each ``new-session``/``new-window`` first appends the
+    byte length of its whole argv, the figure tmux's command-length limit
+    applies to.
     """
+    log_length = (
+        f"printf '%s' \"$*\" | wc -c >> {command_log!s}" if command_log else ":"
+    )
     script = textwrap.dedent(f"""\
         #!/usr/bin/env bash
         case "$1" in
@@ -2850,6 +2977,7 @@ def _write_fake_tmux(
             exit 1
             ;;
           new-session|new-window)
+            {log_length}
             touch {marker!s}
             while [[ $# -gt 0 ]]; do
               if [[ "$1" == "bash" ]]; then
