@@ -107,8 +107,7 @@ def _rule(args: argparse.Namespace) -> int:
     return 0
 
 
-def _rule_parser(commands: Any) -> None:
-    rule = commands.add_parser('rule', help='record one ruling under a freshly minted D/L id')
+def _configure_rule(rule: argparse.ArgumentParser) -> None:
     rule.add_argument('--run', required=True, help='the run id whose home records the ruling')
     rule.add_argument('--by', required=True, choices=[str(r) for r in state.RuledBy])
     rule.add_argument('--question', required=True)
@@ -132,7 +131,7 @@ def _parser() -> argparse.ArgumentParser:
     init = commands.add_parser('init', help='validate program.json and create the run home')
     init.add_argument('program_json', type=Path)
     init.set_defaults(handler=_init)
-    _rule_parser(commands)
+    _configure_rule(commands.add_parser('rule', help='record one ruling under a freshly minted D/L id'))
     return parser
 
 

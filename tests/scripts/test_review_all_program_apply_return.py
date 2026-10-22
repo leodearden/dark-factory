@@ -38,7 +38,7 @@ def env(tmp_path: Path, store: FakeStore) -> ProgramEnv:
     return env
 
 
-def _output(proc: Any) -> str:
+def _output(proc: subprocess.CompletedProcess[str]) -> str:
     return proc.stdout + proc.stderr
 
 
