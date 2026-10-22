@@ -85,7 +85,7 @@ def test_wire_constants() -> None:
     )
     assert set(state.LEDGER_OPS) == {
         'stream_status', 'amend_stream', 'amend_program', 'xref', 'action',
-        'action_result', 'scanned', 'note', 'commit',
+        'action_result', 'scanned', 'note', 'commit', 'question',
     }
     active = tuple(sorted(str(s) for s in task_statuses.ACTIVE))
     assert active == state.NON_TERMINAL_STATUSES
@@ -355,6 +355,30 @@ def test_stream_of_refuses_keys_that_hit_two_streams() -> None:
     assert 'S1' in message and 'S2' in message
 
 
+_WAIT = {'stream': 'S2', 'contract': 'C1', 'release_owner': 'S2'}
+
+
+def test_a_held_leaf_carries_a_seam_wait_and_no_release() -> None:
+    assert state.is_held(_row(1, x_seam_wait=_WAIT))
+    assert not state.is_held(_row(2, x_seam_wait=_WAIT, x_seam_released={'by': 'S2'}))
+    assert not state.is_held(_row(3))
+
+
+def test_seam_keys_read_a_declared_field_and_refuse_an_undeclared_one() -> None:
+    row = _row(1, x_seam_wait=_WAIT)
+    assert state.SEAM_WAIT_KEYS.value(row, 'contract') == 'C1'
+    assert state.SEAM_RELEASED_KEYS.value(row, 'by') is None
+    with pytest.raises(state.StateError, match="no field 'owner'"):
+        state.SEAM_WAIT_KEYS.value(row, 'owner')
+
+
+def test_unauthored_reason_names_the_missing_authored_line() -> None:
+    program = _program()
+    reason = state.unauthored_reason(state.stream_views(program, ())['S1'])
+    assert reason is not None and 'S1' in reason and 'authored' in reason
+    assert state.unauthored_reason(state.stream_views(program, [_authored(1, 'S1')])['S1']) is None
+
+
 RUN_ID = 'review-all-fixture-20261019'
 
 
@@ -515,6 +539,101 @@ def test_append_ledger_refuses_a_line_its_op_does_not_describe(
     with pytest.raises(state.LedgerRefused, match=named):
         state.append_ledger(home, [line])
     assert not home.ledger.exists() or home.ledger.read_bytes() == b''
+
+
+_DROPPED = object()
+
+
+def _question(seq: int, **overrides: Any) -> dict[str, Any]:
+    fields = {
+        'stream': 'S1', 'id': 'Q2', 'question': 'Does beta own the retry budget?',
+        'options': ['beta owns it', 'alpha owns it'], 'recommendation': 'beta owns it',
+        'needs_human': True, 'lead_rulable': False, 'source': 'critic',
+        'return': 'returns/S1.author.amend-1.json', **overrides,
+    }
+    return _line(seq, 'question', **{k: v for k, v in fields.items() if v is not _DROPPED})
+
+
+def test_append_ledger_accepts_a_question_line(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    state.append_ledger(home, [_question(1)])
+    (line,) = state.read_ledger(home)
+    assert line['op'] == 'question'
+    assert (line['stream'], line['id'], line['source']) == ('S1', 'Q2', 'critic')
+    assert line['return'] == 'returns/S1.author.amend-1.json'
+
+
+@pytest.mark.parametrize(
+    ('overrides', 'named'),
+    [
+        ({'source': 'reviewer'}, ['source']),
+        ({'recommendation': _DROPPED}, ['recommendation', 'is required']),
+        ({'answer': 'beta owns it'}, ['answer']),
+    ],
+    ids=['source-outside-enum', 'missing-recommendation', 'unknown-field'],
+)
+def test_append_ledger_refuses_a_malformed_question_line(
+    overrides: dict[str, Any], named: list[str], tmp_path: Path,
+) -> None:
+    home = state.Home(tmp_path)
+    with pytest.raises(state.LedgerRefused) as caught:
+        state.append_ledger(home, [_question(1, **overrides)])
+    for text in named:
+        assert text in str(caught.value)
+    assert not home.ledger.exists() or home.ledger.read_bytes() == b''
+
+
+def test_append_ledger_accepts_an_action_line_carrying_its_lead_op(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    state.append_ledger(home, [_line(
+        1, 'action', id='A1', lead_op='edge', task=102, target=[106],
+        text='102 consumes C2 from S2.', needs_human=False,
+    ) | {'return': 'returns/S1.decompose.json'}])
+    (line,) = state.read_ledger(home)
+    assert (line['op'], line['lead_op'], line['target']) == ('action', 'edge', (106,))
+
+
+def test_an_action_line_refuses_a_lead_op_outside_the_vocabulary(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    line = _line(1, 'action', id='A1', lead_op='rename', task=102, target=None, text='t',
+                 needs_human=False) | {'return': 'returns/S1.decompose.json'}
+    with pytest.raises(state.LedgerRefused, match='lead_op'):
+        state.append_ledger(home, [line])
+
+
+def _action(seq: int, action_id: str) -> dict[str, Any]:
+    return _line(seq, 'action', id=action_id, lead_op='note', task=102, target=None,
+                 text='Route callers after 101.', needs_human=False) | {
+        'return': 'returns/S1.decompose.json'}
+
+
+def test_next_action_id_counts_the_ledgers_action_lines() -> None:
+    ledger = [_authored(1, 'S1'), _action(2, 'A1'), _line(3, 'note', text='n'), _action(4, 'A2')]
+    assert state.next_action_id(ledger[:1]) == 'A1'
+    assert state.next_action_id(ledger) == 'A3'
+
+
+@pytest.mark.parametrize('action_id', ['A1', 'A3', 'B2'])
+def test_append_ledger_refuses_an_action_id_that_is_not_the_next(
+    action_id: str, tmp_path: Path,
+) -> None:
+    home = state.Home(tmp_path)
+    state.append_ledger(home, [_action(1, 'A1')])
+    with pytest.raises(state.LedgerRefused) as caught:
+        state.append_ledger(home, [_action(2, action_id)])
+    assert "expected id 'A2'" in str(caught.value)
+    assert f'got {action_id!r}' in str(caught.value)
+
+
+def test_read_ledger_refuses_a_hand_edited_duplicate_action_id(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    home.ledger.write_text(''.join(json.dumps(line) + '\n' for line in (_action(1, 'A1'), _action(2, 'A1'))))
+    with pytest.raises(state.LedgerRefused, match='line 2'):
+        state.read_ledger(home)
+
+
+def test_date_of_is_the_utc_date_of_a_now_utc_stamp() -> None:
+    assert state.date_of('2026-10-19T23:59:59Z') == '2026-10-19'
 
 
 def test_read_ledger_refuses_a_hand_edited_gap(tmp_path: Path) -> None:
