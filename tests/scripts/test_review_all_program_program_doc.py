@@ -644,3 +644,66 @@ def test_an_unknown_wave_names_the_programs_waves(run: DocRun) -> None:
 
     assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
     assert re.search(r'\b1, 2\b', proc.stderr), proc.stderr
+
+
+HANDOFF_HEADINGS = ['## Sources of truth', '## State', '## Inherited duties', '## Remaining work']
+RECORD_PATH = 'plans/review-all-fixture-20261019.json'
+
+
+def _handoff(run: DocRun) -> str:
+    proc = run.doc('--handoff')
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    handoff = run.home / 'HANDOFF.md'
+    assert str(handoff) in proc.stdout
+    return handoff.read_text(encoding='utf-8')
+
+
+@pytest.fixture
+def recorded(decomposed: DocRun) -> DocRun:
+    """The decomposed run with the fixture run record at the program's record_path."""
+    (decomposed.project / RECORD_PATH).write_bytes((FIXTURE_DIR / 'record.json').read_bytes())
+    return decomposed
+
+
+def _opening(section: list[str], opening: str) -> list[str]:
+    return [line for line in section if line.startswith(opening)]
+
+
+def test_b8_the_handoff_carries_the_four_sections_from_state_record_and_store(recorded: DocRun) -> None:
+    text = _handoff(recorded)
+
+    assert _headings(text) == HANDOFF_HEADINGS
+    duties = _section(text, '## Inherited duties')
+    (launched,) = _opening(duties, '- launched_from: ')
+    assert launched.endswith('/review-all-fixture/project')
+    (fable,) = _opening(duties, '- fable_seats: ')
+    assert 'synthesis' in fable and 'critic' in fable
+    (yes,) = _opening(duties, '- --yes: ')
+    assert yes.endswith('true')
+    remaining = _section(text, '## Remaining work')
+    (held,) = _opening(remaining, '- held 103 ')
+    assert 'release owner S2' in held
+    assert len(_opening(remaining, '- action A1 ')) == len(_opening(remaining, '- action A2 ')) == 1
+    assert {line.split()[2] for line in _opening(remaining, '- stream ')} == {'S2', 'S3'}
+    (s1,) = _opening(_section(text, '## State'), '- stream S1 ')
+    assert 'decomposed' in s1
+
+
+def test_a_handoff_without_the_run_record_names_the_absent_record(decomposed: DocRun) -> None:
+    duties = _section(_handoff(decomposed), '## Inherited duties')
+
+    assert any(str(decomposed.project / RECORD_PATH) in line for line in duties)
+    assert not _opening(duties, '- launched_from: ')
+
+
+def test_the_handoff_lists_the_wave_commits_the_ledger_records(recorded: DocRun) -> None:
+    state_before = _section(_handoff(recorded), '## State')
+    assert any('no wave commit' in line for line in state_before)
+    assert not any('abc1234' in line for line in state_before)
+
+    _append(recorded, 'commit', sha='abc1234', paths=[f'plans/{DOC_NAME}'],
+            measured_at='2026-10-19T09:00:00Z')
+
+    state_after = _section(_handoff(recorded), '## State')
+    assert any('abc1234' in line for line in state_after)
+    assert not any('no wave commit' in line for line in state_after)
