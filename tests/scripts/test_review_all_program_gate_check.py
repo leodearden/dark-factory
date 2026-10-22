@@ -27,6 +27,7 @@ FOREIGN = 'foreign dependency'
 ESCAPES = 'escapes the completion measure'
 EMPTY = 'empty program'
 OPEN_PROGRAM_IDS = (101, 102, 103, 104, 105, 106, 107, 108, 113)
+ABSENT = 999
 
 
 @pytest.fixture
@@ -109,6 +110,17 @@ def test_with_no_high_or_critical_task_every_open_program_task_is_expected(
     interim.store.edit({GATE: {'dependencies': list(OPEN_PROGRAM_IDS)}})
 
     _assert_correct(_check(interim))
+
+
+def test_an_interim_dependency_absent_from_the_store_is_foreign(interim: SeededRun) -> None:
+    interim.store.edit({GATE: {'dependencies': [101, 104, 106, ABSENT]}})
+
+    result = _check(interim)
+
+    assert result.returncode == DEFECTIVE, result.stdout + result.stderr
+    assert _task_ids(result, FOREIGN) == {ABSENT}
+    assert _task_ids(result, MISSING) == set()
+    assert 'Traceback' not in result.stderr, result.stderr
 
 
 def test_an_empty_program_is_defective(interim: SeededRun) -> None:
@@ -237,6 +249,34 @@ def test_a_task_carrying_another_runs_tag_escapes(final: SeededRun) -> None:
 
     assert result.returncode == DEFECTIVE, result.stdout + result.stderr
     assert _task_ids(result, ESCAPES) == {ESCAPEE}
+
+
+@pytest.mark.parametrize('status', ['done', 'cancelled'])
+def test_a_terminal_completion_gate_still_marks_the_final_form(
+    final: SeededRun, status: str,
+) -> None:
+    final.store.edit({COMPLETION_GATE: {'status': status}})
+
+    result = _check(final)
+
+    assert result.returncode == DEFECTIVE, result.stdout + result.stderr
+    form = _lines(result, 'final form')
+    assert len(form) == 1, result.stdout
+    assert re.search(rf'completion gate {COMPLETION_GATE} \({status}\)', form[0]), form
+    assert _lines(result, MISSING) == []
+    assert _lines(result, FOREIGN) == []
+    assert _task_ids(result, ESCAPES) == {ESCAPEE}
+
+
+def test_a_final_dependency_absent_from_the_store_is_foreign(final: SeededRun) -> None:
+    final.store.edit({GATE: {'dependencies': [COMPLETION_GATE, ABSENT]}})
+
+    result = _check(final)
+
+    assert result.returncode == DEFECTIVE, result.stdout + result.stderr
+    assert _task_ids(result, FOREIGN) == {ABSENT}
+    assert _lines(result, MISSING) == []
+    assert 'Traceback' not in result.stderr, result.stderr
 
 
 def test_an_empty_final_program_is_defective(final: SeededRun) -> None:

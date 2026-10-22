@@ -191,6 +191,27 @@ def judge(reads: Reads) -> Verdict:
     )
 
 
+def _is_completion_gate_of(row: state.TaskRow, run_id: str) -> bool:
+    chain = row.metadata.get('trigger_chain')
+    return isinstance(chain, Mapping) and (chain.get('run_id'), chain.get('role')) == (
+        run_id, state.TriggerChainRole.COMPLETION_GATE)
+
+
+def _completion_gate(
+    open_read: state.StoreRead, outsiders: Mapping[int, state.TaskRow | None], run_id: str,
+) -> state.TaskRow | None:
+    """The open completion gate, else a done or cancelled one the human gate depends on.
+
+    StoreReader.completion_gate reads non-terminal tasks only, so once the
+    completion gate is terminal the human gate's dependency is what still names it.
+    """
+    if open_read.rows:
+        return open_read.rows[0]
+    terminal = (row for row in outsiders.values()
+                if row is not None and _is_completion_gate_of(row, run_id))
+    return next(terminal, None)
+
+
 def _read_store(
     reader: state.StoreReader, run_id: str, prd_paths: tuple[str, ...], gate_read: state.StoreRead,
 ) -> Reads:
@@ -201,11 +222,12 @@ def _read_store(
     outsider_reads = {
         dep: reader.task(dep) for dep in gate.dependencies if dep not in known_ids
     }
+    outsiders = {dep: read.rows[0] if read.rows else None for dep, read in outsider_reads.items()}
     return Reads(
         run_id=run_id, prd_paths=prd_paths, gate=gate,
-        completion_gate=completion_read.rows[0] if completion_read.rows else None,
+        completion_gate=_completion_gate(completion_read, outsiders, run_id),
         program=program_read.rows,
-        outsiders={dep: read.rows[0] if read.rows else None for dep, read in outsider_reads.items()},
+        outsiders=outsiders,
         measured_at=min(read.measured_at for read in (
             gate_read, completion_read, program_read, *outsider_reads.values())),
     )
