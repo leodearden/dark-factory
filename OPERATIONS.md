@@ -1279,7 +1279,11 @@ takes no arguments: it always re-reads that process's own
   `merge_lane/worker.py::_run_post_merge_verify` (runner `history-leg`, with
   its own `merge_verify` row), so a red or unrunnable leg gets the same disk
   guard, ENOSPC and infra-transient retry, transient-infra hold, main-health
-  probe, timeout loop-breaker and task-fault reason as a red re-verify.
+  probe, timeout loop-breaker and task-fault reason as a red re-verify. The
+  main-health probe re-runs the task's own scoped commands on bare main, not
+  the leg, so a leg red that main shares is classified main-red only when
+  those commands reproduce its failure signature; otherwise it blocks as a
+  task fault.
   Green-tier for the same reason as the bullet above: read per gate
   evaluation, and it only decides whether one more verify runs.
 - `merge_gate_history_test_command` (task 7248; default unset). The shell

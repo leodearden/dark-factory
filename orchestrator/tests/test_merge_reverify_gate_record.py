@@ -678,9 +678,10 @@ class TestReverifyGateRecordsItsDecision:
         assert '[category: ' in outcome.reason, outcome.reason
         assert timeouts == {rebased.request.task_id: 1}
 
-    async def test_a_history_leg_red_already_red_on_bare_main_is_main_health_red(
+    async def test_a_red_history_leg_is_main_red_when_the_tasks_own_commands_reproduce_it(
         self, tmp_path: Path,
     ) -> None:
+        """The probe re-runs the task's scoped module_configs on main, not the leg; here they agree."""
         scene = _scene(tmp_path)
         red_on_main = 'echo red-on-main; exit 3'
         config = _history_leg_config(scene, red_on_main).model_copy(
