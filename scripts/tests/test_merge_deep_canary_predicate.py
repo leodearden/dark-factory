@@ -5,6 +5,7 @@ payload carries every fact and the events.duration_ms column stays NULL.
 """
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,6 +13,7 @@ from pathlib import Path
 import pytest
 from canary_predicate_summary import metric, n_deep_verifies, verdict
 from cli_subprocess_timeout import cli_timeout_from_env
+from orchestrator.event_store import EventStore, EventType
 
 _PREDICATE = Path(__file__).resolve().parents[1] / 'merge-deep-canary-predicate.sh'
 _PREDICATE_TIMEOUT = cli_timeout_from_env('MERGE_DEEP_CANARY_PREDICATE_CLI_TIMEOUT_SECS')
@@ -86,7 +88,7 @@ class TestVerifyP90ReadsThePayloadDuration:
         assert verdict(result.stdout, 'items_per_verify') == 'ok'
 
     def test_non_numeric_payload_durations_are_not_durations(self, runs_db_path, runs_db):
-        for i, duration_ms in enumerate((True, None, '600000', _ABSENT, 300_000)):
+        for i, duration_ms in enumerate((True, None, '600000', _ABSENT, float('nan'), float('inf'), 300_000)):
             _seed_verify(runs_db, _recent(i), passed=True, duration_ms=duration_ms)
             _seed_finalized(runs_db, _recent(i), landed_via_chain=2)
 
@@ -138,15 +140,50 @@ class TestWindowEdges:
         assert n_deep_verifies(result.stdout) == 1
 
 
+def _emit_unlanded_deep_verify(db_path: Path) -> datetime:
+    """Write one deep verify through the real EventStore.emit; return the instant it stamped."""
+    EventStore(db_path, 'run-writer').emit(
+        EventType.merge_verify, data={'passed': True, 'chain_items': 2, 'duration_ms': 600_000},
+    )
+    conn = sqlite3.connect(db_path)
+    try:
+        (stamp,), = conn.execute('SELECT timestamp FROM events').fetchall()
+    finally:
+        conn.close()
+    return datetime.fromisoformat(stamp)
+
+
+class TestWindowBoundsMeetTheWritersStamp:
+    """The bounds compare exactly against the timestamp layout EventStore.emit itself writes."""
+
+    @pytest.mark.parametrize(('now_after_stamp', 'admitted'), [
+        pytest.param(timedelta(0), 1, id='stamped-at-now'),
+        pytest.param(-timedelta(microseconds=1), 0, id='stamped-after-now'),
+        pytest.param(timedelta(days=7), 0, id='stamped-at-the-cutoff'),
+        pytest.param(timedelta(days=7, microseconds=-1), 1, id='stamped-just-inside-the-cutoff'),
+    ])
+    def test_an_emitted_row_meets_the_bounds_exactly(self, tmp_path, now_after_stamp, admitted):
+        db_path = tmp_path / 'runs.db'
+        now = _emit_unlanded_deep_verify(db_path) + now_after_stamp
+
+        result = _run(db_path, '--now', repr(now.timestamp()), '--window-days', '7')
+
+        assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
+        assert n_deep_verifies(result.stdout) == admitted
+
+
 class TestUsageFaultsExitTwo:
     @pytest.mark.parametrize(('flag', 'value'), [
         ('--now', 'yesterday'),
         ('--now', 'nan'),
         ('--now', 'inf'),
+        ('--now', '1e20'),
         ('--window-days', 'seven'),
         ('--window-days', '0'),
         ('--window-days', '-3'),
+        ('--window-days', '1e12'),
         ('--deep-fail-rate-max', 'loose'),
+        ('--items-per-verify-min', 'x'),
         ('--verify-p90-max-secs', 'nan'),
     ])
     def test_malformed_numeric_flag_is_a_usage_fault(self, runs_db_path, flag, value):
