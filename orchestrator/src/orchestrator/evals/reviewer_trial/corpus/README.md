@@ -6,7 +6,8 @@ expanded under **task 2495** (PRD `tier1-prompt-optimization` T4 / D-6) to
 ≥50 diffs (aim ~100) by *mining* additional diffs from this project's own
 orchestrator run history. This file documents the corpus schema, the mining
 pipeline that produced the `source: "mined"` diffs, the train/selection/test
-split, and the ground-truth adjudication protocol.
+split, the ground-truth adjudication protocol, and the answer-key pooling
+protocol.
 
 ## Layout
 
@@ -18,6 +19,7 @@ corpus/
   real_world/<id>.diff    # source == "real_world" diff text
   mined/<id>.diff         # source == "mined" diff text
   adjudication_log.jsonl  # one AdjudicationEntry per diff_id (see below)
+  pooling_log.jsonl       # one PoolingRecord per pooled answer-key issue (see below)
   README.md               # this file
 ```
 
@@ -28,9 +30,13 @@ corpus/
 
 ## Schema
 
-**`manifest.json`** — `{"version": "1.0", "split_seed": "<seed>", "diffs": [...]}`.
+**`manifest.json`** — `{"version": "2.0", "split_seed": "<seed>", "diffs": [...]}`.
 Each entry: `{diff_id, language, source, description, project?, split?}`.
 
+- `version` — bumped whenever the answer key changes. Recall, precision and
+  F1 are comparable only between scores computed against the same version.
+  1.0 → 2.0 is the 2026-10-22 pooling (task 7367, see "Answer-key pooling
+  protocol").
 - `language` — `"python" | "rust" | "typescript"`.
 - `source` — `"synthetic"` (planted mutation) | `"real_world"` (hand-picked
   real bug, pre-task-2495) | `"mined"` (task-2495 FN mining, see below).
@@ -239,6 +245,107 @@ human review themselves — the spot-check subset is flagged and documented
 here, but sign-off is an **operator follow-on** (filed as a non-blocking
 `escalate_info`, not a blocker on the corpus-expansion work itself). Until an
 entry's `spot_check_status` is updated, it remains `"pending"`.
+
+## Pooling log (`pooling_log.jsonl`)
+
+One JSON object per line, one record per pooled answer-key issue
+(`key_pooling.PoolingRecord` / `PoolingLog`):
+
+- `diff_id`, `issue_id` — the annotation and the `ground_truth` id the record
+  describes.
+- `pooling_date` — the day the pooling run adjudicated the issue.
+- `pooling_run` — the run's directory, relative to the MAIN checkout and
+  untracked. It holds `pooling/` (`BRIEF.md`, the adjudication standard;
+  `verdicts/P*.json`; `key/key.json`, which unblinds finding ids to arm and
+  trial; `pooled_ground_truth.json`), `skeptic/` and
+  `blocking-adjudication/`.
+- `provenance` — the run's `x_provenance` for the issue, verbatim:
+  `finding_ids`, `real` (`yes | partly`), `adjudicated_severity`,
+  `skeptic_corrections`, `corpus_severity` (the first-pass rating, before a
+  `quality_block` promotion), `quality_block`, `confidence`, `evidence`.
+
+Provenance lives here rather than in the annotations for two reasons. The
+adjudication log stays one entry per diff_id, and `CorpusManifest.load`
+builds `GroundTruthIssue(**gt)`, which rejects unknown keys, so an
+annotation carries only the six issue fields.
+
+`key_pooling.audit_pooling` checks the log ↔ annotation bijection: no
+duplicate record, no record without its issue, and no pooled issue without
+its record. `test_reviewer_trial_corpus_integrity.py` pins it over the
+committed corpus.
+
+## Answer-key pooling protocol
+
+An unmatched reviewer finding scores as a false alarm, so an incomplete key
+penalises reviewers for finding real problems. A blind check in the D2
+campaign showed the key was badly incomplete. Pooling repairs it: every
+compared arm's unmatched findings are adjudicated against the code, and each
+distinct real problem in the change becomes a new key issue.
+
+**The 2026-10-22 run** (task 7367). Twelve opus adjudicators, blind to arm,
+read all 851 unmatched findings of both arms (opus diff-only and opus `d2`),
+3 trials, all 37 test-split fixtures, with read access to scratch clones of
+the reviewed trees. The findings resolved to 271 distinct problems: 8
+duplicated an existing key issue, 36 were not real, 26 were real but in code
+the change left alone, and 201 were added (30 blocking, 171 suggestion). A
+refute-prompted skeptic pass downgraded `mined_1169_pool_01` and `_02` to
+suggestion.
+
+**Rules.** Pooling is blind, symmetric, and drawn from the unmatched
+findings of every arm being compared. A new arm's unmatched findings MUST be
+pooled the same way before its scores are compared; otherwise an arm whose
+real findings were never pooled is penalised for them.
+
+**Severity mapping.** `blocking` means a correctness or security blocker, or
+a maintainability problem a careful reviewer would refuse to merge
+(`quality_block`). The mapping was calibrated on 57 controls: every reviewer
+flag that matched an existing blocking key issue was rated one of those two
+kinds, and none merely a suggestion.
+
+**Folding a run.** Pooled entries carry `mutation_type` `pooled_<date>`
+(`pooled_2026_10_22` for the run above). `pooled_ground_truth.json` maps diff_id to entries holding the six
+`GroundTruthIssue` fields plus `x_provenance`. Fold it from `orchestrator/`
+with `uv run python`, then bump `version`:
+
+```python
+import dataclasses, json
+from pathlib import Path
+
+from orchestrator.evals.reviewer_trial.corpus import CorpusManifest
+from orchestrator.evals.reviewer_trial.key_pooling import PoolingLog, fold_pooled_issues
+
+corpus = Path("src/orchestrator/evals/reviewer_trial/corpus")
+pooled = json.loads(Path("<run>/pooling/pooled_ground_truth.json").read_text())
+manifest, log = fold_pooled_issues(
+    CorpusManifest.load(corpus / "manifest.json"),
+    PoolingLog.load(corpus / "pooling_log.jsonl"),
+    pooled,
+    pooling_date="<YYYY-MM-DD>",
+    pooling_run="<run directory, relative to the main checkout>",
+)
+dataclasses.replace(manifest, version="<next major>").save(corpus / "manifest.json")
+log.save(corpus / "pooling_log.jsonl")
+```
+
+`fold_pooled_issues` appends each diff's pooled issues after its existing
+key, in file order, and rejects an unknown diff_id, a repeated issue id, or
+an entry with missing or unexpected keys. A load → save round trip
+reproduces the corpus byte for byte, so only the pooled annotations and
+`manifest.json` change.
+
+### Key entries flagged for human review (not edited)
+
+- `mined_829` `frontier_1`: a Python 3.11 probe shows the marker DOES change
+  `AsyncMock` behaviour, contradicting the entry.
+- `py_always_passes` `py_pass_3`: the assertion is roundabout, not
+  tautological.
+- `py_real_01` `py_real_cap_3`: possibly blocking, not suggestion.
+
+### Matcher noise
+
+Re-running the haiku matcher (`scorer.py::match_issues`) on identical reviews
+and an identical key changed 7% of cell F1 values and moved an arm-difference
+mean by 0.033. A single matcher run is noisy at the decision margin.
 
 ## Verifying corpus integrity
 
