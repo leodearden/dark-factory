@@ -8,6 +8,7 @@ calls (``name``, ``cancel_verify()``, ``probe_clean()``).
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 
 import pytest
 
@@ -53,6 +54,17 @@ class _Hooks:
 
     def on_recovered(self, name: str) -> None:
         self.recovered.append(name)
+
+
+class _RecordingUnwind:
+    """An async teardown that records what *observe* returns each time it is awaited."""
+
+    def __init__(self, observe: Callable[[], object]) -> None:
+        self._observe = observe
+        self.snapshots: list[object] = []
+
+    async def __call__(self) -> None:
+        self.snapshots.append(self._observe())
 
 
 async def _no_sleep(_seconds: float) -> None:
@@ -240,3 +252,51 @@ class TestReleaseAndCancel:
 
         assert hooks.recovered == ['laptop']
         await pool.release(lease)
+
+    async def test_clean_cancel_unwinds_after_the_host_cancel_while_the_slot_is_held(self) -> None:
+        remote = _FakeRemote('laptop', cancel_rc=0)
+        pool, allocator = _pool([remote], _Hooks())
+        lease = _lease(pool.acquire_for_task('42'))
+        unwind = _RecordingUnwind(lambda: (
+            remote.cancel_calls,
+            allocator.is_busy('laptop'),
+            allocator.is_parked('laptop'),
+            dict(pool.holders()),
+        ))
+
+        assert await pool.cancel_and_release(lease, unwind=unwind) is True
+
+        assert unwind.snapshots == [(1, True, False, {'laptop': 'task:42'})]
+        assert allocator.is_busy('laptop') is False
+        assert pool.holders() == {}
+
+    async def test_failed_cancel_unwinds_before_the_park_and_the_probe(self) -> None:
+        remote = _FakeRemote('laptop', cancel_rc=1, probe_clean=False)
+        pool, allocator = _pool([remote], _Hooks())
+        lease = _lease(pool.acquire_for_task('42'))
+        unwind = _RecordingUnwind(lambda: (
+            remote.cancel_calls,
+            remote.probe_calls,
+            allocator.is_parked('laptop'),
+            dict(pool.holders()),
+        ))
+
+        assert await pool.cancel_and_release(lease, unwind=unwind) is False
+
+        assert unwind.snapshots == [(1, 0, False, {'laptop': 'task:42'})]
+        assert allocator.is_parked('laptop') is True
+        assert pool.holders() == {}
+        assert pool.acquire_for_task('43') == Refusal('host_parked')
+
+    async def test_unwind_runs_once_for_a_lease_the_pool_does_not_hold(self) -> None:
+        remote = _FakeRemote('laptop')
+        pool, allocator = _pool([remote], _Hooks())
+        merge_lease = allocator.acquire_remote()
+        assert merge_lease is not None
+        unwind = _RecordingUnwind(lambda: 'unwound')
+
+        assert await pool.cancel_and_release(merge_lease, unwind=unwind) is True
+
+        assert unwind.snapshots == ['unwound']
+        assert remote.cancel_calls == 0
+        assert allocator.is_busy('laptop') is True
