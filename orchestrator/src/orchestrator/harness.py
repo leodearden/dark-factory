@@ -130,6 +130,7 @@ from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.offline_lane_pass import lane_pass_outcome_hooks
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.pause_policy import PauseClass, policy_for
 from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.recovery_emission import (
@@ -1633,7 +1634,7 @@ def _already_landed_gate_shape(*, has_open_escalation: bool | None) -> str:
 
 
 def _ewa_trip_reason(ewa: float, storm: digest_mod.CategoryShare | None) -> str:
-    """The EWA pause reason: the ``ewa_trip_`` prefix every reader keys on, then the storm share."""
+    """The human-readable EWA pause reason: the tripping EWA, then the storm share."""
     if storm is None:
         return f'ewa_trip_{ewa:.4f}'
     return f'ewa_trip_{ewa:.4f} · storm: {storm}'
@@ -8956,8 +8957,8 @@ class Harness:
         free-bytes from ``git_ops.worktree_base`` (fail-open on OSError), feeds
         the breaker, and reacts to any ``BreakerTrip`` decision:
 
-        * ``action='halt'``:  ``force_halt_scheduler(reason)`` +
-          ``_file_no_landings_info_escalation(trip)``
+        * ``action='halt'``:  ``force_halt_scheduler(reason,
+          PauseClass.NO_LANDINGS)`` + ``_file_no_landings_info_escalation(trip)``
         * ``action='resume'``: ``force_resume_scheduler(reason)`` +
           ``_resolve_no_landings_info_escalation(trip)``
 
@@ -9072,7 +9073,9 @@ class Harness:
             return
 
         if trip.action == 'halt':
-            await self.force_halt_scheduler(reason=trip.reason)
+            await self.force_halt_scheduler(
+                reason=trip.reason, pause_class=PauseClass.NO_LANDINGS,
+            )
             self._file_no_landings_info_escalation(trip)
         elif trip.action == 'resume':
             await self.force_resume_scheduler(reason=trip.reason)
@@ -11450,7 +11453,9 @@ class Harness:
                 '— pausing scheduler',
                 watcher, self.config.watcher_daily_cost_ceiling_usd,
             )
-            await self.pause_scheduler('cost_ceiling_watcher_exceeded')
+            await self.pause_scheduler(
+                'cost_ceiling_watcher_exceeded', PauseClass.COST_CEILING,
+            )
             # File an L2 outage escalation so the operator learns via their L2
             # stream that the watcher has been paused (dedup-safe: no-op if one
             # is already open).  Intentionally NOT done for the orch-wide ceiling
@@ -11465,7 +11470,9 @@ class Harness:
                 '— pausing scheduler',
                 total, self.config.orch_daily_cost_ceiling_usd,
             )
-            await self.pause_scheduler('cost_ceiling_orch_exceeded')
+            await self.pause_scheduler(
+                'cost_ceiling_orch_exceeded', PauseClass.COST_CEILING,
+            )
 
     async def _apply_retry_cap(
         self, task_id: str, report: TaskReport, requeued: bool,
@@ -15268,7 +15275,7 @@ class Harness:
             window_secs,
         )
         try:
-            await self.pause_scheduler(reason)
+            await self.pause_scheduler(reason, PauseClass.WATCHER_GUARD)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -18103,19 +18110,25 @@ class Harness:
         """
         was_paused = self.scheduler.is_paused
         prior_reason = self.scheduler.pause_reason
+        prior_class = self.scheduler.pause_class
+        prior_pause_class = prior_class.value if prior_class else None
         await self.resume_scheduler()
         logger.warning(
-            'force_resume_scheduler: was_paused=%s prior_reason=%r by_reason=%r',
-            was_paused, prior_reason, reason,
+            'force_resume_scheduler: was_paused=%s prior_reason=%r '
+            'prior_pause_class=%s by_reason=%r',
+            was_paused, prior_reason, prior_pause_class, reason,
         )
         return {
             'resumed': was_paused,
             'was_paused': was_paused,
             'prior_reason': prior_reason,
+            'prior_pause_class': prior_pause_class,
             'reason': reason,
         }
 
-    async def force_halt_scheduler(self, reason: str) -> dict[str, Any]:
+    async def force_halt_scheduler(
+        self, reason: str, pause_class: PauseClass = PauseClass.OPERATOR,
+    ) -> dict[str, Any]:
         """Operator-initiated scheduler halt (backs the halt_scheduler tool).
 
         Pauses the scheduler so ``acquire_next()`` stops dispatching new tasks,
@@ -18126,21 +18139,26 @@ class Harness:
         that L1 would silently undo the halt.  Reversed by
         ``force_resume_scheduler`` / ``resume_scheduler``.
 
+        ``pause_class`` defaults to the operator MCP tool's class; automatic
+        breakers pass their own (PRD decision 5).
+
         ``reason`` is required for audit.  Returns
-        ``{halted, was_paused, prior_reason, reason}``.
+        ``{halted, was_paused, prior_reason, reason, pause_class}``.
         """
         was_paused = self.scheduler.is_paused
         prior_reason = self.scheduler.pause_reason
-        await self.pause_scheduler(reason, file_escalation=False)
+        await self.pause_scheduler(reason, pause_class, file_escalation=False)
         logger.warning(
-            'force_halt_scheduler: was_paused=%s prior_reason=%r by_reason=%r',
-            was_paused, prior_reason, reason,
+            'force_halt_scheduler: was_paused=%s prior_reason=%r by_reason=%r '
+            'pause_class=%s',
+            was_paused, prior_reason, reason, pause_class,
         )
         return {
             'halted': True,
             'was_paused': was_paused,
             'prior_reason': prior_reason,
             'reason': reason,
+            'pause_class': pause_class.value,
         }
 
     # ------------------------------------------------------------------ #
@@ -18246,29 +18264,24 @@ class Harness:
     # Scheduler park-and-stop pause (task 1322)                           #
     # ------------------------------------------------------------------ #
 
-    async def pause_scheduler(self, reason: str, *, file_escalation: bool = True) -> None:
+    async def pause_scheduler(
+        self, reason: str, pause_class: PauseClass, *, file_escalation: bool = True,
+    ) -> None:
         """Pause the scheduler so acquire_next() returns None until resumed.
 
-        1. Delegates to ``scheduler.pause(reason)`` (idempotent in-memory state).
-        2. Persists via ``RunStore.save_scheduler_pause`` (best-effort),
-           including the live ``_ewa_value`` (task 4559).  The value is
-           recorded for EVERY pause class, not just ``ewa_trip_*``: it is
-           operator EVIDENCE and forensic record, never a trip flag — the
-           pause class is carried by *reason*, which is also the only thing
-           the restore-time predicate keys on.  Seven ``scheduler_pause_restored``
-           events across four pause classes showed a restart re-asserted the
-           halt while losing the number behind it, so the evidence-vs-halt
-           asymmetry is structural to ``pause_scheduler`` rather than
-           EWA-specific, and is fixed here for all classes at once.
-           This write is the trip-TIME snapshot.  While an ``ewa_trip_`` halt
-           is subsequently HELD, ``_maybe_write_digest`` step (13b) refreshes
-           the same column on every digest step, so the stored scalar tracks
-           the decaying statistic rather than freezing at the tripping value —
-           without which the restart-time predicate re-check below could never
-           observe recovery.  That refresh is scoped to ``ewa_trip_`` rows;
-           for every other class the trip-time snapshot written here is the
-           forensic record and is never overwritten.
-        3. Emits ``EventType.scheduler_paused`` (best-effort).
+        1. Delegates to ``scheduler.pause(reason, pause_class)`` (idempotent
+           in-memory state; refuses a class whose policy forbids halting).
+        2. If the class's policy persists, saves the hold via
+           ``RunStore.save_scheduler_pause`` (best-effort) with its class and
+           the live ``_ewa_value`` (task 4559).  The value is recorded for
+           EVERY class as operator evidence, never as a trip flag.  This write
+           is the trip-TIME snapshot; while an ewa_rate hold is HELD,
+           ``_maybe_write_digest`` step (13b) refreshes the same column so the
+           stored scalar tracks the decaying statistic.  For every other class
+           the snapshot written here is the forensic record and is never
+           overwritten.
+        3. Emits ``EventType.scheduler_paused`` with the reason and class
+           (best-effort).
         4. Logs a WARNING so the operator sees it.
         5. Files an auto-resumable scheduler-pause L1 — unless ``file_escalation``
            is False.
@@ -18294,10 +18307,11 @@ class Harness:
         and disk for the in-flight pause is accepted as the cost of keeping
         the trip's status write off the synchronous critical path.
         """
-        self.scheduler.pause(reason)
-        logger.warning('Scheduler paused: %s', reason)
+        policy = policy_for(pause_class)
+        self.scheduler.pause(reason, pause_class)
+        logger.warning('Scheduler paused (%s): %s', pause_class, reason)
 
-        if self._run_store and self._run_id:
+        if policy.persisted and self._run_store and self._run_id:
             try:
                 self._run_store.save_scheduler_pause(
                     project_id=self.config.fused_memory.project_id,
@@ -18305,6 +18319,7 @@ class Harness:
                     pause_at_iso=datetime.now(UTC).isoformat(),
                     set_by_run_id=self._run_id,
                     ewa_value=self._ewa_value,  # task 4559 — evidence, every class
+                    pause_class=pause_class,
                 )
             except Exception:
                 logger.warning('pause_scheduler: failed to persist pause state', exc_info=True)
@@ -18312,7 +18327,7 @@ class Harness:
         if self.event_store:
             self.event_store.emit(
                 EventType.scheduler_paused,
-                data={'reason': reason},
+                data={'reason': reason, 'pause_class': pause_class.value},
             )
 
         # File an L1 so an AFK operator is actually notified (a WARNING log +
@@ -18332,21 +18347,21 @@ class Harness:
         1. Delegates to ``scheduler.resume()`` (idempotent).
         2. Clears persistence via ``RunStore.clear_scheduler_pause`` (best-effort).
         3. Emits ``EventType.scheduler_resumed`` (best-effort).
-        4. If the pause was caused by an EWA trip (reason starts with 'ewa_trip_'),
-           resets ``_ewa_value`` to 0.0 so the next digest step does not immediately
+        4. If the cleared hold's class was ``PauseClass.EWA_RATE``, resets
+           ``_ewa_value`` to 0.0 so the next digest step does not immediately
            re-trigger a pause.  EWA decays naturally with alpha=0.3 (~N digests of
            low ratio to fall back below threshold), but an operator-driven resume
            signals that the situation is under control — a clean reset is less
            surprising than watching the EWA trip instantly again.
         5. Logs INFO.
         """
-        # Snapshot pause reason BEFORE resume() clears it.
-        prior_reason = self.scheduler.pause_reason or ''
+        # Snapshot the class BEFORE resume() clears it.
+        prior_class = self.scheduler.pause_class
         self.scheduler.resume()
-        if prior_reason.startswith('ewa_trip_'):
+        if prior_class is PauseClass.EWA_RATE:
             self._ewa_value = 0.0
             logger.info(
-                'resume_scheduler: EWA value reset to 0.0 (prior pause was ewa_trip).'
+                'resume_scheduler: EWA value reset to 0.0 (prior pause was ewa_rate).'
             )
         logger.info('Scheduler resumed.')
 
@@ -18359,7 +18374,10 @@ class Harness:
                 logger.warning('resume_scheduler: failed to clear persisted pause', exc_info=True)
 
         if self.event_store:
-            self.event_store.emit(EventType.scheduler_resumed)
+            self.event_store.emit(
+                EventType.scheduler_resumed,
+                data={'pause_class': prior_class.value if prior_class else None},
+            )
 
     async def _load_persisted_scheduler_pause(self) -> None:
         """Restore scheduler pause state from runs.db on restart.
@@ -18450,7 +18468,7 @@ class Harness:
                 )
 
                 if reassert:
-                    self.scheduler.pause(reason)
+                    self.scheduler.pause(reason, record['pause_class'])
                     # Stash the reason so run() can file the L1 escalation once
                     # the escalation queue exists (this runs at line ~492, before
                     # _start_escalation_server creates _escalation_queue).  See
@@ -18794,7 +18812,8 @@ class Harness:
             # auto-resume here without engaging those three first.
             if tripped and not self.scheduler.is_paused:
                 await self.pause_scheduler(
-                    _ewa_trip_reason(new_ewa, escalation_stats.dominant_category())
+                    _ewa_trip_reason(new_ewa, escalation_stats.dominant_category()),
+                    PauseClass.EWA_RATE,
                 )
 
         except asyncio.CancelledError:
