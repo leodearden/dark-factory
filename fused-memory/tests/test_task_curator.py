@@ -5320,10 +5320,10 @@ class TestSizeOneBatchReusesThePreparedCorpus:
         assert '"module": 6' in prompt
 
     @pytest.mark.asyncio
-    async def test_a_failed_bundle_is_rebuilt_rather_than_reused(self):
-        """A corpus failure degrades the bundle to an empty pool — reusing THAT
-        would trade a `corpus-failed` deferral for an LLM call over nothing,
-        and would drop the retry the rebuild gave the size-1 path."""
+    async def test_a_failed_bundle_defers_without_a_rebuild(self):
+        """A corpus failure leaves the bundle an empty pool that is not a real
+        corpus. The size-1 path defers it, as a larger batch does; the parked
+        ticket's backoff retry is what assembles the corpus again."""
         curator = TaskCurator(config=_make_config(), taskmaster=None)
         build = AsyncMock(return_value=(
             _pool_with_ids(('rebuilt-1', 'pending')),
@@ -5338,12 +5338,12 @@ class TestSizeOneBatchReusesThePreparedCorpus:
         )
         with patch.object(curator, '_build_corpus', new=build), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=llm):
-            decisions = await curator.curate_batch_prepared([prepared], 'p', '/x')
+            [decision] = await curator.curate_batch_prepared([prepared], 'p', '/x')
 
-        assert build.await_count == 1
-        assert len(decisions) == 1
-        assert llm.await_args is not None
-        assert 'rebuilt-1' in llm.await_args.kwargs['prompt']
+        assert decision.action == 'defer'
+        assert decision.defer_reason is DeferReason.CORPUS_FAILED
+        assert build.await_count == 0
+        llm.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_prepare_candidate_records_the_corpus_failure(self):

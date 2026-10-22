@@ -514,8 +514,8 @@ class PreparedCandidate:
     ``corpus_error`` is set when assembly FAILED and the pool above is the
     empty degradation rather than a real (possibly empty) corpus.  The two
     are indistinguishable from the fields alone, and they call for opposite
-    handling: a real corpus is worth reusing, a failed one is worth
-    rebuilding (see :meth:`TaskCurator.curate`'s ``prepared`` parameter).
+    handling: a real corpus is curated over, a failed one defers the
+    candidate as ``corpus-failed``.
     """
 
     candidate: CandidateTask
@@ -604,6 +604,21 @@ POOL_SOURCES: Final = ('anchor', 'module', 'embedding', 'dependency')
 def empty_pool_sizes() -> dict[str, int]:
     """Per-source pool sizes of a decision reached without a corpus."""
     return dict.fromkeys(POOL_SOURCES, 0)
+
+
+def _corpus_failed_deferral(
+    candidate: CandidateTask, error: object, start: float, *, exc_info: bool = False,
+) -> CuratorDecision:
+    """Defer *candidate* because its corpus could not be assembled."""
+    logger.warning(
+        'task_curator: corpus assembly failed, deferring curation of %r: %s',
+        candidate.title, error, exc_info=exc_info,
+    )
+    return CuratorDecision.deferred(
+        DeferReason.CORPUS_FAILED,
+        pool_sizes=empty_pool_sizes(),
+        latency_ms=int((time.monotonic() - start) * 1000),
+    )
 
 
 @dataclass
@@ -1845,7 +1860,8 @@ class TaskCurator:
         qdrant query for work already done, and size-1 batches get MORE likely
         as per-candidate sections grow, so the cost would otherwise move with
         exactly the setting that shrinks the batch.  A bundle whose own
-        assembly failed is deliberately NOT reused — see ``corpus_error``.
+        assembly failed defers, exactly as it does in a larger batch — see
+        ``corpus_error``.
         Everything ahead of corpus assembly (blocklist, premise, exact-match,
         idempotency cache, deterministic routing, ZOT breaker) still runs.
         """
@@ -1921,7 +1937,9 @@ class TaskCurator:
                 latency_ms=int((time.monotonic() - start) * 1000),
             )
 
-        if prepared is not None and prepared.corpus_error is None:
+        if prepared is not None and prepared.corpus_error is not None:
+            return _corpus_failed_deferral(candidate, prepared.corpus_error, start)
+        if prepared is not None:
             pool = prepared.pool
             pool_sizes = prepared.pool_sizes
             withheld = prepared.withheld or PoolWithheld()
@@ -1931,17 +1949,7 @@ class TaskCurator:
                     candidate, project_id, project_root,
                 )
             except Exception as exc:
-                logger.warning(
-                    'task_curator: corpus assembly failed, deferring curation of %r: %s',
-                    candidate.title,
-                    exc,
-                    exc_info=True,
-                )
-                return CuratorDecision.deferred(
-                    DeferReason.CORPUS_FAILED,
-                    pool_sizes=empty_pool_sizes(),
-                    latency_ms=int((time.monotonic() - start) * 1000),
-                )
+                return _corpus_failed_deferral(candidate, exc, start, exc_info=True)
 
         # Render the LLM call. A genuine LLM failure raises
         # CuratorFailureError; route it through the escalator if one was
@@ -2085,7 +2093,7 @@ class TaskCurator:
         except Exception as exc:
             logger.warning(
                 'task_curator: corpus assembly failed for candidate %r, '
-                'continuing with empty pool: %s',
+                'so its curation will defer: %s',
                 candidate.title,
                 exc,
                 exc_info=True,
@@ -2385,23 +2393,17 @@ class TaskCurator:
         # ── Failed corpus assembly ─────────────────────────────────────────────
         # A bundle whose corpus failed carries an empty pool that only LOOKS
         # like a real one; the batch prompt would tell the LLM to answer
-        # 'create' for it.  Defer it instead, in curate()'s guard order:
-        # cache → route → breaker → corpus → LLM.
+        # 'create' for it.  Defer it, as curate() does, in curate()'s guard
+        # order: cache → route → breaker → corpus → LLM.
         llm_bound_k: list[int] = []
         for _k in llm_k_list:
             bundle = prepared[unique_indices[_k]]
             if bundle.corpus_error is None:
                 llm_bound_k.append(_k)
-                continue
-            logger.warning(
-                'curate_batch: corpus assembly failed, deferring curation of %r: %s',
-                bundle.candidate.title, bundle.corpus_error,
-            )
-            decided_without_llm[_k] = CuratorDecision.deferred(
-                DeferReason.CORPUS_FAILED,
-                pool_sizes=bundle.pool_sizes,
-                latency_ms=int((time.monotonic() - start) * 1000),
-            )
+            else:
+                decided_without_llm[_k] = _corpus_failed_deferral(
+                    bundle.candidate, bundle.corpus_error, start,
+                )
         llm_k_list = llm_bound_k
 
         # ── LLM dispatch for non-cached unique candidates ────────────────────
