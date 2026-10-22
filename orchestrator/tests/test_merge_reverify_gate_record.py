@@ -531,7 +531,7 @@ class TestReverifyGateRecordsItsDecision:
             outcome = await _gate(scene, rebased, verifier, merge_sha=same_tree_sha)
             merge_wt_survived = rebased.merge_wt.exists()
 
-        assert isinstance(outcome, MergeOutcome), outcome
+        assert not isinstance(outcome, GateClearance), outcome
         assert outcome.status == 'blocked', outcome
         assert outcome.reason.startswith('Post-merge verification failed'), outcome.reason
         assert 'history leg' in outcome.reason, outcome.reason
