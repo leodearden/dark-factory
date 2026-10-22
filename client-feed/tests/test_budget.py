@@ -7,9 +7,10 @@ from typing import Any
 import pytest
 from _git_repo import Repo, make_repo
 
-from client_feed.budget import counted_set, lines_since
-from client_feed.contract import FileKind, RevealBudget, TreeFile
+from client_feed.budget import Granted, counted_set, judge, lines_since
+from client_feed.contract import FileKind, RefusalReason, RevealBudget, TreeFile
 from client_feed.policy import Policy
+from client_feed.sources.git import EntryKind, TreeEntry
 from client_feed.sources.tree import visible_tree
 
 PROJECT = 'acme'
@@ -165,3 +166,119 @@ def test_b17_only_lines_added_or_changed_since_delivery_are_counted(
     for outside in ('src/same.py', 'src/blank.py', 'src/moved.py', 'tests/test_new.py'):
         assert counted.cost(outside) == 0
     assert counted.cost('src/long.py') == 50
+
+
+JUDGE_POLICY = policy_of(never_reveal_globs=['src/secret/**'])
+TEXT_A = 'a = 1\n\nb = 2\n'
+NOT_UTF8 = b'\xff\xfe\x00binary'
+
+
+def _entry(path: str, kind: EntryKind, sha: str) -> TreeEntry:
+    return TreeEntry(path=path, kind=kind, object_sha=sha, size=None if kind is EntryKind.SUBMODULE else 1)
+
+
+HEAD_ENTRIES = {
+    entry.path: entry
+    for entry in (
+        _entry('src/a.py', EntryKind.FILE, 'a' * 40),
+        _entry('src/b.py', EntryKind.FILE, 'b' * 40),
+        _entry('src/c.py', EntryKind.FILE, 'c' * 40),
+        _entry('src/d.py', EntryKind.FILE, 'd' * 40),
+        _entry('src/e.py', EntryKind.FILE, 'e' * 40),
+        _entry('tests/test_a.py', EntryKind.FILE, '1' * 40),
+        _entry('.mcp.json', EntryKind.FILE, '2' * 40),
+        _entry('src/link.py', EntryKind.SYMLINK, '3' * 40),
+        _entry('private/link.py', EntryKind.SYMLINK, '4' * 40),
+        _entry('src/sub', EntryKind.SUBMODULE, '5' * 40),
+        _entry('src/secret/k.py', EntryKind.FILE, '6' * 40),
+        _entry('src/blob.bin', EntryKind.FILE, '7' * 40),
+    )
+}
+BLOBS = {
+    'a' * 40: TEXT_A.encode(),
+    'b' * 40: b'b = 1\n',
+    'c' * 40: b'c = 1\n',
+    'd' * 40: b'd = 1\n',
+    'e' * 40: b'e = 1\n',
+    '1' * 40: b'def test_a():\n    pass\n',
+    '2' * 40: b'{"secret": true}\n',
+    '3' * 40: b'/etc/passwd',
+    '4' * 40: b'/etc/passwd',
+    '6' * 40: b'KEY = "k"\n',
+    '7' * 40: NOT_UTF8,
+}
+
+
+class RecordingReader:
+    """A blob reader over BLOBS that records every sha it is asked for."""
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    def __call__(self, sha: str) -> bytes:
+        self.asked.append(sha)
+        return BLOBS[sha]
+
+
+def judged(path: str, *, revealed: frozenset[str] = frozenset()) -> tuple[Granted | RefusalReason, list[str]]:
+    reader = RecordingReader()
+    verdict = judge(
+        path,
+        entries=HEAD_ENTRIES,
+        policy=JUDGE_POLICY,
+        counted=counted_set(JUDGE_POLICY, B12_FILES),
+        revealed=revealed,
+        read=reader,
+    )
+    return verdict, reader.asked
+
+
+@pytest.mark.parametrize(
+    'path', ['../x', '/etc/passwd', 'src/untracked.py', 'src', 'src//a.py', './src/a.py']
+)
+def test_b15_a_path_that_is_not_an_entry_of_heads_tree_is_not_in_tree(path: str) -> None:
+    assert judged(path) == (RefusalReason.NOT_IN_TREE, [])
+
+
+def test_b11_a_tracked_file_outside_the_visible_set_is_not_visible() -> None:
+    assert judged('.mcp.json') == (RefusalReason.NOT_VISIBLE, [])
+
+
+@pytest.mark.parametrize('path', ['src/link.py', 'src/sub'])
+def test_a_visible_symlink_or_submodule_is_refused_as_symlink(path: str) -> None:
+    assert judged(path) == (RefusalReason.SYMLINK, [])
+
+
+def test_an_invisible_symlink_is_not_visible_so_its_entry_type_never_leaks() -> None:
+    assert judged('private/link.py') == (RefusalReason.NOT_VISIBLE, [])
+
+
+def test_a_never_reveal_path_is_not_revealable_and_its_blob_is_never_read() -> None:
+    assert judged('src/secret/k.py') == (RefusalReason.NOT_REVEALABLE, [])
+
+
+def test_a_blob_that_is_not_utf8_is_not_revealable() -> None:
+    assert judged('src/blob.bin') == (RefusalReason.NOT_REVEALABLE, ['7' * 40])
+
+
+@pytest.mark.parametrize('path', ['src/c.py', 'src/d.py'])
+def test_b13_a_request_past_the_budget_is_over_budget(path: str) -> None:
+    verdict, asked = judged(path, revealed=frozenset({'src/b.py'}))
+
+    assert verdict is RefusalReason.OVER_BUDGET
+    assert asked == [HEAD_ENTRIES[path].object_sha]
+
+
+def test_a_grant_carries_the_decoded_text_and_its_counted_lines() -> None:
+    assert judged('src/a.py') == (
+        Granted(text=TEXT_A, lines=JUDGE_POLICY.counted_lines(TEXT_A.encode())),
+        ['a' * 40],
+    )
+    assert JUDGE_POLICY.counted_lines(TEXT_A.encode()) == 2
+
+
+def test_a_free_file_is_granted_reading_its_blob_once() -> None:
+    verdict, asked = judged('tests/test_a.py', revealed=frozenset({'src/b.py'}))
+
+    assert isinstance(verdict, Granted)
+    assert asked == ['1' * 40]
