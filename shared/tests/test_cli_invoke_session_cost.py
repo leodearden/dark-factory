@@ -3,7 +3,8 @@
 The recorded sessions in ``fixtures/cumulative_cost/sessions.json`` go through
 the real invoke path: ``invoke_claude_agent`` spawns the fake ``claude`` from
 ``shared.testing_fake_claude`` (selected through ``CLAUDE_BINARY``), and the
-real parser reads what it prints.
+real parser reads what it prints. ``invoke_with_cap_retry`` carries the
+prior forward when it re-arms a resume itself, and drops it with the resume.
 """
 
 from __future__ import annotations
@@ -13,11 +14,13 @@ import logging
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from shared.cli_invoke import AgentResult, invoke_claude_agent
+from shared.cli_invoke import AgentResult, invoke_claude_agent, invoke_with_cap_retry
 from shared.process_cost import ProcessCostBasis
+from shared.testing import make_gate_mock
 from shared.testing_fake_claude import FakeClaudeCli, install_fake_claude_cli
 
 _SESSIONS = json.loads(
@@ -146,3 +149,114 @@ class TestInvokePathDerivesPerProcessCost:
         assert result.cost_basis is ProcessCostBasis.REPORTED
         assert result.reported_total_cost_usd is None
         assert result.cost_delta_clamped is False
+
+
+_SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
+_PRIOR_KWARG = 'resume_prior_total_cost_usd'
+
+
+def _capped(*, session_id: str = 'S', reported: float | None = None) -> AgentResult:
+    return AgentResult(
+        success=False,
+        output="You've hit your limit",
+        session_id=session_id,
+        reported_total_cost_usd=reported,
+    )
+
+
+def _completed(**overrides: Any) -> AgentResult:
+    fields: dict[str, Any] = {
+        'success': True, 'output': 'done', 'cost_usd': 0.5, 'turns': 2,
+        'duration_ms': 30_000, 'session_id': 'S',
+    }
+    return AgentResult(**(fields | overrides))
+
+
+async def _retry(
+    results: Sequence[AgentResult], *, cap_hits: Sequence[bool], **kwargs: Any,
+) -> AsyncMock:
+    """Run invoke_with_cap_retry over canned *results*; return the invoke_fn mock."""
+    invoke_fn = AsyncMock(side_effect=list(results))
+    gate = make_gate_mock(detect_cap_hit=MagicMock(side_effect=list(cap_hits)))
+    kwargs.setdefault('prompt', 'p')
+    with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+        await invoke_with_cap_retry(gate, 'lbl', invoke_fn=invoke_fn, **kwargs)
+    return invoke_fn
+
+
+def _second_call_kwargs(invoke_fn: AsyncMock) -> dict[str, Any]:
+    assert invoke_fn.await_count == 2
+    return invoke_fn.call_args_list[1].kwargs
+
+
+class TestCapRetryCarriesSessionPrior:
+    async def test_cap_resume_carries_the_capped_result_total(self) -> None:
+        invoke_fn = await _retry(
+            [_capped(reported=4.0), _completed()], cap_hits=[True, False],
+        )
+
+        second = _second_call_kwargs(invoke_fn)
+        assert second['resume_session_id'] == 'S'
+        assert second[_PRIOR_KWARG] == 4.0
+
+    async def test_cap_resume_keeps_the_session_high_water_mark(self) -> None:
+        invoke_fn = await _retry(
+            [_capped(reported=0.0), _completed()],
+            cap_hits=[True, False],
+            prompt='real',
+            resume_session_id='S',
+            resume_prior_total_cost_usd=5.0,
+        )
+
+        assert _second_call_kwargs(invoke_fn)[_PRIOR_KWARG] == 5.0
+
+    async def test_cap_resume_with_no_figure_passes_no_prior(self) -> None:
+        invoke_fn = await _retry(
+            [_capped(reported=None), _completed()], cap_hits=[True, False],
+        )
+
+        assert _PRIOR_KWARG not in _second_call_kwargs(invoke_fn)
+
+    @pytest.mark.parametrize(('first', 'cap_hits', 'extra'), [
+        (
+            AgentResult(success=False, output='resume broke', turns=3,
+                        duration_ms=60_000, cost_usd=1.0),
+            [False, False],
+            {},
+        ),
+        (
+            AgentResult(success=False, output='Unauthorized', api_error_status=401),
+            [False, False],
+            {},
+        ),
+        (_capped(reported=4.0), [True, False], {'resume_on_cap_hit': False}),
+    ], ids=['resume-failed', 'auth-failed', 'cap-hit-without-resume'])
+    async def test_fresh_fallback_drops_the_prior_with_the_resume(
+        self, first: AgentResult, cap_hits: list[bool], extra: dict[str, Any],
+    ) -> None:
+        invoke_fn = await _retry(
+            [first, _completed()],
+            cap_hits=cap_hits,
+            prompt='real',
+            resume_session_id='S',
+            resume_prior_total_cost_usd=5.0,
+            **extra,
+        )
+
+        second = _second_call_kwargs(invoke_fn)
+        assert 'resume_session_id' not in second
+        assert _PRIOR_KWARG not in second
+
+    async def test_cost_row_records_the_per_process_cost(self) -> None:
+        cost_store = MagicMock()
+        cost_store.save_invocation = AsyncMock()
+
+        await _retry(
+            [_completed(cost_usd=1.1174095, reported_total_cost_usd=3.4060185)],
+            cap_hits=[],
+            cost_store=cost_store,
+            run_id='run-1',
+        )
+
+        saved = cost_store.save_invocation.await_args.kwargs
+        assert saved['cost_usd'] == pytest.approx(1.1174095, abs=1e-9)
