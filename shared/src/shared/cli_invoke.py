@@ -21,6 +21,7 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard, TypeVar
 
 from shared.cost_store import CapReason
 from shared.proc_group import snapshot_process_group, terminate_process_group
+from shared.process_cost import ProcessCostBasis, derive_process_cost
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
@@ -441,7 +442,10 @@ class AgentResult:
     Fields:
     - ``success``: whether the agent completed without error
     - ``output``: the primary text response from the agent
-    - ``cost_usd``: total cost in USD (0.0 if not reported by the provider)
+    - ``cost_usd``: what THIS CLI process cost in USD (0.0 if not reported by
+      the provider).  For a resumed Claude session it is derived by
+      ``shared.process_cost.derive_process_cost`` and is never the session's
+      running total; ``cost_basis`` says how it was obtained
     - ``duration_ms``: wall-clock time in milliseconds
     - ``turns``: number of agentic turns (0 if not tracked)
     - ``session_id``: provider session identifier for resumption
@@ -567,6 +571,16 @@ class AgentResult:
     distinct from the caller-supplied lineage alias (``opus``/``sonnet``) that
     callers record as ``model`` — that alias names the routing choice, this
     names the version that answered."""
+    cost_basis: ProcessCostBasis = ProcessCostBasis.REPORTED
+    """How ``cost_usd`` was obtained: the CLI's own figure, the delta over the
+    resumed session's prior total, or the priced usage block."""
+    reported_total_cost_usd: float | None = None
+    """The CLI's ``total_cost_usd`` verbatim, None when absent or malformed.  A
+    caller passes it back as ``resume_prior_total_cost_usd`` when it next
+    resumes this ``session_id``."""
+    cost_delta_clamped: bool = False
+    """True when a prior total was supplied for this resume and the delta over
+    it was rejected as implausible, so ``cost_usd`` fell back."""
 
 
 # The ``AgentResult.subtype`` the Claude CLI stamps when its own
@@ -2330,6 +2344,7 @@ async def invoke_claude_agent(
     strict_mcp_config: bool = False,
     available_tools: list[str] | None = None,
     setting_sources: list[str] | None = None,
+    resume_prior_total_cost_usd: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -2363,6 +2378,11 @@ async def invoke_claude_agent(
     role charter.  A resumed session therefore gets the CURRENT role prompt —
     see ``build_claude_argv`` for the full rationale and the probed CLI
     behaviour.
+
+    *resume_prior_total_cost_usd* is the ``reported_total_cost_usd`` of the
+    result being resumed, so the resumed process is charged only its own
+    spend (see ``shared.process_cost``).  Ignored unless *resume_session_id*
+    is set.
 
     *session_id*, when set and *resume_session_id* is not, pre-allocates the
     session UUID via ``--session-id <id>`` so callers can resume the same
@@ -2426,6 +2446,7 @@ async def invoke_claude_agent(
         strict_mcp_config=strict_mcp_config,
         available_tools=available_tools,
         setting_sources=setting_sources,
+        resume_prior_total_cost_usd=resume_prior_total_cost_usd,
     )
 
 
@@ -3745,6 +3766,7 @@ async def _invoke_claude(
     strict_mcp_config: bool = False,
     available_tools: list[str] | None = None,
     setting_sources: list[str] | None = None,
+    resume_prior_total_cost_usd: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     # BEFORE build_claude_argv, which writes system-prompt / mcp-config temp
@@ -3838,7 +3860,11 @@ async def _invoke_claude(
             working_idle_secs=working_idle_secs,
             absolute_cap_secs=absolute_cap_secs,
         )
-        return _parse_claude_output(result)
+        return _parse_claude_output(
+            result,
+            resumed=bool(resume_session_id),
+            prior_total_cost_usd=resume_prior_total_cost_usd,
+        )
     finally:
         for path in temp_files:
             Path(path).unlink(missing_ok=True)
@@ -3846,11 +3872,22 @@ async def _invoke_claude(
             await bridge.stop()
 
 
-def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
+def _parse_claude_output(
+    result: _SubprocessResult,
+    *,
+    resumed: bool = False,
+    prior_total_cost_usd: float | None = None,
+) -> AgentResult:
     """Parse Claude Code JSON output into AgentResult.
 
     timed_out, transcript_turns and model_id are propagated directly from
     result on every return path.
+
+    *resumed* and *prior_total_cost_usd* must come from the argv the caller
+    actually spawned: a resumed process reports its session's running total,
+    and ``shared.process_cost.derive_process_cost`` turns that into this
+    process's cost.  Both call sites (``_invoke_claude`` and the orchestrator's
+    sandboxed sub-path) pass them.
     """
     if not result.stdout.strip():
         # Distinct subtype (task 2360 fix #3): a wall-clock timeout that DID
@@ -3904,7 +3941,12 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             model_id=result.model_id,
         )
 
-    cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
+    process_cost = derive_process_cost(
+        data,
+        resumed=resumed,
+        prior_total_usd=prior_total_cost_usd,
+        served_model_id=result.model_id,
+    )
     duration = data.get('duration_ms', 0)
     turns = data.get('num_turns', 0)
     session_id = data.get('session_id', '')
@@ -3975,7 +4017,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     return AgentResult(
         success=is_success,
         output=output_text,
-        cost_usd=cost,
+        cost_usd=process_cost.cost_usd,
         duration_ms=duration,
         turns=turns,
         session_id=session_id,
@@ -3995,6 +4037,9 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         proc_tree=result.proc_tree,
         transcript_turns=result.transcript_turns,
         model_id=result.model_id,
+        cost_basis=process_cost.basis,
+        reported_total_cost_usd=process_cost.reported_total_usd,
+        cost_delta_clamped=process_cost.delta_clamped,
     )
 
 
