@@ -159,9 +159,10 @@ def _make_git_ops() -> MagicMock:
     return git_ops
 
 
-def _make_req() -> MagicMock:
+def _make_req(project_root: Path) -> MagicMock:
     req = MagicMock()
     req.task_id = 'task-scope-spawn'
+    req.config.project_root = project_root
     req.task_files = None
     req.module_configs = []
     req.config.merge_verify_min_free_disk_bytes = 1024
@@ -173,13 +174,13 @@ def _make_req() -> MagicMock:
 class TestMergeLaneHoldsScopeSpawnFailure:
 
     @pytest.mark.asyncio
-    async def test_persistent_refusal_holds_as_transient_infra(self, worktree):
+    async def test_persistent_refusal_holds_as_transient_infra(self, worktree, tmp_path):
         spawn_failed = await _verify_with_unreachable_bus(worktree)
         verifier = FakeVerifier(default=VerifyScript(result=spawn_failed))
         timeouts: dict[str, int] = {}
 
         outcome = await _run_post_merge_verify(
-            _make_git_ops(), _make_req(), MagicMock(),
+            _make_git_ops(), _make_req(tmp_path), MagicMock(),
             timeouts=timeouts, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             dry_run_handles=_DryRunInvestigationHandles(scheduler=MagicMock()),
@@ -195,12 +196,12 @@ class TestMergeLaneHoldsScopeSpawnFailure:
         assert outcome.failure_category == ''
 
     @pytest.mark.asyncio
-    async def test_refusal_that_clears_on_retry_lets_the_merge_proceed(self, worktree):
+    async def test_refusal_that_clears_on_retry_lets_the_merge_proceed(self, worktree, tmp_path):
         spawn_failed = await _verify_with_unreachable_bus(worktree)
         verifier = FakeVerifier(sequence=[VerifyScript(result=spawn_failed)])
 
         outcome = await _run_post_merge_verify(
-            _make_git_ops(), _make_req(), MagicMock(),
+            _make_git_ops(), _make_req(tmp_path), MagicMock(),
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             verifier=verifier,
