@@ -34,9 +34,12 @@ from pathlib import Path
 
 import pytest
 import verify_command_invariants as vci
-from orchestrator.config import ModuleConfig, _discover_module_configs
-from orchestrator.pytest_markers import locate_pytest_config
+from _pytest.mark.expression import Expression
+from orchestrator.config import ModuleConfig, OrchestratorConfig, _discover_module_configs
+from orchestrator.pytest_markers import locate_pytest_config, resolve_marker_expression
 from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+
+from orchestrator import verify_cmd
 
 REPO_ROOT = Path(__file__).parents[2]
 MARKER = 'reads_git_history'
@@ -367,6 +370,71 @@ def _registered_markers(pyproject_text: str) -> frozenset[str]:
     )
 
 
+# ─── The declared leg ───────────────────────────────────────────────────────
+
+
+def selects(expression: str, item_markers: Iterable[str]) -> bool:
+    """Whether pytest's own ``-m`` evaluator selects an item carrying exactly *item_markers*."""
+    present = frozenset(item_markers)
+    return Expression.compile(expression).evaluate(lambda name, **_: name in present)
+
+
+@dataclasses.dataclass(frozen=True)
+class LegSegment:
+    command: str
+    roots: tuple[GateTestRoot, ...]
+
+    @property
+    def pytest_config(self) -> str | None:
+        return self.roots[0].pytest_config if self.roots else None
+
+    def config_text(self) -> str:
+        assert self.pytest_config is not None, f'no pytest config governs {self.command!r}'
+        return (REPO_ROOT / self.pytest_config).read_text()
+
+    def marker_expression(self) -> str | None:
+        return resolve_marker_expression(None, self.command)
+
+    def addopts_deselected_markers(self) -> frozenset[str]:
+        text = self.config_text()
+        addopts = resolve_marker_expression(text, None)
+        if addopts is None or not selects(addopts, ()):
+            return frozenset()
+        return frozenset(name for name in _registered_markers(text) if not selects(addopts, {name}))
+
+    def timeout_secs(self) -> float | None:
+        _, own_args = vci.anchor_split(self.command, vci.PYTEST)
+        for index, token in enumerate(own_args):
+            if token.startswith('--timeout='):
+                return float(token.split('=', 1)[1])
+            if token == '--timeout' and index + 1 < len(own_args):
+                return float(own_args[index + 1])
+        return None
+
+
+def leg_segments(command: str) -> list[LegSegment]:
+    segments = verify_cmd.split_and_chain_segments(command)
+    assert segments is not None, (
+        f'merge_gate_history_test_command is not an `&&` chain the verify runner can split: '
+        f'{command!r}'
+    )
+    for segment in segments:
+        assert segment.cwd_rel == '.', (
+            f'{segment.command!r} runs from {segment.cwd_rel!r}; name its member with '
+            f'`uv run --directory <member>` instead of a `cd`'
+        )
+        assert vci.optional_token_segment(segment.command, vci.PYTEST) == segment.command, (
+            f'each history leg segment must be one pytest invocation: {segment.command!r}'
+        )
+    return [
+        LegSegment(
+            command=segment.command,
+            roots=tuple(pytest_segment_roots(segment.command, _read_repo_file)),
+        )
+        for segment in segments
+    ]
+
+
 # ─── The detector, pinned on synthetic sources ──────────────────────────────
 
 
@@ -548,3 +616,73 @@ def test_every_package_owning_a_marked_test_registers_the_marker() -> None:
         f'these pytest configs own a test marked {MARKER} but do not register it in '
         f'[tool.pytest.ini_options] markers: {unregistered}'
     )
+
+
+def test_pytest_s_evaluator_reads_the_leg_expression_closed_world() -> None:
+    expression = f'{MARKER} and not integration'
+    assert selects(expression, {MARKER})
+    assert not selects(expression, ())
+    assert not selects(expression, {MARKER, 'integration'})
+
+
+def test_a_leg_segment_reads_its_own_marker_expression_and_timeout() -> None:
+    segment = LegSegment(
+        command=f"uv run --directory pkg pytest tests/ -m '{MARKER}' --timeout=300", roots=(),
+    )
+    assert segment.marker_expression() == MARKER
+    assert segment.timeout_secs() == 300
+    assert LegSegment(command='uv run pytest tests/ --timeout 90', roots=()).timeout_secs() == 90
+
+
+@pytest.fixture
+def declared_leg(root_config: OrchestratorConfig) -> list[LegSegment]:
+    command = root_config.merge_gate_history_test_command
+    assert isinstance(command, str) and command.strip(), command
+    return leg_segments(command)
+
+
+def test_dark_factory_declares_a_history_pure_gate_with_a_history_leg(
+    root_config: OrchestratorConfig,
+) -> None:
+    assert root_config.merge_gate_history_pure is True
+    command = root_config.merge_gate_history_test_command
+    assert isinstance(command, str) and command.strip(), command
+
+
+@_SWEEP_GROUP
+def test_the_leg_runs_exactly_the_roots_that_own_marked_tests(
+    declared_leg: list[LegSegment],
+) -> None:
+    for segment in declared_leg:
+        assert segment.roots, f'{segment.command!r} names no test root'
+    leg_roots = {root for segment in declared_leg for root in segment.roots}
+    marked_roots = {swept.root for swept in _live_sweep().marked}
+    assert leg_roots - marked_roots == set(), (
+        f'leg segments over roots with no {MARKER} test exit 5 at the gate and block every '
+        f'same-tree merge: {sorted(leg_roots - marked_roots, key=str)}'
+    )
+    assert marked_roots - leg_roots == set(), (
+        f'roots owning a {MARKER} test that no leg segment runs, so a same-tree merge never '
+        f'checks them: {sorted(marked_roots - leg_roots, key=str)}'
+    )
+
+
+def test_each_leg_segment_selects_only_history_readers_its_member_would_run(
+    declared_leg: list[LegSegment],
+) -> None:
+    for segment in declared_leg:
+        expression = segment.marker_expression()
+        assert expression is not None, f'{segment.command!r} carries no -m expression'
+        assert selects(expression, {MARKER}), (segment.command, expression)
+        assert not selects(expression, ()), (segment.command, expression)
+        for deselected in segment.addopts_deselected_markers():
+            assert not selects(expression, {MARKER, deselected}), (
+                f'{segment.command!r}: its -m replaces addopts\' -m, so it must still '
+                f'deselect {deselected!r}'
+            )
+
+
+def test_each_leg_segment_carries_a_gate_pytest_timeout(declared_leg: list[LegSegment]) -> None:
+    for segment in declared_leg:
+        timeout = segment.timeout_secs()
+        assert timeout is not None and timeout > 60, (segment.command, timeout)
