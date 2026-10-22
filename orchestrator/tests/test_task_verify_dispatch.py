@@ -251,11 +251,15 @@ class _Transport:
     pull_rc: int = 0
     log: list[str] = field(default_factory=list)
     argvs: list[list[str]] = field(default_factory=list)
+    on_delete_ref: Callable[[], object] | None = None
+    at_delete_ref: list[object] = field(default_factory=list)
 
     async def run(self, argv: list[str], *, cwd: Any = None) -> Answer:
         label, answer = self.answer(argv)
         self.log.append(label)
         self.argvs.append(list(argv))
+        if label == 'delete_ref' and self.on_delete_ref is not None:
+            self.at_delete_ref.append(self.on_delete_ref())
         return answer
 
     async def ssh_run(self, argv: list[str], *, cwd: Any = None) -> Answer:
@@ -741,13 +745,33 @@ class TestCancellation:
         assert h.dispatcher.decision_for('7', 1) is None
         assert h.local.calls == []
 
+    async def test_the_slot_stays_leased_until_the_cancelled_dispatch_unwinds(
+        self, tmp_path: Path,
+    ) -> None:
+        started = asyncio.Event()
+        h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_hangs(started)))
+        h.transport.on_delete_ref = lambda: (h.allocator.is_busy('laptop'), dict(h.pool.holders()))
+
+        await _cancel_mid_verify(h, started)
+
+        assert h.transport.at_delete_ref == [(True, {'laptop': 'task:7'})]
+        log = h.transport.log
+        assert log.index('verify_task') < log.index('cancel_verify') < log.index('delete_ref')
+        _assert_slot_free(h)
+
     async def test_a_failed_cancel_parks_the_host_for_the_next_call(self, tmp_path: Path) -> None:
         started = asyncio.Event()
         transport = _Transport(verify=_hangs(started), cancel_rc=1, pgrep_rc=0)
         h = _harness(tmp_path, _ORCH_ONLY, transport=transport)
+        transport.on_delete_ref = lambda: (
+            h.allocator.is_busy('laptop'), h.allocator.is_parked('laptop'), dict(h.pool.holders()),
+        )
 
         await _cancel_mid_verify(h, started)
 
+        assert transport.at_delete_ref == [(True, False, {'laptop': 'task:7'})]
+        log = transport.log
+        assert log.index('cancel_verify') < log.index('delete_ref') < log.index('pgrep')
         assert h.allocator.is_parked('laptop') is True
         assert h.pool.holders() == {}
         result = await h.call(attempt_id=2)
