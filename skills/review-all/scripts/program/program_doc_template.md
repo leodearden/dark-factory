@@ -18,6 +18,10 @@ ${seams}
 
 ${invariants}
 
+## Resolved decisions (do not relitigate)
+
+${decisions}
+
 ## Shared conventions (every session)
 
 - Every task the program files carries `metadata.x_finding_key` (the keys it closes), `metadata.x_finding_run = "${run_id}"` and `metadata.source = "review-all"`. The rest of the filing mechanics, the held-leaf convention and the one-editor rule are `skills/review-all/references/report-format.md` §Artefact 3's.
@@ -31,3 +35,11 @@ ${triage}
 ## FILED — program status
 
 ${filed}
+
+## Held leaves
+
+${held}
+
+## Ledger
+
+${ledger}

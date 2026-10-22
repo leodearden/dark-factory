@@ -75,12 +75,12 @@ def _text(value: Any) -> str:
     if isinstance(value, Mapping):
         return '; '.join(f'{name}: {_text(item)}' for name, item in value.items())
     if isinstance(value, list | tuple):
-        return ', '.join(_text(item) for item in value)
+        return ', '.join(_text(item) for item in value) or NONE
     return str(value)
 
 
 def _listed(values: Iterable[Any]) -> str:
-    return _text(tuple(values)) or NONE
+    return _text(tuple(values))
 
 
 def _bullets(values: Iterable[Any]) -> str:
@@ -128,22 +128,46 @@ def _streams(home: HomeRead, store: StoreFacts) -> str:
 
 def _program_section(section: state.ProgramSection) -> Callable[[HomeRead, StoreFacts], str]:
     def render(home: HomeRead, store: StoreFacts) -> str:
-        return _bullets_or_none(getattr(home.run.program, section.value))
+        return _bullets_or_none(program_facts.program_section(home, section))
     return render
 
 
 def _conventions_extra(home: HomeRead, store: StoreFacts) -> str:
-    return _bullets(home.run.program.conventions_extra)
+    return _bullets(program_facts.program_section(home, state.ProgramSection.CONVENTIONS_EXTRA))
+
+
+_DECISION_FIELDS = ('stream', 'item', 'question', 'ruling', 'options', 'consequence', 'keys', 'answers')
+
+
+def _decision(current: program_facts.CurrentRuling) -> str:
+    ruling = current.ruling
+    parts = [ruling['id'], ruling['ruled_by'], ruling['date']]
+    parts += [
+        f'{name}: {_text(ruling[name])}' for name in _DECISION_FIELDS
+        if ruling.get(name) not in (None, '', ())
+    ]
+    if current.superseded:
+        parts.append(f'supersedes {_listed(current.superseded)}')
+    if ruling.get('reask', False):
+        parts.append('re-ask: the items it answers stay pending')
+    return '- ' + _line(' · '.join(parts))
+
+
+def _decisions(home: HomeRead, store: StoreFacts) -> str:
+    return '\n'.join(map(_decision, program_facts.current_rulings(home.rulings))) or NONE
+
+
+def _task_name(row: state.TaskRow) -> str:
+    """``[<label> ]<id>``: the task as its PRD names it."""
+    return ' '.join(part for part in (program_facts.task_label(row), str(row.task_id)) if part)
 
 
 def _task_entry(row: state.TaskRow) -> str:
-    """``[<label> ]<id>[ <programme state>]``; the state is left out while the task is filed."""
+    """``<task name>[ <programme state>]``; the state is left out while the task is filed."""
     programme_state = program_facts.program_state(row)
-    parts = (
-        program_facts.task_label(row), str(row.task_id),
-        None if programme_state is ProgramState.FILED else str(programme_state),
-    )
-    return ' '.join(part for part in parts if part)
+    if programme_state is ProgramState.FILED:
+        return _task_name(row)
+    return f'{_task_name(row)} {programme_state}'
 
 
 _CHAIN_LABELS: Mapping[state.TriggerChainRole, str] = {
@@ -184,14 +208,57 @@ def _filed(home: HomeRead, store: StoreFacts) -> str:
     return f'{tasks}\n\nTrigger chain:\n\n{_trigger_chain(home, store)}'
 
 
+NOT_RELEASED = 'not released'
+HELD_COLUMNS = (
+    'Leaf', 'Waits on', 'Contract as specified', 'Release owner', 'Released onto',
+    'Contract as delivered',
+)
+
+
+def _held_row(row: state.TaskRow) -> list[str]:
+    wait, released = state.SEAM_WAIT_KEYS, state.SEAM_RELEASED_KEYS
+    if released.record(row) is None:
+        release = [NOT_RELEASED, ABSENT]
+    else:
+        release = [_text(released.value(row, 'onto')), _text(released.value(row, 'contract_as_delivered'))]
+    return [
+        _task_name(row), _text(wait.value(row, 'stream')), _text(wait.value(row, 'contract')),
+        _text(wait.value(row, 'release_owner')), *release,
+    ]
+
+
+def _held(home: HomeRead, store: StoreFacts) -> str:
+    if not store.seam_leaves:
+        return f'no program task carries {state.SEAM_WAIT_KEYS.key}'
+    return _table(HELD_COLUMNS, [_held_row(row) for row in store.seam_leaves])
+
+
+_LEDGER_LEAD = ('seq', 'at', 'by', 'op')
+
+
+def _ledger_entry(line: Mapping[str, Any]) -> str:
+    """``<seq> · <at> · <by> · <op>``, then ``name: value`` for each of the line's own fields."""
+    parts = [_text(line[name]) for name in _LEDGER_LEAD]
+    parts += [f'{name}: {_text(value)}' for name, value in line.items()
+              if name not in state.LEDGER_COMMON_FIELDS]
+    return '- ' + _line(' · '.join(parts))
+
+
+def _ledger(home: HomeRead, store: StoreFacts) -> str:
+    return '\n'.join(map(_ledger_entry, home.run.ledger)) or NONE
+
+
 _SECTIONS: Mapping[str, Callable[[HomeRead, StoreFacts], str]] = {
     'streams': _streams,
     'routed': _program_section(state.ProgramSection.ROUTED),
     'seams': _program_section(state.ProgramSection.SEAMS_EXTRA),
     'invariants': _program_section(state.ProgramSection.INVARIANTS),
+    'decisions': _decisions,
     'conventions_extra': _conventions_extra,
     'triage': _program_section(state.ProgramSection.TRIAGE),
     'filed': _filed,
+    'held': _held,
+    'ledger': _ledger,
 }
 
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 import enum
 import sys
 import types
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -90,6 +90,15 @@ class StoreFacts:
     measured_at: str
 
     @property
+    def rows(self) -> tuple[state.TaskRow, ...]:
+        return tuple(sorted((r for rows in self.by_stream.values() for r in rows), key=_task_id))
+
+    @property
+    def seam_leaves(self) -> tuple[state.TaskRow, ...]:
+        """Every program task that waits, or waited, on a seam: held and released leaves alike."""
+        return tuple(row for row in self.rows if state.SEAM_WAIT_KEYS.key in row.metadata)
+
+    @property
     def is_empty(self) -> bool:
         return not any(self.by_stream.values())
 
@@ -98,6 +107,10 @@ class StoreFacts:
         if self.gate is None:
             return ()
         return tuple(row.task_id for row in self.by_stream[stream] if row.task_id in self.gate.dependencies)
+
+
+def _task_id(row: state.TaskRow) -> int:
+    return row.task_id
 
 
 def _only(read: state.StoreRead) -> state.TaskRow | None:
@@ -115,7 +128,7 @@ def read_store(reader: state.StoreReader, home: HomeRead) -> StoreFacts:
     buckets: dict[str, list[state.TaskRow]] = {
         stream: [] for stream in (*run.program.stream_ids, state.UNSTREAMED)
     }
-    for row in sorted(tasks.rows, key=lambda row: row.task_id):
+    for row in sorted(tasks.rows, key=_task_id):
         buckets[state.stream_of(row, run.views)].append(row)
     return StoreFacts(
         by_stream=types.MappingProxyType({stream: tuple(rows) for stream, rows in buckets.items()}),
@@ -123,3 +136,36 @@ def read_store(reader: state.StoreReader, home: HomeRead) -> StoreFacts:
         completion_gate=_only(completion_gate),
         measured_at=min(read.measured_at for read in reads),
     )
+
+
+@dataclass(frozen=True)
+class CurrentRuling:
+    """A ruling no later ruling supersedes, and the ids it replaces, transitively, newest first."""
+
+    ruling: Mapping[str, Any]
+    superseded: tuple[str, ...]
+
+
+def current_rulings(rulings: Sequence[Mapping[str, Any]]) -> tuple[CurrentRuling, ...]:
+    """Every ruling still in force, in file order; a reversal replaces the ruling it supersedes."""
+    by_id = {ruling['id']: ruling for ruling in rulings}
+    replaced = {ruling['supersedes'] for ruling in rulings if ruling['supersedes'] is not None}
+
+    def chain(ruling: Mapping[str, Any]) -> tuple[str, ...]:
+        ids: list[str] = []
+        prior = ruling['supersedes']
+        while prior is not None:
+            ids.append(prior)
+            prior = by_id[prior]['supersedes']
+        return tuple(ids)
+
+    return tuple(CurrentRuling(r, chain(r)) for r in rulings if r['id'] not in replaced)
+
+
+def program_section(home: HomeRead, section: state.ProgramSection) -> tuple[Any, ...]:
+    """The section's program.json values, then each ``amend_program`` value for it, in seq order."""
+    amended = tuple(
+        line['value'] for line in home.run.ledger
+        if line['op'] == state.LedgerOp.AMEND_PROGRAM and line['section'] == section
+    )
+    return (*getattr(home.run.program, section.value), *amended)
