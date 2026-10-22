@@ -214,3 +214,88 @@ def test_b11_a_store_that_dropped_include_rows_renders_nothing(tmp_path: Path) -
         assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
         assert 'include_rows' in proc.stderr
         assert not (run.home / 'render').exists()
+
+
+DECISIONS = '## Resolved decisions (do not relitigate)'
+HELD = '## Held leaves'
+LEDGER = '## Ledger'
+
+
+def _rule(run: DocRun, ruling: str, *args: str) -> None:
+    proc = run.env.run(
+        'record.py', 'rule', '--run', RUN_ID, '--question', 'q?', '--ruling', ruling,
+        '--source', 'sitting 1', '--option', 'a', '--option', 'b', '--consequence', 'c', *args,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def _append(run: DocRun, op: str, **fields: object) -> None:
+    home = state.Home(run.home)
+    state.append_ledger(home, [{
+        'seq': state.next_seq(state.read_ledger(home)), 'at': state.now_utc(), 'by': 'test',
+        'op': op, **fields,
+    }])
+
+
+def _bullet(section: list[str], ident: str) -> str:
+    """The section's one bullet that opens with *ident*."""
+    (line,) = [line for line in section if line.startswith(f'- {ident} ')]
+    return line
+
+
+def test_b12_a_superseded_ruling_shows_only_its_successor_naming_it(run: DocRun) -> None:
+    _rule(run, 'alpha owns C1', '--by', 'human')
+    _rule(run, 'beta owns C1', '--by', 'human', '--supersedes', 'D1')
+
+    decisions = _section(_rendered(run), DECISIONS)
+
+    d2 = _bullet(decisions, 'D2')
+    assert 'beta owns C1' in d2
+    assert 'supersedes D1' in d2
+    assert not [line for line in decisions if line.startswith('- D1 ')]
+    assert not [line for line in decisions if 'alpha owns C1' in line]
+
+
+def test_a_reask_ruling_is_marked_as_one(run: DocRun) -> None:
+    run.applied('S1.author.json')
+    _rule(run, 'probe it first', '--by', 'human', '--answers', 'S1:Q1', '--reask')
+
+    assert 're-ask' in _bullet(_section(_rendered(run), DECISIONS), 'D1')
+
+
+def test_held_leaves_lists_every_task_carrying_a_seam_wait(decomposed: DocRun) -> None:
+    rows = _table(_section(_rendered(decomposed), HELD))
+
+    by_leaf = {next(iter(_ids(row['Leaf']))): row for row in rows}
+    assert set(by_leaf) == {103, 113}
+    held = by_leaf[103]
+    assert (held['Waits on'], held['Contract as specified'], held['Release owner']) == (
+        'S2', 'C1', 'S2')
+    assert held['Released onto'] == 'not released'
+    released = by_leaf[113]
+    assert _ids(released['Released onto']) == {106}
+    assert released['Contract as delivered'] == 'C2: beta.contract() returns a frozen view'
+
+
+def test_the_ledger_section_has_one_bullet_per_ledger_line_in_seq_order(decomposed: DocRun) -> None:
+    bullets = [line for line in _section(_rendered(decomposed), LEDGER) if line.startswith('- ')]
+
+    ledger = state.read_ledger(state.Home(decomposed.home))
+    assert len(bullets) == len(ledger)
+    for bullet, line in zip(bullets, ledger, strict=True):
+        fields = bullet.removeprefix('- ').split(' · ')
+        assert (fields[0], fields[3]) == (str(line['seq']), line['op']), bullet
+
+
+def test_amendments_from_the_ledger_are_rendered(run: DocRun) -> None:
+    _rule(run, 'gamma gains the c2 key', '--by', 'lead')
+    _append(run, 'amend_program', section='invariants', value={
+        'n': 3, 'statement': 'Gamma never re-exports alpha.', 'owner': 'S3', 'inv_id': None})
+    _append(run, 'amend_stream', stream='S3', field='keys', change='add',
+            value='fk-0000000000c2', ruling='L1')
+
+    text = _rendered(run)
+
+    assert any('Gamma never re-exports alpha.' in line for line in _section(text, '## Invariants'))
+    (s3,) = [row for row in _table(_section(text, '## Streams')) if row['ID'] == 'S3']
+    assert 'fk-0000000000c2' in s3['Finding keys']
