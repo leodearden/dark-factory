@@ -19,6 +19,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _fm_helpers import complete_paged_read
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 from escalation.store_identity import StoreIdentity
@@ -117,11 +118,15 @@ async def spawn(
     journal.data_dir = tmp_path
     journal.record_run_session = AsyncMock()
     journal.clear_run_session = AsyncMock()
+    memory = AsyncMock()
+    memory.graphiti.enumerate_all_valid_edges = AsyncMock(
+        return_value=({}, complete_paged_read()),
+    )
     taskmaster = AsyncMock()
     taskmaster.get_statuses = AsyncMock(return_value={})
     stage = stage_cls(
         stage_id,
-        AsyncMock(),
+        memory,
         taskmaster,
         journal,
         ReconciliationConfig(
