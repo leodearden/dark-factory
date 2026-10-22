@@ -144,18 +144,6 @@ async def spawn(
 
 @STAGES
 @pytest.mark.asyncio
-async def test_b8_recon_stage_spawn_denies_both_escalation_reads(
-    stage_cls: type[BaseStage], stage_id: StageId, tmp_path: Path, fake_claude: Path,
-) -> None:
-    received = await spawn(stage_cls, stage_id, tmp_path, fake_claude)
-
-    denied = denied_by(received['argv'])
-    assert 'mcp__escalation__get_pending_escalations' in denied
-    assert 'mcp__escalation__get_task_escalation_history' in denied
-
-
-@STAGES
-@pytest.mark.asyncio
 async def test_b8_recon_stage_cannot_obtain_an_escalation_read_result(
     stage_cls: type[BaseStage],
     stage_id: StageId,

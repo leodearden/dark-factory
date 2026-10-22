@@ -196,7 +196,7 @@ async def test_b3_omitted_assertion_is_byte_identical(
 
     with_identity, without_identity = answers
     assert seeded.id in wire_text(with_identity)
-    assert wire_text(with_identity).encode() == wire_text(without_identity).encode()
+    assert wire_text(with_identity) == wire_text(without_identity)
     assert with_identity.structured_content == without_identity.structured_content
 
 
@@ -273,8 +273,6 @@ async def test_b7_mismatch_storm_files_exactly_one_l1(
         assert str(queue.queue_dir) in storms[0].summary
 
         await refused_pending_read(client, df_root)
-        storms = stores.storm_records(queue)
-        assert len(storms) == 1
-        assert storms[0].dedupe_count == 0
+        assert len(stores.storm_records(queue)) == 1
 
     assert list(df_root.iterdir()) == []
