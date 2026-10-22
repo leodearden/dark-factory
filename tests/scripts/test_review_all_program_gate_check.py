@@ -19,6 +19,8 @@ SCRIPT = 'gate_check.py'
 GATE = 110
 CORRECT = 0
 DEFECTIVE = 1
+UNCHECKED = 2
+NO_GATE = 3
 MISSING = 'missing dependency'
 FOREIGN = 'foreign dependency'
 ESCAPES = 'escapes the completion measure'
@@ -115,3 +117,50 @@ def test_an_empty_program_is_defective(interim: SeededRun) -> None:
 
     assert result.returncode == DEFECTIVE, result.stdout + result.stderr
     assert len(_lines(result, EMPTY)) == 1, result.stdout
+
+
+def _assert_unjudged(result: subprocess.CompletedProcess[str]) -> None:
+    for kind in (MISSING, FOREIGN, ESCAPES, EMPTY):
+        assert _lines(result, kind) == [], result.stdout
+    assert not any(line.endswith(': correct') for line in result.stdout.splitlines())
+
+
+ANOTHER_RUNS_CHAIN = {'trigger_chain': {
+    'role': 'human_gate', 'skill': 'review-all', 'run_id': 'review-all-other-20261019',
+}}
+
+
+@pytest.mark.parametrize('change', [None, {'metadata': ANOTHER_RUNS_CHAIN}],
+                         ids=['gate-removed', 'gate-of-another-run'])
+def test_no_human_gate_is_its_own_state_not_a_defect(
+    interim: SeededRun, change: dict[str, object] | None,
+) -> None:
+    interim.store.edit({GATE: change})
+
+    result = _check(interim)
+
+    assert result.returncode == NO_GATE, result.stdout + result.stderr
+    assert f'no human_gate task carries trigger_chain.run_id = {RUN_ID}' in (
+        result.stdout.splitlines())
+    _assert_unjudged(result)
+
+
+def test_a_store_without_include_rows_is_unchecked(tmp_path: Path) -> None:
+    with seeded_run(tmp_path, store_flags=('--no-include-rows',)) as run:
+        result = _check(run)
+
+    assert result.returncode == UNCHECKED, result.stdout + result.stderr
+    assert 'include_rows' in result.stderr
+    _assert_unjudged(result)
+
+
+def test_a_run_with_no_home_is_unchecked(interim: SeededRun) -> None:
+    result = interim.run(SCRIPT, '--run', 'review-all-absent-20261019')
+
+    assert result.returncode == UNCHECKED, result.stdout + result.stderr
+    assert 'program.json' in result.stderr
+    _assert_unjudged(result)
+
+
+def test_no_run_argument_is_unchecked(interim: SeededRun) -> None:
+    assert interim.run(SCRIPT).returncode == UNCHECKED
