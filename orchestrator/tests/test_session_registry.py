@@ -77,6 +77,7 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
         'question': sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00'),
         'claude_session_id': 'uuid-claude-abc123',
         'claude_owner_pid': 424242,
+        'self_exit': True,
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
