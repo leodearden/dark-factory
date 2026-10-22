@@ -22,7 +22,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
-from shared.branch_names import canonical_queued_branch_name
+from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 
 from orchestrator.branch_stack import PreStackTip
 from orchestrator.git_ops import MergeResult
@@ -907,14 +907,14 @@ class QueuedBranch:
         computed by delegating to
         :func:`shared.branch_names.canonical_queued_branch_name` — the
         existing single source of truth for the prepend-unless-present rule
-        — rather than reimplementing it here; ``bare_id`` is then stripped
-        from it the same way the ``merge_queue_store.py`` journal
-        normalization does. This is the ONLY place branch-prefix *pairing*
+        — rather than reimplementing it here; ``bare_id`` is derived by
+        :func:`shared.branch_names.bare_queued_branch_id`, the inverse
+        direction of that same rule. This is the ONLY place branch-prefix *pairing*
         logic should live — callers should not reimplement prefix
         stripping/prepending elsewhere.
         """
         full_name = canonical_queued_branch_name(raw, branch_prefix)
-        bare_id = full_name.removeprefix(branch_prefix)
+        bare_id = bare_queued_branch_id(raw, branch_prefix)
         return cls(bare_id=bare_id, full_name=full_name)
 
 
