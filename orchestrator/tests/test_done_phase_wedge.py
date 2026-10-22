@@ -31,6 +31,7 @@ from _workflow_helpers import (
 from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
+from orchestrator.harness import TaskReport
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import WorkflowState
@@ -41,6 +42,10 @@ pytestmark = pytest.mark.usefixtures(_derive_meta_root_like_production.__name__)
 TID = '42'
 GRACE = 0.5
 BARRIER = 45.0
+WEDGE_ALONE_OR_WITH_THE_GIT_CLEANUP = (
+    ['stop_claimant_heartbeat'],
+    ['stop_claimant_heartbeat', 'cleanup_done_worktree'],
+)
 
 
 class _HeartbeatSurvivesOneCancel(FakeScheduler):
@@ -84,7 +89,7 @@ def config(tmp_path: Path) -> OrchestratorConfig:
 
 @dataclass(frozen=True)
 class _Unwound:
-    slot: asyncio.Task[None]
+    slot: asyncio.Task[TaskReport | None]
     sem: asyncio.Semaphore
     scheduler: Scheduler
     events: MagicMock
@@ -153,6 +158,10 @@ async def _hard_cancel_a_slot_wedged_after_done(
 
 
 def _assert_released_with_the_wedge_abandoned(unwound: _Unwound) -> list[str]:
+    """The wedge is always abandoned; cleanup_done_worktree, the only later entry here that waits on real git, may legitimately overrun the test's short grace too.
+
+    The other entries are instant in this harness: no steward, no escalation queue, no warm-lane pool so release_lane returns at once, and a synchronous cleanup_config_dir.
+    """
     assert unwound.slot.done(), 'the hard-cancelled slot never unwound'
     assert not unwound.slot.cancelled()
     assert not unwound.sem.locked(), 'the slot semaphore was not released'
@@ -163,7 +172,8 @@ def _assert_released_with_the_wedge_abandoned(unwound: _Unwound) -> list[str]:
         c.kwargs['data']['entries'] for c in unwound.events.emit.call_args_list
         if c.args and c.args[0] is EventType.workflow_cleanup_abandoned
     ]
-    assert abandoned == [['stop_claimant_heartbeat']]
+    assert len(abandoned) == 1
+    assert abandoned[0] in WEDGE_ALONE_OR_WITH_THE_GIT_CLEANUP
     return abandoned[0]
 
 
