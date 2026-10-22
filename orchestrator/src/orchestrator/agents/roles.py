@@ -29,8 +29,7 @@ from orchestrator.agents.sigpipe_guidance import SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
 # did not exist and the Lever-C fast-path silently always fell through to the
 # architect).  jcodemunch tools intentionally have no prefix entry here — they
 # ride inside the 'orchestrator' MCP config but are not themselves a trigger
-# for requiring a family (a role may use jcodemunch alone with no family
-# declared, e.g. reviewer_comprehensive).
+# for requiring a family.
 _FAMILY_TOOL_PREFIXES: dict[str, tuple[str, ...]] = {
     'orchestrator': ('mcp__fused-memory__', 'mcp__escalation__'),
     'plan_tools': ('mcp__plan-tools__',),
@@ -69,6 +68,28 @@ class AgentRole:
     # whenever the paired CONTRACT changes materially, invalidating any stale
     # pinned artifact for the old contract). None when prompt_spec is None.
     prompt_harness_version: str | None = None
+
+    @property
+    def strict_mcp_scope(self) -> bool:
+        """Whether _invoke runs this role with --strict-mcp-config.
+
+        True when _invoke spawns every MCP server the role can reach per
+        invocation: it declares a family, none is 'orchestrator', and each
+        mcp__ grant belongs to a declared family. The CLI then does not union
+        in the ambient project/user .mcp.json. Orchestrator-family and
+        family-less roles keep the ambient merge (task 3849; the reviewer
+        trial scopes the same reviewer strictly, evals/reviewer_trial/runner.py).
+        """
+        if not self.mcp_families or 'orchestrator' in self.mcp_families:
+            return False
+        declared_prefixes = tuple(
+            prefix for family in self.mcp_families for prefix in _FAMILY_TOOL_PREFIXES[family]
+        )
+        return all(
+            tool.startswith(declared_prefixes)
+            for tool in self.allowed_tools
+            if tool.startswith('mcp__')
+        )
 
     def __post_init__(self) -> None:
         """Import-time capability assertion (W9-η, reify esc-4943-54 class).

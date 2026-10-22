@@ -14174,10 +14174,12 @@ class TaskWorkflow:
         if 'verdict_tools' in role.mcp_families and cwd:
             mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role)
 
-        # Strict scoping (EVAL_PROFILE, task 4757) is a no-op without a truthy
-        # --mcp-config, so a role whose families composed none gets the
-        # zero-server one rather than keeping the worktree's ambient .mcp.json.
-        if self.config.strict_mcp_config and not mcp_config:
+        # Strict scoping (EVAL_PROFILE, task 4757; a self-contained role, task
+        # 3849) is a no-op without a truthy --mcp-config, so a role whose
+        # families composed none gets the zero-server one rather than keeping
+        # the worktree's ambient .mcp.json.
+        strict_mcp = self.config.strict_mcp_config or role.strict_mcp_scope
+        if strict_mcp and not mcp_config:
             mcp_config = no_mcp_servers_config()
 
         # Session-resume lifecycle: if the harness recovered a sidecar that
@@ -14473,7 +14475,7 @@ class TaskWorkflow:
                 allowed_tools=role.allowed_tools or None,
                 disallowed_tools=role.disallowed_tools or None,
                 mcp_config=mcp_config,
-                strict_mcp_config=self.config.strict_mcp_config,
+                strict_mcp_config=strict_mcp,
                 output_schema=output_schema,
                 sandbox_modules=sandbox_modules,
                 sandbox_extras=sandbox_extras,
