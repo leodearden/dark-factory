@@ -58,9 +58,9 @@ git always emits English-locale diagnostics. ``git_ops._git_clean_failure_
 is_benign`` substring-matches that English warning text; under a translated
 locale the matcher silently stops recognising it, defeating the R3
 ENOENT-tolerance fix for the 4892-class warm-lane FAULT. Do not "simplify"
-this away. A caller whose child must see the caller's own environment passes
-``pin_c_locale=False`` — orchestrator ``verify_runner``'s ssh/push transport,
-because ssh forwards ``LANG``/``LC_*`` to the remote host.
+this away. A caller whose child must see the caller's own environment (for
+example, a child that forwards the locale onward) passes
+``pin_c_locale=False``.
 
 CANCELLATION SAFETY (tasks 2608, 4155, 6346). If the ``communicate()`` await is
 interrupted — a caller-side ``asyncio.wait_for``, an outer cancellation, or

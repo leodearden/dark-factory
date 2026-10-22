@@ -1119,6 +1119,14 @@ async def _default_ssh_heartbeat_run(
     called from another thread, and routing through ``call_soon_threadsafe``
     would put the write back on the very loop whose stalls are the defect.
 
+    That raw stdin fd is also why this keeps its own spawn instead of adapting
+    ``shared.git_async.run_git`` as :func:`_default_subprocess_run` does:
+    ``run_git`` only feeds a one-shot ``input_text`` through ``communicate()``
+    and then closes stdin.  So its kill-the-group-on-cancel contract does not
+    cover this child.  A cancelled dispatch is ended by the connection-death
+    protocol instead: stopping the writer closes ``write_fd``, and the remote
+    watchdog fires on that EOF.
+
     A failed beat never raises out of the writer nor alters the returned
     ``(rc, stdout, stderr)``; ``verify_cancel.run_stdin_heartbeat`` names each
     suppressed error and why it is benign.
