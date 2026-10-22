@@ -1765,9 +1765,14 @@ unblock_auto:
 
 # Task 3546 (mu gate), Leo's ruling of 2026-10-18 on esc-3546-1: enforce strand
 # conversion (task 3539) fleet-wide. Restart-only, so it takes effect at the next
-# scheduled fleet redeploy. workflow_exit_contract_enforce stays False until task
-# 3113 lands and a fresh soak shows zero would-violates.
+# scheduled fleet redeploy.
 convert_to_blocked_enforce: true
+# Task 3546 (mu gate), Leo's ruling E of 2026-10-20 (task 7255): enforce the
+# run()-exit contract (task 3542) fleet-wide. Soak clean on 2026-10-22: zero
+# workflow_exit_contract events of any verdict in all 8 fleet run stores since
+# 2026-10-20T01:10Z, after 3113's deploy, with every unit restarted inside the
+# window. Restart-only, so it goes live at the next fleet restart.
+workflow_exit_contract_enforce: true
 
 psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2026-09-08)
   mem_some_avg10: 15.0
