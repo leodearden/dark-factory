@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
+import subprocess
 import sys
 import types
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
+from review_all_program_cli import FIXTURE_RETURNS, RUN_ID, ProgramEnv
 from review_all_program_fixture import FIXTURE_DIR, PROGRAM_DIR, load_state
 
 state = load_state()
@@ -153,3 +156,178 @@ def test_a_check_entry_that_is_not_an_object_is_skipped_not_raised() -> None:
         _row(204, None),
     ]
     assert _impacts([_move(OLD, NEW)], rows) == [(203, 'kept', 'path', OLD, NEW)]
+
+
+UNREACHABLE = 'http://127.0.0.1:9/mcp'
+PROJECT_ROOT = '/review-all-fixture/project'
+S1_PRD = 'plans/review-all-fixture-s1-prd.md'
+S1_AUTHOR = 'returns/S1.author.json'
+S1_DECOMPOSE = 'returns/S1.decompose.json'
+
+
+def _status(status: str, ret: str | None, stream: str = 'S1') -> dict[str, Any]:
+    fields: dict[str, Any] = {'op': 'stream_status', 'stream': stream, 'status': status,
+                              'prd_path': S1_PRD}
+    if ret is not None:
+        fields['return'] = ret
+    return fields
+
+
+def _action(
+    action_id: str, lead_op: str, task: int, target: Any, text: str, needs_human: bool,
+    ret: str = S1_DECOMPOSE,
+) -> dict[str, Any]:
+    return {'op': 'action', 'id': action_id, 'lead_op': lead_op, 'task': task, 'target': target,
+            'text': text, 'needs_human': needs_human, 'return': ret}
+
+
+def _action_result(action_id: str, result_state: str, batch: int | None = 1,
+                   detail: str | None = None) -> dict[str, Any]:
+    return {'op': 'action_result', 'id': action_id, 'state': result_state, 'batch': batch,
+            'detail': detail}
+
+
+A1 = _action('A1', 'note', 102, None, 'Route callers only after 101 lands.', False)
+A2 = _action('A2', 'edge', 102, [106], '102 consumes C2 from S2 α.', False)
+A3 = _action('A3', 'cancel', 104, [101], 'subsumed by 101', True)
+BASE_LEDGER = (_status('authored', S1_AUTHOR), _status('decomposed', S1_DECOMPOSE), A1, A2, A3)
+
+
+def _append(home: Any, entries: Sequence[Mapping[str, Any]]) -> None:
+    prior = state.read_ledger(home)
+    state.append_ledger(home, [
+        {'seq': state.next_seq(prior) + offset, 'at': state.now_utc(), 'by': 'test', **fields}
+        for offset, fields in enumerate(entries)
+    ])
+
+
+def _seed(
+    env: ProgramEnv, ledger: Sequence[Mapping[str, Any]] = BASE_LEDGER,
+    returns: Sequence[str] = ('S1.author.json', 'S1.decompose.json'),
+) -> Any:
+    """A home holding the fixture program, copies of *returns* under returns/, and *ledger*."""
+    home = state.Home(env.home)
+    (home.root / 'returns').mkdir(parents=True)
+    shutil.copyfile(FIXTURE_DIR / 'program.json', home.program_json)
+    for name in returns:
+        shutil.copyfile(FIXTURE_RETURNS / name, home.root / 'returns' / name)
+    _append(home, ledger)
+    return home
+
+
+@pytest.fixture
+def env(tmp_path: Path) -> ProgramEnv:
+    """Every script run sees an unreachable store: a test that needs one replaces the URL."""
+    return ProgramEnv.under(tmp_path, UNREACHABLE)
+
+
+def _output(proc: subprocess.CompletedProcess[str]) -> str:
+    return proc.stdout + proc.stderr
+
+
+def _write(env: ProgramEnv, *args: str) -> subprocess.CompletedProcess[str]:
+    return env.run('clerk_batch.py', 'write', '--run', RUN_ID, *args)
+
+
+def _batch(home: Any, number: int = 1) -> dict[str, Any]:
+    return json.loads(home.batch_files(number).actions.read_text())
+
+
+def _batched(*actions: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Each seeded action as a batch carries it: its own fields, without the ledger op."""
+    return [{key: value for key, value in action.items() if key != 'op'} for action in actions]
+
+
+def _actions_dir(home: Any) -> list[str]:
+    actions = home.root / 'actions'
+    return sorted(path.name for path in actions.iterdir()) if actions.exists() else []
+
+
+def test_write_batches_every_unapplied_action_that_needs_no_human(env: ProgramEnv) -> None:
+    home = _seed(env)
+    ledger_before = home.ledger.read_bytes()
+    proc = _write(env)
+    assert proc.returncode == 0, _output(proc)
+    files = home.batch_files(1)
+    assert _batch(home) == {
+        'run_id': RUN_ID, 'batch': 1, 'result_file': str(files.result), 'accepted': [],
+        'actions': _batched(A1, A2),
+    }
+    assert home.ledger.read_bytes() == ledger_before
+    awaiting = [line for line in proc.stdout.splitlines() if line.lstrip().startswith('A3 ')]
+    assert len(awaiting) == 1 and '--accept A3' in awaiting[0], proc.stdout
+    assert str(files.actions) in proc.stdout and str(files.prompt) in proc.stdout
+
+
+def test_the_prompt_carries_the_rules_the_paths_and_every_result_key(env: ProgramEnv) -> None:
+    home = _seed(env)
+    proc = _write(env)
+    assert proc.returncode == 0, _output(proc)
+    files = home.batch_files(1)
+    prompt = files.prompt.read_text()
+    assert clerk.CLERK_RULES in prompt
+    header, _, shape = prompt.partition(clerk.CLERK_RULES)
+    assert str(files.actions) in header and str(files.result) in header
+    assert PROJECT_ROOT in header
+    for key in [*clerk.RESULT_LISTS, 'dirtied']:
+        assert key in shape, f'the result shape after CLERK_RULES does not name {key!r}'
+
+
+def test_an_action_with_a_result_is_not_batched_again(env: ProgramEnv) -> None:
+    home = _seed(env, [*BASE_LEDGER, _action_result('A1', 'applied')])
+    proc = _write(env)
+    assert proc.returncode == 0, _output(proc)
+    assert _batch(home)['actions'] == _batched(A2)
+
+
+def test_accept_batches_a_needs_human_action_and_records_it(env: ProgramEnv) -> None:
+    home = _seed(env)
+    proc = _write(env, '--accept', 'A3')
+    assert proc.returncode == 0, _output(proc)
+    batch = _batch(home)
+    assert batch['actions'] == _batched(A1, A2, A3)
+    assert batch['accepted'] == ['A3']
+
+
+@pytest.mark.parametrize(('ledger', 'accepted'), [
+    (BASE_LEDGER, 'A9'),
+    (BASE_LEDGER, 'A1'),
+    ((*BASE_LEDGER, _action_result('A3', 'applied')), 'A3'),
+], ids=['unknown', 'needs-no-human', 'already-recorded'])
+def test_accept_refuses_an_id_that_is_no_unapplied_needs_human_action(
+    env: ProgramEnv, ledger: Sequence[Mapping[str, Any]], accepted: str,
+) -> None:
+    home = _seed(env, ledger)
+    proc = _write(env, '--accept', accepted)
+    assert proc.returncode == 1, _output(proc)
+    assert accepted in proc.stderr
+    assert _actions_dir(home) == []
+
+
+def test_a_second_write_is_a_new_batch_and_leaves_the_first_untouched(env: ProgramEnv) -> None:
+    home = _seed(env)
+    assert _write(env).returncode == 0
+    first = home.batch_files(1).actions.read_bytes()
+    proc = _write(env)
+    assert proc.returncode == 0, _output(proc)
+    assert _batch(home, 2)['batch'] == 2
+    assert _batch(home, 2)['actions'] == _batched(A1, A2)
+    assert home.batch_files(1).actions.read_bytes() == first
+
+
+def test_nothing_unapplied_writes_no_batch(env: ProgramEnv) -> None:
+    home = _seed(env, [
+        *BASE_LEDGER, _action_result('A1', 'applied'), _action_result('A2', 'skipped', detail='x'),
+        _action_result('A3', 'rejected', detail='y'),
+    ])
+    proc = _write(env)
+    assert proc.returncode == 0, _output(proc)
+    assert 'nothing to batch' in proc.stdout
+    assert _actions_dir(home) == []
+
+
+def test_a_home_with_no_program_is_refused_naming_the_home(env: ProgramEnv) -> None:
+    proc = _write(env)
+    assert proc.returncode == 1, _output(proc)
+    assert str(env.home) in proc.stderr
+    assert 'record.py init' in proc.stderr
