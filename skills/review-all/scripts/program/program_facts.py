@@ -15,6 +15,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import home_writer
+import questions
 import run_cli
 import state
 
@@ -169,3 +170,50 @@ def program_section(home: HomeRead, section: state.ProgramSection) -> tuple[Any,
         if line['op'] == state.LedgerOp.AMEND_PROGRAM and line['section'] == section
     )
     return (*getattr(home.run.program, section.value), *amended)
+
+
+@dataclass(frozen=True)
+class OpenAction:
+    """A lead action the ledger records and no ``action_result`` line has closed yet."""
+
+    id: str
+    lead_op: str
+    task: int
+    target: Any
+    text: str
+    stream: str
+
+
+def _stream_of_returns(ledger: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    """Each applied return's stream, from the ``stream_status`` line its application wrote."""
+    return {
+        line['return']: line['stream'] for line in ledger
+        if line['op'] == state.LedgerOp.STREAM_STATUS and 'return' in line
+    }
+
+
+def open_actions(ledger: Sequence[Mapping[str, Any]]) -> tuple[OpenAction, ...]:
+    """Every ``action`` line no ``action_result`` names, in seq order, with the stream it came from."""
+    closed = {line['id'] for line in ledger if line['op'] == state.LedgerOp.ACTION_RESULT}
+    streams = _stream_of_returns(ledger)
+    actions = []
+    for line in ledger:
+        if line['op'] != state.LedgerOp.ACTION or line['id'] in closed:
+            continue
+        if line['return'] not in streams:
+            raise state.StateError(
+                f'ledger seq {line["seq"]}: action {line["id"]} came from {line["return"]}, '
+                'which no stream_status line names'
+            )
+        actions.append(OpenAction(
+            id=line['id'], lead_op=line['lead_op'], task=line['task'], target=line['target'],
+            text=line['text'], stream=streams[line['return']],
+        ))
+    return tuple(actions)
+
+
+def pending_questions(home: HomeRead) -> tuple[questions.RecordedQuestion, ...]:
+    """The recorded questions still awaiting a ruling, in the order they were first recorded."""
+    recorded = questions.recorded_questions(home.run.ledger)
+    pending = set(questions.pending_items(recorded, home.rulings))
+    return tuple(question for ref, question in recorded.items() if ref in pending)

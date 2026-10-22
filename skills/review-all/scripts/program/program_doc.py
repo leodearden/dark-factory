@@ -178,13 +178,13 @@ _CHAIN_LABELS: Mapping[state.TriggerChainRole, str] = {
 
 def _chain_line(run_id: str, role: state.TriggerChainRole, gate: state.TaskRow | None) -> str:
     if gate is None:
-        return f'- no {role} task carries trigger_chain.run_id = {run_id}'
-    return f'- {_CHAIN_LABELS[role]} {gate.task_id} · depends on {_listed(gate.dependencies)}'
+        return f'no {role} task carries trigger_chain.run_id = {run_id}'
+    return f'{_CHAIN_LABELS[role]} {gate.task_id} · depends on {_listed(gate.dependencies)}'
 
 
 def _trigger_chain(home: HomeRead, store: StoreFacts) -> str:
     run_id = home.run.program.run_id
-    return '\n'.join([
+    return _bullets([
         _chain_line(run_id, state.TriggerChainRole.HUMAN_GATE, store.gate),
         _chain_line(run_id, state.TriggerChainRole.COMPLETION_GATE, store.completion_gate),
     ])
@@ -365,8 +365,7 @@ class Render:
 
 def _checked_render(args: argparse.Namespace) -> Render | None:
     """Render, check the headings against the published doc, and write; None when refused."""
-    home = program_facts.read_home(args.run)
-    store = program_facts.read_store(state.open_reader(home.run.program), home)
+    home, store = _read(args)
     program = home.run.program
     text = render_text(args.template or TEMPLATE, home, store)
     published = _published_text(program)
@@ -475,18 +474,76 @@ def _publish(args: argparse.Namespace) -> Exit:
     return Exit.DONE
 
 
+def _read(args: argparse.Namespace) -> tuple[HomeRead, StoreFacts]:
+    home = program_facts.read_home(args.run)
+    return home, program_facts.read_store(state.open_reader(home.run.program), home)
+
+
+def _held_leaf_line(stream: str, row: state.TaskRow, store: StoreFacts) -> str:
+    wait = state.SEAM_WAIT_KEYS
+    waits_on = wait.value(row, 'stream')
+    label = program_facts.task_label(row)
+    named = stream if label is None else f'{stream} {label}'
+    waited_on_filed = [other.task_id for other in store.by_stream.get(waits_on, ())]
+    return (
+        f'held {row.task_id} ({named}) waits on {waits_on} {wait.value(row, "contract")} · '
+        f'release owner {wait.value(row, "release_owner")} · {waits_on} filed: {_listed(waited_on_filed)}'
+    )
+
+
+def _roster_lines(home: HomeRead, store: StoreFacts) -> list[str]:
+    run = home.run
+    waves = state.waves(run.views)
+    actions = program_facts.open_actions(run.ledger)
+    pending = program_facts.pending_questions(home)
+    lines = []
+    for stream in run.program.stream_ids:
+        rows = store.by_stream[stream]
+        held = [row for row in rows if program_facts.program_state(row) is ProgramState.HELD]
+        lines.append(' · '.join([
+            stream, f'wave {waves[stream]}', str(run.views[stream].status or NO_STATUS),
+            f'filed {len(rows)}', f'held {len(held)}', f'gate deps {len(store.gate_deps(stream))}',
+            f'open actions {sum(1 for a in actions if a.stream == stream)}',
+            f'open questions {sum(1 for q in pending if q.ref.stream == stream)}',
+        ]))
+    lines.append(' · '.join([
+        state.UNSTREAMED, f'filed {len(store.by_stream[state.UNSTREAMED])}',
+        f'gate deps {len(store.gate_deps(state.UNSTREAMED))}',
+    ]))
+    lines += [
+        _held_leaf_line(stream, row, store)
+        for stream, rows in store.by_stream.items() for row in rows
+        if program_facts.program_state(row) is ProgramState.HELD
+    ]
+    lines.append(_chain_line(run.program.run_id, state.TriggerChainRole.HUMAN_GATE, store.gate))
+    return lines
+
+
+def _roster(args: argparse.Namespace) -> Exit:
+    home, store = _read(args)
+    for line in _roster_lines(home, store):
+        print(line)
+    print(f'store read {store.measured_at}')
+    return Exit.DONE
+
+
 @dataclass(frozen=True)
 class _Mode:
-    """A mode of the CLI: the flag that selects it, what it does, and the verb its failure names."""
+    """A mode of the CLI: the flag that selects it, what it does, and the verb its failure names.
+
+    Only a mode that renders takes ``--template`` and ``--allow-drop``.
+    """
 
     flag: str | None
     verb: str
     body: Callable[[argparse.Namespace], Exit]
+    renders: bool
 
 
-_RENDER = _Mode(None, 'render', _render)
+_RENDER = _Mode(None, 'render', _render, renders=True)
 _MODES = (
-    _Mode('publish', 'publish', _publish),
+    _Mode('publish', 'publish', _publish, renders=True),
+    _Mode('roster', 'print the roster', _roster, renders=False),
 )
 
 
@@ -509,12 +566,17 @@ def _parser() -> argparse.ArgumentParser:
     modes.add_argument('--publish', action='store_true',
                        help='render, then copy the doc, its snapshot and every prds/<S>/ file '
                             'into the checkout and list the paths for one commit')
+    modes.add_argument('--roster', action='store_true',
+                       help='print one line per stream, each unreleased held leaf and the gate')
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
     mode = _selected(args)
+    if not mode.renders and (args.template is not None or args.allow_drop):
+        parser.error('--template and --allow-drop go only with a render or --publish')
     try:
         return mode.body(args)
     except (state.StateError, OSError) as failed:
