@@ -430,6 +430,7 @@ def test_restarts_disabled_attribute_the_worker_death(
     )
 
 
+@pytest.mark.xdist_group(RESTART_REPRO_GROUP)
 @pytest.mark.timeout(180)
 def test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
