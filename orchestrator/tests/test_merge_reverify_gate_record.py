@@ -53,11 +53,15 @@ _SHAS = {
 }
 
 
+_LEG = 'pytest tests/ -m reads_git_history'
+
+
 def _decision(
     reason: ReverifyGateReason,
     *,
     overlap: tuple[str, ...] = (),
     blockers: tuple[str, ...] = (),
+    history_leg_command: str | None = None,
     task_id: str = 't-5064',
 ) -> ReverifyGateDecision:
     return ReverifyGateDecision(
@@ -66,7 +70,7 @@ def _decision(
         verified_merge_sha=_SHAS['verified_merge_sha'],
         rebased_from=_SHAS['rebased_from'],
         rebased_onto=_SHAS['rebased_onto'],
-        overlap=overlap, blockers=blockers,
+        overlap=overlap, blockers=blockers, history_leg_command=history_leg_command,
     )
 
 
@@ -79,7 +83,9 @@ _CONSISTENT_DECISIONS = {
     ),
     ReverifyGateReason.overlap: _decision(ReverifyGateReason.overlap, overlap=('x.txt',)),
     ReverifyGateReason.overlap_unknown: _decision(ReverifyGateReason.overlap_unknown),
-    ReverifyGateReason.same_tree_history_leg: _decision(ReverifyGateReason.same_tree_history_leg),
+    ReverifyGateReason.same_tree_history_leg: _decision(
+        ReverifyGateReason.same_tree_history_leg, history_leg_command=_LEG,
+    ),
 }
 
 _SKIPS = {ReverifyGateReason.same_tree, ReverifyGateReason.disjoint}
@@ -133,6 +139,29 @@ class TestReverifyGateDecisionRecord:
 
         message = str(refused.value)
         for fact in ('t-refused', str(reason), repr(overlap), repr(blockers)):
+            assert fact in message, message
+
+    @pytest.mark.parametrize(
+        ('reason', 'history_leg_command'),
+        [
+            pytest.param(
+                ReverifyGateReason.same_tree_history_leg, None, id='history-leg-without-a-command',
+            ),
+            pytest.param(
+                ReverifyGateReason.same_tree_history_leg, '  ', id='history-leg-with-a-blank-command',
+            ),
+            pytest.param(ReverifyGateReason.same_tree, _LEG, id='same-tree-skip-with-a-command'),
+            pytest.param(ReverifyGateReason.overlap_unknown, _LEG, id='re-verify-with-a-command'),
+        ],
+    )
+    def test_only_a_history_leg_decision_carries_the_leg_it_runs(
+        self, reason: ReverifyGateReason, history_leg_command: str | None,
+    ) -> None:
+        with pytest.raises(ValueError) as refused:
+            _decision(reason, history_leg_command=history_leg_command, task_id='t-refused')
+
+        message = str(refused.value)
+        for fact in ('t-refused', str(reason), repr(history_leg_command)):
             assert fact in message, message
 
     @pytest.mark.parametrize('reason', list(ReverifyGateReason), ids=str)

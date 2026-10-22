@@ -3368,8 +3368,11 @@ async def _decide_reverify_gate(
     )
     history_pure = getattr(req.config, 'merge_gate_history_pure', False) is True
     if history_pure and await _same_tree(git_ops, verified_merge_sha, merge_sha):
-        if _declared_history_leg(req) is not None:
-            return decide(reason=ReverifyGateReason.same_tree_history_leg)
+        if (history_leg_command := _declared_history_leg(req)) is not None:
+            return decide(
+                reason=ReverifyGateReason.same_tree_history_leg,
+                history_leg_command=history_leg_command,
+            )
         return decide(reason=ReverifyGateReason.same_tree)
     overlap = await _rebase_delta_touched_overlap(
         req.worktree, rebased_from, rebased_onto, git_ops,
@@ -3505,11 +3508,6 @@ async def _reverify_rebased_tree(
     emit_reverify_gate_decision(event_store, decision)
     if (clearance := decision.reason.skip_clearance) is not None:
         return clearance
-    history_leg = (
-        _declared_history_leg(req)
-        if decision.reason is ReverifyGateReason.same_tree_history_leg
-        else None
-    )
     failure = await run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts=timeouts,
@@ -3519,11 +3517,13 @@ async def _reverify_rebased_tree(
         merge_sha=merge_sha,
         keep_worktrees=keep_worktrees,
         event_store=event_store,
-        history_leg_command=history_leg,
+        history_leg_command=decision.history_leg_command,
     )
     if failure is not None:
         return failure
-    return GateClearance.reverified if history_leg is None else GateClearance.history_leg
+    if decision.history_leg_command is None:
+        return GateClearance.reverified
+    return GateClearance.history_leg
 
 
 async def _check_post_merge_pyright(
