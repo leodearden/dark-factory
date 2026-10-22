@@ -481,3 +481,43 @@ def test_publish_without_the_checkout_names_project_root(decomposed: DocRun) -> 
 
     assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
     assert 'project_root' in proc.stderr
+
+
+def _roster(run: DocRun) -> list[str]:
+    proc = run.doc('--roster')
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc.stdout.splitlines()
+
+
+def _roster_line(lines: list[str], opening: str) -> str:
+    (line,) = [line for line in lines if line.startswith(opening)]
+    return line
+
+
+def test_the_roster_prints_one_line_per_stream_each_held_leaf_and_the_gate(decomposed: DocRun) -> None:
+    lines = _roster(decomposed)
+
+    assert _roster_line(lines, 'S1 · ') == (
+        'S1 · wave 1 · decomposed · filed 6 · held 1 · gate deps 2 · open actions 2 · '
+        'open questions 2')
+    assert _roster_line(lines, 'S2 · ') == (
+        'S2 · wave 2 · no status · filed 2 · held 0 · gate deps 0 · open actions 0 · '
+        'open questions 0')
+    assert _roster_line(lines, 'S3 · ').startswith('S3 · wave 1 · no status · filed 1 · ')
+    assert _roster_line(lines, 'unstreamed · ') == 'unstreamed · filed 1 · gate deps 0'
+    assert [line for line in lines if line.startswith('held ')] == [
+        'held 103 (S1 γ) waits on S2 C1 · release owner S2 · S2 filed: 105, 106']
+    assert _roster_line(lines, 'human gate ').startswith('human gate 110 ')
+    assert lines[-1].startswith('store read ')
+
+
+def test_an_action_result_closes_the_action_on_the_roster(decomposed: DocRun) -> None:
+    _append(decomposed, 'action_result', id='A1', state='applied', batch=1, detail='noted')
+
+    assert ' · open actions 1 · ' in _roster_line(_roster(decomposed), 'S1 · ')
+
+
+def test_a_ruling_closes_the_question_on_the_roster(decomposed: DocRun) -> None:
+    _rule(decomposed, 'alpha owns C1', '--by', 'human', '--answers', 'S1:Q1')
+
+    assert _roster_line(_roster(decomposed), 'S1 · ').endswith(' · open questions 1')
