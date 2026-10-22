@@ -595,3 +595,30 @@ def test_b16_without_reveals_head_a_changed_revealed_file_is_still_re_emitted_on
 
     assert summary(pass_answers(followed, minutes=70)) == [('src/a.py', c2, None, False, 30)]
     assert pass_answers(followed, minutes=71) == []
+
+
+def test_a_crash_between_append_and_cursor_neither_re_answers_nor_drops_a_request(
+    hostile: Project,
+) -> None:
+    hostile.run(minutes=60)
+    request(hostile, 'src/a.py', '../x', minutes=61)
+    committed = {
+        name: (hostile.out_dir / name).read_bytes() for name in (CURSOR_FILENAME, STATE_FILENAME)
+    }
+    hostile.run(minutes=62)
+    for name, data in committed.items():
+        (hostile.out_dir / name).write_bytes(data)
+    request(hostile, 'src/d.py', minutes=63)
+
+    hostile.run(minutes=64)
+
+    assert [(line.type, line.path) for line in answers(hostile)] == [
+        ('file_revealed', 'src/a.py'),
+        ('reveal_refused', '../x'),
+        ('file_revealed', 'src/d.py'),
+    ]
+    seqs = [line.seq for line in hostile.feed()]
+    assert seqs == sorted(set(seqs))
+    cursor = Cursor.model_validate_json((hostile.out_dir / CURSOR_FILENAME).read_text())
+    assert cursor.inbox_offset == (hostile.in_dir / INBOX_FILENAME).stat().st_size
+    assert validate_out_dir(hostile.out_dir, expected_project_id=PROJECT).ok
