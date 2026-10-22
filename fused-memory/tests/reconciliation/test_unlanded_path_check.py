@@ -97,10 +97,11 @@ class TestSelectDoneTransitions:
             {'kind': 'operational-verified', 'evidence': 'ran the script'},
             {'kind': 'merged', 'commit': ''},
             {'kind': 'merged', 'commit': 12345},
+            {'kind': 'found_on_main', 'commit': MERGE_SHA, 'note': 'landed by task 106'},
             'merged at abc',
         ],
     )
-    def test_commit_is_none_without_a_usable_provenance_commit(self, provenance):
+    def test_commit_is_none_without_the_tasks_own_merge_commit(self, provenance):
         (transition,) = select_done_transitions([_status('5', 'done', provenance)])
 
         assert transition.commit is None
@@ -362,6 +363,18 @@ async def test_commitless_and_non_merge_transitions_are_skipped(repo: Path) -> N
     assert result.flags == ()
     assert memory.list_calls == []
     assert memory.read_calls == []
+
+
+@pytest.mark.asyncio
+async def test_found_on_main_borrowing_another_tasks_merge_is_skipped(repo: Path) -> None:
+    borrowed = _incident_merge(repo, '106')
+    memory = FakeMemoryService({'107': INCIDENT_MEMORIES})
+    found = {'kind': 'found_on_main', 'commit': borrowed, 'note': 'landed by task 106'}
+
+    result = await _check(memory, repo, [_status('107', 'done', found)])
+
+    assert result == UnlandedPathCheckResult(flags=(), checked=0, skipped=1, errors=0)
+    assert memory.list_calls == []
 
 
 @pytest.mark.asyncio

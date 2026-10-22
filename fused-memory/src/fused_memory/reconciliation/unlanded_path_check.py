@@ -39,9 +39,10 @@ class DoneTransition:
     commit: str | None
 
 
-def _provenance_commit(payload: dict) -> str | None:
+def _own_merge_commit(payload: dict) -> str | None:
+    """The task's own merge commit; a found_on_main commit may be another task's merge."""
     provenance = payload.get('done_provenance')
-    if not isinstance(provenance, dict):
+    if not isinstance(provenance, dict) or provenance.get('kind') != 'merged':
         return None
     commit = provenance.get('commit')
     return commit if isinstance(commit, str) and commit else None
@@ -56,11 +57,11 @@ def _is_done_transition(event: ReconciliationEvent) -> bool:
 
 
 def select_done_transitions(events: Sequence[ReconciliationEvent]) -> tuple[DoneTransition, ...]:
-    """One transition per task that went done, carrying its LAST event's provenance commit."""
+    """One transition per task that went done, carrying its LAST event's own merge commit."""
     latest: dict[str, DoneTransition] = {}
     for event in filter(_is_done_transition, events):
         task_id = str(event.payload['task_id'])
-        latest[task_id] = DoneTransition(task_id=task_id, commit=_provenance_commit(event.payload))
+        latest[task_id] = DoneTransition(task_id=task_id, commit=_own_merge_commit(event.payload))
     return tuple(latest.values())
 
 
