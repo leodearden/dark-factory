@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import MutableMapping, MutableSequence
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from orchestrator.evals.reviewer_trial.key_pooling import (
     PoolingRecord,
     audit_pooling,
     fold_pooled_issues,
+    is_pooled_issue,
 )
 
 
@@ -76,14 +78,32 @@ class TestPoolingLog:
         assert PoolingLog.load(path).records[0].provenance == rec.provenance
 
 
-def _make_gt(id: str) -> GroundTruthIssue:
+class TestPoolingRecord:
+    def test_provenance_is_detached_from_the_callers_dict(self) -> None:
+        provenance: dict[str, Any] = {'finding_ids': ['P1-f1'], 'real': 'yes'}
+        rec = _record('d1', 'd1_pool_01', **provenance)
+
+        provenance['real'] = 'no'
+        provenance['finding_ids'].append('P2-f1')
+
+        assert rec.provenance == {'finding_ids': ('P1-f1',), 'real': 'yes'}
+
+    def test_provenance_cannot_be_mutated_through_the_record(self) -> None:
+        rec = _record('d1', 'd1_pool_01', finding_ids=['P1-f1'], scores={'a': [1]})
+
+        assert not isinstance(rec.provenance, MutableMapping)
+        assert not isinstance(rec.provenance['scores'], MutableMapping)
+        assert not isinstance(rec.provenance['finding_ids'], MutableSequence)
+
+
+def _make_gt(id: str, mutation_type: str = 'test_mutation') -> GroundTruthIssue:
     return GroundTruthIssue(
         id=id,
         location='src/foo.py:42',
         category='test_category',
         severity='blocking',
         description='Test issue',
-        mutation_type='test_mutation',
+        mutation_type=mutation_type,
     )
 
 
@@ -222,6 +242,11 @@ class TestFoldPooledIssues:
                 'severity',
                 id='missing-issue-field',
             ),
+            pytest.param(
+                {'d1': [_entry('d1_pool_01', mutation_type='logic')]},
+                'logic',
+                id='mutation-type-not-pooled',
+            ),
         ],
     )
     def test_rejects_entries_it_cannot_fold_and_names_the_offender(
@@ -280,3 +305,29 @@ class TestAuditPooling:
         assert recorded.isdisjoint({('d1', 'a'), ('d2', 'b')})
 
         assert audit_pooling(manifest, log).unrecorded_issues == ()
+
+    def test_losing_every_record_of_a_run_leaves_all_its_issues_unrecorded(self) -> None:
+        manifest, _ = _folded_pair()
+
+        audit = audit_pooling(manifest, PoolingLog())
+
+        assert audit.unrecorded_issues == (('d1', 'd1_pool_01'), ('d1', 'd1_pool_02'))
+        assert audit.ok is False
+
+    def test_record_naming_an_unpooled_issue_is_dangling(self) -> None:
+        manifest, log = _folded_pair()
+        log = PoolingLog(records=(*log.records, _record('d1', 'a')))
+
+        audit = audit_pooling(manifest, log)
+
+        assert audit.dangling_records == (('d1', 'a'),)
+        assert audit.unrecorded_issues == ()
+        assert audit.ok is False
+
+
+class TestIsPooledIssue:
+    def test_pooled_mutation_type_marks_an_issue_pooled(self) -> None:
+        assert is_pooled_issue(_make_gt('x', mutation_type='pooled_2026_10_22')) is True
+
+    def test_other_mutation_types_are_not_pooled(self) -> None:
+        assert is_pooled_issue(_make_gt('x', mutation_type='logic')) is False

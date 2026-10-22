@@ -269,9 +269,12 @@ adjudication log stays one entry per diff_id, and `CorpusManifest.load`
 builds `GroundTruthIssue(**gt)`, which rejects unknown keys, so an
 annotation carries only the six issue fields.
 
-`key_pooling.audit_pooling` checks the log ↔ annotation bijection: no
-duplicate record, no record without its issue, and no pooled issue without
-its record. `test_reviewer_trial_corpus_integrity.py` pins it over the
+A key issue is pooled when its `mutation_type` starts with `pooled_`
+(`key_pooling.is_pooled_issue`); `fold_pooled_issues` refuses an entry
+without that prefix. `key_pooling.audit_pooling` checks the log ↔ pooled
+issue bijection: no duplicate record, no record naming anything but a pooled
+issue, and no pooled issue without its record, even when every record of
+its run is lost. `test_reviewer_trial_corpus_integrity.py` pins it over the
 committed corpus.
 
 ## Answer-key pooling protocol

@@ -7,12 +7,12 @@ protocol".
 
 from __future__ import annotations
 
-import copy
 import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from orchestrator.evals.reviewer_trial.corpus import (
@@ -23,17 +23,32 @@ from orchestrator.evals.reviewer_trial.corpus import (
 
 _ISSUE_FIELDS = frozenset(f.name for f in fields(GroundTruthIssue))
 _PROVENANCE_KEY = 'x_provenance'
+POOLED_MUTATION_PREFIX = 'pooled_'
+
+
+def is_pooled_issue(issue: GroundTruthIssue) -> bool:
+    return issue.mutation_type.startswith(POOLED_MUTATION_PREFIX)
 
 
 @dataclass(frozen=True)
 class PoolingRecord:
-    """Where one pooled ground-truth issue came from."""
+    """Where one pooled ground-truth issue came from.
+
+    *provenance* is stored as a read-only copy: mappings become
+    MappingProxyType and lists become tuples.
+    """
 
     diff_id: str
     issue_id: str
     pooling_date: str
     pooling_run: str
-    provenance: dict[str, Any]
+    provenance: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'provenance', _frozen(self.provenance))
+
+    def to_json(self) -> str:
+        return json.dumps({f.name: _thawed(getattr(self, f.name)) for f in fields(self)})
 
 
 @dataclass(frozen=True)
@@ -46,7 +61,7 @@ class PoolingLog:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open('w') as f:
             for record in self.records:
-                f.write(json.dumps(asdict(record)))
+                f.write(record.to_json())
                 f.write('\n')
 
     @classmethod
@@ -63,7 +78,11 @@ class PoolingLog:
 
 @dataclass(frozen=True)
 class PoolingAudit:
-    """(diff_id, issue_id) pairs breaking the pooling log <-> answer key bijection."""
+    """(diff_id, issue_id) pairs breaking the pooling log <-> pooled key issue bijection.
+
+    A dangling record names no pooled key issue; an unrecorded issue is a
+    pooled key issue that no record names.
+    """
 
     duplicate_records: tuple[tuple[str, str], ...]
     dangling_records: tuple[tuple[str, str], ...]
@@ -75,21 +94,16 @@ class PoolingAudit:
 
 
 def audit_pooling(manifest: CorpusManifest, log: PoolingLog) -> PoolingAudit:
-    """Report every pooling-log record and pooled key issue that lacks its counterpart.
-
-    A key issue counts as pooled when its mutation_type is one the log's
-    records reference, so no mutation_type spelling is assumed.
-    """
-    key = {(diff.diff_id, gt.id): gt for diff in manifest.diffs for gt in diff.ground_truth}
+    """Report every pooling-log record and pooled key issue that lacks its counterpart."""
+    pooled = {
+        (diff.diff_id, gt.id)
+        for diff in manifest.diffs for gt in diff.ground_truth if is_pooled_issue(gt)
+    }
     counts = Counter((record.diff_id, record.issue_id) for record in log.records)
-    pooled_types = {key[pair].mutation_type for pair in counts if pair in key}
     return PoolingAudit(
         duplicate_records=tuple(sorted(pair for pair, n in counts.items() if n > 1)),
-        dangling_records=tuple(sorted(pair for pair in counts if pair not in key)),
-        unrecorded_issues=tuple(sorted(
-            pair for pair, gt in key.items()
-            if gt.mutation_type in pooled_types and pair not in counts
-        )),
+        dangling_records=tuple(sorted(pair for pair in counts if pair not in pooled)),
+        unrecorded_issues=tuple(sorted(pair for pair in pooled if pair not in counts)),
     )
 
 
@@ -104,7 +118,8 @@ def fold_pooled_issues(
     """Append each diff's pooled entries after its existing key, recording their provenance.
 
     *pooled* maps diff_id to entries carrying the GroundTruthIssue fields plus
-    ``x_provenance``. Returns new values; the inputs are left untouched.
+    ``x_provenance``; each entry's mutation_type must start with
+    POOLED_MUTATION_PREFIX. Returns new values; the inputs are left untouched.
     """
     unknown = sorted(set(pooled) - {diff.diff_id for diff in manifest.diffs})
     if unknown:
@@ -128,7 +143,7 @@ def fold_pooled_issues(
 
 def _split_entry(
     diff_id: str, entry: Mapping[str, Any],
-) -> tuple[GroundTruthIssue, dict[str, Any]]:
+) -> tuple[GroundTruthIssue, Mapping[str, Any]]:
     where = f'pooled entry {entry.get("id")!r} for diff {diff_id!r}'
     if _PROVENANCE_KEY not in entry:
         raise ValueError(f'{where} lacks {_PROVENANCE_KEY!r}')
@@ -139,7 +154,12 @@ def _split_entry(
     if missing:
         raise ValueError(f'{where} is missing issue fields {missing}')
     issue = GroundTruthIssue(**{name: entry[name] for name in _ISSUE_FIELDS})
-    return issue, copy.deepcopy(dict(entry[_PROVENANCE_KEY]))
+    if not is_pooled_issue(issue):
+        raise ValueError(
+            f'{where} has mutation_type {issue.mutation_type!r}, '
+            f'which lacks the pooled prefix {POOLED_MUTATION_PREFIX!r}'
+        )
+    return issue, entry[_PROVENANCE_KEY]
 
 
 def _reject_repeated_ids(diff: CorpusDiff, issues: Sequence[GroundTruthIssue]) -> None:
@@ -150,3 +170,19 @@ def _reject_repeated_ids(diff: CorpusDiff, issues: Sequence[GroundTruthIssue]) -
             f'pooled issue ids {repeated} for diff {diff.diff_id!r} repeat an id '
             'already in its answer key or elsewhere in the batch'
         )
+
+
+def _frozen(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _frozen(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_frozen(item) for item in value)
+    return value
+
+
+def _thawed(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thawed(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thawed(item) for item in value]
+    return value

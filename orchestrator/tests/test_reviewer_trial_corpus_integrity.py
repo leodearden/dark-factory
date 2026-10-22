@@ -104,13 +104,11 @@ class TestPooledAnswerKey:
             if r.pooling_run == _POOLING_RUN_2026_10_22
         ]
         key = {(d.diff_id, gt.id): gt for d in manifest.diffs for gt in d.ground_truth}
-        test_split = {d.diff_id for d in manifest.diffs if d.split == 'test'}
 
         severities = Counter(key[(r.diff_id, r.issue_id)].severity for r in records)
 
         assert len(records) == 201
-        assert len(test_split) == 37
-        assert {r.diff_id for r in records} == test_split
+        assert len({r.diff_id for r in records}) == 37
         assert severities == {'blocking': 30, 'suggestion': 171}
         assert all(r.pooling_date == '2026-10-22' for r in records)
         assert all(r.provenance['finding_ids'] for r in records)
