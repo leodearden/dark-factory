@@ -420,6 +420,26 @@ class TestWorkProductProbeClose:
         assert rig.probe.snapshot is WorkProductSnapshot.EMPTY
         assert rig.filed == []
 
+    async def test_closing_before_the_refresh_first_runs_leaves_nothing_to_join(self):
+        rig, load = _Rig(), _counting_load()
+        rig.probe.poll(load)
+
+        await rig.probe.aclose()
+        await rig.probe.join()
+
+        assert load.calls == 0
+
+    async def test_a_refresh_cancelled_before_it_first_runs_does_not_wedge_the_next_window(self):
+        rig, load = _Rig(), _counting_load()
+        rig.probe.poll(load)
+        [refresh] = [t for t in asyncio.all_tasks() if t.get_name() == 'continuity-probe-refresh']
+
+        refresh.cancel()
+        await asyncio.wait({refresh})
+        await rig.refresh_next_window(load)
+
+        assert load.calls == 1
+
     async def test_a_closed_probe_starts_no_further_refresh(self):
         rig, load = _Rig(), _counting_load()
         await rig.probe.aclose()
