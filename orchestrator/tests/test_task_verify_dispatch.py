@@ -226,6 +226,12 @@ def _commit_on_task_branch(repo: Path, path: str, text: str) -> str:
     return _git(repo, 'rev-parse', 'HEAD')
 
 
+def _commit_unrooted_tip(repo: Path) -> str:
+    _git(repo, 'checkout', '-q', '--orphan', 'unrooted')
+    _git(repo, 'commit', '-q', '-m', 'a tip with no merge base with main')
+    return _git(repo, 'rev-parse', 'HEAD')
+
+
 def _result(passed: bool, *, category: str = '', summary: str = '') -> VerifyResult:
     return VerifyResult(
         passed=passed, test_output='' if passed else 'FAILED test_x', lint_output='',
@@ -253,6 +259,9 @@ class _Transport:
     argvs: list[list[str]] = field(default_factory=list)
     on_delete_ref: Callable[[], object] | None = None
     at_delete_ref: list[object] = field(default_factory=list)
+    cancel_raises: Exception | None = None
+    hang_on: str | None = None
+    reached: asyncio.Event = field(default_factory=asyncio.Event)
 
     async def run(self, argv: list[str], *, cwd: Any = None) -> Answer:
         label, answer = self.answer(argv)
@@ -260,6 +269,11 @@ class _Transport:
         self.argvs.append(list(argv))
         if label == 'delete_ref' and self.on_delete_ref is not None:
             self.at_delete_ref.append(self.on_delete_ref())
+        if label == 'cancel_verify' and self.cancel_raises is not None:
+            raise self.cancel_raises
+        if label == self.hang_on:
+            self.reached.set()
+            await asyncio.Event().wait()
         return answer
 
     async def ssh_run(self, argv: list[str], *, cwd: Any = None) -> Answer:
@@ -495,6 +509,44 @@ class TestLocalRoutes:
         assert 'fused_memory' in warnings[0].getMessage()
         assert 'verify_env' in warnings[0].getMessage()
 
+    async def test_an_underivable_file_scope_runs_locally_under_remote_all(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _harness(tmp_path, TaskVerifyPolicy(host_policy='remote_all'))
+        tip = _commit_unrooted_tip(h.repo)
+
+        result = await h.call(task_files=None)
+
+        assert result is h.local.result
+        assert h.local.calls == [h.expected_call(task_files=None)]
+        sidecar = h.only_sidecar()
+        assert (sidecar['reason'], sidecar['decision']) == ('not_eligible', 'local')
+        assert (sidecar['tip_sha'], sidecar['base_sha']) == (tip, None)
+        assert h.hooks.demand_calls == 0
+        assert h.transport.log == []
+
+    async def test_a_scope_derivation_failure_runs_locally_as_a_dispatcher_error(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        h = _harness(tmp_path, TaskVerifyPolicy(host_policy='remote_all'))
+        _git(h.repo, 'symbolic-ref', 'HEAD', 'refs/heads/unborn')
+        caplog.set_level(logging.WARNING, logger=_DISPATCH_LOGGER)
+
+        result = await h.call()
+
+        assert result is h.local.result
+        assert h.local.calls == [h.expected_call()]
+        sidecar = h.only_sidecar()
+        assert (sidecar['reason'], sidecar['decision'], sidecar['runner']) == (
+            'dispatcher_error', 'local', 'local',
+        )
+        assert sidecar['tip_sha'] is None
+        assert h.hooks.demand_calls == 0
+        assert h.transport.log == []
+        [warning] = [r for r in caplog.records if r.name == _DISPATCH_LOGGER]
+        assert warning.levelno == logging.WARNING
+        assert warning.exc_info is not None
+
     async def test_merge_demand_runs_locally_without_taking_the_slot(self, tmp_path: Path) -> None:
         h = _harness(tmp_path, _ORCH_ONLY, demand=True)
 
@@ -708,6 +760,17 @@ def _hangs(started: asyncio.Event) -> VerifyAnswer:
     return answer
 
 
+def _hangs_then_raises(started: asyncio.Event, exc: Exception) -> VerifyAnswer:
+    async def answer(argv: list[str]) -> Answer:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise exc from None
+        raise AssertionError('a never-set event was set')
+    return answer
+
+
 def _pending_tasks() -> set[asyncio.Task[Any]]:
     current = asyncio.current_task()
     return {t for t in asyncio.all_tasks() if t is not current and not t.done()}
@@ -716,7 +779,7 @@ def _pending_tasks() -> set[asyncio.Task[Any]]:
 async def _cancel_mid_verify(h: _Harness, started: asyncio.Event) -> None:
     before = _pending_tasks()
     call = asyncio.create_task(h.call())
-    await wait_responsive(started.wait(), label='remote verify started')
+    await wait_responsive(started.wait(), label='dispatch reached its hang point')
 
     call.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -777,6 +840,49 @@ class TestCancellation:
         result = await h.call(attempt_id=2)
         assert result is h.local.result
         assert h.only_sidecar(attempt_id=2)['reason'] == 'host_parked'
+
+    async def test_a_cancel_while_the_runner_syncs_frees_the_slot(self, tmp_path: Path) -> None:
+        df_local = tmp_path / 'df-local'
+        df_local.mkdir()
+        transport = _Transport(hang_on='remote_df_head')
+        h = _harness(
+            tmp_path, _ORCH_ONLY, transport=transport,
+            runner_kwargs={'df_remote_checkout': '/remote/df', 'df_local_checkout': df_local},
+        )
+
+        await _cancel_mid_verify(h, transport.reached)
+
+        assert 'verify_task' not in transport.log
+        assert 'cancel_verify' not in transport.log
+        _assert_slot_free(h)
+        assert h.sidecars() == []
+        assert h.local.calls == []
+
+    async def test_a_remote_leg_that_fails_while_being_reaped_is_logged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        started = asyncio.Event()
+        verify = _hangs_then_raises(started, RuntimeError('torn down'))
+        h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=verify))
+        caplog.set_level(logging.DEBUG, logger=_DISPATCH_LOGGER)
+
+        await _cancel_mid_verify(h, started)
+
+        [record] = [r for r in caplog.records if r.name == _DISPATCH_LOGGER]
+        assert 'torn down' in record.getMessage()
+        _assert_slot_free(h)
+
+    async def test_a_cancel_verify_that_raises_still_frees_the_slot(self, tmp_path: Path) -> None:
+        started = asyncio.Event()
+        transport = _Transport(verify=_hangs(started), cancel_raises=RuntimeError('ssh died'))
+        h = _harness(tmp_path, _ORCH_ONLY, transport=transport)
+
+        await _cancel_mid_verify(h, started)
+
+        log = transport.log
+        assert log.index('cancel_verify') < log.index('delete_ref') < log.index('pgrep')
+        _assert_slot_free(h)
+        assert h.allocator.is_parked('laptop') is False
 
 
 

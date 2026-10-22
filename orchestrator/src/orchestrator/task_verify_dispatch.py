@@ -272,6 +272,8 @@ def _worktree_reader(worktree: Path) -> Callable[[str], str | None]:
 async def _reap(task: asyncio.Future[Any]) -> None:
     task.cancel()
     await asyncio.wait({task})
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        logger.debug('A cancelled remote task verify ended with %r instead', exc)
 
 
 class TaskVerifyDispatcher:
@@ -335,7 +337,9 @@ class TaskVerifyDispatcher:
     async def _dispatch(
         self, call: _VerifyCall, policy: TaskVerifyPolicy, draft: _DecisionDraft,
     ) -> VerifyResult:
-        scope = await self._scope_of(call)
+        scope = await self._scope_or_none(call)
+        if scope is None:
+            return await self._run_local_because(call, draft, 'dispatcher_error')
         draft.tip_sha, draft.base_sha = scope.tip_sha, scope.base_sha
         if not self._eligible(call, policy, scope):
             return await self._run_local_because(call, draft, 'not_eligible')
@@ -431,6 +435,17 @@ class TaskVerifyDispatcher:
             self._pool.cancel_and_release(lease, unwind=functools.partial(_reap, remote)),
         )
 
+    async def _scope_or_none(self, call: _VerifyCall) -> _TaskScope | None:
+        """*call*'s scope, or None (logged) when it cannot be derived; nothing is leased yet."""
+        try:
+            return await self._scope_of(call)
+        except Exception:
+            logger.warning(
+                'Task %s verify runs locally: its scope could not be derived in %s',
+                call.task_id, call.worktree, exc_info=True,
+            )
+            return None
+
     async def _scope_of(self, call: _VerifyCall) -> _TaskScope:
         tip = await run_git(['git', 'rev-parse', 'HEAD'], cwd=call.worktree)
         if not tip.ok:
@@ -460,7 +475,8 @@ class TaskVerifyDispatcher:
         collapsed = collapsed_module_overrides(call.module_configs)
         for override in collapsed:
             self._warn_once(override)
-        return eligible(
+        files_derivable = call.task_files is not None or scope.base_sha is not None
+        return files_derivable and eligible(
             policy, scope.executed_prefixes,
             force_workspace=call.force_workspace,
             per_module_overrides_present=bool(collapsed),
