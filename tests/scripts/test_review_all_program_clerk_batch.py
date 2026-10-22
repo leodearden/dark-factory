@@ -467,3 +467,132 @@ def test_a_move_to_scan_with_no_store_writes_nothing(env: ProgramEnv) -> None:
     assert UNREACHABLE in proc.stderr
     assert home.ledger.read_bytes() == ledger_before
     assert _actions_dir(home) == []
+
+
+SIDECAR = 'plans/review-all-fixture-s1-prd.capability-manifest.yaml'
+SIDECAR_MD = 'plans/review-all-fixture-s1-prd.capability-manifest.md'
+
+
+def _ingest(env: ProgramEnv, path: Path) -> subprocess.CompletedProcess[str]:
+    return env.run('clerk_batch.py', 'ingest', path)
+
+
+def _clerk_result(**lists: Any) -> dict[str, Any]:
+    return {'applied': [], 'skipped': [], 'rejected': [], 'kept_for_human': [], 'dirtied': [],
+            **lists}
+
+
+def _batched_home(env: ProgramEnv) -> Any:
+    """The base home after one write: batch-1 holds A1 and A2."""
+    home = _seed(env)
+    proc = _write(env)
+    assert proc.returncode == 0, _output(proc)
+    return home
+
+
+def _put_result(home: Any, content: Any, number: int = 1) -> Path:
+    path = home.batch_files(number).result
+    path.write_text(content if isinstance(content, str) else json.dumps(content))
+    return path
+
+
+def _recorded(action_id: str, seq: int, result_state: str, detail: str | None = None) -> dict[str, Any]:
+    return {'seq': seq, 'by': 'clerk_batch.py', **_action_result(action_id, result_state, 1, detail)}
+
+
+def test_b13_ingest_records_each_known_id_and_refuses_an_unknown_one(env: ProgramEnv) -> None:
+    home = _batched_home(env)
+    path = _put_result(home, _clerk_result(
+        applied=['A1', 'A99'], skipped=[{'id': 'A2', 'why': 'task 102 is in-progress'}],
+        dirtied=[SIDECAR, SIDECAR_MD],
+    ))
+    proc = _ingest(env, path)
+    assert proc.returncode == 1, _output(proc)
+    assert _appended(home, len(BASE_LEDGER)) == [
+        _recorded('A1', 6, 'applied'),
+        _recorded('A2', 7, 'skipped', 'task 102 is in-progress'),
+    ]
+    assert 'A99: not an action of batch-1' in proc.stderr
+    assert SIDECAR in proc.stdout and SIDECAR_MD in proc.stdout
+
+
+def test_ingest_refuses_a_ledger_action_the_batch_did_not_carry(env: ProgramEnv) -> None:
+    home = _batched_home(env)
+    path = _put_result(home, _clerk_result(
+        applied=['A1'], kept_for_human=[{'id': 'A3', 'why': 'a cancel needs a ruling'}],
+    ))
+    proc = _ingest(env, path)
+    assert proc.returncode == 1, _output(proc)
+    assert 'A3' in proc.stderr
+    assert _appended(home, len(BASE_LEDGER)) == [_recorded('A1', 6, 'applied')]
+
+
+def test_a_clean_result_is_recorded_and_its_actions_leave_the_next_batch(env: ProgramEnv) -> None:
+    home = _batched_home(env)
+    path = _put_result(home, _clerk_result(
+        applied=['A1'], rejected=[{'id': 'A2', 'why': '106 does not exist'}],
+    ))
+    proc = _ingest(env, path)
+    assert proc.returncode == 0, _output(proc)
+    assert _appended(home, len(BASE_LEDGER)) == [
+        _recorded('A1', 6, 'applied'), _recorded('A2', 7, 'rejected', '106 does not exist'),
+    ]
+    again = _write(env)
+    assert again.returncode == 0, _output(again)
+    assert 'nothing to batch' in again.stdout
+    assert not home.batch_files(2).actions.exists()
+
+
+def test_re_ingesting_a_result_names_each_id_as_already_recorded(env: ProgramEnv) -> None:
+    home = _batched_home(env)
+    path = _put_result(home, _clerk_result(
+        applied=['A1'], skipped=[{'id': 'A2', 'why': 'task 102 is in-progress'}],
+    ))
+    assert _ingest(env, path).returncode == 0
+    ledger_before = home.ledger.read_bytes()
+    proc = _ingest(env, path)
+    assert proc.returncode == 1, _output(proc)
+    assert 'A1: already recorded' in proc.stderr and 'A2: already recorded' in proc.stderr
+    assert home.ledger.read_bytes() == ledger_before
+
+
+def test_an_id_named_in_two_lists_is_refused_and_the_rest_recorded(env: ProgramEnv) -> None:
+    home = _batched_home(env)
+    path = _put_result(home, _clerk_result(
+        applied=['A1'], rejected=[{'id': 'A1', 'why': 'second thoughts'}],
+        skipped=[{'id': 'A2', 'why': 'task 102 is in-progress'}],
+    ))
+    proc = _ingest(env, path)
+    assert proc.returncode == 1, _output(proc)
+    assert 'A1' in proc.stderr
+    assert _appended(home, len(BASE_LEDGER)) == [
+        _recorded('A2', 6, 'skipped', 'task 102 is in-progress'),
+    ]
+
+
+@pytest.mark.parametrize(('content', 'named'), [
+    ('{not json', 'JSON'),
+    ({key: value for key, value in _clerk_result().items() if key != 'dirtied'}, 'dirtied'),
+    (_clerk_result(notes='extra'), 'notes'),
+    (_clerk_result(skipped=[{'id': 'A2'}]), 'skipped[0].why'),
+    (_clerk_result(applied=[{'id': 'A1'}]), 'applied[0]'),
+], ids=['not-json', 'dirtied-missing', 'extra-key', 'skipped-without-why', 'applied-not-a-string'])
+def test_a_malformed_result_is_refused_whole(env: ProgramEnv, content: Any, named: str) -> None:
+    home = _batched_home(env)
+    path = _put_result(home, content)
+    ledger_before = home.ledger.read_bytes()
+    proc = _ingest(env, path)
+    assert proc.returncode == 1, _output(proc)
+    assert named in proc.stderr
+    assert home.ledger.read_bytes() == ledger_before
+
+
+def test_a_path_that_is_no_batch_result_is_refused_naming_it(env: ProgramEnv) -> None:
+    home = _batched_home(env)
+    ledger_before = home.ledger.read_bytes()
+    for path in (home.batch_files(7).result, home.root / 'result.json'):
+        path.write_text(json.dumps(_clerk_result(applied=['A1'])))
+        proc = _ingest(env, path)
+        assert proc.returncode == 1, _output(proc)
+        assert str(path) in proc.stderr
+    assert home.ledger.read_bytes() == ledger_before
