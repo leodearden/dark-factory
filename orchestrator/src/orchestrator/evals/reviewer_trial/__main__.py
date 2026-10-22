@@ -9,7 +9,8 @@ Commands:
     calibrate      Run scorer on 3 diffs for human inspection (step 3)
     corpus-sanity  Run baseline on all 15 diffs and score (step 4)
     campaign       Run arms x fixtures x N trials and reduce them; ``--briefing
-                   diff-only,d2`` adds a context-complete arm per variant
+                   diff-only,d2`` adds a context-complete arm per variant,
+                   ``--briefing d2`` runs only the context-complete arms
 """
 
 from __future__ import annotations
@@ -1155,10 +1156,12 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
 def _parse_briefings(
     _ctx: click.Context, _param: click.Parameter, value: str,
 ) -> list[ReviewBriefing]:
-    """The generations to run, each once; the diff-only incumbent leads whenever d2 is measured.
+    """The generations to run, each once; diff-only, when listed, leads.
 
-    Every arm is paired against the first arm's first generation, so a repeat
-    would collide on its result paths and a leading d2 would pair d2 against itself.
+    Every arm is paired against the first arm's first generation, so ``d2``
+    alone pairs every d2 arm against the first arm's d2 arm, while d2 listed
+    before diff-only would invert the gate. A repeat would collide on its
+    result paths.
     """
     valid = [b.value for b in ReviewBriefing]
     names = [name.strip() for name in value.split(',') if name.strip()]
@@ -1171,9 +1174,9 @@ def _parse_briefings(
     if repeated:
         raise click.BadParameter(f'each generation runs once; repeated: {", ".join(repeated)}')
     briefings = [ReviewBriefing(name) for name in names]
-    if ReviewBriefing.CONTEXT_COMPLETE in briefings and briefings[0] is not ReviewBriefing.DIFF_ONLY:
+    if ReviewBriefing.DIFF_ONLY in briefings and briefings[0] is not ReviewBriefing.DIFF_ONLY:
         raise click.BadParameter(
-            f'{ReviewBriefing.DIFF_ONLY.value} must come first: it is the incumbent '
+            f'{ReviewBriefing.DIFF_ONLY.value} must come first when listed: it is the incumbent '
             f'{ReviewBriefing.CONTEXT_COMPLETE.value} is paired against',
         )
     return briefings
@@ -1187,7 +1190,8 @@ def _parse_briefings(
 @click.option('--arms', default=None, help='Comma-separated variant names (default: FABLE_EVIDENCE_VARIANTS)')
 @click.option('--briefing', 'briefings', default=ReviewBriefing.DIFF_ONLY.value, callback=_parse_briefings,
               help='Comma-separated reviewer briefing generations, each run once for every arm '
-                   '(diff-only | d2; default: diff-only; diff-only first whenever d2 is listed)')
+                   '(diff-only | d2; default: diff-only; diff-only first when both are listed; '
+                   "d2 alone pairs every arm against the first arm's d2 arm)")
 @click.option('--diff-cap', default=None, type=int,
               help='Diff truncation in chars (default: runner.DIFF_CAP_CHARS; 0 lifts the cap)')
 @click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
