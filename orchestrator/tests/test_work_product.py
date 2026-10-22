@@ -333,6 +333,16 @@ class TestWorkProductProbe:
         assert rig.probe.snapshot is FRESH
         assert counting.calls == 0
 
+    async def test_the_next_window_refreshes_as_soon_as_the_last_refresh_has_published(self):
+        rig, load = _Rig(), _counting_load()
+        rig.probe.poll(load)
+        while rig.probe.snapshot is not FRESH:
+            await asyncio.sleep(0)
+
+        await rig.refresh_next_window(load)
+
+        assert load.calls == 2
+
     async def test_a_failed_refresh_withdraws_all_credit(self):
         rig = _Rig()
         await rig.refresh(_counting_load())

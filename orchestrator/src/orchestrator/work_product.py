@@ -187,7 +187,7 @@ class WorkProductProbe:
         self._resolve = resolve
         self._snapshot = WorkProductSnapshot.EMPTY
         self._attempted_at: float | None = None
-        self._in_flight: asyncio.Task[None] | None = None
+        self._refresh_task: asyncio.Task[None] | None = None
         self._failure_streak = 0
         # True at start: a previous process may have stopped with its escalation open.
         self._escalation_may_be_open = True
@@ -199,25 +199,24 @@ class WorkProductProbe:
 
     def poll(self, load: Callable[[], WorkProductSnapshot]) -> None:
         """Start a refresh when one is due, none is in flight and the probe is open; never waits on it."""
-        if self._closed or self._in_flight is not None:
+        if self._closed or self._in_flight() is not None:
             return
         now = self._clock()
         if self._attempted_at is not None and now - self._attempted_at < self._ttl_secs():
             return
         self._attempted_at = now
-        refresh = asyncio.get_running_loop().create_task(
+        self._refresh_task = asyncio.get_running_loop().create_task(
             self._refresh(load), name='continuity-probe-refresh',
         )
-        self._in_flight = refresh
-        refresh.add_done_callback(self._forget_refresh)
 
-    def _forget_refresh(self, refresh: asyncio.Task[None]) -> None:
-        if self._in_flight is refresh:
-            self._in_flight = None
+    def _in_flight(self) -> asyncio.Task[None] | None:
+        """The latest refresh until it is done, however it ended: published, failed, or cancelled before or during its load."""
+        refresh = self._refresh_task
+        return refresh if refresh is not None and not refresh.done() else None
 
     async def join(self) -> None:
         """Wait for the in-flight refresh, if any, to publish its outcome."""
-        in_flight = self._in_flight
+        in_flight = self._in_flight()
         if in_flight is not None:
             await in_flight
 
@@ -228,7 +227,7 @@ class WorkProductProbe:
         finishes on its worker thread, bounded by PROBE_TIMEOUT_SECS.
         """
         self._closed = True
-        in_flight = self._in_flight
+        in_flight = self._in_flight()
         if in_flight is not None:
             in_flight.cancel()
             await asyncio.wait({in_flight})
