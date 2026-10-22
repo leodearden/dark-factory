@@ -2531,6 +2531,7 @@ def test_spawn_fail_soft_skips_result_handback_when_registry_faults(
     _write_fake_claude_capturing_prompt_and_writing_result(bin_dir, capture_file)
     _write_foreground_terminal(bin_dir, "xterm")
     env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_SELF_EXIT"] = "1"
 
     # Shadow _base_env's CLAUDE_FLEET_ROOT with one that can never be created:
     # a path nested UNDER a pre-existing regular file (same trick as
@@ -2571,6 +2572,96 @@ def test_spawn_fail_soft_skips_result_handback_when_registry_faults(
         f"expected no 'result.md' substring anywhere in the prompt claude "
         f"received, got:\n{captured_prompt!r}"
     )
+
+
+# ===========================================================================
+# trailer: outcome vocabulary, checkpoint, /reflect, self-exit
+# ===========================================================================
+_FAKE_SESSION_ID = "fake-session-7179"
+
+
+def _spawn_capturing_prompt(tmp_path: pathlib.Path) -> str:
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_prompt.txt"
+    _write_fake_claude_capturing_prompt(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    result = _run_spawn(_base_env(bin_dir, "xterm"), tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    return capture_file.read_text()
+
+
+def _write_fake_claude_obeying_exit_marker(
+    bin_dir: pathlib.Path, prompt_file: pathlib.Path, env_file: pathlib.Path,
+) -> None:
+    """A fake ``claude`` that captures its prompt and environment, then runs
+    any prompt line ending in ``/exit-requested"`` the way the session's Bash
+    tool would: as written, with its own ``CLAUDE_CODE_SESSION_ID`` set.
+    """
+    p = bin_dir / "claude"
+    p.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        printf %s "$1" > {prompt_file!s}
+        env -0 > {env_file!s}
+        while IFS= read -r line; do
+          case "$line" in
+            *'/exit-requested"') CLAUDE_CODE_SESSION_ID={_FAKE_SESSION_ID} bash -c "$line" ;;
+          esac
+        done <<< "$1"
+        exit 0
+    """))
+    p.chmod(0o755)
+
+
+def test_trailer_outcome_line_mirrors_result_outcomes(tmp_path: pathlib.Path) -> None:
+    captured = _spawn_capturing_prompt(tmp_path)
+
+    outcome_lines = [line for line in captured.splitlines() if line.startswith("outcome: ")]
+    assert len(outcome_lines) == 1, outcome_lines
+    spelled = tuple(outcome_lines[0].removeprefix("outcome: ").split("|"))
+    assert spelled == session_registry.RESULT_OUTCOMES
+
+
+def test_trailer_asks_for_a_checkpoint_outcome_and_reflect(tmp_path: pathlib.Path) -> None:
+    captured = _spawn_capturing_prompt(tmp_path)
+
+    after_exit_clause = captured[captured.index("must never block your normal exit"):]
+    assert any(
+        "outcome: in-progress" in line and not line.startswith("outcome: ")
+        for line in after_exit_clause.splitlines()
+    ), after_exit_clause
+    assert "/reflect" in after_exit_clause
+
+
+@pytest.mark.parametrize(("self_exit", "expected"), [
+    ("1", True), ("0", False), ("true", False), ("", False), (None, False),
+])
+def test_self_exit_input_stamps_the_record_and_gates_the_marker_instruction(
+    tmp_path: pathlib.Path, self_exit: str | None, expected: bool,
+) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    prompt_file = tmp_path / "captured_prompt.txt"
+    env_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_obeying_exit_marker(bin_dir, prompt_file, env_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    if self_exit is not None:
+        env["CLAUDE_SPAWN_SELF_EXIT"] = self_exit
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    record_path = _find_one_record(pathlib.Path(env["CLAUDE_FLEET_ROOT"]))
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.self_exit is expected
+    assert ("exit-requested" in prompt_file.read_text()) is expected
+    marker = record_path.parent / session_registry.EXIT_REQUESTED_FILENAME
+    if expected:
+        assert marker.read_text() == _FAKE_SESSION_ID
+    else:
+        assert not marker.exists()
+    child_namespace = _read_spawn_namespace(env_file)
+    assert "CLAUDE_SPAWN_SELF_EXIT" not in child_namespace
+    assert {"CLAUDE_SPAWN_SESSION_ID", "CLAUDE_SPAWN_RESULT_FILE"} <= child_namespace.keys()
 
 
 # ===========================================================================
