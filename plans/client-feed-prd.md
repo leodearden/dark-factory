@@ -496,6 +496,18 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     handler never sets the stop Event while its own thread holds that Event's lock
     (`client-feed/src/client_feed/cli.py::_publish_until_signalled`). δ's inbox tail is
     `client-feed/src/client_feed/inbox.py::read_inbox`, with its offset in `Cursor.inbox_offset`.
+- 2026-10-22, from task 7221 (B22). These bind γ (6970) and ε (6972):
+  - (a) A test case id reaches the feed through
+    `client-feed/src/client_feed/sources/archive.py::_case_id`, which applies
+    `client-feed/src/client_feed/redact.py::redact_paths`. γ emits `read_archived_run`'s case ids as
+    they are and never re-derives them.
+  - (b) ε's `criteria_results` `results[].tests` carries those same ids. The collection map's nodeids
+    are converted to that spelling, redaction included, before the join, so both sides of the join
+    pass through the one rule and no raw nodeid is emitted. The staging CLI
+    (`client-feed criteria-results --run-kind staging`) follows the same rule.
+  - (c) Case ids were never unique, and redaction can merge parametrized ids (measured 2026-10-22 on
+    task 5244's archived junits: 90,933 cases, 3,199 duplicate ids before redaction and 3,220
+    after). A join must not assume one case per id.
 
 ## 13. Open questions (tactical)
 
