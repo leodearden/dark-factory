@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
-from shared.config_dir import TaskConfigDir
 from shared.project_layout import escalation_queue_dir
 from shared.scheduler_state import SchedulerStateSnapshot
 from shared.storm_counter import StormCounter
@@ -49,8 +48,10 @@ from fused_memory.models.scope import (
 from fused_memory.reconciliation.active_runs import ActiveRunRegistry
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.cli_stage_runner import (
+    announce_recon_archive_root,
     gc_run_config_dir,
-    recon_config_base_dir,
+    recon_archive_root,
+    run_config_dir_path,
 )
 from fused_memory.reconciliation.drained_event_restore import (
     restore_unless_completed_best_effort,
@@ -2129,7 +2130,10 @@ class ReconciliationHarness:
         # session-resume depends on is destroyed and resume has nothing to
         # resume from.
         try:
-            gc_run_config_dir(self.journal.data_dir, run.id)
+            gc_run_config_dir(
+                self.journal.data_dir, run.id,
+                archive_root=recon_archive_root(self.config),
+            )
         except Exception as gc_err:  # noqa: BLE001
             logger.warning(
                 'gc_run_config_dir failed for recovered run %s: %r', run.id, gc_err
@@ -2419,7 +2423,9 @@ class ReconciliationHarness:
           must differ from ``run.stage_cursor`` (never re-resume the same stage).
         * **transcript-exists** — only when a session was captured
           (``run.session_id`` non-null): its transcript must still be on disk in
-          the per-run config dir.  ``record_run_session``'s snapshot is
+          the per-run config dir, whose path is derived rather than built as a
+          ``TaskConfigDir``, because a read-only probe must not create the dir
+          it probes for.  ``record_run_session``'s snapshot is
           best-effort (can go stale after an internal cap retry), so a missing
           transcript means there is nothing to ``--resume``.  A NULL session_id
           is NOT a failure — no session was captured (the interrupt landed
@@ -2454,15 +2460,12 @@ class ReconciliationHarness:
 
         # Transcript existence — only meaningful when a session was captured.
         if run.session_id:
-            config_dir = TaskConfigDir(
-                task_id=run.id,
-                base_dir=recon_config_base_dir(self.journal.data_dir),
-            )
-            transcript = read_transcript_records(config_dir.path, run.session_id)
+            config_dir_path = run_config_dir_path(self.journal.data_dir, run.id)
+            transcript = read_transcript_records(config_dir_path, run.session_id)
             if not transcript:
                 return (
                     f'session {run.session_id} has no transcript on disk '
-                    f'({config_dir.path}) — unresumable'
+                    f'({config_dir_path}) — unresumable'
                 )
 
         return None
@@ -3119,6 +3122,7 @@ class ReconciliationHarness:
         """Startup prologue: readiness wait, gate and judge init, escalation
         server, then the one-shot recovery passes."""
         logger.info('Reconciliation harness background loop started')
+        announce_recon_archive_root(self.config)
         # Reviewer finding race_condition: wait for the recon-report server to be
         # accepting connections before the first stage subprocess is launched.  This
         # encodes the ordering invariant in code rather than relying on comment-only
@@ -4441,7 +4445,8 @@ class ReconciliationHarness:
         cancellation still propagates
         (``tests/test_harness.py::test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation``).
         An interrupted run keeps its dir for the startup ``--resume`` pass
-        (task σ). A GC failure is logged, never raised.
+        (task σ); its stage transcripts were already copied to the archive by
+        ``stages/base.py::BaseStage.run``. A GC failure is logged, never raised.
         """
         stage_reports_write = asyncio.ensure_future(
             self.journal.update_run_stage_reports(run.id, run.stage_reports)
@@ -4454,7 +4459,10 @@ class ReconciliationHarness:
         finally:
             if run.status != RunStatus.interrupted:
                 try:
-                    gc_run_config_dir(self.journal.data_dir, run.id)
+                    gc_run_config_dir(
+                        self.journal.data_dir, run.id,
+                        archive_root=recon_archive_root(self.config),
+                    )
                 except Exception as gc_err:  # noqa: BLE001
                     logger.warning(
                         'gc_run_config_dir failed for %s run %s: %r',
