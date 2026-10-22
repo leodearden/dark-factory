@@ -26,6 +26,7 @@ import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler, fixed_prompt
 
 from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
@@ -601,4 +602,136 @@ class TestInvokeDerivesGatingFromRole:
         )
         assert 'verdict-tools' in servers, (
             f"Expected 'verdict-tools' added alongside it, got {list(servers)!r}."
+        )
+
+
+@pytest.mark.asyncio
+class TestInvokeScopesSelfContainedRolesStrictly:
+    """A role whose every MCP server _invoke spawns per invocation runs with
+    --strict-mcp-config under the PRODUCTION config, so the CLI does not
+    union in the ambient project/user .mcp.json (task 3849).
+
+    The ``config`` fixture leaves strict_mcp_config at its False production
+    default, so strictness here can only come from the role. Config-level
+    strictness is pinned by
+    test_eval_mcp_isolation.py::test_invoke_strict_config_scopes_every_role.
+    """
+
+    @pytest.mark.parametrize('briefing', list(ReviewBriefing))
+    async def test_shipped_reviewers_are_strictly_scoped_to_their_verdict_server(
+        self, briefing, config, git_ops, task_assignment,
+    ):
+        from orchestrator.agents.roles import reviewers_for  # noqa: PLC0415
+
+        roster = reviewers_for(briefing)
+        assert roster, f'reviewers_for({briefing!r}) is empty; nothing to pin.'
+        for role in roster:
+            call_kwargs, _workflow, _cwd = await _invoke_probe(
+                role, config, git_ops, task_assignment,
+            )
+
+            assert call_kwargs['strict_mcp_config'] is True, (
+                f'{briefing.value}/{role.name}: expected strict_mcp_config=True, got '
+                f"{call_kwargs['strict_mcp_config']!r}. A verdict-only role must not "
+                'inherit the ambient .mcp.json merge: the merged registry defers '
+                'submit_review_verdict behind ToolSearch and the reviewer exhausts '
+                'its turns before submitting (task 3849).'
+            )
+            servers = set(call_kwargs['mcp_config']['mcpServers'])
+            assert servers == {'verdict-tools'}, (
+                f'{briefing.value}/{role.name}: expected the strict surface to be '
+                f'exactly {{"verdict-tools"}}, got {servers!r}.'
+            )
+
+    @pytest.mark.parametrize(
+        'families',
+        [
+            frozenset({'verdict_tools'}),
+            frozenset({'plan_tools'}),
+            frozenset({'plan_tools', 'verdict_tools'}),
+        ],
+        ids=['verdict_tools', 'plan_tools', 'plan_and_verdict_tools'],
+    )
+    async def test_self_contained_probe_role_is_strictly_scoped(
+        self, families, config, git_ops, task_assignment,
+    ):
+        """The rule keys off the role's families, not the reviewer's name."""
+        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
+
+        role = AgentRole(
+            name='probe_self_contained', system_prompt='x', allowed_tools=[],
+            mcp_families=families,
+        )
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        assert call_kwargs['strict_mcp_config'] is True, (
+            f'mcp_families={set(families)!r}: every server is spawned per '
+            'invocation, so the role must run with strict_mcp_config=True rather '
+            f"than the ambient .mcp.json merge; got {call_kwargs['strict_mcp_config']!r}."
+        )
+
+    async def test_orchestrator_and_verdict_role_keeps_the_ambient_merge(
+        self, config, git_ops, task_assignment,
+    ):
+        from orchestrator.agents.roles import MERGER  # noqa: PLC0415
+
+        call_kwargs, _workflow, _cwd = await _invoke_probe(
+            MERGER, config, git_ops, task_assignment, mcp=_FakeMcpWithFusedMemory(),
+        )
+
+        assert call_kwargs['strict_mcp_config'] is False, (
+            "MERGER declares the 'orchestrator' family, whose sessions may rely on "
+            'ambient servers the orchestrator does not assemble; strict scoping '
+            f"would strip them. Got strict_mcp_config={call_kwargs['strict_mcp_config']!r}."
+        )
+
+    async def test_orchestrator_family_role_keeps_the_ambient_merge(
+        self, config, git_ops, task_assignment,
+    ):
+        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
+
+        role = AgentRole(
+            name='probe_orch', system_prompt='x', allowed_tools=[],
+            mcp_families=frozenset({'orchestrator'}),
+        )
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        assert call_kwargs['strict_mcp_config'] is False, (
+            "An 'orchestrator'-family role keeps the ambient .mcp.json merge: "
+            "project-local ambient servers such as reify's reify-debug cannot be "
+            'declared by any generic role, so strict scoping would silently remove '
+            f"them. Got strict_mcp_config={call_kwargs['strict_mcp_config']!r}."
+        )
+
+    async def test_family_less_role_keeps_the_ambient_merge(
+        self, config, git_ops, task_assignment,
+    ):
+        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
+
+        role = AgentRole(name='probe_bare', system_prompt='x', allowed_tools=[])
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        assert call_kwargs['strict_mcp_config'] is False, (
+            'A role declaring no MCP family has no per-invocation server, so its '
+            'only MCP surface is the ambient one; strict scoping would remove it. '
+            f"Got strict_mcp_config={call_kwargs['strict_mcp_config']!r}."
+        )
+
+    async def test_grant_outside_declared_families_keeps_the_ambient_merge(
+        self, config, git_ops, task_assignment,
+    ):
+        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
+
+        role = AgentRole(
+            name='probe_verdict_jcm', system_prompt='x',
+            allowed_tools=['mcp__verdict-tools__*', 'mcp__jcodemunch__*'],
+            mcp_families=frozenset({'verdict_tools'}),
+        )
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        assert call_kwargs['strict_mcp_config'] is False, (
+            'The role grants mcp__jcodemunch__*, which only the orchestrator-'
+            'assembled or the ambient config serves; strict scoping would silently '
+            'strip a granted tool. Got '
+            f"strict_mcp_config={call_kwargs['strict_mcp_config']!r}."
         )
