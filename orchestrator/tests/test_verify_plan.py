@@ -585,32 +585,35 @@ class TestDeriveVerifyPlanTaskRoleFloor:
 
     Task 3294 widened WHEN the floor fires: it now sits ABOVE the
     collectable-test branch, so at role='task' ANY touched SOURCE/STRUCTURAL
-    file under the prefix full-suites the owning module — a test-tree-ONLY
-    diff is what keeps FILE_SCOPED selection, not "no test file was touched".
-    The cases in this class are all production-file diffs, so every outcome
-    below is unchanged by 3294; the mixed case it DID change is pinned next
-    door in TestDeriveVerifyPlanTaskRoleFloorMixedDiff.
+    file under the prefix fires it — a test-tree-ONLY diff is what keeps
+    FILE_SCOPED selection, not "no test file was touched".
+
+    Task 7253 (gate-5702 ruling) narrowed WHAT the floor runs: the touched
+    collectable tests plus the owning module's whole-tree guard family, with
+    the full suite kept only as the fallback for a module that has no family.
     """
 
-    def test_source_only_diff_full_suites_pytest_at_task_role(self):
-        """(a) A source-only diff full-suites the owning module's pytest at
-        role='task', and the reason names both the role and the "sibling
-        modules NOT run" coverage signpost."""
+    def test_source_only_diff_narrows_pytest_to_the_guard_family_at_task_role(self):
+        """(a) A source-only diff runs the owning module's guard family — and
+        only it — at role='task'; an unmarked test of the same module is not
+        selected."""
         mc = ModuleConfig(
             prefix='orchestrator',
             test_command='uv run --directory orchestrator pytest tests/',
             lint_command='uv run --directory orchestrator ruff check src/',
         )
+        reader, list_pkg_tests = _guard_family_seams()
         plan = derive_verify_plan(
-            SOURCE_ONLY_DIFF, [mc], None, fake_worktree_reader, role='task',
+            SOURCE_ONLY_DIFF, [mc], None, reader, role='task', list_pkg_tests=list_pkg_tests,
         )
         run = _run_for(plan, 'orchestrator', 'pytest:')
         assert run is not None
-        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.scoped_targets == _GUARD_FAMILY
+        assert _PLAIN_TEST not in run.scoped_targets
         assert mc.test_command is not None
-        assert run.cmd == parse_config_command(mc.test_command)
-        assert 'task' in run.reason.lower()
-        assert 'not run' in run.reason.lower()
+        assert run.cmd == scope_prefix_to_keyword(mc.test_command, 'pytest', list(_GUARD_FAMILY))
+        assert 'guard family' in run.reason
 
     def test_touched_test_only_diff_stays_file_scoped_at_task_role(self):
         """(b) A test-tree-ONLY diff keeps FILE_SCOPED selection.
@@ -635,11 +638,11 @@ class TestDeriveVerifyPlanTaskRoleFloor:
         assert run.cmd is not None
         assert 'shared/tests/test_x.py' in run.cmd.targets
 
-    def test_multi_module_source_only_diff_floors_only_owning_modules(self):
-        """(c) Each owning module full-suites its own pytest; a THIRD
-        registered module NOT touched by the diff contributes only SKIPPED
-        runs — the floor never widens beyond the modules actually touched
-        (R1)."""
+    def test_multi_module_source_only_diff_narrows_each_owning_module_by_its_own_family(self):
+        """(c) The family is per OWNING module: 'orchestrator' narrows to its
+        own family, 'shared' — whose lister finds no family — keeps the
+        full-suite floor as its fallback, and a THIRD registered module NOT
+        touched by the diff contributes only SKIPPED runs (R1)."""
         mc_a = ModuleConfig(
             prefix='orchestrator',
             test_command='uv run --directory orchestrator pytest tests/',
@@ -659,26 +662,32 @@ class TestDeriveVerifyPlanTaskRoleFloor:
             SOURCE_ONLY_DIFF[0],
             'shared/src/shared/another_module.py',
         ]
+        reader, list_pkg_tests = _guard_family_seams()
         plan = derive_verify_plan(
-            files, [mc_a, mc_b, mc_c], None, fake_worktree_reader, role='task',
+            files, [mc_a, mc_b, mc_c], None, reader, role='task',
+            list_pkg_tests=list_pkg_tests,
         )
 
         run_a = _run_for(plan, 'orchestrator', 'pytest:')
         assert run_a is not None
-        assert run_a.scope_kind is ScopeKind.FULL_SUITE
+        assert run_a.scope_kind is ScopeKind.FILE_SCOPED
+        assert run_a.scoped_targets == _GUARD_FAMILY
 
         run_b = _run_for(plan, 'shared', 'pytest:')
         assert run_b is not None
         assert run_b.scope_kind is ScopeKind.FULL_SUITE
+        assert mc_b.test_command is not None
+        assert run_b.cmd == parse_config_command(mc_b.test_command)
+        assert 'not narrowed' in run_b.reason
 
         module_c_runs = [r for r in plan.runs if r.module_prefix == 'escalation']
         assert module_c_runs
         assert all(r.scope_kind is ScopeKind.SKIPPED for r in module_c_runs)
 
-    def test_structural_only_diff_floors_pytest_and_widens_pyright_at_task_role(self):
-        """(d) A structural-only diff full-suites BOTH pytest (the floor —
-        STRUCTURAL counts as source, non-test .py) AND pyright (existing D2,
-        unaffected by the floor)."""
+    def test_structural_only_diff_narrows_pytest_and_widens_pyright_at_task_role(self):
+        """(d) A structural-only diff narrows pytest to the guard family
+        (STRUCTURAL counts as production, non-test .py) while pyright still
+        widens to FULL_SUITE (existing D2, untouched by the floor)."""
         mc = ModuleConfig(
             prefix='orchestrator',
             test_command='uv run --directory orchestrator pytest tests/',
@@ -687,15 +696,15 @@ class TestDeriveVerifyPlanTaskRoleFloor:
                 'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
             ),
         )
+        reader, list_pkg_tests = _guard_family_seams()
         plan = derive_verify_plan(
-            STRUCTURAL_DIFF, [mc], None, fake_worktree_reader, role='task',
+            STRUCTURAL_DIFF, [mc], None, reader, role='task', list_pkg_tests=list_pkg_tests,
         )
 
         pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
         assert pytest_run is not None
-        assert pytest_run.scope_kind is ScopeKind.FULL_SUITE
-        assert mc.test_command is not None
-        assert pytest_run.cmd == parse_config_command(mc.test_command)
+        assert pytest_run.scope_kind is ScopeKind.FILE_SCOPED
+        assert pytest_run.scoped_targets == _GUARD_FAMILY
 
         pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
         assert pyright_run is not None
@@ -729,10 +738,66 @@ MIXED_STRUCTURAL_DIFF: list[str] = [
     'orchestrator/tests/test_new_thing.py',
 ]
 
+# Task 7253 (gate-5702 ruling): the task-role arm narrows to the touched
+# collectable tests plus the owning module's whole-tree guard family, which
+# derive_verify_plan enumerates through a `list_pkg_tests` seam. These stand in
+# for verify.py's worktree lister and reader. Never build a lister here by
+# globbing a directory: the census guard (test_whole_tree_scan_timeout_guard.py)
+# would read this module as a whole-tree scanner and demand the 1200s mark.
+_GUARD_MARK_SOURCE = (
+    'import pytest\n'
+    'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
+    'pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n'
+)
+_GUARD_A = 'orchestrator/tests/test_guard_a.py'
+_GUARD_B = 'orchestrator/tests/test_guard_b.py'
+_PLAIN_TEST = 'orchestrator/tests/test_plain.py'
+_GUARD_FAMILY = (_GUARD_A, _GUARD_B)
+_TOUCHED_TEST = 'orchestrator/tests/test_new_thing.py'
+
+_OLD_FLOOR_MIXED_REASON = (
+    'pytest: production module touched (orchestrator/src/orchestrator/some_module.py) — '
+    'owning-module full suite (task role); co-committed test file(s) do NOT narrow it; '
+    'sibling modules NOT run'
+)
+_OLD_FLOOR_SOURCE_ONLY_REASON = (
+    'pytest: source-only diff — owning-module full suite (task role); sibling modules NOT run'
+)
+
+
+def _guard_family_seams(extra: dict[str, str] | None = None):
+    """``(worktree_reader, list_pkg_tests)`` over a fake orchestrator test tree.
+
+    The tree holds the two guard modules, one unmarked test, and *extra*; every
+    other path reads through :func:`fake_worktree_reader`. The lister answers
+    the sorted orchestrator test files for prefix ``'orchestrator'`` and ``[]``
+    for any other module.
+    """
+    contents = {
+        _GUARD_A: _GUARD_MARK_SOURCE,
+        _GUARD_B: _GUARD_MARK_SOURCE,
+        _PLAIN_TEST: 'def test_plain():\n    pass\n',
+        **(extra or {}),
+    }
+
+    def reader(path: str) -> str | None:
+        if path in contents:
+            return contents[path]
+        return fake_worktree_reader(path)
+
+    def list_pkg_tests(prefix: str) -> list[str]:
+        if prefix != 'orchestrator':
+            return []
+        return sorted(
+            p for p in contents if p.startswith('orchestrator/tests/') and p.endswith('.py')
+        )
+
+    return reader, list_pkg_tests
+
 
 class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
-    """Task 3294: at role='task', a touched PRODUCTION file full-suites the
-    owning module even when a test file is co-committed.
+    """Task 3294: at role='task', a touched PRODUCTION file widens the owning
+    module's pytest run even when a test file is co-committed.
 
     λ (task 2589, R3) placed the task-role floor BELOW the collectable-test
     branch, so it only ever fired when the module's touched files contained no
@@ -745,41 +810,45 @@ class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
     consumer of workflow.py) was structurally invisible.
 
     The rule pinned here: ANY touched SOURCE/STRUCTURAL file under the prefix
-    runs the owning module's full test_command at role='task'; only a
-    test-tree-ONLY diff keeps FILE_SCOPED selection (PRD R3). role='merge' is
-    untouched (PRD R4).
+    fires the floor at role='task'; only a test-tree-ONLY diff keeps plain
+    FILE_SCOPED selection (PRD R3). role='merge' is untouched (PRD R4).
+
+    Task 7253 (gate-5702 ruling) narrowed what the floor runs to the touched
+    tests plus the owning module's whole-tree guard family; the full suite now
+    runs at the merge gate. Monotonicity still holds: a co-committed test only
+    ADDS a target.
     """
 
-    def test_mixed_source_plus_touched_test_full_suites_at_task_role(self):
+    def test_mixed_source_plus_touched_test_narrows_to_touched_test_plus_guard_family(self):
         """(a) SOURCE production file + co-committed collectable test ->
-        FULL_SUITE at role='task'. The co-committed test must NOT narrow the
-        run: the command is the module's verbatim test_command and carries no
-        scoped_targets, so the whole owning package is collected."""
+        FILE_SCOPED over the touched test first, then the sorted family, at
+        role='task' — and NOT the module's full suite."""
         mc = ModuleConfig(
             prefix='orchestrator',
             test_command='uv run --directory orchestrator pytest tests/',
             lint_command='uv run --directory orchestrator ruff check src/',
         )
+        reader, list_pkg_tests = _guard_family_seams()
         plan = derive_verify_plan(
-            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='task',
+            MIXED_SOURCE_DIFF, [mc], None, reader, role='task', list_pkg_tests=list_pkg_tests,
         )
         run = _run_for(plan, 'orchestrator', 'pytest:')
         assert run is not None
-        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.scoped_targets == (_TOUCHED_TEST, *_GUARD_FAMILY)
         assert mc.test_command is not None
-        assert run.cmd == parse_config_command(mc.test_command)
-        assert run.scoped_targets == ()
-        # The widened run targets the package, never the touched test file.
-        assert run.cmd is not None
-        assert 'orchestrator/tests/test_new_thing.py' not in run.cmd.targets
+        assert run.cmd != parse_config_command(mc.test_command)
+        assert run.cmd == scope_prefix_to_keyword(
+            mc.test_command, 'pytest', [_TOUCHED_TEST, *_GUARD_FAMILY],
+        )
 
-    def test_mixed_structural_plus_touched_test_full_suites_at_task_role(self):
+    def test_mixed_structural_plus_touched_test_narrows_to_touched_test_plus_guard_family(self):
         """(b) The REAL workflow.py case: the production file classifies
         STRUCTURAL (Protocol-bearing content, read because type_check_command
-        is configured), not SOURCE. It must widen pytest exactly as the SOURCE
-        variant does — the predicate is SOURCE ∪ STRUCTURAL, so pytest breadth
-        never becomes silently type-check-config-dependent. Control: pyright
-        is still FULL_SUITE via the untouched D2 rule."""
+        is configured), not SOURCE. It must fire the floor exactly as the
+        SOURCE variant does — the predicate is SOURCE ∪ STRUCTURAL, so pytest
+        breadth never becomes silently type-check-config-dependent. Control:
+        pyright is still FULL_SUITE via the untouched D2 rule."""
         mc = ModuleConfig(
             prefix='orchestrator',
             test_command='uv run --directory orchestrator pytest tests/',
@@ -788,18 +857,18 @@ class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
                 'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
             ),
         )
+        reader, list_pkg_tests = _guard_family_seams()
         plan = derive_verify_plan(
-            MIXED_STRUCTURAL_DIFF, [mc], None, fake_worktree_reader, role='task',
+            MIXED_STRUCTURAL_DIFF, [mc], None, reader, role='task',
+            list_pkg_tests=list_pkg_tests,
         )
 
         pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
         assert pytest_run is not None
-        assert pytest_run.scope_kind is ScopeKind.FULL_SUITE
+        assert pytest_run.scope_kind is ScopeKind.FILE_SCOPED
+        assert pytest_run.scoped_targets == (_TOUCHED_TEST, *_GUARD_FAMILY)
         assert mc.test_command is not None
-        assert pytest_run.cmd == parse_config_command(mc.test_command)
-        assert pytest_run.scoped_targets == ()
-        assert pytest_run.cmd is not None
-        assert 'orchestrator/tests/test_new_thing.py' not in pytest_run.cmd.targets
+        assert pytest_run.cmd != parse_config_command(mc.test_command)
 
         # Control: D2 is role-independent and untouched by this task.
         pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
@@ -811,24 +880,26 @@ class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
     def test_mixed_diff_stays_file_scoped_at_merge_role(self):
         """(c) PRD R4 rollback golden: the SAME mixed diff at role='merge'
         (breadth 'scoped') keeps the byte-identical legacy FILE_SCOPED shape.
-        The widening is role='task'-gated and never reaches the merge gate."""
+        The floor is role='task'-gated and never reaches the merge gate — not
+        even its guard family."""
         mc = ModuleConfig(
             prefix='orchestrator',
             test_command='uv run --directory orchestrator pytest tests/',
             lint_command='uv run --directory orchestrator ruff check src/',
         )
+        reader, list_pkg_tests = _guard_family_seams()
         plan = derive_verify_plan(
-            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='merge',
+            MIXED_SOURCE_DIFF, [mc], None, reader, role='merge', list_pkg_tests=list_pkg_tests,
         )
         run = _run_for(plan, 'orchestrator', 'pytest:')
         assert run is not None
         assert run.scope_kind is ScopeKind.FILE_SCOPED
         assert run.cmd is not None
-        assert 'orchestrator/tests/test_new_thing.py' in run.cmd.targets
-        assert run.scoped_targets == ('orchestrator/tests/test_new_thing.py',)
+        assert _TOUCHED_TEST in run.cmd.targets
+        assert run.scoped_targets == (_TOUCHED_TEST,)
 
     def test_touched_test_only_diff_still_file_scoped_at_task_role(self):
-        """(d) The widening is PRODUCTION-triggered, not blanket: a
+        """(d) The floor is PRODUCTION-triggered, not blanket: a
         test-tree-ONLY diff at role='task' still file-scopes (PRD R3,
         "touched-test-only diffs keep file-scoped selection")."""
         mc = ModuleConfig(
@@ -847,49 +918,50 @@ class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
         assert 'orchestrator/tests/test_new_thing.py' in run.cmd.targets
         assert 'orchestrator/tests/test_other.py' in run.cmd.targets
 
-    # -- WHY the run widened, and how far it did NOT reach -------------------
+    # -- WHY the run narrowed this way, and how far it did NOT reach ----------
 
     def test_mixed_diff_reason_names_the_production_trigger(self):
         """(e) VerifyResult.plan is the operator-facing record of WHY a scope
         decision was made, and this codebase already names the trigger in its
-        widening reasons (``pytest: conftest touched ({conftest_trigger})``).
-        The mixed case must do the same: name the production file that
-        triggered the widening, say the co-committed tests did NOT narrow it
-        (otherwise the widened run reads as a scoper bug), and NOT claim the
-        diff was "source-only" — factually false about a diff that touched
-        tests, and the pre-3294 floor's wording.
-
-        Only these are asserted. The role gating is pinned structurally by
-        ``test_mixed_diff_stays_file_scoped_at_merge_role``, and a substring
-        check for a word as common as "task" would discriminate nearly
-        nothing."""
+        reasons (``pytest: conftest touched ({conftest_trigger})``). The
+        narrowed floor must name the production file that fired it and say it
+        ran the guard family, so it reads neither as plain test-file scoping
+        nor as the old full-suite floor — and must NOT claim the diff was
+        "source-only", which is false about a diff that touched tests."""
         mc = ModuleConfig(
             prefix='orchestrator',
             test_command='uv run --directory orchestrator pytest tests/',
             lint_command='uv run --directory orchestrator ruff check src/',
         )
+        reader, list_pkg_tests = _guard_family_seams()
         plan = derive_verify_plan(
-            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='task',
+            MIXED_SOURCE_DIFF, [mc], None, reader, role='task', list_pkg_tests=list_pkg_tests,
         )
         run = _run_for(plan, 'orchestrator', 'pytest:')
         assert run is not None
-        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.reason.startswith('pytest:')
         assert 'orchestrator/src/orchestrator/some_module.py' in run.reason
-        assert 'narrow' in run.reason.lower()
+        assert 'guard family' in run.reason
         assert 'source-only' not in run.reason.lower()
+        assert run.reason not in {
+            'pytest: file-scoped to touched test file(s)',
+            _OLD_FLOOR_MIXED_REASON,
+            _OLD_FLOOR_SOURCE_ONLY_REASON,
+        }
 
     def test_mixed_diff_in_one_module_never_widens_a_sibling(self):
         """(f) PRD R1, asserted rather than merely claimed in a reason string:
-        the widening changes each module's own BREADTH, never the SET of
+        the floor changes each module's own BREADTH, never the SET of
         modules. Three registered modules, one diff — 'orchestrator' mixed
         (production + test), 'shared' test-ONLY, 'escalation' untouched.
 
         This is the case the single-module tests structurally cannot fail on.
         If the production predicate were computed over the whole
         *existing_files* list instead of the prefix-filtered ``scoped`` one,
-        'shared' would widen to its full suite off ORCHESTRATOR's production
-        file — and every other test in this class would still pass, because
-        no sibling module is in their plan at all."""
+        'shared' would fire the floor off ORCHESTRATOR's production file — and
+        every other test in this class would still pass, because no sibling
+        module is in their plan at all."""
         mc_orch = ModuleConfig(
             prefix='orchestrator',
             test_command='uv run --directory orchestrator pytest tests/',
@@ -905,15 +977,18 @@ class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
             test_command='uv run --directory escalation pytest tests/',
             lint_command='uv run --directory escalation ruff check src/',
         )
+        reader, list_pkg_tests = _guard_family_seams()
         plan = derive_verify_plan(
             [*MIXED_SOURCE_DIFF, 'shared/tests/test_sibling.py'],
-            [mc_orch, mc_shared, mc_esc], None, fake_worktree_reader, role='task',
+            [mc_orch, mc_shared, mc_esc], None, reader, role='task',
+            list_pkg_tests=list_pkg_tests,
         )
 
-        # The touched-production module widens...
+        # The touched-production module takes the narrowed floor...
         orch_run = _run_for(plan, 'orchestrator', 'pytest:')
         assert orch_run is not None
-        assert orch_run.scope_kind is ScopeKind.FULL_SUITE
+        assert orch_run.scope_kind is ScopeKind.FILE_SCOPED
+        assert orch_run.scoped_targets == (_TOUCHED_TEST, *_GUARD_FAMILY)
 
         # ...its test-ONLY sibling does not: FILE_SCOPED to its own test file.
         shared_run = _run_for(plan, 'shared', 'pytest:')
@@ -929,6 +1004,146 @@ class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
         esc_runs = [r for r in plan.runs if r.module_prefix == 'escalation']
         assert [r.scope_kind for r in esc_runs] == [ScopeKind.SKIPPED]
         assert esc_runs[0].reason == 'no files under prefix'
+
+
+class TestDeriveVerifyPlanTaskRoleGuardFamily:
+    """Task 7253, the gate-5702 ruling's own pins: the guard family is
+    enumerated, not listed; the merge gate still runs the full suite; and the
+    full-suite floor survives as the fallback wherever narrowing cannot be
+    trusted."""
+
+    _MC = ModuleConfig(
+        prefix='orchestrator',
+        test_command='uv run --directory orchestrator pytest tests/',
+        lint_command='uv run --directory orchestrator ruff check src/',
+    )
+
+    def test_the_same_diff_runs_the_full_suite_at_the_full_breadth_merge_gate(self):
+        """THE RULING'S MERGE PIN: the workflow.py + new-test diff that the
+        task role narrows is the module's full suite at the merge gate, which
+        is what makes the narrowing safe."""
+        reader, list_pkg_tests = _guard_family_seams()
+        plan = derive_verify_plan(
+            MIXED_STRUCTURAL_DIFF, [self._MC], _FULL_BREADTH_CONFIG, reader, role='merge',
+            list_pkg_tests=list_pkg_tests,
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert self._MC.test_command is not None
+        assert run.cmd == parse_config_command(self._MC.test_command)
+
+    @pytest.mark.parametrize(
+        'constant',
+        ['WHOLE_TREE_SCAN_TEST_TIMEOUT', '_orch_helpers.WHOLE_TREE_SCAN_TEST_TIMEOUT'],
+    )
+    def test_a_new_scanner_joins_the_family_without_a_code_change(self, constant: str):
+        new_scanner = 'orchestrator/tests/test_brand_new_scanner.py'
+        reader, list_pkg_tests = _guard_family_seams({
+            new_scanner: f'import pytest\npytestmark = pytest.mark.timeout({constant})\n',
+        })
+        plan = derive_verify_plan(
+            SOURCE_ONLY_DIFF, [self._MC], None, reader, role='task',
+            list_pkg_tests=list_pkg_tests,
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.scoped_targets == (new_scanner, *_GUARD_FAMILY)
+
+    def test_a_marked_file_pytest_cannot_collect_is_not_in_the_family(self):
+        reader, list_pkg_tests = _guard_family_seams({
+            'orchestrator/tests/conftest.py': _GUARD_MARK_SOURCE,
+            'orchestrator/tests/guard_data.py': _GUARD_MARK_SOURCE,
+        })
+        plan = derive_verify_plan(
+            SOURCE_ONLY_DIFF, [self._MC], None, reader, role='task',
+            list_pkg_tests=list_pkg_tests,
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scoped_targets == _GUARD_FAMILY
+
+    def test_a_touched_guard_module_is_listed_once(self):
+        reader, list_pkg_tests = _guard_family_seams()
+        plan = derive_verify_plan(
+            [SOURCE_ONLY_DIFF[0], _GUARD_A], [self._MC], None, reader, role='task',
+            list_pkg_tests=list_pkg_tests,
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scoped_targets == _GUARD_FAMILY
+
+    @pytest.mark.parametrize(
+        'list_pkg_tests',
+        [
+            pytest.param(None, id='no-lister'),
+            pytest.param(lambda prefix: [], id='empty-listing'),
+            pytest.param(lambda prefix: [_PLAIN_TEST], id='no-marked-module'),
+        ],
+    )
+    def test_no_guard_family_falls_back_to_the_full_suite_floor(self, list_pkg_tests):
+        reader, _ = _guard_family_seams()
+        plan = derive_verify_plan(
+            SOURCE_ONLY_DIFF, [self._MC], None, reader, role='task',
+            list_pkg_tests=list_pkg_tests,
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert self._MC.test_command is not None
+        assert run.cmd == parse_config_command(self._MC.test_command)
+        assert run.scoped_targets == ()
+        assert run.reason == (
+            f'{_OLD_FLOOR_SOURCE_ONLY_REASON} — not narrowed: '
+            'no whole-tree guard family found for orchestrator'
+        )
+
+    _DESELECTED_GUARD_SOURCE = (
+        'import pytest\n'
+        'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
+        'pytestmark = [pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT), '
+        'pytest.mark.warm_lane_bash]\n'
+    )
+    _DESELECTED_TEST_SOURCE = (
+        'import pytest\npytestmark = pytest.mark.warm_lane_bash\n\ndef test_x():\n    pass\n'
+    )
+
+    def test_an_entirely_deselected_narrowed_selection_falls_back_to_the_full_suite(self):
+        reader, list_pkg_tests = _guard_family_seams({
+            'orchestrator/pyproject.toml': ORCH_SHAPED_PYPROJECT,
+            _GUARD_A: self._DESELECTED_GUARD_SOURCE,
+            _GUARD_B: self._DESELECTED_GUARD_SOURCE,
+            _TOUCHED_TEST: self._DESELECTED_TEST_SOURCE,
+        })
+        plan = derive_verify_plan(
+            MIXED_SOURCE_DIFF, [self._MC], None, reader, role='task',
+            list_pkg_tests=list_pkg_tests,
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert self._MC.test_command is not None
+        assert run.cmd == parse_config_command(self._MC.test_command)
+        assert run.reason.startswith(_OLD_FLOOR_MIXED_REASON)
+        assert "'not warm_lane_bash'" in run.reason
+        assert 'not narrowed' in run.reason
+
+    def test_a_partly_deselected_narrowed_selection_stays_narrowed(self):
+        """Control: only the touched test is deselected, so the family still
+        collects and the run stays FILE_SCOPED."""
+        reader, list_pkg_tests = _guard_family_seams({
+            'orchestrator/pyproject.toml': ORCH_SHAPED_PYPROJECT,
+            _TOUCHED_TEST: self._DESELECTED_TEST_SOURCE,
+        })
+        plan = derive_verify_plan(
+            MIXED_SOURCE_DIFF, [self._MC], None, reader, role='task',
+            list_pkg_tests=list_pkg_tests,
+        )
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.scoped_targets == (_TOUCHED_TEST, *_GUARD_FAMILY)
 
 
 # ---------------------------------------------------------------------------
@@ -2174,6 +2389,24 @@ class TestReverseDependentTestTargets:
 
         assert result == [('escalation', ['escalation/tests/test_server.py'])]
 
+    def test_an_importing_file_pytest_cannot_collect_is_dropped(self):
+        """(e) the seam lists every test-tree .py file; only collectable ones are targets."""
+        existing_files = ['orchestrator/src/orchestrator/merge_queue.py']
+        reverse_dep_map = {'orchestrator': frozenset({'escalation'})}
+        list_pkg_tests = _fake_list_pkg_tests({
+            'escalation': ['escalation/tests/conftest.py', 'escalation/tests/test_server.py'],
+        })
+        read_content = _fake_read_content({
+            'escalation/tests/conftest.py': _ESCALATION_TEST_SERVER_CONTENT,
+            'escalation/tests/test_server.py': _ESCALATION_TEST_SERVER_CONTENT,
+        })
+
+        result = reverse_dependent_test_targets(
+            existing_files, reverse_dep_map, list_pkg_tests, read_content,
+        )
+
+        assert result == [('escalation', ['escalation/tests/test_server.py'])]
+
 
 # ---------------------------------------------------------------------------
 # PlannedRun.scoped_targets: the D3 plan record's scoping provenance (task 3219)
@@ -2287,7 +2520,8 @@ def _assert_scoped_targets_invariant(plan, files: list[str], label: str) -> None
        SKIPPED/TRIVIAL never ran.
     2. **No invented paths** — the record is always a subset of the diff it
        was derived from, so it can never drift into naming a file the plan
-       never saw.
+       never saw. (These sweeps pass no ``list_pkg_tests``; with one, the
+       task-role floor also records the guard-family modules it enumerated.)
     3. **D3 stays intact** — the key serialises JSON-natively and the whole
        plan dict survives a JSON round-trip unchanged, which is what actually
        reaches ``VerifyResult.plan``.
@@ -2313,11 +2547,11 @@ class TestPlanRecordScopedTargets:
     one's lint_command chains a sibling checker. The scoping itself was and
     remains correct; only the machine-readable record was lost.
 
-    The field's contract is "non-empty EXACTLY for FILE_SCOPED", so task
-    3294's widening moved a slot rather than changing the contract: a mixed
-    diff's pytest slot is FULL_SUITE at role='task' and therefore records
-    NOTHING (it narrowed to nothing), while the same slot is still
-    FILE_SCOPED-with-a-record at role='merge'. The parametrised sweep
+    The field's contract is "non-empty EXACTLY for FILE_SCOPED", so neither
+    task 3294's widening nor task 7253's narrowing changed it: a mixed diff's
+    task-role pytest slot records the touched test plus the guard family it
+    narrowed to, and falls back to a FULL_SUITE slot recording NOTHING when the
+    module has no family. The parametrised sweep
     (test_module_path_scoped_targets_nonempty_exactly_for_file_scoped_runs)
     is what pins the contract itself across both.
     """
@@ -2376,13 +2610,12 @@ class TestPlanRecordScopedTargets:
         records only the collectable tests — the two legitimately DIFFER, so
         one shared field per run, not one per plan, is the right shape.
 
-        Task 3294 migrated the ROLE this is exercised at: at role='task' a
-        mixed diff now widens pytest to FULL_SUITE, and a widened slot
-        records NO scoped_targets (it narrowed to nothing), so the differing
+        Task 3294 migrated the ROLE this is exercised at, so the differing
         pair is pinned at role='merge' — where the legacy FILE_SCOPED shape
         is preserved byte-identically (PRD R4). The task-role half below
-        pins the complementary record: pyright still narrows, pytest does
-        not, and the widened slot's scoped_targets is empty.
+        pins the complementary record (task 7253, gate 5702): pyright still
+        narrows to the touched files, while pytest records the touched test
+        plus the module's whole-tree guard family.
         """
         source_file = 'orchestrator/src/orchestrator/some_module.py'
         test_file = 'orchestrator/tests/test_x.py'
@@ -2412,10 +2645,12 @@ class TestPlanRecordScopedTargets:
         # The two slots' records legitimately differ — the point of the assertion.
         assert set(merge_pyright.scoped_targets) != set(merge_pytest.scoped_targets)
 
-        # -- role='task': pyright still narrows; the widened pytest slot
-        # records nothing, because it narrowed to nothing (task 3294). --
+        # -- role='task': pyright still narrows; pytest records the touched
+        # test plus the guard family it narrowed to (task 7253). --
+        reader, list_pkg_tests = _guard_family_seams()
         task_plan = derive_verify_plan(
-            [source_file, test_file], [mc], None, fake_worktree_reader, role='task',
+            [source_file, test_file], [mc], None, reader, role='task',
+            list_pkg_tests=list_pkg_tests,
         )
 
         task_pyright = _run_for(task_plan, 'orchestrator', 'pyright:')
@@ -2425,8 +2660,8 @@ class TestPlanRecordScopedTargets:
 
         task_pytest = _run_for(task_plan, 'orchestrator', 'pytest:')
         assert task_pytest is not None
-        assert task_pytest.scope_kind is ScopeKind.FULL_SUITE
-        assert task_pytest.scoped_targets == ()
+        assert task_pytest.scope_kind is ScopeKind.FILE_SCOPED
+        assert task_pytest.scoped_targets == (test_file, *_GUARD_FAMILY)
 
     def test_full_suite_and_skipped_runs_record_no_scoped_targets(self):
         """The negative half of the invariant: empty is CORRECT, and meaningful.

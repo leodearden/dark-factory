@@ -70,7 +70,7 @@ slot. Up to `max_concurrent_tasks` workflows share one dispatcher (heuristic 7).
 | `TaskVerifyDispatcher` | producer γ (new `task_verify_dispatch.py`) | PASS | grep `^class TaskVerifyDispatcher[(:]` |
 | public `build_remote_runners` | producer γ, moved from `merge_lane/drift.py::_build_remote_runners` (present) | PASS | grep `^def build_remote_runners\(` |
 | policy without config keys | as written: producer-downstream (δ2) **FAIL** → resolution 1 | PASS | manual |
-| dispatcher substrate | `verify_plan.py::derive_verify_plan`, `GitOps.has_uncommitted_work`, `RemoteRunner.sync_if_stale`, `verify_categories.py` `INFRA_TRANSIENT_CATEGORIES` (all present) | PASS | manual |
+| dispatcher substrate | `verify_plan.py::derive_verify_plan`, `GitOps.has_uncommitted_work`, `RemoteRunner.ensure_gate`, `verify_categories.py` `INFRA_TRANSIENT_CATEGORIES` (all present) | PASS | manual |
 | lease released on every exit | built by γ; rows 13, 14, 21 | PASS | manual |
 
 ### δ1 — harness-owned allocator (hub carry, stage 1)

@@ -166,6 +166,7 @@ def _make_runner(name: str) -> VerifyRunnerConfig:
         name=name,
         ssh_host=f'{name}.example.com',
         git_remote=f'remote-{name}',
+        df_checkout_path='/df',
     )
 
 

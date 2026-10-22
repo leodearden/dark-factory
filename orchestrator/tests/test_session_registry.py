@@ -9291,6 +9291,21 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
             'hand-launched ones.'
         ),
     ),
+    _BareShellEntrypoint(
+        name='session_ownership_probes.py (tier-2: import with PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_ownership_probes.py',
+        pythonpath=(_SR_PKG_ROOT_ENTRY,),
+        shape=_EntrypointShape.IMPORT,
+        argv=(),
+        probe='from shared import safe_io',
+        callers=(
+            'session_hooks.py imports this module at module scope, and '
+            'skills/spawn/hooks/{session-start,stop,notification}.sh run '
+            'session_hooks.py by absolute path with PYTHONPATH=orchestrator/src and '
+            'no venv. A non-stdlib import here makes session_hooks.py unimportable, '
+            'which silently disables every hook.'
+        ),
+    ),
 )
 
 #: Mutation matrix: ``(entrypoint filename, import injected at module scope)``.
@@ -9320,6 +9335,8 @@ _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
     # site-packages on that path.
     ('session_hooks.py', 'from shared import safe_io'),
     ('session_hooks.py', 'import pydantic'),
+    ('session_ownership_probes.py', 'from shared import safe_io'),
+    ('session_ownership_probes.py', 'import pydantic'),
 )
 
 
@@ -9626,7 +9643,8 @@ class TestStdlibOnlySelfContainment:
     DO NOT WIDEN THIS INTO A REPO-WIDE RULE.  "stdlib-only" names at least three
     different contracts in this repo, and only the first is what these rows pin:
 
-    (a) bare-shell executability — ``session_registry``, ``session_hooks``;
+    (a) bare-shell executability — ``session_registry``, ``session_hooks``,
+        ``session_ownership_probes``;
     (b) layering / cycle avoidance — ``routing``, ``stop_instruction``,
         ``fm_retry``, ``agents/triage``, ``fused_memory/config``/``schema``,
         where importing an intra-package sibling is perfectly fine;

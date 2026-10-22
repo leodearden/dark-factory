@@ -168,7 +168,7 @@ tasks:
         record
   - name: dispatcher-substrate
     binding: substrate — verify_plan.py::derive_verify_plan, git_ops.py::GitOps.has_uncommitted_work,
-      verify_runner.py::RemoteRunner.sync_if_stale and verify_categories.py INFRA_TRANSIENT_CATEGORIES
+      verify_runner.py::RemoteRunner.ensure_gate and verify_categories.py INFRA_TRANSIENT_CATEGORIES
       all present on main.
     verdict: PASS
     delivered_check:

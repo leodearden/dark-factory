@@ -197,6 +197,13 @@ DISALLOW_CONSOLIDATION_OP = [
     'mcp__fused-memory__consolidate_memories',
 ]
 
+# Defect-record writers (disallowed in every stage — plans/defect-tests-prd.md
+# decision 7): no recon stage declares, rules on or proves a defect.
+DISALLOW_DEFECT_RECORD_WRITES = [
+    'mcp__fused-memory__declare_defect',
+    'mcp__fused-memory__record_defect_outcome',
+]
+
 # Escalation READ tools (disallowed in every stage — task 3163,
 # plans/escalation-store-ambiguity-prd.md task α).
 #
@@ -275,24 +282,35 @@ DISALLOW_ESCALATION_WRITES = [
     'mcp__escalation__escalate_info',
 ]
 
+# Operator merge-lane control (disallowed in every stage — task 5246, Leo
+# 2026-10-21): operator merge-lane control; reconciliation stages must not
+# re-prioritise merges.
+DISALLOW_ESCALATION_MERGE_LANE_CONTROL = [
+    'mcp__escalation__merge_relane',
+]
+
 # Per-stage disallowed lists
 STAGE1_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_CONSOLIDATION_OP
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
+    + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
     + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )
 # Stage 2 keeps its memory + task write access except the consolidation op and
-# the proposal tool; built-ins, the escalation reads and the fused-memory
-# control-plane mutators are blocked too.
+# the proposal tool; built-ins, the escalation reads, the fused-memory
+# control-plane mutators and the defect-record writers are blocked too.
 STAGE2_DISALLOWED = (
     DISALLOW_CONSOLIDATION_OP
     + DISALLOW_CONSOLIDATION_PROPOSALS
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
+    + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
     + DISALLOW_BUILTIN
 )
 STAGE3_DISALLOWED = (
@@ -302,7 +320,9 @@ STAGE3_DISALLOWED = (
     + DISALLOW_RECON_REPORT_JOURNAL_WRITES
     + DISALLOW_CONSOLIDATION_PROPOSALS
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
+    + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
     + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )

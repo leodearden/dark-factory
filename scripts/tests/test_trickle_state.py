@@ -24,6 +24,8 @@ The three outcomes:
 """
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import json
 import os
 import pwd
@@ -520,7 +522,9 @@ class TestLoadState:
 
 def _record(project_id='dark_factory', *, day=1, hour=3, exit_code=0,
             applied=0, commit_made=False, budget_suppressed=False,
-            capped=False, scheduled=False, **counters):
+            capped=False, scheduled=False,
+            census: trickle_state.CensusObservation | None = None,
+            **counters):
     """Call record_run with a derived-total counter set and an injected
     clock (the module is deliberately clock-injectable — no time faking)."""
     kw = _counters(**counters)
@@ -535,6 +539,7 @@ def _record(project_id='dark_factory', *, day=1, hour=3, exit_code=0,
         budget_suppressed=budget_suppressed,
         capped=capped,
         scheduled=scheduled,
+        census=census,
         **kw,
     )
 
@@ -820,6 +825,238 @@ class TestRecordRunFailedStreak:
             trickle_state.DEFAULT_MAX_FAILED_RUNS
             < trickle_state.DEFAULT_MAX_BARREN_RUNS
         )
+
+
+_CENSUS_STATE = '/p/docs/legibility/census-state.json'
+
+
+def _fire(anchor: str | None = '2026-08-02', path=_CENSUS_STATE):
+    return trickle_state.CensusObservation(
+        fired=True, last_census_at=anchor, census_state_path=path,
+    )
+
+
+def _no_fire(anchor: str | None = '2026-08-02', path=_CENSUS_STATE):
+    return trickle_state.CensusObservation(
+        fired=False, last_census_at=anchor, census_state_path=path,
+    )
+
+
+class TestRecordRunCensusFireStreak:
+    """The census-fire streak: how many consecutive recorded nights the
+    census trigger FIRED against one unchanged ``last_census_at``.
+
+    ``census=None`` means the trigger was not evaluated that night (the
+    trickle failed or was capped before the census step)."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_consecutive_fires_against_one_anchor_increment(self):
+        for day, fires in ((1, 1), (2, 2), (3, 3)):
+            doc = _record(day=day, zero_signal_dropped=1, census=_fire())
+            assert doc['census_fired'] is True
+            assert doc['census_fire_streak'] == {
+                'fires': fires,
+                'last_census_at': '2026-08-02',
+                'census_state_path': _CENSUS_STATE,
+                'since': '2026-07-01',
+            }
+
+    def test_a_no_fire_night_clears_the_streak(self):
+        _record(day=1, census=_fire())
+        _record(day=2, census=_fire())
+
+        doc = _record(day=3, census=_no_fire())
+
+        assert doc['census_fired'] is False
+        assert doc['census_fire_streak'] is None
+
+    def test_quiet_no_fire_nights_never_build_a_streak(self):
+        for day in range(1, 7):
+            doc = _record(day=day, census=_no_fire())
+        assert doc['census_fire_streak'] is None
+
+    def test_a_night_that_did_not_evaluate_the_trigger_carries_the_streak(self):
+        _record(day=1, census=_fire())
+        before = _record(day=2, census=_fire())
+
+        skipped = _record(day=3, exit_code=1, census=None)
+
+        assert skipped['census_fired'] is None
+        assert skipped['census_fire_streak'] == before['census_fire_streak']
+        resumed = _record(day=4, census=_fire())
+        assert resumed['census_fire_streak']['fires'] == 3
+        assert resumed['census_fire_streak']['since'] == '2026-07-01'
+
+    def test_a_first_night_without_evaluation_records_no_streak(self):
+        doc = _record(day=1, census=None)
+        assert doc['census_fired'] is None
+        assert doc['census_fire_streak'] is None
+
+    def test_a_fire_against_a_moved_anchor_restarts_the_streak(self):
+        _record(day=1, census=_fire(anchor='2026-08-02'))
+        _record(day=2, census=_fire(anchor='2026-08-02'))
+
+        doc = _record(day=3, census=_fire(anchor='2026-09-24'))
+
+        assert doc['census_fire_streak'] == {
+            'fires': 1,
+            'last_census_at': '2026-09-24',
+            'census_state_path': _CENSUS_STATE,
+            'since': '2026-07-03',
+        }
+
+    def test_a_fire_against_another_census_state_path_restarts_the_streak(self):
+        _record(day=1, census=_fire())
+        _record(day=2, census=_fire())
+
+        doc = _record(day=3, census=_fire(path='/q/census-state.json'))
+
+        assert doc['census_fire_streak']['fires'] == 1
+        assert doc['census_fire_streak']['census_state_path'] == (
+            '/q/census-state.json'
+        )
+        assert doc['census_fire_streak']['since'] == '2026-07-03'
+
+    def test_a_never_censused_anchor_still_builds_a_streak(self):
+        _record(day=1, census=_fire(anchor=None))
+        doc = _record(day=2, census=_fire(anchor=None))
+
+        assert doc['census_fire_streak']['fires'] == 2
+        assert doc['census_fire_streak']['last_census_at'] is None
+
+    def test_a_predecessor_without_census_fields_starts_the_streak_at_one(
+        self, caplog,
+    ):
+        path = trickle_state.trickle_state_path('dark_factory')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            'schema_version': trickle_state.STATE_SCHEMA_VERSION,
+            'project_id': 'dark_factory',
+            'outcome': OUTCOME_QUIET,
+            'consecutive_barren_runs': 0,
+            'consecutive_failed_runs': 0,
+            'last_productive_at': None,
+        }))
+
+        with caplog.at_level('WARNING'):
+            status, _ = trickle_state.load_state(path)
+            doc = _record(day=2, census=_fire())
+
+        assert status == 'ok'
+        assert not [r for r in caplog.records if r.levelname == 'WARNING']
+        assert doc['census_fire_streak']['fires'] == 1
+        assert trickle_state.STATE_SCHEMA_VERSION == 1
+
+    def test_the_census_fields_round_trip_through_load_state(self):
+        doc = _record(day=1, census=_fire())
+        status, loaded = trickle_state.load_state(
+            trickle_state.trickle_state_path('dark_factory')
+        )
+        assert (status, loaded) == ('ok', doc)
+
+    def test_census_is_a_required_keyword(self):
+        """A defaulted ``census=None`` is how a future caller would silently
+        blind the census progress probe into a permanent OK."""
+        census = inspect.signature(trickle_state.record_run).parameters['census']
+        assert census.kind is inspect.Parameter.KEYWORD_ONLY
+        assert census.default is inspect.Parameter.empty
+
+
+class TestReadCensusFireStreak:
+    """``read_census_fire_streak(doc)``: the ONE parser of the recorded
+    streak, shared by the writer's fold and the census progress probe."""
+
+    _WELL_FORMED = {
+        'fires': 2,
+        'last_census_at': '2026-08-02',
+        'census_state_path': _CENSUS_STATE,
+        'since': '2026-07-01',
+    }
+
+    def test_a_well_formed_streak_parses_to_a_frozen_value(self):
+        streak = trickle_state.read_census_fire_streak(
+            {'census_fire_streak': dict(self._WELL_FORMED)}
+        )
+
+        assert streak == trickle_state.CensusFireStreak(
+            fires=2,
+            last_census_at='2026-08-02',
+            census_state_path=_CENSUS_STATE,
+            since='2026-07-01',
+        )
+        assert streak is not None
+        for field in dataclasses.fields(streak):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(streak, field.name, None)
+
+    def test_a_never_censused_anchor_parses(self):
+        raw = dict(self._WELL_FORMED, last_census_at=None)
+        streak = trickle_state.read_census_fire_streak(
+            {'census_fire_streak': raw}
+        )
+        assert streak is not None
+        assert streak.last_census_at is None
+
+    @pytest.mark.parametrize('doc', [
+        pytest.param({}, id='key-absent'),
+        pytest.param({'census_fire_streak': None}, id='null'),
+        pytest.param({'census_fire_streak': [1, 2]}, id='not-a-dict'),
+        pytest.param(None, id='doc-not-a-dict'),
+    ])
+    def test_no_streak_object_parses_to_none(self, doc):
+        assert trickle_state.read_census_fire_streak(doc) is None
+
+    @pytest.mark.parametrize('field, value', [
+        pytest.param('fires', '3', id='fires-str'),
+        pytest.param('fires', True, id='fires-bool'),
+        pytest.param('fires', 0, id='fires-zero'),
+        pytest.param('fires', -1, id='fires-negative'),
+        pytest.param('census_state_path', None, id='path-null'),
+        pytest.param('since', 20260701, id='since-int'),
+        pytest.param('last_census_at', 20260802, id='anchor-int'),
+    ])
+    def test_an_unusable_field_parses_to_none(self, field, value):
+        raw = dict(self._WELL_FORMED, **{field: value})
+        assert trickle_state.read_census_fire_streak(
+            {'census_fire_streak': raw}
+        ) is None
+
+
+class TestReadLastCensusAt:
+    """``read_last_census_at(path)``: the ONE quiet read of census-state's
+    raw ``last_census_at``, shared by the nightly's pre-launch anchor and
+    the census progress probe's live comparison."""
+
+    def test_a_missing_file_is_missing(self, tmp_path):
+        assert trickle_state.read_last_census_at(
+            tmp_path / 'census-state.json'
+        ) == ('missing', None)
+
+    @pytest.mark.parametrize('content, expected', [
+        pytest.param('{"last_census_at": "2026-08-02"}', '2026-08-02', id='dated'),
+        pytest.param('{}', None, id='never-censused'),
+        pytest.param('{"last_census_at": 20260802}', 20260802, id='raw-not-validated'),
+    ])
+    def test_a_json_object_yields_its_raw_value(self, tmp_path, content, expected):
+        path = tmp_path / 'census-state.json'
+        path.write_text(content, encoding='utf-8')
+        assert trickle_state.read_last_census_at(path) == ('ok', expected)
+
+    @pytest.mark.parametrize('content', [
+        pytest.param('{not json', id='invalid-json'),
+        pytest.param('[1, 2]', id='not-an-object'),
+    ])
+    def test_an_unusable_file_is_malformed_and_quiet(self, tmp_path, caplog, content):
+        """Quiet because census_trigger.load_census_state already logs the
+        malformed WARNING for the same file on the same night."""
+        path = tmp_path / 'census-state.json'
+        path.write_text(content, encoding='utf-8')
+        with caplog.at_level('DEBUG'):
+            assert trickle_state.read_last_census_at(path) == ('malformed', None)
+        assert caplog.records == []
 
 
 class TestRecordedAgeHours:

@@ -238,6 +238,11 @@ class EventType(StrEnum):
     #   - merge_shadow's warm/cold compare emits a wholly different
     #     {merge_commit, shadow_compare, warm_test_count, cold_test_count}.
     verdict_parity_ok = 'verdict_parity_ok'
+    # A due drift check could not acquire both host slots within its settle
+    # window, so it ran nothing and re-arms for the next landing.  Producer:
+    # merge_lane/drift.py::_run_drift_check.  Payload {merge_sha,
+    # consecutive_deferrals, hosts}, hosts being HostAllocator.host_states().
+    drift_check_deferred = 'drift_check_deferred'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence
     # and local-infra-inconclusive outcomes their own auditable types.
@@ -281,8 +286,15 @@ class EventType(StrEnum):
     # crossing the streak or time threshold).  Payload: {host, reason}.
     verify_host_unreachable = 'verify_host_unreachable'
     # Emitted when a previously-unreachable remote verify host passes health()
-    # and is cleared back into the live pool.  Payload: {host, downtime_s}.
+    # and is cleared back into the live pool.  Payload: {host, downtime_s}; a
+    # host re-admitted from a skew bench adds quarantine_class='skew'.
     verify_host_recovered = 'verify_host_recovered'
+    # Task 6565 (design D6): a remote verify host was benched in the 'skew'
+    # class — reached, but it could not run the dispatcher's gate or gave no
+    # usable verdict.  Emitted by the merge worker on every such bench.
+    # Payload: {host, kind, reason, sticky, code_sha, identity} where identity
+    # is GateIdentityPair.to_wire() or null.
+    verify_host_skew = 'verify_host_skew'
     # Emitted from enqueue_merge_request's terminal done-callback when a
     # MergeRequest future reaches its final state (resolved, cancelled, or
     # exception).  Payload shape: {request_id, branch, state, snapshot_tip,
@@ -330,28 +342,31 @@ class EventType(StrEnum):
     # in-worktree path is None-safe (correctness fix still applies; only the
     # event is dispatch-local, mirroring merge_flake_suppressed).
     trivial_pass_escalated = 'trivial_pass_escalated'
-    # Contract-currency (INV-2, plans/merge-verdict-integrity-prd.md §1, §3.1,
-    # §3.7) telemetry for the RemoteRunner auto-sync-at-dispatch gate.  A
-    # RemoteRunner's adoptable post-merge verdict is trustworthy only if the
-    # runner executed CURRENT gate logic; incident bb834dd42a is the laptop's
-    # Dark-Factory *code* checkout frozen ~5 weeks, rubber-stamping trivial
-    # PASSes (966f23a6).  Both are queue/runner-scoped (task_id optional; the
-    # sync happens before/around dispatch, not necessarily bound to one task).
+    # Contract-currency (INV-2, plans/merge-verdict-integrity-prd.md §1, §3.1)
+    # telemetry: a RemoteRunner's verdict is adoptable only if the remote ran
+    # the dispatcher's own gate code.  Since task 6565 every remote verify runs
+    # in an immutable gate checkout of the dispatcher's deployed sha
+    # (RemoteRunner.ensure_gate).  Both are runner-scoped (task_id optional).
     #
-    # runner_stale: emitted by RemoteRunner.sync_if_stale when the remote
-    # DF-code checkout HEAD differs from the dispatcher's local DF HEAD
-    # (staleness detected, BEFORE any sync/pull is attempted).  data carries
-    # {runner, local_head, remote_head}.
+    # runner_stale: emitted by RemoteRunner.ensure_gate when the remote had no
+    # ready gate of the deployed sha and ensure-gate.sh had to build one.  data
+    # carries {runner, local_head: the deployed sha, remote_head: the sha this
+    # runner's previous successful ensure used, or null}.
     #
-    # runner_synced: emitted when the remote git state was brought current with
-    # the dispatcher — either the DF-code checkout (git pull --ff-only + uv
-    # sync, kind='df_checkout') or the project checkout's main ref (mirror
-    # force-push after a non-fast-forward, kind='project_main_mirror').  data
-    # carries {runner, kind, from_head, to_head, forced}; kind ∈ {'df_checkout',
-    # 'project_main_mirror'}; forced is True only on the project-main mirror
-    # force-push arm.
+    # runner_synced: emitted when the remote was brought current with the
+    # dispatcher — a gate checkout built for the deployed sha (right after
+    # runner_stale, kind='gate_checkout'), or the project checkout's main ref
+    # mirror-forced after a non-fast-forward (kind='project_main_mirror').  data
+    # carries {runner, kind, from_head, to_head, forced}; forced is True only on
+    # the project-main mirror arm.
     runner_stale = 'runner_stale'
     runner_synced = 'runner_synced'
+    # Task 6565 (design D1): the process's deployed sha is flagged — HEAD moved
+    # while the wire path was being imported (indeterminate), or a tracked
+    # wire-path file was dirty.  Emitted once at startup by
+    # Harness._announce_deployed_sha; data is DeployedSha.to_wire():
+    # {sha, indeterminate, dirty_wire_path}.  The remote gate stays in use.
+    deployed_sha_indeterminate = 'deployed_sha_indeterminate'
     # INV-3 chain-intact enforcement (PRD plans/merge-verdict-integrity-prd.md
     # §3.7 new vocab).  Emitted whenever a verdict (PASS or FAIL) is VOIDED
     # because its verified tree no longer chains onto a still-live prefix — the

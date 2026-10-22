@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import functools
+import importlib
 import json
 import logging
 import os
@@ -247,6 +248,13 @@ def main(verbose: bool):
 def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | None,
         force_dirty_start: bool, retag_modules: bool, until_idle: bool):
     """Run the orchestrator against a PRD, or execute existing tasks if no PRD given."""
+    from orchestrator.deployed_sha import capture_deployed_sha, resolve_code_checkout
+
+    # Task 6565 (D1): importing the harness loads the whole verify wire path, so
+    # bracketing this one import records which commit the process runs.
+    deployed_sha = capture_deployed_sha(
+        resolve_code_checkout(), lambda: importlib.import_module('orchestrator.harness'),
+    )
     from orchestrator.harness import Harness
 
     delay_secs = _parse_duration(delay) if delay else 0
@@ -255,7 +263,15 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
     except ConfigRequiredError as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
-    harness = Harness(config)
+    if deployed_sha is None and config.enabled_verify_runners:
+        click.echo(
+            'Error: a remote verify runner is enabled but this process cannot read the '
+            'commit it runs (no readable git checkout above its code); the remote gate '
+            'needs that sha (task 6565). Run from a git checkout or disable the runner.',
+            err=True,
+        )
+        sys.exit(1)
+    harness = Harness(config, deployed_sha=deployed_sha)
     logger = logging.getLogger(__name__)
 
     async def _main():
@@ -1118,6 +1134,34 @@ def _recorded_merge_worktree_remover(git_ops: 'GitOps') -> Callable[[Path], None
         asyncio.run(git_ops.cleanup_merge_worktree(worktree))
 
     return remove
+
+
+@main.command('gate-identity')
+def gate_identity():
+    """Print this checkout's gate identity as one JSON line (task 6565, D3).
+
+    ``{"code_sha": <HEAD of the checkout holding this code>,
+    "wire_fingerprint": <remote_gate.wire_fingerprint of the wire classes>}``.
+    A remote gate answers this before any verify is dispatched to it; the
+    dispatcher proceeds only when both values equal its own.  Importing the
+    wire classes to fingerprint them also proves the gate's codec imports.
+    Exits 1 with the cause on stderr when the checkout's HEAD cannot be read.
+    """
+    import subprocess
+
+    from orchestrator.deployed_sha import checkout_head, resolve_code_checkout
+    from orchestrator.remote_gate import local_gate_identity
+
+    checkout = resolve_code_checkout()
+    if checkout is None:
+        click.echo('Error: no git checkout holds this orchestrator code', err=True)
+        sys.exit(1)
+    try:
+        code_sha = checkout_head(checkout)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        click.echo(f'Error: cannot read HEAD of {checkout}: {exc}', err=True)
+        sys.exit(1)
+    click.echo(json.dumps(local_gate_identity(code_sha).to_wire()))
 
 
 @main.command('cancel-verify')

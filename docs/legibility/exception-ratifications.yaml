@@ -33,8 +33,10 @@
   covers: >-
     The two shrink-only baseline units, scripts/inline_suppression_baseline.json
     and orchestrator/tests/merge_lane_ratchet_baseline.json, whose grandfathered
-    entries may only fall and convert to an owned disposition when touched, with
-    no burn-down scheduled.
+    entries may only fall without an authorized, ledgered raise (the merge-lane
+    unit's --authorize-raise, one file per raise under
+    orchestrator/tests/merge_lane_ratchet_raises/) and convert to an owned
+    disposition when touched, with no burn-down scheduled.
 
 - id: inv12-dashboard-unit-divergence
   date: 2026-10-19

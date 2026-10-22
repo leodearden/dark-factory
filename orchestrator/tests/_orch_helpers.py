@@ -2382,8 +2382,8 @@ def mcp_tool_envelope(payload: object) -> dict:
     """The JSON-RPC body ``Scheduler.dispatch_tool`` ACTUALLY returns for a
     successful ``tools/call``, wrapping *payload* — the tool's own return value.
 
-    ``dispatch_tool`` hands back ``McpSession._raw_call``'s parsed response
-    verbatim (``mcp_lifecycle.py::McpSession.call_tool`` returns it unmodified),
+    ``dispatch_tool`` hands back ``shared.mcp_session.McpSession.call``'s parsed response
+    verbatim (``shared/src/shared/mcp_session.py::McpSession.call_tool`` returns it unmodified),
     so a fake that answers with a bare ``{'statuses': …}`` is speaking a shape the
     transport never emits.  That substitution is not a harmless simplification: it
     is what let a one-level envelope unwrapper in

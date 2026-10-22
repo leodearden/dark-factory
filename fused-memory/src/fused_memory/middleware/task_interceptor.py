@@ -7,23 +7,32 @@ import json
 import logging
 import os
 import uuid as uuid_mod
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, get_args
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, get_args
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from shared import process_identity
+from shared.defects import DeclareEvent, OutcomeEvent
+from shared.mcp_envelope import write_failure_reason
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
+from fused_memory.backends import defect_ref_lookup
+from fused_memory.backends.defect_records import (
+    DefectCreationRefused,
+    DefectWriteRefused,
+    require_creation_floor,
+)
 from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
+    DefectRecordsWriteAuthorityError,
     DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
@@ -4022,8 +4031,15 @@ class TaskInterceptor:
             return err
 
         metadata = kwargs.pop('metadata', None)
-        if 'deferral' in (coerce_task_metadata(metadata) or {}):
+        incoming_metadata = coerce_task_metadata(metadata)
+        if 'deferral' in (incoming_metadata or {}):
             return DeferralWriteAuthorityError(None).to_error_dict()
+        # Before the planning_mode split, so both creation paths refuse
+        # synchronously, before a ticket or a row is written.
+        try:
+            require_creation_floor(incoming_metadata)
+        except DefectCreationRefused as exc:
+            return exc.to_error_dict()
 
         # Inject the override reason into task metadata (both the normal ticket
         # path and the planning_mode path benefit from this placement).  When no
@@ -5921,7 +5937,11 @@ class TaskInterceptor:
            ``{'success': False, 'error': 'status_via_update_task' | 'done_provenance_via_update_task',
            'task_id': …, …}`` shape defined in ``task_backend_errors.py`` (task C2).
            Any add, alter or removal of ``metadata.deferral`` raises
-           ``DeferralWriteAuthorityError``, returned the same way.
+           ``DeferralWriteAuthorityError``, returned the same way, and so does
+           any add, change or removal of ``metadata.defects`` /
+           ``metadata.defect_test_retirements`` (the same carry-verbatim rule as
+           ``done_provenance``): :class:`~fused_memory.backends.task_backend_errors.DefectRecordsWriteAuthorityError`,
+           ``error='defect_records_via_update_task'``, for every caller.
            The backend also rejects a metadata payload that is not a JSON object,
            in every mode, with
            :class:`~fused_memory.backends.task_backend_errors.MetadataNotAnObjectError`,
@@ -6092,6 +6112,7 @@ class TaskInterceptor:
             except (
                 StatusWriteAuthorityError,
                 DoneProvenanceWriteAuthorityError,
+                DefectRecordsWriteAuthorityError,
                 DeferralWriteAuthorityError,
                 MetadataNotAnObjectError,
             ) as e:
@@ -6507,6 +6528,50 @@ class TaskInterceptor:
             statuses=statuses, limit=limit, offset=offset, tag=tag,
             include_value=include_value,
         )
+
+    async def apply_defect_events(
+        self,
+        task_id: str,
+        project_root: str,
+        events: Sequence[DeclareEvent | OutcomeEvent],
+        *,
+        operation: Literal['declare_defect', 'record_defect_outcome'],
+        agent_id: str | None,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """The defect-record tools' write: the backend core under the write lock, journalled.
+
+        No backlog gate and no idempotency key: a proof or ruling must never be
+        shed under reconciliation backlog, and a replayed proof is refused by
+        I2's later-proof rule rather than replayed. A refusal returns its
+        ``to_error_dict()``; nothing was written.
+        """
+        tm = await self._ensure_taskmaster()
+        project_id = resolve_project_id(project_root)
+        async with self._write_lock(project_id):
+            try:
+                result = await self._journal_around(
+                    operation,
+                    project_root,
+                    {'task_id': task_id, 'events': [event.model_dump(mode='json') for event in events]},
+                    tm.apply_defect_events(task_id, project_root, events, tag=tag),
+                    agent_id=agent_id,
+                )
+            except DefectWriteRefused as exc:
+                return exc.to_error_dict(task_id=task_id)
+        await self._journal(
+            self._make_event(
+                EventType.task_modified,
+                project_root,
+                {'task_id': task_id, 'operation': operation},
+            )
+        )
+        return {'success': True, **result}
+
+    async def lookup_defect_ref(
+        self, project_root: str, ref: str, *, tag: str | None = None,
+    ) -> defect_ref_lookup.DefectRefLookup:
+        return await defect_ref_lookup.lookup_defect_ref(self, project_root, ref, tag=tag)
 
     def _require_done_provenance(self) -> bool:
         """True when the provenance gate is enforcing (reject missing/invalid).
@@ -7722,43 +7787,12 @@ def _reject_directory_locks_in_update_metadata(
 def interceptor_write_succeeded(resp: object) -> bool:
     """Return True iff *resp* represents a successful TaskInterceptor write.
 
-    Centralises the success/failure contract for *internal* consumers that
-    need a boolean classification (e.g. reconciliation hint-attachment in
-    ``TargetedReconciler._on_task_blocked``).  MCP passthrough call sites
-    (such as ``server/tools.py``'s ``update_task`` handler) must return the
-    raw response dict to the client so rejection details (``error``,
-    ``hint``, ``task_id``) reach the user — do **not** route them through
-    this helper.
-
-    Rejection-dict shapes this helper recognises as failures:
-
-    * The canonical write-authority rejection shape — defined once in
-      ``fused_memory.backends.task_backend_errors``
-      (``status_via_update_task_error`` / ``done_provenance_via_update_task_error``,
-      tasks C1/C2) and surfaced here via
-      ``StatusWriteAuthorityError`` / ``DoneProvenanceWriteAuthorityError
-      .to_error_dict()`` →
-      ``{'success': False, 'error': 'status_via_update_task' | 'done_provenance_via_update_task', 'task_id': …, …}``
-    * ``BacklogVerdict.to_error_dict()`` (and other no-``success``/has-``error``
-      shapes, e.g. lock-charter rejections) →
-      ``{'error': '<rendered-msg>', 'error_type': 'ReconciliationBacklogExceeded', …}``
-      (no ``success`` key — defeated by the ``not resp.get('error')`` clause)
-
-    The ``success`` key defaults to ``True`` so a successful Taskmaster passthrough
-    that does not include an explicit ``success`` field still classifies correctly.
-    Non-dict responses (``None``, strings, lists) are always treated as failures.
-
-    An empty dict ``{}`` carries no positive write signal and is therefore treated as
-    **failure** (``bool({})`` is ``False``). Production Taskmaster responses always
-    include at least one of ``success`` or ``id``; if you see ``{}`` in logs,
-    investigate the caller.
+    The predicate's single home is ``shared.mcp_envelope.write_failure_reason``;
+    this boolean form is for INTERNAL consumers (e.g.
+    ``TargetedReconciler._on_task_blocked``).  MCP passthrough sites
+    (``server/tools.py``'s ``update_task``) must return the raw dict instead.
     """
-    return (
-        isinstance(resp, dict)
-        and bool(resp)
-        and bool(resp.get('success', True))
-        and not resp.get('error')
-    )
+    return write_failure_reason(resp) is None
 
 
 def _journal_error_text(resp: object) -> str | None:

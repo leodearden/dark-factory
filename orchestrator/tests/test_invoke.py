@@ -140,7 +140,9 @@ class TestAccountNameThreading:
             _make_slot(account_name='acct-a', cap_hit=True),
             _make_slot(account_name='acct-b', cap_hit=False),
         ])
-        fake_invoke = AsyncMock(return_value=_make_result())
+        fake_invoke = AsyncMock(
+            side_effect=[_make_result(success=False), _make_result()],
+        )
 
         with patch(_SHARED_ASYNCIO_PATCH) as mock_asyncio:
             mock_asyncio.sleep = AsyncMock()
@@ -177,7 +179,7 @@ class TestCapHitResume:
         ])
 
         capped_result = _make_result(
-            success=True, cost_usd=0.5, session_id='sess-abc',
+            success=False, cost_usd=0.5, session_id='sess-abc',
         )
         capped_result.duration_ms = 6000
         capped_result.turns = 2
@@ -209,7 +211,7 @@ class TestCapHitResume:
             _make_slot(token='token-b', account_name='acct-b', cap_hit=False),
         ])
 
-        capped_result = _make_result(session_id='')  # codex: no session
+        capped_result = _make_result(success=False, session_id='')  # codex: no session
         ok_result = _make_result()
         ok_result.duration_ms = 6000
         ok_result.turns = 2
@@ -234,7 +236,7 @@ class TestCapHitResume:
             _make_slot(token='token-c', account_name='acct-b', cap_hit=False),
         ])
 
-        capped_result = _make_result(session_id='sess-abc')
+        capped_result = _make_result(success=False, session_id='sess-abc')
         failed_resume = _make_result(success=False)
         failed_resume.duration_ms = 6000
         failed_resume.turns = 2

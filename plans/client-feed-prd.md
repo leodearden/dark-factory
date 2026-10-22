@@ -315,7 +315,7 @@ path. It writes nowhere but O. The portal account reads O and nothing under R.
 | B4 | Foreign project refusal | the policy names project X; feed lines name Y | `validate-feed` rejects; the portal's consumer test (other repo) rejects the same fixture |
 | B5 | Fixture round trip | the committed fixture feed `tests/fixtures/feed-v1/` | validates under `contract.py`; `fold(feed)` equals the committed `state.json`; the portal's suite validates and renders it |
 | B6 | Landed merge with review | `merge_finalized` `state=done` for task 7, two `review_completed` rows, a `Merge task/7 into main` commit | one `merge_landed` with that sha, stat counts from git, `review.cycles == 2` and the last row's counts; with no rows, `review == "not_recorded"` |
-| B7 | Red shown | `workflow_verify` `passed=false` and a junit with one failure | `verify_run.passed == false`; `test_results.counts.failed == 1`; `exception_type` present, no message |
+| B7 | Red shown | an archived red attempt summary (a leg rc ≠ 0) and a junit with one failure under the task's archive dir | `verify_run.passed == false`; `test_results.counts.failed == 1`; `exception_type` present, no message |
 | B8 | Not recorded | a `verify_run` whose task dir has no junit | `test_results` absent; `verify_run.legs == "not_recorded"` |
 | B9 | Factory state | `scheduler_paused` then nothing for 3 h | `factory_state.scheduler == paused`, `idle_seconds ≥ 10800` |
 | B10 | Waiting on Leo | task 9 blocked with an open `escalation_created` level 2 | `task_upserted.waiting_on == "leo"`; after `escalation_resolved`, `"factory"` |
@@ -384,6 +384,119 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
   `by_kind` counts to `review_completed`; the ε sidecar block's plugin check is replaced. The defect display
   (`cases[].defects`, `defects_results`) is that PRD's ι, not a task of this one.
 
+- 2026-10-20, from β1 (task 6968), answering the esc-6969-1 note routed to it. These bind γ (6970):
+  - (a) Red task verifies come from the verify archive's per-attempt summaries, which
+    `orchestrator/src/orchestrator/verify.py::_archive_attempt_summary` writes for every attempt, green
+    or red. γ assembles them through `client-feed/src/client_feed/sources/archive.py::read_archived_run`.
+    `workflow_verify` cannot be that source: it is emitted only on VERIFY→REVIEW, with `passed=true`
+    (0 of 6,377 live rows are false). β1 still maps the recorded `passed` of `workflow_verify` and
+    `merge_verify` (`client-feed/src/client_feed/sources/events.py::read_events`), so either source
+    flows through unchanged. B7's precondition is amended to match.
+  - (b) `waiting_on` (`client-feed/src/client_feed/sources/tasks.py::waiting_on`): done or cancelled
+    gives null; an open escalation with recorded level 2 gives `leo`; any other open escalation, or a
+    blocked task, gives `factory`; otherwise null. An escalation is closed by `escalation_id`, else by
+    `escalation_ids`, else task-wide by an outcome-only `escalation_resolved`
+    (`client-feed/src/client_feed/sources/events.py::read_open_escalations`). Level promotions and
+    most resolutions are not recorded in runs.db, so `leo` rarely fires today; follow-up ticket
+    tkt_0RW1F0587N3HXAH0PN8A4A5TYJ covers recording them.
+  - (c) PRD title and excerpt are read from main's git objects, never the working tree (§8;
+    `client-feed/src/client_feed/sources/prds.py::read_prds`).
+  - (d) `review.cycles` = max(newest `review_completed` cycle, Σ `task_results.review_cycles` for the
+    task); a task with no valid row gives `not_recorded`
+    (`client-feed/src/client_feed/sources/events.py::read_review_counts`).
+
+- 2026-10-21, from β1's review amendments (task 6968). These bind γ (6970):
+  - (e) The tasks cursor (`client-feed/src/client_feed/sources/tasks.py::read_tasks`) is the last
+    projected row's raw `updated_at`. A skipped row never moves it, so it is read again until a
+    projected row passes it. The cursor is not exactly-once. Rows are ordered as the store spells
+    `updated_at` (`.mmmZ` beside microsecond `+00:00`), and the next read takes rows strictly after
+    the cursor. So a row stamped at or before the cursor (the producer stamps to the millisecond),
+    but committed after the read, is missed until that task is next written. If γ needs every
+    write, it re-reads with `since=None` on some cadence and emits only rows that differ from its
+    folded state.
+  - (f) `client-feed/src/client_feed/cli.py` is no longer vendorable: `dump-sources` pulls in
+    `yaml`, `shared.project_layout` and git through `policy` and the sources.
+    `client-feed/tests/test_import_boundary.py` still lists `cli` in `VENDORABLE_MODULES` and
+    passes, because it checks only each direct import's root package. That file is outside β1's
+    scope; ticket tkt_0RW1SJ7XHC6R7VVTB1AERS60T7 drops `cli` from the set.
+  - (g) `client-feed/tests/_stores.py` copies the producers' DDL by hand, citing each by
+    path::symbol. Nothing executable catches drift, so a renamed producer column would leave the
+    fixture tests green and a live read failing. The risk is accepted: `client-feed dump-sources`
+    against a live root is the check.
+
+- 2026-10-21, from γ (task 6970). These bind δ (6971), ε (6972), η (6974) and the portal:
+  - (a) A task `verify_run` is closed at each verify-phase exit. Its window runs from that task's
+    `phase_enter` with phase `verify` to the `phase_exit`, and it is read through
+    `client-feed/src/client_feed/sources/archive.py::read_archived_run`
+    (`client-feed/src/client_feed/stream_events.py::_task_run`). `passed` is "every archived leg's
+    rc is 0". A window with no archived summary emits no `verify_run`, because nothing records
+    whether it passed (§4.10). `workflow_verify` is not mapped: it follows the same phase exit, so
+    mapping it would report every green run twice. Merge runs come from `merge_verify`, which is
+    emitted after its run, so their window is `[at - duration_ms, at]`; with no duration or no
+    task id their legs are `not_recorded`
+    (`client-feed/src/client_feed/stream_events.py::_merge_run`). `run_key` is
+    `'<kind>-<runs.db event id>'`, from the closing `phase_exit` or the `merge_verify` row.
+  - (b) `heartbeat.watermark_seq` is the watermark of the `state.json` on disk when the heartbeat
+    was appended, i.e. the previous commit's
+    (`client-feed/src/client_feed/publisher.py::run_pass`), as in the committed feed-v1 fixture.
+  - (c) `factory_state` is emitted only when (`scheduler`, `since`, `last_event_at` floored to the
+    minute, `idle_seconds // 60`) differs from the folded state's
+    (`client-feed/src/client_feed/value_events.py::factory_event`, `IDLE_RESOLUTION_SECONDS`). So
+    the folded `idle_seconds` is at most a minute behind, and a busy factory emits at most one
+    line a minute.
+  - (d) A train's `merge_landed.review` is `not_recorded`: its members were reviewed separately,
+    and summing their counts would report a review that never happened
+    (`client-feed/src/client_feed/stream_events.py::_merge_landed`).
+  - (e) `cursor.json` adds `through_seq` and `feed_bytes`
+    (`client-feed/src/client_feed/feed_io.py::Cursor`). A commit appends and fsyncs, then
+    replaces `state.json`, then `cursor.json` (`client-feed/src/client_feed/feed_io.py::OutDir.commit`).
+    On restart, the lines past `through_seq` are folded. The first pass skips any stream event
+    whose identity is among them: `(type, natural_key)`, or for `task_phase` its payload without
+    `seq` (`client-feed/src/client_feed/stream_events.py::identity`,
+    `client-feed/src/client_feed/publisher.py::_published`). The stamps of skipped events are not
+    reused, so a `seq` gap can follow a crash. The contract requires only that `seq` strictly
+    increases.
+  - (f) An archive file that cannot be read loses only that run's archived details: a task run is
+    not emitted, a merge run's legs are `not_recorded`, and `archive` is named in `degraded`
+    (`client-feed/src/client_feed/stream_events.py::_archived`). A merge commit git cannot read holds
+    the whole events batch: `events_id` does not advance, and `git` is named in every heartbeat.
+    The hold is bounded only for a commit the repository does not hold. Once the landing is more
+    than `UNKNOWN_MERGE_GRACE` (one hour) old, and only on a pass where git still reads main's
+    head, it is skipped when git, running, reports that the repository does not hold the commit
+    (`client-feed/src/client_feed/sources/git.py::has_commit`): no `merge_landed`, an ERROR log
+    naming the commit and the runs.db event id, and `skipped N landing(s) whose merge commit is not
+    in the repository` under `git` (`client-feed/src/client_feed/publisher.py::_skip_missing_before`,
+    `client-feed/src/client_feed/stream_events.py::_missing_before`). A timeout, a failed spawn, a
+    killed git or any other failure reading a commit the repository holds keeps holding the batch,
+    however old the landing. The rule is stateless: a restart
+    neither resets nor extends it, and a broken repository never drops a landing. Git is read
+    lazily, in landing order and before any archive, and only for landings not already in the
+    uncommitted tail, so a held pass re-reads only the landings ahead of the one held
+    (`client-feed/src/client_feed/stream_events.py::_landed`). The stream read is not capped per
+    pass: one commit can land in more than one row, and `_first_landings` folds them only within
+    one read, so a batch boundary between them would publish a second `merge_landed`. The
+    other failure rules: each source unit fails alone, and its typed error becomes
+    `Degradation(source, redact_paths(str(exc)))` while any other exception propagates
+    (`client-feed/src/client_feed/publisher.py::_guarded`). Unprojectable rows are named as
+    `skipped N rows: <reason>=<count>, …` under `events` or `tasks`
+    (`client-feed/src/client_feed/publisher.py::_skipped`). While `runs.db` cannot be read, no
+    escalation is known: a re-read task whose status the state already records keeps its recorded
+    `waiting_on`, so a degraded pass holds the last known value rather than publishing a guess
+    (`client-feed/src/client_feed/value_events.py::task_events`).
+  - (g) Until δ, `tree_snapshot.budget` uses §4.12's null `delivered_commit` rule. `counted_lines`
+    counts the production files that match neither `free_globs` nor `never_reveal_globs`.
+    `budget_lines` is `floor(proportion × counted_lines)` and `spent_lines` is 0
+    (`client-feed/src/client_feed/value_events.py::_budget`). δ moves the rule into its budget module.
+  - (h) Tasks are read from the tasks cursor, and re-read with `since=None` on a process's first
+    pass and every `TASKS_RESCAN_PASSES` = 60 passes after it
+    (`client-feed/src/client_feed/publisher.py::publish`). A row is emitted only when it differs
+    from the folded state, which closes the tasks-cursor gap of β1's amendment (e). `snapshot` always re-reads
+    (`client-feed/src/client_feed/publisher.py::snapshot`). For η: `client-feed publish` exits 0 on
+    SIGTERM or SIGINT once its pass in progress completes. The loop runs on a worker thread, so the
+    handler never sets the stop Event while its own thread holds that Event's lock
+    (`client-feed/src/client_feed/cli.py::_publish_until_signalled`). δ's inbox tail is
+    `client-feed/src/client_feed/inbox.py::read_inbox`, with its offset in `Cursor.inbox_offset`.
+
 ## 13. Open questions (tactical)
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
@@ -393,7 +506,9 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
    per project, `--config ~/.config/client-feed/<name>.yaml`. Decide in η.
 3. **Default globs** for visible, test, docs and generated sets. Suggested as in §7.2 and §7.6, with
    `visible_globs` having no default (a policy must name it). Decide in β2.
-4. **`excerpt` rule for PRDs** whose first paragraph is a status line. Suggested: first paragraph after
-   the first `## ` heading. Decide in β1.
+4. **`excerpt` rule for PRDs** whose first paragraph is a status line. **Decided by β1 (6968):** the
+   first paragraph after the first `## ` heading, skipping subheadings and fenced blocks; the title is
+   the first H1, else the path; both are path-redacted
+   (`client-feed/src/client_feed/sources/prds.py::summarize_prd`).
 5. **Where the plugin writes the map when no `--junitxml` is given.** Suggested: nowhere; the plugin is
    inert without a junit target. Decide in ε.

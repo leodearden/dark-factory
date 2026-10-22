@@ -355,8 +355,8 @@ class TestDefaults:
             'RELOADABLE_FIELDS'
         )
         # task 4755: how old the in-flight fleet-redeploy lease may get before
-        # its readers stop believing it. DERIVED from the --drain verify-wait cap
-        # (worst legitimate sweep ~13,300s), not picked, and deliberately far
+        # its readers stop believing it. Fixed (a --drain sweep is fitted under
+        # it at scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS), and deliberately far
         # below the 8h min-interval so a lease leaked by a SIGKILLed sweep
         # delays at most one window. Red-tier / restart-only like its
         # siblings — captured at coordinator construction.
@@ -1811,17 +1811,20 @@ class TestVerifyRunnerConfig:
         """VerifyRunnerConfig parses from required str fields."""
         from orchestrator.config import VerifyRunnerConfig
 
-        cfg = VerifyRunnerConfig(name='laptop', ssh_host='laptop.local', git_remote='origin')
+        cfg = VerifyRunnerConfig(
+            name='laptop', ssh_host='laptop.local', git_remote='origin', df_checkout_path='/df',
+        )
         assert cfg.name == 'laptop'
         assert cfg.ssh_host == 'laptop.local'
         assert cfg.git_remote == 'origin'
 
     def test_verify_runner_config_defaults(self):
-        """config_path defaults None, enabled defaults True."""
+        """config_path and gate_checkouts_path default None, enabled defaults True."""
         from orchestrator.config import VerifyRunnerConfig
 
-        cfg = VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g')
+        cfg = VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g', df_checkout_path='/df')
         assert cfg.config_path is None
+        assert cfg.gate_checkouts_path is None
         assert cfg.enabled is True
 
     def test_verify_runner_config_explicit_values(self):
@@ -1838,12 +1841,50 @@ class TestVerifyRunnerConfig:
         assert cfg.config_path == '/etc/orch.yaml'
         assert cfg.enabled is False
 
-    def test_verify_runner_config_df_checkout_path_defaults_none(self):
-        """df_checkout_path defaults None — INV-2 auto-sync opt-in/off (task 2884)."""
+    def test_an_enabled_runner_without_df_checkout_path_is_rejected_by_name(self):
+        """A runner that cannot be gated is a config error, never a shared-tree dispatch (task 6565)."""
         from orchestrator.config import VerifyRunnerConfig
 
-        cfg = VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g')
+        with pytest.raises(ValidationError, match="verify_runners\\['laptop'\\].*df_checkout_path"):
+            VerifyRunnerConfig(name='laptop', ssh_host='h', git_remote='g')
+
+    @pytest.mark.parametrize('path', ['', 'relative/df'])
+    def test_a_non_absolute_df_checkout_path_is_rejected(self, path):
+        from orchestrator.config import VerifyRunnerConfig
+
+        with pytest.raises(ValidationError, match='absolute'):
+            VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g', df_checkout_path=path)
+
+    def test_a_disabled_runner_needs_no_df_checkout_path(self):
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g', enabled=False)
         assert cfg.df_checkout_path is None
+
+    def test_gate_paths_default_the_root_beside_the_source(self):
+        """design D2: <dirname(df_checkout_path)>/dark-factory-gate, absolute."""
+        from orchestrator.config import RemoteGatePaths, VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(
+            name='r', ssh_host='h', git_remote='g', df_checkout_path='/home/leo/src/dark-factory/',
+        )
+        assert cfg.gate_paths() == RemoteGatePaths(
+            source='/home/leo/src/dark-factory/', root='/home/leo/src/dark-factory-gate',
+        )
+
+    def test_an_explicit_gate_root_must_be_absolute(self):
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(
+            name='r', ssh_host='h', git_remote='g', df_checkout_path='/df',
+            gate_checkouts_path='/gates',
+        )
+        assert cfg.gate_paths().root == '/gates'
+        with pytest.raises(ValidationError, match='gate_checkouts_path'):
+            VerifyRunnerConfig(
+                name='r', ssh_host='h', git_remote='g', df_checkout_path='/df',
+                gate_checkouts_path='~/gates',
+            )
 
     def test_verify_runner_config_df_checkout_path_accepts_string(self):
         """df_checkout_path accepts a remote-host path string (task 2884)."""
@@ -1868,13 +1909,12 @@ class TestVerifyRunnerConfig:
         rebuilt = VerifyRunnerConfig(**dumped)
         assert rebuilt.df_checkout_path == '/remote/df'
 
-    def test_verify_runner_config_backcompat_block_without_df_checkout_path(self):
-        """An existing verify_runners block omitting df_checkout_path still validates
-        and defaults the field to None (back-compat — task 2884)."""
-        config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
-            {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
-        ])
-        assert config.verify_runners[0].df_checkout_path is None
+    def test_a_verify_runners_block_without_df_checkout_path_fails_validation(self):
+        """The pre-6565 opt-out is gone: an enabled runner must name its gate source."""
+        with pytest.raises(ValidationError, match='df_checkout_path'):
+            OrchestratorConfig.model_validate({'verify_runners': [
+                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+            ]})
 
     @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_verify_runners_defaults_empty(self):
@@ -1887,7 +1927,8 @@ class TestVerifyRunnerConfig:
         from orchestrator.config import VerifyRunnerConfig
 
         config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
-            {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+            {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin',
+             'df_checkout_path': '/df'},
         ])
         assert len(config.verify_runners) == 1
         assert isinstance(config.verify_runners[0], VerifyRunnerConfig)
@@ -1912,7 +1953,8 @@ class TestVerifyRunnerConfig:
     def test_enabled_verify_runners_filters_disabled(self):
         """enabled_verify_runners returns only runners with enabled=True."""
         config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
-            {'name': 'active', 'ssh_host': 'h1', 'git_remote': 'r1', 'enabled': True},
+            {'name': 'active', 'ssh_host': 'h1', 'git_remote': 'r1', 'enabled': True,
+             'df_checkout_path': '/df'},
             {'name': 'disabled', 'ssh_host': 'h2', 'git_remote': 'r2', 'enabled': False},
         ])
         enabled = config.enabled_verify_runners
@@ -1929,8 +1971,8 @@ class TestVerifyRunnerConfig:
     def test_enabled_verify_runners_all_when_all_enabled(self):
         """enabled_verify_runners returns all runners when all have enabled=True."""
         config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
-            {'name': 'r1', 'ssh_host': 'h1', 'git_remote': 'g1'},
-            {'name': 'r2', 'ssh_host': 'h2', 'git_remote': 'g2'},
+            {'name': 'r1', 'ssh_host': 'h1', 'git_remote': 'g1', 'df_checkout_path': '/df'},
+            {'name': 'r2', 'ssh_host': 'h2', 'git_remote': 'g2', 'df_checkout_path': '/df'},
         ])
         assert len(config.enabled_verify_runners) == 2
 

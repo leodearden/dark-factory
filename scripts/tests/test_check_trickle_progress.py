@@ -135,6 +135,7 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
             target_date=at.date() if hasattr(at, "date") else date(2026, 7, 1),
             recorded_at=at,
             exit_code=entry_exit_code,
+            census=None,
             **full,
         )
     return doc
@@ -192,6 +193,7 @@ def test_probe_reads_the_path_the_writer_wrote_under_a_divergent_environment(
         exit_code=0,
         total_records=2, zero_signal_dropped=0, dedupe_collapsed=0,
         below_sampling_cut=0, budget_skipped=0, selected_count=2,
+        census=None,
     )
 
     # Asserted, not assumed: both sides must land on ONE tmp root. That is

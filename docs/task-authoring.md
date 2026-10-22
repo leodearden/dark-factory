@@ -1372,7 +1372,8 @@ related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
 execution_class, merge_lane, pending_since, pending_since_backfilled,
-claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at
+claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at,
+main_health_signature
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1508,8 +1509,20 @@ asymmetry is deliberate; the reason for it is stated once, in
 `escalation/src/escalation/merge_lane_resolution.py`, under the same one-place
 rule this section applies to the carrier census below.
 
+The lane is decided once, at enqueue. Editing `metadata.merge_lane` on a task
+whose request is already queued moves nothing (task 5246). An operator moves a
+request that is still waiting for the merger with the `merge_relane` MCP tool
+(`escalation/src/escalation/server.py::merge_relane`). It also reaches a
+coalesced member by task id and moves the member's whole train. The tool
+changes the live lane at once and writes the new lane as `metadata.merge_lane`
+on every task the entry carries. That write is the durable lane: a train's live
+lane is lost when the train dissolves (for example at a restart drain), but its
+members re-enqueue at the written lane. The tool reports each write, so a
+failed one shows up and can be repeated by hand.
+
 `'high'` remains reserved for the **rare, gated hotfix / main-health class**
-(task 1689) — its three machine writers are all of that shape. Routine work
+(task 1689) — its three machine writers are all of that shape, and its fourth
+writer, the operator's `merge_relane`, is meant for the same class. Routine work
 declaring itself urgent starves the normal lane, which is the failure the
 reservation exists to prevent. The carrier census and the reason this key was
 blessed rather than typed are recorded beside the frozenset entry in
@@ -1897,7 +1910,7 @@ since `_merge_metadata` is a shallow `{**old, **new}` with no deletion
 sentinel. Until task 3777 that made a whole-blob `'replace'` impossible on
 most of the corpus. It is now admitted when the payload carries the stored
 `done_provenance` through verbatim (the contract is
-`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_assert_done_provenance_passthrough`),
+`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_assert_passthrough_only_keys`),
 which is exactly what the migration script sends. Any other shape that
 touches the key is still refused.
 
@@ -1914,20 +1927,38 @@ either key must also pass the whole list through
 - **`defects`**: a list of `DefectDeclaration` records, one per declared
   defect, each keyed by its ref.
   - *Who writes it:* at creation, `submit_task` accepts only fresh `open`
-    entries. After creation only `declare_defect` and
-    `record_defect_outcome` write it, never `update_task`; the PRD's α2 leaf
-    builds those two tools and the `update_task` refusal. A defect leaves
-    `open` only through a recorded I2 transition
+    entries and refuses anything else synchronously with
+    `error == 'defect_creation_refused'`, whose `detail` names the allowed
+    values. After creation `declare_defect` (`Declare`, `DeclareClosure`,
+    `Sighting`) and `record_defect_outcome` (`Proof`, `Rule`) are its only
+    writers. A defect leaves `open` only through a recorded I2 transition
     (`shared/src/shared/defects.py::apply_event`).
   - *PRD:* `plans/defect-tests-prd.md` decisions 7, 13 and 15; Contract I1
     and I2.
 - **`defect_test_retirements`**: a list of `Retirement` records, carried on
   the task whose diff removes a proven defect's test, not on the defect's
   own task.
-  - *Who writes it:* declared through `declare_defect` (a
+  - *Who writes it:* at creation, `submit_task` accepts only unruled
+    entries. After creation it is declared through `declare_defect` (a
     `DeclareRetirement` event) and ruled through `record_defect_outcome` (a
     `Rule` event).
   - *PRD:* `plans/defect-tests-prd.md` decisions 13 and 14.
+
+**The write path** for both keys is
+`fused-memory/src/fused_memory/backends/defect_records.py`, which holds the
+creation floor, the per-ref event fold and the typed refusals; read the
+rules there rather than here. `record_defect_outcome` is meant for the
+orchestrator workflow and `scripts/prove_defect.py` alone. No dispatched
+role's `allowed_tools` grants it (pinned by
+`orchestrator/tests/test_role_defect_outcome_authority.py`), but that list
+is a permission allow list, not a denial, so a dispatched session that
+mounts fused-memory can still reach the tool: no role denies it through
+`disallowed_tools` yet. A `duplicate_of` or `superseded_by` ref must already
+be declared on some task, which `lookup_defect_ref` answers. `update_task`
+never writes either key: it refuses one with
+`error == 'defect_records_via_update_task'`, except under
+`metadata_mode='replace'` when the payload carries the stored value through
+verbatim, the same rule as `done_provenance` above.
 
 **Census corollary:** like `delivered_checks` above, both registrations are
 an import side effect of `shared.defects`, so a census script must import

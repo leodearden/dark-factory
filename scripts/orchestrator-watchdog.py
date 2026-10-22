@@ -60,6 +60,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import ModuleType
 
 # A flat sibling in scripts/, found because a directly executed script puts its
 # own directory at sys.path[0]; never run this file via `python -m` or `-I`.
@@ -271,14 +272,9 @@ FLEET_LEASE_PATH = os.environ.get(
 )
 
 # How long a lease may go unrefreshed before every reader treats it as expired,
-# whatever its pid says. DERIVED from the drain knobs rather than guessed, so a
-# reviewer can re-check it: the common long --drain sweep (task 5371) waits
-# out the whole ORCH_DRAIN_VERIFY_MAX_WAIT_SECS verify-wait cap (11400s, counted
-# once from Stage A) + 7 x (RESTART_VERIFY_TIMEOUT 30 + RESTART_VERIFY_GRACE_SECS
-# 120) + 7 x ORCH_DRAIN_UNKNOWN_GRACE_SECS (120s) = 11400 + 1050 + 840 =
-# 13290s ~= 3.7h; each unit left on the legacy merge-idle gate (pre-5371 code,
-# or a refused request) can add its 600s busy grace on top, so it is not a
-# worst case. 14400 clears the common case with ~8% headroom while staying far below
+# whatever its pid says. FIXED: a --drain sweep is fitted under it by the
+# script's sweep-wide verify-wait ceiling, derived at
+# scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS. 4h stays far below
 # the 72h ORCH_RESTART_MIN_INTERVAL_SECS, and that inequality is the whole
 # point: a leaked lease can therefore delay at most ONE redeploy window and can
 # never wedge the fleet indefinitely — the same reasoning that makes the pid
@@ -3084,20 +3080,66 @@ def _classify_unit_heartbeat(unit: str, now: float) -> str:
     invoked.
     """
     try:
-        scripts_dir = os.path.dirname(os.path.abspath(__file__))
-        if scripts_dir not in sys.path:
-            sys.path.insert(0, scripts_dir)
-        import drain_check  # noqa: PLC0415
-
-        fleet_dir = drain_check.resolve_fleet_dir()
-        path = drain_check.heartbeat_path(fleet_dir, unit)
-        heartbeat = drain_check._read_heartbeat(path)
+        drain_check = _import_drain_check()
+        heartbeat = drain_check._read_heartbeat(
+            drain_check.heartbeat_path(drain_check.resolve_fleet_dir(), unit)
+        )
         return drain_check.classify(heartbeat, now, DRAIN_FRESH_WINDOW_SECS)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             f"_classify_unit_heartbeat({unit!r}): swallowed {exc!r}; returning 'unknown'"
         )
         return "unknown"
+
+
+def _import_drain_check() -> ModuleType:
+    """Import scripts/drain_check.py, the one reader of the fleet heartbeat files.
+
+    Inserts this module's own directory onto sys.path (guarded — a no-op if
+    already present, e.g. via tests/scripts/conftest.py under test) so
+    ``import drain_check`` resolves regardless of how this script was invoked.
+    """
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import drain_check
+
+    return drain_check
+
+
+def _render_code_sha(deployed_sha: object) -> str:
+    """Render a heartbeat's ``deployed_sha`` block for report()'s CODE-SHA column.
+
+    The first 12 hex digits of the sha the unit's wire path was imported from
+    (task 6565), suffixed ``?`` when indeterminate and ``*`` when a tracked
+    wire-path file was dirty, so either flag is visible without hand-reading
+    JSON.  ``none`` when the block is absent or null: a pre-6565 unit, or one
+    that could not read its own checkout.
+    """
+    if not isinstance(deployed_sha, dict) or not isinstance(deployed_sha.get("sha"), str):
+        return "none"
+    flags = ("?" if deployed_sha.get("indeterminate") else "") + (
+        "*" if deployed_sha.get("dirty_wire_path") else ""
+    )
+    return f"{deployed_sha['sha'][:12]}{flags}"
+
+
+def _unit_code_sha(unit: str) -> str:
+    """CODE-SHA for *unit*, read from its fleet heartbeat; 'unknown' on any read error.
+
+    Cross-check against the unit's START with
+    ``git rev-parse 'main@{<START>}'``.  Fail-soft like
+    _classify_unit_heartbeat: an error degrades this one column, logged.
+    """
+    try:
+        drain_check = _import_drain_check()
+        heartbeat = drain_check._read_heartbeat(
+            drain_check.heartbeat_path(drain_check.resolve_fleet_dir(), unit)
+        )
+    except Exception as exc:
+        logger.warning(f"_unit_code_sha({unit!r}): swallowed {exc!r}; returning 'unknown'")
+        return "unknown"
+    return _render_code_sha(None if heartbeat is None else heartbeat.get("deployed_sha"))
 
 
 def report() -> int:
@@ -3134,6 +3176,9 @@ def report() -> int:
     rendered as hours-to-one-decimal and repeated on every row, like the
     existing NEWEST WATCHED COMMIT column; 'unknown' when the clock is
     absent/unreadable.
+
+    CODE-SHA is the commit each unit's verify wire path was imported from, read
+    from its fleet heartbeat (task 6565; rendered by _render_code_sha).
 
     MERGE-IDLE is each unit's per-unit merge-idle heartbeat verdict
     (idle/busy/stale/absent/unknown), classified by _classify_unit_heartbeat
@@ -3172,8 +3217,8 @@ def report() -> int:
     )
     print(f"FLEET-LEASE: {_format_fleet_lease()}")
     print(
-        f"{'UNIT':<50} {'START':<24} {'NEWEST WATCHED COMMIT':<24} {'VERDICT':<10} "
-        f"{'DEPLOY-AGE':<12} {'MERGE-IDLE':<12} WOULD-DEFER"
+        f"{'UNIT':<50} {'START':<24} {'CODE-SHA':<14} {'NEWEST WATCHED COMMIT':<24} "
+        f"{'VERDICT':<10} {'DEPLOY-AGE':<12} {'MERGE-IDLE':<12} WOULD-DEFER"
     )
 
     any_stale = False
@@ -3189,8 +3234,9 @@ def report() -> int:
             verdict = "fresh"
         merge_verdict = _classify_unit_heartbeat(unit, now)
         would_defer = "yes" if merge_verdict == "busy" else "no"
+        code_sha = _unit_code_sha(unit)
         print(
-            f"{unit:<50} {start_str:<24} {commit_str:<24} {verdict:<10} "
+            f"{unit:<50} {start_str:<24} {code_sha:<14} {commit_str:<24} {verdict:<10} "
             f"{deploy_age_str:<12} {merge_verdict:<12} {would_defer}"
         )
 

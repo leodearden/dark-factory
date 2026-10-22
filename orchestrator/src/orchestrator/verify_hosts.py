@@ -14,11 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, get_args
 
+from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
 from orchestrator.verify_runner import (
     HostAllocator,
     HostLease,
     RemoteRunner,
-    resolve_local_df_checkout,
 )
 
 if TYPE_CHECKING:
@@ -35,31 +35,45 @@ def build_remote_runners(
     config: OrchestratorConfig,
     cwd: str | Path,
     *,
+    deployed_sha: DeployedSha,
     quarantine: set[str] | None = None,
 ) -> list[RemoteRunner]:
-    """One :class:`RemoteRunner` per enabled ``config.verify_runners`` entry not in *quarantine*.
+    """Build the list of RemoteRunner instances from operator config (Lever C).
 
-    Remotes only: no local runner is included.  Every runner pushes
-    ``config.git.main_branch`` to its host before a verify, and carries the
-    INV-2 contract-currency paths (task 2884) that ``sync_if_stale`` compares:
-    its own ``df_checkout_path`` (``None`` leaves auto-sync off) and this
-    process's DF code root, resolved once and shared by every runner.
+    Returns REMOTES ONLY — the LocalRunner trust anchor is prepended by callers
+    since it needs call-specific arguments (worktree path, module configs, etc.).
+
+    Filters out disabled runners (enabled=False) and any runner whose name is in
+    the quarantine set (in-memory worker-level quarantine from DriftDetector).
+    quarantine=None is treated as an empty set (no quarantine).
+
+    _build_verify_runners passes main_branch=config.git.main_branch so the
+    remote host receives a freshness push before the merge-sha transport.
+
+    Each runner gates its verifies on *deployed_sha* (task 6565, the commit
+    this process's wire path was imported from) through the runner's
+    :meth:`~orchestrator.config.VerifyRunnerConfig.gate_paths`, publishing the
+    sha from this process's own code checkout, resolved once here.
     """
-    _local_df = resolve_local_df_checkout()
-    return [
-        RemoteRunner(
+    code_checkout = resolve_code_checkout()
+    runners = []
+    for r in config.enabled_verify_runners:
+        if quarantine is not None and r.name in quarantine:
+            continue
+        gate = r.gate_paths()
+        runners.append(RemoteRunner(
             name=r.name,
             ssh_host=r.ssh_host,
             git_remote=r.git_remote,
             cwd=cwd,
             config_path=r.config_path,
             main_branch=config.git.main_branch,
-            df_remote_checkout=r.df_checkout_path,
-            df_local_checkout=_local_df,
-        )
-        for r in config.enabled_verify_runners
-        if quarantine is None or r.name not in quarantine
-    ]
+            df_remote_checkout=gate.source,
+            gate_checkouts_path=gate.root,
+            deployed_sha=deployed_sha,
+            code_checkout=code_checkout,
+        ))
+    return runners
 
 
 @dataclass(frozen=True)

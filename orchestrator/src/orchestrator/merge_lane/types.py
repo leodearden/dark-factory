@@ -15,10 +15,11 @@ import dataclasses
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
 from shared.branch_names import canonical_queued_branch_name
@@ -26,6 +27,7 @@ from shared.branch_names import canonical_queued_branch_name
 from orchestrator.branch_stack import PreStackTip
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
 if TYPE_CHECKING:
@@ -910,6 +912,53 @@ class MergeRequest:
     reaper and journal recovery, whose submitters never park. Not journaled: a
     recovered request's workflow died with the process. Read only on single
     requests; a GroupMergeRequest is never a coalesce candidate."""
+
+
+@dataclass(frozen=True)
+class LaneMetadataWrite:
+    """Whether ``merge_relane`` persisted the new lane as one task's
+    ``metadata.merge_lane`` (task 5246)."""
+
+    task_id: str
+    written: bool
+
+
+@dataclass(frozen=True)
+class RelaneOutcome:
+    """What an operator's ``merge_relane`` did to a waiting merge (task 5246).
+
+    ``relaned`` is True when the addressed request, or for a coalesced member
+    the train carrying it (``via_train``), now belongs to ``lane``.
+    ``request_id`` and ``from_lane`` name that queue entry, and ``task_ids``
+    lists the tasks it carries: the request's own task, or every member of
+    the train.
+
+    That is the LIVE lane, and it lives only as long as the queue entry. A
+    solo request's journal record keeps it across a restart, but a train is
+    never journaled and is dissolved by a restart drain, so its live lane is
+    lost there. The DURABLE lane is ``metadata.merge_lane`` on each of
+    ``task_ids``: re-enqueued members inherit it. ``metadata_writes`` reports
+    that write per task. It is empty when nothing moved, and a False entry
+    means that task will re-enqueue at its old lane.
+
+    Otherwise ``refusal`` says why nothing moved:
+    - ``'already_picked'``: the merger has taken the request, so no lane
+      orders it any more. ``state`` is its lifecycle state.
+    - ``'not_found'``: nothing the lane holds answers to that id, or its
+      outcome is already decided. It can be transient while the request
+      passes between two of the lane's containers, so re-read
+      ``get_merge_queue``.
+    """
+
+    relaned: bool
+    lane: Literal['normal', 'high']
+    request_id: str | None = None
+    from_lane: Literal['normal', 'high'] | None = None
+    via_train: str | None = None
+    task_ids: tuple[str, ...] = ()
+    metadata_writes: tuple[LaneMetadataWrite, ...] = ()
+    refusal: Literal['already_picked', 'not_found'] | None = None
+    state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1809,23 +1858,76 @@ class VerifyInFlight:
         }
 
 
+# How a benched remote host is held and re-probed (design D6): 'ru' hosts are
+# unreachable and come back when ``ssh true`` answers; 'skew' hosts were reached
+# but could not run the dispatcher's gate, and come back when ensure-gate passes.
+QuarantineClass = Literal['ru', 'skew']
+
+# When a bench files its L1: at once, or on the 3-consecutive / 600 s ladder.
+EscalationTiming = Literal['immediate', 'ladder']
+
+
+def quarantine_class(kind: RunnerUnavailableKind) -> QuarantineClass:
+    """The quarantine class of a RunnerUnavailable *kind* (design D6)."""
+    return 'ru' if kind == 'transport' else 'skew'
+
+
+def escalation_policy(kind: RunnerUnavailableKind, *, sticky: bool) -> EscalationTiming:
+    """When a bench of *kind* files its L1 (design D6).
+
+    A wire-shape skew is filed at once.  So is a sticky bench: it can no
+    longer clear itself, so the ladder's wait would buy nothing.
+    """
+    return 'immediate' if sticky or kind == 'wire_shape' else 'ladder'
+
+
 @dataclass
 class _HostUnavailability:
-    """Per-host RunnerUnavailable streak tracker entry (task 1795).
+    """Per-host RunnerUnavailable tracker entry (task 1795; kinds, task 6565).
 
-    Tracks consecutive failures so the worker can fire a dedup'd escalation
-    once the streak threshold is reached, and can clear state on recovery.
+    One downtime episode of one remote host: the worker files a dedup'd
+    escalation per :func:`escalation_policy` and clears the entry on readmit.
 
     Fields
     ------
     streak              : consecutive RunnerUnavailable count for this host.
     first_unavailable_at: time.time() of the first failure in this episode.
-    reason              : str(exc) from the most recent RunnerUnavailable.
+    reason              : str(exc) from the RunnerUnavailable that set ``kind``.
+    kind                : what benched the host; a 'skew'-class kind is never
+                          downgraded to 'transport' within the episode.
+    identity            : both gate identities, when a handshake mismatched.
+    sticky              : no automatic readmit until an operator clear or a
+                          restart (the second skew bench of one host and sha).
     """
 
     streak: int
     first_unavailable_at: float
     reason: str
+    kind: RunnerUnavailableKind = 'transport'
+    identity: GateIdentityPair | None = None
+    sticky: bool = False
+
+    def to_wire(self, now: float) -> dict[str, Any]:
+        """This episode as the heartbeat ``hosts`` block shows it, aged against *now*.
+
+        The keys are exactly :data:`UNTRACKED_HOST_WIRE`'s, so a tracked and an
+        untracked host share one schema.
+        """
+        return {
+            'unavailable_since': self.first_unavailable_at,
+            'unavailable_secs': max(0.0, now - self.first_unavailable_at),
+            'streak': self.streak,
+            'reason': self.reason,
+            'kind': self.kind,
+            'sticky': self.sticky,
+            'identity': self.identity.to_wire() if self.identity is not None else None,
+        }
+
+
+# The ``hosts``-block fields of a host with no unavailability episode.
+UNTRACKED_HOST_WIRE: Mapping[str, None] = MappingProxyType(dict.fromkeys((
+    'unavailable_since', 'unavailable_secs', 'streak', 'reason', 'kind', 'sticky', 'identity',
+)))
 
 
 @dataclass
@@ -1853,6 +1955,8 @@ class InflightVerifyResult:
                   InflightStatus.RUNNER_UNAVAILABLE; None on all other paths.  Used by
                   the unavailability tracker + alarm to name the actual failure cause
                   in escalation summaries.
+    kind, identity: the RunnerUnavailable's ``kind`` and ``identity`` when status
+                  is InflightStatus.RUNNER_UNAVAILABLE; the defaults elsewhere.
     """
 
     outcome: MergeOutcome | None
@@ -1861,6 +1965,8 @@ class InflightVerifyResult:
     status: InflightStatus | None = None  # None | DROPPED | REQUEUED | RUNNER_UNAVAILABLE
     reason: str | None = None  # str(RunnerUnavailable exc) when status=RUNNER_UNAVAILABLE
     spec_warm: bool = False   # True when merge_wt is a warm _spec- lane (not an ephemeral wt)
+    kind: RunnerUnavailableKind = 'transport'
+    identity: GateIdentityPair | None = None
 
     def __post_init__(self) -> None:
         """Enforce status is restricted to the 3 verify-result sentinels (task

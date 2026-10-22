@@ -3380,12 +3380,12 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
 
     THE FALLBACK IS 0 DELIBERATELY, and specifically NOT ``os.getsid(0)`` ->
     ``os.getppid()`` (which this returned before review). Those are the
-    durable-pid idiom ``session_hooks._hand_launched_liveness_pid`` uses for
-    T6's hand-launched RECORDS, and they are wrong HERE, because a lease pid
-    is consumed by a REAPER rather than merely displayed: the POSIX session
-    leader is ordinarily the interactive shell, which session_hooks itself
-    documents as living "for the terminal's whole lifetime" -- so it stays
-    alive after the ``claude`` process it stood in for has crashed.
+    durable-pid idiom ``session_ownership_probes.py::EventProbes.hand_launched_liveness_pid``
+    uses for T6's hand-launched RECORDS, and they are wrong HERE, because a
+    lease pid is consumed by a REAPER rather than merely displayed: the POSIX
+    session leader is ordinarily the interactive shell, which lives for the
+    terminal's whole lifetime -- so it stays alive after the ``claude``
+    process it stood in for has crashed.
     ``_pid_alive`` would then answer True forever, and because BOTH staleness
     rules (claim_lease's ``is_stale`` and reap_stale_leases' ``stale_pid``)
     require a DEAD pid AND an aged heartbeat, a crashed holder's lease would

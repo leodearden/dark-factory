@@ -65,10 +65,10 @@ def _ascend_for_rearm_marker(start: Path | None = None) -> Path | None:
     resolves the checkout whose code it is itself executing — the same
     ``__file__``-anchored trick as
     `orchestrator.agents.skill_prompt.load_skill_system_prompt` and
-    `orchestrator.verify_runner.resolve_local_df_checkout`.
+    `orchestrator.deployed_sha.resolve_code_checkout`.
 
     The walk is keyed on ``_REARM_MARKER``, NOT on ``.git``, and that difference
-    is the point.  ``resolve_local_df_checkout`` answers "which is the first
+    is the point.  ``resolve_code_checkout`` answers "which is the first
     ancestor containing ``.git``" — a different question, and one whose answer
     can be wrong here in both directions: it terminates at the FIRST ``.git``
     ancestor, so a dark-factory checkout nested under an outer git repo (vendored
@@ -150,7 +150,7 @@ def resolve_dark_factory_root() -> Path | None:
       2. Otherwise `_ascend_for_rearm_marker`'s ``__file__``-anchored walk for
          the first ancestor carrying the marker.  See that function for why the
          walk is keyed on the marker rather than reusing
-         `orchestrator.verify_runner.resolve_local_df_checkout`'s ``.git`` walk.
+         `orchestrator.deployed_sha.resolve_code_checkout`'s ``.git`` walk.
       3. Otherwise ``None``.
 
     A set-but-INVALID override is warned about and falls THROUGH to arm 2 rather

@@ -15,6 +15,7 @@ from client_feed.sources.git import (
     TreeEntry,
     blob_reader,
     generated_paths,
+    has_commit,
     is_ancestor,
     last_changes,
     main_head,
@@ -328,3 +329,53 @@ def test_is_ancestor(repo: Repo) -> None:
     assert is_ancestor(repo.root, first, first)
     assert not is_ancestor(repo.root, second, first)
     assert not is_ancestor(repo.root, '0' * 40, second)
+
+
+def test_has_commit_holds_a_commit_on_main_or_on_another_branch_only(repo: Repo) -> None:
+    repo.write('a.txt', 'a\n')
+    on_main = repo.commit('base', when=T0)
+    repo.branch('task/7')
+    repo.checkout('task/7')
+    repo.write('a.txt', 'b\n')
+    on_branch = repo.commit('seven', when=T1)
+
+    assert has_commit(repo.root, on_main)
+    assert has_commit(repo.root, on_branch)
+
+
+def test_has_commit_is_false_for_a_sha_the_repository_does_not_hold(repo: Repo) -> None:
+    repo.write('a.txt', 'a\n')
+    repo.commit('base', when=T0)
+
+    assert not has_commit(repo.root, 'e' * 40)
+
+
+def test_has_commit_is_false_for_an_object_that_is_not_a_commit(repo: Repo) -> None:
+    repo.write('a.txt', 'a\n')
+    commit = repo.commit('base', when=T0)
+
+    assert not has_commit(repo.root, repo.rev(f'{commit}^{{tree}}'))
+
+
+def test_has_commit_refuses_a_non_sha_before_git_runs(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match='sha'):
+        has_commit(tmp_path / 'missing', '--output=x')
+
+
+def test_has_commit_outside_a_repository_raises_rather_than_answering_false(
+    tmp_path: Path,
+) -> None:
+    plain = tmp_path / 'plain'
+    plain.mkdir()
+
+    with pytest.raises(GitError) as caught:
+        has_commit(plain, 'e' * 40)
+
+    assert caught.value.returncode == 128
+
+
+def test_has_commit_of_a_missing_root_raises_rather_than_answering_false(tmp_path: Path) -> None:
+    with pytest.raises(GitError) as caught:
+        has_commit(tmp_path / 'missing', 'e' * 40)
+
+    assert caught.value.returncode is None

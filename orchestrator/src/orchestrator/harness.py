@@ -81,6 +81,7 @@ from orchestrator.delivered_checks import (
     gate_mark_done_on_delivered_checks,
 )
 from orchestrator.deploy_state import DeployPhase, DeployState
+from orchestrator.deployed_sha import DeployedSha
 from orchestrator.deterministic_runner import (
     DETERMINISTIC_AGENT_ROLE,
     DeterministicRunner,
@@ -1647,8 +1648,13 @@ def _repend_while_paused_note(task_id: str, pause_reason: str) -> str:
 class Harness:
     """Top-level orchestration loop."""
 
-    def __init__(self, config: OrchestratorConfig):
+    def __init__(
+        self, config: OrchestratorConfig, *, deployed_sha: DeployedSha | None = None,
+    ):
         self.config = config
+        # Task 6565: the commit this process's wire path was imported from,
+        # captured by cli.py::run around the import of this module.
+        self._deployed_sha = deployed_sha
         from orchestrator.agents.sandbox_dispatch import set_backend
         set_backend(config.sandbox.backend)
         self.mcp = McpLifecycle(config)
@@ -2624,6 +2630,7 @@ class Harness:
             self.scheduler.event_store = self.event_store
         except Exception:
             logger.warning('Failed to create event store', exc_info=True)
+        self._announce_deployed_sha()
 
         # 0a. Create run store and register this run immediately so
         # task_results can be written incrementally as tasks complete.
@@ -2634,6 +2641,7 @@ class Harness:
                 self.config.fused_memory.project_id,
                 self.report.started_at,
                 str(prd_path) if prd_path else '',
+                code_sha=None if self._deployed_sha is None else self._deployed_sha.sha,
             )
         except Exception:
             # Non-fatal, but loud: swallowing this at warning level understated
@@ -6274,7 +6282,7 @@ class Harness:
         # an owner.  And a `preexisting_main_break` pin (task 4645): this clause
         # ALONE relaxes the wider `recovery_pins.ON_MAIN_REMEDIABLE_ESC_CATEGORIES`,
         # because it only fires with the branch ON MAIN, where that escalation's
-        # ask (`await_preexisting_main_hotfix`) is already satisfied.  The
+        # ask (a fixed main so the branch can merge) is already satisfied.  The
         # off-main clause below keeps the shared set — there the ask is unmet.
         #
         # The relaxation itself is why this clause exists at all (PRD leaf δ):
@@ -12285,6 +12293,8 @@ class Harness:
             usage_gate=getattr(self, 'usage_gate', None),
             cost_store=getattr(self, 'cost_store', None),
             provenance_conflict_sink=self._provenance_conflict_sink,
+            deployed_sha=self._deployed_sha,
+            verify_hosts=[r.name for r in self.config.verify_runners],
         )
 
         # task 2828 (limb 1) — STARTUP SURVIVOR BARRIER.  Reap any orphaned
@@ -12920,12 +12930,38 @@ class Harness:
                 ts_epoch=time.time(),
                 drain=reading.drain,
                 verifies_in_flight=reading.verifies_in_flight,
+                deployed_sha=(
+                    None if self._deployed_sha is None else self._deployed_sha.to_wire()
+                ),
             )
             await asyncio.to_thread(write_heartbeat, resolve_fleet_dir(), unit, payload)
         except Exception:
             logger.warning(
                 'merge heartbeat write failed; continuing (fail-open)',
                 exc_info=True,
+            )
+
+    def _announce_deployed_sha(self) -> None:
+        """Log the deployed sha; warn and emit an event when it is flagged (6565 D1).
+
+        A flagged sha keeps the remote gate in use (Leo, 2026-10-20): the flags
+        are made visible here, in the fleet heartbeat and in ``--report``.
+        """
+        deployed = self._deployed_sha
+        if deployed is None:
+            logger.info('deployed sha: unknown (no readable code checkout)')
+            return
+        if not deployed.flagged:
+            logger.info('deployed sha: %s', deployed.sha)
+            return
+        logger.warning(
+            'deployed sha %s is flagged (indeterminate=%s, dirty_wire_path=%s): the '
+            'loaded code may differ from it; restart from a clean, still tree to clear',
+            deployed.sha, deployed.indeterminate, deployed.dirty_wire_path,
+        )
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.deployed_sha_indeterminate, data=deployed.to_wire(),
             )
 
     def _emit_fleet_drain(self, event: FleetDrainEvent) -> None:
@@ -14395,6 +14431,17 @@ class Harness:
     def is_workflow_active(self, task_id: str) -> bool:
         """True iff a workflow slot is currently active for ``task_id``."""
         return task_id in self._workflow_cancel_events
+
+    async def clear_verify_host_quarantine(self, host: str) -> dict[str, Any]:
+        """Operator clear of a benched remote verify host (task 6565, design D6).
+
+        Delegates to the merge worker's
+        :meth:`~orchestrator.merge_lane.worker.SpeculativeMergeWorker.clear_host_quarantine`;
+        reports ``cleared=False`` with a reason when no merge worker runs.
+        """
+        if self._merge_worker is None:
+            return {'host': host, 'cleared': False, 'reason': 'no merge worker is running'}
+        return await self._merge_worker.clear_host_quarantine(host)
 
     def _cancel_causes(self) -> dict[str, str]:
         """The cancel-cause registry, lazily created when absent.

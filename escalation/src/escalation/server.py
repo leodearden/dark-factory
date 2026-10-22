@@ -7,7 +7,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, assert_never, cast
@@ -61,6 +61,7 @@ from escalation.merge_status_answer import (
     hint_for,
     map_terminal_state,
 )
+from escalation.mismatch_streak import DEFAULT_MISMATCH_STREAK_THRESHOLD, MismatchStreak
 from escalation.models import (
     ACTION_KEEP_DRIVING,
     ACTION_TERMINATE_CLEANLY,
@@ -74,6 +75,7 @@ from escalation.models import (
     max_severity,
 )
 from escalation.pins import classify_pins
+from escalation.project_root_guard import ProjectRootGuard
 from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
 from escalation.related_pending import related_pending
@@ -86,6 +88,7 @@ if TYPE_CHECKING:
         MergeQueueStore,
         PersistedMergeRequest,
     )
+    from orchestrator.merge_lane.types import LaneMetadataWrite
 
 logger = logging.getLogger(__name__)
 
@@ -496,29 +499,51 @@ class _ProbeFailed(Exception):
         )
 
 
-def _require_matching_project_root(harness: Any, project_root: str) -> str | None:
-    """Return an error message if *project_root* doesn't match this server's project.
+def _require_matching_project_root(wired_root: Path, project_root: str) -> str | None:
+    """Return an error message if *project_root* doesn't match *wired_root*.
 
-    The escalation server closes over exactly one project's ``harness``, so
-    *project_root* can never be used to route a call — it is a defensive
-    validation guard.  Resolved-path equality (not string equality) so
-    trailing slashes / relative segments / symlink differences don't produce
-    false-positive mismatches.  Returns None when they match.
+    The escalation server closes over exactly one project, so *project_root*
+    can never be used to route a call — it is a defensive validation guard.
+    Resolved-path equality (not string equality) so trailing slashes /
+    relative segments / symlink differences don't produce false-positive
+    mismatches.  Returns None when they match.
 
     Shared by claim_warm_worktree and release_warm_worktree (PRD β, task
-    2011) so a multi-project interactive caller (/do, /warm) that mis-targets
-    an escalation MCP endpoint gets a clean testable failure instead of
-    claiming/releasing a worktree against the wrong orchestrator.
+    2011), which pass their harness's git_ops root, and by
+    ``_project_root_refusal``, which passes the store identity's root, so a
+    caller that mis-targets an escalation MCP endpoint gets one clean,
+    testable failure wording.
     """
-    gops_root = Path(harness.git_ops.project_root).resolve()
+    wired_resolved = wired_root.resolve()
     given_root = Path(project_root).resolve()
-    if given_root != gops_root:
+    if given_root != wired_resolved:
         return (
             f'project_root mismatch: {project_root!r} does not match this '
-            f"server's wired project ({harness.git_ops.project_root!s}, "
-            f'resolved {gops_root!s}).'
+            f"server's wired project ({wired_root!s}, "
+            f'resolved {wired_resolved!s}).'
         )
     return None
+
+
+def _project_root_refusal(identity: StoreIdentity, project_root: str) -> str | None:
+    """The PRD §6.3 verdict on an asserted *project_root*: a refusal message, or None to proceed.
+
+    ``create_server`` hands it to ``escalation.project_root_guard::ProjectRootGuard``.
+    """
+    if identity.kind == 'reconciliation':
+        return (
+            f'this endpoint serves the reconciliation store ({identity.queue_dir}), '
+            'not a project task queue; it never contains orchestrator task escalations '
+            f'(asserted project_root={project_root!r}).'
+        )
+    assert identity.project_root is not None
+    mismatch = _require_matching_project_root(identity.project_root, project_root)
+    if mismatch is None:
+        return None
+    return (
+        f'{mismatch} This endpoint serves project {identity.project_id!r} '
+        f'(escalation store {identity.queue_dir}).'
+    )
 
 
 def _project_task_runtime_entry(s: Any) -> TaskRuntimeEntry:
@@ -1027,15 +1052,17 @@ def create_server(
     startup_sweep: bool = True,
     startup_sweep_now: datetime | None = None,
     store_identity: StoreIdentity | None = None,
+    mismatch_streak_threshold: int = DEFAULT_MISMATCH_STREAK_THRESHOLD,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
 
     *harness* is the running ``orchestrator.harness.Harness``.  When passed,
     it enables the ``release_workflow`` tool which lets external callers
     (humans via /unblock, automation) ask the orchestrator to soft-cancel a
-    workflow whose task has been completed out-of-band.  When omitted (e.g.
-    in tests with no orchestrator), the tool reports that no workflow is
-    active.
+    workflow whose task has been completed out-of-band, and the
+    ``clear_verify_host_quarantine`` operator clear.  When omitted (e.g. in
+    tests with no orchestrator), both tools report that no orchestrator is
+    attached.
 
     *dedupe_config* controls infra_issue deduplication.  When omitted,
     ``DedupeConfig()`` is used (enabled, 600 s window, infra_issue category).
@@ -1086,8 +1113,15 @@ def create_server(
     (``escalation.store_identity::StoreIdentity``), passed by both production
     call sites.  When given, one transform appends the PRD §6.2 store-identity
     block to every tool's description; None leaves each description exactly
-    its docstring.  ``plans/escalation-store-ambiguity-prd.md`` §6.3 specifies
-    its other consumer.
+    its docstring.  It is also read by the optional ``project_root`` guard
+    (``escalation.project_root_guard::ProjectRootGuard``,
+    ``plans/escalation-store-ambiguity-prd.md`` §6.3): a tool call asserting a
+    root this store does not serve is refused; with no identity, nothing is.
+
+    *mismatch_streak_threshold* (default 5) — how many refused assertions of
+    one ``project_root`` within the streak's window file (or fold) ONE
+    ``infra_issue`` L1 into this server's own queue
+    (``escalation.mismatch_streak::MismatchStreak``).
     """
     mcp = FastMCP('escalation', instructions=ESCALATION_SERVER_INSTRUCTIONS)
     if store_identity is not None:
@@ -1172,13 +1206,14 @@ def create_server(
         subject_task_id = record.get('subject_task_id')
         detail = '\n'.join([
             # WHOSE call leaked. Rendered FIRST and unconditionally because on
-            # this server it is the only attribution that ever resolves: the
+            # this server it is the only attribution that always resolves: the
             # middleware's `_identity` reads `agent_id` / `project_root` /
-            # `project_id` off the call's own arguments, and no escalation tool
-            # declares any of the three, so the two fields below it are
-            # structurally None here. The record's own `task_id` is the
-            # synthetic anchor, not the caller's, so without these two lines a
-            # critical L2 record names nobody at all.
+            # `project_id` off the call's own arguments; no escalation tool
+            # declares `agent_id` or `project_id`, and the five that accept an
+            # OPTIONAL `project_root` see it omitted by fleet callers, so
+            # `project` below usually stays None. The record's own `task_id` is
+            # the synthetic anchor, not the caller's, so without these two
+            # lines a critical L2 record names nobody at all.
             f'subject_task_id={subject_task_id!r}',
             f'subject_agent_role={record.get("subject_agent_role")!r}',
             # The OWNER that will exit this hold unprompted (INV-7), read off
@@ -1327,6 +1362,15 @@ def create_server(
     mcp.add_middleware(MissingArgumentMiddleware())
 
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
+
+    # --- Optional project_root assertion (PRD §6.3) ---
+    # Sync tools call check() directly: FastMCP already runs them on a worker
+    # thread.  Async tools await check_off_loop().
+    project_root_guard = ProjectRootGuard(
+        store_identity,
+        MismatchStreak(queue, threshold=mismatch_streak_threshold),
+        _project_root_refusal,
+    )
 
     # --- Startup sweep (pre-serving single-writer window) ---
     if startup_sweep:
@@ -1846,6 +1890,7 @@ def create_server(
         workflow_state: str | None = None,
         evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Report a non-blocking observation. The agent continues working after this call.
 
@@ -1900,6 +1945,8 @@ def create_server(
           ``action`` key — that is only on the blocker path — so an info filer
           simply carries on, as it already does on every other branch.
         """
+        if (refusal := await project_root_guard.check_off_loop(project_root)) is not None:
+            return refusal
         if severity not in KNOWN_SEVERITIES:
             return {
                 'error': (
@@ -1943,6 +1990,7 @@ def create_server(
         evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
         level: int = 0,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Report a blocking problem. After calling this, follow the response's
         ``action``: on ``'terminate_cleanly'`` commit any in-progress work, log your
@@ -2048,6 +2096,8 @@ def create_server(
           way — so its state is unknown).  ``action`` is
           ``'terminate_cleanly'`` on every OTHER branch above.
         """
+        if (refusal := await project_root_guard.check_off_loop(project_root)) is not None:
+            return refusal
         if severity not in KNOWN_SEVERITIES:
             return {
                 'error': (
@@ -2353,11 +2403,10 @@ def create_server(
         the capability and legality problems first.  None of the four mutates
         the record, so the ordering is an error-reporting precedence only.
 
-        NOTE: the ``target_status`` values above are not yet written by
-        resolve_issue — this call changes only the escalation record; the
-        task-status effects described in the table earlier in this docstring
-        remain owned by the orchestrator harness. Wiring the harness to
-        consume Table B directly is a separate, out-of-scope follow-up.
+        NOTE: resolve_issue itself writes no task status — this call changes
+        only the escalation record. The orchestrator harness applies the
+        ``target_status`` values above. Table B's consumers are listed in the
+        ``escalation/src/escalation/action_effects.py`` module docstring.
         """
         if terminate is not None:
             return {
@@ -2644,7 +2693,8 @@ def create_server(
         task_id: str | None = None,
         level: int | None = None,
         compact: bool = False,
-    ) -> list[dict[str, Any]]:
+        project_root: str | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         """List all pending escalations, optionally filtered by task ID and/or level.
 
         *level* — when set, returns only escalations at the given escalation level:
@@ -2708,6 +2758,8 @@ def create_server(
         prevent, so callers must treat an absent key as UNKNOWN and render
         nothing rather than "not pinning".
         """
+        if (refusal := await project_root_guard.check_off_loop(project_root)) is not None:
+            return refusal
         # Read the pending set ONCE, unfiltered, and narrow it in memory.  The
         # `level` filter is applied here rather than pushed into the queue
         # because `_annotate_pins_recovery` needs the UNFILTERED set to classify
@@ -2859,6 +2911,7 @@ def create_server(
     def get_task_escalation_history(
         task_id: str,
         level: int | None = None,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Every escalation ever filed for a task, as a self-describing envelope.
 
@@ -2918,6 +2971,8 @@ def create_server(
         unlike the adjacent ``get_escalation``: this is a scan, not an id
         lookup, so zero matches is a valid answer rather than a failure.
         """
+        if (refusal := project_root_guard.check(project_root)) is not None:
+            return refusal
         escalations = get_task_escalations(task_id, level=level)
         return {
             'task_id': task_id,
@@ -2929,8 +2984,11 @@ def create_server(
     @mcp.tool()
     def get_escalation(
         escalation_id: str,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Get a single escalation by ID."""
+        if (refusal := project_root_guard.check(project_root)) is not None:
+            return refusal
         esc = queue.get(escalation_id)
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
@@ -3835,8 +3893,9 @@ def create_server(
           ``lane_applied`` is **False** here and the resolution is audit only.
           Branch on ``lane_applied``, never on ``lane`` alone: a ``lane='high'``
           hotfix that coalesced is riding a possibly-``'normal'`` in-flight
-          entry.  To actually get the high lane, ``merge_cancel`` the
-          in-flight entry and resubmit, or wait for it and resubmit after.
+          entry.  To actually get the high lane, ``merge_relane`` that
+          entry while it still waits for the merger; once it has been picked,
+          ``merge_cancel`` it and resubmit, or wait for it and resubmit after.
           The in-flight entry's OWN lane is not echoed here — this arm can
           reach a foreign or pre-restart merger for which no in-process entry
           exists at all (``poll_by='branch'``), so it is not knowable
@@ -4502,6 +4561,29 @@ def create_server(
         return result
 
     @mcp.tool()
+    async def clear_verify_host_quarantine(host: str) -> dict[str, Any]:
+        """Return a benched remote verify host to this orchestrator's verify pool.
+
+        The operator clear for a host the merge worker benched (task 6565,
+        design D6): an unreachable ('ru') or gate-skew ('skew') bench —
+        including a STICKY skew bench, which is never re-admitted
+        automatically — or a verdict-divergence quarantine.  It does not probe
+        the host first; use it once the cause is fixed.  A PARKED slot is still
+        freed only after a clean probe that no stale verify runs there.  The
+        open unreachability and skew L1s for the host are resolved.
+
+        Returns ``{host, cleared, quarantine_class, was_sticky}`` plus
+        ``reason`` when nothing was cleared (no orchestrator, no merge worker,
+        an unknown or un-benched host, or a PARKED slot not yet clean).
+        """
+        if harness is None:
+            return {
+                'host': host, 'cleared': False,
+                'reason': 'No orchestrator harness wired in — running in standalone mode',
+            }
+        return await harness.clear_verify_host_quarantine(host)
+
+    @mcp.tool()
     async def release_workflow(
         task_id: str,
         timeout_secs: int = 30,
@@ -4856,7 +4938,9 @@ def create_server(
         """
         if harness is None or getattr(harness, 'git_ops', None) is None:
             return {'error': 'escalation server running standalone — no harness wired'}
-        mismatch = _require_matching_project_root(harness, project_root)
+        mismatch = _require_matching_project_root(
+            Path(harness.git_ops.project_root), project_root,
+        )
         if mismatch is not None:
             return {'error': mismatch}
 
@@ -4925,7 +5009,9 @@ def create_server(
         """
         if harness is None or getattr(harness, 'git_ops', None) is None:
             return {'error': 'escalation server running standalone — no harness wired'}
-        mismatch = _require_matching_project_root(harness, project_root)
+        mismatch = _require_matching_project_root(
+            Path(harness.git_ops.project_root), project_root,
+        )
         if mismatch is not None:
             return {'error': mismatch}
 
@@ -5338,5 +5424,115 @@ def create_server(
             event_store=event_store,
         )
         return {'cancelled': True, 'state': MergeState.abandoned, 'reason': None}
+
+    # ── merge_relane — move an already-enqueued request between lanes (task 5246) ──
+
+    @mcp.tool()
+    async def merge_relane(
+        lane: str,
+        request_id: str | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Move a merge request that is still waiting for the merger into *lane*.
+
+        A request's lane is decided ONCE, at enqueue, from ``merge_request``'s
+        ``lane`` or the task's ``metadata.merge_lane``.  Editing that metadata
+        afterwards moves nothing, so this tool is the lever for an
+        already-enqueued request.  ``lane='high'`` gets the request picked
+        ahead of every normal-lane request, and ``lane='normal'`` demotes it.
+        It is non-preemptive: a merge or verify already in progress is never
+        touched.
+
+        Name the request with exactly one of *request_id* (as
+        ``get_merge_queue`` lists it) or *task_id*.  A task coalesced into a
+        train has no queue entry of its own, because coalescing retired its
+        request id.  Address it by *task_id* instead: its whole train moves,
+        named by ``via_train``.
+
+        The LIVE lane changes at once.  The DURABLE lane is this tool's
+        ``metadata.merge_lane`` write (``metadata_mode='merge'``, that key
+        only) on every task the entry carries: the request's own task, or
+        every member of a train.  A train's live lane is lost when the train
+        dissolves (a restart drain dissolves an unstarted one), but its
+        members re-enqueue at the written lane.  ``metadata_writes`` reports
+        each write.  A ``written: False`` entry means that task will
+        re-enqueue at its old lane, so set its ``metadata.merge_lane`` by
+        hand.
+        If you relane a request seconds after it was enqueued, re-read
+        ``metadata_writes`` or ``get_task``: a workflow's whole-blob metadata
+        write at the enqueue boundary can race the ``merge_lane`` write.
+
+        Returns ``{relaned, lane, request_id, from_lane, via_train, task_ids,
+        metadata_writes, refusal, state}``
+        (orchestrator/src/orchestrator/merge_lane/types.py::RelaneOutcome).
+        ``refusal`` is ``'already_picked'`` once the merger has taken the
+        request (``state`` names where it is) and nothing is written.
+        ``'not_found'`` can be transient while a request passes between two
+        of the lane's containers, so re-read ``get_merge_queue`` before
+        concluding it is gone.  Bad input or no merge worker returns
+        ``{error, code, hint}`` with ``code`` ``'invalid_lane'``,
+        ``'invalid_target'`` or ``'no_merge_worker'``, and nothing moves.
+
+        Operator-only: this tool appears in no agent role's allow-list.
+        """
+        try:
+            validated_lane = validate_requested_lane(lane)
+        except InvalidMergeLane as exc:
+            valid = ', '.join(repr(v) for v in exc.valid_lanes)
+            return {
+                'error': f'invalid merge lane {exc.value!r}',
+                'code': 'invalid_lane',
+                'hint': f'lane must be one of: {valid}',
+            }
+        if (request_id is None) == (task_id is None):
+            return {
+                'error': 'name the request with exactly one of request_id or task_id',
+                'code': 'invalid_target',
+                'hint': 'a coalesced member is addressed by task_id',
+            }
+        worker = _get_merge_worker(harness)
+        if worker is None or not hasattr(worker, 'relane'):
+            return {
+                'error': 'Merge worker not available',
+                'code': 'no_merge_worker',
+                'hint': 'the orchestrator is not running in this process',
+            }
+        outcome = worker.relane(validated_lane, request_id=request_id, task_id=task_id)
+        if outcome.relaned:
+            outcome = replace(
+                outcome,
+                metadata_writes=await _write_merge_lane_metadata(outcome.task_ids, outcome.lane),
+            )
+        answer = asdict(outcome)
+        if outcome.refusal == 'not_found' and request_id is not None:
+            answer['hint'] = (
+                "a coalesced member's own request id is retired: address it by task_id"
+            )
+        return answer
+
+    async def _write_merge_lane_metadata(
+        task_ids: Sequence[str], lane: str,
+    ) -> tuple[LaneMetadataWrite, ...]:
+        """Persist *lane* as ``metadata.merge_lane`` on each task, concurrently.
+
+        Through the scheduler's own ``update_task`` with ``metadata_mode='merge'``
+        and only that key, so every sibling key is preserved.  Each result is
+        reported, never swallowed: no scheduler counts as a failed write.
+        """
+        from orchestrator.merge_lane.types import (
+            LaneMetadataWrite,
+        )
+
+        scheduler = getattr(harness, 'scheduler', None)
+
+        async def _write(tid: str) -> LaneMetadataWrite:
+            written = scheduler is not None and await scheduler.update_task(
+                tid, {'merge_lane': lane}, metadata_mode='merge',
+            )
+            if not written:
+                logger.warning('merge_relane: metadata.merge_lane=%s not written for task %s', lane, tid)
+            return LaneMetadataWrite(task_id=tid, written=bool(written))
+
+        return tuple(await asyncio.gather(*(_write(tid) for tid in task_ids)))
 
     return mcp
