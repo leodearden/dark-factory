@@ -12,7 +12,14 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import _init_git_repo
-from _merged_branch_repo import commit_file, delete_file, git, merge_no_ff
+from _merged_branch_repo import (
+    INCIDENT_GUARD,
+    commit_file,
+    delete_file,
+    git,
+    incident_merge,
+    merge_no_ff,
+)
 
 from fused_memory.services.unlanded_branch_paths import (
     ProbeOutcome,
@@ -20,9 +27,6 @@ from fused_memory.services.unlanded_branch_paths import (
     UnlandedPathsProbe,
     probe_unlanded_paths,
 )
-
-GUARD = 'tests/unit/guard.py'
-BRIEFING = 'review/briefing.yaml'
 
 
 @pytest.fixture
@@ -50,19 +54,13 @@ def _paths(probe: UnlandedPathsProbe) -> set[str]:
 
 @pytest.mark.asyncio
 async def test_incident_shape_reports_the_added_then_deleted_path(repo: Path) -> None:
-    commit_file(repo, BRIEFING, 'v1\n', 'seed briefing')
-    _branch(repo, 'task/107')
-    added = commit_file(repo, GUARD, 'one\n', 'add guard')
-    commit_file(repo, BRIEFING, 'v2\n', 'edit briefing')
-    modified = commit_file(repo, GUARD, 'two\n', 'edit guard')
-    deleted = delete_file(repo, GUARD, 'drop guard')
-    merge = merge_no_ff(repo, 'task/107')
+    incident = incident_merge(repo, '107')
 
-    probe = await _probe(repo, merge)
+    probe = await _probe(repo, incident.merge)
 
     assert probe.outcome is ProbeOutcome.ANALYZED
-    assert probe.merge_commit == merge
-    assert probe.unlanded == (UnlandedPath(path=GUARD, branch_commits=(added, modified, deleted)),)
+    assert probe.merge_commit == incident.merge
+    assert probe.unlanded == (UnlandedPath(path=INCIDENT_GUARD, branch_commits=incident.guard_commits),)
 
 
 @pytest.mark.asyncio
@@ -184,7 +182,7 @@ async def test_non_git_directory_is_unknown(tmp_path: Path, monkeypatch: pytest.
 
 
 def test_probe_and_unlanded_path_are_frozen() -> None:
-    item = UnlandedPath(path=GUARD, branch_commits=('a' * 40,))
+    item = UnlandedPath(path=INCIDENT_GUARD, branch_commits=('a' * 40,))
     probe = UnlandedPathsProbe(outcome=ProbeOutcome.ANALYZED, merge_commit='b' * 40, unlanded=(item,))
 
     with pytest.raises(dataclasses.FrozenInstanceError):

@@ -16,7 +16,14 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import _init_git_repo
-from _merged_branch_repo import commit_file, delete_file, git, merge_no_ff
+from _merged_branch_repo import (
+    INCIDENT_BRIEFING,
+    INCIDENT_GUARD,
+    commit_file,
+    git,
+    incident_merge,
+    merge_no_ff,
+)
 
 from fused_memory.models.reconciliation import EventSource, EventType, ReconciliationEvent
 from fused_memory.reconciliation.cli_stage_runner import FINDING_ITEM_SCHEMA
@@ -41,8 +48,6 @@ from fused_memory.services.unlanded_branch_paths import (
     UnlandedPathsProbe,
 )
 
-GUARD = 'tests/unit/guard.py'
-BRIEFING = 'review/briefing.yaml'
 OTHER = 'src/pkg/helper.py'
 MERGE_SHA = 'abcdef0123' + '4' * 30
 ADD_SHA = '1111111111' + 'a' * 30
@@ -129,27 +134,27 @@ class TestMentionsPath:
     @pytest.mark.parametrize(
         'content',
         [
-            f'Added {GUARD} as the guard.',
-            f'Added `{GUARD}` as the guard.',
-            f'See {GUARD}::test_x for the pin.',
-            f'The guard lives in {GUARD}.',
-            f'Wrote /home/x/repo/{GUARD} today.',
+            f'Added {INCIDENT_GUARD} as the guard.',
+            f'Added `{INCIDENT_GUARD}` as the guard.',
+            f'See {INCIDENT_GUARD}::test_x for the pin.',
+            f'The guard lives in {INCIDENT_GUARD}.',
+            f'Wrote /home/x/repo/{INCIDENT_GUARD} today.',
         ],
     )
     def test_mentions(self, content):
-        assert mentions_path(content, GUARD)
+        assert mentions_path(content, INCIDENT_GUARD)
 
     @pytest.mark.parametrize(
         'content',
         [
-            f'Compiled {GUARD}c into the cache.',
-            f'Created {GUARD}/extra as a directory.',
-            f'Edited my{GUARD} instead.',
+            f'Compiled {INCIDENT_GUARD}c into the cache.',
+            f'Created {INCIDENT_GUARD}/extra as a directory.',
+            f'Edited my{INCIDENT_GUARD} instead.',
             'Nothing about any guard here.',
         ],
     )
     def test_non_mentions(self, content):
-        assert not mentions_path(content, GUARD)
+        assert not mentions_path(content, INCIDENT_GUARD)
 
     def test_regex_metacharacters_in_the_path_are_literal(self):
         assert not mentions_path('touched aab/c.py', 'a+b/c.py')
@@ -160,7 +165,7 @@ def _probe(*unlanded: UnlandedPath) -> UnlandedPathsProbe:
     return UnlandedPathsProbe(outcome=ProbeOutcome.ANALYZED, merge_commit=MERGE_SHA, unlanded=unlanded)
 
 
-GUARD_UNLANDED = UnlandedPath(path=GUARD, branch_commits=(ADD_SHA, EDIT_SHA, DROP_SHA))
+GUARD_UNLANDED = UnlandedPath(path=INCIDENT_GUARD, branch_commits=(ADD_SHA, EDIT_SHA, DROP_SHA))
 OTHER_UNLANDED = UnlandedPath(path=OTHER, branch_commits=(EDIT_SHA,))
 
 
@@ -193,7 +198,9 @@ class TestBuildUnlandedPathFlag:
     def test_description_names_the_evidence(self):
         description = self._flag()['description']
 
-        for needle in ('m1', 'm2', GUARD, OTHER, MERGE_SHA[:10], ADD_SHA[:10], EDIT_SHA[:10], DROP_SHA[:10]):
+        for needle in (
+            'm1', 'm2', INCIDENT_GUARD, OTHER, MERGE_SHA[:10], ADD_SHA[:10], EDIT_SHA[:10], DROP_SHA[:10],
+        ):
             assert needle in description
 
     def test_suggested_action_names_both_branches(self):
@@ -278,8 +285,8 @@ class FakeMemoryService:
 
 
 INCIDENT_MEMORIES: dict[str, str | None] = {
-    'm1': f'Task 107 delivered {GUARD} and a briefing edit.',
-    'm2': f'Task 107 edited {BRIEFING}.',
+    'm1': f'Task 107 delivered {INCIDENT_GUARD} and a briefing edit.',
+    'm2': f'Task 107 edited {INCIDENT_BRIEFING}.',
     'm3': None,
 }
 
@@ -290,19 +297,7 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / 'repo'
     root.mkdir()
     _init_git_repo(root)
-    commit_file(root, BRIEFING, 'v1\n', 'seed briefing')
     return root
-
-
-def _incident_merge(repo: Path, task_id: str) -> str:
-    """The solar_challenge 107 shape: the branch adds, edits and deletes GUARD, and edits BRIEFING."""
-    branch = f'task/{task_id}'
-    git(repo, 'checkout', '-q', '-b', branch, 'main')
-    commit_file(repo, GUARD, 'one\n', 'add guard')
-    commit_file(repo, BRIEFING, f'{task_id}\n', 'edit briefing')
-    commit_file(repo, GUARD, 'two\n', 'edit guard')
-    delete_file(repo, GUARD, 'drop guard')
-    return merge_no_ff(repo, branch)
 
 
 def _clean_merge(repo: Path, task_id: str) -> str:
@@ -318,7 +313,7 @@ async def _check(memory: FakeMemoryService, root: Path, events: list[Reconciliat
 
 @pytest.mark.asyncio
 async def test_incident_flags_only_the_memory_naming_the_unlanded_path(repo: Path) -> None:
-    merge = _incident_merge(repo, '107')
+    merge = incident_merge(repo, '107').merge
     memory = FakeMemoryService({'107': INCIDENT_MEMORIES})
 
     result = await _check(memory, repo, [_status('107', 'done', _merged(merge))])
@@ -326,7 +321,7 @@ async def test_incident_flags_only_the_memory_naming_the_unlanded_path(repo: Pat
     (flag,) = result.flags
     assert flag['task_id'] == '107'
     assert flag['cited_memories'] == [{'memory_id': 'm1', 'store': 'mem0'}]
-    assert GUARD in flag['description']
+    assert INCIDENT_GUARD in flag['description']
     assert result.checked == 1
     assert result.errors == 0
     assert result.stats()['unlanded_path_check_flags_emitted'] == 1
@@ -337,7 +332,7 @@ async def test_incident_flags_only_the_memory_naming_the_unlanded_path(repo: Pat
 @pytest.mark.asyncio
 async def test_clean_merge_costs_no_memory_reads(repo: Path) -> None:
     merge = _clean_merge(repo, '108')
-    memory = FakeMemoryService({'108': {'m1': f'Mentions {GUARD} anyway.'}})
+    memory = FakeMemoryService({'108': {'m1': f'Mentions {INCIDENT_GUARD} anyway.'}})
 
     result = await _check(memory, repo, [_status('108', 'done', _merged(merge))])
 
@@ -350,7 +345,7 @@ async def test_clean_merge_costs_no_memory_reads(repo: Path) -> None:
 @pytest.mark.asyncio
 async def test_commitless_and_non_merge_transitions_are_skipped(repo: Path) -> None:
     seed = git(repo, 'rev-list', '--max-parents=0', 'HEAD')
-    memory = FakeMemoryService({'201': {'m1': GUARD}, '202': {'m2': GUARD}})
+    memory = FakeMemoryService({'201': {'m1': INCIDENT_GUARD}, '202': {'m2': INCIDENT_GUARD}})
     events = [
         _status('201', 'done', {'kind': 'operational-verified', 'evidence': 'ran it'}),
         _status('202', 'done', _merged(seed)),
@@ -367,7 +362,7 @@ async def test_commitless_and_non_merge_transitions_are_skipped(repo: Path) -> N
 
 @pytest.mark.asyncio
 async def test_found_on_main_borrowing_another_tasks_merge_is_skipped(repo: Path) -> None:
-    borrowed = _incident_merge(repo, '106')
+    borrowed = incident_merge(repo, '106').merge
     memory = FakeMemoryService({'107': INCIDENT_MEMORIES})
     found = {'kind': 'found_on_main', 'commit': borrowed, 'note': 'landed by task 106'}
 
@@ -393,7 +388,7 @@ async def test_non_git_project_root_is_an_error_not_a_raise(tmp_path: Path, monk
 
 @pytest.mark.asyncio
 async def test_memory_listing_failure_is_an_error_not_a_raise(repo: Path) -> None:
-    merge = _incident_merge(repo, '107')
+    merge = incident_merge(repo, '107').merge
     memory = FakeMemoryService({'107': INCIDENT_MEMORIES}, list_error=TimeoutError('qdrant read timed out'))
 
     result = await _check(memory, repo, [_status('107', 'done', _merged(merge))])
@@ -404,9 +399,9 @@ async def test_memory_listing_failure_is_an_error_not_a_raise(repo: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_one_unreadable_memory_does_not_cost_the_flag(repo: Path) -> None:
-    merge = _incident_merge(repo, '107')
+    merge = incident_merge(repo, '107').merge
     memory = FakeMemoryService(
-        {'107': {'m-bad': f'also names {GUARD}', 'm1': f'delivered {GUARD}'}},
+        {'107': {'m-bad': f'also names {INCIDENT_GUARD}', 'm1': f'delivered {INCIDENT_GUARD}'}},
         read_errors={'m-bad': TimeoutError('qdrant read timed out')},
     )
 
@@ -419,7 +414,7 @@ async def test_one_unreadable_memory_does_not_cost_the_flag(repo: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_two_done_tasks_one_unlanded(repo: Path) -> None:
-    incident = _incident_merge(repo, '107')
+    incident = incident_merge(repo, '107').merge
     clean = _clean_merge(repo, '108')
     memory = FakeMemoryService({'107': INCIDENT_MEMORIES, '108': {'m9': 'clean work'}})
     events = [_status('107', 'done', _merged(incident)), _status('108', 'done', _merged(clean))]
@@ -432,7 +427,7 @@ async def test_two_done_tasks_one_unlanded(repo: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_cancellation_propagates(repo: Path) -> None:
-    merge = _incident_merge(repo, '107')
+    merge = incident_merge(repo, '107').merge
     memory = FakeMemoryService({'107': INCIDENT_MEMORIES}, list_error=asyncio.CancelledError())
 
     with pytest.raises(asyncio.CancelledError):

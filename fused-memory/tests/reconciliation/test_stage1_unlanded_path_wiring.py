@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _fm_helpers import _init_git_repo
-from _merged_branch_repo import commit_file, delete_file, git, merge_no_ff
+from _merged_branch_repo import INCIDENT_BRIEFING, INCIDENT_GUARD, incident_merge
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -29,12 +29,10 @@ from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsoli
 from reconciliation.consolidator_fixtures import make_consolidator
 
 FLAG_TYPE = 'memory_cites_unlanded_path'
-GUARD = 'tests/unit/guard.py'
-BRIEFING = 'review/briefing.yaml'
 TASK_FILTER = {'task_id': '107'}
 INCIDENT_MEMORIES = {
-    'm1': f'Task 107 delivered {GUARD} and a briefing edit.',
-    'm2': f'Task 107 edited {BRIEFING}.',
+    'm1': f'Task 107 delivered {INCIDENT_GUARD} and a briefing edit.',
+    'm2': f'Task 107 edited {INCIDENT_BRIEFING}.',
 }
 STAT_KEYS = (
     'unlanded_path_check_checked',
@@ -60,18 +58,12 @@ def _read_memory(project_id: str, memory_id: str) -> dict | None:
 
 @pytest.fixture
 def merged_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str]:
-    """The solar_challenge 107 shape: the branch adds, edits and deletes GUARD before merging."""
+    """The repo, and task 107's incident merge in it."""
     monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path))
     root = tmp_path / 'repo'
     root.mkdir()
     _init_git_repo(root)
-    commit_file(root, BRIEFING, 'v1\n', 'seed briefing')
-    git(root, 'checkout', '-q', '-b', 'task/107', 'main')
-    commit_file(root, GUARD, 'one\n', 'add guard')
-    commit_file(root, BRIEFING, 'v2\n', 'edit briefing')
-    commit_file(root, GUARD, 'two\n', 'edit guard')
-    delete_file(root, GUARD, 'drop guard')
-    return root, merge_no_ff(root, 'task/107')
+    return root, incident_merge(root, '107').merge
 
 
 def _done_event(merge_sha: str) -> ReconciliationEvent:
