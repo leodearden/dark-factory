@@ -655,15 +655,16 @@ class TestReconArchiveRoot:
 
     def test_malformed_config_returns_none_and_warns(self, tmp_path, caplog):
         """A config regression disables archival loudly rather than raising on
-        the recon dispatch path. The plain assignment is the shape an in-place
-        ``apply_reload`` mutation lands in: no validate_assignment."""
+        the recon dispatch path. ``object.__setattr__`` lands the value
+        unvalidated, as an in-place ``apply_reload`` mutation does: no
+        validate_assignment."""
         import logging
 
         from fused_memory.config.schema import ReconciliationConfig
         from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
 
         cfg = ReconciliationConfig(explore_codebase_root=str(tmp_path))
-        cfg.transcript_archive_root = None  # type: ignore[assignment]
+        object.__setattr__(cfg, 'transcript_archive_root', None)
 
         with caplog.at_level(logging.WARNING, logger=self.LOGGER):
             result = recon_archive_root(cfg)
@@ -813,15 +814,19 @@ class TestGcArchivesBeforeDelete:
         assert not archive_root.exists()
 
     def test_a_call_that_omits_archive_root_destroys_nothing(self, tmp_path):
-        """Omitting or positionally passing archive_root is refused before any rmtree."""
+        """A forwarded call omitting or positionally passing archive_root is refused before any rmtree."""
         from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
 
         data_dir, config_dir, transcript = self._plant(tmp_path)
+        forwarded_without_root: dict[str, Path | None] = {}
+        forwarded_root_positionally: list[Path | None] = [None]
 
         with pytest.raises(TypeError):
-            gc_run_config_dir(data_dir, self.RUN_ID)  # pyright: ignore[reportCallIssue]
+            gc_run_config_dir(data_dir, self.RUN_ID, **forwarded_without_root)
         with pytest.raises(TypeError):
-            gc_run_config_dir(data_dir, self.RUN_ID, None)  # pyright: ignore[reportCallIssue]
+            gc_run_config_dir(
+                data_dir, self.RUN_ID, *forwarded_root_positionally, **forwarded_without_root,
+            )
 
         assert transcript.read_bytes() == self.TRANSCRIPT
         assert config_dir.is_dir()
