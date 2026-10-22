@@ -62,7 +62,7 @@ def test_interim_gate_missing_a_high_task_and_carrying_an_outsider_is_defective(
     result = _check(interim)
 
     assert result.returncode == DEFECTIVE, result.stdout + result.stderr
-    form = [line for line in result.stdout.splitlines() if 'interim form' in line]
+    form = _lines(result, 'interim form')
     assert len(form) == 1 and re.search(rf'\b{GATE}\b', form[0]), result.stdout
     assert _task_ids(result, MISSING) == {106}
     assert _task_ids(result, FOREIGN) == {201}
