@@ -130,7 +130,7 @@ from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.offline_lane_pass import lane_pass_outcome_hooks
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
-from orchestrator.pause_policy import PauseClass, policy_for
+from orchestrator.pause_policy import PauseClass, Rehydration, policy_for
 from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.recovery_emission import (
@@ -18392,38 +18392,15 @@ class Harness:
         is alerted on startup.  Any failure is caught and logged but never
         blocks startup.
 
-        Task 4559 — restart-time predicate re-check.  SCOPE, stated precisely,
-        because it sits next to something deliberately excluded: this is NOT an
-        auto-resume of a live pause.  Nothing new reads ``_ewa_value`` to
-        unpause a running scheduler.  What this declines to do is RE-ASSERT,
-        across a process boundary, a halt whose stored predicate no longer
-        holds.  It is scoped strictly to ``ewa_trip_*`` — the one pause class
-        whose predicate is a stored scalar and can therefore be re-evaluated.
-        Park-stop, cost-ceiling and operator halts are restored blind exactly
-        as before (task 3328: 'Non-5xx park-stop pauses NEVER auto-resume'), as
-        is an ``ewa_trip_*`` row with a NULL value — a row predating the
-        migration — which fails safe toward KEEPING the halt when the predicate
-        is unknowable, never toward releasing it.
-
-        What makes that re-check reachable at all is ``_maybe_write_digest``
-        step (13b): while an ``ewa_trip_`` halt is held it refreshes the stored
-        ``ewa_value`` on every digest step, so the number read here is the EWA
-        as of the last digest before shutdown, not the trip-time snapshot.
-        Without that refresh the stored value would be >= the threshold by
-        construction and this branch could only ever fire because an operator
-        RAISED ``digest_ewa_threshold`` — never because the backlog drained.
-
-        The stored value is written back to LIVE state (``self._ewa_value``)
-        only for an ``ewa_trip_*`` row — the same predicate that governs the
-        halt decision, and the one class whose stored scalar IS the live
-        statistic.  For every other pause class it is forensic evidence about
-        a value that never tripped anything: seeding it would leave a latent
-        EWA trip input that ``resume_scheduler`` never clears (it resets only
-        on ``ewa_trip_`` reasons), turning a park-stop restart into a head
-        start toward the threshold.  The evidence is not lost by that
-        narrowing — every pause class still carries ``ewa_value`` on the
-        ``scheduler_pause_restored`` event and in the startup WARNING, which is
-        where an operator reads it.
+        Restart-time predicate re-check (task 4559): the row's class policy
+        decides.  A class whose rehydration is ``RETEST_STORED_EWA`` declines
+        to RE-ASSERT a halt whose stored EWA is below the current threshold
+        (never an auto-resume of a live pause), and only that class seeds its
+        stored value into live ``_ewa_value``; for every other class the value
+        is forensic evidence, reported on the event and WARNING but never
+        seeded.  Every other class re-asserts blind, as does a NULL stored
+        value.  A NULL or unrecognised stored class reads as operator and
+        re-asserts (PRD open question 3).
         """
         if not self._run_store:
             return
@@ -18435,40 +18412,36 @@ class Harness:
                 reason = record.get('reason', '<unknown reason>')
                 pause_at = record.get('pause_at', '<unknown time>')
                 restored_from_run_id = record.get('set_by_run_id', '<unknown>')
+                pause_class = record['pause_class']
+                policy = policy_for(pause_class)
                 logger.warning(
                     'Scheduler pause persisted from prior run — restoring. '
-                    'reason=%r  pause_at=%r  set_by_run_id=%r  '
+                    'reason=%r  pause_class=%s  pause_at=%r  set_by_run_id=%r  '
                     '(call Harness.resume_scheduler() to clear)',
                     reason,
+                    pause_class,
                     pause_at,
                     restored_from_run_id,
                 )
                 ewa_value = record.get('ewa_value')
                 threshold = self.config.digest_ewa_threshold
-                # One class test, two decisions — hoisted to a single local so
+                # One policy test, two decisions — hoisted to a single local so
                 # the live-state restore and the halt re-assertion below can
                 # never drift apart (task 4559).
-                is_ewa_trip = reason.startswith('ewa_trip_')
+                retests_stored_ewa = policy.rehydration is Rehydration.RETEST_STORED_EWA
 
-                # Restore the value into LIVE state only for an ewa_trip_ row,
-                # the one class whose stored scalar IS the live statistic.  For
-                # any other class it is forensic evidence about a value that
-                # never tripped anything; seeding it would leave a head start
-                # toward the threshold that resume_scheduler never clears.
-                if is_ewa_trip and ewa_value is not None:
+                if retests_stored_ewa and ewa_value is not None:
                     self._ewa_value = ewa_value
 
-                # Re-assert unless this is an ewa_trip_ pause whose stored
-                # predicate demonstrably no longer holds.  A missing value is
-                # an unknowable predicate, so it re-asserts.
+                # A missing value is an unknowable predicate, so it re-asserts.
                 reassert = not (
-                    is_ewa_trip
+                    retests_stored_ewa
                     and ewa_value is not None
                     and ewa_value < threshold
                 )
 
                 if reassert:
-                    self.scheduler.pause(reason, record['pause_class'])
+                    self.scheduler.pause(reason, pause_class)
                     # Stash the reason so run() can file the L1 escalation once
                     # the escalation queue exists (this runs at line ~492, before
                     # _start_escalation_server creates _escalation_queue).  See
@@ -18506,6 +18479,7 @@ class Harness:
                         EventType.scheduler_pause_restored,
                         data={
                             'reason': reason,
+                            'pause_class': pause_class.value,
                             'pause_at': pause_at,
                             'restored_from_run_id': restored_from_run_id,
                             'reasserted': reassert,
@@ -18553,7 +18527,7 @@ class Harness:
         13. Advance counters/state using the snapshot from step 2 (not the
             live counter), so that concurrent callbacks firing inside this
             function do not silently skip counted events.
-        13b. If an ``ewa_trip_`` halt is currently HELD, refresh the persisted
+        13b. If an ewa_rate hold is currently HELD, refresh the persisted
             ``scheduler_state.ewa_value`` so the stored scalar tracks the
             decaying live statistic instead of freezing at the trip-time
             snapshot (fail-open; see the inline note).
@@ -18740,46 +18714,19 @@ class Harness:
             self._last_digest_submit_count = submit_count_snapshot
             self._last_digest_window_end_iso = window_end
 
-            # (13b) While an ewa_trip_ halt is HELD, keep the persisted scalar
-            # tracking the live statistic (task 4559 amendment).
+            # (13b) While an ewa_rate hold is HELD, keep the persisted scalar
+            # tracking the live statistic (task 4559 amendment), so the
+            # restart-time re-test in _load_persisted_scheduler_pause can
+            # observe the decay instead of the frozen trip-time value.
             #
-            # pause_scheduler is otherwise the only writer, and step (14) below
-            # only fires `if tripped and not is_paused` — so once the halt is
-            # asserted the row would freeze at the trip-time value forever,
-            # even as this method decays _ewa_value on every drain window.  Two
-            # things broke as a result: the restart-time predicate re-check in
-            # _load_persisted_scheduler_pause could essentially never observe
-            # recovery (a stored value is by construction >= the threshold at
-            # write time, so `ewa_value < threshold` was only reachable if an
-            # operator RAISED digest_ewa_threshold), and a restart re-seeded
-            # _ewa_value with the stale high number, discarding the decay the
-            # drain had achieved — on the 8h fleet-redeploy cadence, on every
-            # restart.  Refreshing here is what makes "draining heals the
-            # breaker" survive a process boundary rather than being reset by it.
-            #
-            # Scoped to ewa_trip_ pauses for the same reason the restore is
-            # (see _load_persisted_scheduler_pause): that is the one class whose
-            # stored scalar IS the live statistic.  For every other class the
-            # value is trip-time forensic evidence about the pause, and
-            # overwriting it with an unrelated later number would destroy it.
-            #
-            # The check below is a cheap PRE-FILTER, not the enforcement point:
-            # it reads the IN-MEMORY reason, which can disagree with the row's
-            # stored reason (Scheduler.pause is first-wins in memory;
-            # save_scheduler_pause is INSERT OR REPLACE, last-wins on disk — so
-            # a park-stop trip during a held ewa_trip_ halt is an in-memory
-            # no-op that still rewrites the row).  refresh_scheduler_pause_ewa
-            # re-tests the prefix against the ROW's own pause_reason in its
-            # WHERE clause; that is what actually protects a non-EWA row's
-            # forensic value.  Do not drop it in favour of this check.
-            #
-            # Best-effort with its own guard: a persistence hiccup must never
-            # break the digest, and this is observability plus a restart hint,
-            # never a correctness gate.
+            # The class check below is only a PRE-FILTER: memory is first-wins
+            # while the row is last-wins, so they can disagree.  The enforcement
+            # point is refresh_scheduler_pause_ewa's WHERE pause_class clause.
+            # Best-effort: a persistence hiccup must never break the digest.
             if (
                 self._run_store
                 and self.scheduler.is_paused
-                and (self.scheduler.pause_reason or '').startswith('ewa_trip_')
+                and self.scheduler.pause_class is PauseClass.EWA_RATE
             ):
                 try:
                     self._run_store.refresh_scheduler_pause_ewa(
