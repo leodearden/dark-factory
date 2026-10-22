@@ -1414,6 +1414,45 @@ class EscalationQueue:
             open_l1s = [esc for esc in open_l1s if esc.category == category]
         return bool(open_l1s)
 
+    def dismiss_if_covered(self, esc: Escalation, *, resolver: str) -> list[str]:
+        """Dismiss *esc* when an open L1 of its category covers its task.
+
+        Returns the ids of the covering L1s; when none covers it, nothing is
+        written and the list is empty.  Category-scoped, unlike
+        :meth:`has_open_l1`'s default: an L1 about another category does not
+        cover a new root cause (the unblock-4917 amendment).  An L1 covers only
+        once it carries an amendment naming *esc*, so the dismissal never
+        silences it.  The category is matched here rather than through
+        ``has_open_l1(category=)``, which raises for a legacy category.
+        """
+        covering = []
+        for l1 in self.get_by_task(esc.task_id, status='pending', level=1):
+            if l1.category != esc.category:
+                continue
+            amended = self.amend(
+                l1.id,
+                agent_role=resolver,
+                summary=f'Covered L0 {esc.id}: {esc.summary}',
+                detail=(
+                    f'{esc.id} ({esc.agent_role}, severity={esc.severity}) was dismissed '
+                    f'by {resolver} as covered by this open {esc.category} L1.\n\n{esc.detail}'
+                ),
+            )
+            if amended['status'] in ('amended', 'repeat_framing'):
+                covering.append(l1.id)
+        if covering:
+            self.resolve(
+                esc.id,
+                (
+                    f'Dismissed by {resolver} — open L1 already covers this task '
+                    f'(task_id={esc.task_id}, category={esc.category}, '
+                    f'covering={", ".join(covering)})'
+                ),
+                dismiss=True,
+                resolved_by=resolver,
+            )
+        return covering
+
     def find_terminal_by_citation(
         self, task_id: str, category: str, citation_sha: str | None,
     ) -> Escalation | None:

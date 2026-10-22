@@ -18343,15 +18343,10 @@ class TaskWorkflow:
 
         The exit finalizer of plans/info-l0-disposition-router-prd.md D7: one
         bounded curator submit per note, no polling (INV-8); a held note is
-        left for the orphan reaper.  Eval mode leaves notes to the eval harness.
+        left for the orphan reaper.
         """
         queue = self.escalation_queue
-        if (
-            exit_kind is None
-            or not self.config.info_l0_router_enabled
-            or queue is None
-            or self._worktree_external
-        ):
+        if exit_kind is None or not self.config.info_l0_router_enabled or queue is None:
             return
         sweep = InfoL0Sweep(
             self._router_ports(queue), by='workflow-finalizer',

@@ -36,6 +36,7 @@ from escalation.disposition import (
 )
 from escalation.models import Escalation, normalised_severity
 from escalation.queue import EscalationQueue, ResolveOutcome, amendment_room
+from shared.eval_lane import eval_lane_provenance
 from shared.mcp_envelope import parse_tool_result
 from shared.task_submit import (
     SubmitFailed,
@@ -57,8 +58,13 @@ CONVERTED_CLASS = 'converted'
 
 
 def router_owns(record: Escalation, *, enabled: bool) -> bool:
-    """True when the router, not a steward, is *record*'s exit consumer."""
-    return enabled and record.level == 0 and normalised_severity(record.severity) == 'info'
+    """True when the router, not a steward or the eval harness, is *record*'s exit consumer."""
+    return (
+        enabled
+        and record.level == 0
+        and normalised_severity(record.severity) == 'info'
+        and eval_lane_provenance(record.task_id, record.worktree) is None
+    )
 
 
 _EXIT_KIND_BY_OUTCOME: dict[WorkflowOutcome, ExitKind] = {

@@ -6912,6 +6912,65 @@ class TestHasOpenL1CategoryFilter:
         assert queue.has_open_l1('T', category='merge_error') is False
 
 
+class TestDismissIfCovered:
+    """``dismiss_if_covered`` dismisses an L0 under an open L1 of its own
+    category only, and tells that L1 what it absorbed (unblock-4917)."""
+
+    RESOLVER = 'harness-orphan-reaper'
+
+    @staticmethod
+    def _l0(queue: EscalationQueue, category: str) -> Escalation:
+        esc = _make_esc_with_category('esc-T-9', 'T', category, level=0)
+        esc.summary, esc.detail = 'disk quota hit', 'df shows 100%'
+        queue.submit(esc)
+        return esc
+
+    @staticmethod
+    def _get(queue: EscalationQueue, esc_id: str) -> Escalation:
+        esc = queue.get(esc_id)
+        assert esc is not None
+        return esc
+
+    def test_a_same_category_l1_covers_and_carries_the_dismissed_record(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_esc_with_category('esc-T-1', 'T', 'infra_issue'))
+        l0 = self._l0(queue, 'infra_issue')
+
+        assert queue.dismiss_if_covered(l0, resolver=self.RESOLVER) == ['esc-T-1']
+
+        dismissed = self._get(queue, l0.id)
+        assert (dismissed.status, dismissed.resolved_by) == ('dismissed', self.RESOLVER)
+        assert 'esc-T-1' in (dismissed.resolution or '')
+        (amendment,) = self._get(queue, 'esc-T-1').amendments
+        assert amendment['agent_role'] == self.RESOLVER
+        carried = amendment['summary'] + amendment['detail']
+        assert all(fact in carried for fact in (l0.id, 'disk quota hit', 'df shows 100%'))
+
+    @pytest.mark.parametrize(('category', 'status'), [
+        ('task_failure', 'pending'), ('infra_issue', 'resolved'),
+    ], ids=['another-category', 'closed-l1'])
+    def test_no_open_same_category_l1_writes_nothing(self, tmp_path: Path, category, status):
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_esc_with_category('esc-T-1', 'T', category, status=status))
+        l0 = self._l0(queue, 'infra_issue')
+
+        assert queue.dismiss_if_covered(l0, resolver=self.RESOLVER) == []
+
+        assert self._get(queue, l0.id).status == 'pending'
+        assert self._get(queue, 'esc-T-1').amendments == []
+
+    def test_a_legacy_category_is_matched_without_raising(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        for esc_id, level in (('esc-T-1', 1), ('esc-T-9', 0)):
+            legacy = _make_esc_with_category(esc_id, 'T', 'retired_category', level=level)
+            (queue.queue_dir / f'{esc_id}.json').write_text(legacy.to_json())
+
+        assert queue.dismiss_if_covered(self._get(queue, 'esc-T-9'), resolver=self.RESOLVER) == [
+            'esc-T-1',
+        ]
+        assert self._get(queue, 'esc-T-9').status == 'dismissed'
+
+
 class TestMultipleCoOpenL1Resolution:
     """Signature-aware dedup permits N co-open L1s per task; resolving one must
     leave the task blocked until the others are resolved (task 2757; reviewer

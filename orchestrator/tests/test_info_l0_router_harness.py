@@ -213,6 +213,16 @@ class TestReaperRoutesInfoOrphans:
         assert still.id == aggregate.id
         assert all(e.id in still.amendments[-1]['detail'] for e in later)
 
+    async def test_the_curator_candidate_names_the_subject_status(self, harness: Harness):
+        harness.scheduler.get_task = AsyncMock(return_value={'status': 'done', 'metadata': {}})
+        _submit_aged(harness, '42')
+
+        await harness._reap_orphan_l0_escalations()
+
+        (arguments,) = _curator(harness).calls_named('submit_task')
+        assert 'Subject status: done' in arguments['description']
+        harness.scheduler.get_task.assert_awaited_once_with('42')
+
     async def test_an_unregistered_orchestrator_role_goes_to_the_curator(self, harness: Harness):
         esc = _submit_aged(harness, '42', agent_role='orchestrator-offline-lane', category='infra_issue')
 

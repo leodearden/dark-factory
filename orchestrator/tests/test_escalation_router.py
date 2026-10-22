@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import pytest
 from _curator_fake import FakeCurator
@@ -51,6 +52,19 @@ from orchestrator.escalation_router import (
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.workflow_types import WorkflowOutcome
 
+if TYPE_CHECKING:
+    from orchestrator.escalation_router import DispatchTool
+    from orchestrator.scheduler import Scheduler, SchedulerFacade
+
+    def _scheduler_dispatch_tool_is_a_dispatch_tool(scheduler: Scheduler) -> DispatchTool:
+        return scheduler.dispatch_tool
+
+    def _facade_dispatch_tool_is_a_dispatch_tool(scheduler: SchedulerFacade) -> DispatchTool:
+        return scheduler.dispatch_tool
+
+    def _the_curator_double_is_a_dispatch_tool(curator: FakeCurator) -> DispatchTool:
+        return curator
+
 
 def _record(
     *, severity: str = 'info', level: int = 0, esc_id: str = 'esc-42-1', task_id: str = '42',
@@ -88,6 +102,15 @@ class TestRouterOwns:
 
     def test_disabled_router_owns_nothing(self):
         assert not router_owns(_record(), enabled=False)
+
+    @pytest.mark.parametrize(('task_id', 'worktree'), [
+        ('df_task_2339', None),
+        ('42', '/home/leo/src/dark-factory/.eval-worktrees/2339/df_task_2339'),
+    ], ids=['fixture-task-id', 'eval-worktree'])
+    def test_an_eval_lane_note_is_the_eval_harness_s(self, task_id, worktree):
+        record = _record(task_id=task_id)
+        record.worktree = worktree
+        assert not router_owns(record, enabled=True)
 
 
 class TestExitKindFor:

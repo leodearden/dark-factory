@@ -79,13 +79,13 @@ def _workflow(tmp_path: Path, *, router_enabled: bool) -> tuple[TaskWorkflow, Es
 
 def _submit(
     queue: EscalationQueue, *, severity: str, level: int = 0,
-    suggested_action: str = 'create_followup_task',
+    suggested_action: str = 'create_followup_task', worktree: str | None = None,
 ) -> Escalation:
     esc = Escalation(
         id=queue.make_id(TASK_ID), task_id=TASK_ID, agent_role='implementer',
         severity=severity, category='task_failure' if severity != 'info' else 'design_concern',
         summary=f'{severity} L{level} note', detail=f'{severity} detail',
-        suggested_action=suggested_action, level=level,
+        suggested_action=suggested_action, level=level, worktree=worktree,
     )
     queue.submit(esc)
     return esc
@@ -378,10 +378,9 @@ class TestExitFinalizerRoutesInfoNotes:
 
 @pytest.mark.asyncio
 class TestExitFinalizerNoOps:
-    async def test_eval_mode_leaves_the_note_alone(self, tmp_path: Path):
+    async def test_an_eval_lane_note_is_left_to_the_eval_harness(self, tmp_path: Path):
         workflow, queue, curator, _cleanups = _finalizer_workflow(tmp_path)
-        workflow._worktree_external = True
-        note = _submit(queue, severity='info')
+        note = _submit(queue, severity='info', worktree=str(tmp_path / '.eval-worktrees' / TASK_ID))
 
         await _exit_with(workflow, WorkflowOutcome.DONE, row='done')
 

@@ -13178,7 +13178,7 @@ class Harness:
             'Auto-dismissed: orchestrator restarted — stale from prior run'
         )
         count = self._escalation_queue.dismiss_all_pending(
-            resolution, strand_age_secs=threshold, keep=self._router_eligible,
+            resolution, strand_age_secs=threshold, keep=self._router_owns,
         )
         if count:
             logger.info(
@@ -13206,7 +13206,7 @@ class Harness:
             )
             now = datetime.now(UTC)
             for esc in queue.get_pending():
-                if not self._router_eligible(esc):
+                if not self._router_owns(esc):
                     continue
                 hold = read_hold(esc)
                 if hold is None:
@@ -13246,7 +13246,7 @@ class Harness:
         try:
             now = datetime.now(UTC)
             for esc in self._escalation_queue.get_pending():
-                if esc.level != 0 or self._router_eligible(esc):
+                if esc.level != 0 or self._router_owns(esc):
                     continue
                 # fallback=datetime.max — same sentinel direction as the queue
                 # side, so an unparseable timestamp is never mistaken for a
@@ -14192,58 +14192,15 @@ class Harness:
         """The I/O the info-L0 router may touch from the harness."""
         return RouterPorts(
             queue=queue,
-            event_store=getattr(self, 'event_store', None),
+            event_store=self.event_store,
             dispatch_tool=self.scheduler.dispatch_tool,
             project_root=str(self.config.project_root),
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
 
-    def _router_eligible(self, esc: Escalation) -> bool:
-        """True when the info-L0 router, not the eval-lane rule, owns *esc*."""
-        return (
-            router_owns(esc, enabled=self.config.info_l0_router_enabled)
-            and eval_lane_provenance(esc.task_id, esc.worktree) is None
-        )
-
-    @staticmethod
-    def _dismiss_under_covering_l1(queue: EscalationQueue, esc: Escalation) -> bool:
-        """Dismiss orphan *esc* when an open L1 of its category covers its task.
-
-        Category-scoped by the unblock-4917 amendment: an L1 about another
-        category does not cover a new root cause.  Each covering L1 is amended
-        with the dismissed record, so the dismissal never silences it.  The
-        filter reads ``get_by_task`` directly because ``has_open_l1(category=)``
-        raises for a legacy category, and the reaper loop has no per-record
-        guard.
-        """
-        covering = [
-            l1 for l1 in queue.get_by_task(esc.task_id, status='pending', level=1)
-            if l1.category == esc.category
-        ]
-        if not covering:
-            return False
-        for l1 in covering:
-            queue.amend(
-                l1.id,
-                agent_role='harness-orphan-reaper',
-                summary=f'Covered orphan L0 {esc.id}: {esc.summary}',
-                detail=(
-                    f'{esc.id} ({esc.agent_role}, severity={esc.severity}) was dismissed '
-                    f'by the orphan reaper as covered by this open {esc.category} L1.\n\n'
-                    f'{esc.detail}'
-                ),
-            )
-        queue.resolve(
-            esc.id,
-            (
-                'Dismissed by orphan reaper — open L1 already covers this task '
-                f'(task_id={esc.task_id}, category={esc.category}, '
-                f'covering={", ".join(l1.id for l1 in covering)})'
-            ),
-            dismiss=True,
-            resolved_by='harness-orphan-reaper',
-        )
-        return True
+    def _router_owns(self, esc: Escalation) -> bool:
+        """True when the info-L0 router is *esc*'s consumer under the live config."""
+        return router_owns(esc, enabled=self.config.info_l0_router_enabled)
 
     #: "not read yet", distinguishable from a genuine ``get_task`` -> ``None``
     #: (no such row).  Scoped to :meth:`_reap_orphan_l0_escalations`'s per-record
@@ -14315,7 +14272,7 @@ class Harness:
             # A router hold (PRD D9) is owned by this reaper alone, so it is
             # finished ahead of the liveness arm: a live newer incarnation
             # never consumes it.
-            routed_here = self._router_eligible(esc)
+            routed_here = self._router_owns(esc)
             hold = read_hold(esc) if routed_here else None
             if hold is not None:
                 await router.finish_hold(
@@ -14393,9 +14350,9 @@ class Harness:
                 )
 
             if routed_here:
-                fetched = None if task is self._UNFETCHED else cast('dict | None', task)
+                row = await _task_row()
                 await router.route(
-                    esc, exit_kind=ExitKind.ORPHAN, task_status=(fetched or {}).get('status'),
+                    esc, exit_kind=ExitKind.ORPHAN, task_status=(row or {}).get('status'),
                 )
                 continue
 
@@ -14407,7 +14364,7 @@ class Harness:
             # in flight.  If an L1 about the same category is already open for
             # this task, dismiss the orphan L0 rather than promoting it to a
             # duplicate "echo" L1.
-            if self._dismiss_under_covering_l1(self._escalation_queue, esc):
+            if self._escalation_queue.dismiss_if_covered(esc, resolver='harness-orphan-reaper'):
                 continue
 
             # Live lock-free-stage race (task 2931): defer — don't promote —
