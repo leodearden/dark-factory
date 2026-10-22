@@ -76,13 +76,17 @@ _PYTESTMARK = 'pytestmark'
 
 
 class GapReason(StrEnum):
-    """Why a tree entry's refs are unseen; UNLISTABLE_DIRECTORY's entry is a directory, not a file."""
+    """Why a tree entry's refs are unseen; a *_DIRECTORY reason's entry is a directory, not a file.
+
+    REVISITED_DIRECTORY is a directory a symlink leads back to after the walk has already listed it.
+    """
 
     SYNTAX_ERROR = 'syntax_error'
     UNREADABLE_REF = 'unreadable_ref'
     MALFORMED_REF = 'malformed_ref'
     UNREADABLE_FILE = 'unreadable_file'
     UNLISTABLE_DIRECTORY = 'unlistable_directory'
+    REVISITED_DIRECTORY = 'revisited_directory'
 
 
 @dataclass(frozen=True)
@@ -570,26 +574,43 @@ def _is_pruned(directory: Path) -> bool:
     return any(fnmatchcase(directory.name, pattern) for pattern in _NORECURSE_DIRS) or _is_virtualenv(directory)
 
 
-def _walk(root: Path) -> tuple[list[str], list[str]]:
-    """Tree-relative POSIX paths of every test file under *root*, and of every subdirectory it cannot list.
+@dataclass(frozen=True)
+class _Walk:
+    """The tree-relative POSIX paths of a walk's test files, and of each directory it could not cover."""
 
-    Both are sorted. Only an unlistable *root* raises.
+    test_files: tuple[str, ...]
+    directory_gaps: tuple[tuple[str, GapReason], ...]
+
+
+def _walk(root: Path) -> _Walk:
+    """Every test file under *root*, following directory symlinks as pytest does; both parts sorted.
+
+    A subdirectory that cannot be listed is UNLISTABLE_DIRECTORY, and one whose real path was
+    already listed (a symlink cycle or a second link to it) is REVISITED_DIRECTORY rather than
+    walked twice. Only an unlistable *root* raises.
     """
     test_files: list[str] = []
-    unlistable: list[str] = []
+    directory_gaps: list[tuple[str, GapReason]] = []
+    listed: set[str] = set()
 
     def note_unlistable(error: OSError) -> None:
         directory = Path(error.filename).relative_to(root)
         if directory == Path():
             raise error
-        unlistable.append(directory.as_posix())
+        directory_gaps.append((directory.as_posix(), GapReason.UNLISTABLE_DIRECTORY))
 
-    for directory, directory_names, file_names in os.walk(root, onerror=note_unlistable, followlinks=False):
+    for directory, directory_names, file_names in os.walk(root, onerror=note_unlistable, followlinks=True):
         current = Path(directory)
-        directory_names[:] = [name for name in directory_names if not _is_pruned(current / name)]
         relative = current.relative_to(root)
+        real = os.path.realpath(current)
+        if real in listed:
+            directory_names[:] = []
+            directory_gaps.append((relative.as_posix(), GapReason.REVISITED_DIRECTORY))
+            continue
+        listed.add(real)
+        directory_names[:] = sorted(name for name in directory_names if not _is_pruned(current / name))
         test_files.extend((relative / name).as_posix() for name in file_names if is_test_file(name))
-    return sorted(test_files), sorted(unlistable)
+    return _Walk(tuple(sorted(test_files)), tuple(sorted(directory_gaps)))
 
 
 def _enumerate_file(root: Path, path: str, module_root: str) -> FileEnumeration:
@@ -600,20 +621,21 @@ def _enumerate_file(root: Path, path: str, module_root: str) -> FileEnumeration:
     return enumerate_source(path, source, module_root=module_root)
 
 
-def _unlistable_directory(path: str) -> FileEnumeration:
-    return FileEnumeration(path, {}, gaps=(EnumerationGap(GapReason.UNLISTABLE_DIRECTORY, None),))
+def _directory_gap(path: str, reason: GapReason) -> FileEnumeration:
+    return FileEnumeration(path, {}, gaps=(EnumerationGap(reason, None),))
 
 
 def enumerate_tree(root: Path, *, module_root_of: Callable[[str], str]) -> TreeEnumeration:
     """Enumerate every test file pytest's default rules would collect under *root*.
 
     *module_root_of* maps each tree-relative path to the module root that qualifies its NodeIds.
-    A file that cannot be read is an UNREADABLE_FILE gap and a subdirectory that cannot be listed
-    an UNLISTABLE_DIRECTORY one, so the walk always covers the rest; only an unlistable *root* raises.
+    Directory symlinks are followed. A file that cannot be read is an UNREADABLE_FILE gap, and a
+    subdirectory that cannot be listed or that a symlink revisits is a directory gap, so the walk
+    always covers the rest; only an unlistable *root* raises.
     """
-    test_files, unlistable = _walk(root)
-    files = (_enumerate_file(root, path, module_root_of(path)) for path in test_files)
-    return TreeEnumeration((*files, *map(_unlistable_directory, unlistable)))
+    walk = _walk(root)
+    files = (_enumerate_file(root, path, module_root_of(path)) for path in walk.test_files)
+    return TreeEnumeration((*files, *(_directory_gap(path, reason) for path, reason in walk.directory_gaps)))
 
 
 def _directory(value: str) -> Path:

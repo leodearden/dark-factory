@@ -1098,6 +1098,46 @@ def test_an_unlistable_subdirectory_is_an_unlistable_directory_gap_and_the_walk_
     assert tree.incomplete_files == ('b/locked',)
 
 
+def test_enumerate_tree_follows_a_symlinked_directory_as_pytest_does(tmp_path):
+    _write(tmp_path / 'elsewhere', 'real/test_x.py')
+    (tmp_path / 'tree').mkdir()
+    (tmp_path / 'tree' / 'linked').symlink_to(tmp_path / 'elsewhere' / 'real', target_is_directory=True)
+    tree = enumerate_tree(tmp_path / 'tree', module_root_of=_dot_root)
+    assert tree.files == (_file('linked/test_x.py', _MARKED),)
+    assert tree.complete is True
+
+
+def test_a_symlink_cycle_is_a_revisited_directory_gap_and_the_walk_terminates(tmp_path):
+    _write(tmp_path, 'a/test_ok.py')
+    (tmp_path / 'a' / 'loop').symlink_to(tmp_path / 'a', target_is_directory=True)
+    tree = enumerate_tree(tmp_path, module_root_of=_dot_root)
+    assert tree.files == (
+        FileEnumeration('a/loop', {}, gaps=(EnumerationGap(GapReason.REVISITED_DIRECTORY, None),)),
+        _file('a/test_ok.py', _MARKED),
+    )
+    assert tree.incomplete_files == ('a/loop',)
+
+
+def test_a_second_link_to_a_walked_directory_is_a_revisited_directory_gap(tmp_path):
+    _write(tmp_path, 'real/test_x.py')
+    (tmp_path / 'linked').symlink_to(tmp_path / 'real', target_is_directory=True)
+    tree = enumerate_tree(tmp_path, module_root_of=_dot_root)
+    assert tree.files == (
+        _file('linked/test_x.py', _MARKED),
+        FileEnumeration('real', {}, gaps=(EnumerationGap(GapReason.REVISITED_DIRECTORY, None),)),
+    )
+    assert tree.complete is False
+
+
+def test_a_symlinked_directory_with_a_norecurse_name_stays_pruned(tmp_path):
+    _write(tmp_path / 'elsewhere', 'real/test_x.py')
+    (tmp_path / 'tree').mkdir()
+    (tmp_path / 'tree' / 'build').symlink_to(tmp_path / 'elsewhere' / 'real', target_is_directory=True)
+    tree = enumerate_tree(tmp_path / 'tree', module_root_of=_dot_root)
+    assert tree.files == ()
+    assert tree.complete is True
+
+
 def test_enumerate_tree_refuses_a_root_it_cannot_list(tmp_path):
     with pytest.raises(FileNotFoundError):
         enumerate_tree(tmp_path / 'missing', module_root_of=_dot_root)
