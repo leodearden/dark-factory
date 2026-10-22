@@ -302,6 +302,14 @@ def _return_file(home: state.Home, name: str) -> Path:
     return path
 
 
+def _move(move: Mapping[str, Any]) -> state.Move:
+    frm, to, symbols = move['from'], move['to'], move['symbols']
+    if not (isinstance(frm, str) and (to is None or isinstance(to, str))
+            and isinstance(symbols, list) and all(isinstance(s, str) for s in symbols)):
+        raise TypeError(f'a move is {{from: path, to: path or null, symbols: [str]}}; got {move!r}')
+    return state.Move(from_path=frm, to_path=to, symbols=tuple(symbols))
+
+
 def _decompose_return(home: state.Home, name: str) -> _DecomposeReturn | None:
     """The return *name* when its own ``pass`` is decompose; None for any other pass."""
     path = _return_file(home, name)
@@ -309,13 +317,11 @@ def _decompose_return(home: state.Home, name: str) -> _DecomposeReturn | None:
         data = json.loads(path.read_text(encoding='utf-8'))
         if data['pass'] != state.Pass.DECOMPOSE:
             return None
-        moves = tuple(
-            state.Move(from_path=move['from'], to_path=move['to'], symbols=tuple(move['symbols']))
-            for move in data['moves']
-        )
-        return _DecomposeReturn(name, data['stream'], moves)
+        if not isinstance(data['stream'], str):
+            raise TypeError(f'stream is a stream id; got {data["stream"]!r}')
+        return _DecomposeReturn(name, data['stream'], tuple(_move(move) for move in data['moves']))
     except (OSError, KeyError, TypeError, ValueError) as bad:
-        raise state.StateError(f'{path}: cannot read the applied return\'s moves: {bad!r}') from None
+        raise state.StateError(f'{path}: cannot read the applied return: {bad!r}') from None
 
 
 def _pending_scans(home: state.Home, ledger: Sequence[Mapping[str, Any]]) -> list[_DecomposeReturn]:
@@ -579,7 +585,7 @@ def _parse_result(text: str) -> ClerkResult | list[str]:
     return ClerkResult(tuple(entry for entry in entries if entry is not None), tuple(dirtied))
 
 
-def _sorted_entries(
+def _partition_entries(
     entries: Sequence[ResultEntry], batch_ids: Collection[str],
     results: Mapping[str, Mapping[str, Any]], number: int,
 ) -> tuple[list[ResultEntry], list[str]]:
@@ -636,7 +642,7 @@ def ingest(result_path: Path) -> int:
             print(f'  {violation}', file=sys.stderr)
         return 1
     with home_writer.locked(home) as snapshot:
-        recorded, refusals = _sorted_entries(
+        recorded, refusals = _partition_entries(
             parsed.entries, batch_ids, _results_by_id(snapshot.ledger), number,
         )
         if recorded:

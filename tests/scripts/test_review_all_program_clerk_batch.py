@@ -513,6 +513,39 @@ def test_a_move_to_scan_with_no_store_writes_nothing(env: ProgramEnv) -> None:
     assert _actions_dir(home) == []
 
 
+def _refused_before_any_store_read(env: ProgramEnv, home: Any, named: str) -> None:
+    """``write --scan`` exits 1 naming *named*, reads no store, and writes nothing."""
+    ledger_before = home.ledger.read_bytes()
+    proc = _write(env, '--scan')
+    assert proc.returncode == 1, _output(proc)
+    assert named in proc.stderr and UNREACHABLE not in proc.stderr, proc.stderr
+    assert home.ledger.read_bytes() == ledger_before
+    assert _actions_dir(home) == []
+
+
+@pytest.mark.parametrize('move', [
+    {'from': OLD, 'to': NEW, 'symbols': 'OldThing'},
+    {'from': 7, 'to': NEW, 'symbols': []},
+    {'from': OLD, 'to': NEW, 'symbols': ['OldThing', 3]},
+], ids=['symbols-a-string', 'from-not-a-string', 'a-symbol-not-a-string'])
+def test_a_return_with_a_malformed_move_is_refused_naming_it(
+    env: ProgramEnv, move: dict[str, Any],
+) -> None:
+    home = _seed(env)
+    returned = home.root / S1_DECOMPOSE
+    data = json.loads(returned.read_text())
+    data['moves'] = [move]
+    returned.write_text(json.dumps(data))
+    _refused_before_any_store_read(env, home, str(returned.resolve()))
+
+
+def test_a_ledgered_return_outside_the_home_is_refused_naming_it(env: ProgramEnv) -> None:
+    escape = '../escape.json'
+    home = _seed(env, [_status('authored', S1_AUTHOR), _status('decomposed', escape)])
+    shutil.copyfile(FIXTURE_RETURNS / 'S1.decompose.json', home.root / escape)
+    _refused_before_any_store_read(env, home, escape)
+
+
 SIDECAR = 'plans/review-all-fixture-s1-prd.capability-manifest.yaml'
 SIDECAR_MD = 'plans/review-all-fixture-s1-prd.capability-manifest.md'
 
@@ -639,4 +672,14 @@ def test_a_path_that_is_no_batch_result_is_refused_naming_it(env: ProgramEnv) ->
         proc = _ingest(env, path)
         assert proc.returncode == 1, _output(proc)
         assert str(path) in proc.stderr
+    assert home.ledger.read_bytes() == ledger_before
+
+
+def test_ingesting_a_result_file_not_yet_written_is_refused_naming_it(env: ProgramEnv) -> None:
+    home = _batched_home(env)
+    ledger_before = home.ledger.read_bytes()
+    path = home.batch_files(1).result
+    proc = _ingest(env, path)
+    assert proc.returncode == 1, _output(proc)
+    assert str(path) in proc.stderr
     assert home.ledger.read_bytes() == ledger_before
