@@ -647,6 +647,17 @@ async def test_branch_key_in_the_skills_full_ref_form_resolves_a_prior_run_row(
 _TASK_ID_KEYED_ROWS = ('B1', 'B2', 'B3', 'B4', 'B5', 'B8')
 
 
+@pytest.mark.parametrize('row', sorted(_SCENES))
+async def test_task_id_keyed_rows_names_every_scene_keyed_by_task_id(
+    world: _World, row: str,
+) -> None:
+    scene = await _SCENES[row](world)
+
+    assert ('task_id' in scene.key) == (row in _TASK_ID_KEYED_ROWS), (
+        f'{row} polls by {sorted(scene.key)}: update _TASK_ID_KEYED_ROWS'
+    )
+
+
 @pytest.mark.parametrize('row', _TASK_ID_KEYED_ROWS)
 async def test_a_branch_key_in_either_spelling_answers_what_the_task_id_key_answers(
     world: _World, row: str,
