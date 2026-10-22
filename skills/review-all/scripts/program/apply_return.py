@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 import enum
-import functools
 import hashlib
+import json
 import os
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -125,32 +125,148 @@ def _numbered_actions(entries: Iterable[_Entry], ledger: Iterable[Mapping[str, A
     return numbered
 
 
-def _seat_entries(ret: state.PrdReturn, return_name: str, *, status: state.StreamStatus) -> list[_Entry]:
-    """An author or decompose return's lines: its stream's new status, then its lists."""
+_SEAT_STATUS: Mapping[state.Pass, state.StreamStatus] = {
+    state.Pass.AUTHOR: state.StreamStatus.AUTHORED,
+    state.Pass.DECOMPOSE: state.StreamStatus.DECOMPOSED,
+}
+
+
+def _list_entries(ret: state.PrdReturn, return_name: str) -> list[_Entry]:
     return [
-        _status_entry(ret, status, return_name),
         *_question_entries(ret, return_name),
         *_xref_entries(ret, return_name),
         *_action_entries(ret, return_name),
     ]
 
 
-_PASS_ENTRIES: Mapping[state.Pass, Callable[[state.PrdReturn, str], list[_Entry]]] = {
-    state.Pass.AUTHOR: functools.partial(_seat_entries, status=state.StreamStatus.AUTHORED),
-    state.Pass.DECOMPOSE: functools.partial(_seat_entries, status=state.StreamStatus.DECOMPOSED),
-}
+def _answered_item(ret: state.PrdReturn) -> state.ItemRef | None:
+    """The recorded question an investigate return answers; None for any other pass."""
+    return None if ret.item is None else state.ItemRef(ret.stream, ret.item)
+
+
+def _session_ruling_fields(
+    ret: state.PrdReturn, ruling: state.SessionRuling, return_name: str,
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        'stream': ret.stream, 'item': ret.item, 'question': ruling.question,
+        'ruling': ruling.ruling, 'options': list(ruling.options),
+        'consequence': ruling.consequence, 'keys': [],
+        'source': f'{return_name} session ruling {ruling.id}', 'supersedes': None,
+    }
+    item = _answered_item(ret)
+    if item is not None:
+        fields['answers'] = [str(item)]
+    return fields
+
+
+@dataclass(frozen=True)
+class _Entries:
+    """What one application appends: ledger entries, and human rulings by rulings_in_session index."""
+
+    ledger: list[_Entry]
+    rulings: list[tuple[int, dict[str, Any]]]
+
+
+def _return_entries(ret: state.PrdReturn, return_name: str) -> _Entries:
+    """Everything a first application of *ret* appends; an investigate return appends rulings only."""
+    status = _SEAT_STATUS.get(ret.pass_)
+    ledger = [] if status is None else [
+        _status_entry(ret, status, return_name), *_list_entries(ret, return_name),
+    ]
+    rulings = [
+        (index, _session_ruling_fields(ret, ruling, return_name))
+        for index, ruling in enumerate(ret.rulings_in_session)
+    ]
+    return _Entries(ledger, rulings)
+
+
+_UNCOMPARED_FIELDS = frozenset({'seq', 'at', 'by', 'op', 'return'})
+
+
+def _ledger_content(op: str, fields: Mapping[str, Any]) -> str:
+    """A ledger entry's claim, without when, by whom, from which file, or an action's id."""
+    dropped = _UNCOMPARED_FIELDS | ({'id'} if op == state.LedgerOp.ACTION else set())
+    kept = {name: value for name, value in fields.items() if name not in dropped}
+    return json.dumps([str(op), kept], sort_keys=True, default=dict)
+
+
+def _ruling_content(fields: Mapping[str, Any]) -> str:
+    return json.dumps([fields['stream'], fields['question'], fields['ruling'],
+                       list(fields['options']), fields['consequence']])
+
+
+@dataclass(frozen=True)
+class _Target:
+    """Where an application's file goes: the first returns file, or amendment ``amendment``."""
+
+    path: Path
+    amendment: int | None
+    priors: tuple[str, ...]
+
+
+def _amendment_entries(
+    ret: state.PrdReturn, entries: _Entries, snapshot: home_writer.Snapshot, target: _Target,
+    return_name: str,
+) -> _Entries:
+    """Only what the ledger and rulings lack, plus the stream's current status naming the amendment."""
+    applied = {
+        _ledger_content(line['op'], line) for line in snapshot.ledger
+        if line.get('return') in target.priors
+    }
+    lists = [
+        (op, fields) for op, fields in entries.ledger
+        if op is not state.LedgerOp.STREAM_STATUS and _ledger_content(op, fields) not in applied
+    ]
+    ruled = {
+        _ruling_content(ruling) for ruling in snapshot.rulings
+        if ruling['ruled_by'] == state.RuledBy.HUMAN and ruling['stream'] == ret.stream
+    }
+    rulings = [(index, fields) for index, fields in entries.rulings if _ruling_content(fields) not in ruled]
+    status = _SEAT_STATUS.get(ret.pass_)
+    if status is None:
+        return _Entries(lists, rulings)
+    current = state.stream_views(snapshot.program, snapshot.ledger)[ret.stream].status or status
+    return _Entries([_status_entry(ret, current, return_name), *lists], rulings)
 
 
 def _count(lines: Iterable[Mapping[str, Any]], op: state.LedgerOp) -> int:
     return sum(1 for line in lines if line['op'] == op)
 
 
-def _digest(ret: state.PrdReturn, ledger: Sequence[Mapping[str, Any]], return_name: str) -> str:
+def _seat_digest(ret: state.PrdReturn, lines: home_writer.Lines, return_name: str) -> str:
     return (
         f'{ret.stream} {ret.pass_}: {len(ret.filed)} filed, {len(ret.held)} held, '
-        f'{_count(ledger, state.LedgerOp.QUESTION)} questions, '
-        f'{_count(ledger, state.LedgerOp.ACTION)} actions → {return_name}'
+        f'{_count(lines.ledger, state.LedgerOp.QUESTION)} questions, '
+        f'{_count(lines.ledger, state.LedgerOp.ACTION)} actions → {return_name}'
     )
+
+
+def _investigate_digest(ret: state.PrdReturn, lines: home_writer.Lines, return_name: str) -> str:
+    ids = ', '.join(ruling['id'] for ruling in lines.rulings)
+    return (
+        f'{ret.stream} investigate-{ret.item}: {len(lines.rulings)} ruling(s) {ids} '
+        f'answer {_answered_item(ret)} → {return_name}'
+    )
+
+
+def _amendment_digest(
+    ret: state.PrdReturn, lines: home_writer.Lines, amendment: int, return_name: str,
+) -> str:
+    return (
+        f'{ret.stream} {ret.pass_} amend {amendment}: '
+        f'+{_count(lines.ledger, state.LedgerOp.QUESTION)} questions, '
+        f'+{_count(lines.ledger, state.LedgerOp.XREF)} xrefs, '
+        f'+{_count(lines.ledger, state.LedgerOp.ACTION)} actions, '
+        f'+{len(lines.rulings)} rulings → {return_name}'
+    )
+
+
+def _digest(ret: state.PrdReturn, lines: home_writer.Lines, target: _Target, return_name: str) -> str:
+    if target.amendment is not None:
+        return _amendment_digest(ret, lines, target.amendment, return_name)
+    if _answered_item(ret) is not None:
+        return _investigate_digest(ret, lines, return_name)
+    return _seat_digest(ret, lines, return_name)
 
 
 def _home_relative(home: state.Home, path: Path) -> str:
@@ -177,7 +293,7 @@ def _sha256(data: bytes) -> str:
 
 def _application_target(
     home: state.Home, returns_file: Path, raw: bytes, *, amend: bool,
-) -> Path | Refused:
+) -> _Target | Refused:
     """Where this application's file goes, or why the return may not be applied (again)."""
     stem, priors = returns_file.stem, _prior_returns(returns_file)
     same = [prior for prior in priors if _sha256(prior.read_bytes()) == _sha256(raw)]
@@ -191,16 +307,41 @@ def _application_target(
     if amend and not priors:
         return Refused(RefusalKind.APPLICATION, (
             f'nothing to amend: {stem} is not applied; apply it without --amend',))
-    return _amendment_file(returns_file, len(priors)) if priors else returns_file
+    if not priors:
+        return _Target(returns_file, None, ())
+    names = tuple(_home_relative(home, prior) for prior in priors)
+    return _Target(_amendment_file(returns_file, len(priors)), len(priors), names)
 
 
-def plan_application(
-    snapshot: home_writer.Snapshot, inbox_file: Path, *, amend: bool, store: state.StoreView,
-    by: str = DEFAULT_BY,
-) -> Applied | Refused:
-    """What applying *inbox_file* would append and where it would move it; reads, never writes."""
-    home = home_of(inbox_file)
-    raw = inbox_file.read_bytes()
+def _item_rejections(ret: state.PrdReturn, snapshot: home_writer.Snapshot) -> list[state.Rejection]:
+    item = _answered_item(ret)
+    if item is None or item in questions.recorded_questions(snapshot.ledger):
+        return []
+    return [state.Rejection(
+        'item', state.RejectionClass.CONTRADICTION,
+        f'{item} is no question the ledger records; an investigate return answers a recorded one',
+    )]
+
+
+def _prd_path_rejections(
+    ret: state.PrdReturn, snapshot: home_writer.Snapshot, target: _Target,
+) -> list[state.Rejection]:
+    if target.amendment is None or ret.pass_ not in _SEAT_STATUS:
+        return []
+    recorded = state.stream_views(snapshot.program, snapshot.ledger)[ret.stream].prd_path
+    if ret.prd_path == recorded:
+        return []
+    return [state.Rejection(
+        'prd_path', state.RejectionClass.CONTRADICTION,
+        f'{ret.prd_path!r} is not {ret.stream}\'s recorded PRD {recorded!r}; an amendment may not move it',
+    )]
+
+
+def _checked_return(
+    home: state.Home, inbox_file: Path, raw: bytes, snapshot: home_writer.Snapshot,
+    store: state.StoreView,
+) -> tuple[state.PrdReturn, str | None] | Refused:
+    """The validated return correctly named in the inbox, and when the store was read for it."""
     try:
         text = raw.decode('utf-8')
     except UnicodeDecodeError as bad:
@@ -210,29 +351,58 @@ def plan_application(
     )
     if checked.value is None:
         return _refused(checked.rejections)
-    ret = checked.value
-    misnamed = _name_rejection(home, inbox_file, ret)
+    misnamed = _name_rejection(home, inbox_file, checked.value)
     if misnamed is not None:
         return _refused([misnamed])
-    entries = _PASS_ENTRIES.get(ret.pass_)
-    if entries is None:
-        return Refused(RefusalKind.APPLICATION, (f'{ret.pass_} returns are not applied yet',))
-    returns_file = _application_target(
-        home, home.returns_file(ret.stream, ret.pass_, ret.item), raw, amend=amend,
-    )
-    if isinstance(returns_file, Refused):
-        return returns_file
-    return_name = _home_relative(home, returns_file)
-    lines = home_writer.stamp(
-        snapshot, by, _numbered_actions(entries(ret, return_name), snapshot.ledger), (),
-    )
+    return checked.value, checked.measured_at
+
+
+def _stamped(snapshot: home_writer.Snapshot, by: str, entries: _Entries) -> home_writer.Lines | Refused:
+    """The entries stamped; a session ruling the rulings file would refuse is a form rejection."""
+    rulings = [(state.RuledBy.HUMAN, fields) for _, fields in entries.rulings]
+    try:
+        return home_writer.stamp(
+            snapshot, by, _numbered_actions(entries.ledger, snapshot.ledger), rulings,
+        )
+    except home_writer.RulingRefused as refused:
+        index, _ = entries.rulings[refused.index]
+        return _refused([state.Rejection(
+            f'rulings_in_session[{index}]', state.RejectionClass.FORM, str(refused),
+        )])
+
+
+def plan_application(
+    snapshot: home_writer.Snapshot, inbox_file: Path, *, amend: bool, store: state.StoreView,
+    by: str = DEFAULT_BY,
+) -> Applied | Refused:
+    """What applying *inbox_file* would append and where it would move it; reads, never writes."""
+    home = home_of(inbox_file)
+    raw = inbox_file.read_bytes()
+    checked = _checked_return(home, inbox_file, raw, snapshot, store)
+    if isinstance(checked, Refused):
+        return checked
+    ret, measured_at = checked
+    returns_file = home.returns_file(ret.stream, ret.pass_, ret.item)
+    target = _application_target(home, returns_file, raw, amend=amend)
+    if isinstance(target, Refused):
+        return target
+    rejections = _item_rejections(ret, snapshot) + _prd_path_rejections(ret, snapshot, target)
+    if rejections:
+        return _refused(rejections)
+    return_name = _home_relative(home, target.path)
+    entries = _return_entries(ret, return_name)
+    if target.amendment is not None:
+        entries = _amendment_entries(ret, entries, snapshot, target, return_name)
+    lines = _stamped(snapshot, by, entries)
+    if isinstance(lines, Refused):
+        return lines
     recorded = questions.recorded_questions(lines.ledger)
     return Applied(
-        stem=returns_file.stem, returns_file=returns_file,
+        stem=returns_file.stem, returns_file=target.path,
         ledger=lines.ledger, rulings=lines.rulings,
-        digest=_digest(ret, lines.ledger, return_name),
+        digest=_digest(ret, lines, target, return_name),
         needs_human=tuple(q for q in recorded.values() if q.needs_human),
-        measured_at=checked.measured_at,
+        measured_at=measured_at,
     )
 
 

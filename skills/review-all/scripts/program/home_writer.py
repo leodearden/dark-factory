@@ -53,6 +53,14 @@ def locked(home: state.Home) -> Iterator[Snapshot]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+class RulingRefused(state.LedgerRefused):
+    """A ruling entry the rulings file would refuse; ``index`` is its place among the entries given."""
+
+    def __init__(self, index: int, refused: state.LedgerRefused) -> None:
+        self.index = index
+        super().__init__(str(refused))
+
+
 @dataclass(frozen=True)
 class Lines:
     """Stamped lines ready to append: each ledger line numbered, each ruling minted."""
@@ -86,7 +94,10 @@ def stamp(
     for ruled_by, fields in ruling_entries:
         ruling_id = state.next_ruling_id([*snapshot.rulings, *rulings], ruled_by)
         line = _stamped({'id': ruling_id, 'ruled_by': str(ruled_by), 'date': today}, fields)
-        state.check_ruling_line(line)
+        try:
+            state.check_ruling_line(line)
+        except state.LedgerRefused as refused:
+            raise RulingRefused(len(rulings), refused) from None
         rulings.append(line)
     return Lines(tuple(ledger), tuple(rulings))
 
