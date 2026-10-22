@@ -743,11 +743,16 @@ _VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
 #     (systemd 255.4, user bus unreachable, measured 2026-10-22)
 # Matched against the WHOLE output, never per line: systemd-run fails before
 # exec'ing the leg, so its refusal is all the leg can print, and any other
-# output means the command ran and its own verdict stands. Extend the
-# alternation only on a newly observed sample (the _CARGO_CLI_ERROR_RE
-# discipline).
+# output means the command ran and its own verdict stands. Only systemd-run
+# prints the scope-unit line, so any reason after it means the scope never
+# started. `systemctl --user` and `busctl --user` print the bus-connect line
+# verbatim too (measured), so only its observed reasons match; a leg whose own
+# systemctl prints exactly that line still reads as infra until task 7339 tags
+# the spawn path structurally. Add a reason only on a newly observed sample
+# (the _CARGO_CLI_ERROR_RE discipline).
 _SCOPE_SPAWN_FAILURE_RE = re.compile(
-    r'(?:Failed to start transient scope unit|Failed to connect to bus): [^\n]+'
+    r'Failed to start transient scope unit: [^\n]+'
+    r'|Failed to connect to bus: No such file or directory'
 )
 
 

@@ -55,6 +55,10 @@ class TestClassifiesScopeSpawnFailureAsEnvTransient:
             ToolKind.PYTEST, 1, sample.rstrip('\n'), False,
         ) == FailureCategory.ENV_TRANSIENT
 
+    def test_scope_unit_refusal_is_env_transient_whatever_the_reason(self):
+        output = 'Failed to start transient scope unit: Connection reset by peer\n'
+        assert classify_failure(ToolKind.OPAQUE, 1, output, False) == FailureCategory.ENV_TRANSIENT
+
 
 class TestCommandThatRanKeepsItsOwnVerdict:
 
@@ -75,6 +79,12 @@ class TestCommandThatRanKeepsItsOwnVerdict:
         output = 'E       ' + _SCOPE_START_REFUSED
         assert classify_failure(
             ToolKind.PYTEST, 1, output, False,
+        ) == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    def test_bus_connect_refusal_with_unobserved_reason_is_not_infra(self):
+        output = 'Failed to connect to bus: Permission denied\n'
+        assert classify_failure(
+            ToolKind.OPAQUE, 1, output, False,
         ) == FailureCategory.UNKNOWN_TEST_FAILURE
 
     def test_bare_errno_text_is_not_infra(self):
