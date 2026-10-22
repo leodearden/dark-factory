@@ -3968,17 +3968,17 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
         Mirrors tests/test_flag_dedup.py::_seed_marker: dedup identity is
         (project_id, 'stage1_flag_marker', task_id, flag_type, run_id='') —
         the originating run_id rides in payload_json, not the PK.  The
-        identity's task component is the flag's SIGNATURE component, not its
-        top-level task_id: compute_flag_signature unions the top-level id with
-        every cited_tasks id, so this flag keys on '3839,598'.  Derived from
-        compute_flag_signature rather than hardcoded so a future change to the
-        union rule cannot silently turn this seed into a MISS (which would
-        make the whole test pass vacuously — the gate is HIT-only).
+        identity's task component is the flag's MARKER signature, not its
+        top-level task_id: compute_marker_signature unions the top-level id
+        with every cited_tasks id, project-qualifying the foreign fix task.
+        Derived rather than hardcoded so a future change to the union rule
+        cannot silently turn this seed into a MISS (which would make the whole
+        test pass vacuously — the gate is HIT-only).
         """
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.flag_dedup import compute_marker_signature
         from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 
-        signature = compute_flag_signature(self._suppressed_flag())
+        signature = compute_marker_signature(self._suppressed_flag(), project_id=self.PROJECT_ID)
         assert signature is not None, 'the suppressed flag must have a signature'
         sig_task_id, sig_flag_type = signature
 
@@ -4090,7 +4090,10 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
 
     @pytest.mark.asyncio
     async def test_cross_project_drop_is_excluded_from_acknowledge(self, ledger_store):
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            compute_marker_signature,
+        )
 
         await self._seed_prior_marker(ledger_store)
 
@@ -4126,9 +4129,12 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
 
         # Ledger-level restatement: the marker row itself survives the cycle,
         # re-upserted active by dedup_flags BEFORE the gate ran.
-        assert suppressed_sig is not None
+        marker_sig = compute_marker_signature(
+            self._suppressed_flag(), project_id=self.PROJECT_ID,
+        )
+        assert marker_sig is not None
         marker = await ledger_store.get_by_identity(
-            self.PROJECT_ID, 'stage1_flag_marker', suppressed_sig[0], suppressed_sig[1], '',
+            self.PROJECT_ID, 'stage1_flag_marker', marker_sig[0], marker_sig[1], '',
         )
         assert marker is not None and marker.state == 'active', (
             'the suppressed flag\'s marker must survive un-reclaimed; '
