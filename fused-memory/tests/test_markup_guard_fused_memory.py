@@ -952,7 +952,7 @@ class TestInstalledOnTheRealServer:
         server = create_mcp_server(AsyncMock())
 
         with pytest.raises(TypeError):
-            _install_tool_dispatch_guards(server, known_projects=_KNOWN_PROJECTS)
+            _install_tool_dispatch_guards(server, known_projects=_KNOWN_PROJECTS)  # pyright: ignore[reportCallIssue] - missing BY DESIGN
 
     @pytest.mark.parametrize(
         ('reconciliation', 'expected'),
@@ -968,7 +968,8 @@ class TestInstalledOnTheRealServer:
         preservation."""
         from fused_memory.server.main import _server_data_dir
 
-        assert _server_data_dir(SimpleNamespace(reconciliation=reconciliation)) == expected
+        config = SimpleNamespace(reconciliation=reconciliation)
+        assert _server_data_dir(config) == expected  # pyright: ignore[reportArgumentType] - duck-typed BY DESIGN
 
     def test_an_undeliverable_policy_is_refused_at_WIRING_time(self):
         """The declared ValueError, which is a fail-LOUD wiring guard.
