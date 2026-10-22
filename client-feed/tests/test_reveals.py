@@ -448,3 +448,150 @@ def test_b17_a_changed_file_is_charged_its_lines_since_delivery_not_its_lines_at
     (revealed,) = answers(project)
     assert isinstance(revealed, FileRevealed) and revealed.lines == 260
     assert newest_tree(project).budget.spent_lines == 60
+
+
+FOLLOWED = ('src/a.py', 'src/b.py', 'src/c.py', 'src/f.py')
+FOLLOW_FILES: Mapping[str, str | bytes] = {
+    **{path: numbered(Path(path).stem, 20) for path in FOLLOWED},
+    'src/e.py': numbered('e', 400),
+}
+
+
+@pytest.fixture
+def followed(tmp_path: Path) -> Project:
+    """Pass 1 at c1 granted src/a.py, src/b.py, src/c.py and src/f.py, each charged its 20 lines."""
+    project = make_project(tmp_path, FOLLOW_FILES, reveal_proportion=1.0, reveal_floor_lines=5)
+    write_engagement(project.in_dir, project_id=PROJECT)
+    request(project, *FOLLOWED)
+    project.run(minutes=60)
+    assert [file.path for file in state_of(project).revealed] == list(FOLLOWED)
+    return project
+
+
+def pass_answers(project: Project, *, minutes: float) -> list[FileRevealed | RevealRefused]:
+    """The answers and re-emissions one more pass appends; every pass leaves a valid out_dir."""
+    before = len(project.feed())
+    project.run(minutes=minutes)
+    assert validate_out_dir(project.out_dir, expected_project_id=PROJECT).ok
+    return [line for line in project.feed()[before:] if isinstance(line, FileRevealed | RevealRefused)]
+
+
+def revealed_paths(project: Project) -> list[str]:
+    return [file.path for file in state_of(project).revealed]
+
+
+def summary(events: list[FileRevealed | RevealRefused]) -> list[tuple[Any, ...]]:
+    return [
+        (event.path, event.commit, event.renamed_from, event.deleted, event.lines)
+        for event in events
+        if isinstance(event, FileRevealed)
+    ]
+
+
+def test_b16_a_changed_file_is_re_emitted_and_a_renamed_one_follows_its_new_path(
+    followed: Project,
+) -> None:
+    repo = followed.repo
+    repo.write('src/a.py', numbered('a', 25))
+    repo.git('mv', 'src/b.py', 'src/b2.py')
+    c2 = repo.commit('c2', when=at(65))
+
+    got = pass_answers(followed, minutes=70)
+
+    assert summary(got) == [
+        ('src/a.py', c2, None, False, 25),
+        ('src/b2.py', c2, 'src/b.py', False, 20),
+    ]
+    assert [event.content for event in got if isinstance(event, FileRevealed)] == [
+        numbered('a', 25),
+        numbered('b', 20),
+    ]
+    assert revealed_paths(followed) == ['src/a.py', 'src/b2.py', 'src/c.py', 'src/f.py']
+
+
+def test_b16_a_deleted_file_ends_its_reveal_and_its_recreation_is_not_followed(
+    followed: Project,
+) -> None:
+    repo = followed.repo
+    spent = newest_tree(followed).budget.spent_lines
+    repo.git('rm', '-q', 'src/c.py')
+    c3 = repo.commit('c3', when=at(65))
+
+    assert summary(pass_answers(followed, minutes=70)) == [('src/c.py', c3, None, True, 0)]
+    assert 'src/c.py' not in revealed_paths(followed)
+    assert newest_tree(followed).budget.spent_lines == spent - 20
+
+    repo.write('src/c.py', numbered('c', 20))
+    repo.commit('c4', when=at(75))
+
+    assert pass_answers(followed, minutes=80) == []
+    assert 'src/c.py' not in revealed_paths(followed)
+
+    request(followed, 'src/c.py', minutes=85)
+
+    assert summary(pass_answers(followed, minutes=90)) == [
+        ('src/c.py', repo.rev('main'), None, False, 20)
+    ]
+    assert newest_tree(followed).budget.spent_lines == spent
+
+
+def test_b16_a_delete_and_recreate_inside_one_pass_ends_the_reveal(followed: Project) -> None:
+    repo = followed.repo
+    repo.git('rm', '-q', 'src/f.py')
+    repo.commit('c5', when=at(65))
+    repo.write('src/f.py', numbered('recreated', 20))
+    c6 = repo.commit('c6', when=at(66))
+
+    assert summary(pass_answers(followed, minutes=70)) == [('src/f.py', c6, None, True, 0)]
+    assert 'src/f.py' not in revealed_paths(followed)
+
+
+def test_b16_a_change_and_its_revert_inside_one_pass_re_emit_nothing(followed: Project) -> None:
+    repo = followed.repo
+    repo.write('src/a.py', numbered('changed', 20))
+    repo.commit('c7', when=at(65))
+    repo.write('src/a.py', numbered('a', 20))
+    repo.commit('c8', when=at(66))
+
+    assert pass_answers(followed, minutes=70) == []
+    assert revealed_paths(followed) == list(FOLLOWED)
+
+
+def test_b16_a_file_renamed_out_of_the_visible_tree_ends_its_reveal(followed: Project) -> None:
+    repo = followed.repo
+    (repo.root / 'private').mkdir()
+    repo.git('mv', 'src/a.py', 'private/x.py')
+    moved = repo.commit('move out of sight', when=at(65))
+
+    assert summary(pass_answers(followed, minutes=70)) == [('src/a.py', moved, None, True, 0)]
+    assert revealed_paths(followed) == ['src/b.py', 'src/c.py', 'src/f.py']
+
+
+def test_b16_a_merge_touching_a_revealed_file_re_emits_it_once_at_the_merge(
+    followed: Project,
+) -> None:
+    repo = followed.repo
+    repo.branch('task/7')
+    repo.checkout('task/7')
+    repo.write('src/a.py', numbered('a', 21))
+    repo.commit('seven one', when=at(61))
+    repo.write('src/a.py', numbered('a', 22))
+    repo.commit('seven two', when=at(62))
+    repo.checkout('main')
+    merge = repo.merge_no_ff('task/7', 'Merge task/7 into main', when=at(65))
+
+    assert summary(pass_answers(followed, minutes=70)) == [('src/a.py', merge, None, False, 22)]
+
+
+def test_b16_without_reveals_head_a_changed_revealed_file_is_still_re_emitted_once(
+    followed: Project,
+) -> None:
+    cursor_path = followed.out_dir / CURSOR_FILENAME
+    cursor = Cursor.model_validate_json(cursor_path.read_text())
+    cursor_path.write_text(cursor.model_copy(update={'reveals_head': None}).model_dump_json())
+    repo = followed.repo
+    repo.write('src/a.py', numbered('a', 30))
+    c2 = repo.commit('c2', when=at(65))
+
+    assert summary(pass_answers(followed, minutes=70)) == [('src/a.py', c2, None, False, 30)]
+    assert pass_answers(followed, minutes=71) == []
