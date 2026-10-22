@@ -13,7 +13,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import pytest
-from _call_recorder import ThreadRecordingCall
+from _call_recorder import BlockingCall, ThreadRecordingCall
 from _git_fixtures import README_SEED, _git, build_repo
 
 from orchestrator.sentinel_l1 import SentinelL1
@@ -407,18 +407,15 @@ class TestWorkProductProbe:
 @pytest.mark.asyncio
 class TestWorkProductProbeClose:
     async def test_close_cancels_an_in_flight_refresh_without_waiting_for_git(self):
-        rig, release = _Rig(), threading.Event()
-
-        def blocked_load() -> WorkProductSnapshot:
-            release.wait(timeout=30)
-            return FRESH
+        rig, load = _Rig(), BlockingCall(FRESH)
 
         try:
-            rig.probe.poll(blocked_load)
+            rig.probe.poll(load)
+            await load.entered()
             await asyncio.wait_for(rig.probe.aclose(), timeout=5)
-            assert not release.is_set()
+            assert load.blocked
         finally:
-            release.set()
+            load.release()
 
         assert rig.probe.snapshot is WorkProductSnapshot.EMPTY
         assert rig.filed == []

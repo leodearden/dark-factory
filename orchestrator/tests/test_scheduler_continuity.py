@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from _call_recorder import ThreadRecordingCall
+from _call_recorder import BlockingCall, ThreadRecordingCall
 from _git_fixtures import README_SEED, _git, build_repo
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -147,25 +147,19 @@ class TestBoundedProbeOccupancy:
         assert len(blocked) == 1
 
     async def test_closing_the_scheduler_abandons_a_slow_refresh_and_stops_probing(self, store, clock):
-        release = threading.Event()
-        reads: list[int] = []
-
-        def blocked_reader() -> dict[str, BranchWork]:
-            reads.append(threading.get_ident())
-            release.wait(timeout=30)
-            return {}
-
-        scheduler = _scheduler(blocked_reader, event_store=store, clock=clock)
+        reader = BlockingCall[dict[str, BranchWork]]({})
+        scheduler = _scheduler(reader, event_store=store, clock=clock)
         try:
             await _tick(scheduler, _tasks(3))
+            await reader.entered()
             await asyncio.wait_for(scheduler.aclose(), timeout=5)
-            assert not release.is_set()
+            assert reader.blocked
         finally:
-            release.set()
+            reader.release()
 
         clock[0] += 10 * TTL
         await _tick_and_settle(scheduler, _tasks(3))
-        assert len(reads) == 1
+        assert reader.calls == 1
 
     async def test_nothing_is_probed_without_an_event_store(self, clock):
         reader = _reader()
