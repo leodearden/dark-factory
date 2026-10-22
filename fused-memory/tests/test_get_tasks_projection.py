@@ -7,10 +7,21 @@ the MCP tool.
 
 from __future__ import annotations
 
+import contextlib
+import json
+import sqlite3
+import subprocess
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
+from shared.project_layout import tasks_db
 
+from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.backends.task_projection import (
     ALLOWED_FIELDS,
     TASK_ROW_KEYS,
@@ -18,6 +29,10 @@ from fused_memory.backends.task_projection import (
     TaskProjection,
     parse_task_projection,
 )
+from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.server.tools import create_mcp_server
 
 _FULL_ROW: dict[str, Any] = {
     'id': '7',
@@ -115,4 +130,150 @@ def test_a_non_list_argument_is_named_whole(argument):
 
 
 def test_the_allowed_set_is_every_row_key_plus_the_metadata_form():
-    assert ALLOWED_FIELDS == (*TASK_ROW_KEYS, 'metadata.<key>')
+    assert (*TASK_ROW_KEYS, 'metadata.<key>') == ALLOWED_FIELDS
+
+
+# ── Real-store stack ────────────────────────────────────────────────────
+
+
+def _git_init_root(path: Path) -> str:
+    path.mkdir(parents=True)
+    subprocess.run(['git', 'init', '-q', str(path)], check=True, capture_output=True)
+    return str(path.resolve())
+
+
+@dataclass(frozen=True)
+class ProjectionStack:
+    root: str
+    backend: SqliteTaskBackend
+    interceptor: TaskInterceptor
+    server: Any
+    seed: Callable[..., Awaitable[str]]
+
+    async def call(self, **args: Any) -> Any:
+        return await self.server._tool_manager.call_tool(
+            'get_tasks', {'project_root': self.root, **args},
+        )
+
+    def corrupt(self, task_id: str, raw: str) -> None:
+        with contextlib.closing(sqlite3.connect(tasks_db(self.root))) as conn, conn:
+            conn.execute('UPDATE tasks SET metadata = ? WHERE id = ?', (raw, int(task_id)))
+
+
+@pytest_asyncio.fixture
+async def projection_stack(tmp_path: Path) -> AsyncIterator[ProjectionStack]:
+    root = _git_init_root(tmp_path / 'project')
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=root))
+    await backend.start()
+    interceptor = TaskInterceptor(backend, None, EventBuffer(db_path=None))
+    server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+    seeded = 0
+
+    async def seed(status: str = 'pending', metadata: dict[str, Any] | None = None) -> str:
+        nonlocal seeded
+        seeded += 1
+        added = await backend.add_task(
+            project_root=root,
+            title=f'task {seeded}',
+            description=f'seeded projection fixture task {seeded}',
+            metadata=json.dumps(metadata) if metadata is not None else None,
+            status=status,
+        )
+        return str(added['id'])
+
+    try:
+        yield ProjectionStack(root, backend, interceptor, server, seed)
+    finally:
+        await interceptor.close()
+        await backend.close()
+
+
+# ── In-process face: TaskInterceptor.get_tasks ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_allow_list_is_the_key_tuple_the_store_emits(projection_stack):
+    await projection_stack.seed('pending', {'prd_path': 'p'})
+
+    rows = (await projection_stack.backend.get_tasks(projection_stack.root))['tasks']
+
+    assert tuple(rows[0]) == TASK_ROW_KEYS
+
+
+@pytest.mark.asyncio
+async def test_in_process_projection_keeps_only_requested_metadata_present(projection_stack):
+    both = await projection_stack.seed('pending', {'prd_path': 'p', 'spawned_from': '12'})
+    one = await projection_stack.seed('pending', {'prd_path': 'p'})
+    none = await projection_stack.seed('pending', None)
+
+    result = await projection_stack.interceptor.get_tasks(
+        projection_stack.root,
+        fields=['id', 'metadata.prd_path', 'metadata.spawned_from'],
+    )
+
+    assert result['tasks'] == [
+        {'id': both, 'metadata': {'prd_path': 'p', 'spawned_from': '12'}},
+        {'id': one, 'metadata': {'prd_path': 'p'}},
+        {'id': none, 'metadata': {}},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_in_process_projection_composes_with_statuses(projection_stack):
+    await projection_stack.seed('pending')
+    done = await projection_stack.seed('done')
+
+    result = await projection_stack.interceptor.get_tasks(
+        projection_stack.root, statuses=['done'], fields=['status'],
+    )
+
+    assert result['tasks'] == [{'id': done, 'status': 'done'}]
+
+
+@pytest.mark.asyncio
+async def test_malformed_metadata_projects_as_empty_and_never_aborts(projection_stack):
+    healthy = await projection_stack.seed('pending', {'prd_path': 'p'})
+    unparseable = await projection_stack.seed('pending', {'prd_path': 'q'})
+    not_an_object = await projection_stack.seed('pending', {'prd_path': 'r'})
+    projection_stack.corrupt(unparseable, 'not json {')
+    projection_stack.corrupt(not_an_object, '[1, 2]')
+
+    result = await projection_stack.interceptor.get_tasks(
+        projection_stack.root, fields=['metadata.prd_path'],
+    )
+
+    assert result['tasks'] == [
+        {'id': healthy, 'metadata': {'prd_path': 'p'}},
+        {'id': unparseable, 'metadata': {}},
+        {'id': not_an_object, 'metadata': {}},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_backend_rejects_an_invalid_entry_in_process(projection_stack):
+    await projection_stack.seed('pending')
+
+    with pytest.raises(InvalidTaskProjectionField) as caught:
+        await projection_stack.interceptor.get_tasks(projection_stack.root, fields=['foo'])
+
+    assert caught.value.field == 'foo'
+
+
+@pytest.mark.asyncio
+async def test_a_tuple_projection_works_in_process(projection_stack):
+    task_id = await projection_stack.seed('pending')
+
+    result = await projection_stack.interceptor.get_tasks(projection_stack.root, fields=('id',))
+
+    assert result['tasks'] == [{'id': task_id}]
+
+
+@pytest.mark.asyncio
+async def test_none_fields_returns_the_unprojected_rows(projection_stack):
+    await projection_stack.seed('pending', {'prd_path': 'p'})
+    await projection_stack.seed('done', None)
+
+    explicit = await projection_stack.interceptor.get_tasks(projection_stack.root, fields=None)
+    omitted = await projection_stack.interceptor.get_tasks(projection_stack.root)
+
+    assert explicit == omitted
