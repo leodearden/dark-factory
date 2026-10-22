@@ -5,8 +5,9 @@ BODY quotes a merge subject shadows the genuine merge. The selecting form in
 ``skills/_shared/deriving-landed-sha.md`` step 1 scans past such a body match;
 a ``--max-count=1`` stops at it. This guard extracts every marker search in
 ``skills/**/*.md`` (any fenced block or inline code span in which a
-``git log`` or ``git rev-list`` greps for ``$S`` or a ``Merge task/…`` /
-``Merge branch 'task/…'`` subject, whatever its other flags), RUNS it against a
+``git log`` or ``git rev-list`` greps for ``$S``, a ``Merge task/…`` /
+``Merge branch 'task/…'`` subject or the bare ``task/…`` branch name, whatever
+its other flags), RUNS it against a
 fixture history where a body match shadows the genuine marker, and requires it
 to print the genuine marker and nothing else.
 
@@ -44,7 +45,7 @@ COUNTEREXAMPLE_MARKER = 'marker-search-guard: counterexample'
 
 _COUNTEREXAMPLE_TAG = re.compile(rf'[ \t]*<!--[ \t]*{re.escape(COUNTEREXAMPLE_MARKER)}[ \t]*-->')
 _HISTORY_SEARCH_COMMAND = re.compile(r'\bgit\s+(?:log|rev-list)\b')
-_MARKER_GREP_OPTION = re.compile(r'''--grep[= ]['"]?\^?(?:\$\{?S\b|Merge (?:branch ')?task/[<\d])''')
+_MARKER_GREP_OPTION = re.compile(r'''--grep[= ]['"]?\^?(?:\$\{?S\b|(?:Merge (?:branch ')?)?task/[<\d])''')
 _FENCE_OPEN = re.compile(r'^\s*(`{3,})[^`]*$')
 _FENCE_CLOSE = re.compile(r'^\s*(`{3,})\s*$')
 _INLINE_SPAN = re.compile(r'(?<!`)`([^`]+)`(?!`)')
