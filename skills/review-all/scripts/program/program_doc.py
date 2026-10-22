@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Render a /review-all program's doc and its .state/ snapshot into the run home.
+"""Render a /review-all program's doc and .state/ snapshot into the run home, and the lead's views of it.
 
-The only writer of the rendered doc and its snapshot. It reads the home under
-program.json's lock and the task store through ``state.StoreReader``; it prints
-when the store was read and never writes that stamp into the doc, so two renders
-over an unchanged program are byte-identical.
+The only writer of the rendered doc, its snapshot and HANDOFF.md; ``--publish``
+copies the render into the checkout, and ``--roster`` and ``--sitting`` print the
+same facts for the lead. It reads the home under program.json's lock and the
+task store through ``state.StoreReader``; it prints when the store was read and
+never writes that stamp into the doc, so two renders over an unchanged program
+are byte-identical.
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ import os
 import string
 import sys
 import tempfile
+import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -35,11 +38,11 @@ class Exit(enum.IntEnum):
     COULD_NOT_RUN = run_cli.COULD_NOT_RUN
 
 
-_EXIT_MEANINGS: Mapping[Exit, str] = {
+_EXIT_MEANINGS: Mapping[Exit, str] = types.MappingProxyType({
     Exit.DONE: 'done',
     Exit.REFUSED: 'refused, nothing written',
     Exit.COULD_NOT_RUN: 'could not run (usage, run home, store or template)',
-}
+})
 
 TEMPLATE = Path(__file__).resolve().with_name('program_doc_template.md')
 NONE = 'none'
@@ -172,10 +175,10 @@ def _task_entry(row: state.TaskRow) -> str:
     return f'{_task_name(row)} {programme_state}'
 
 
-_CHAIN_LABELS: Mapping[state.TriggerChainRole, str] = {
+_CHAIN_LABELS: Mapping[state.TriggerChainRole, str] = types.MappingProxyType({
     state.TriggerChainRole.HUMAN_GATE: 'human gate',
     state.TriggerChainRole.COMPLETION_GATE: 'completion gate',
-}
+})
 
 
 def _chain_line(run_id: str, role: state.TriggerChainRole, gate: state.TaskRow | None) -> str:
@@ -250,7 +253,7 @@ def _ledger(home: HomeRead, store: StoreFacts) -> str:
     return '\n'.join(map(_ledger_entry, home.run.ledger)) or NONE
 
 
-_SECTIONS: Mapping[str, Callable[[HomeRead, StoreFacts], str]] = {
+_SECTIONS: Mapping[str, Callable[[HomeRead, StoreFacts], str]] = types.MappingProxyType({
     'streams': _streams,
     'routed': _program_section(state.ProgramSection.ROUTED),
     'seams': _program_section(state.ProgramSection.SEAMS_EXTRA),
@@ -261,14 +264,17 @@ _SECTIONS: Mapping[str, Callable[[HomeRead, StoreFacts], str]] = {
     'filed': _filed,
     'held': _held,
     'ledger': _ledger,
-}
+})
 
 
 def _placeholders(home: HomeRead, store: StoreFacts) -> dict[str, str]:
     program = home.run.program
-    return {
+    scalars = {
         'run_id': program.run_id, 'project_id': program.project_id,
         'as_of_sha': program.as_of_sha, 'record_path': program.record_path,
+    }
+    return {
+        **{name: _line(value) for name, value in scalars.items()},
         **{name: render(home, store) for name, render in _SECTIONS.items()},
     }
 
@@ -487,7 +493,7 @@ def _held_leaf_line(stream: str, row: state.TaskRow, store: StoreFacts) -> str:
     label = program_facts.task_label(row)
     named = stream if label is None else f'{stream} {label}'
     waited_on_filed = [other.task_id for other in store.by_stream.get(waits_on, ())]
-    return (
+    return _line(
         f'held {row.task_id} ({named}) waits on {waits_on} {wait.value(row, "contract")} · '
         f'release owner {wait.value(row, "release_owner")} · {waits_on} filed: {_listed(waited_on_filed)}'
     )
