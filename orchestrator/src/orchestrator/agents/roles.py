@@ -71,14 +71,10 @@ class AgentRole:
 
     @property
     def strict_mcp_scope(self) -> bool:
-        """Whether _invoke runs this role with --strict-mcp-config.
+        """Whether this role's whole MCP surface is its declared families.
 
-        True when _invoke spawns every MCP server the role can reach per
-        invocation: it declares a family, none is 'orchestrator', and each
-        mcp__ grant belongs to a declared family. The CLI then does not union
-        in the ambient project/user .mcp.json. Orchestrator-family and
-        family-less roles keep the ambient merge (task 3849; the reviewer
-        trial scopes the same reviewer strictly, evals/reviewer_trial/runner.py).
+        True when it declares a family, none is 'orchestrator', and every
+        mcp__ grant falls under a declared family's prefix.
         """
         if not self.mcp_families or 'orchestrator' in self.mcp_families:
             return False
