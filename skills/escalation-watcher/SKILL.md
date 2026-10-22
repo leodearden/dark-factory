@@ -1113,8 +1113,8 @@ switches on and off. Three behavioural shifts:
    - Hold the task, choosing by the record's **severity**:
      - **Not `info`:** `resolve_issue(..., action='park')`. The task lands `blocked`, held under
        the open L2, because a pinning escalation vetoes the stranded-blocked sweep.
-     - **`info`:** never park. An info record never pins
-       (`escalation/src/escalation/pins.py::classify_pins`; intended, Leo 2026-10-09). The sweep
+     - **`info`:** never park; `resolve_issue` refuses it (`park_on_info`). An info record never
+       pins (`escalation/src/escalation/pins.py::classify_pins`; intended, Leo 2026-10-09). The sweep
        re-pends a parked task within a tick, as with esc-5708-3, reify esc-7881-5 and
        esc-4681-3 (16 s). Leave the escalation pending and **defer** the task:
        1. `set_task_status(id, status='deferred', deferral={'kind': 'until_condition',
@@ -1809,8 +1809,10 @@ enter through `resolve-answers`, with `--source docket` or `--source terminal`.
    Mem0 category, because the Graphiti route keeps the conclusion and distills the reasoning away.
 
 The order is deliberate. The markers go on while the record is still pending, and `resolve_issue`
-runs before `close-decision`, so a server refusal such as `declared_pin_refused` stops the apply
-before the registry records an answer.
+runs before `close-decision`, so a server refusal such as `declared_pin_refused` or `park_on_info`
+stops the apply before the registry records an answer. On `park_on_info` the record is
+info-severity: do not retry the park; hold the task with a deferral (AFK shift 1) and report it to
+Leo.
 
 An L2 with no DecisionRecord is filed, then closed, under
 `scripts/sitting/payloads.py::sitting_decision_id`: `<project>-<esc id>`, or `<project>-recon-<esc
@@ -2348,7 +2350,7 @@ its values may be passed to `resolve_issue`.
 |---|---|---|---|---|
 | `resume` (default) | `resolved` | resumes; resolution text injected (L0 live path) | `blocked` → `pending` (any task-attached level ≥ 1, incl. memberless born-at-L2) | "Here's the answer — continue." |
 | `restart` | `resolved` | killed (soft-cancel → grace → hard) | → `pending` (from `in-progress` or `blocked`) | "This run is off-course — re-run fresh." |
-| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." **Never on an `info` record:** info never pins, so the sweep re-pends the task within a tick. Defer the task instead (AFK shift 1). `resolve_issue` will refuse it once task 6578 lands. |
+| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." **Never on an `info` record:** info never pins, so the sweep re-pends the task within a tick. Defer the task instead (AFK shift 1). `resolve_issue` refuses it with code `park_on_info` and changes nothing; the response's `hint` and `task_id` give the deferral to use instead. An info park that is accepted means that orchestrator's escalation server predates task 6578: defer the task anyway. |
 | `abandon` | `dismissed` | killed | → `cancelled` | "Never run again." |
 | `close_only` | `dismissed` | untouched | none | "Record is noise/duplicate — change nothing." |
 
