@@ -9,7 +9,7 @@ import json
 import sys
 import types
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -256,6 +256,144 @@ def _prompt(program: state.Program, files: state.BatchFiles, number: int) -> str
     return f'{header}\n\n{CLERK_RULES}\n\n{_result_shape()}\n'
 
 
+DELETED_PATH = 'check anchors a deleted path'
+
+
+@dataclass(frozen=True)
+class _DecomposeReturn:
+    """An applied decompose return: its name as the ledger gives it, its stream and its moves."""
+
+    name: str
+    stream: str
+    moves: tuple[state.Move, ...]
+
+
+def _return_names(ledger: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Each return a ``stream_status`` line names, in seq order, once."""
+    named = (line.get('return') for line in _lines(ledger, state.LedgerOp.STREAM_STATUS))
+    return list(dict.fromkeys(name for name in named if name is not None))
+
+
+def _return_file(home: state.Home, name: str) -> Path:
+    path = (home.root / name).resolve()
+    if not path.is_relative_to(home.root.resolve()):
+        raise state.StateError(f'the ledger names the return {name!r}, outside {home.root}')
+    return path
+
+
+def _decompose_return(home: state.Home, name: str) -> _DecomposeReturn | None:
+    """The return *name* when its own ``pass`` is decompose; None for any other pass."""
+    path = _return_file(home, name)
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if data['pass'] != state.Pass.DECOMPOSE:
+            return None
+        moves = tuple(
+            state.Move(from_path=move['from'], to_path=move['to'], symbols=tuple(move['symbols']))
+            for move in data['moves']
+        )
+        return _DecomposeReturn(name, data['stream'], moves)
+    except (OSError, KeyError, TypeError, ValueError) as bad:
+        raise state.StateError(f'{path}: cannot read the applied return\'s moves: {bad!r}') from None
+
+
+def _pending_scans(home: state.Home, ledger: Sequence[Mapping[str, Any]]) -> list[_DecomposeReturn]:
+    """Each applied decompose return no ``scanned`` line names, with the moves no earlier return
+    of its stream carried."""
+    scanned = {line['return'] for line in _lines(ledger, state.LedgerOp.SCANNED)}
+    carried: dict[str, set[state.Move]] = {}
+    pending = []
+    for name in _return_names(ledger):
+        ret = _decompose_return(home, name)
+        if ret is None:
+            continue
+        earlier = carried.setdefault(ret.stream, set())
+        if name not in scanned:
+            new = tuple(move for move in ret.moves if move not in earlier)
+            pending.append(replace(ret, moves=new))
+        earlier.update(ret.moves)
+    return pending
+
+
+def _checked_rows(program: state.Program, pending: Sequence[_DecomposeReturn]) -> tuple[state.TaskRow, ...]:
+    """The non-terminal tasks carrying delivered checks, read once, and only when a move needs it."""
+    if not any(ret.moves for ret in pending):
+        return ()
+    read = state.open_reader(program).tasks_with_delivered_checks()
+    reread = f'; {len(read.reread)} re-read in full' if read.reread else ''
+    print(f'store read at {read.measured_at}: {len(read.rows)} task(s) with delivered checks{reread}')
+    return read.rows
+
+
+def _repath_fields(ret: _DecomposeReturn, impact: Impact) -> dict[str, Any]:
+    anchor = f'check {impact.check} (kind {impact.kind}) anchors {impact.from_path}'
+    moved = ', which the stream deletes' if impact.to_path is None else f', moved to {impact.to_path}'
+    return {
+        'lead_op': str(state.LeadActionOp.REPATH), 'task': impact.task, 'target': impact.to_path,
+        'text': anchor + moved, 'needs_human': impact.to_path is None, 'return': ret.name,
+    }
+
+
+def _kept_for_human(action_id: str) -> dict[str, Any]:
+    return {'id': action_id, 'state': str(state.ActionResultState.KEPT_FOR_HUMAN), 'batch': None,
+            'detail': DELETED_PATH}
+
+
+_Entry = tuple[state.LedgerOp, Mapping[str, Any]]
+
+
+def _stamped(
+    snapshot: home_writer.Snapshot, lines: Sequence[Mapping[str, Any]], entries: Sequence[_Entry],
+) -> tuple[dict[str, Any], ...]:
+    """*entries* stamped to follow the snapshot's ledger and then *lines*."""
+    after = replace(snapshot, ledger=(*snapshot.ledger, *lines))
+    return home_writer.stamp(after, BY, entries, ()).ledger
+
+
+def _scan_lines(
+    snapshot: home_writer.Snapshot, pending: Sequence[_DecomposeReturn],
+    rows: Sequence[state.TaskRow],
+) -> tuple[dict[str, Any], ...]:
+    """Per return: one repath action per impact, a kept-for-human result for each deleted path,
+    then the return's ``scanned`` line naming every action minted for it."""
+    lines: list[dict[str, Any]] = []
+    for ret in pending:
+        impacts = impact_scan(ret.moves, rows)
+        actions = _stamped(snapshot, lines, [
+            (state.LedgerOp.ACTION, _repath_fields(ret, impact)) for impact in impacts
+        ])
+        lines += actions
+        lines += _stamped(snapshot, lines, [
+            *((state.LedgerOp.ACTION_RESULT, _kept_for_human(action['id']))
+              for action, impact in zip(actions, impacts, strict=True) if impact.to_path is None),
+            (state.LedgerOp.SCANNED, {'return': ret.name, 'repaths': [a['id'] for a in actions]}),
+        ])
+    return tuple(lines)
+
+
+def _print_scanned(lines: Sequence[Mapping[str, Any]]) -> None:
+    kept = {line['id'] for line in _lines(lines, state.LedgerOp.ACTION_RESULT)}
+    scanned = _lines(lines, state.LedgerOp.SCANNED)
+    if not scanned:
+        print('scan: every applied decompose return is already scanned')
+    for line in scanned:
+        repaths = [i for i in line['repaths'] if i not in kept]
+        held = [i for i in line['repaths'] if i in kept]
+        found = (f'{len(repaths)} repath(s) {" ".join(repaths)}; '
+                 f'{len(held)} kept for human {" ".join(held)}') if line['repaths'] else 'nothing'
+        print(f'{line["return"]}: {found}')
+
+
+def _scan(home: state.Home) -> None:
+    """Ledger the impact of every unscanned decompose return's moves, in one append."""
+    with home_writer.locked(home) as snapshot:
+        pending = _pending_scans(home, snapshot.ledger)
+        lines = _scan_lines(snapshot, pending, _checked_rows(snapshot.program, pending))
+        if lines:
+            home_writer.append(home, home_writer.Lines(lines, ()))
+    _print_scanned(lines)
+
+
 def _free_batch(home: state.Home) -> int:
     return next(k for k in itertools.count(1) if not home.batch_files(k).actions.exists())
 
@@ -292,14 +430,17 @@ def _print_awaiting(awaiting: Sequence[Mapping[str, Any]]) -> None:
               f'(--accept {action["id"]})')
 
 
-def write(home: state.Home, *, accept: Sequence[str]) -> int:
-    """Batch every unapplied action that needs no human or is accepted; exit 1 on a refused --accept."""
-    snapshot = home_writer.read(home)
-    refusals = _accept_refusals(snapshot.ledger, accept)
+def write(home: state.Home, *, accept: Sequence[str], scan: bool) -> int:
+    """Scan first when asked, then batch every unapplied action that needs no human or is
+    accepted; exit 1 on a refused --accept, before anything is written."""
+    refusals = _accept_refusals(home_writer.read(home).ledger, accept)
     for refusal in refusals:
         print(refusal, file=sys.stderr)
     if refusals:
         return 1
+    if scan:
+        _scan(home)
+    snapshot = home_writer.read(home)
     unapplied = _unapplied(snapshot.ledger)
     batched = [action for action in unapplied if _batchable(action, accept)]
     awaiting = [action for action in unapplied if not _batchable(action, accept)]
@@ -326,6 +467,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     write_command.add_argument('--run', required=True, help='the run id whose home is read')
     write_command.add_argument(
+        '--scan', action='store_true',
+        help="first ledger a repath for each delivered check an unscanned return's moves anchor",
+    )
+    write_command.add_argument(
         '--accept', action='extend', nargs='+', default=[], metavar='ID',
         help='batch these needs-human actions too: a human accepted them',
     )
@@ -335,7 +480,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        return write(state.run_home(args.run), accept=args.accept)
+        return write(state.run_home(args.run), accept=args.accept, scan=args.scan)
     except state.StateError as refused:
         print(f'refused: {refused}', file=sys.stderr)
         return 1
