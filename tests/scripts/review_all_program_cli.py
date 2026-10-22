@@ -43,16 +43,28 @@ class ProgramEnv:
     def home(self) -> Path:
         return self.homes_root / RUN_ID
 
+    def _command(self, script: str, args: tuple[str | Path, ...]) -> list[str]:
+        return [sys.executable, '-I', '-S', str(PROGRAM_DIR / script), *map(str, args)]
+
+    def _environ(self) -> dict[str, str]:
+        return {
+            'PATH': os.environ.get('PATH', ''),
+            'HOME': str(self.cwd),
+            'REVIEW_ALL_HOME': str(self.homes_root),
+            'FUSED_MEMORY_URL': self.store_url,
+        }
+
     def run(self, script: str, *args: str | Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, '-I', '-S', str(PROGRAM_DIR / script), *map(str, args)],
-            cwd=self.cwd, capture_output=True, text=True, timeout=SCRIPT_TIMEOUT_SECS,
-            env={
-                'PATH': os.environ.get('PATH', ''),
-                'HOME': str(self.cwd),
-                'REVIEW_ALL_HOME': str(self.homes_root),
-                'FUSED_MEMORY_URL': self.store_url,
-            },
+            self._command(script, args), cwd=self.cwd, env=self._environ(),
+            capture_output=True, text=True, timeout=SCRIPT_TIMEOUT_SECS,
+        )
+
+    def start(self, script: str, *args: str | Path) -> subprocess.Popen[str]:
+        """The same invocation as ``run``, left running for the caller to wait on."""
+        return subprocess.Popen(
+            self._command(script, args), cwd=self.cwd, env=self._environ(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
 
     def put_inbox(self, fixture_return_name: str, as_stem: str | None = None) -> Path:
