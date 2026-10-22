@@ -1128,9 +1128,12 @@ def create_server(
     registry is never imported, preserving the standalone import path.
 
     *startup_sweep* (default True) — when True, runs
-    ``sweep.run_startup_sweep(queue.queue_dir)`` at construction time (the
-    pre-serving single-writer window) to relocate resolved/dismissed root
-    orphans and loose archive files, and prune stale dated subdirs.  Non-fatal:
+    ``sweep.run_startup_sweep(queue.queue_dir)`` at construction time, before
+    the server binds, to relocate resolved/dismissed root orphans and loose
+    archive files, prune stale dated subdirs and reap orphaned sidecar locks.
+    Other processes write the same queue directory concurrently; the
+    concurrency contract the sweep honours is stated in the
+    ``escalation/src/escalation/sweep.py`` module docstring.  Non-fatal:
     any exception is logged at WARNING level and the server continues binding.
     Pass False in tests that pre-populate the queue and do not want the sweep
     to run.
@@ -1404,7 +1407,7 @@ def create_server(
         _project_root_refusal,
     )
 
-    # --- Startup sweep (pre-serving single-writer window) ---
+    # --- Startup sweep (before binding; other processes write this queue concurrently) ---
     if startup_sweep:
         try:
             _sweep.run_startup_sweep(queue.queue_dir, now=startup_sweep_now)
