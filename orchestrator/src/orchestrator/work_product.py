@@ -205,9 +205,15 @@ class WorkProductProbe:
         if self._attempted_at is not None and now - self._attempted_at < self._ttl_secs():
             return
         self._attempted_at = now
-        self._in_flight = asyncio.get_running_loop().create_task(
+        refresh = asyncio.get_running_loop().create_task(
             self._refresh(load), name='continuity-probe-refresh',
         )
+        self._in_flight = refresh
+        refresh.add_done_callback(self._forget_refresh)
+
+    def _forget_refresh(self, refresh: asyncio.Task[None]) -> None:
+        if self._in_flight is refresh:
+            self._in_flight = None
 
     async def join(self) -> None:
         """Wait for the in-flight refresh, if any, to publish its outcome."""
@@ -246,8 +252,6 @@ class WorkProductProbe:
             if self._escalation_may_be_open:
                 self._escalation_may_be_open = False
                 self._resolve(PROBE_SENTINEL, PROBE_RECOVERED_RESOLUTION)
-        finally:
-            self._in_flight = None
 
     def _failure_escalation(self, exc: Exception) -> SentinelL1:
         streak = self._failure_streak
