@@ -202,7 +202,7 @@ LEDGER_OPS: Mapping[LedgerOp, FieldSpec] = types.MappingProxyType({
     LedgerOp.AMEND_PROGRAM: _field_spec(('section', 'value'), ('ruling',), section=ProgramSection),
     LedgerOp.XREF: _field_spec(('from', 'to', 'text', 'return')),
     LedgerOp.ACTION: _field_spec(
-        ('id', 'op', 'task', 'target', 'text', 'needs_human', 'return'), op=LeadActionOp,
+        ('id', 'lead_op', 'task', 'target', 'text', 'needs_human', 'return'), lead_op=LeadActionOp,
     ),
     LedgerOp.ACTION_RESULT: _field_spec(
         ('id', 'state', 'batch', 'detail'), state=ActionResultState,

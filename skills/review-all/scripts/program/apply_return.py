@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import enum
+import functools
+import hashlib
 import os
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -104,7 +106,7 @@ def _action_entries(ret: state.PrdReturn, return_name: str) -> list[_Entry]:
     """One unnumbered ``action`` entry per lead action; ``_numbered_actions`` gives the ids."""
     return [
         (state.LedgerOp.ACTION, {
-            'op': str(action.op), 'task': action.task, 'target': _target_json(action.target),
+            'lead_op': str(action.op), 'task': action.task, 'target': _target_json(action.target),
             'text': action.text, 'needs_human': action.needs_human, 'return': return_name,
         })
         for action in ret.lead_actions
@@ -123,9 +125,10 @@ def _numbered_actions(entries: Iterable[_Entry], ledger: Iterable[Mapping[str, A
     return numbered
 
 
-def _author_entries(ret: state.PrdReturn, return_name: str) -> list[_Entry]:
+def _seat_entries(ret: state.PrdReturn, return_name: str, *, status: state.StreamStatus) -> list[_Entry]:
+    """An author or decompose return's lines: its stream's new status, then its lists."""
     return [
-        _status_entry(ret, state.StreamStatus.AUTHORED, return_name),
+        _status_entry(ret, status, return_name),
         *_question_entries(ret, return_name),
         *_xref_entries(ret, return_name),
         *_action_entries(ret, return_name),
@@ -133,7 +136,8 @@ def _author_entries(ret: state.PrdReturn, return_name: str) -> list[_Entry]:
 
 
 _PASS_ENTRIES: Mapping[state.Pass, Callable[[state.PrdReturn, str], list[_Entry]]] = {
-    state.Pass.AUTHOR: _author_entries,
+    state.Pass.AUTHOR: functools.partial(_seat_entries, status=state.StreamStatus.AUTHORED),
+    state.Pass.DECOMPOSE: functools.partial(_seat_entries, status=state.StreamStatus.DECOMPOSED),
 }
 
 
@@ -149,14 +153,56 @@ def _digest(ret: state.PrdReturn, ledger: Sequence[Mapping[str, Any]], return_na
     )
 
 
+def _home_relative(home: state.Home, path: Path) -> str:
+    return path.relative_to(home.root).as_posix()
+
+
+def _amendment_file(returns_file: Path, number: int) -> Path:
+    return returns_file.with_name(f'{returns_file.stem}.amend-{number}.json')
+
+
+def _prior_returns(returns_file: Path) -> tuple[Path, ...]:
+    """The return's first applied file, then its amendments in order; empty when never applied."""
+    if not returns_file.exists():
+        return ()
+    priors = [returns_file]
+    while _amendment_file(returns_file, len(priors)).exists():
+        priors.append(_amendment_file(returns_file, len(priors)))
+    return tuple(priors)
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _application_target(
+    home: state.Home, returns_file: Path, raw: bytes, *, amend: bool,
+) -> Path | Refused:
+    """Where this application's file goes, or why the return may not be applied (again)."""
+    stem, priors = returns_file.stem, _prior_returns(returns_file)
+    same = [prior for prior in priors if _sha256(prior.read_bytes()) == _sha256(raw)]
+    if same:
+        return Refused(RefusalKind.APPLICATION, (
+            f'{stem} is already applied: {_home_relative(home, same[0])} has the same content',))
+    if priors and not amend:
+        return Refused(RefusalKind.APPLICATION, (
+            f'{stem} is already applied with different content '
+            f'({_home_relative(home, priors[0])}); re-run with --amend to append the delta',))
+    if amend and not priors:
+        return Refused(RefusalKind.APPLICATION, (
+            f'nothing to amend: {stem} is not applied; apply it without --amend',))
+    return _amendment_file(returns_file, len(priors)) if priors else returns_file
+
+
 def plan_application(
     snapshot: home_writer.Snapshot, inbox_file: Path, *, amend: bool, store: state.StoreView,
     by: str = DEFAULT_BY,
 ) -> Applied | Refused:
     """What applying *inbox_file* would append and where it would move it; reads, never writes."""
     home = home_of(inbox_file)
+    raw = inbox_file.read_bytes()
     try:
-        text = inbox_file.read_text(encoding='utf-8')
+        text = raw.decode('utf-8')
     except UnicodeDecodeError as bad:
         return _refused([state.Rejection('<file>', state.RejectionClass.FORM, f'is not UTF-8: {bad}')])
     checked = state.validate_return(
@@ -171,8 +217,12 @@ def plan_application(
     entries = _PASS_ENTRIES.get(ret.pass_)
     if entries is None:
         return Refused(RefusalKind.APPLICATION, (f'{ret.pass_} returns are not applied yet',))
-    returns_file = home.returns_file(ret.stream, ret.pass_, ret.item)
-    return_name = returns_file.relative_to(home.root).as_posix()
+    returns_file = _application_target(
+        home, home.returns_file(ret.stream, ret.pass_, ret.item), raw, amend=amend,
+    )
+    if isinstance(returns_file, Refused):
+        return returns_file
+    return_name = _home_relative(home, returns_file)
     lines = home_writer.stamp(
         snapshot, by, _numbered_actions(entries(ret, return_name), snapshot.ledger), (),
     )
