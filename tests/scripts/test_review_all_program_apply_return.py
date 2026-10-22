@@ -6,18 +6,20 @@ fixture program, and fixture returns are copied into its inbox.
 from __future__ import annotations
 
 import dataclasses
+import json
 import shutil
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from review_all_program_cli import FIXTURE_RETURNS, ProgramEnv
+from review_all_program_cli import FIXTURE_RETURNS, ProgramEnv, load_program_module
 from review_all_program_fixture import FIXTURE_DIR, FakeStore, load_state, running_fake_store
 
 state = load_state()
 
 S1_PRD = 'plans/review-all-fixture-s1-prd.md'
+S1_AUTHOR_DIGEST = 'S1 author: 0 filed, 0 held, 2 questions, 0 actions → returns/S1.author.json'
 
 
 @pytest.fixture(scope='module')
@@ -83,7 +85,7 @@ def test_b2_an_author_return_is_moved_and_recorded(env: ProgramEnv) -> None:
     ]
     assert not (env.home / 'rulings.jsonl').exists()
     digest, *rest = proc.stdout.splitlines()
-    assert digest == 'S1 author: 0 filed, 0 held, 2 questions, 0 actions → returns/S1.author.json'
+    assert digest == S1_AUTHOR_DIGEST
     (needs_human,) = rest
     assert 'S1:Q1' in needs_human
     assert 'Does alpha or beta own seam contract C1?' in needs_human
@@ -118,9 +120,7 @@ def test_check_reports_the_digest_and_writes_nothing(env: ProgramEnv) -> None:
     before = env.snapshot()
     proc = env.run('apply_return.py', '--check', inbox_file)
     assert proc.returncode == 0, _output(proc)
-    assert proc.stdout.splitlines()[0] == (
-        'check ok: S1 author: 0 filed, 0 held, 2 questions, 0 actions → returns/S1.author.json'
-    )
+    assert proc.stdout.splitlines()[0] == f'check ok: {S1_AUTHOR_DIGEST}'
     assert env.snapshot() == before
 
 
@@ -156,3 +156,129 @@ def test_an_uninitialised_home_names_record_py_init(env: ProgramEnv) -> None:
     proc = env.run('apply_return.py', orphan)
     assert proc.returncode == 1
     assert 'record.py init' in _output(proc)
+
+
+def _contradictions(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith('contradiction: ')]
+
+
+def test_b3_a_store_contradiction_stops_for_the_lead_and_writes_nothing(env: ProgramEnv) -> None:
+    _applied(env, 'S1.author.json')
+    inbox_file = env.put_inbox('S1.decompose.absent-filed.json')
+    before = env.snapshot()
+    applied = env.run('apply_return.py', inbox_file)
+    assert applied.returncode == 1
+    (absent,) = [line for line in _contradictions(_output(applied)) if 'filed[0].task_id:' in line]
+    assert '999' in absent
+    assert 'stop for the lead' in _output(applied).splitlines()[-1]
+    assert env.snapshot() == before
+    checked = env.run('apply_return.py', '--check', inbox_file)
+    assert checked.returncode == 1
+    assert _contradictions(_output(checked)) == _contradictions(_output(applied))
+    assert env.snapshot() == before
+
+
+def test_a_decompose_before_its_author_return_is_a_contradiction(env: ProgramEnv) -> None:
+    inbox_file = env.put_inbox('S1.decompose.json')
+    before = env.snapshot()
+    proc = env.run('apply_return.py', inbox_file)
+    assert proc.returncode == 1
+    assert any(line.startswith('contradiction: pass:') for line in _output(proc).splitlines())
+    assert env.snapshot() == before
+
+
+def _tools_calls(store: FakeStore) -> list[str]:
+    return [
+        entry['body']['params']['name'] for entry in store.requests()
+        if entry['body'].get('method') == 'tools/call'
+    ]
+
+
+def test_b4_a_decompose_return_records_its_status_and_numbered_actions(
+    env: ProgramEnv, store: FakeStore,
+) -> None:
+    _applied(env, 'S1.author.json')
+    calls_before = len(_tools_calls(store))
+    proc = env.run('apply_return.py', env.put_inbox('S1.decompose.json'))
+    assert proc.returncode == 0, _output(proc)
+    by = {'by': 'apply_return.py', 'return': 'returns/S1.decompose.json'}
+    assert _ledger(env)[4:] == [
+        {'seq': 5, 'op': 'stream_status', 'stream': 'S1', 'status': 'decomposed',
+         'prd_path': S1_PRD, **by},
+        {'seq': 6, 'op': 'action', 'id': 'A1', 'lead_op': 'note', 'task': 102, 'target': None,
+         'text': 'Route callers only after 101 lands.', 'needs_human': False, **by},
+        {'seq': 7, 'op': 'action', 'id': 'A2', 'lead_op': 'edge', 'task': 102, 'target': (106,),
+         'text': '102 consumes C2 from S2 α.', 'needs_human': False, **by},
+    ]
+    assert proc.stdout.splitlines()[0] == (
+        'S1 decompose: 2 filed, 1 held, 0 questions, 2 actions → returns/S1.decompose.json'
+    )
+    assert set(_tools_calls(store)[calls_before:]) <= {'get_task', 'find_tasks_by_metadata'}
+    assert len(_tools_calls(store)) > calls_before
+
+
+def _inbox_variant(env: ProgramEnv, fixture_return: str, mutate: Callable[[dict[str, Any]], None]) -> Path:
+    data = json.loads((FIXTURE_RETURNS / fixture_return).read_text())
+    mutate(data)
+    target = env.put_inbox(fixture_return)
+    target.write_text(json.dumps(data, indent=2))
+    return target
+
+
+def _with_lead_note(data: dict[str, Any]) -> None:
+    data['lead_actions'] = [
+        {'op': 'note', 'task': 105, 'target': None, 'text': 'Watch C1.', 'needs_human': False},
+    ]
+
+
+def test_action_ids_stay_dense_across_returns(env: ProgramEnv) -> None:
+    _applied(env, 'S1.author.json')
+    _applied(env, 'S1.decompose.json')
+    proc = env.run('apply_return.py', _inbox_variant(env, 'S2.author.json', _with_lead_note))
+    assert proc.returncode == 0, _output(proc)
+    actions = [line for line in _ledger(env) if line['op'] == 'action']
+    assert [line['id'] for line in actions] == ['A1', 'A2', 'A3']
+    assert actions[-1]['return'] == 'returns/S2.author.json'
+
+
+def test_a_second_application_of_the_same_return_is_refused(env: ProgramEnv) -> None:
+    _applied(env, 'S1.author.json')
+    _applied(env, 'S1.decompose.json')
+    again = env.put_inbox('S1.decompose.json')
+    before = env.snapshot()
+    proc = env.run('apply_return.py', again)
+    assert proc.returncode == 1
+    assert 'already applied' in _output(proc)
+    assert 'returns/S1.decompose.json' in _output(proc)
+    assert env.snapshot() == before
+    amended = env.run('apply_return.py', again, '--amend')
+    assert amended.returncode == 1
+    assert 'already applied' in _output(amended)
+    assert env.snapshot() == before
+
+
+def test_different_content_for_an_applied_return_needs_amend(env: ProgramEnv) -> None:
+    _applied(env, 'S1.author.json')
+    changed = _inbox_variant(env, 'S1.author.json', lambda data: data.update(notes='Revised.'))
+    before = env.snapshot()
+    proc = env.run('apply_return.py', changed)
+    assert proc.returncode == 1
+    assert '--amend' in _output(proc)
+    assert env.snapshot() == before
+
+
+def _fixture_store_factory(store: FakeStore) -> Callable[[Any], Any]:
+    program_state = load_program_module('state')
+    return lambda program: program_state.StoreReader(store.url, program.project_root)
+
+
+def test_apply_returns_typed_outcomes_for_eta(env: ProgramEnv, store: FakeStore) -> None:
+    apply_return = load_program_module('apply_return')
+    factory = _fixture_store_factory(store)
+    applied = apply_return.apply(env.put_inbox('S1.author.json'), store_factory=factory)
+    assert isinstance(applied, apply_return.Applied)
+    assert applied.returns_file.exists()
+    assert applied.digest == S1_AUTHOR_DIGEST
+    refused = apply_return.apply(env.put_inbox('S1.author.json'), store_factory=factory)
+    assert isinstance(refused, apply_return.Refused)
+    assert refused.kind is apply_return.RefusalKind.APPLICATION

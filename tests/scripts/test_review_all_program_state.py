@@ -559,6 +559,24 @@ def test_append_ledger_refuses_a_malformed_question_line(
     assert not home.ledger.exists() or home.ledger.read_bytes() == b''
 
 
+def test_append_ledger_accepts_an_action_line_carrying_its_lead_op(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    state.append_ledger(home, [_line(
+        1, 'action', id='A1', lead_op='edge', task=102, target=[106],
+        text='102 consumes C2 from S2.', needs_human=False,
+    ) | {'return': 'returns/S1.decompose.json'}])
+    (line,) = state.read_ledger(home)
+    assert (line['op'], line['lead_op'], line['target']) == ('action', 'edge', (106,))
+
+
+def test_an_action_line_refuses_a_lead_op_outside_the_vocabulary(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    line = _line(1, 'action', id='A1', lead_op='rename', task=102, target=None, text='t',
+                 needs_human=False) | {'return': 'returns/S1.decompose.json'}
+    with pytest.raises(state.LedgerRefused, match='lead_op'):
+        state.append_ledger(home, [line])
+
+
 def test_read_ledger_refuses_a_hand_edited_gap(tmp_path: Path) -> None:
     home = state.Home(tmp_path)
     home.ledger.write_text(
