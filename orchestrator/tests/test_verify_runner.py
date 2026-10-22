@@ -1707,12 +1707,15 @@ class TestDispatchDurationWiring:
 
         conn = sqlite3.connect(db_path)
         try:
-            rows = conn.execute('SELECT event_type, data FROM events').fetchall()
+            rows = conn.execute(
+                "SELECT data, duration_ms FROM events WHERE event_type = 'merge_verify'"
+            ).fetchall()
         finally:
             conn.close()
-        verify_payloads = [json.loads(data) for (event_type, data) in rows if event_type == 'merge_verify']
-        assert len(verify_payloads) == 1, rows
-        duration_ms = verify_payloads[0]['duration_ms']
+        assert len(rows) == 1, rows
+        (data, duration_column), = rows
+        assert duration_column is None, rows
+        duration_ms = json.loads(data)['duration_ms']
         assert isinstance(duration_ms, int) and not isinstance(duration_ms, bool), duration_ms
         assert 150 <= duration_ms <= outer_ms + 1, (duration_ms, outer_ms)
 
