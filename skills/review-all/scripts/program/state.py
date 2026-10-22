@@ -159,6 +159,7 @@ class LedgerOp(enum.StrEnum):
     SCANNED = 'scanned'
     NOTE = 'note'
     COMMIT = 'commit'
+    QUESTION = 'question'
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,11 @@ LEDGER_OPS: Mapping[LedgerOp, FieldSpec] = types.MappingProxyType({
     LedgerOp.SCANNED: _field_spec(('return', 'repaths')),
     LedgerOp.NOTE: _field_spec(('text',)),
     LedgerOp.COMMIT: _field_spec(('sha', 'paths', 'measured_at')),
+    LedgerOp.QUESTION: _field_spec(
+        ('stream', 'id', 'question', 'options', 'recommendation', 'needs_human', 'source',
+         'return'),
+        ('lead_rulable',), source=QuestionSource,
+    ),
 })
 
 
