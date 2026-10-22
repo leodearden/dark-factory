@@ -17,6 +17,7 @@ from orchestrator.evals.reviewer_trial.corpus import (
 from orchestrator.evals.reviewer_trial.key_pooling import (
     PoolingLog,
     PoolingRecord,
+    audit_pooling,
     fold_pooled_issues,
 )
 
@@ -228,3 +229,54 @@ class TestFoldPooledIssues:
     ) -> None:
         with pytest.raises(ValueError, match=re.escape(repr(offending))):
             _fold(pooled)
+
+
+def _folded_pair() -> tuple[CorpusManifest, PoolingLog]:
+    return _fold({'d1': [_entry('d1_pool_01'), _entry('d1_pool_02')]})
+
+
+class TestAuditPooling:
+    def test_fold_output_is_ok(self) -> None:
+        audit = audit_pooling(*_folded_pair())
+
+        assert audit.ok is True
+        assert audit.duplicate_records == ()
+        assert audit.dangling_records == ()
+        assert audit.unrecorded_issues == ()
+
+    def test_empty_log_over_an_unpooled_corpus_is_ok(self) -> None:
+        assert audit_pooling(_manifest(), PoolingLog()).ok is True
+
+    def test_record_naming_no_key_issue_is_dangling(self) -> None:
+        manifest, log = _folded_pair()
+        log = PoolingLog(records=(*log.records, _record('d1', 'ghost')))
+
+        audit = audit_pooling(manifest, log)
+
+        assert audit.dangling_records == (('d1', 'ghost'),)
+        assert audit.ok is False
+
+    def test_pooled_issue_without_a_record_is_unrecorded(self) -> None:
+        manifest, log = _folded_pair()
+        log = PoolingLog(records=tuple(r for r in log.records if r.issue_id != 'd1_pool_02'))
+
+        audit = audit_pooling(manifest, log)
+
+        assert audit.unrecorded_issues == (('d1', 'd1_pool_02'),)
+        assert audit.ok is False
+
+    def test_repeated_record_is_a_duplicate(self) -> None:
+        manifest, log = _folded_pair()
+        log = PoolingLog(records=(*log.records, log.records[0]))
+
+        audit = audit_pooling(manifest, log)
+
+        assert audit.duplicate_records == (('d1', 'd1_pool_01'),)
+        assert audit.ok is False
+
+    def test_non_pooled_key_issues_are_never_unrecorded(self) -> None:
+        manifest, log = _folded_pair()
+        recorded = {(r.diff_id, r.issue_id) for r in log.records}
+        assert recorded.isdisjoint({('d1', 'a'), ('d2', 'b')})
+
+        assert audit_pooling(manifest, log).unrecorded_issues == ()
