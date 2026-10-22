@@ -1,17 +1,25 @@
-"""Tests for the architect-filed-L0-without-plan early-promote path (RC2a).
+"""An architect that escalates instead of planning blocks behind an L1 (RC2).
 
-When the architect calls ``escalate_blocker`` from plan-tools MCP and exits
-without writing ``.task/plan.json`` or any rejection artifact, the workflow
-must detect the new L0 (compared to the pre-architect snapshot) and route
-directly to ``_mark_blocked(escalate_to_human=True, skip_escalation=True)``,
-bypassing both ``_handle_no_plan_failure`` and the steward.  This stops the
-no-plan loop after the FIRST occurrence rather than letting the cycle
-counter reset on every main-SHA bump (the bug behind 16 successive Opus
-calls on task 917).
+When the architect files a blocking L0 through plan-tools MCP and exits
+without writing ``.task/plan.json`` or any rejection artifact, ``_plan()``
+promotes every L0 it filed, verbatim, to a new level-1 record and blocks
+the task behind them. The L0s are dismissed naming their L1s, so the
+finding a human must act on is open exactly once, and the stranded-blocked
+sweep's own veto keeps the task from being re-pended into the same loop.
+
+An architect that filed only ``escalate_info`` has not escalated in lieu of
+a plan: the no-plan handler (with its cycle counters) runs instead, as it
+does when the architect filed nothing new.
+
+These tests drive ``_plan()`` against a real ``EscalationQueue`` and the
+real ``_mark_blocked`` / ``_handle_no_plan_failure``. The architect
+subprocess (``_invoke``) is the stub, and it files its L0s the way
+escalate_blocker / escalate_info would.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -19,67 +27,92 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _orch_helpers import pydantic_spec
 from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
+from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+
+TASK_ID = '917'
+BLOCKING_SUMMARY = 'Leo decision needed: RECOMMEND KEEP max_concurrent_tasks=24'
+BLOCKING_DETAIL = (
+    'Dispatch latency is flat at 24 slots.\n'
+    'Lowering the cap trades throughput for nothing measurable.\n'
+    'Hypothesis: the latency is merge-lane bound, not slot bound.'
+)
+INFO_SUMMARY = 'Noted: helpers.foo is duplicated in two modules'
 
 
 @dataclass
 class _Fixture:
     wf: TaskWorkflow
-    artifacts: TaskArtifacts
-    escalation_queue: MagicMock
-    mark_blocked: AsyncMock
-    handle_no_plan: AsyncMock
+    queue: EscalationQueue
+    scheduler: MagicMock
     invoke: AsyncMock
 
 
-def _make(
-    *,
-    worktree: Path,
-    project_root: Path,
-    task_id: str = '917',
-    new_l0: Escalation | None = None,
-) -> _Fixture:
-    """Build a TaskWorkflow ready for ``_plan()`` invocation.
+def _architect_l0(
+    queue: EscalationQueue, *, severity: str, summary: str, detail: str,
+) -> Escalation:
+    return Escalation(
+        id=queue.make_id(TASK_ID),
+        task_id=TASK_ID,
+        agent_role='architect',
+        severity=severity,
+        category='design_concern',
+        summary=summary,
+        detail=detail,
+        level=0,
+        filing_claimant_run_id='architect-run/session/pid=1',
+    )
 
-    The escalation_queue stub returns ``[]`` for the pre-architect snapshot
-    and ``[new_l0]`` (when provided) for the post-architect check.  A wrapper
-    list lets us flip the second call's result without rebuilding the mock.
-    """
+
+def _blocking_l0(queue: EscalationQueue) -> Escalation:
+    return _architect_l0(
+        queue, severity='blocking',
+        summary=BLOCKING_SUMMARY, detail=BLOCKING_DETAIL,
+    )
+
+
+def _info_l0(queue: EscalationQueue) -> Escalation:
+    return _architect_l0(
+        queue, severity='info',
+        summary=INFO_SUMMARY, detail='Both copies are identical today.',
+    )
+
+
+def _make(tmp_path: Path) -> _Fixture:
+    """A TaskWorkflow ready for ``_plan()``, backed by a real escalation queue."""
     assignment = MagicMock()
-    assignment.task_id = task_id
+    assignment.task_id = TASK_ID
     assignment.task = {
-        'id': task_id, 'title': 'T', 'description': 'd', 'metadata': {},
+        'id': TASK_ID, 'title': 'T', 'description': 'd', 'metadata': {},
     }
     assignment.modules = ['mod_a']
 
-    _spec = pydantic_spec(OrchestratorConfig)
-    config = MagicMock(spec_set=_spec)
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.fused_memory.project_id = 'dark_factory'
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
-    config.project_root = project_root
+    config.project_root = tmp_path / 'proj'
     config.max_review_cycles = 2
     config.max_amendment_rounds = 1
+    config.unblock_auto.enabled = False
+    config.git.branch_prefix = 'task/'
 
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock()
     scheduler.update_task = AsyncMock(return_value=True)
     scheduler.get_status = AsyncMock(return_value='in-progress')
+    scheduler.get_task = AsyncMock(return_value=None)
 
     git_ops = MagicMock()
     git_ops.get_main_sha = AsyncMock(return_value='currentmain')
 
-    escalation_queue = MagicMock()
-    # First call (pre-architect snapshot) → empty.
-    # Second call (post-architect) → [new_l0] when provided, [] otherwise.
-    post_value = [new_l0] if new_l0 is not None else []
-    escalation_queue.get_by_task = MagicMock(side_effect=[[], post_value])
-
+    queue = EscalationQueue(tmp_path / 'escalations')
     wf = TaskWorkflow(
         assignment=assignment,
         config=config,
@@ -87,139 +120,135 @@ def _make(
         scheduler=scheduler,
         briefing=MagicMock(),
         mcp=MagicMock(),
-        escalation_queue=escalation_queue,
+        escalation_queue=queue,
     )
 
+    worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
     artifacts = TaskArtifacts(worktree)
-    artifacts.init(task_id, 'T', 'd', base_commit='oldbase')
+    artifacts.init(TASK_ID, 'T', 'd', base_commit='oldbase')
     wf.artifacts = artifacts
     wf.worktree = worktree
 
-    # Stub the architect invoke — succeeds but writes nothing (no plan,
-    # no rejection artifact).  The L0 it would have filed via plan-tools
-    # MCP is simulated by the escalation_queue side_effect.
-    invoke = AsyncMock(
-        return_value=AgentResult(
-            success=True,
-            output='filed L0',
-            cost_usd=0.50,
-            duration_ms=10_000,
-            turns=8,
-        ),
-    )
+    invoke = AsyncMock(return_value=AgentResult(
+        success=True, output='filed L0', cost_usd=0.50,
+        duration_ms=10_000, turns=8,
+    ))
     wf._invoke = invoke  # type: ignore[method-assign]
-
-    # Stub _mark_blocked + _handle_no_plan_failure so we can observe the
-    # routing decision without exercising their full machinery.
-    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-    handle_no_plan = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-    wf._handle_no_plan_failure = handle_no_plan  # type: ignore[method-assign]
-
-    # The architect prompt builder is unused in this path but needs to exist.
     wf.briefing.build_architect_prompt = AsyncMock(return_value='prompt')
     wf.briefing.build_revalidation_prompt = AsyncMock(return_value='prompt')
 
-    return _Fixture(
-        wf=wf,
-        artifacts=artifacts,
-        escalation_queue=escalation_queue,
-        mark_blocked=mark_blocked,
-        handle_no_plan=handle_no_plan,
-        invoke=invoke,
+    return _Fixture(wf=wf, queue=queue, scheduler=scheduler, invoke=invoke)
+
+
+def _architect_files(f: _Fixture, *records: Escalation) -> None:
+    """The architect run submits *records*, as escalate_blocker/_info would."""
+    result = f.invoke.return_value
+
+    def _run(*_args: object, **_kwargs: object) -> AgentResult:
+        for record in records:
+            f.queue.submit(record)
+        return result
+
+    f.invoke.side_effect = _run
+
+
+def _open_handoffs(queue: EscalationQueue) -> list[Escalation]:
+    return [e for e in queue.get_by_task(TASK_ID, status='pending') if e.level >= 1]
+
+
+def _pending_l0s(queue: EscalationQueue) -> list[Escalation]:
+    return [e for e in queue.get_by_task(TASK_ID, status='pending') if e.level == 0]
+
+
+def _l1_carrying(handoffs: Sequence[Escalation], summary: str) -> Escalation:
+    matches = [e for e in handoffs if e.summary == summary]
+    assert len(matches) == 1, [(e.id, e.summary) for e in handoffs]
+    return matches[0]
+
+
+def _sweep_would_leave_it_blocked(queue: EscalationQueue) -> bool:
+    return records_pin_blocked_recovery(
+        TASK_ID, queue.get_by_task(TASK_ID, status='pending'), live_claimant=False,
     )
 
 
-def _make_l0(
-    task_id: str = '917',
-    summary: str = 'plan-tools missing_premise: helpers.foo not found',
-    detail: str = 'Architect could not locate helpers.foo on main',
-) -> Escalation:
-    return Escalation(
-        id=f'esc-{task_id}-001',
-        task_id=task_id,
-        agent_role='architect',
-        severity='blocking',
-        category='missing_premise',
-        summary=summary,
-        detail=detail,
-        level=0,
-        status='pending',
-    )
+def _assert_blocked_through_no_plan_handler(
+    f: _Fixture, *, not_promoted: str | None = None,
+) -> None:
+    handoffs = _open_handoffs(f.queue)
+    assert not_promoted not in [e.summary for e in handoffs]
+    assert any('no plan.json produced' in e.summary for e in handoffs), [
+        e.summary for e in handoffs
+    ]
 
 
 @pytest.mark.asyncio
-async def test_new_l0_promotes_to_l1_directly(tmp_path: Path):
-    """Architect fires escalate_blocker without writing plan.json →
-    workflow auto-promotes to _mark_blocked(escalate_to_human=True,
-    skip_escalation=True) with the architect's summary/detail surfaced."""
-    new_l0 = _make_l0(
-        summary='plan-tools missing_premise: helpers.foo not found',
-        detail='Architect could not locate helpers.foo on main',
-    )
-    f = _make(
-        worktree=tmp_path / 'wt',
-        project_root=tmp_path / 'proj',
-        new_l0=new_l0,
-    )
+async def test_blocking_l0_is_promoted_and_pins_the_block(tmp_path: Path):
+    f = _make(tmp_path)
+    l0 = _blocking_l0(f.queue)
+    _architect_files(f, l0)
 
     outcome = await f.wf._plan()
 
     assert outcome == WorkflowOutcome.BLOCKED
-    # _mark_blocked was called with the right flags and the architect's
-    # summary surfaced into the L1 reason/detail.
-    f.mark_blocked.assert_awaited_once()
-    args, kwargs = f.mark_blocked.await_args
-    assert kwargs.get('escalate_to_human') is True
-    assert kwargs.get('skip_escalation') is True, (
-        'skip_escalation must be True — the architect already filed an L0; '
-        'creating a duplicate would clutter the queue'
-    )
-    assert 'helpers.foo not found' in args[0]
-    assert 'Architect could not locate helpers.foo on main' in kwargs['detail']
-    # _handle_no_plan_failure must NOT fire — the deterministic catch
-    # short-circuits before the cycle counter is touched.
-    f.handle_no_plan.assert_not_called()
+    handoffs = _open_handoffs(f.queue)
+    assert len(handoffs) == 1, [(e.id, e.summary) for e in handoffs]
+    l1 = handoffs[0]
+    assert l1.summary == BLOCKING_SUMMARY
+    assert BLOCKING_DETAIL in l1.detail
+    assert _pending_l0s(f.queue) == []
+    dismissed = f.queue.get(l0.id)
+    assert dismissed is not None
+    assert dismissed.status == 'dismissed'
+    assert dismissed.resolution is not None and l1.id in dismissed.resolution
+    assert f.scheduler.set_task_status.await_args_list[-1].args == (TASK_ID, 'blocked')
+    assert _sweep_would_leave_it_blocked(f.queue)
 
 
 @pytest.mark.asyncio
-async def test_pre_existing_l0_not_treated_as_new(tmp_path: Path):
-    """If the same L0 is present BOTH before and after the architect runs
-    (e.g. left over from a prior run), it must NOT trigger the early-promote.
-    The check filters by id-not-in-pre-set.
-    """
-    pre_existing = _make_l0()
-    f = _make(
-        worktree=tmp_path / 'wt',
-        project_root=tmp_path / 'proj',
-    )
-    # Override side_effect — both calls return the same L0 (no new ones).
-    f.escalation_queue.get_by_task = MagicMock(
-        side_effect=[[pre_existing], [pre_existing]],
-    )
+async def test_every_new_l0_is_promoted_keeping_its_severity(tmp_path: Path):
+    f = _make(tmp_path)
+    _architect_files(f, _blocking_l0(f.queue), _info_l0(f.queue))
 
     outcome = await f.wf._plan()
 
     assert outcome == WorkflowOutcome.BLOCKED
-    # Must fall through to _handle_no_plan_failure (the existing path).
-    f.handle_no_plan.assert_awaited_once()
-    f.mark_blocked.assert_not_called()
+    handoffs = _open_handoffs(f.queue)
+    assert len(handoffs) == 2, [(e.id, e.summary) for e in handoffs]
+    assert _l1_carrying(handoffs, BLOCKING_SUMMARY).severity == 'blocking'
+    assert _l1_carrying(handoffs, INFO_SUMMARY).severity == 'info'
+    assert _pending_l0s(f.queue) == []
+    assert _sweep_would_leave_it_blocked(f.queue)
 
 
 @pytest.mark.asyncio
-async def test_no_l0_falls_through_to_no_plan_handler(tmp_path: Path):
-    """When the architect produces no plan AND files no L0, the workflow
-    must fall through to the existing ``_handle_no_plan_failure`` path
-    (the RC2b total-counter backstop applies there)."""
-    f = _make(
-        worktree=tmp_path / 'wt',
-        project_root=tmp_path / 'proj',
-        new_l0=None,
-    )
+async def test_info_only_filing_goes_through_the_no_plan_handler(tmp_path: Path):
+    f = _make(tmp_path)
+    _architect_files(f, _info_l0(f.queue))
 
     outcome = await f.wf._plan()
 
     assert outcome == WorkflowOutcome.BLOCKED
-    f.handle_no_plan.assert_awaited_once()
-    f.mark_blocked.assert_not_called()
+    _assert_blocked_through_no_plan_handler(f, not_promoted=INFO_SUMMARY)
+
+
+@pytest.mark.asyncio
+async def test_l0_pending_before_the_architect_ran_is_not_new(tmp_path: Path):
+    f = _make(tmp_path)
+    f.queue.submit(_blocking_l0(f.queue))
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    _assert_blocked_through_no_plan_handler(f, not_promoted=BLOCKING_SUMMARY)
+
+
+@pytest.mark.asyncio
+async def test_no_l0_goes_through_the_no_plan_handler(tmp_path: Path):
+    f = _make(tmp_path)
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    _assert_blocked_through_no_plan_handler(f)
