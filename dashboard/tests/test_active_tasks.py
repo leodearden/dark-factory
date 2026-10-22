@@ -1,4 +1,5 @@
-"""Tests for the ACTIVE_TASKS aggregator that joins task tree + worktrees."""
+"""Tests for the task-row aggregator behind ``TASKS_SNAPSHOT[p].rows`` and the
+scheduler page, which joins the task tree with per-task runtime state."""
 
 from __future__ import annotations
 
@@ -2163,14 +2164,14 @@ class TestDepsOutsideTheFetchedRows:
 
 
 class TestTheReturnedUnitsCarryTheShapedRows:
-    """``snapshots[label].rows.value`` is the row list ``ACTIVE_TASKS`` is joined from.
+    """``snapshots[label].rows.value`` is what ``/tasks`` serves, and the flat list is joined from it.
 
     The CACHED unit holds the raw MCP rows, because the next render shapes
-    from them. The unit the collector RETURNS must carry the shaped rows, in
-    the same ``TaskRow`` shape as ``ACTIVE_TASKS``, because that is what goes
-    on the wire. These tests pin that the two exposures cannot disagree, and
-    that putting shaped rows on the wire does not use up the raw rows in the
-    cache.
+    from them. The unit the collector RETURNS must carry the shaped rows, as
+    the shaped ``TaskRow`` list, because that is what goes on the wire. These
+    tests pin that the two exposures (the flat list the scheduler reads and
+    the units ``/tasks`` serves) cannot disagree, and that putting shaped rows
+    on the wire does not use up the raw rows in the cache.
 
     Every read goes through ``dashboard.data.tasks.mcp_tool_call``, so the real
     ``acquire_snapshot`` and its cache run underneath.
@@ -2188,13 +2189,13 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         rows = [_raw_row(1, 'in-progress'), _raw_row(2, 'pending'), _raw_row(3, 'blocked')]
         return rows, {int(row['id']): row['status'] for row in rows}
 
-    async def test_active_tasks_is_the_units_rows_joined_in_root_order(
+    async def test_the_flat_list_is_the_units_rows_joined_in_root_order(
         self, tmp_path, monkeypatch, dummy_client,
     ):
-        """ACTIVE_TASKS is every root's ``rows.value``, concatenated in canonical root order.
+        """The flat list is every root's ``rows.value``, concatenated in canonical root order.
 
-        Then the two exposures cannot disagree, and γ3 can retire
-        ``ACTIVE_TASKS`` by deleting it.
+        Then the scheduler page, which reads the flat list, and ``/tasks``,
+        which reads the units, cannot disagree.
         """
         df, reify = self._roots(tmp_path, 'df', 'reify')
         mcp, _calls = _canned_mcp(*self._tree())
@@ -2266,7 +2267,7 @@ class TestTheReturnedUnitsCarryTheShapedRows:
     ):
         """A cut-off root's unit keeps ``value is None``, even when it was measured before.
 
-        The render shaped no rows for it, so ``ACTIVE_TASKS`` gets none, and
+        The render shaped no rows for it, so the flat list gets none, and
         its unit must agree. The unit could otherwise only carry the last
         good RAW list, which is unshaped and heavy on the wire, or the empty
         shaped list, which claims a measured zero at the last good's instant.

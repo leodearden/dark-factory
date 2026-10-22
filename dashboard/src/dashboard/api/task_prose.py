@@ -1,8 +1,8 @@
 """`/api/v2/dashboard/task/{project}/T-{task_id}` — one task's description and details.
 
 Serves the Tasks tab's Task Detail pane, which fetches the prose of the
-selected task on selection and never polls it. The ACTIVE_TASKS list
-deliberately omits both fields (see
+selected task on selection and never polls it. The task rows served as
+``TASKS_SNAPSHOT[p].rows`` deliberately omit both fields (see
 ``dashboard/src/dashboard/data/active_tasks.py::_build_task_row``).
 """
 

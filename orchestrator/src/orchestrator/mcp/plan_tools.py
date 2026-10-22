@@ -98,6 +98,7 @@ from shared.mcp_markup_middleware import (
     RepairPolicy,
     accepts_markup_override,
 )
+from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
 from shared.toolcall_markup import detect_for, repair
 
@@ -2280,6 +2281,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             fact_sink=_markup_fact_sink(artifacts),
         )
     )
+    mcp.add_middleware(MissingArgumentMiddleware())
 
     @mcp.tool()
     @accepts_markup_override
