@@ -12,14 +12,20 @@ fixture repo, so the sweep fails CLOSED: every gate test file that shells a
 history subcommand must be accounted for in exactly one way. It carries the
 marker, it is a helper module imported by a marked test file, or it is listed
 in :data:`READS_ONLY_THROWAWAY_REPOS` with the reason every call it makes
-targets a tmp or fixture repo. A test that reaches the checkout's history only
-through production code makes no call this sweep can see; mark it by hand.
+targets a tmp or fixture repo. A helper's history call is invisible from the
+test files that call into it, so each test file importing such a helper is
+held to the same choice: marked, or listed with the reason none of its calls
+into the helper reads the checkout. A test that reaches the checkout's history
+only through production code, or through a helper's own helper, makes no call
+this sweep can see; mark it by hand.
 
 The sweep reads the disk rather than a pytest collection, for the reason
 ``orchestrator/tests/test_marker_registration_drift.py`` records: a
 FILE_SCOPED run of this file would otherwise check nothing else. The gate's
 test roots come from the production module-config walk, so a new gate package
-is covered without an edit here.
+is covered without an edit here, and every pytest segment is read through
+``verify_cmd.parse_config_command``, the parse the verify runner applies, so
+this guard keeps no pytest flag grammar of its own.
 """
 from __future__ import annotations
 
@@ -46,8 +52,17 @@ MARKER = 'reads_git_history'
 HISTORY_SUBCOMMANDS = frozenset({'log', 'merge-base', 'rev-list', 'describe'})
 
 _SEEDS_ITS_OWN_REPO = 'every history call runs in a tmp_path repo or worktree the test seeds'
+_PARSES_CACHE_BUSTER_TEXT_ONLY = (
+    'imports only redux_cache_buster_versions from _cache_buster_helpers, a text parse; '
+    'no git runs'
+)
 
 READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
+    'dashboard/tests/test_cache_buster_freshness.py': (
+        'resolve_redux_base_state runs only on the repos _init_repo builds under tmp_path'
+    ),
+    'dashboard/tests/test_tab_tasks_deferral.py': _PARSES_CACHE_BUSTER_TEXT_ONLY,
+    'dashboard/tests/test_tab_tasks_invariant_chip.py': _PARSES_CACHE_BUSTER_TEXT_ONLY,
     'fused-memory/tests/server/test_topic_cluster_store.py': (
         'the match is memory-text prose passed to pytest.param; no git runs'
     ),
@@ -124,12 +139,6 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
 
 _GIT_OPTIONS_TAKING_A_VALUE = frozenset({'-C', '-c'})
 _SHELLED_HISTORY_CALL = re.compile(r'git (-C \S+ )?(log|merge-base|rev-list|describe)\b')
-_PYTEST_VALUE_FLAGS = frozenset({
-    '-c', '-k', '-m', '-n', '-o', '-p', '-r', '-W',
-    '--basetemp', '--color', '--deselect', '--dist', '--durations',
-    '--ignore', '--ignore-glob', '--import-mode', '--junitxml',
-    '--log-level', '--maxfail', '--rootdir', '--tb', '--timeout',
-})
 _SWEEP_GROUP = pytest.mark.xdist_group('merge_gate_history_leg_sweep')
 
 
@@ -242,25 +251,23 @@ def imported_module_stems(tree: ast.Module) -> frozenset[str]:
 # ─── The gate's test roots ──────────────────────────────────────────────────
 
 
-def _uv_directory(wrapper_tokens: list[str]) -> str:
-    for index, token in enumerate(wrapper_tokens):
-        if token == '--directory' and index + 1 < len(wrapper_tokens):
-            return wrapper_tokens[index + 1]
-        if token.startswith('--directory='):
-            return token.split('=', 1)[1]
-    return '.'
+def structured_pytest(segment: str) -> verify_cmd.VerifyCmd:
+    """*segment* as the verify runner parses it, refused unless it is one structured pytest run."""
+    parsed = verify_cmd.parse_config_command(segment)
+    assert parsed.tool is verify_cmd.ToolKind.PYTEST and parsed.raw is None, (
+        f'the verify runner cannot structure {segment!r} as one pytest invocation, so this '
+        f'guard cannot read which tests it collects'
+    )
+    return parsed
 
 
 def pytest_segment_roots(
     segment: str, read: Callable[[str], str | None],
 ) -> list[GateTestRoot]:
     """The test roots one ``uv run ... pytest <targets>`` segment collects."""
-    wrapper, _ = vci.anchor_split(segment, vci.PYTEST)
-    directory = _uv_directory(wrapper)
-    paths = [
-        posixpath.normpath(posixpath.join(directory, target))
-        for target in vci.positional_targets(segment, vci.PYTEST, value_flags=_PYTEST_VALUE_FLAGS)
-    ]
+    parsed = structured_pytest(segment)
+    directory = parsed.cwd_rel or '.'
+    paths = [posixpath.normpath(posixpath.join(directory, target)) for target in parsed.targets]
     config = locate_pytest_config(posixpath.commonpath(paths), read) if paths else None
     return [GateTestRoot(path=path, pytest_config=config) for path in paths]
 
@@ -308,10 +315,39 @@ class Sweep:
     def marked(self) -> tuple[SweptFile, ...]:
         return tuple(swept for swept in self.files if MARKER in swept.markers)
 
+    @functools.cached_property
+    def history_helpers(self) -> tuple[SweptFile, ...]:
+        """Non-test modules whose history calls run on whatever repo an importer hands them."""
+        return tuple(
+            swept for swept in self.files
+            if swept.calls and not swept.is_test_module
+            and swept.rel_path not in READS_ONLY_THROWAWAY_REPOS
+        )
+
+    def importing_test_files(self, helper: SweptFile) -> tuple[SweptFile, ...]:
+        return tuple(
+            swept for swept in self.files
+            if swept.is_test_module and swept.root == helper.root and helper.stem in swept.imports
+        )
+
     def is_helper_of_a_marked_file(self, swept: SweptFile) -> bool:
         return not swept.is_test_module and any(
-            marked.root == swept.root and swept.stem in marked.imports
-            for marked in self.marked
+            MARKER in importer.markers for importer in self.importing_test_files(swept)
+        )
+
+    def unaccounted_helper_importers(self) -> list[tuple[SweptFile, SweptFile]]:
+        """Each (helper, importer) pair whose importing test file is neither marked nor listed."""
+        return [
+            (helper, importer)
+            for helper in self.history_helpers
+            for importer in self.importing_test_files(helper)
+            if MARKER not in importer.markers
+            and importer.rel_path not in READS_ONLY_THROWAWAY_REPOS
+        ]
+
+    def reaches_a_history_call(self, swept: SweptFile) -> bool:
+        return bool(swept.calls) or any(
+            swept in self.importing_test_files(helper) for helper in self.history_helpers
         )
 
     def ways_accounted_for(self, swept: SweptFile) -> list[str]:
@@ -328,25 +364,23 @@ class Sweep:
         return {swept.rel_path: swept for swept in self.files}
 
 
+def swept_source(rel_path: str, root: GateTestRoot, source: str) -> SweptFile:
+    tree = ast.parse(source)
+    return SweptFile(
+        rel_path=rel_path, root=root, calls=tuple(history_calls(tree)),
+        markers=applied_marker_names(tree), imports=imported_module_stems(tree),
+    )
+
+
 def _sweep_file(path: Path, root: GateTestRoot) -> SweptFile:
     rel_path = path.relative_to(REPO_ROOT).as_posix()
     try:
-        source = path.read_text()
-        if 'git' not in source:
-            # Every detectable history call and every application of MARKER spells it.
-            return SweptFile(
-                rel_path=rel_path, root=root, calls=(), markers=frozenset(), imports=frozenset(),
-            )
-        tree = ast.parse(source)
+        return swept_source(rel_path, root, path.read_text())
     except (SyntaxError, OSError) as exc:
         raise AssertionError(
             f'{rel_path} could not be read or parsed by the history-reader sweep: {exc!r}. '
             f'A skipped file would make this guard vacuous for it.'
         ) from exc
-    return SweptFile(
-        rel_path=rel_path, root=root, calls=tuple(history_calls(tree)),
-        markers=applied_marker_names(tree), imports=imported_module_stems(tree),
-    )
 
 
 def sweep(roots: frozenset[GateTestRoot]) -> Sweep:
@@ -403,12 +437,12 @@ class LegSegment:
         return frozenset(name for name in _registered_markers(text) if not selects(addopts, {name}))
 
     def timeout_secs(self) -> float | None:
-        _, own_args = vci.anchor_split(self.command, vci.PYTEST)
-        for index, token in enumerate(own_args):
-            if token.startswith('--timeout='):
-                return float(token.split('=', 1)[1])
-            if token == '--timeout' and index + 1 < len(own_args):
-                return float(own_args[index + 1])
+        flags = structured_pytest(self.command).base_flags
+        for index, flag in enumerate(flags):
+            if flag.startswith('--timeout='):
+                return float(flag.split('=', 1)[1])
+            if flag == '--timeout' and index + 1 < len(flags):
+                return float(flags[index + 1])
         return None
 
 
@@ -540,6 +574,45 @@ def test_a_root_segment_names_each_target_and_reads_the_root_config() -> None:
     ]
 
 
+
+def test_a_segment_the_verify_runner_cannot_structure_is_refused() -> None:
+    with pytest.raises(AssertionError, match='cannot structure'):
+        pytest_segment_roots('uv run pytest tests/ | tee log', {}.get)
+
+
+_SYNTHETIC_ROOT = GateTestRoot(path='pkg/tests', pytest_config='pkg/pyproject.toml')
+_HISTORY_HELPER_SOURCE = "def base(root):\n    return _git(root, 'merge-base', 'main', 'HEAD')\n"
+
+
+def test_a_file_that_never_spells_git_still_records_its_imports() -> None:
+    swept = swept_source(
+        'pkg/tests/test_versions.py', _SYNTHETIC_ROOT, 'from _history import versions\n',
+    )
+    assert '_history' in swept.imports
+
+
+def test_a_marked_importer_of_a_history_helper_does_not_vouch_for_an_unmarked_one() -> None:
+    helper = swept_source('pkg/tests/_history.py', _SYNTHETIC_ROOT, _HISTORY_HELPER_SOURCE)
+    marked = swept_source(
+        'pkg/tests/test_reads.py', _SYNTHETIC_ROOT,
+        f'import pytest\nfrom _history import base\npytestmark = pytest.mark.{MARKER}\n',
+    )
+    unmarked = swept_source(
+        'pkg/tests/test_also_reads.py', _SYNTHETIC_ROOT, 'from _history import base\n',
+    )
+    other_root = GateTestRoot(path='other/tests', pytest_config=None)
+    elsewhere = swept_source('other/tests/test_other.py', other_root, 'from _history import base\n')
+    synthetic = Sweep(
+        roots=frozenset({_SYNTHETIC_ROOT, other_root}),
+        files=(helper, marked, unmarked, elsewhere),
+    )
+
+    assert synthetic.ways_accounted_for(helper) == ['a helper imported by a marked test file']
+    assert synthetic.unaccounted_helper_importers() == [(helper, unmarked)]
+    assert synthetic.reaches_a_history_call(unmarked)
+    assert not synthetic.reaches_a_history_call(elsewhere)
+
+
 # ─── The live tree ──────────────────────────────────────────────────────────
 
 
@@ -563,9 +636,28 @@ def test_every_history_reader_in_the_gate_is_accounted_for() -> None:
         f'not accounted for:\n' + '\n'.join(unaccounted) + '\n'
         f'Remedies, one per file: (1) mark every test that reads the REAL checkout\'s '
         f'history with @pytest.mark.{MARKER}, at the narrowest scope covering them; '
-        f'(2) for a helper module, import it from a marked test file; (3) if every history '
+        f'(2) for a helper module, import it from a marked test file, then account for every '
+        f'other test file importing it; (3) if every history '
         f'call targets a tmp or fixture repo, add the file to READS_ONLY_THROWAWAY_REPOS '
         f'with that reason.'
+    )
+
+
+@_SWEEP_GROUP
+def test_every_test_file_importing_a_history_helper_is_accounted_for() -> None:
+    unaccounted = [
+        f'  {importer.rel_path} imports {helper.rel_path}, which runs '
+        f'`git {helper.calls[0].subcommand}` at line {helper.calls[0].line}'
+        for helper, importer in _live_sweep().unaccounted_helper_importers()
+    ]
+    assert not unaccounted, (
+        f'{len(unaccounted)} merge-gate test file(s) import a helper that shells a git history '
+        f'subcommand but are not accounted for:\n' + '\n'.join(unaccounted) + '\n'
+        f'The history call lives in the helper, so a marked test file importing it vouches '
+        f'only for itself. Remedies, one per file: (1) mark every test that hands the helper '
+        f'the REAL checkout with @pytest.mark.{MARKER}; (2) if every call into the helper '
+        f'targets a tmp or fixture repo, or none reaches its history call, add the file to '
+        f'READS_ONLY_THROWAWAY_REPOS with that reason.'
     )
 
 
@@ -581,15 +673,16 @@ def test_every_history_reader_is_accounted_for_exactly_once() -> None:
 
 
 @_SWEEP_GROUP
-def test_every_throwaway_repo_entry_still_reads_history() -> None:
-    files = _live_sweep().by_path()
+def test_every_throwaway_repo_entry_still_reaches_a_history_call() -> None:
+    live = _live_sweep()
+    files = live.by_path()
     stale = [
         rel_path for rel_path in READS_ONLY_THROWAWAY_REPOS
-        if rel_path not in files or not files[rel_path].calls
+        if rel_path not in files or not live.reaches_a_history_call(files[rel_path])
     ]
     assert not stale, (
         f'READS_ONLY_THROWAWAY_REPOS entries that no longer name a gate test file making a '
-        f'history call: {stale}. Remove them.'
+        f'history call or importing a history helper: {stale}. Remove them.'
     )
 
 

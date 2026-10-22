@@ -1291,7 +1291,9 @@ takes no arguments: it always re-reads that process's own
   history-reading tests. Dark-factory's leg runs the `reads_git_history`
   marker per owning package;
   `tests/scripts/test_merge_gate_history_leg.py::test_every_history_reader_in_the_gate_is_accounted_for`
-  fails on an unmarked reader, and
+  fails on an unmarked reader,
+  `tests/scripts/test_merge_gate_history_leg.py::test_every_test_file_importing_a_history_helper_is_accounted_for`
+  on an unmarked test file importing a history-reading helper, and
   `tests/scripts/test_merge_gate_history_leg.py::test_the_leg_runs_exactly_the_roots_that_own_marked_tests`
   keeps the leg's segments on the packages that own marked tests. Green-tier
   for the same reason as `merge_gate_history_pure`.
