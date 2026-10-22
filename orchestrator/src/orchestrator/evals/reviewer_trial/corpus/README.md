@@ -254,15 +254,22 @@ One JSON object per line, one record per pooled answer-key issue
 - `diff_id`, `issue_id` — the annotation and the `ground_truth` id the record
   describes.
 - `pooling_date` — the day the pooling run adjudicated the issue.
-- `pooling_run` — the run's directory, relative to the MAIN checkout and
-  untracked. It holds `pooling/` (`BRIEF.md`, the adjudication standard;
-  `verdicts/P*.json`; `key/key.json`, which unblinds finding ids to arm and
-  trial; `pooled_ground_truth.json`), `skeptic/` and
-  `blocking-adjudication/`.
+- `pooling_run` — the run's tracked directory, relative to the checkout
+  root: `corpus/pooling_runs/<date>/`. It holds the run's adjudication
+  standards (`pooling/BRIEF.md`, `skeptic/BRIEF.md`,
+  `blocking-adjudication/BRIEF.md`) and `pooling/key/key.json`, which
+  unblinds each `finding_ids` entry to arm, trial and reviewer severity.
 - `provenance` — the run's `x_provenance` for the issue, verbatim:
   `finding_ids`, `real` (`yes | partly`), `adjudicated_severity`,
   `skeptic_corrections`, `corpus_severity` (the first-pass rating, before a
   `quality_block` promotion), `quality_block`, `confidence`, `evidence`.
+
+The 2026-10-22 files are verbatim copies from that run's working directory,
+`plans/fable-evidence-package-2026-09-10/campaign-d2/pooling-2026-10-22` in
+the main checkout. That directory is untracked and not durable; the packets,
+the per-finding verdicts (including findings ruled not real) and the rescore
+outputs exist only there. Its `pooled_ground_truth.json` is not copied,
+because the annotations plus this log reproduce it.
 
 Provenance lives here rather than in the annotations for two reasons. The
 adjudication log stays one entry per diff_id, and `CorpusManifest.load`
@@ -307,8 +314,9 @@ kinds, and none merely a suggestion.
 
 **Folding a run.** Pooled entries carry `mutation_type` `pooled_<date>`
 (`pooled_2026_10_22` for the run above). `pooled_ground_truth.json` maps diff_id to entries holding the six
-`GroundTruthIssue` fields plus `x_provenance`. Fold it from `orchestrator/`
-with `uv run python`, then bump `version`:
+`GroundTruthIssue` fields plus `x_provenance`. Copy the run's briefs and
+unblinding key into `corpus/pooling_runs/<date>/`, then fold from
+`orchestrator/` with `uv run python` and bump `version`:
 
 ```python
 import dataclasses, json
@@ -324,7 +332,7 @@ manifest, log = fold_pooled_issues(
     PoolingLog.load(corpus / "pooling_log.jsonl"),
     pooled,
     pooling_date="<YYYY-MM-DD>",
-    pooling_run="<run directory, relative to the main checkout>",
+    pooling_run="orchestrator/src/orchestrator/evals/reviewer_trial/corpus/pooling_runs/<date>",
 )
 dataclasses.replace(manifest, version="<next major>").save(corpus / "manifest.json")
 log.save(corpus / "pooling_log.jsonl")

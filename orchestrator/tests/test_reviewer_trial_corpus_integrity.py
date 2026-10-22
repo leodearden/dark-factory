@@ -19,6 +19,7 @@ an adjudication log.
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from orchestrator.evals.reviewer_trial.mining import audit_corpus
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 from orchestrator.evals.reviewer_trial.scorer import score_panel_run
 
+_REPO_ROOT = Path(__file__).parents[2]
 _PKG_DIR = (
     Path(__file__).parent.parent
     / 'src' / 'orchestrator' / 'evals' / 'reviewer_trial'
@@ -39,7 +41,7 @@ _MANIFEST_PATH = _PKG_DIR / 'corpus' / 'manifest.json'
 _ADJUDICATION_LOG_PATH = _PKG_DIR / 'corpus' / 'adjudication_log.jsonl'
 _POOLING_LOG_PATH = _PKG_DIR / 'corpus' / 'pooling_log.jsonl'
 _POOLING_RUN_2026_10_22 = (
-    'plans/fable-evidence-package-2026-09-10/campaign-d2/pooling-2026-10-22'
+    'orchestrator/src/orchestrator/evals/reviewer_trial/corpus/pooling_runs/2026-10-22'
 )
 
 
@@ -112,6 +114,25 @@ class TestPooledAnswerKey:
         assert severities == {'blocking': 30, 'suggestion': 171}
         assert all(r.pooling_date == '2026-10-22' for r in records)
         assert all(r.provenance['finding_ids'] for r in records)
+
+    def test_every_pooling_run_is_a_directory_in_this_checkout(self) -> None:
+        runs = {r.pooling_run for r in PoolingLog.load(_POOLING_LOG_PATH).records}
+
+        assert runs, 'pooling log is empty'
+        assert not [run for run in runs if not (_REPO_ROOT / run).is_dir()]
+
+    def test_2026_10_22_finding_ids_resolve_in_the_runs_unblinding_key(self) -> None:
+        run_dir = _REPO_ROOT / _POOLING_RUN_2026_10_22
+        key = json.loads((run_dir / 'pooling' / 'key' / 'key.json').read_text())
+        finding_ids = [
+            finding_id
+            for r in PoolingLog.load(_POOLING_LOG_PATH).records
+            if r.pooling_run == _POOLING_RUN_2026_10_22
+            for finding_id in r.provenance['finding_ids']
+        ]
+
+        assert finding_ids
+        assert not [finding_id for finding_id in finding_ids if finding_id not in key]
 
     def test_adjudication_log_has_one_entry_per_diff_id(self) -> None:
         log = AdjudicationLog.load(_ADJUDICATION_LOG_PATH)
