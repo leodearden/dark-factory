@@ -213,6 +213,7 @@ class TestTheCommitStampMaskHidesOnlyTheStamps:
 
 
 class TestAStampOffThisHistoryIsReported:
+    @pytest.mark.reads_git_history
     def test_an_unresolvable_or_missing_commit_is_reported_and_head_is_not(self):
         head = subprocess.run(
             ['git', 'rev-parse', 'HEAD'],
@@ -227,6 +228,7 @@ class TestAStampOffThisHistoryIsReported:
 
         assert [p['path'] for p in _stamps_not_on_head(entries)] == ['a', 'b']
 
+    @pytest.mark.reads_git_history
     def test_each_report_names_its_commit_a_kind_and_a_reason(self):
         entries = [
             {'path': 'a', 'commit': '0' * 40},
@@ -301,6 +303,7 @@ class TestTheCommittedReportIsWhatTheCacheProduces:
         assert _regenerated_pair()[1] == _committed_markdown(), _STALE_REMEDY
 
 
+@pytest.mark.reads_git_history
 class TestEveryCommittedFixtureStampIsOnThisHistory:
     def test_every_stamp_is_an_ancestor_of_head(self):
         stamps = _committed_report()['fixture_provenance']

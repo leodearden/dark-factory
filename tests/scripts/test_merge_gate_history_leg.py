@@ -12,7 +12,8 @@ fixture repo, so the sweep fails CLOSED: every gate test file that shells a
 history subcommand must be accounted for in exactly one way. It carries the
 marker, it is a helper module imported by a marked test file, or it is listed
 in :data:`READS_ONLY_THROWAWAY_REPOS` with the reason every call it makes
-targets a tmp or fixture repo.
+targets a tmp or fixture repo. A test that reaches the checkout's history only
+through production code makes no call this sweep can see; mark it by hand.
 
 The sweep reads the disk rather than a pytest collection, for the reason
 ``orchestrator/tests/test_marker_registration_drift.py`` records: a
@@ -41,7 +42,82 @@ REPO_ROOT = Path(__file__).parents[2]
 MARKER = 'reads_git_history'
 HISTORY_SUBCOMMANDS = frozenset({'log', 'merge-base', 'rev-list', 'describe'})
 
-READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {}
+_SEEDS_ITS_OWN_REPO = 'every history call runs in a tmp_path repo or worktree the test seeds'
+
+READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
+    'fused-memory/tests/server/test_topic_cluster_store.py': (
+        'the match is memory-text prose passed to pytest.param; no git runs'
+    ),
+    'fused-memory/tests/test_live_workflow_detector.py': (
+        'run_git is patched; each git argv is a mocked CompletedProcess or side-effect input'
+    ),
+    'orchestrator/tests/test_atomic_train_merge.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_branch_stack.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_branch_work_landed.py': '_Repo wraps the tmp_path git_repo fixture',
+    'orchestrator/tests/test_citation_gate_positive_arm.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_convert_to_blocked.py': (
+        'a predicate over recorded argv; the probe it intercepts runs in the tmp git_ops repo'
+    ),
+    'orchestrator/tests/test_git_ops.py': (
+        'GitOps over the tmp_path git_repo fixture and its worktrees'
+    ),
+    'orchestrator/tests/test_git_ops_no_op_landing.py': '_Repo wraps the tmp_path git_repo fixture',
+    'orchestrator/tests/test_git_ops_unstack.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_group_merge_candidate_ordering.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_harness_plan_step_rederive.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_harness_warm_lane_wiring.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_landlock.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_merge_chain_unstack.py': 'GitOps over a tmp_path repo',
+    'orchestrator/tests/test_merge_gate_already_on_main.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_merge_gates_equivalence_rename.py': 'GitOps over a tmp_path repo',
+    'orchestrator/tests/test_merge_gates_plan_files_rename.py': (
+        'a predicate over recorded argv; the probe it intercepts runs in the tmp git_repo fixture'
+    ),
+    'orchestrator/tests/test_merge_lane_ratchet_commit_gate.py': (
+        '_Repo.seeded builds its repo under tmp_path'
+    ),
+    'orchestrator/tests/test_merge_queue.py': 'GitOps over the tmp_path git_repo fixture',
+    'orchestrator/tests/test_merge_queue_build_chain.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_merge_queue_deep_dispatch.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_merge_queue_deep_integration_gate.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_merge_queue_deep_landing.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_merge_speculation.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_plan_tools_server.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_rebase_branch_reset_guard.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_rebased_solo_landing_ladder.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_reconcile_done_step_commits.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_recut_ruling_gitops.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_roles_ancestry_check.py': 'every call runs in a clone under tmp_path',
+    'orchestrator/tests/test_timeout_marker_inversion_guard.py': (
+        'create_subprocess_exec is faked; the git argv is a recorded-call literal'
+    ),
+    'orchestrator/tests/test_train_moved_main.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_verify_phase_rebase.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_warm_lane_abort_teardown.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_warm_lane_integration_gate.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_warm_lane_pool.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_workflow_e2e.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_workflow_helpers.py': _SEEDS_ITS_OWN_REPO,
+    'scripts/tests/test_flip_reify_gate_exclude_heavy.py': (
+        'every call runs in the fake reify repo under tmp_path'
+    ),
+    'scripts/tests/test_install_memory_metadata_coverage_census_timer.py': (
+        'every call runs in a fake, decoy or outer repo under tmp_path'
+    ),
+    'scripts/tests/test_legibility_nightly.py': _SEEDS_ITS_OWN_REPO,
+    'scripts/tests/test_merge_deep_set_cap.py': _SEEDS_ITS_OWN_REPO,
+    'scripts/tests/test_merge_pytest_n_ab_switch.py': _SEEDS_ITS_OWN_REPO,
+    'shared/tests/test_merge_subject.py': _SEEDS_ITS_OWN_REPO,
+    'tests/scripts/test_merge_gate_history_leg.py': (
+        "this guard's own synthetic sources: string literals it parses, never runs"
+    ),
+    'tests/scripts/test_merge_marker_search_snippets.py': (
+        'the snippets run against the shadowed_history repo under tmp_path'
+    ),
+    'tests/scripts/test_unblock_skill_done_provenance_templates.py': (
+        'the matches are skill-prose fixtures it scans; no git runs'
+    ),
+}
 
 _GIT_OPTIONS_TAKING_A_VALUE = frozenset({'-C', '-c'})
 _SHELLED_HISTORY_CALL = re.compile(r'git (-C \S+ )?(log|merge-base|rev-list|describe)\b')
