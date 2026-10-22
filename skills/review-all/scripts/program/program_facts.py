@@ -10,7 +10,7 @@ import types
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, assert_never
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -38,19 +38,16 @@ def _raw(path: Path) -> bytes:
 
 
 def read_home(run_id: str) -> HomeRead:
-    """The home of *run_id*; its parsed state and its file bytes describe the same instant."""
+    """The home of *run_id*, loaded as ``run_cli.load_run`` loads it, but under program.json's lock.
+
+    The run, the rulings and the file bytes are all read inside that one lock, so
+    they describe the same instant.
+    """
     home = state.run_home(run_id)
     with home_writer.locked(home) as snapshot:
+        run = run_cli.load_run(run_id)
         files = {path.name: _raw(path) for path in (home.program_json, home.rulings, home.ledger)}
-    program = snapshot.program
-    if program.run_id != run_id:
-        raise state.StateError(f'{home.program_json} is the program of {program.run_id}, not {run_id}')
-    views = state.stream_views(program, snapshot.ledger)
-    return HomeRead(
-        run=run_cli.Run(home, program, snapshot.ledger, views),
-        rulings=snapshot.rulings,
-        files=types.MappingProxyType(files),
-    )
+    return HomeRead(run=run, rulings=snapshot.rulings, files=types.MappingProxyType(files))
 
 
 class ProgramState(enum.StrEnum):
@@ -171,13 +168,29 @@ def current_rulings(rulings: Sequence[Mapping[str, Any]]) -> tuple[CurrentRuling
     return tuple(CurrentRuling(r, chain(r)) for r in rulings if r['id'] not in replaced)
 
 
+def _recorded(program: state.Program, section: state.ProgramSection) -> tuple[Any, ...]:
+    match section:
+        case state.ProgramSection.SEAMS_EXTRA:
+            return program.seams_extra
+        case state.ProgramSection.INVARIANTS:
+            return program.invariants
+        case state.ProgramSection.ROUTED:
+            return program.routed
+        case state.ProgramSection.CONVENTIONS_EXTRA:
+            return program.conventions_extra
+        case state.ProgramSection.TRIAGE:
+            return program.triage
+        case _:
+            assert_never(section)
+
+
 def program_section(home: HomeRead, section: state.ProgramSection) -> tuple[Any, ...]:
     """The section's program.json values, then each ``amend_program`` value for it, in seq order."""
     amended = tuple(
         line['value'] for line in home.run.ledger
         if line['op'] == state.LedgerOp.AMEND_PROGRAM and line['section'] == section
     )
-    return (*getattr(home.run.program, section.value), *amended)
+    return (*_recorded(home.run.program, section), *amended)
 
 
 @dataclass(frozen=True)
