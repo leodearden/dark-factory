@@ -58,7 +58,9 @@ git always emits English-locale diagnostics. ``git_ops._git_clean_failure_
 is_benign`` substring-matches that English warning text; under a translated
 locale the matcher silently stops recognising it, defeating the R3
 ENOENT-tolerance fix for the 4892-class warm-lane FAULT. Do not "simplify"
-this away.
+this away. A caller whose child must see the caller's own environment passes
+``pin_c_locale=False`` — orchestrator ``verify_runner``'s ssh/push transport,
+because ssh forwards ``LANG``/``LC_*`` to the remote host.
 
 CANCELLATION SAFETY (tasks 2608, 4155, 6346). If the ``communicate()`` await is
 interrupted — a caller-side ``asyncio.wait_for``, an outer cancellation, or
@@ -161,9 +163,12 @@ async def _kill_and_reap(proc: asyncio.subprocess.Process, pgid: int) -> None:
 
 
 async def _spawn_session_leader(
-    cmd: Sequence[str], cwd: Path | str | None, *, pipe_stdin: bool,
+    cmd: Sequence[str], cwd: Path | str | None, *, pipe_stdin: bool, pin_c_locale: bool,
 ) -> asyncio.subprocess.Process:
-    """Spawn *cmd* as a new session's leader, its output piped, in the C locale.
+    """Spawn *cmd* as a new session's leader, its output piped.
+
+    With *pin_c_locale* the child runs in the C locale; without it the child
+    inherits ``os.environ`` verbatim.
 
     asyncio's own cleanup for a spawn interrupted after the fork kills only the
     direct child, so an interrupted spawn is waited out and its whole group
@@ -171,7 +176,7 @@ async def _spawn_session_leader(
     """
     # Force a stable C locale so child output is always English and amenable
     # to substring matching (see the module docstring — this is load-bearing).
-    env = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'}
+    env = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'} if pin_c_locale else None
     spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(cwd) if cwd is not None else None,
@@ -213,6 +218,7 @@ async def run_git(
     input_text: str | None = None,
     timeout: float | None = None,
     bounded: bool = True,
+    pin_c_locale: bool = True,
 ) -> GitResult:
     """Spawn *cmd* asynchronously and return its :class:`GitResult`.
 
@@ -238,13 +244,16 @@ async def run_git(
         that the bound is sized for short-lived git probes, so a caller
         whose children are long-lived or operator-supplied must pass
         ``False`` rather than park them in the probes' queue.
+    :param pin_c_locale: whether the child runs with ``LC_ALL=C``/``LANG=C``
+        (the default; see "locale is load-bearing" in the module docstring).
+        ``False`` hands the child the caller's environment unchanged.
 
     :raises FileNotFoundError: the binary (or *cwd*) does not exist.
     """
     if not bounded:
-        return await _spawn_and_communicate(cmd, cwd, input_text, timeout)
+        return await _spawn_and_communicate(cmd, cwd, input_text, timeout, pin_c_locale)
     async with _semaphore_for_running_loop():
-        return await _spawn_and_communicate(cmd, cwd, input_text, timeout)
+        return await _spawn_and_communicate(cmd, cwd, input_text, timeout, pin_c_locale)
 
 
 async def _spawn_and_communicate(
@@ -252,9 +261,12 @@ async def _spawn_and_communicate(
     cwd: Path | str | None,
     input_text: str | None,
     timeout: float | None,
+    pin_c_locale: bool,
 ) -> GitResult:
     """The primitive itself, run under the caller's semaphore slot."""
-    proc = await _spawn_session_leader(cmd, cwd, pipe_stdin=input_text is not None)
+    proc = await _spawn_session_leader(
+        cmd, cwd, pipe_stdin=input_text is not None, pin_c_locale=pin_c_locale,
+    )
     pgid = proc.pid  # frozen at spawn: see shared.proc_group's module docstring (task 845)
     communicate = proc.communicate(
         input=input_text.encode() if input_text is not None else None,
