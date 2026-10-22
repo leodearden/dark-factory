@@ -6,6 +6,7 @@ fixture program, and fixture returns are copied into its inbox.
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import json
 import os
 import re
@@ -16,7 +17,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from review_all_program_cli import FIXTURE_RETURNS, RUN_ID, ProgramEnv, load_program_module
+from review_all_program_cli import (
+    FIXTURE_RETURNS,
+    RUN_ID,
+    ProgramEnv,
+    load_program_module,
+    wait_until_blocked_on,
+)
 from review_all_program_fixture import FIXTURE_DIR, FakeStore, load_state, running_fake_store
 
 state = load_state()
@@ -93,6 +100,24 @@ def test_b2_an_author_return_is_moved_and_recorded(env: ProgramEnv) -> None:
     assert 'S1:Q1' in needs_human
     assert 'Does alpha or beta own seam contract C1?' in needs_human
     assert 'alpha owns C1' in needs_human
+
+
+def test_apply_waits_for_the_home_writer_lock(env: ProgramEnv) -> None:
+    inbox_file = env.put_inbox('S1.author.json')
+    program_json = env.home / 'program.json'
+    with program_json.open() as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        writer = env.start('apply_return.py', inbox_file)
+        try:
+            wait_until_blocked_on(program_json, writer)
+            assert not (env.home / 'ledger.jsonl').exists()
+            assert _inbox(env) == ['S1.author.json']
+        finally:
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+    stdout, stderr = writer.communicate(timeout=60)
+    assert writer.returncode == 0, stdout + stderr
+    assert stdout.splitlines()[0] == S1_AUTHOR_DIGEST
+    assert _inbox(env) == []
 
 
 def test_b3_a_form_rejection_names_the_field_and_writes_nothing(env: ProgramEnv) -> None:

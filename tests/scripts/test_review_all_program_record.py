@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from review_all_program_cli import RUN_ID, ProgramEnv, load_program_module
+from review_all_program_cli import RUN_ID, ProgramEnv, load_program_module, wait_until_blocked_on
 from review_all_program_fixture import FIXTURE_DIR, FakeStore, load_state, running_fake_store
 
 state = load_state()
@@ -244,17 +244,16 @@ def test_recorded_questions_keep_the_latest_line_per_item(home: ProgramEnv) -> N
 
 
 def test_rule_waits_for_the_home_writer_lock(home: ProgramEnv) -> None:
-    rulings = home.home / 'rulings.jsonl'
-    with (home.home / 'program.json').open() as held:
+    program_json = home.home / 'program.json'
+    with program_json.open() as held:
         fcntl.flock(held.fileno(), fcntl.LOCK_EX)
         writer = home.start(
             'record.py', 'rule', '--run', RUN_ID, '--by', 'human', '--question', 'q?',
             '--ruling', 'r', '--source', 'sitting 1', *_HUMAN,
         )
         try:
-            with pytest.raises(subprocess.TimeoutExpired):
-                writer.wait(timeout=0.5)
-            assert not rulings.exists()
+            wait_until_blocked_on(program_json, writer)
+            assert not (home.home / 'rulings.jsonl').exists()
         finally:
             fcntl.flock(held.fileno(), fcntl.LOCK_UN)
     stdout, stderr = writer.communicate(timeout=60)

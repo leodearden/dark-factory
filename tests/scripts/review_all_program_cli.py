@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,6 +84,33 @@ class ProgramEnv:
             str(path.relative_to(self.home)): path.read_bytes()
             for path in sorted(self.home.rglob('*')) if path.is_file()
         }
+
+
+PROC_LOCKS = Path('/proc/locks')
+
+
+def _blocked_waiters(inode: int) -> set[int]:
+    """The pids ``/proc/locks`` lists as blocked (``->``) on a lock of the file with *inode*."""
+    rows = (line.split() for line in PROC_LOCKS.read_text().splitlines())
+    return {
+        int(row[5]) for row in rows
+        if len(row) >= 7 and row[1] == '->' and row[6].rpartition(':')[2] == str(inode)
+    }
+
+
+def wait_until_blocked_on(locked: Path, process: subprocess.Popen[str]) -> None:
+    """Return once *process* is blocked on *locked*'s lock; fail if it exits or never blocks."""
+    inode = locked.stat().st_ino
+    deadline = time.monotonic() + SCRIPT_TIMEOUT_SECS
+    while process.pid not in _blocked_waiters(inode):
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(f'exited {process.returncode} before blocking on {locked}: '
+                                 f'{stdout}{stderr}')
+        if time.monotonic() > deadline:
+            process.kill()
+            raise AssertionError(f'not blocked on {locked} within {SCRIPT_TIMEOUT_SECS}s')
+        time.sleep(0.02)
 
 
 def load_program_module(name: str) -> types.ModuleType:
