@@ -253,28 +253,45 @@ def _require_repository_root(config: Path, policy: Policy) -> None:
         )
 
 
-def _require_owned_out_dir(config: Path, policy: Policy) -> None:
-    out_dir = policy.out_dir
+class OutDirRefused(Exception):
+    """An out_dir the publisher must not write to: missing, not a real directory, or another user's."""
+
+    def __init__(self, *, problem: PolicyProblem, out_dir: Path, detail: str) -> None:
+        self.problem = problem
+        self.out_dir = out_dir
+        self.detail = detail
+        super().__init__(f'out_dir refused ({problem}): {detail}')
+
+
+def require_usable_out_dir(out_dir: Path) -> None:
+    """The one check that out_dir is a directory, not a symlink, owned by the running user; at policy load and at writer open."""
     try:
         status = os.lstat(out_dir)
     except OSError as exc:
-        raise PolicyError(
-            config=config,
+        raise OutDirRefused(
             problem=PolicyProblem.OUT_DIR_UNUSABLE,
+            out_dir=out_dir,
             detail=f'out_dir {out_dir} cannot be inspected: {exc.strerror}',
         ) from exc
     if not stat.S_ISDIR(status.st_mode):
-        raise PolicyError(
-            config=config,
+        raise OutDirRefused(
             problem=PolicyProblem.OUT_DIR_UNUSABLE,
+            out_dir=out_dir,
             detail=f'out_dir {out_dir} is not a directory (a symlink is refused)',
         )
     if status.st_uid != os.geteuid():
-        raise PolicyError(
-            config=config,
+        raise OutDirRefused(
             problem=PolicyProblem.OUT_DIR_NOT_OWNED,
+            out_dir=out_dir,
             detail=f'out_dir {out_dir} is owned by uid {status.st_uid}, not the running uid {os.geteuid()}',
         )
+
+
+def _require_owned_out_dir(config: Path, policy: Policy) -> None:
+    try:
+        require_usable_out_dir(policy.out_dir)
+    except OutDirRefused as exc:
+        raise PolicyError(config=config, problem=exc.problem, detail=exc.detail) from exc
 
 
 def load_policy(config: Path) -> Policy:

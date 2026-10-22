@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
@@ -84,3 +86,19 @@ def make_repo(path: Path) -> Repo:
     repo = Repo(path)
     repo.git('init', '-q', '-b', 'main')
     return repo
+
+
+def path_with_git_killed_on(bin_dir: Path, subcommand: str) -> str:
+    """A PATH whose `git` dies of SIGKILL running `subcommand` and is the real git for every other."""
+    real_git = shutil.which('git')
+    if real_git is None:
+        raise RuntimeError('no git on PATH to wrap')
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    wrapper = bin_dir / 'git'
+    wrapper.write_text(
+        '#!/bin/sh\n'
+        f'[ "$1" = {shlex.quote(subcommand)} ] && kill -KILL $$\n'
+        f'exec {shlex.quote(real_git)} "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    return f'{bin_dir}{os.pathsep}{os.environ["PATH"]}'
