@@ -20,6 +20,7 @@ from client_feed.budget import counted_set
 from client_feed.contract import (
     Branch,
     Degradation,
+    EngagementProjection,
     EventHeader,
     FeedEvent,
     FeedLine,
@@ -28,6 +29,7 @@ from client_feed.contract import (
     NonNegativeInt,
     Source,
 )
+from client_feed.engagement import EngagementUnusable, read_engagement
 from client_feed.envelope import Stamp
 from client_feed.feed_io import Cursor, OutDir
 from client_feed.fold import fold
@@ -62,7 +64,7 @@ TASKS_RESCAN_PASSES: Final = 60
 UNKNOWN_MERGE_GRACE: Final = timedelta(hours=1)
 
 _NO_ESCALATIONS: Final = OpenEscalations(by_task=MappingProxyType({}))
-_SOURCE_ERRORS: Final = (StoreReadError, GitError, ArchiveReadError)
+_SOURCE_ERRORS: Final = (StoreReadError, GitError, ArchiveReadError, EngagementUnusable)
 
 _log = logging.getLogger(__name__)
 
@@ -79,9 +81,11 @@ class PassReport(BaseModel):
     degraded: tuple[Degradation, ...]
 
 
-def _source_of(exc: StoreReadError | GitError | ArchiveReadError) -> Source:
+def _source_of(exc: StoreReadError | GitError | ArchiveReadError | EngagementUnusable) -> Source:
     if isinstance(exc, StoreReadError):
         return exc.source
+    if isinstance(exc, EngagementUnusable):
+        return Source.ENGAGEMENT
     return Source.GIT if isinstance(exc, GitError) else Source.ARCHIVE
 
 
@@ -108,6 +112,14 @@ def _skipped(source: Source, rows: Iterable[tuple[int, StrEnum]]) -> tuple[Degra
     reason = f'skipped {len(rows)} rows: {counts}'
     _log.warning('source %s %s (ids %s)', source, reason, ', '.join(str(key) for key, _ in rows))
     return (Degradation(source=source, reason=reason),)
+
+
+def _engagement_unit(policy: Policy, degraded: list[Degradation]) -> EngagementProjection | None:
+    """This project's engagement, None while it is unusable; a projection of another project raises and stops the pass."""
+    return _guarded(
+        lambda: read_engagement(policy.project_root, policy.in_dir, project_id=policy.project_id),
+        degraded,
+    )
 
 
 @dataclass(frozen=True)
@@ -275,6 +287,7 @@ def run_pass(
     cursor = out.cursor
     stamp = out.stamp()
     degraded: list[Degradation] = []
+    engagement = _engagement_unit(policy, degraded)
     store = _events_store_unit(root, cursor, now, degraded)
     tasks = _tasks_unit(root, None if rescan_tasks else cursor.tasks_updated_at, store, degraded)
     upserts = task_events(
@@ -307,7 +320,7 @@ def run_pass(
         **stamp(now),
         head=None if git is None else git.head,
         as_of=now,
-        engagement_version=None,
+        engagement_version=None if engagement is None else engagement.engagement_version,
         watermark_seq=out.state.watermark_seq,
         degraded=tuple(degraded),
     )
