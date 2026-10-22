@@ -138,6 +138,11 @@ def _answered_item(ret: state.PrdReturn) -> state.ItemRef | None:
     return None if ret.item is None else state.ItemRef(ret.stream, ret.item)
 
 
+def _session_source(return_name: str) -> str:
+    """How the ``source`` of every ruling minted from *return_name*'s rulings_in_session begins."""
+    return f'{return_name} session ruling '
+
+
 def _session_ruling_fields(
     ret: state.PrdReturn, ruling: state.SessionRuling, return_name: str,
 ) -> dict[str, Any]:
@@ -145,7 +150,7 @@ def _session_ruling_fields(
         'stream': ret.stream, 'item': ret.item, 'question': ruling.question,
         'ruling': ruling.ruling, 'options': list(ruling.options),
         'consequence': ruling.consequence, 'keys': [],
-        'source': f'{return_name} session ruling {ruling.id}', 'supersedes': None,
+        'source': _session_source(return_name) + ruling.id, 'supersedes': None,
     }
     item = _answered_item(ret)
     if item is not None:
@@ -285,11 +290,35 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _ledgered(snapshot: home_writer.Snapshot, return_name: str) -> bool:
+    """Whether a ledger line or a minted ruling already records applying *return_name*."""
+    return (any(line.get('return') == return_name for line in snapshot.ledger)
+            or any(str(ruling['source']).startswith(_session_source(return_name))
+                   for ruling in snapshot.rulings))
+
+
+def _unmoved(
+    home: state.Home, inbox_file: Path, path: Path, snapshot: home_writer.Snapshot,
+) -> Refused | None:
+    """An application whose lines were appended but whose file never reached returns/."""
+    name = _home_relative(home, path)
+    if not _ledgered(snapshot, name):
+        return None
+    return Refused(RefusalKind.APPLICATION, (
+        f'{path.stem} is already applied per the ledger, which names {name}; '
+        f'move {_home_relative(home, inbox_file.resolve())} to {name}',))
+
+
 def _application_target(
-    home: state.Home, returns_file: Path, raw: bytes, *, amend: bool,
+    home: state.Home, inbox_file: Path, returns_file: Path, raw: bytes,
+    snapshot: home_writer.Snapshot, *, amend: bool,
 ) -> _Target | Refused:
     """Where this application's file goes, or why the return may not be applied (again)."""
     stem, priors = returns_file.stem, _prior_returns(returns_file)
+    path = _amendment_file(returns_file, len(priors)) if priors else returns_file
+    unmoved = _unmoved(home, inbox_file, path, snapshot)
+    if unmoved is not None:
+        return unmoved
     same = [prior for prior in priors if _sha256(prior.read_bytes()) == _sha256(raw)]
     if same:
         return Refused(RefusalKind.APPLICATION, (
@@ -302,9 +331,8 @@ def _application_target(
         return Refused(RefusalKind.APPLICATION, (
             f'nothing to amend: {stem} is not applied; apply it without --amend',))
     if not priors:
-        return _Target(returns_file, None, ())
-    names = tuple(_home_relative(home, prior) for prior in priors)
-    return _Target(_amendment_file(returns_file, len(priors)), len(priors), names)
+        return _Target(path, None, ())
+    return _Target(path, len(priors), tuple(_home_relative(home, prior) for prior in priors))
 
 
 def _item_rejections(ret: state.PrdReturn, snapshot: home_writer.Snapshot) -> list[state.Rejection]:
@@ -361,7 +389,7 @@ def plan_application(
         return checked
     ret, measured_at = checked
     returns_file = home.returns_file(ret.stream, ret.pass_, ret.item)
-    target = _application_target(home, returns_file, raw, amend=amend)
+    target = _application_target(home, inbox_file, returns_file, raw, snapshot, amend=amend)
     if isinstance(target, Refused):
         return target
     rejections = _item_rejections(ret, snapshot)

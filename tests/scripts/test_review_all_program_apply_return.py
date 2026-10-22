@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -401,6 +402,44 @@ def test_b16_amend_appends_only_the_delta_and_keeps_the_first_file(env: ProgramE
     questions = load_program_module('questions')
     recorded = questions.recorded_questions(state.read_ledger(state.Home(env.home)))
     assert sorted(str(ref) for ref in recorded) == ['S1:Q1', 'S1:Q2', 'S1:Q3']
+
+
+def _first_author(env: ProgramEnv) -> None:
+    _applied(env, 'S1.author.json')
+
+
+def _amended(env: ProgramEnv) -> None:
+    _first_author(env)
+    assert _amended_author(env).returncode == 0
+
+
+def _investigated(env: ProgramEnv) -> None:
+    _amended(env)
+    _applied(env, 'S1.investigate-Q2.json')
+
+
+_UNMOVED = {
+    'first': (_first_author, 'S1.author.json', 'S1.author', ()),
+    'amendment': (_amended, 'S1.author.amend-1.json', 'S1.author', ('--amend',)),
+    'investigate': (_investigated, 'S1.investigate-Q2.json', 'S1.investigate-Q2', ()),
+}
+
+
+@pytest.mark.parametrize('scenario', list(_UNMOVED))
+def test_an_application_whose_file_never_moved_is_refused_per_the_ledger(
+    scenario: str, env: ProgramEnv,
+) -> None:
+    apply_first, applied_name, inbox_stem, args = _UNMOVED[scenario]
+    apply_first(env)
+    inbox_file = env.home / 'inbox' / f'{inbox_stem}.json'
+    os.replace(env.home / 'returns' / applied_name, inbox_file)
+    before = env.snapshot()
+    for command in (('--check', inbox_file), (inbox_file, *args)):
+        proc = env.run('apply_return.py', *command)
+        assert proc.returncode == 1, _output(proc)
+        assert 'already applied per the ledger' in _output(proc)
+        assert f'move inbox/{inbox_stem}.json to returns/{applied_name}' in _output(proc)
+    assert env.snapshot() == before
 
 
 def test_an_amendment_may_not_move_the_streams_prd(env: ProgramEnv) -> None:
