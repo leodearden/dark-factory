@@ -91,6 +91,9 @@ cross-checked at runtime) with skills/spawn/spawn-claude.sh's own
 ``$SESSION_RECORD_DIR/result.md`` and this module's
 ``str(record_dir / RESULT_FILENAME)`` are byte-identical paths."""
 
+EXIT_REQUESTED_FILENAME = 'exit-requested'
+"""The marker a self-exit session writes into its record dir; spawn-claude.sh's trailer spells it literally."""
+
 
 class ResultOutcome(StrEnum):
     """The ``outcome:`` header of RESULT_FILENAME; IN_PROGRESS marks a checkpoint, not an end."""

@@ -22,6 +22,9 @@
 #     inherit the spawner's default model. For other/extra claude flags use
 #     $CLAUDE_SPAWN_CLAUDE_ARGS (a raw passthrough, applied after --model).
 #
+# Self-exit: $CLAUDE_SPAWN_SELF_EXIT=1 (exactly 1) stamps record.self_exit
+#   and adds the exit-requested marker instruction to the trailer.
+#
 # These, and every other CLAUDE_SPAWN_* var read below, are per-launch
 # INPUTS: consumed by this invocation and then REMOVED from the spawned
 # session's own environment (task 4015 -- see $sanitize_env further down), so
@@ -100,6 +103,8 @@ title="$3"
 # positional-arg parse -- 'child' (the default) preserves every existing
 # caller's behavior byte-for-byte.
 spawn_mode="${CLAUDE_SPAWN_MODE:-child}"
+self_exit=""
+[ "${CLAUDE_SPAWN_SELF_EXIT:-}" = "1" ] && self_exit=1
 
 # Started-verification watchdog (Attention Rail T4) state: a spawn-time
 # reference marker (mtime = spawn start, used by the step-4 transcript-
@@ -162,6 +167,7 @@ if command -v python3 >/dev/null 2>&1; then
     CLAUDE_SPAWN_PROMPT="$prompt" \
     CLAUDE_SPAWN_CWD="$cwd" \
     CLAUDE_SPAWN_LAUNCHER_PID="$$" \
+    CLAUDE_SPAWN_SELF_EXIT="$self_exit" \
     python3 "$SESSION_REGISTRY_PY" launching
   ) || true
 fi
@@ -354,13 +360,25 @@ Format (markdown with a small structured header -- parent readers are
 LLMs, so keep it concise and scannable):
 
 ---
-outcome: done|blocked|abandoned|handed-off
+outcome: done|blocked|abandoned|handed-off|in-progress
 changed: (commits/branches/task ids touched, or none)
 action_needed: (what a human or parent should do next, or none)
 ---
 A few sentences of prose context.
 
-This is best-effort: writing this file must never block your normal exit."
+This is best-effort: writing this file must never block your normal exit.
+If you write it before your work is done, set outcome: in-progress and
+rewrite it with a final outcome before you end. Run /reflect before you
+end this session."
+  if [ "$self_exit" = 1 ]; then
+    self_exit_trailer='This session was spawned with self-exit on. When all work, result.md and
+/reflect are complete and no background task of yours is still running,
+run this as your final action (best-effort; skip it if it fails):
+printf '\''%s'\'' "$CLAUDE_CODE_SESSION_ID" > "$(dirname "$CLAUDE_SPAWN_RESULT_FILE")/exit-requested"'
+    prompt="${prompt}
+
+${self_exit_trailer}"
+  fi
 fi
 
 flags=""
