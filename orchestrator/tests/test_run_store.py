@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from orchestrator.harness import HarnessReport, TaskReport
-from orchestrator.pause_policy import PauseClass
+from orchestrator.pause_policy import PauseClass, policy_for
 from orchestrator.run_store import RunStore
 from orchestrator.workflow import WorkflowOutcome
 
@@ -641,6 +641,27 @@ class TestSchedulerStatePersistence:
         assert result is not None
         assert result['ewa_value'] == pytest.approx(42.0)
         assert result['reason'] == 'ewa_trip_1.0'
+
+    @pytest.mark.parametrize('pause_class', list(PauseClass))
+    def test_refresh_scope_is_the_policy_predicate(self, tmp_path, pause_class):
+        """A row is refreshed exactly when its class's stored EWA is its predicate."""
+        store = RunStore(tmp_path / 'runs.db')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='any reason',
+            pause_at_iso='2026-05-14T10:05:00+00:00',
+            set_by_run_id='run-1',
+            ewa_value=42.0,
+            pause_class=pause_class,
+        )
+        predicate = policy_for(pause_class).stored_ewa_is_predicate
+
+        refreshed = store.refresh_scheduler_pause_ewa('proj-a', 1.5)
+
+        assert refreshed is predicate
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None
+        assert result['ewa_value'] == pytest.approx(1.5 if predicate else 42.0)
 
     def test_refresh_leaves_a_legacy_null_class_row_untouched(self, tmp_path):
         """A row written before pause_class existed reads as operator, not ewa_rate."""

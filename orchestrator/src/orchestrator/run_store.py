@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING
 
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
 
-from orchestrator.pause_policy import PauseClass, stored_pause_class
+from orchestrator.pause_policy import (
+    STORED_EWA_PREDICATE_CLASSES,
+    PauseClass,
+    stored_pause_class,
+)
 
 if TYPE_CHECKING:
     from orchestrator.harness import HarnessReport, TaskReport
@@ -552,9 +556,11 @@ class RunStore:
             conn.close()
 
     def refresh_scheduler_pause_ewa(self, project_id: str, ewa_value: float) -> bool:
-        """Update ONLY ``ewa_value``, and only on a held ewa_rate-class pause row.
+        """Update ONLY ``ewa_value``, and only on a held row whose stored EWA is its predicate.
 
-        Returns True if such a row existed and was updated.
+        Returns True if such a row existed and was updated.  Which classes
+        qualify is ``pause_policy.STORED_EWA_PREDICATE_CLASSES`` (today:
+        ewa_rate alone).
 
         Task 4559 amendment.  ``save_scheduler_pause`` writes a trip-TIME
         snapshot, and it is the only writer, so once a halt is asserted the
@@ -574,23 +580,25 @@ class RunStore:
         ``set_by_run_id`` are left untouched so the row keeps recording WHEN
         and WHY the halt was asserted while ``ewa_value`` tracks the live
         statistic.  The bool return lets the caller distinguish "refreshed"
-        from "no ewa_rate row to refresh" without a second read.
+        from "no qualifying row to refresh" without a second read.
 
         The class scope is enforced HERE, in the WHERE clause, not only at the
         call site.  ``_maybe_write_digest`` step (13b) pre-filters on the
         IN-MEMORY ``scheduler.pause_class``, which is first-wins, while this
         row is last-wins (INSERT OR REPLACE): a held ewa_rate halt plus a later
         park-stop ``pause_scheduler`` leaves memory saying ewa_rate over a
-        park_stop row.  For ewa_rate rows alone the stored scalar IS the live
-        statistic; for every other class (and a legacy NULL-class row, which
+        park_stop row.  For a qualifying class alone the stored scalar IS the
+        live statistic; for every other class (and a legacy NULL-class row, which
         reads as operator) it is evidence about that pause and is kept.
         """
+        predicate_values = sorted(c.value for c in STORED_EWA_PREDICATE_CLASSES)
+        placeholders = ', '.join('?' * len(predicate_values))
         conn = self._connect()
         try:
             cursor = conn.execute(
                 'UPDATE scheduler_state SET ewa_value = ? '
-                'WHERE project_id = ? AND pause_class = ?',
-                (ewa_value, project_id, PauseClass.EWA_RATE.value),
+                f'WHERE project_id = ? AND pause_class IN ({placeholders})',
+                (ewa_value, project_id, *predicate_values),
             )
             conn.commit()
             return cursor.rowcount > 0

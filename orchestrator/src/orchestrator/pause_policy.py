@@ -60,6 +60,15 @@ class PausePolicy:
     live_recovery: LiveRecovery
     bound: Bound
 
+    @property
+    def stored_ewa_is_predicate(self) -> bool:
+        """The hold's stored ``ewa_value`` is its live trip statistic, not evidence.
+
+        Read from the rehydration column, so the restart re-test, the held-row
+        refresh and the reset on resume all follow one cell of the table.
+        """
+        return self.rehydration is Rehydration.RETEST_STORED_EWA
+
     def require_may_halt(self) -> None:
         if not self.may_halt:
             raise HaltNotPermittedError(
@@ -141,6 +150,12 @@ if _missing_classes:
         'PAUSE_POLICY has no row for pause class(es): '
         + ', '.join(sorted(c.value for c in _missing_classes))
     )
+
+STORED_EWA_PREDICATE_CLASSES: frozenset[PauseClass] = frozenset(
+    policy.pause_class
+    for policy in PAUSE_POLICY.values()
+    if policy.stored_ewa_is_predicate
+)
 
 
 def _valid_values() -> str:

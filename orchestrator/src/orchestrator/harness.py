@@ -130,7 +130,12 @@ from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.offline_lane_pass import lane_pass_outcome_hooks
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
-from orchestrator.pause_policy import PauseClass, Rehydration, policy_for
+from orchestrator.pause_policy import (
+    STORED_EWA_PREDICATE_CLASSES,
+    HaltNotPermittedError,
+    PauseClass,
+    policy_for,
+)
 from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.recovery_emission import (
@@ -18143,22 +18148,28 @@ class Harness:
         breakers pass their own (PRD decision 5).
 
         ``reason`` is required for audit.  Returns
-        ``{halted, was_paused, prior_reason, reason, pause_class}``.
+        ``{halted, was_paused, prior_reason, prior_pause_class, reason,
+        requested_pause_class}``.  The in-memory pause is first-wins, so when
+        ``was_paused`` the scheduler stays held under the prior class, not the
+        requested one.
         """
         was_paused = self.scheduler.is_paused
         prior_reason = self.scheduler.pause_reason
+        prior_class = self.scheduler.pause_class
+        prior_pause_class = prior_class.value if prior_class else None
         await self.pause_scheduler(reason, pause_class, file_escalation=False)
         logger.warning(
-            'force_halt_scheduler: was_paused=%s prior_reason=%r by_reason=%r '
-            'pause_class=%s',
-            was_paused, prior_reason, reason, pause_class,
+            'force_halt_scheduler: was_paused=%s prior_reason=%r '
+            'prior_pause_class=%s by_reason=%r requested_pause_class=%s',
+            was_paused, prior_reason, prior_pause_class, reason, pause_class,
         )
         return {
             'halted': True,
             'was_paused': was_paused,
             'prior_reason': prior_reason,
+            'prior_pause_class': prior_pause_class,
             'reason': reason,
-            'pause_class': pause_class.value,
+            'requested_pause_class': pause_class.value,
         }
 
     # ------------------------------------------------------------------ #
@@ -18347,7 +18358,8 @@ class Harness:
         1. Delegates to ``scheduler.resume()`` (idempotent).
         2. Clears persistence via ``RunStore.clear_scheduler_pause`` (best-effort).
         3. Emits ``EventType.scheduler_resumed`` (best-effort).
-        4. If the cleared hold's class was ``PauseClass.EWA_RATE``, resets
+        4. If the cleared hold's stored EWA was its predicate
+           (``STORED_EWA_PREDICATE_CLASSES``), resets
            ``_ewa_value`` to 0.0 so the next digest step does not immediately
            re-trigger a pause.  EWA decays naturally with alpha=0.3 (~N digests of
            low ratio to fall back below threshold), but an operator-driven resume
@@ -18358,10 +18370,11 @@ class Harness:
         # Snapshot the class BEFORE resume() clears it.
         prior_class = self.scheduler.pause_class
         self.scheduler.resume()
-        if prior_class is PauseClass.EWA_RATE:
+        if prior_class in STORED_EWA_PREDICATE_CLASSES:
             self._ewa_value = 0.0
             logger.info(
-                'resume_scheduler: EWA value reset to 0.0 (prior pause was ewa_rate).'
+                'resume_scheduler: EWA value reset to 0.0 (prior pause class %s).',
+                prior_class,
             )
         logger.info('Scheduler resumed.')
 
@@ -18393,14 +18406,16 @@ class Harness:
         blocks startup.
 
         Restart-time predicate re-check (task 4559): the row's class policy
-        decides.  A class whose rehydration is ``RETEST_STORED_EWA`` declines
-        to RE-ASSERT a halt whose stored EWA is below the current threshold
-        (never an auto-resume of a live pause), and only that class seeds its
-        stored value into live ``_ewa_value``; for every other class the value
-        is forensic evidence, reported on the event and WARNING but never
-        seeded.  Every other class re-asserts blind, as does a NULL stored
-        value.  A NULL or unrecognised stored class reads as operator and
-        re-asserts (PRD open question 3).
+        decides.  A class whose stored EWA is its predicate
+        (``PausePolicy.stored_ewa_is_predicate``) declines to RE-ASSERT a halt
+        whose stored EWA is below the current threshold (never an auto-resume
+        of a live pause), and only that class seeds its stored value into live
+        ``_ewa_value``; for every other class the value is forensic evidence,
+        reported on the event and WARNING but never seeded.  Every other class
+        re-asserts blind, as does a NULL stored value.  A NULL or unrecognised
+        stored class reads as operator and re-asserts (PRD open question 3).
+        A row whose class may no longer halt is declined the same way: the
+        scheduler refuses it, the row is cleared and the event says why.
         """
         if not self._run_store:
             return
@@ -18428,36 +18443,35 @@ class Harness:
                 # One policy test, two decisions — hoisted to a single local so
                 # the live-state restore and the halt re-assertion below can
                 # never drift apart (task 4559).
-                retests_stored_ewa = policy.rehydration is Rehydration.RETEST_STORED_EWA
+                retests_stored_ewa = policy.stored_ewa_is_predicate
 
                 if retests_stored_ewa and ewa_value is not None:
                     self._ewa_value = ewa_value
 
                 # A missing value is an unknowable predicate, so it re-asserts.
-                reassert = not (
-                    retests_stored_ewa
-                    and ewa_value is not None
-                    and ewa_value < threshold
-                )
-
-                if reassert:
-                    self.scheduler.pause(reason, pause_class)
-                    # Stash the reason so run() can file the L1 escalation once
-                    # the escalation queue exists (this runs at line ~492, before
-                    # _start_escalation_server creates _escalation_queue).  See
-                    # _file_restored_pause_escalation.
-                    self._restored_pause_reason = reason
-                    disposition = 'predicate still holds or is not re-checkable'
-                else:
-                    # Do NOT pause, and do NOT set _restored_pause_reason — no
-                    # L1 may be filed for a halt that is not being re-asserted.
+                if retests_stored_ewa and ewa_value is not None and ewa_value < threshold:
                     logger.warning(
                         'Scheduler pause NOT re-asserted: persisted EWA %.4f is '
                         'below the current threshold %.4f, so the stored trip '
                         'predicate no longer holds. reason=%r  (task 4559)',
                         ewa_value, threshold, reason,
                     )
+                    reassert = False
                     disposition = 'ewa below threshold — halt not re-asserted'
+                else:
+                    reassert, disposition = self._reassert_restored_pause(
+                        reason, pause_class,
+                    )
+
+                if reassert:
+                    # Stash the reason so run() can file the L1 escalation once
+                    # the escalation queue exists (this runs at line ~492, before
+                    # _start_escalation_server creates _escalation_queue).  See
+                    # _file_restored_pause_escalation.
+                    self._restored_pause_reason = reason
+                else:
+                    # Do NOT set _restored_pause_reason — no L1 may be filed for
+                    # a halt that is not being re-asserted.
                     try:
                         self._run_store.clear_scheduler_pause(
                             self.config.fused_memory.project_id,
@@ -18493,6 +18507,26 @@ class Harness:
                 '_load_persisted_scheduler_pause: failed to read pause state',
                 exc_info=True,
             )
+
+    def _reassert_restored_pause(
+        self, reason: str, pause_class: PauseClass,
+    ) -> tuple[bool, str]:
+        """Re-assert a persisted hold, declining one whose class may no longer halt.
+
+        Returns ``(reasserted, disposition)``.  The refusal is
+        ``Scheduler.pause``'s (PRD §6 invariant 1), so a row written before its
+        class stopped halting is retired instead of failing the whole restore.
+        """
+        try:
+            self.scheduler.pause(reason, pause_class)
+        except HaltNotPermittedError:
+            logger.warning(
+                'Scheduler pause NOT re-asserted: pause class %s may not halt '
+                '(PRD §6 invariant 1). reason=%r',
+                pause_class, reason,
+            )
+            return False, 'class may not halt — halt not re-asserted'
+        return True, 'predicate still holds or is not re-checkable'
 
     # ------------------------------------------------------------------ #
     # Digest + EWA trip (task 1327)                                       #
@@ -18714,7 +18748,8 @@ class Harness:
             self._last_digest_submit_count = submit_count_snapshot
             self._last_digest_window_end_iso = window_end
 
-            # (13b) While an ewa_rate hold is HELD, keep the persisted scalar
+            # (13b) While a hold whose stored EWA is its predicate is HELD
+            # (STORED_EWA_PREDICATE_CLASSES), keep the persisted scalar
             # tracking the live statistic (task 4559 amendment), so the
             # restart-time re-test in _load_persisted_scheduler_pause can
             # observe the decay instead of the frozen trip-time value.
@@ -18725,8 +18760,7 @@ class Harness:
             # Best-effort: a persistence hiccup must never break the digest.
             if (
                 self._run_store
-                and self.scheduler.is_paused
-                and self.scheduler.pause_class is PauseClass.EWA_RATE
+                and self.scheduler.pause_class in STORED_EWA_PREDICATE_CLASSES
             ):
                 try:
                     self._run_store.refresh_scheduler_pause_ewa(

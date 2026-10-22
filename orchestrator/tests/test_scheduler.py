@@ -25,7 +25,12 @@ from orchestrator.config import (
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import fm_retry_backoffs
-from orchestrator.pause_policy import PauseClass
+from orchestrator.pause_policy import (
+    HaltNotPermittedError,
+    PauseClass,
+    PausePolicy,
+    policy_for,
+)
 from orchestrator.scheduler import (
     BlastRadiusResult,
     ExternalResolverError,
@@ -8301,6 +8306,39 @@ class TestSchedulerPause:
         assert scheduler.get_state_snapshot().pause_class == 'cost_ceiling'
         scheduler.resume()
         assert scheduler.get_state_snapshot().pause_class is None
+
+    @staticmethod
+    def _refusing_ewa_rate(pause_class: PauseClass) -> PausePolicy:
+        policy = policy_for(pause_class)
+        if pause_class is PauseClass.EWA_RATE:
+            return dataclasses.replace(policy, may_halt=False)
+        return policy
+
+    def test_a_class_the_policy_refuses_is_never_held(self):
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            pause_policy_lookup=self._refusing_ewa_rate,
+        )
+
+        with pytest.raises(HaltNotPermittedError, match='ewa_rate'):
+            scheduler.pause('digest halt', PauseClass.EWA_RATE)
+
+        assert scheduler.is_paused is False
+        assert scheduler.pause_reason is None
+        assert scheduler.pause_class is None
+
+    def test_a_refused_class_is_refused_even_over_an_existing_hold(self):
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            pause_policy_lookup=self._refusing_ewa_rate,
+        )
+        scheduler.pause('operator halt', PauseClass.OPERATOR)
+
+        with pytest.raises(HaltNotPermittedError):
+            scheduler.pause('digest halt', PauseClass.EWA_RATE)
+
+        assert scheduler.pause_class is PauseClass.OPERATOR
+        assert scheduler.pause_reason == 'operator halt'
 
     @pytest.mark.asyncio
     async def test_acquire_next_returns_none_when_paused(self, scheduler: Scheduler):

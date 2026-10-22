@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from orchestrator.pause_policy import (
+    STORED_EWA_PREDICATE_CLASSES,
     Bound,
     HaltNotPermittedError,
     LiveRecovery,
@@ -104,6 +105,26 @@ class TestPolicyTable:
             PauseClass.PARK_STOP,
             PauseClass.WATCHER_GUARD,
         }
+
+
+class TestStoredEwaIsPredicate:
+    def test_follows_the_rehydration_column(self):
+        assert _policy(
+            PauseClass.PARK_STOP,
+            Retestability.NO,
+            rehydration=Rehydration.RETEST_STORED_EWA,
+        ).stored_ewa_is_predicate
+        assert not _policy(
+            PauseClass.EWA_RATE, Retestability.NO,
+        ).stored_ewa_is_predicate
+
+    def test_class_set_is_the_tables_predicate_rows(self):
+        assert {
+            c for c in PauseClass if policy_for(c).stored_ewa_is_predicate
+        } == STORED_EWA_PREDICATE_CLASSES
+
+    def test_only_ewa_rate_holds_a_live_stored_ewa_today(self):
+        assert {PauseClass.EWA_RATE} == STORED_EWA_PREDICATE_CLASSES
 
 
 class TestRequireMayHalt:

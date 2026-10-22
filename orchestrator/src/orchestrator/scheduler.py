@@ -65,7 +65,7 @@ from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
-from orchestrator.pause_policy import PauseClass, policy_for
+from orchestrator.pause_policy import PauseClass, PausePolicy, policy_for
 from orchestrator.pending_age import AnchorReading, read_pending_age
 from orchestrator.pin_reservation import (
     Blocker,
@@ -2264,6 +2264,7 @@ class Scheduler:
         state_snapshot_path: Path | None = None,
         jitter_source: Callable[[float, float], float] | None = None,
         branch_work_reader: Callable[[], Mapping[str, BranchWork]] | None = None,
+        pause_policy_lookup: Callable[[PauseClass], PausePolicy] | None = None,
     ):
         self.config = config
         # Constructor-injected Harness callback bundle (task 2235).  Omitting
@@ -2285,6 +2286,11 @@ class Scheduler:
         # Production leaves it None and gets ``random.uniform``.
         self._jitter_source: Callable[[float, float], float] = (
             jitter_source if jitter_source is not None else random.uniform
+        )
+        # Injectable so a test can drive a halt the policy refuses (PRD §6
+        # invariant 1) without patching the module table.
+        self._pause_policy_lookup: Callable[[PauseClass], PausePolicy] = (
+            pause_policy_lookup if pause_policy_lookup is not None else policy_for
         )
         # Monotonic clock source for the park-stop rolling-window transition
         # recorder.  time.monotonic avoids false-trip / stale-entry artefacts
@@ -2867,7 +2873,7 @@ class Scheduler:
         Raises:
             HaltNotPermittedError: *pause_class* may not halt.
         """
-        policy_for(pause_class).require_may_halt()
+        self._pause_policy_lookup(pause_class).require_may_halt()
         if self._paused:
             logger.debug(
                 'Scheduler.pause() called while already paused '
