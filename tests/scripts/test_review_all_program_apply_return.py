@@ -8,12 +8,13 @@ from __future__ import annotations
 import dataclasses
 import json
 import shutil
+import subprocess
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from review_all_program_cli import FIXTURE_RETURNS, ProgramEnv, load_program_module
+from review_all_program_cli import FIXTURE_RETURNS, RUN_ID, ProgramEnv, load_program_module
 from review_all_program_fixture import FIXTURE_DIR, FakeStore, load_state, running_fake_store
 
 state = load_state()
@@ -217,10 +218,13 @@ def test_b4_a_decompose_return_records_its_status_and_numbered_actions(
     assert len(_tools_calls(store)) > calls_before
 
 
-def _inbox_variant(env: ProgramEnv, fixture_return: str, mutate: Callable[[dict[str, Any]], None]) -> Path:
+def _inbox_variant(
+    env: ProgramEnv, fixture_return: str, mutate: Callable[[dict[str, Any]], None],
+    as_stem: str | None = None,
+) -> Path:
     data = json.loads((FIXTURE_RETURNS / fixture_return).read_text())
     mutate(data)
-    target = env.put_inbox(fixture_return)
+    target = env.put_inbox(fixture_return, as_stem=as_stem)
     target.write_text(json.dumps(data, indent=2))
     return target
 
@@ -282,3 +286,145 @@ def test_apply_returns_typed_outcomes_for_eta(env: ProgramEnv, store: FakeStore)
     refused = apply_return.apply(env.put_inbox('S1.author.json'), store_factory=factory)
     assert isinstance(refused, apply_return.Refused)
     assert refused.kind is apply_return.RefusalKind.APPLICATION
+
+
+def _rulings(env: ProgramEnv) -> list[dict[str, Any]]:
+    return [dict(ruling) for ruling in state.read_rulings(state.Home(env.home))]
+
+
+def _pending(env: ProgramEnv) -> list[str]:
+    questions = load_program_module('questions')
+    home = state.Home(env.home)
+    recorded = questions.recorded_questions(state.read_ledger(home))
+    return [str(ref) for ref in questions.pending_items(recorded, state.read_rulings(home))]
+
+
+def _amended_author(env: ProgramEnv) -> subprocess.CompletedProcess[str]:
+    return env.run('apply_return.py', env.put_inbox('S1.author.amend.json'), '--amend')
+
+
+def _ruled(env: ProgramEnv, by: str, *args: str) -> None:
+    proc = env.run(
+        'record.py', 'rule', '--run', RUN_ID, '--by', by, '--question', 'q?', '--ruling', 'r',
+        '--source', 'sitting 1', '--option', 'a', '--option', 'b', '--consequence', 'c', *args,
+    )
+    assert proc.returncode == 0, _output(proc)
+
+
+def test_b16_an_investigate_return_applies_as_one_minted_ruling(env: ProgramEnv) -> None:
+    _applied(env, 'S1.author.json')
+    assert _amended_author(env).returncode == 0
+    _ruled(env, 'human', '--answers', 'S1:Q1')
+    _ruled(env, 'lead', '--answers', 'S1:Q3')
+    _ruled(env, 'human', '--answers', 'S1:Q2', '--reask')
+    ledger_before = _ledger(env)
+    proc = env.run('apply_return.py', env.put_inbox('S1.investigate-Q2.json'))
+    assert proc.returncode == 0, _output(proc)
+    assert (env.home / 'returns' / 'S1.investigate-Q2.json').exists()
+    assert _inbox(env) == []
+    assert _ledger(env) == ledger_before
+    *_, minted = _rulings(env)
+    assert len(_rulings(env)) == 4
+    source = minted.pop('source')
+    assert 'returns/S1.investigate-Q2.json' in source and 'R1' in source
+    assert not minted.pop('reask', False)
+    minted.pop('date')
+    assert minted == {
+        'id': 'D4', 'ruled_by': 'human', 'stream': 'S1', 'item': 'Q2',
+        'question': 'Should the alpha shim be retired before S2 releases C1?',
+        'ruling': 'hold until S2 releases C1',
+        'options': ('retire now', 'hold until S2 releases C1'),
+        'consequence': '103 stays held on S2 C1', 'keys': (), 'supersedes': None,
+        'answers': ('S1:Q2',),
+    }
+    assert _pending(env) == []
+    digest = proc.stdout.splitlines()[0]
+    assert 'D4' in digest and 'S1:Q2' in digest
+
+
+def test_an_investigate_return_on_an_unrecorded_item_is_a_contradiction(env: ProgramEnv) -> None:
+    _applied(env, 'S1.author.json')
+    inbox_file = _inbox_variant(
+        env, 'S1.investigate-Q2.json', lambda data: data.update(item='Q9'),
+        as_stem='S1.investigate-Q9',
+    )
+    before = env.snapshot()
+    proc = env.run('apply_return.py', inbox_file)
+    assert proc.returncode == 1
+    (line,) = [line for line in _contradictions(_output(proc)) if line.startswith('contradiction: item:')]
+    assert 'S1:Q9' in line
+    assert env.snapshot() == before
+
+
+def _without_options(data: dict[str, Any]) -> None:
+    data['item'] = 'Q1'
+    data['rulings_in_session'][0]['options'] = []
+
+
+def test_a_session_ruling_the_rulings_file_would_refuse_is_a_form_rejection(env: ProgramEnv) -> None:
+    _applied(env, 'S1.author.json')
+    inbox_file = _inbox_variant(
+        env, 'S1.investigate-Q2.json', _without_options, as_stem='S1.investigate-Q1',
+    )
+    before = env.snapshot()
+    proc = env.run('apply_return.py', inbox_file)
+    assert proc.returncode == 1
+    (line,) = [line for line in _form_lines(_output(proc)) if 'rulings_in_session[0]' in line]
+    assert 'options' in line
+    assert env.snapshot() == before
+
+
+def test_b16_amend_appends_only_the_delta_and_keeps_the_first_file(env: ProgramEnv) -> None:
+    _applied(env, 'S1.author.json')
+    unamended = env.run('apply_return.py', env.put_inbox('S1.author.amend.json'))
+    assert unamended.returncode == 1
+    assert '--amend' in _output(unamended)
+    proc = _amended_author(env)
+    assert proc.returncode == 0, _output(proc)
+    returns = env.home / 'returns'
+    assert (returns / 'S1.author.json').read_bytes() == (FIXTURE_RETURNS / 'S1.author.json').read_bytes()
+    assert (returns / 'S1.author.amend-1.json').read_bytes() == (
+        FIXTURE_RETURNS / 'S1.author.amend.json').read_bytes()
+    assert _inbox(env) == []
+    amendment = {'by': 'apply_return.py', 'return': 'returns/S1.author.amend-1.json'}
+    assert _ledger(env)[4:] == [
+        {'seq': 5, 'op': 'stream_status', 'stream': 'S1', 'status': 'authored',
+         'prd_path': S1_PRD, **amendment},
+        {'seq': 6, 'op': 'question', 'stream': 'S1', 'id': 'Q2',
+         'question': 'Should the alpha shim be retired before S2 releases C1?',
+         'options': ('retire now', 'hold until S2 releases C1'),
+         'recommendation': 'hold until S2 releases C1', 'needs_human': True,
+         'lead_rulable': False, 'source': 'critic', **amendment},
+    ]
+    assert [line for line in proc.stdout.splitlines() if 'needs_human' in line and 'S1:Q2' in line]
+    questions = load_program_module('questions')
+    recorded = questions.recorded_questions(state.read_ledger(state.Home(env.home)))
+    assert sorted(str(ref) for ref in recorded) == ['S1:Q1', 'S1:Q2', 'S1:Q3']
+
+
+def test_an_amendment_may_not_move_the_streams_prd(env: ProgramEnv) -> None:
+    _applied(env, 'S1.author.json')
+    inbox_file = _inbox_variant(
+        env, 'S1.author.amend.json', lambda data: data.update(prd_path='plans/elsewhere-prd.md'),
+    )
+    before = env.snapshot()
+    proc = env.run('apply_return.py', inbox_file, '--amend')
+    assert proc.returncode == 1
+    assert any(line.startswith('contradiction: prd_path:') for line in _output(proc).splitlines())
+    assert env.snapshot() == before
+
+
+def _with_session_ruling(data: dict[str, Any]) -> None:
+    data['rulings_in_session'] = [{
+        'id': 'R7', 'question': 'Does S2 keep its own retry budget?', 'ruling': 'it does',
+        'options': ['it does', 'S1 owns it'], 'consequence': 'S2 keeps budget.py',
+    }]
+
+
+def test_an_author_returns_session_rulings_become_minted_human_rulings(env: ProgramEnv) -> None:
+    proc = env.run('apply_return.py', _inbox_variant(env, 'S2.author.json', _with_session_ruling))
+    assert proc.returncode == 0, _output(proc)
+    (ruling,) = _rulings(env)
+    assert (ruling['id'], ruling['ruled_by'], ruling['stream']) == ('D1', 'human', 'S2')
+    assert 'R7' in ruling['source']
+    assert 'answers' not in ruling
