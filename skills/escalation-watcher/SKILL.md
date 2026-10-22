@@ -2318,11 +2318,14 @@ Instead, **read the session's result file** for the structured outcome:
 1. Locate the session-registry record for the spawn (the slug you launched it under, or the
    matching record under `~/.claude/fleet/sessions/` for the task/title you spawned).
 2. Read `record.result_file` — equivalently `~/.claude/fleet/sessions/<slug>/result.md` — for the
-   `outcome` (`done|blocked|abandoned|handed-off`), `changed` (commits/branches/task ids touched),
+   `outcome: done|blocked|abandoned|handed-off|in-progress`, `changed` (commits/branches/task ids touched),
    and `action_needed` fields the spawned session wrote before ending.
 3. Use that structured outcome to decide your next step (resolve the escalation, follow up, escalate
    further) — `result.md` is the authoritative outcome source, so this replaces exploring the
    task/worktree yourself to reconstruct what happened.
+4. An `in-progress` outcome on a finished spawn (the background task has completed, so the record
+   is terminal) means the session **ended at checkpoint**, before its final write. Treat it like an
+   absent file and fall back to exploring the task/escalation state.
 
 **Fail-soft:** the write is best-effort — if `result.md` is absent, empty, or unparsable (the
 spawned session ended without writing it, or the registry write itself faulted so the record never
