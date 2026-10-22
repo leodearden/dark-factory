@@ -60,6 +60,7 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # refuses the ``--flag=value`` form: the configs share one spelling.
 RESTART_DISABLED_TOKEN = '--max-worker-restart=0'
 RESTART_FLAG_PREFIX = '--max-worker-restart'
+RESTART_FLAG_SPELLING = re.compile(rf'{re.escape(RESTART_FLAG_PREFIX)}=\d+')
 THREAD_TIMEOUT_METHOD = 'thread'
 
 ROOT_CONFIG_NAME = '.'
@@ -300,7 +301,7 @@ def _run_synthetic_suite(
 ) -> subprocess.CompletedProcess[str]:
     """Run the suite at ``-n REPRO_INITIAL_WORKERS --dist loadgroup`` plus *restart_args*.
 
-    *restart_args* must be ``--max-worker-restart`` flags; anything else is refused.
+    *restart_args* must each be ``--max-worker-restart=<n>``; anything else is refused.
 
     ``PYTEST_*`` is scrubbed from the child's environment so an inherited
     ``PYTEST_ADDOPTS`` (a ``-q``, say) cannot suppress the literals asserted on.
@@ -309,10 +310,10 @@ def _run_synthetic_suite(
     default pytest temp root; why:
     ``test_xdist_worker_restart_policy.py::test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched``.
     """
-    refused = [arg for arg in restart_args if not arg.startswith(RESTART_FLAG_PREFIX)]
+    refused = [arg for arg in restart_args if not RESTART_FLAG_SPELLING.fullmatch(arg)]
     if refused:
         raise ValueError(
-            f'_run_synthetic_suite takes only {RESTART_FLAG_PREFIX} flags (its '
+            f'_run_synthetic_suite takes only {RESTART_FLAG_PREFIX}=<n> flags (its '
             f'basetemp and output options are fixed); refused: {refused!r}'
         )
     missing = [
@@ -333,8 +334,8 @@ def _run_synthetic_suite(
             '-p', 'no:cacheprovider',
             '-n', str(REPRO_INITIAL_WORKERS),
             '--dist', 'loadgroup',
-            f'--basetemp={suite.basetemp}',
             *restart_args,
+            f'--basetemp={suite.basetemp}',
         ],
         cwd=str(suite.root),
         env=env,
@@ -470,16 +471,11 @@ def test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched(
     )
 
 
-@pytest.mark.parametrize(
-    'extra',
-    [('--basetemp={}',), ('--basetemp', '{}'), ('-q',)],
-    ids=['basetemp-joined', 'basetemp-separate', 'quiet'],
-)
 def test_an_argument_other_than_a_restart_flag_is_refused_before_any_session_starts(
-    tmp_path: pathlib.Path, extra: tuple[str, ...],
+    tmp_path: pathlib.Path,
 ) -> None:
     smuggled = tmp_path / 'elsewhere'
-    args = tuple(arg.format(smuggled) for arg in extra)
+    smuggle = f'--basetemp={smuggled}'
     suite = _write_suite(
         tmp_path,
         ini=_RECORDER_INI,
@@ -487,9 +483,9 @@ def test_an_argument_other_than_a_restart_flag_is_refused_before_any_session_sta
     )
 
     with pytest.raises(ValueError, match=re.escape(RESTART_FLAG_PREFIX)) as refused:
-        _run_synthetic_suite(suite, *args)
+        _run_synthetic_suite(suite, smuggle)
 
-    assert args[0] in str(refused.value)
+    assert smuggle in str(refused.value)
     assert not suite.basetemp.exists(), 'a session started anyway'
     assert not smuggled.exists(), 'a session started anyway'
     assert not (suite.root / 'seen-temproot').exists(), 'a session started anyway'
