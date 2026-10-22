@@ -73,6 +73,7 @@ from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
     MarkupGuardMiddleware,
     RepairPolicy,
+    SpooledResidue,
     _bounded_axis,
 )
 from shared.toolcall_markup import MARKUP_OVERRIDE_KEY, detect
@@ -1837,73 +1838,74 @@ def _raises_for_test(record: dict[str, Any]) -> str:
     raise RuntimeError('queue unavailable')
 
 
-class TestResidueRecordsClaimOnlyWhatTheyCarry:
-    """A residue record is built BEFORE any sink runs (task 4809).
+#: What a spooling sink hands back: an absolute file path, typed apart from an
+#: escalation id.
+SPOOL_PATH = '/var/lib/fused-memory/markup_residue/20261022T000000.000000Z-abcd1234.json'
 
-    So its ``summary`` cannot know where the record will end up: a queue, a
-    floor, or the last-tier log line of a host that could preserve it nowhere.
-    It states what the record CARRIES, which is true in all three. The
-    caller-facing hint, chosen AFTER the sink answered, is what may speak of
-    preservation, and that selection is unchanged.
+
+def _spooling_sink(record: dict[str, Any]) -> SpooledResidue:
+    """A sink whose last tier is a FILE, as fused-memory's floor is."""
+    return SpooledResidue(SPOOL_PATH)
+
+
+class TestASpooledResidueIsNotAnEscalation:
+    """A sink answers a residue with a ``str`` escalation id or a
+    :class:`SpooledResidue` (task 4809).
+
+    ``get_escalation`` cannot find a file, so a spooled residue is named under
+    ``residue_spool_path`` and ``escalation_id`` stays null. The hint is chosen
+    by which of the two held the payload, or neither.
     """
 
-    async def _refusal_record(self, policy) -> tuple[dict[str, Any], str]:
-        h, value, _ = await TestB5UnrepairableIsNeverGuessed()._refuse(policy)
-        [record] = h.escalations
-        return record, value
+    @staticmethod
+    async def _refuse(policy, **guard_kwargs) -> dict[str, Any]:
+        _, payload = await TestTheHintNeverOverclaimsPreservation()._refuse(
+            policy, **guard_kwargs
+        )
+        return payload
 
     @BOTH_POLICIES
-    async def test_the_refusal_record_does_not_claim_preservation(self, policy):
-        record, _ = await self._refusal_record(policy)
+    async def test_the_refusal_names_the_file_apart_from_any_escalation(self, policy):
+        payload = await self._refuse(policy, escalation_sink=_spooling_sink)
 
-        assert 'preserved' not in record['summary'], record['summary']
+        assert payload['escalation_id'] is None
+        assert payload['residue_spool_path'] == SPOOL_PATH
 
     @BOTH_POLICIES
-    async def test_the_refusal_record_states_it_carries_the_raw_payload(self, policy):
-        record, value = await self._refusal_record(policy)
+    async def test_an_escalation_id_carries_no_spool_field(self, policy):
+        payload = await self._refuse(policy)
 
-        assert 'carries' in record['summary'], record['summary']
-        assert 'full raw payload' in record['summary'], record['summary']
-        assert record['raw_value'] == value
+        assert payload['escalation_id'] == ESCALATION_ID
+        assert 'residue_spool_path' not in payload
 
-    async def test_the_dropped_slice_record_claims_only_what_it_carries(self):
-        truncated = '[{"observation": "the tail was cut off'
-        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+    @BOTH_POLICIES
+    async def test_each_holder_selects_its_own_hint(self, policy):
+        escalated = await self._refuse(policy)
+        spooled = await self._refuse(policy, escalation_sink=_spooling_sink)
+        unpreserved = await self._refuse(policy, escalation_sink=None)
 
-        await h.call(
+        hints = {escalated['hint'], spooled['hint'], unpreserved['hint']}
+        assert len(hints) == 3
+        assert 'residue_spool_path' in spooled['hint']
+        assert 'residue_spool_path' not in escalated['hint']
+
+    async def test_a_dropped_slice_the_sink_spooled_is_named_by_its_path(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR, escalation_sink=_spooling_sink)
+
+        result = await h.call(
             'escalate_info_typed',
             {
                 **TestCoercionNeverGuesses.REQUIRED,
-                'detail': TestCoercionNeverGuesses()._payload('Ill-formed.', 'evidence', truncated),
+                'detail': TestCoercionNeverGuesses()._payload(
+                    'Ill-formed.', 'evidence', '[{"observation": "the tail was cut off'
+                ),
             },
         )
 
-        [record] = [
-            r for r in h.escalations if r['error_type'] == 'mcp_markup_unrecovered_param'
-        ]
-        assert 'preserved' not in record['summary'], record['summary']
-        assert 'carries' in record['summary'], record['summary']
-        assert 'full raw payload' in record['summary'], record['summary']
-        assert record['raw_value'] == truncated
+        markup_repair = meta_of(result)['markup_repair']
+        assert markup_repair['unrecovered_residue_id'] is None
+        assert markup_repair['unrecovered_residue_spool_path'] == SPOOL_PATH
 
-    @pytest.mark.parametrize(
-        ('sink', 'preserved'),
-        [
-            (lambda record: ESCALATION_ID, True),
-            (lambda record: None, False),
-            (_raises_for_test, False),
-        ],
-        ids=['sink-returns-an-id', 'sink-returns-none', 'sink-raises'],
-    )
-    @BOTH_POLICIES
-    async def test_the_hint_still_follows_what_the_sink_answered(self, policy, sink, preserved):
-        """Negative control: only the record's wording changed."""
-        _, payload = await TestTheHintNeverOverclaimsPreservation()._refuse(
-            policy, escalation_sink=sink
-        )
-
-        assert ('preserved verbatim' in payload['hint']) is preserved
-        assert ('nothing was preserved' in payload['hint'].lower()) is not preserved
 
 class TestB8RecoveredNameOutsideTheToolSchema:
     """A tail that parses CLEANLY but names a parameter the tool does not have.
