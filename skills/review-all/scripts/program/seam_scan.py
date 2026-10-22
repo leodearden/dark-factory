@@ -34,6 +34,7 @@ _EXIT_MEANINGS: Mapping[Exit, str] = {
 G4_COLUMNS = ('Other PRD', 'Direction', 'Seam mechanism', 'Owner', 'Status')
 UNRULED = '?'
 NONE_LINE = 'no non-terminal task outside the program declares any touched path'
+UNNAMED_CHECK = '<unnamed check>'
 
 
 class Anchor(NamedTuple):
@@ -79,6 +80,11 @@ def _parsed_return(run: run_cli.Run, path: Path, reader: state.StoreReader) -> s
 
 def _author_return(run: run_cli.Run, stream: str, reader: state.StoreReader) -> state.PrdReturn:
     """The stream's applied author return, the single home of its touches."""
+    if not run.views[stream].authored:
+        raise state.StateError(
+            f'{stream} has no applied author return: the ledger has no stream_status authored '
+            f'line for {stream}'
+        )
     path = run.home.returns_file(stream, state.Pass.AUTHOR)
     if not path.is_file():
         raise state.StateError(
@@ -101,10 +107,18 @@ def _declared(row: state.TaskRow, touches: Sequence[str]) -> tuple[str, ...]:
     return tuple(path for path in touches if path in files)
 
 
+def _check_name(check: Mapping[str, Any]) -> str:
+    name = check.get('name')
+    return UNNAMED_CHECK if name is None or name == '' else str(name)
+
+
 def _anchored(row: state.TaskRow, touches: Sequence[str]) -> tuple[Anchor, ...]:
-    """Each (touched path, check name) where the check's ``paths`` names the path exactly."""
+    """Each (touched path, check name) where the check's ``paths`` names the path exactly.
+
+    Exactly, as metadata.files is matched: a directory never anchors the files under it.
+    """
     return tuple(
-        Anchor(path, str(check.get('name')))
+        Anchor(path, _check_name(check))
         for check in _listed(row.metadata.get('delivered_checks')) if isinstance(check, Mapping)
         for path in touches if path in _listed(check.get('paths'))
     )
