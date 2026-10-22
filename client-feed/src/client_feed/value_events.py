@@ -9,13 +9,13 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Final
 
+from client_feed.budget import counted_set
 from client_feed.contract import (
     Branch,
     BranchSnapshot,
     FactoryState,
     FeedEvent,
     FeedState,
-    FileKind,
     PrdUpserted,
     RevealBudget,
     TaskStatus,
@@ -24,7 +24,7 @@ from client_feed.contract import (
     TreeSnapshot,
 )
 from client_feed.envelope import Stamp, payload
-from client_feed.policy import Policy, matches_any
+from client_feed.policy import Policy
 from client_feed.sources.events import FactoryStatus, OpenEscalations
 from client_feed.sources.prds import PrdText, summarize_prd
 from client_feed.sources.tasks import TaskRow, waiting_on
@@ -164,19 +164,7 @@ def branch_event(
 
 def _budget(policy: Policy, files: Sequence[TreeFile]) -> RevealBudget:
     """PRD §4.12 with no delivered commit and no reveal granted: the proportion of every counted line."""
-    uncounted = (*policy.free_globs, *policy.never_reveal_globs)
-    counted = sum(
-        file.lines
-        for file in files
-        if file.kind is FileKind.PRODUCTION and not matches_any(uncounted, file.path)
-    )
-    return RevealBudget(
-        proportion=policy.reveal_proportion,
-        counted_lines=counted,
-        budget_lines=math.floor(policy.reveal_proportion * counted),
-        spent_lines=0,
-        floor_lines=policy.reveal_floor_lines,
-    )
+    return counted_set(policy, files).budget(())
 
 
 def tree_event(tree: VisibleTree, *, policy: Policy, stamp: Stamp, now: datetime) -> TreeSnapshot:
