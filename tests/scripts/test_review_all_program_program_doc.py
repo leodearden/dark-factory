@@ -9,10 +9,11 @@ fixture store that the fake store re-reads per request. Every script runs as an
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import re
 import subprocess
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -521,3 +522,125 @@ def test_a_ruling_closes_the_question_on_the_roster(decomposed: DocRun) -> None:
     _rule(decomposed, 'alpha owns C1', '--by', 'human', '--answers', 'S1:Q1')
 
     assert _roster_line(_roster(decomposed), 'S1 · ').endswith(' · open questions 1')
+
+
+SCREEN = re.compile(r'^screen (\d+) of (\d+)$')
+CLOSING = 'lead_rulable — one uncontested yes/no block'
+ITEM = re.compile(r'^(\S+:\S+) \[(\w+)\] ')
+UNREACHABLE_STORE = 'http://127.0.0.1:9/mcp'
+
+
+def _sitting(run: DocRun, wave: int, env: ProgramEnv | None = None) -> list[str]:
+    proc = (env or run.env).run(SCRIPT, '--run', RUN_ID, '--sitting', str(wave))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc.stdout.splitlines()
+
+
+def _blocks(lines: list[str]) -> tuple[list[list[str]], list[str] | None]:
+    """The item refs of each screen, in order, and of the closing block (None when it is absent)."""
+    screens: list[list[str]] = []
+    closing: list[str] | None = None
+    current: list[str] | None = None
+    for line in lines:
+        if SCREEN.match(line):
+            current = []
+            screens.append(current)
+        elif line == CLOSING:
+            current = closing = []
+        elif (item := ITEM.match(line)) and current is not None:
+            current.append(item[1])
+    return screens, closing
+
+
+def _item(lines: list[str], ref: str) -> list[str]:
+    """One item's line, then its indented detail lines, stripped."""
+    (start,) = [i for i, line in enumerate(lines) if line.startswith(f'{ref} [')]
+    block = [lines[start]]
+    for line in lines[start + 1:]:
+        if not line.startswith(' '):
+            break
+        block.append(line.strip())
+    return block
+
+
+def _questions(count: int, stream: str) -> list[dict[str, object]]:
+    return [
+        {'id': f'Q{n}', 'question': f'{stream} question {n}?', 'options': ['yes', 'no'],
+         'recommendation': 'yes', 'needs_human': True, 'source': 'author'}
+        for n in range(1, count + 1)
+    ]
+
+
+def _applied_variant(run: DocRun, fixture_return: str, change: Callable[[dict], None]) -> None:
+    """Apply a copy of *fixture_return* that *change* edited; the fixture file is untouched."""
+    inbox = run.env.put_inbox(fixture_return)
+    data = json.loads(inbox.read_text())
+    change(data)
+    inbox.write_text(json.dumps(data, indent=2))
+    proc = run.env.run('apply_return.py', inbox)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.fixture
+def folded(run: DocRun) -> DocRun:
+    """S1 authored, then amended by its fold seat with a critic-sourced Q2."""
+    run.applied('S1.author.json')
+    run.applied('S1.author.amend.json', '--amend')
+    return run
+
+
+def test_b16_the_sitting_puts_the_waves_pending_items_on_screens(folded: DocRun) -> None:
+    lines = _sitting(folded, 1)
+
+    assert lines[0] == 'sitting wave 1: 2 pending on 1 screen(s), 1 lead_rulable'
+    assert _blocks(lines) == ([['S1:Q1', 'S1:Q2']], ['S1:Q3'])
+    draft = f'draft: {folded.home}/prds/S1/review-all-fixture-s1-prd.md'
+    q1, q2 = _item(lines, 'S1:Q1'), _item(lines, 'S1:Q2')
+    assert 'recommendation: alpha owns C1' in q1 and draft in q1
+    assert q2[0].startswith('S1:Q2 [critic] ')
+    assert 'recommendation: hold until S2 releases C1' in q2 and draft in q2
+    assert any(line.startswith('options: ') and 'retire now' in line for line in q2)
+
+
+def test_b16_a_ruled_item_leaves_the_sitting_and_a_reask_stays(folded: DocRun) -> None:
+    _rule(folded, 'alpha owns C1', '--by', 'human', '--answers', 'S1:Q1')
+    _rule(folded, 'new_name.py', '--by', 'lead', '--answers', 'S1:Q3')
+    _rule(folded, 'probe it first', '--by', 'human', '--answers', 'S1:Q2', '--reask')
+
+    assert _blocks(_sitting(folded, 1)) == ([['S1:Q2']], None)
+
+    folded.applied('S1.investigate-Q2.json')
+
+    assert _sitting(folded, 1) == ['nothing pending']
+
+
+def test_screens_hold_at_most_four_items_in_recorded_order(folded: DocRun) -> None:
+    _applied_variant(folded, 'S3.author.json',
+                     lambda data: data.update(open_questions=_questions(6, 'S3')))
+
+    screens, _ = _blocks(_sitting(folded, 1))
+
+    assert all(len(screen) <= 4 for screen in screens)
+    assert [ref for screen in screens for ref in screen] == [
+        'S1:Q1', 'S1:Q2', *(f'S3:Q{n}' for n in range(1, 7))]
+
+
+def test_the_sitting_is_one_waves(folded: DocRun) -> None:
+    _applied_variant(folded, 'S2.author.json',
+                     lambda data: data.update(open_questions=_questions(1, 'S2')))
+
+    assert not [line for line in _sitting(folded, 1) if line.startswith('S2:')]
+    assert _blocks(_sitting(folded, 2)) == ([['S2:Q1']], None)
+
+
+def test_the_sitting_reads_the_home_alone(folded: DocRun) -> None:
+    offline = dataclasses.replace(folded.env, store_url=UNREACHABLE_STORE)
+
+    assert _blocks(_sitting(folded, 1, offline))[0] == [['S1:Q1', 'S1:Q2']]
+
+
+def test_an_unknown_wave_names_the_programs_waves(run: DocRun) -> None:
+    proc = run.doc('--sitting', '9')
+
+    assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
+    assert re.search(r'\b1, 2\b', proc.stderr), proc.stderr
