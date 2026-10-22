@@ -4366,8 +4366,8 @@ class TaskInterceptor:
         still resolve it later.
 
         ``awaiting_curation`` is the one non-terminal answer: the curator
-        could not judge the submission (its account pool, LLM call or corpus
-        was unavailable, its zero-output breaker was open, or it raised), so
+        could not judge the submission (for one of the reasons in
+        :class:`~fused_memory.middleware.curation_deferral.DeferReason`), so
         the submission is durably parked and retried by the ticket janitor. It
         carries the row's ``reason`` and no ``task_id``; a waiter blocked
         before the park is woken with it.
@@ -4601,10 +4601,9 @@ class TaskInterceptor:
         ticket in it is marked ``failed/curator_failed`` (best-effort) and its
         waiters are signalled so ``resolve_ticket`` callers are not blocked
         forever. The worker never waits for the curator to recover: a
-        submission the curator could not judge (pool, LLM, corpus or breaker
-        outage, or a curator that raised) comes back as a ``defer`` decision,
-        which parks the ticket durably (``awaiting_curation``) for the ticket
-        janitor to requeue.
+        submission the curator could not judge comes back as a ``defer``
+        decision, which parks the ticket durably (``awaiting_curation``) for
+        the ticket janitor to requeue.
 
         Independent workers per project restore the per-project fairness of
         the old curator_lock approach: project B is never blocked by a slow
@@ -5525,12 +5524,11 @@ class TaskInterceptor:
 
         A submission the curator could not judge parks ``awaiting_curation``,
         and a within-batch drop onto a parked sibling parks with it; nothing
-        is created for them. That covers a ``defer`` decision (pool, LLM,
-        corpus or breaker outage), an account pool that cannot serve raised
-        from ``curate_batch_prepared`` (``POOL_UNAVAILABLE_ERRORS``), a
-        :class:`CuratorFailureError` escaping ``curate()`` other than a
-        zero-output hang, and any other exception ``curate_batch_prepared``
-        raises instead of deciding.
+        is created for them. That covers a ``defer`` decision, an account
+        pool that cannot serve raised from ``curate_batch_prepared``
+        (``POOL_UNAVAILABLE_ERRORS``), a :class:`CuratorFailureError` escaping
+        ``curate()`` other than a zero-output hang, and any other exception
+        ``curate_batch_prepared`` raises instead of deciding.
         """
         if self._ticket_store is None:
             return

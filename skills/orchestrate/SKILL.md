@@ -172,9 +172,8 @@ elif resolve["status"] == "refused":
     # Do NOT retry and do NOT record a task id.
     note_refused(resolve["reason"])
 elif resolve["status"] == "awaiting_curation":
-    # The curator could not judge it (account pool, LLM call or corpus
-    # unavailable, or zero-output breaker open): the ticket is durably parked
-    # and retried until it gets a verdict. No task_id yet. Do NOT re-submit; see
+    # The curator could not judge it yet: the ticket is durably parked and
+    # retried until it gets a verdict. No task_id yet. Do NOT re-submit; see
     # skills/_shared/ticket-failure-handling.md.
     note_parked(ticket)
 elif resolve["status"] == "failed":

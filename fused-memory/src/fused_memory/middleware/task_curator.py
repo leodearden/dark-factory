@@ -13,10 +13,9 @@ anchor + module-lock pool + embedding neighbors + dependency neighbors). See
 docs/reify-task-fragmentation-report-2026-04-11.txt for the motivating analysis.
 
 When the curator cannot judge a candidate it returns ``action="defer"``
-(:meth:`CuratorDecision.deferred`, with a
-:class:`~fused_memory.middleware.curation_deferral.DeferReason`) rather than creating
-anything un-deduped: its account pool cannot serve, its corpus assembly fails, its LLM
-call fails, or its zero-output breaker is open. The interceptor parks a deferred
+(:meth:`CuratorDecision.deferred`, with the
+:class:`~fused_memory.middleware.curation_deferral.DeferReason` that says why) rather
+than creating anything un-deduped. The interceptor parks a deferred
 submission and retries it until it gets a verdict, so task creation is never blocked
 and never silently skips dedupe. A response that arrives but cannot be used still
 degrades to ``action="create"``, marked ``degraded``.
@@ -1845,13 +1844,14 @@ class TaskCurator:
     ) -> CuratorDecision:
         """Render a drop/combine/create decision for a candidate task.
 
-        When the candidate cannot be judged — the account pool cannot serve, the
-        corpus cannot be assembled, the LLM call fails, or the zero-output
-        breaker is open — this returns :meth:`CuratorDecision.deferred`. A
-        zero-output hang on this candidate's own call is the one outage that
-        creates (``degraded_by_zot``), and an unusable response degrades to a
-        ``create``. A failed LLM call is reported to the escalator, which
-        re-raises :class:`CuratorFailureError` when no orchestrator is running.
+        When the candidate cannot be judged this returns
+        :meth:`CuratorDecision.deferred` with the
+        :class:`~fused_memory.middleware.curation_deferral.DeferReason` that
+        says why. A zero-output hang on this candidate's own call is the one
+        outage that creates (``degraded_by_zot``), and an unusable response
+        degrades to a ``create``. A failed LLM call is reported to the
+        escalator, which re-raises :class:`CuratorFailureError` when no
+        orchestrator is running.
 
         *prepared* hands over a corpus the caller already assembled, so it is
         not assembled twice.  :meth:`curate_batch_prepared`'s size-1

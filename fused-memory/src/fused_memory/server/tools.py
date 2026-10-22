@@ -9207,8 +9207,7 @@ def create_mcp_server(
 
         Callers should follow up with ``resolve_ticket`` to obtain the final
         task_id once the curator has decided (create / drop / combine).
-        When the curator cannot judge it (account pool, LLM call or corpus
-        unavailable, or zero-output breaker open) the ticket parks as
+        When the curator cannot judge it yet, the ticket parks as
         ``awaiting_curation`` and is curated later.
 
         ``planning_mode=True`` switches to a synchronous, curator-bypassing
@@ -9610,11 +9609,10 @@ def create_mcp_server(
         - ``failed``   — an error occurred; ``reason`` describes it. Common
           reasons: ``timeout``, ``server_restart``, ``expired``.
         - ``awaiting_curation`` — NON-terminal: the curator could not judge the
-          submission (its account pool, LLM call or corpus was unavailable, or
-          its zero-output breaker was open), so it is durably parked and
-          retried automatically until it gets a verdict. NO ``task_id`` is returned. It is neither a failure
-          nor a creation: do NOT re-submit and do NOT count it as created;
-          call ``resolve_ticket`` again later.
+          submission yet (``reason`` says why), so it is durably parked and
+          retried automatically until it gets a verdict. NO ``task_id`` is
+          returned. It is neither a failure nor a creation: do NOT re-submit
+          and do NOT count it as created; call ``resolve_ticket`` again later.
         - ``refused``  — a deterministic guard (cancelled-premise blocklist /
           recon premise registry) rejected the candidate. **NO TASK WAS
           CREATED and NO ``task_id`` is returned** — the key is absent, not

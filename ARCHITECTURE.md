@@ -344,10 +344,10 @@ Tasks reach the queue through `mcp__fused-memory__submit_task`
   (`fused-memory/src/fused_memory/middleware/task_curator.py`) dedupes,
   combines, or creates the real task row in the SQLite backend
   (`<project_root>/.taskmaster/tasks/tasks.db`). When the curator cannot judge
-  a submission (its account pool, LLM call or corpus is unavailable, its
-  zero-output breaker is open, or it raised instead of deciding), the ticket
-  parks as `awaiting_curation` and the ticket janitor retries it until it gets
-  a verdict; every create the curator did not judge is marked
+  a submission (the reasons are
+  `fused-memory/src/fused_memory/middleware/curation_deferral.py::DeferReason`),
+  the ticket parks as `awaiting_curation` and the ticket janitor retries it
+  until it gets a verdict; every create the curator did not judge is marked
   `metadata.dedupe_skipped`.
 - **`planning_mode=True` path.** Used by `/prd` batch decomposition: writes
   the task directly in status `deferred`, bypassing the curator, so a whole
