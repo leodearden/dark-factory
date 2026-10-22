@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Apply one PRD-seat return from a run home's inbox to the home's ledger and rulings."""
+"""Apply one PRD-seat return from a run home's inbox to the home's ledger and rulings.
+
+With ``--from-store`` it instead records a stream's decompose from the task
+store, for a session that left no usable return to apply.
+"""
 from __future__ import annotations
 
 import argparse
