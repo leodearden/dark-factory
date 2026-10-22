@@ -344,14 +344,6 @@ an entry with missing or unexpected keys. A load → save round trip
 reproduces the corpus byte for byte, so only the pooled annotations and
 `manifest.json` change.
 
-### Key entries flagged for human review (not edited)
-
-- `mined_829` `frontier_1`: a Python 3.11 probe shows the marker DOES change
-  `AsyncMock` behaviour, contradicting the entry.
-- `py_always_passes` `py_pass_3`: the assertion is roundabout, not
-  tautological.
-- `py_real_01` `py_real_cap_3`: possibly blocking, not suggestion.
-
 ### Matcher noise
 
 Re-running the haiku matcher (`scorer.py::match_issues`) on identical reviews
