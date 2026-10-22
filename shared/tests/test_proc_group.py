@@ -970,15 +970,17 @@ class TestSigkillProcessGroup:
 
     @pytest.mark.timeout(5)
     def test_unsafe_pgid_is_refused_and_degrades_to_a_direct_kill(self, monkeypatch, caplog):
+        pgid = _pgid_no_guard_refuses()
         calls: list[tuple[int, int]] = []
         monkeypatch.setattr(
-            'shared.proc_group.os.killpg', lambda pgid, sig: calls.append((pgid, sig))
+            'shared.proc_group.os.killpg', lambda target, sig: calls.append((target, sig))
         )
-        fake = _KillRecordingProc(pid=999_999)
+        fake = _KillRecordingProc(pid=pgid + 1)
 
         with caplog.at_level(logging.ERROR, logger='shared.proc_group'):
-            sigkill_process_group(fake, 999_998)  # type: ignore[arg-type]
+            dispatch = sigkill_process_group(cast(asyncio.subprocess.Process, fake), pgid)
 
+        assert dispatch is SigkillDispatch.DIRECT_KILLED
         assert calls == [], f'killpg should be refused; got {calls}'
         assert fake.killed, 'a refused group kill must still kill the direct child'
         assert any(
@@ -987,36 +989,21 @@ class TestSigkillProcessGroup:
 
     @pytest.mark.timeout(5)
     def test_killpg_failure_degrades_to_a_direct_kill(self, monkeypatch):
-        def failing_killpg(pgid: int, sig: int) -> None:
+        pgid = _pgid_no_guard_refuses()
+        calls: list[tuple[int, int]] = []
+
+        def failing_killpg(target: int, sig: int) -> None:
+            calls.append((target, sig))
             raise ProcessLookupError(errno.ESRCH, 'no such process group')
 
         monkeypatch.setattr('shared.proc_group.os.killpg', failing_killpg)
-        fake = _KillRecordingProc(pid=999_999)
-
-        sigkill_process_group(fake, 999_999)  # type: ignore[arg-type]
-
-        assert fake.killed, 'a failed group kill must still kill the direct child'
-
-    @pytest.mark.timeout(5)
-    @pytest.mark.parametrize('branch', ['refused', 'killpg_raises'])
-    def test_a_degraded_group_kill_reports_a_direct_kill(self, monkeypatch, branch):
-        pgid = _pgid_no_guard_refuses()
-        killpg_calls: list[tuple[int, int]] = []
-
-        def killpg(target: int, sig: int) -> None:
-            killpg_calls.append((target, sig))
-            if branch == 'killpg_raises':
-                raise ProcessLookupError(errno.ESRCH, 'no such process group')
-
-        monkeypatch.setattr('shared.proc_group.os.killpg', killpg)
-        fake = _KillRecordingProc(pid=pgid + 1 if branch == 'refused' else pgid)
+        fake = _KillRecordingProc(pid=pgid)
 
         dispatch = sigkill_process_group(cast(asyncio.subprocess.Process, fake), pgid)
 
         assert dispatch is SigkillDispatch.DIRECT_KILLED
-        assert fake.killed, 'a degraded group kill must still kill the direct child'
-        expected_killpg = [] if branch == 'refused' else [(pgid, signal.SIGKILL)]
-        assert killpg_calls == expected_killpg
+        assert calls == [(pgid, signal.SIGKILL)]
+        assert fake.killed, 'a failed group kill must still kill the direct child'
 
 
 class TestSnapshotProcessGroup:

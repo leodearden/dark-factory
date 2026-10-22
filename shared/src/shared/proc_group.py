@@ -269,9 +269,11 @@ def unsafe_pgid_reason(pgid: int, proc_pid: int | None = None) -> str | None:
     Applied as defence-in-depth: even if a caller (or a PID-reuse race) hands
     us a pgid that targets the user session or ourselves, we refuse.
 
-    Public: consumed cross-package by
-    ``orchestrator.deterministic_runner`` as the third defence layer of the
-    task-845 frozen-pgid contract (task 4333). *proc_pid* defaults to
+    Every caller is a group-killer in this module
+    (:func:`terminate_process_group`, :func:`sigkill_process_group`,
+    :func:`reap_process_groups`), where it is the third defence layer of the
+    task-845 frozen-pgid contract; ``df_pytest_isolation._unsafe_pgid_reason``
+    is a stdlib-only port of it. *proc_pid* defaults to
     ``None`` so a caller that has no companion pid to compare against (e.g.
     :func:`reap_process_groups`, reaping foreign pgids by number) can omit
     it.  Any caller that does hold a ``proc`` handle must pass ``proc.pid``:
@@ -377,9 +379,10 @@ def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> Sigkil
     stage: that helper stops escalating once the LEADER exits, so a grandchild
     that ignores SIGTERM would survive.
 
-    An already-reaped *proc* gets no signal (its pid may be recycled).  A
-    refused or failed group kill degrades to a direct ``proc.kill()``, which is
-    safe while the pid is unreaped.
+    An already-reaped *proc* gets no signal (its pid may be recycled), so any
+    grandchildren still running are deliberately forgone: refusing to kill a
+    stranger beats reaping an orphan.  A refused or failed group kill degrades
+    to a direct ``proc.kill()``, which is safe while the pid is unreaped.
 
     Returns the :class:`SigkillDispatch` naming which of those it dispatched.
     """
