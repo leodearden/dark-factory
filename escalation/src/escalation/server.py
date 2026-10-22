@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any, assert_never, cast
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import Field, ValidationError
-from shared.branch_names import canonical_queued_branch_name
+from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 from shared.eval_lane import eval_lane_provenance
 
 # Fully qualified rather than `from shared import ...`: the module is
@@ -492,11 +492,27 @@ def _get_merge_journal(harness: Any | None) -> MergeQueueStore | None:
 
 @dataclass(frozen=True)
 class _PollKey:
-    """One merge_status lookup: request_id outranks branch, which outranks task_id."""
+    """One merge_status lookup: request_id outranks branch, which outranks task_id.
+
+    ``branch`` holds the bare id every producer writes (``QueuedBranch.bare_id``),
+    so a key carrying a branch is built through :meth:`parse`.
+    """
 
     request_id: str | None = None
     branch: str | None = None
     task_id: str | None = None
+
+    @classmethod
+    def parse(
+        cls,
+        *,
+        request_id: str | None,
+        branch: str | None,
+        task_id: str | None,
+        branch_prefix: str,
+    ) -> _PollKey:
+        bare = bare_queued_branch_id(branch, branch_prefix) if branch is not None else None
+        return cls(request_id=request_id, branch=bare, task_id=task_id)
 
     @property
     def landing_key(self) -> str | None:
@@ -5291,8 +5307,9 @@ def create_server(
     ) -> dict[str, Any]:
         """Return the current merge state for a merge request.
 
-        Accepts one of: request_id (authoritative), branch (most-recent), or
-        task_id (most-recent).  Tiers, by strength of claim
+        Accepts one of: request_id (authoritative), branch (most-recent; bare
+        or carrying the configured prefix), or task_id (most-recent).  Tiers,
+        by strength of claim
         (``plans/merge-status-durable-non-landed-prd.md`` D5):
 
             live snapshot → event store (this run) → git authority
@@ -5314,7 +5331,10 @@ def create_server(
         if request_id is None and branch is None and task_id is None:
             return {'error': 'At least one of request_id, branch, or task_id is required'}
 
-        key = _PollKey(request_id=request_id, branch=branch, task_id=task_id)
+        key = _PollKey.parse(
+            request_id=request_id, branch=branch, task_id=task_id,
+            branch_prefix=orch_config.git.branch_prefix if orch_config is not None else '',
+        )
         return (await _resolve(key)).to_response()
 
     async def _cancel_in_lane(request_id: str) -> dict[str, Any]:
