@@ -355,6 +355,30 @@ def test_stream_of_refuses_keys_that_hit_two_streams() -> None:
     assert 'S1' in message and 'S2' in message
 
 
+_WAIT = {'stream': 'S2', 'contract': 'C1', 'release_owner': 'S2'}
+
+
+def test_a_held_leaf_carries_a_seam_wait_and_no_release() -> None:
+    assert state.is_held(_row(1, x_seam_wait=_WAIT))
+    assert not state.is_held(_row(2, x_seam_wait=_WAIT, x_seam_released={'by': 'S2'}))
+    assert not state.is_held(_row(3))
+
+
+def test_seam_keys_read_a_declared_field_and_refuse_an_undeclared_one() -> None:
+    row = _row(1, x_seam_wait=_WAIT)
+    assert state.SEAM_WAIT_KEYS.value(row, 'contract') == 'C1'
+    assert state.SEAM_RELEASED_KEYS.value(row, 'by') is None
+    with pytest.raises(state.StateError, match="no field 'owner'"):
+        state.SEAM_WAIT_KEYS.value(row, 'owner')
+
+
+def test_unauthored_reason_names_the_missing_authored_line() -> None:
+    program = _program()
+    reason = state.unauthored_reason(state.stream_views(program, ())['S1'])
+    assert reason is not None and 'S1' in reason and 'authored' in reason
+    assert state.unauthored_reason(state.stream_views(program, [_authored(1, 'S1')])['S1']) is None
+
+
 RUN_ID = 'review-all-fixture-20261019'
 
 

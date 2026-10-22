@@ -35,8 +35,22 @@ TERMINAL_STATUSES: tuple[str, ...] = tuple(sorted(str(s) for s in task_statuses.
 
 @dataclass(frozen=True)
 class SeamKeys:
+    """A seam metadata key on a held-leaf task and the fields of the record it carries."""
+
     key: str
     fields: tuple[str, ...]
+
+    def record(self, row: TaskRow) -> Mapping[str, Any] | None:
+        """The row's record under ``key``; None when it carries none, or not a mapping."""
+        value = row.metadata.get(self.key)
+        return value if isinstance(value, Mapping) else None
+
+    def value(self, row: TaskRow, field: str) -> Any:
+        """One declared field of the row's record; None when the record or the field is absent."""
+        if field not in self.fields:
+            raise StateError(f'{self.key} has no field {field!r} (fields: {", ".join(self.fields)})')
+        record = self.record(row)
+        return None if record is None else record.get(field)
 
 
 SEAM_WAIT_KEYS = SeamKeys('x_seam_wait', ('stream', 'contract', 'release_owner'))
@@ -576,6 +590,11 @@ class TaskRow:
         object.__setattr__(self, 'dependencies', tuple(self.dependencies))
 
 
+def is_held(row: TaskRow) -> bool:
+    """A held leaf: the task waits on a seam and no release of it is recorded."""
+    return SEAM_WAIT_KEYS.key in row.metadata and SEAM_RELEASED_KEYS.key not in row.metadata
+
+
 @dataclass(frozen=True)
 class StreamView:
     """A stream row after the ledger's amendments, with its status and authored PRD path."""
@@ -694,6 +713,14 @@ def stream_views(program: Program, ledger: Iterable[Mapping[str, Any]]) -> Mappi
 def waves(views: Mapping[str, StreamView]) -> Mapping[str, int]:
     """Each stream's wave, 1 + the max of its upstream streams' waves; never stored."""
     return types.MappingProxyType(_wave_numbers({v.id: v.deps for v in views.values()}))
+
+
+def unauthored_reason(view: StreamView) -> str | None:
+    """Why *view*'s stream has no applied author return yet; None once it has one."""
+    if view.authored:
+        return None
+    return (f'{view.id} author return is not applied: the ledger has no '
+            f'stream_status authored line for {view.id}')
 
 
 UNSTREAMED = 'unstreamed'
@@ -1343,11 +1370,7 @@ class StoreReader:
 
     def held_leaves(self, run_id: str, prd_paths: Iterable[str]) -> StoreRead:
         program = self.program_tasks(run_id, prd_paths)
-        held = tuple(
-            row for row in program.rows
-            if SEAM_WAIT_KEYS.key in row.metadata and SEAM_RELEASED_KEYS.key not in row.metadata
-        )
-        return replace(program, rows=held)
+        return replace(program, rows=tuple(row for row in program.rows if is_held(row)))
 
     def _chain_task(self, run_id: str, role: TriggerChainRole) -> StoreRead:
         measured_at = now_utc()
@@ -1771,13 +1794,9 @@ def _contradiction(field: str, reason: str) -> Rejection:
     return Rejection(field, RejectionClass.CONTRADICTION, reason)
 
 
-def _authored_rejections(ret: PrdReturn, view: StreamView) -> list[Rejection]:
-    if view.authored:
-        return []
-    return [_contradiction(
-        'pass', f'{ret.stream} author return is not applied: the ledger has no '
-        f'stream_status authored line for {ret.stream}',
-    )]
+def _authored_rejections(view: StreamView) -> list[Rejection]:
+    reason = unauthored_reason(view)
+    return [] if reason is None else [_contradiction('pass', reason)]
 
 
 def _filed_key_rejections(ret: PrdReturn, view: StreamView) -> list[Rejection]:
@@ -1833,14 +1852,14 @@ def _held_rejections(ret: PrdReturn, reads: _StoreReads) -> list[Rejection]:
         if row.status != task_statuses.TaskStatus.DEFERRED:
             rejections.append(_contradiction(
                 field, f'task {held.task_id} is {row.status}, not {task_statuses.TaskStatus.DEFERRED}'))
-        wait = row.metadata.get(SEAM_WAIT_KEYS.key)
-        if not isinstance(wait, Mapping):
+        waits_on = SEAM_WAIT_KEYS.value(row, 'stream')
+        if SEAM_WAIT_KEYS.record(row) is None:
             rejections.append(_contradiction(
                 field, f'task {held.task_id} carries no {SEAM_WAIT_KEYS.key}'))
-        elif wait.get('stream') != held.waits_on:
+        elif waits_on != held.waits_on:
             rejections.append(_contradiction(
                 f'held[{i}].waits_on', f'the store records {SEAM_WAIT_KEYS.key}.stream '
-                f'{wait.get("stream")!r} for task {held.task_id}, not {held.waits_on!r}'))
+                f'{waits_on!r} for task {held.task_id}, not {held.waits_on!r}'))
     return rejections
 
 
@@ -1869,7 +1888,7 @@ def _check_store(
     reads = _StoreReads(store)
     view = views[ret.stream]
     rejections = [
-        *_authored_rejections(ret, view),
+        *_authored_rejections(view),
         *_filed_key_rejections(ret, view),
         *_filed_rejections(ret, reads),
         *_gate_dep_rejections(ret, reads),

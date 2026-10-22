@@ -449,13 +449,10 @@ def _unknown_stream(snapshot: home_writer.Snapshot, home: state.Home, stream: st
 
 
 def _unauthored_stream(snapshot: home_writer.Snapshot, home: state.Home, stream: str) -> Refused | None:
-    if state.stream_views(snapshot.program, snapshot.ledger)[stream].authored:
+    reason = state.unauthored_reason(state.stream_views(snapshot.program, snapshot.ledger)[stream])
+    if reason is None:
         return None
-    return _refused([state.Rejection(
-        'stream', state.RejectionClass.CONTRADICTION,
-        f'{stream} author return is not applied: the ledger has no stream_status authored line '
-        f'for {stream}',
-    )])
+    return _refused([state.Rejection('stream', state.RejectionClass.CONTRADICTION, reason)])
 
 
 def _decomposed_stream(snapshot: home_writer.Snapshot, home: state.Home, stream: str) -> Refused | None:
@@ -482,22 +479,6 @@ def _usable_inbox(snapshot: home_writer.Snapshot, home: state.Home, stream: str)
 _FROM_STORE_REFUSALS = (_unknown_stream, _unauthored_stream, _decomposed_stream, _usable_inbox)
 
 
-def _seam_wait(row: state.TaskRow) -> Mapping[str, Any]:
-    wait = row.metadata.get(state.SEAM_WAIT_KEYS.key)
-    return wait if isinstance(wait, Mapping) else {}
-
-
-def _is_held(row: state.TaskRow) -> bool:
-    return (state.SEAM_WAIT_KEYS.key in row.metadata
-            and state.SEAM_RELEASED_KEYS.key not in row.metadata)
-
-
-def _released_by(row: state.TaskRow, stream: str) -> Mapping[str, Any] | None:
-    released = row.metadata.get(state.SEAM_RELEASED_KEYS.key)
-    by_field = state.SEAM_RELEASED_KEYS.fields[0]
-    return released if isinstance(released, Mapping) and released.get(by_field) == stream else None
-
-
 @dataclass(frozen=True)
 class _Reconstruction:
     """A stream's decompose as the store shows it."""
@@ -512,9 +493,9 @@ def _reconstructed(
 ) -> _Reconstruction:
     own = [row for row in rows if state.stream_of(row, views) == stream]
     return _Reconstruction(
-        filed=tuple(row for row in own if not _is_held(row)),
-        held=tuple(row for row in own if _is_held(row)),
-        released=tuple(row for row in rows if _released_by(row, stream) is not None),
+        filed=tuple(row for row in own if not state.is_held(row)),
+        held=tuple(row for row in own if state.is_held(row)),
+        released=tuple(row for row in rows if state.SEAM_RELEASED_KEYS.value(row, 'by') == stream),
     )
 
 
@@ -523,20 +504,18 @@ def _filed_text(rows: Sequence[state.TaskRow]) -> str:
 
 
 def _held_leaf_text(row: state.TaskRow) -> str:
-    stream_field, contract_field, owner_field = state.SEAM_WAIT_KEYS.fields
-    wait = _seam_wait(row)
-    return (f'{row.task_id} on {wait.get(stream_field)} {wait.get(contract_field)} '
-            f'(release owner {wait.get(owner_field)})')
+    wait = state.SEAM_WAIT_KEYS
+    return (f'{row.task_id} on {wait.value(row, "stream")} {wait.value(row, "contract")} '
+            f'(release owner {wait.value(row, "release_owner")})')
 
 
 def _held_text(rows: Sequence[state.TaskRow]) -> str:
     return ', '.join(_held_leaf_text(row) for row in rows) or 'none'
 
 
-def _released_text(rows: Sequence[state.TaskRow], stream: str) -> str:
-    onto_field = state.SEAM_RELEASED_KEYS.fields[2]
+def _released_text(rows: Sequence[state.TaskRow]) -> str:
     return ', '.join(
-        f'{row.task_id} onto {list((_released_by(row, stream) or {}).get(onto_field, ()))}'
+        f'{row.task_id} onto {list(state.SEAM_RELEASED_KEYS.value(row, "onto") or ())}'
         for row in rows
     ) or 'none'
 
@@ -545,7 +524,7 @@ def _note_text(stream: str, found: _Reconstruction, measured_at: str, leftover: 
     text = (
         f'{stream} decompose reconstructed from the store read at {measured_at}: '
         f'filed {_filed_text(found.filed)}; held {_held_text(found.held)}; '
-        f'released {_released_text(found.released, stream)}; '
+        f'released {_released_text(found.released)}; '
         f'lost with the return: {", ".join(LOST_WITH_THE_RETURN)}'
     )
     return text if leftover is None else f'{text}; {leftover}'
