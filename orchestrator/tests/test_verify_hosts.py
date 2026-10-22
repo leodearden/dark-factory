@@ -8,6 +8,7 @@ calls (``name``, ``cancel_verify()``, ``probe_clean()``).
 from __future__ import annotations
 
 import dataclasses
+import logging
 from collections.abc import Callable
 
 import pytest
@@ -19,15 +20,21 @@ from orchestrator.verify_runner import HostAllocator, HostLease
 class _FakeRemote:
     """A remote host whose cancel rc and probe verdict are fixed per test."""
 
-    def __init__(self, name: str, *, cancel_rc: int = 0, probe_clean: bool = True) -> None:
+    def __init__(
+        self, name: str, *, cancel_rc: int = 0, probe_clean: bool = True,
+        cancel_raises: Exception | None = None,
+    ) -> None:
         self.name = name
         self.cancel_rc = cancel_rc
+        self.cancel_raises = cancel_raises
         self.probe_verdict = probe_clean
         self.cancel_calls = 0
         self.probe_calls = 0
 
     async def cancel_verify(self) -> int:
         self.cancel_calls += 1
+        if self.cancel_raises is not None:
+            raise self.cancel_raises
         return self.cancel_rc
 
     async def probe_clean(self) -> bool:
@@ -300,3 +307,24 @@ class TestReleaseAndCancel:
         assert unwind.snapshots == ['unwound']
         assert remote.cancel_calls == 0
         assert allocator.is_busy('laptop') is True
+
+    @pytest.mark.parametrize(('probe_clean', 'parked'), [(True, False), (False, True)])
+    async def test_a_cancel_that_raises_is_a_failed_cancel_not_a_busy_leak(
+        self, probe_clean: bool, parked: bool, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        remote = _FakeRemote('laptop', probe_clean=probe_clean, cancel_raises=RuntimeError('ssh died'))
+        pool, allocator = _pool([remote], _Hooks())
+        lease = _lease(pool.acquire_for_task('42'))
+        unwind = _RecordingUnwind(lambda: 'unwound')
+        caplog.set_level(logging.WARNING, logger='orchestrator.verify_hosts')
+
+        assert await pool.cancel_and_release(lease, unwind=unwind) is False
+
+        assert unwind.snapshots == ['unwound']
+        assert remote.probe_calls >= 1
+        assert allocator.is_parked('laptop') is parked
+        assert allocator.is_busy('laptop') is parked
+        assert pool.holders() == {}
+        [warning] = [r for r in caplog.records if r.name == 'orchestrator.verify_hosts']
+        assert warning.levelno == logging.WARNING
+        assert 'laptop' in warning.getMessage()

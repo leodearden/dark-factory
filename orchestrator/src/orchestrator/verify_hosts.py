@@ -8,6 +8,7 @@ below both the merge lane and the task workflow: it must never import
 from __future__ import annotations
 
 import dataclasses
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,8 @@ from orchestrator.verify_runner import (
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
 
+logger = logging.getLogger(__name__)
+
 MergeDemand = Callable[[], bool]
 RefusalReason = Literal['no_host', 'host_parked', 'merge_demand', 'pressure_hold']
 Unwind = Callable[[], Awaitable[object]]
@@ -34,23 +37,13 @@ def build_remote_runners(
     *,
     quarantine: set[str] | None = None,
 ) -> list[RemoteRunner]:
-    """Build the list of RemoteRunner instances from operator config (Lever C).
+    """One :class:`RemoteRunner` per enabled ``config.verify_runners`` entry not in *quarantine*.
 
-    Returns REMOTES ONLY — the LocalRunner trust anchor is prepended by callers
-    since it needs call-specific arguments (worktree path, module configs, etc.).
-
-    Filters out disabled runners (enabled=False) and any runner whose name is in
-    the quarantine set (in-memory worker-level quarantine from DriftDetector).
-    quarantine=None is treated as an empty set (no quarantine).
-
-    _build_verify_runners passes main_branch=config.git.main_branch so the
-    remote host receives a freshness push before the merge-sha transport.
-
-    Each runner also receives the INV-2 contract-currency paths (task 2884):
-    df_remote_checkout=r.df_checkout_path (per-runner, opt-in; None keeps
-    auto-sync OFF / byte-identical) and df_local_checkout=the dispatcher's own
-    DF code root, resolved ONCE here (call-invariant) and shared across every
-    runner so sync_if_stale can HEAD-compare remote-vs-local at dispatch.
+    Remotes only: no local runner is included.  Every runner pushes
+    ``config.git.main_branch`` to its host before a verify, and carries the
+    INV-2 contract-currency paths (task 2884) that ``sync_if_stale`` compares:
+    its own ``df_checkout_path`` (``None`` leaves auto-sync off) and this
+    process's DF code root, resolved once and shared by every runner.
     """
     _local_df = resolve_local_df_checkout()
     return [
@@ -92,6 +85,12 @@ class _CancelThenUnwind:
     async def cancel_verify(self) -> int:
         try:
             return await self.runner.cancel_verify()
+        except Exception:
+            logger.warning(
+                'cancel-verify on %s raised; treating it as a failed cancel',
+                self.runner.name, exc_info=True,
+            )
+            return 1
         finally:
             await self.unwind()
 
@@ -112,8 +111,9 @@ def _run_once(unwind: Unwind | None) -> Callable[[], Awaitable[None]]:
 class HostPool:
     """The task path's leases on the worker-lifetime :class:`HostAllocator`.
 
-    Invariants: a hold exists iff the allocator slot is BUSY for a task this
-    pool leased; the pool never writes the allocator's quarantine set (an
+    Invariants: a hold is a lease this pool handed out and whose release or
+    cancel has not yet returned, so its slot is BUSY (or PARKED while a failed
+    cancel probes the host); the pool never writes the allocator's quarantine set (an
     unavailable host is reported through *on_unavailable* and readmission stays
     with the merge lane's tracker, PRD §4.5); :meth:`acquire_for_task` is
     synchronous, so its check-then-acquire is atomic on the event loop.
