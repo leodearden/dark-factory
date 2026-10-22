@@ -804,6 +804,7 @@ class ReconciliationHarness:
         recon_report_state=None,
         server_ready_event: asyncio.Event | None = None,
         escalation_listener: socket.socket | None = None,
+        full_cycle_deadline: Callable[[float], asyncio.Timeout] = asyncio.timeout,
     ):
         self.memory = memory_service
         # systemd-held listening socket for the escalation port, so it stays
@@ -825,6 +826,7 @@ class ReconciliationHarness:
             _raw_root = os.path.expanduser(_raw_root)
         self._project_root = str(Path(_raw_root).resolve()) if _raw_root else ''
         self.config = config.reconciliation
+        self._full_cycle_deadline = full_cycle_deadline
         self._backlog_policy = backlog_policy
         # Multi-project routing: build a {project_id → project_root} map from
         # the configured project + DASHBOARD_KNOWN_PROJECT_ROOTS env var so
@@ -3483,15 +3485,14 @@ class ReconciliationHarness:
     async def _run_bounded_full_cycle(
         self, project_id: str, reason: str, tier: TierConfig | None,
     ) -> None:
-        """Run one full cycle within cycle_timeout_seconds as a caller-minted
-        run; if it raises, the timeout included, its own drained events are
-        restored unless the journal records it completed."""
+        """Run one full cycle within cycle_timeout_seconds, under the injected
+        ``full_cycle_deadline``, as a caller-minted run; if it raises, the
+        timeout included, its own drained events are restored unless the
+        journal records it completed."""
         run_id = str(uuid4())
         try:
-            await asyncio.wait_for(
-                self.run_full_cycle(project_id, reason, tier=tier, run_id=run_id),
-                timeout=self.config.cycle_timeout_seconds,
-            )
+            async with self._full_cycle_deadline(self.config.cycle_timeout_seconds):
+                await self.run_full_cycle(project_id, reason, tier=tier, run_id=run_id)
         except Exception:
             await restore_unless_completed_best_effort(
                 self.journal, self.buffer, project_id, run_id,
@@ -3675,7 +3676,7 @@ class ReconciliationHarness:
                     ``resume_run.stage_cursor`` by threading
                     ``resume_run.session_id`` into it.  The remaining stages run
                     fresh, and the completion/judge/remediation tail is unchanged.
-            run_id: caller-minted id for this run, so a caller whose wait_for
+            run_id: caller-minted id for this run, so a caller whose deadline
                     timed out can still scope the restore of its events (task 6453).
         """
         # task 1143: pre-flight guard — raises before any side effects (no journal row,
@@ -3996,7 +3997,7 @@ class ReconciliationHarness:
     ) -> None:
         """Journal a ``run_full_cycle`` cancelled before durable completion; the
         caller re-raises, so asyncio cancellation semantics hold
-        (``asyncio.wait_for`` cancels via CancelledError, which is not an
+        (the cycle deadline cancels via CancelledError, which is not an
         Exception, so without this the row would stay 'running').
 
         Task σ: when resume_after_restart is enabled, a restart cancelling an
