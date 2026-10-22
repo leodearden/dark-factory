@@ -69,13 +69,14 @@ The script is idempotent (safe to re-run) and self-reports each step with
 ### Known gap: step 5 hardcodes the maintainer's other projects
 
 `scripts/setup-host.sh`'s orchestrator-units step unconditionally installs
-and enables systemd units for **six projects that are not part of this
+and enables systemd units for **seven projects that are not part of this
 repo and won't exist on your machine**: `orchestrator-reify.service`,
 `orchestrator-autopilot-video.service`,
 `orchestrator-my-solar-challenge.service`,
 `orchestrator-solar-challenge-platform.service`,
-`orchestrator-know-live.service`, and
-`orchestrator-pump-web-ui.service`. Each `ExecStart` points at
+`orchestrator-know-live.service`,
+`orchestrator-pump-web-ui.service`, and
+`orchestrator-stream-touch.service`. Each `ExecStart` points at
 a `dark-factory-orchestrator.yaml` in a sibling repo that doesn't exist for
 you, so once `default.target` restarts them (next login/boot), they'll
 crash-loop until `StartLimitBurst` is exhausted. `orchestrator-dark-factory.service`
@@ -93,7 +94,8 @@ systemctl --user disable --now \
   orchestrator-my-solar-challenge.service \
   orchestrator-solar-challenge-platform.service \
   orchestrator-know-live.service \
-  orchestrator-pump-web-ui.service
+  orchestrator-pump-web-ui.service \
+  orchestrator-stream-touch.service
 ```
 
 Keep `orchestrator-watchdog.timer` enabled — it skips disabled units, so
