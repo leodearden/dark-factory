@@ -15107,9 +15107,9 @@ class TaskWorkflow:
         deadline = asyncio.get_event_loop().time() + window
         last_progress = self._steward_progress_counter()
         while True:
-            pending_l0 = self.escalation_queue.get_by_task(
-                self.task_id, status='pending', level=0,
-            )
+            # The same set the give-up below dismisses: an info note the
+            # router owns is the exit finalizer's (D10) and holds no wait.
+            pending_l0 = self._pending_steward_l0s()
             if not pending_l0:
                 break
             self._escalation_event.clear()
@@ -15202,7 +15202,7 @@ class TaskWorkflow:
                 # invariant fix A establishes on the producer side.  Leaving
                 # them pending would re-strand the NEXT ESCALATED entry on
                 # the same records for another full window.
-                for esc in self._pending_steward_l0s():
+                for esc in pending_l0:
                     self.escalation_queue.resolve(
                         esc.id,
                         'Auto-dismissed: steward did not resolve within the '

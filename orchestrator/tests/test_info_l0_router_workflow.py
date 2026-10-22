@@ -149,12 +149,20 @@ async def _steward_wait_timeout(workflow: TaskWorkflow, queue: EscalationQueue, 
     assert workflow._steward_wait_expired
 
 
+async def _steward_wait_reentry(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:
+    """The next ESCALATED entry after a give-up waits on nothing the give-up left."""
+    await _steward_wait_timeout(workflow, queue, tmp_path)
+    await asyncio.wait_for(workflow._wait_for_resolution(), 10)
+    assert not workflow._steward_wait_expired
+
+
 DISMISSAL_SITES = {
     'blocked-fall-through': _blocked_fall_through,
     'skip-escalation-sweep': _skip_escalation_sweep,
     'wip-interruption': _wip_interruption,
     'open-l1-override': _open_l1_override,
     'steward-wait-timeout': _steward_wait_timeout,
+    'steward-wait-reentry': _steward_wait_reentry,
 }
 
 
