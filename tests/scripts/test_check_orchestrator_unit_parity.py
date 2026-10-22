@@ -257,8 +257,8 @@ def test_shared_find_dropins_counts_only_conf_files(tmp_path: pathlib.Path):
 # The unit registry, and its staleness guard  (step-3 / step-4)
 # ---------------------------------------------------------------------------
 
-# The sixteen units scripts/setup-host.sh installs by copying VERBATIM —
-# including the seven `orchestrator-<project>.socket` units, whose committed
+# The eighteen units scripts/setup-host.sh installs by copying VERBATIM —
+# including the eight `orchestrator-<project>.socket` units, whose committed
 # source is `<unit>.template` but whose `cp` is exactly as verbatim as every
 # other unit's (see UNITS' own comment for why the name differs). Stated as a
 # literal here so a bug in the shell-parsing helper below cannot make the
@@ -273,6 +273,7 @@ _EXPECTED_UNITS = {
     "orchestrator-solar-challenge-platform.service",
     "orchestrator-know-live.service",
     "orchestrator-pump-web-ui.service",
+    "orchestrator-stream-touch.service",
     "orchestrator-dark-factory.socket",
     "orchestrator-reify.socket",
     "orchestrator-autopilot-video.socket",
@@ -280,10 +281,11 @@ _EXPECTED_UNITS = {
     "orchestrator-solar-challenge-platform.socket",
     "orchestrator-know-live.socket",
     "orchestrator-pump-web-ui.socket",
+    "orchestrator-stream-touch.socket",
 }
 
-def test_registry_covers_the_sixteen_verbatim_copied_units():
-    """UNITS registers exactly the sixteen units setup-host.sh copies verbatim."""
+def test_registry_covers_the_eighteen_verbatim_copied_units():
+    """UNITS registers exactly the eighteen units setup-host.sh copies verbatim."""
     checker = _load_checker()
 
     assert set(checker.UNITS) == _EXPECTED_UNITS, (
@@ -860,7 +862,7 @@ def test_cli_undecodable_repo_unit_names_the_repo_side(tmp_path: pathlib.Path):
 def test_cli_drift_dominates_absence(tmp_path: pathlib.Path):
     """PRECEDENCE: one unit drifted + another absent => 1, not 2.
 
-    With sixteen units a single run can hit both at once. Returning 2 would let
+    With eighteen units a single run can hit both at once. Returning 2 would let
     an unrelated uninstalled unit MASK an actionable finding, because
     setup-host.sh treats 2 as a benign skip. The absent unit is still
     reported — dominated, not hidden.
@@ -1735,7 +1737,7 @@ def _installer_section() -> str:
 def _fake_repo(
     tmp_path: pathlib.Path, *, checker_body: str | None = None, with_checker: bool = True
 ) -> pathlib.Path:
-    """A tmp repo root holding the sixteen committed units (+ optionally the checker).
+    """A tmp repo root holding the eighteen committed units (+ optionally the checker).
 
     The unit files are copied from the real repo so the comparison under test is
     the real one; only the TREE is fake.
