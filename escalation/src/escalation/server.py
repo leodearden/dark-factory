@@ -73,7 +73,6 @@ from escalation.models import (
     Escalation,
     EvidenceEntry,
     max_severity,
-    normalised_severity,
 )
 from escalation.pins import classify_pins
 from escalation.project_root_guard import ProjectRootGuard
@@ -260,12 +259,15 @@ def _info_only_refusal(members: dict[str, Escalation | None]) -> dict[str, Any]:
 
 
 def _park_on_info_refusal(rec: Escalation) -> dict[str, Any] | None:
-    """The ``park_on_info`` refusal for parking an info-severity *rec*, else None.
+    """The ``park_on_info`` refusal for parking a never-pinning *rec*, else None.
 
-    An info record never pins its task (``escalation/src/escalation/pins.py::classify_pins``
-    link 1), so a park could not hold the task it blocks (task 6578).
+    Whether *rec* pins is the pin chain's answer
+    (``escalation/src/escalation/pins.py::classify_pins``), whose non-pinning
+    class is the info record (link 1). A park could not hold that record's task
+    (task 6578). The chain is asked with no live claimant, because the park's
+    teardown kills the run before the stranded-blocked sweep looks.
     """
-    if normalised_severity(rec.severity) != 'info':
+    if not classify_pins(rec.task_id, [rec], live_claimant=False).non_pinning:
         return None
     return {
         'error': (
@@ -2578,11 +2580,9 @@ def create_server(
                 'code': 'illegal_transition',
             }
 
-        # See "Gate precedence" in this docstring.
-        if action == 'park' and (refusal := _park_on_info_refusal(rec)) is not None:
-            return refusal
-
         if action == 'park':
+            if (refusal := _park_on_info_refusal(rec)) is not None:
+                return refusal
             # Version-a: park keeps the escalation open at L2.
             # queue.park() handles all stamping (level=2, resolution_action='park',
             # resolution text) and fires the resolve callback for teardown WITHOUT

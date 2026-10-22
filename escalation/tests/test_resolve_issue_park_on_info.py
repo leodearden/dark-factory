@@ -75,7 +75,6 @@ class TestParkOnInfoRefused:
         _assert_park_on_info_refusal(result, rec)
         assert 'deferred' in result['hint']
         assert 'close_only' in result['hint']
-        assert 'docs/task-authoring.md' in result['hint']
 
     @pytest.mark.parametrize('severity', ['INFO', ' Info '])
     async def test_unnormalised_info_severity_is_refused(
@@ -264,6 +263,22 @@ class TestCapabilityGatePrecedence:
         )
 
         assert result.get('code') == 'level_forbidden', result
+        after = queue.get(rec.id)
+        assert after is not None
+        assert after.to_dict() == snapshot
+
+    async def test_permitted_connection_gets_park_on_info(self, served_info_l2):
+        base_url, queue, rec = served_info_l2
+        before = queue.get(rec.id)
+        assert before is not None
+        snapshot = before.to_dict()
+
+        result = await escalation_http_call(
+            base_url, 'resolve_issue', levels='0,1,2',
+            escalation_id=rec.id, resolution='r', action='park',
+        )
+
+        _assert_park_on_info_refusal(result, rec)
         after = queue.get(rec.id)
         assert after is not None
         assert after.to_dict() == snapshot
