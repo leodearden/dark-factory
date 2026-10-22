@@ -332,8 +332,7 @@ def _report_refusal(check: HeadingCheck, published: Path, *, exists: bool) -> No
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
-    """Write *path* through a temp file in its own directory, so a reader never sees half of it."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Write *path* through a temp file in its existing directory, so a reader never sees half of it."""
     handle, temp = tempfile.mkstemp(dir=path.parent, prefix=f'.{path.name}.')
     try:
         with os.fdopen(handle, 'wb') as out:
@@ -348,6 +347,7 @@ def _write_atomic(path: Path, data: bytes) -> None:
 def _write_render(home: HomeRead, text: str) -> Path:
     run_home, program = home.run.home, home.run.program
     doc = run_home.render_doc(program)
+    run_home.render_state_dir.mkdir(parents=True, exist_ok=True)
     _write_atomic(doc, text.encode('utf-8'))
     for name, data in home.files.items():
         _write_atomic(run_home.render_state_dir / name, data)
@@ -389,6 +389,111 @@ def _render(args: argparse.Namespace) -> Exit:
     return Exit.DONE
 
 
+@dataclass(frozen=True)
+class Copy:
+    """One file publish copies; *origin* names what it is, for a refusal."""
+
+    source: Path
+    destination: Path
+    origin: str
+
+
+def draft_copy(run: run_cli.Run, stream: str, name: str) -> Copy:
+    """The one naming rule for a stream's author-pass file: ``prds/<S>/<name>`` → ``<plans_dir>/<name>``."""
+    program = run.program
+    return Copy(
+        run.home.prds_dir(stream) / name,
+        Path(program.project_root) / program.plans_dir / name,
+        f'stream {stream}',
+    )
+
+
+def _drafts(run: run_cli.Run, stream: str) -> list[Copy]:
+    directory = run.home.prds_dir(stream)
+    if not directory.exists():
+        return []
+    copies = []
+    for entry in sorted(directory.iterdir()):
+        if entry.is_symlink() or not entry.is_file():
+            raise state.StateError(f'{entry} is not a regular file; nothing published')
+        copies.append(draft_copy(run, stream, entry.name))
+    return copies
+
+
+def _refuse_clashes(copies: Sequence[Copy]) -> None:
+    origins: dict[Path, list[str]] = {}
+    for copy in copies:
+        origins.setdefault(copy.destination, []).append(copy.origin)
+    for destination, named in origins.items():
+        if len(named) > 1:
+            raise state.StateError(
+                f'{destination.name} is published by {" and ".join(named)} to {destination}; '
+                'nothing published'
+            )
+
+
+def _refuse_missing_parents(copies: Sequence[Copy], made: Path) -> None:
+    for copy in copies:
+        parent = copy.destination.parent
+        if parent != made and not parent.is_dir():
+            raise state.StateError(f'{parent} does not exist to publish {copy.destination.name} into; '
+                                   'nothing published')
+
+
+def copy_plan(render: Render) -> tuple[Copy, ...]:
+    """Every copy publish makes, in order, each refusal checked before any is made."""
+    run, program = render.home.run, render.home.run.program
+    if not Path(program.project_root).is_dir():
+        raise state.StateError(f'project_root {program.project_root} is not a directory; nothing published')
+    snapshot = state.snapshot_dir(program)
+    copies = [
+        Copy(render.doc, state.published_doc(program), 'the program doc'),
+        *(Copy(run.home.render_state_dir / name, snapshot / name, 'the snapshot')
+          for name in render.home.files),
+    ]
+    for stream in program.stream_ids:
+        copies += _drafts(run, stream)
+    _refuse_clashes(copies)
+    _refuse_missing_parents(copies, snapshot)
+    return tuple(copies)
+
+
+def _publish(args: argparse.Namespace) -> Exit:
+    render = _checked_render(args)
+    if render is None:
+        return Exit.REFUSED
+    copies = copy_plan(render)
+    program = render.home.run.program
+    state.snapshot_dir(program).mkdir(exist_ok=True)
+    for copy in copies:
+        _write_atomic(copy.destination, copy.source.read_bytes())
+    root = Path(program.project_root)
+    print(f'published {len(copies)} paths into {root}; commit them with one git commit --only')
+    for copy in copies:
+        print(copy.destination.relative_to(root).as_posix())
+    print(f'store read {render.store.measured_at}')
+    return Exit.DONE
+
+
+@dataclass(frozen=True)
+class _Mode:
+    """A mode of the CLI: the flag that selects it, what it does, and the verb its failure names."""
+
+    flag: str | None
+    verb: str
+    body: Callable[[argparse.Namespace], Exit]
+
+
+_RENDER = _Mode(None, 'render', _render)
+_MODES = (
+    _Mode('publish', 'publish', _publish),
+)
+
+
+def _selected(args: argparse.Namespace) -> _Mode:
+    return next((mode for mode in _MODES if getattr(args, mode.flag) not in (None, False)), _RENDER)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='program_doc.py', description=(__doc__ or '').partition('\n')[0],
@@ -400,15 +505,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--allow-drop', action='append', metavar='HEADING',
                         help='let the render lose this exact "## " heading of the published doc; '
                              'repeat once per heading')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--publish', action='store_true',
+                       help='render, then copy the doc, its snapshot and every prds/<S>/ file '
+                            'into the checkout and list the paths for one commit')
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    mode = _selected(args)
     try:
-        return _render(args)
+        return mode.body(args)
     except (state.StateError, OSError) as failed:
-        print(f'program_doc.py: cannot render: {failed}', file=sys.stderr)
+        print(f'program_doc.py: cannot {mode.verb}: {failed}', file=sys.stderr)
         return Exit.COULD_NOT_RUN
 
 
