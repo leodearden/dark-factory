@@ -6,19 +6,27 @@ homes seeded from copies of the committed fixture, which is never edited.
 """
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import sys
 import types
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 from review_all_program_cli import FIXTURE_RETURNS, RUN_ID, ProgramEnv
-from review_all_program_fixture import FIXTURE_DIR, PROGRAM_DIR, load_state
+from review_all_program_fixture import (
+    FIXTURE_DIR,
+    PROGRAM_DIR,
+    FakeStore,
+    load_state,
+    running_fake_store,
+)
 
 state = load_state()
 
@@ -165,9 +173,11 @@ S1_AUTHOR = 'returns/S1.author.json'
 S1_DECOMPOSE = 'returns/S1.decompose.json'
 
 
-def _status(status: str, ret: str | None, stream: str = 'S1') -> dict[str, Any]:
+def _status(
+    status: str, ret: str | None, stream: str = 'S1', prd_path: str = S1_PRD,
+) -> dict[str, Any]:
     fields: dict[str, Any] = {'op': 'stream_status', 'stream': stream, 'status': status,
-                              'prd_path': S1_PRD}
+                              'prd_path': prd_path}
     if ret is not None:
         fields['return'] = ret
     return fields
@@ -331,3 +341,129 @@ def test_a_home_with_no_program_is_refused_naming_the_home(env: ProgramEnv) -> N
     assert proc.returncode == 1, _output(proc)
     assert str(env.home) in proc.stderr
     assert 'record.py init' in proc.stderr
+
+
+SEAM = 'src/fixture/seam.py'
+SEAM_V2 = 'src/fixture/seam_v2.py'
+S1_AMEND = 'returns/S1.decompose.amend-1.json'
+S2_DECOMPOSE = 'returns/S2.decompose.json'
+UTC_STAMP = re.compile(r'\b\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\b')
+
+
+@pytest.fixture(scope='module')
+def store() -> Iterator[FakeStore]:
+    with running_fake_store() as running:
+        yield running
+
+
+def _tool_calls(store: FakeStore, since: int) -> list[dict[str, Any]]:
+    """Each tools/call the store received after its first *since* requests: name and arguments."""
+    return [
+        entry['body']['params'] for entry in store.requests()[since:]
+        if entry['body'].get('method') == 'tools/call'
+    ]
+
+
+def _appended(home: Any, after: int) -> list[dict[str, Any]]:
+    """The ledger lines after seq *after*, without their clock stamp."""
+    return [
+        {key: value for key, value in line.items() if key != 'at'}
+        for line in state.read_ledger(home)[after:]
+    ]
+
+
+def _without_text(line: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in line.items() if key != 'text'}
+
+
+def _repath(action_id: str, seq: int, task: int, target: str | None, ret: str) -> dict[str, Any]:
+    return {'seq': seq, 'by': 'clerk_batch.py', 'op': 'action', 'id': action_id,
+            'lead_op': 'repath', 'task': task, 'target': target, 'needs_human': target is None,
+            'return': ret}
+
+
+def _scanned_home(env: ProgramEnv, store: FakeStore) -> tuple[Any, subprocess.CompletedProcess[str]]:
+    """The base home, scanned once against the fixture store."""
+    home = _seed(env)
+    proc = _write(dataclasses.replace(env, store_url=store.url), '--scan')
+    return home, proc
+
+
+def test_b4_the_scan_ledgers_one_repath_per_anchored_check_and_a_deleted_path_for_a_human(
+    env: ProgramEnv, store: FakeStore,
+) -> None:
+    since = len(store.requests())
+    home, proc = _scanned_home(env, store)
+    assert proc.returncode == 0, _output(proc)
+    appended = _appended(home, len(BASE_LEDGER))
+    assert [_without_text(line) for line in appended] == [
+        _repath('A4', 6, 203, NEW, S1_DECOMPOSE),
+        _repath('A5', 7, 204, None, S1_DECOMPOSE),
+        {'seq': 8, 'by': 'clerk_batch.py', 'op': 'action_result', 'id': 'A5',
+         'state': 'kept-for-human', 'batch': None, 'detail': 'check anchors a deleted path'},
+        {'seq': 9, 'by': 'clerk_batch.py', 'op': 'scanned', 'return': S1_DECOMPOSE,
+         'repaths': ('A4', 'A5')},
+    ]
+    a4_text, a5_text = appended[0]['text'], appended[1]['text']
+    assert all(part in a4_text for part in ('old-thing-defined', OLD, NEW)), a4_text
+    assert all(part in a5_text for part in ('removed-module-present', REMOVED)), a5_text
+    assert [action['id'] for action in _batch(home)['actions']] == ['A1', 'A2', 'A4']
+    calls = _tool_calls(store, since)
+    assert calls and all(
+        call['name'] == 'find_tasks_by_metadata' and call['arguments']['key'] == 'delivered_checks'
+        for call in calls
+    ), calls
+    assert UTC_STAMP.search(proc.stdout), proc.stdout
+
+
+def test_a_scanned_return_is_never_scanned_again(env: ProgramEnv, store: FakeStore) -> None:
+    home, first = _scanned_home(env, store)
+    assert first.returncode == 0, _output(first)
+    scanned = len(state.read_ledger(home))
+    proc = _write(env, '--scan')
+    assert proc.returncode == 0, _output(proc)
+    assert _appended(home, scanned) == []
+
+
+def test_a_return_with_no_moves_is_scanned_with_nothing_and_no_store_read(env: ProgramEnv) -> None:
+    home = _seed(env, [
+        _status('authored', S1_AUTHOR),
+        _status('decomposed', None),
+        _status('decomposed', S2_DECOMPOSE, stream='S2', prd_path='plans/review-all-fixture-s2-prd.md'),
+    ], returns=('S1.author.json', 'S2.decompose.json'))
+    proc = _write(env, '--scan')
+    assert proc.returncode == 0, _output(proc)
+    assert _appended(home, 3) == [
+        {'seq': 4, 'by': 'clerk_batch.py', 'op': 'scanned', 'return': S2_DECOMPOSE, 'repaths': ()},
+    ]
+
+
+def test_an_amended_return_is_scanned_for_its_new_moves_only(
+    env: ProgramEnv, store: FakeStore,
+) -> None:
+    home, first = _scanned_home(env, store)
+    assert first.returncode == 0, _output(first)
+    amended = json.loads((FIXTURE_RETURNS / 'S1.decompose.json').read_text())
+    amended['moves'].append({'from': SEAM, 'to': SEAM_V2, 'symbols': []})
+    (home.root / S1_AMEND).write_text(json.dumps(amended))
+    _append(home, [_status('decomposed', S1_AMEND)])
+    scanned = len(state.read_ledger(home))
+    proc = _write(dataclasses.replace(env, store_url=store.url), '--scan')
+    assert proc.returncode == 0, _output(proc)
+    appended = _appended(home, scanned)
+    assert [_without_text(line) for line in appended] == [
+        _repath('A6', scanned + 1, 202, SEAM_V2, S1_AMEND),
+        {'seq': scanned + 2, 'by': 'clerk_batch.py', 'op': 'scanned', 'return': S1_AMEND,
+         'repaths': ('A6',)},
+    ]
+    assert 'seam-contract-defined' in appended[0]['text']
+
+
+def test_a_move_to_scan_with_no_store_writes_nothing(env: ProgramEnv) -> None:
+    home = _seed(env)
+    ledger_before = home.ledger.read_bytes()
+    proc = _write(env, '--scan')
+    assert proc.returncode == 1, _output(proc)
+    assert UNREACHABLE in proc.stderr
+    assert home.ledger.read_bytes() == ledger_before
+    assert _actions_dir(home) == []
