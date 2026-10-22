@@ -2248,6 +2248,9 @@ def create_server(
         |              |            | workflow effect            |                        |
         +--------------+------------+----------------------------+------------------------+
 
+        A ``park`` on an info-severity target is refused with code
+        ``park_on_info`` and the record is not touched (see Gate precedence).
+
         **Resolution text** reaches the agent only on the L0 live-resume path
         (``action='resume'``).  For all other actions the text is stored on the
         record for audit purposes but is not injected into any agent briefing.
@@ -2345,12 +2348,15 @@ def create_server(
         ``escalation.action_effects`` module docstring for the archive
         verification behind this).
 
-        **Gate precedence**: the connection-capability gate (``bad_capability_header``
-        / ``level_forbidden``, checked first) runs BEFORE this Table B legality
-        gate. A caller that both asserts a forbidden/unparseable capability
-        header AND passes an illegal ``action`` receives the capability error,
-        not ``illegal_transition`` — no record is mutated by either gate, so
-        this ordering is an error-reporting precedence only, not a correctness
+        **Gate precedence**, in order: the connection-capability gate
+        (``bad_capability_header`` / ``level_forbidden``) → this Table B
+        legality gate (``illegal_transition``) → the park-on-info gate
+        (``park_on_info``, via ``_park_on_info_refusal``; ``park`` only, on an
+        info-severity target, because an info record never pins its task,
+        pins.py link 1) → park's early return → the declared-pin gate
+        (``declared_pin_refused``). A caller failing several gates receives the
+        earliest one's error. None of these gates mutates the record, so the
+        ordering is an error-reporting precedence only, not a correctness
         difference.
 
         **Declared-pin gate** (task 4377).  A record carrying
@@ -2427,11 +2433,11 @@ def create_server(
         POSITIONALLY (the gate sits after park's early return) so it cannot be
         got wrong by a later edit.
 
-        In the **Gate precedence** ordering this gate runs LAST: after
-        ``bad_capability_header`` / ``level_forbidden`` and after
-        ``illegal_transition``, so a caller failing several gates learns about
-        the capability and legality problems first.  None of the four mutates
-        the record, so the ordering is an error-reporting precedence only.
+        In the **Gate precedence** ordering this gate runs LAST: after the
+        capability, Table B and park-on-info gates, so a caller failing several
+        gates learns about the capability and legality problems first.  None
+        of them mutates the record, so the ordering is an error-reporting
+        precedence only.
 
         NOTE: resolve_issue itself writes no task status — this call changes
         only the escalation record. The orchestrator harness applies the
