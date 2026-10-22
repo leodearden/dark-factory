@@ -299,3 +299,90 @@ def test_amendments_from_the_ledger_are_rendered(run: DocRun) -> None:
     assert any('Gamma never re-exports alpha.' in line for line in _section(text, '## Invariants'))
     (s3,) = [row for row in _table(_section(text, '## Streams')) if row['ID'] == 'S3']
     assert 'fk-0000000000c2' in s3['Finding keys']
+
+
+REFUSED = 1
+
+
+def _scratch_template(tmp_path: Path, *, drop: str | None = None, extra: str = '') -> Path:
+    """A copy of the live template, less the line *drop*, plus *extra* at its end."""
+    lines = TEMPLATE.read_text(encoding='utf-8').splitlines(keepends=True)
+    scratch = tmp_path / 'scratch-template.md'
+    scratch.write_text(''.join(line for line in lines if line.rstrip('\n') != drop) + extra,
+                       encoding='utf-8')
+    return scratch
+
+
+def _published(run: DocRun, *, extra: str = '') -> Path:
+    """A prior publish, simulated: a default render copied to the program's doc_path, plus *extra*."""
+    published = run.project / 'plans' / DOC_NAME
+    published.write_text(_rendered(run) + extra, encoding='utf-8')
+    return published
+
+
+def test_with_no_published_doc_a_render_can_lose_no_heading(run: DocRun, tmp_path: Path) -> None:
+    proc = run.doc('--template', _scratch_template(tmp_path, drop=LEDGER))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_b6_a_render_that_drops_a_published_heading_is_refused_and_writes_nothing(
+    run: DocRun, tmp_path: Path,
+) -> None:
+    published = _published(run)
+    before = _render_files(run)
+
+    proc = run.doc('--template', _scratch_template(tmp_path, drop=LEDGER))
+
+    assert proc.returncode == REFUSED, proc.stdout + proc.stderr
+    assert LEDGER in proc.stderr
+    assert str(published) in proc.stderr
+    assert _render_files(run) == before
+
+
+def test_b6_allow_drop_names_the_heading_it_lets_go(run: DocRun, tmp_path: Path) -> None:
+    _published(run)
+
+    proc = run.doc('--template', _scratch_template(tmp_path, drop=LEDGER), '--allow-drop', LEDGER)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert any(LEDGER in line for line in proc.stdout.splitlines())
+    assert LEDGER not in run.render_doc.read_text(encoding='utf-8').splitlines()
+
+
+def test_an_allowance_for_a_heading_the_render_keeps_is_refused(run: DocRun) -> None:
+    proc = run.doc('--allow-drop', '## Nope')
+
+    assert proc.returncode == REFUSED, proc.stdout + proc.stderr
+    assert '## Nope' in proc.stderr
+    assert not (run.home / 'render').exists()
+
+
+def test_a_hand_added_published_heading_refuses_a_default_render(run: DocRun) -> None:
+    _published(run, extra='\n## Coordinator interventions\n\n- by hand\n')
+
+    proc = run.doc()
+
+    assert proc.returncode == REFUSED, proc.stdout + proc.stderr
+    assert '## Coordinator interventions' in proc.stderr
+
+
+def test_an_unknown_template_placeholder_is_named(run: DocRun, tmp_path: Path) -> None:
+    proc = run.doc('--template', _scratch_template(tmp_path, extra='\n${no_such_section}\n'))
+
+    assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
+    assert 'no_such_section' in proc.stderr
+    assert not (run.home / 'render').exists()
+
+
+@pytest.mark.parametrize(('args', 'flag'), [
+    (('--roster', '--allow-drop', LEDGER), '--allow-drop'),
+    (('--sitting', '1', '--template', 'x'), '--template'),
+])
+def test_render_flags_outside_a_render_are_usage_errors(
+    run: DocRun, args: tuple[str, ...], flag: str,
+) -> None:
+    proc = run.doc(*args)
+
+    assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
+    assert flag in proc.stderr
