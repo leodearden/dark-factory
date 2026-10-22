@@ -7,6 +7,7 @@ below both the merge lane and the task workflow: it must never import
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 
 MergeDemand = Callable[[], bool]
 RefusalReason = Literal['no_host', 'host_parked', 'merge_demand', 'pressure_hold']
+Unwind = Callable[[], Awaitable[object]]
 
 
 def build_remote_runners(
@@ -78,6 +80,33 @@ class Refusal:
             raise ValueError(
                 f'Refusal reason {self.reason!r} is not one of {get_args(RefusalReason)}'
             )
+
+
+@dataclass(frozen=True)
+class _CancelThenUnwind:
+    """*runner* as the allocator sees it during one cancel: *unwind* follows the host-side cancel."""
+
+    runner: RemoteRunner
+    unwind: Unwind
+
+    async def cancel_verify(self) -> int:
+        try:
+            return await self.runner.cancel_verify()
+        finally:
+            await self.unwind()
+
+    async def probe_clean(self) -> bool:
+        return await self.runner.probe_clean()
+
+
+def _run_once(unwind: Unwind | None) -> Callable[[], Awaitable[None]]:
+    remaining = [] if unwind is None else [unwind]
+
+    async def once() -> None:
+        if remaining:
+            await remaining.pop()()
+
+    return once
 
 
 class HostPool:
@@ -135,14 +164,25 @@ class HostPool:
         finally:
             self._holds.pop(lease.name, None)
 
-    async def cancel_and_release(self, lease: HostLease) -> bool:
-        """Cancel the verify on *lease*'s host and release (or PARK) its slot."""
-        if not self._holds_lease(lease):
-            return True
+    async def cancel_and_release(self, lease: HostLease, *, unwind: Unwind | None = None) -> bool:
+        """Cancel the verify on *lease*'s host and release (or PARK) its slot.
+
+        *unwind*, the caller's teardown of the dispatch that was using the runner,
+        is awaited exactly once: after the host-side cancel and before the slot is
+        freed or PARKED, so no other lease can reach a runner whose dispatch is
+        still unwinding (PRD §4.3 exclusive use).
+        """
+        once = _run_once(unwind)
         try:
-            return await self._allocator.cancel_and_release(lease, sleep=self._probe_sleep)
+            if not self._holds_lease(lease):
+                return True
+            cancelling = dataclasses.replace(lease, runner=_CancelThenUnwind(lease.runner, once))
+            try:
+                return await self._allocator.cancel_and_release(cancelling, sleep=self._probe_sleep)
+            finally:
+                self._holds.pop(lease.name, None)
         finally:
-            self._holds.pop(lease.name, None)
+            await once()
 
     def mark_unavailable(self, lease: HostLease, reason: str) -> None:
         self._on_unavailable(lease.name, reason)
