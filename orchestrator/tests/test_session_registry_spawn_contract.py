@@ -31,5 +31,5 @@ class TestResultOutcomeVocabulary:
 
     def test_owning_outcomes_are_terminal_and_only_the_checkpoint_is_not(self):
         assert sr.OWNING_OUTCOMES <= sr.TERMINAL_RESULT_OUTCOMES
-        assert sr.TERMINAL_RESULT_OUTCOMES == frozenset(sr.RESULT_OUTCOMES) - {'in-progress'}
-        assert sr.OWNING_OUTCOMES == {'done', 'handed-off'}
+        assert frozenset(sr.RESULT_OUTCOMES) - {'in-progress'} == sr.TERMINAL_RESULT_OUTCOMES
+        assert {'done', 'handed-off'} == sr.OWNING_OUTCOMES

@@ -91,6 +91,38 @@ cross-checked at runtime) with skills/spawn/spawn-claude.sh's own
 ``str(record_dir / RESULT_FILENAME)`` are byte-identical paths."""
 
 
+class ResultOutcome(StrEnum):
+    """The ``outcome:`` header of RESULT_FILENAME; IN_PROGRESS marks a checkpoint, not an end."""
+
+    DONE = 'done'
+    BLOCKED = 'blocked'
+    ABANDONED = 'abandoned'
+    HANDED_OFF = 'handed-off'
+    IN_PROGRESS = 'in-progress'
+
+
+RESULT_OUTCOMES: tuple[ResultOutcome, ...] = tuple(ResultOutcome)
+TERMINAL_RESULT_OUTCOMES: frozenset[ResultOutcome] = frozenset(RESULT_OUTCOMES) - {ResultOutcome.IN_PROGRESS}
+OWNING_OUTCOMES: frozenset[ResultOutcome] = frozenset({ResultOutcome.DONE, ResultOutcome.HANDED_OFF})
+
+
+def parse_result_outcome(text: str) -> ResultOutcome | None:
+    """The spawn contract's ``outcome:`` header value, or None when absent or not a contract outcome."""
+    lines = text.lstrip().splitlines()
+    if lines and lines[0].strip() == '---':
+        lines = lines[1:]
+    for line in lines:
+        if not line.strip() or line.strip() == '---':
+            return None
+        key, sep, value = line.partition(':')
+        if sep and key.strip() == 'outcome':
+            try:
+                return ResultOutcome(value.strip())
+            except ValueError:
+                return None
+    return None
+
+
 class Status(StrEnum):
     """Wire-format session-lifecycle status (PRD §4 decision 4).
 
