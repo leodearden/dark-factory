@@ -864,6 +864,7 @@ class TestStateMachineLegalityAndConsistency:
         run() RETURNS the real BLOCKED report — no synthetic mislabel (spec
         §8-E11) — and the violation is recorded in log mode, never raised.
         """
+        monkeypatch.setattr(config, 'workflow_exit_contract_enforce', False)
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
         event_store = MagicMock()
