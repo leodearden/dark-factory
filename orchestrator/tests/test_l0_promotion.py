@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+
 from orchestrator.l0_promotion import promote_l0_to_l1
 
 TASK_ID = '7533'
