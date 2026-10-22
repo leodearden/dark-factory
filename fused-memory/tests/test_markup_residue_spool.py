@@ -8,7 +8,9 @@ spelled raw (``tests/scripts/test_no_raw_envelope_literal.py``).
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
@@ -45,22 +47,34 @@ def _unwritable_spool(tmp_path) -> MarkupResidueSpool:
     return MarkupResidueSpool(blocker / 'spool')
 
 
-def _stored(spool_dir, locator: str) -> dict:
-    return json.loads((spool_dir / locator).read_text(encoding='utf-8'))
+def _stored(locator: str | None) -> dict:
+    assert locator is not None
+    return json.loads(Path(locator).read_text(encoding='utf-8'))
 
 
 class TestPreserve:
-    def test_it_creates_the_dir_and_writes_one_file_named_by_the_locator(self, tmp_path):
+    def test_it_creates_the_dir_and_returns_the_absolute_path_of_one_file(self, tmp_path):
         spool_dir = tmp_path / 'data' / 'markup_residue'
         spool = MarkupResidueSpool(spool_dir)
 
         locator = spool.preserve(_record())
 
         assert locator is not None
-        assert [path.name for path in spool_dir.iterdir()] == [locator]
-        assert '/' not in locator
+        assert Path(locator).is_absolute()
+        assert list(spool_dir.iterdir()) == [Path(locator)]
 
-    def test_the_locator_leads_with_the_utc_time_it_was_written(self, tmp_path):
+    def test_a_relative_spool_dir_still_yields_an_absolute_path(self, tmp_path, monkeypatch):
+        """The path reaches a caller that does not share the server's cwd."""
+        monkeypatch.chdir(tmp_path)
+        spool = MarkupResidueSpool(Path('data') / 'markup_residue')
+
+        locator = spool.preserve(_record())
+
+        assert locator is not None
+        assert Path(locator).is_absolute()
+        assert Path(locator).parent == tmp_path / 'data' / 'markup_residue'
+
+    def test_the_file_name_leads_with_the_utc_time_it_was_written(self, tmp_path):
         """Fixed-width UTC timestamps sort lexically in time order."""
         spool = MarkupResidueSpool(tmp_path / 'spool')
         before = datetime.now(UTC).replace(tzinfo=None)
@@ -69,7 +83,7 @@ class TestPreserve:
 
         after = datetime.now(UTC).replace(tzinfo=None)
         assert locator is not None
-        written = datetime.strptime(locator.split('-', 1)[0], _LOCATOR_TIME_FORMAT)
+        written = datetime.strptime(Path(locator).name.split('-', 1)[0], _LOCATOR_TIME_FORMAT)
         assert before <= written <= after
 
     def test_the_payload_round_trips_byte_for_byte(self, tmp_path):
@@ -77,8 +91,7 @@ class TestPreserve:
 
         locator = spool.preserve(_record())
 
-        assert locator is not None
-        assert _stored(tmp_path / 'spool', locator)['raw_value'] == _RAW_VALUE
+        assert _stored(locator)['raw_value'] == _RAW_VALUE
 
     def test_identical_records_land_in_two_files_and_both_survive(self, tmp_path):
         spool = MarkupResidueSpool(tmp_path / 'spool')
@@ -86,10 +99,9 @@ class TestPreserve:
         first = spool.preserve(_record())
         second = spool.preserve(_record())
 
-        assert first is not None and second is not None
         assert first != second
-        assert _stored(tmp_path / 'spool', first)['raw_value'] == _RAW_VALUE
-        assert _stored(tmp_path / 'spool', second)['raw_value'] == _RAW_VALUE
+        assert _stored(first)['raw_value'] == _RAW_VALUE
+        assert _stored(second)['raw_value'] == _RAW_VALUE
 
     def test_a_file_already_in_the_dir_is_never_overwritten(self, tmp_path):
         spool_dir = tmp_path / 'spool'
@@ -100,7 +112,8 @@ class TestPreserve:
 
         locator = spool.preserve(_record())
 
-        assert locator != existing.name
+        assert locator is not None
+        assert Path(locator) != existing
         assert existing.read_text() == '{"keep": true}'
         assert len(list(spool_dir.iterdir())) == 2
 
@@ -110,8 +123,7 @@ class TestPreserve:
 
         locator = spool.preserve(_record(exotic=object(), names={'a'}))
 
-        assert locator is not None
-        assert _stored(tmp_path / 'spool', locator)['raw_value'] == _RAW_VALUE
+        assert _stored(locator)['raw_value'] == _RAW_VALUE
 
     def test_a_record_without_raw_value_still_writes(self, tmp_path):
         spool = MarkupResidueSpool(tmp_path / 'spool')
@@ -120,8 +132,7 @@ class TestPreserve:
 
         locator = spool.preserve(record)
 
-        assert locator is not None
-        assert _stored(tmp_path / 'spool', locator)['tool'] == 'add_memory'
+        assert _stored(locator)['tool'] == 'add_memory'
 
 
 class TestAFailedWriteIsALostPayload:
@@ -137,6 +148,26 @@ class TestAFailedWriteIsALostPayload:
 
         assert [path.name for path in tmp_path.iterdir()] == ['not-a-directory']
         assert (tmp_path / 'not-a-directory').read_text() == 'occupied'
+
+    def test_a_descriptor_that_cannot_be_wrapped_is_closed_and_its_file_removed(
+        self, tmp_path, monkeypatch
+    ):
+        spool_dir = tmp_path / 'spool'
+        spool = MarkupResidueSpool(spool_dir)
+        claimed: list[int] = []
+
+        def _refuse_to_wrap(fd: int, *args: object, **kwargs: object) -> object:
+            claimed.append(fd)
+            raise OSError('cannot wrap')
+
+        monkeypatch.setattr(os, 'fdopen', _refuse_to_wrap)
+
+        assert spool.preserve(_record()) is None
+        [fd] = claimed
+        with pytest.raises(OSError):
+            os.fstat(fd)
+        assert list(spool_dir.iterdir()) == []
+        assert spool.status()['preservation_failures'] == 1
 
     def test_it_logs_one_greppable_error_line_with_the_running_total(self, tmp_path, caplog):
         spool = _unwritable_spool(tmp_path)
@@ -169,7 +200,32 @@ class TestStatus:
 
         assert status['preservation_failures'] == 0
         assert status['last_failure'] is None
+        assert status['spooled_files'] == 0
+        assert status['last_preserved'] is None
         assert status['spool_dir'] == str(tmp_path / 'spool')
+
+    def test_it_reports_the_files_waiting_and_the_newest_one(self, tmp_path):
+        spool = MarkupResidueSpool(tmp_path / 'spool')
+
+        spool.preserve(_record())
+        newest = spool.preserve(_record())
+
+        status = spool.status()
+        assert status['spooled_files'] == 2
+        assert status['last_preserved'] == newest
+
+    def test_a_file_an_operator_drained_is_no_longer_counted(self, tmp_path):
+        spool = MarkupResidueSpool(tmp_path / 'spool')
+        drained = spool.preserve(_record())
+        spool.preserve(_record())
+        assert drained is not None
+
+        Path(drained).unlink()
+
+        assert spool.status()['spooled_files'] == 1
+
+    def test_an_unlistable_dir_reports_an_unknown_count(self, tmp_path):
+        assert _unwritable_spool(tmp_path).status()['spooled_files'] is None
 
     def test_a_failure_is_counted_with_its_tool_field_and_time(self, tmp_path):
         spool = _unwritable_spool(tmp_path)
@@ -212,3 +268,50 @@ class TestStatus:
 
         assert spool.status()['preservation_failures'] == 0
         assert spool.status()['last_failure'] is None
+
+
+class TestSoftCap:
+    """Past the soft cap every payload is still preserved, and the crossing is
+    logged once rather than once per write."""
+
+    @staticmethod
+    def _over_cap_lines(caplog) -> list[str]:
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == _LOGGER
+            and record.getMessage().startswith('markup_residue_spool_over_soft_cap')
+        ]
+
+    def test_crossing_the_cap_logs_once_and_keeps_preserving(self, tmp_path, caplog):
+        spool = MarkupResidueSpool(tmp_path / 'spool', soft_cap_files=2)
+
+        with caplog.at_level('ERROR', logger=_LOGGER):
+            locators = [spool.preserve(_record()) for _ in range(5)]
+
+        assert all(locator is not None for locator in locators)
+        assert spool.status()['spooled_files'] == 5
+        assert len(self._over_cap_lines(caplog)) == 1
+
+    def test_at_the_cap_nothing_is_logged(self, tmp_path, caplog):
+        spool = MarkupResidueSpool(tmp_path / 'spool', soft_cap_files=2)
+
+        with caplog.at_level('ERROR', logger=_LOGGER):
+            spool.preserve(_record())
+            spool.preserve(_record())
+
+        assert self._over_cap_lines(caplog) == []
+
+    def test_a_drained_spool_logs_again_when_it_next_crosses(self, tmp_path, caplog):
+        spool_dir = tmp_path / 'spool'
+        spool = MarkupResidueSpool(spool_dir, soft_cap_files=1)
+
+        with caplog.at_level('ERROR', logger=_LOGGER):
+            spool.preserve(_record())
+            spool.preserve(_record())
+            for path in spool_dir.iterdir():
+                path.unlink()
+            spool.preserve(_record())
+            spool.preserve(_record())
+
+        assert len(self._over_cap_lines(caplog)) == 2

@@ -93,6 +93,7 @@ why.
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -103,6 +104,9 @@ from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
     MarkupGuardMiddleware,
     RepairPolicy,
+    ResiduePreservation,
+    SpooledResidue,
+    residue_payload_length,
 )
 from shared.toolcall_markup import scan_parameter_values
 
@@ -254,8 +258,22 @@ def _with_rederived_provenance(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-#: The floor under the residue queue: takes a record, returns its locator.
+#: The floor under the residue queue: takes a record, returns the absolute
+#: path of the file now holding it, or ``None``.
 ResidueFloor = Callable[[dict[str, Any]], 'str | None']
+
+
+class ResidueTier(enum.StrEnum):
+    """Which tier held a refused payload.
+
+    Every residue outcome logs one ERROR record carrying this as
+    ``extra={'residue_tier': ...}``, so an operator's log query, and a test,
+    reads the outcome as data rather than from the wording of the line.
+    """
+
+    QUEUE = 'queue'
+    FLOOR = 'floor'
+    UNPRESERVED = 'unpreserved'
 
 
 def _queue_residue(
@@ -292,34 +310,37 @@ def _queue_residue(
             'markup_guard_residue: refused an unrepairable %s.%s and '
             'preserved its payload in %s (%d chars); %s',
             record.get('tool'), record.get('field'), escalation_id,
-            _raw_length(record), MARKUP_RECURRENCE_ROUTING,
+            residue_payload_length(record), MARKUP_RECURRENCE_ROUTING,
+            extra={'residue_tier': ResidueTier.QUEUE, 'residue_locator': escalation_id},
         )
     return escalation_id
 
 
 def _floor_residue(
     record: dict[str, Any], residue_floor: ResidueFloor | None
-) -> str | None:
+) -> SpooledResidue | None:
     """Tier 2: hand *record* to the durable floor, when one is wired."""
     if residue_floor is None:
         return None
     try:
-        locator = residue_floor(record)
+        path = residue_floor(record)
     except Exception:
         logger.exception(
             'markup_guard: the residue floor raised for %s.%s; falling through '
             'to the log', record.get('tool'), record.get('field'),
         )
         return None
-    if locator is not None:
-        logger.error(
-            'markup_guard_residue: refused an unrepairable %s.%s that no queue '
-            'took, and preserved its payload in the residue floor as %s (%d '
-            'chars; the dir is get_status.markup_residue.spool_dir); %s',
-            record.get('tool'), record.get('field'), locator,
-            _raw_length(record), MARKUP_RECURRENCE_ROUTING,
-        )
-    return locator
+    if path is None:
+        return None
+    logger.error(
+        'markup_guard_residue: refused an unrepairable %s.%s that no queue '
+        'took, and preserved its payload in the residue floor file %s (%d '
+        'chars); %s',
+        record.get('tool'), record.get('field'), path,
+        residue_payload_length(record), MARKUP_RECURRENCE_ROUTING,
+        extra={'residue_tier': ResidueTier.FLOOR, 'residue_locator': path},
+    )
+    return SpooledResidue(path)
 
 
 def _log_unpreserved(record: dict[str, Any], *, floor_wired: bool) -> None:
@@ -332,12 +353,11 @@ def _log_unpreserved(record: dict[str, Any], *, floor_wired: bool) -> None:
         'Record: %r; %s',
         record.get('tool'), record.get('field'), record.get('project'), floor,
         record, MARKUP_RECURRENCE_ROUTING,
+        extra={
+            'residue_tier': ResidueTier.UNPRESERVED,
+            'residue_floor_wired': floor_wired,
+        },
     )
-
-
-def _raw_length(record: Mapping[str, Any]) -> int:
-    raw_value = record.get('raw_value')
-    return len(raw_value) if isinstance(raw_value, str) else 0
 
 
 @dataclass
@@ -413,8 +433,8 @@ def install_markup_guard(
     *exempt_tools* names the tools allowed to carry envelope literals as data.
 
     *residue_floor* is the floor under the residue queue. It is called only
-    when the queue yields no id, and the locator it returns is reported to the
-    refused caller as ``escalation_id``.
+    when the queue yields no id, and the path it returns reaches the refused
+    caller as ``residue_spool_path``, never as ``escalation_id``.
 
     Wrapping ``call_tool`` rather than each tool covers every currently
     registered tool and any added later, in one place — the same reasoning
@@ -444,7 +464,7 @@ def install_markup_guard(
     if getattr(tool_manager, '_fused_memory_markup_guarded', False):
         return
 
-    def _file_residue(record: dict[str, Any]) -> str | None:
+    def _file_residue(record: dict[str, Any]) -> ResiduePreservation:
         """Preserve one refused payload, and report where it went.
 
         Queue, then floor, then log. The full record, which carries the
@@ -455,13 +475,14 @@ def install_markup_guard(
         durable copy already exists.
         """
         escalation_id = _queue_residue(record, known_projects)
-        if escalation_id is None:
-            escalation_id = _floor_residue(record, residue_floor)
-        if escalation_id is None:
+        if escalation_id is not None:
+            return escalation_id
+        spooled = _floor_residue(record, residue_floor)
+        if spooled is None:
             _log_unpreserved(record, floor_wired=residue_floor is not None)
-        return escalation_id
+        return spooled
 
-    def _escalation_sink(record: dict[str, Any]) -> str | None:
+    def _escalation_sink(record: dict[str, Any]) -> ResiduePreservation:
         """File a fired burst, and never change the rejection that fired it.
 
         ONE sink serves TWO record kinds — measured, not assumed. The middleware
@@ -484,9 +505,11 @@ def install_markup_guard(
         there. A sink that returns nothing makes that sentence a lie — and
         unrepairable is the COMMON outcome for the real corpus shapes, not an
         edge case. When no queue takes the record (an unresolvable project, no
-        escalation package, a queue outage) the floor's locator is returned
-        instead. Only when the floor is absent or fails too does the caller see
-        a null id, and THEN the full record is dumped to the log.
+        escalation package, a queue outage) the floor's file is returned
+        instead, as a :class:`SpooledResidue` so the middleware reports it as a
+        path and never as an escalation id. Only when the floor is absent or
+        fails too is the caller told nothing was preserved, and THEN the full
+        record is dumped to the log.
 
         The middleware delegates dedup here on purpose — whether an open
         escalation already exists is queue knowledge the shared layer does not

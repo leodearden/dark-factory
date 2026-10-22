@@ -32,7 +32,6 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -53,9 +52,10 @@ from shared.toolcall_markup import (
     closer_for,
 )
 
-from fused_memory.server.main import _install_safe_tool_wrapper
+from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+from fused_memory.server.main import _install_safe_tool_wrapper, server_data_dir
 from fused_memory.server.markup_guard import (
-    _rederive_project,
+    ResidueTier,
     _resolve_project_root,
     install_markup_guard,
 )
@@ -78,6 +78,8 @@ _AGENT_ID = 'recon-stage-9'
 _CLEAN_CONTENT = 'a deterministic cycle summary for the merge lane'
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+_GUARD_LOGGER = 'fused_memory.server.markup_guard'
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -179,6 +181,43 @@ def _build_guarded_server(
         residue_floor=residue_floor,
     )
     return server, mock_service
+
+
+def _content_that_ate(name: str, value: str) -> str:
+    """add_memory ``content`` whose leak ate the *name* parameter and then the
+    envelope's own closer, so ``repair()`` cannot attribute it: the measured
+    residue-loss shape."""
+    return (
+        _CLEAN_CONTENT
+        + closer_for('content')
+        + CANONICAL_OPENER_PREFIX
+        + f'"{name}">{value}'
+        + closer_for('parameter')
+        + closer_for('invoke')
+        + '\nthe head of the next tool call'
+    )
+
+
+async def _refused(server, tool: str, arguments: dict[str, Any]) -> dict:
+    """Call *tool* and return the unrepairable refusal it must raise."""
+    with pytest.raises(ToolError) as exc_info:
+        await server._tool_manager.call_tool(tool, arguments)
+    payload = _payload(exc_info)
+    assert payload['error_type'] == 'mcp_markup_unrepairable', payload
+    return payload
+
+
+def _residue_outcomes(caplog) -> list[dict[str, Any]]:
+    """The structured outcome of every guard log record that reports a residue
+    tier: its ``extra=`` fields plus the rendered ``message``."""
+    return [
+        {
+            key: value for key, value in record.__dict__.items()
+            if key.startswith('residue_')
+        } | {'message': record.getMessage()}
+        for record in caplog.records
+        if record.name == _GUARD_LOGGER and 'residue_tier' in record.__dict__
+    ]
 
 
 def _payload(exc_info) -> dict:
@@ -604,9 +643,13 @@ def _escalations(root) -> list[dict]:
     ]
 
 
-def _spooled(spool_dir: Path, locator: str) -> Any:
-    """The ``raw_value`` the floor holds under *locator*."""
-    return json.loads((spool_dir / locator).read_text(encoding='utf-8'))['raw_value']
+def _spooled(payload: dict, spool_dir: Path) -> Any:
+    """The ``raw_value`` in the floor file a refusal names, which must sit in
+    *spool_dir* and must not pose as an escalation."""
+    path = Path(payload['residue_spool_path'])
+    assert path.parent == spool_dir, payload
+    assert payload['escalation_id'] is None, f'a spool file is not an escalation: {payload!r}'
+    return json.loads(path.read_text(encoding='utf-8'))['raw_value']
 
 
 class TestStormEscape:
@@ -944,32 +987,19 @@ class TestInstalledOnTheRealServer:
         # ``==`` compares a bound method's (func, self): this spool's preserve.
         assert recorded['residue_floor'] == spool.preserve
 
-    def test_the_installer_helper_cannot_be_called_without_a_floor(self):
-        """``residue_spool`` is REQUIRED, so production wiring cannot drop the
-        floor by accident."""
-        from fused_memory.server.main import _install_tool_dispatch_guards
+    @pytest.mark.usefixtures('code_default_config')
+    def test_the_server_data_dir_is_the_configured_reconciliation_dir(self):
+        """Where the spool lives."""
+        config = FusedMemoryConfig(
+            reconciliation=ReconciliationConfig(data_dir='/var/lib/fused-memory')
+        )
 
-        server = create_mcp_server(AsyncMock())
+        assert server_data_dir(config) == Path('/var/lib/fused-memory')
 
-        with pytest.raises(TypeError):
-            _install_tool_dispatch_guards(server, known_projects=_KNOWN_PROJECTS)  # pyright: ignore[reportCallIssue] - missing BY DESIGN
-
-    @pytest.mark.parametrize(
-        ('reconciliation', 'expected'),
-        [
-            (SimpleNamespace(data_dir='/var/lib/fused-memory'), Path('/var/lib/fused-memory')),
-            (None, Path('./data')),
-        ],
-        ids=['reconciliation-configured', 'reconciliation-absent'],
-    )
-    def test_the_server_data_dir_has_one_answer(self, reconciliation, expected):
-        """Where the spool lives. A legal config without a reconciliation
-        section must still yield a dir, or that shape would disable
-        preservation."""
-        from fused_memory.server.main import _server_data_dir
-
-        config = SimpleNamespace(reconciliation=reconciliation)
-        assert _server_data_dir(config) == expected  # pyright: ignore[reportArgumentType] - duck-typed BY DESIGN
+    @pytest.mark.usefixtures('code_default_config')
+    def test_a_config_without_a_reconciliation_section_still_yields_a_dir(self):
+        """That shape is legal, so it must not disable preservation."""
+        assert server_data_dir(FusedMemoryConfig()) == Path(ReconciliationConfig().data_dir)
 
     def test_an_undeliverable_policy_is_refused_at_WIRING_time(self):
         """The declared ValueError, which is a fail-LOUD wiring guard.
@@ -1394,20 +1424,17 @@ class TestUnrepairableResidueIsPreserved:
             residue_floor=spool.preserve,
         )
 
-        with caplog.at_level('ERROR', logger='fused_memory.server.markup_guard'):
+        with caplog.at_level('ERROR', logger=_GUARD_LOGGER):
             payload = await self._refuse(server)
 
-        assert payload['escalation_id'] is not None
-        assert _spooled(tmp_path / 'spool', payload['escalation_id']) == self._unrepairable('one')
+        assert _spooled(payload, tmp_path / 'spool') == self._unrepairable('one')
         assert not (tmp_path / 'data' / 'escalations').exists()
-        text = '\n'.join(
-            r.getMessage() for r in caplog.records
-            if r.name == 'fused_memory.server.markup_guard'
+        [outcome] = _residue_outcomes(caplog)
+        assert outcome['residue_tier'] == ResidueTier.FLOOR
+        assert outcome['residue_locator'] == payload['residue_spool_path'], (
+            'the operator still needs the pointer'
         )
-        assert payload['escalation_id'] in text, (
-            f'the operator still needs the pointer: {text!r}'
-        )
-        assert self._unrepairable('one') not in text
+        assert self._unrepairable('one') not in outcome['message']
 
     @pytest.mark.asyncio
     async def test_a_filed_residue_does_not_dump_the_payload_into_the_log(
@@ -1454,16 +1481,18 @@ class TestUnrepairableResidueIsPreserved:
         assert payload['error_type'] == 'mcp_markup_unrepairable'
         mock_service.add_system_record.assert_not_awaited()
         # The floor caught the payload the raising filer dropped.
-        assert payload['escalation_id'] is not None
-        assert _spooled(tmp_path / 'spool', payload['escalation_id']) == self._unrepairable('one')
+        assert _spooled(payload, tmp_path / 'spool') == self._unrepairable('one')
 
 
 class TestRoutingIdentityIsRederivedFromTheResidue:
     """add_memory declares ``content`` before ``project_id``, so a leak in
     ``content`` eats the routing key. The id survives only inside the refused
     payload, and is recovered from there for QUEUE PLACEMENT only — every
-    scanned token is still vouched for by the one registry check,
-    ``_resolve_project_root``.
+    scanned token is still vouched for by the registry.
+
+    Each case refuses one add_memory through the guarded server's ``call_tool``
+    and asserts which queue the residue landed in, or that only the floor
+    holds it.
     """
 
     @staticmethod
@@ -1474,6 +1503,26 @@ class TestRoutingIdentityIsRederivedFromTheResidue:
     def _echo(name: str, value: str) -> str:
         return '\x3c' + name + '>' + value + closer_for(name)
 
+    @staticmethod
+    async def _refuse(tmp_path, content: str, known_projects: dict[str, str] | None) -> dict:
+        server = create_mcp_server(AsyncMock())
+        install_markup_guard(
+            server,
+            policy=RepairPolicy.REJECT_WITH_REPAIR,
+            known_projects=known_projects,
+            residue_floor=MarkupResidueSpool(tmp_path / 'spool').preserve,
+        )
+        return await _refused(server, 'add_memory', {'content': content})
+
+    @staticmethod
+    def _queues_holding_a_record(registry: dict[str, str]) -> list[str]:
+        return sorted(name for name, root in registry.items() if _escalations(Path(root)))
+
+    @classmethod
+    def _assert_only_the_floor_holds_it(cls, payload: dict, tmp_path, registry) -> None:
+        assert cls._queues_holding_a_record(registry) == []
+        assert _spooled(payload, tmp_path / 'spool') is not None
+
     @pytest.mark.parametrize(
         ('raw_value', 'project_id'),
         [
@@ -1481,70 +1530,97 @@ class TestRoutingIdentityIsRederivedFromTheResidue:
             for index, (raw_value, project_id) in enumerate(_residue_loss_specimens())
         ],
     )
-    def test_every_measured_residue_loss_routes_to_its_own_project(
+    @pytest.mark.asyncio
+    async def test_every_measured_residue_loss_files_into_its_own_project(
         self, tmp_path, raw_value, project_id
     ):
         registry = self._registry(tmp_path)
 
-        assert _rederive_project({'raw_value': raw_value}, registry) == registry[project_id]
+        payload = await self._refuse(tmp_path, raw_value, registry)
 
-    def test_an_unregistered_id_routes_nowhere(self, tmp_path):
-        raw = _leaked(_CLEAN_CONTENT, 'project_id', 'not_a_registered_project')
+        assert self._queues_holding_a_record(registry) == [project_id]
+        [record] = _escalations(Path(registry[project_id]))
+        assert record['id'] == payload['escalation_id']
 
-        assert _rederive_project({'raw_value': raw}, self._registry(tmp_path)) is None
-
-    def test_an_unvouched_absolute_root_routes_nowhere(self, tmp_path):
-        chosen = str(tmp_path / 'chosen-by-the-caller')
-        raw = _leaked(_CLEAN_CONTENT, 'project_root', chosen)
-
-        assert _rederive_project({'raw_value': raw}, self._registry(tmp_path)) is None
-        assert not (tmp_path / 'chosen-by-the-caller').exists()
-
-    def test_a_registered_absolute_root_routes_to_itself(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_an_unregistered_id_files_only_into_the_floor(self, tmp_path):
         registry = self._registry(tmp_path)
-        raw = _leaked(_CLEAN_CONTENT, 'project_root', registry['reify'])
 
-        assert _rederive_project({'raw_value': raw}, registry) == registry['reify']
+        payload = await self._refuse(
+            tmp_path, _content_that_ate('project_id', 'not_a_registered_project'), registry
+        )
 
-    def test_two_different_registered_projects_route_nowhere(self, tmp_path):
+        self._assert_only_the_floor_holds_it(payload, tmp_path, registry)
+
+    @pytest.mark.asyncio
+    async def test_an_unvouched_absolute_root_files_only_into_the_floor(self, tmp_path):
         registry = self._registry(tmp_path)
-        raw = (
-            _leaked(_CLEAN_CONTENT, 'project_id', 'reify')
+        chosen = tmp_path / 'chosen-by-the-caller'
+
+        payload = await self._refuse(
+            tmp_path, _content_that_ate('project_root', str(chosen)), registry
+        )
+
+        self._assert_only_the_floor_holds_it(payload, tmp_path, registry)
+        assert not chosen.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_registered_absolute_root_files_into_its_own_queue(self, tmp_path):
+        registry = self._registry(tmp_path)
+
+        await self._refuse(
+            tmp_path, _content_that_ate('project_root', registry['reify']), registry
+        )
+
+        assert self._queues_holding_a_record(registry) == ['reify']
+
+    @pytest.mark.asyncio
+    async def test_two_different_registered_projects_file_only_into_the_floor(self, tmp_path):
+        registry = self._registry(tmp_path)
+        content = (
+            _content_that_ate('project_id', 'reify')
             + self._echo('project_root', registry['dark_factory'])
         )
 
-        assert _rederive_project({'raw_value': raw}, registry) is None
+        payload = await self._refuse(tmp_path, content, registry)
 
-    def test_one_id_with_two_values_routes_nowhere(self, tmp_path):
-        raw = (
-            _leaked(_CLEAN_CONTENT, 'project_id', 'reify')
+        self._assert_only_the_floor_holds_it(payload, tmp_path, registry)
+
+    @pytest.mark.asyncio
+    async def test_one_id_with_two_values_files_only_into_the_floor(self, tmp_path):
+        registry = self._registry(tmp_path)
+        content = (
+            _content_that_ate('project_id', 'reify')
             + self._echo('project_id', 'dark_factory')
         )
 
-        assert _rederive_project({'raw_value': raw}, self._registry(tmp_path)) is None
+        payload = await self._refuse(tmp_path, content, registry)
 
-    def test_an_id_and_a_root_naming_the_same_project_agree(self, tmp_path):
+        self._assert_only_the_floor_holds_it(payload, tmp_path, registry)
+
+    @pytest.mark.asyncio
+    async def test_an_id_and_a_root_naming_the_same_project_agree(self, tmp_path):
         registry = self._registry(tmp_path)
-        raw = (
-            _leaked(_CLEAN_CONTENT, 'project_id', 'reify')
+        content = (
+            _content_that_ate('project_id', 'reify')
             + self._echo('project_root', registry['reify'])
         )
 
-        assert _rederive_project({'raw_value': raw}, registry) == registry['reify']
+        await self._refuse(tmp_path, content, registry)
 
-    @pytest.mark.parametrize(
-        ('record', 'known_projects'),
-        [
-            ({'raw_value': _leaked(_CLEAN_CONTENT, 'project_id', 'reify')}, None),
-            ({'raw_value': _leaked(_CLEAN_CONTENT, 'project_id', 'reify')}, {}),
-            ({}, {'reify': '/reify'}),
-            ({'raw_value': None}, {'reify': '/reify'}),
-            ({'raw_value': 12345}, {'reify': '/reify'}),
-        ],
-        ids=['no-registry', 'empty-registry', 'no-raw-value', 'none-raw-value', 'int-raw-value'],
-    )
-    def test_it_routes_nowhere_without_raising(self, record, known_projects):
-        assert _rederive_project(record, known_projects) is None
+        assert self._queues_holding_a_record(registry) == ['reify']
+
+    @pytest.mark.parametrize('known_projects', [None, {}], ids=['no-registry', 'empty-registry'])
+    @pytest.mark.asyncio
+    async def test_without_a_registry_it_files_only_into_the_floor(
+        self, tmp_path, known_projects
+    ):
+        payload = await self._refuse(
+            tmp_path, _content_that_ate('project_id', 'reify'), known_projects
+        )
+
+        assert not (tmp_path / 'reify').exists()
+        assert _spooled(payload, tmp_path / 'spool') is not None
 
 
 class TestPreservationIsUnconditional:
@@ -1573,58 +1649,39 @@ class TestPreservationIsUnconditional:
         arguments[specimen['param']] = specimen['value']
         return arguments
 
-    @staticmethod
-    async def _refuse(server, tool: str, arguments: dict[str, Any]) -> dict:
-        with pytest.raises(ToolError) as exc_info:
-            await server._tool_manager.call_tool(tool, arguments)
-        payload = _payload(exc_info)
-        assert payload['error_type'] == 'mcp_markup_unrepairable', payload
-        return payload
-
-    @staticmethod
-    def _content_naming_its_project(project_id: str) -> str:
-        """An add_memory leak that ate ``project_id`` and then a whole second
-        call, so it cannot be repaired — the measured residue-loss shape."""
-        return (
-            _CLEAN_CONTENT
-            + closer_for('content')
-            + CANONICAL_OPENER_PREFIX
-            + f'"project_id">{project_id}'
-            + closer_for('parameter')
-            + closer_for('invoke')
-            + '\nthe head of the next tool call'
-        )
-
-    @pytest.mark.parametrize(
-        'specimen',
-        [
-            pytest.param(specimen, id=specimen['tool_use_id'])
-            for specimen in _unrepairable_add_memory_specimens()
-        ],
-    )
     @pytest.mark.asyncio
-    async def test_no_corpus_payload_of_add_memory_is_lost(self, tmp_path, specimen):
-        spool = MarkupResidueSpool(tmp_path / 'spool')
-        server, mock_service = _build_guarded_server(
-            known_projects={self._UNRELATED: str(tmp_path / 'other')},
-            residue_floor=spool.preserve,
+    async def test_no_corpus_payload_of_add_memory_is_lost(self, tmp_path):
+        """Every specimen the LIVE schema still refuses reaches the floor verbatim.
+
+        A specimen recorded against an older add_memory schema can be repaired
+        by the live one (measured: one predates ``session_id``), and its caller
+        then holds the payload in ``repaired_call``. At least one specimen must
+        still be refused, or this would pass without ever reaching the floor.
+        """
+        reached_the_floor = []
+        for index, specimen in enumerate(_unrepairable_add_memory_specimens()):
+            spool_dir = tmp_path / f'spool-{index}'
+            server, mock_service = _build_guarded_server(
+                known_projects={self._UNRELATED: str(tmp_path / 'other')},
+                residue_floor=MarkupResidueSpool(spool_dir).preserve,
+            )
+
+            with pytest.raises(ToolError) as exc_info:
+                await server._tool_manager.call_tool('add_memory', self._arguments(specimen))
+
+            payload = _payload(exc_info)
+            mock_service.add_memory.assert_not_awaited()
+            if payload['error_type'] == 'mcp_markup_detected':
+                assert payload['repaired_call']['content'] in specimen['value']
+                continue
+            assert payload['error_type'] == 'mcp_markup_unrepairable', payload
+            assert _spooled(payload, spool_dir) == specimen['value'], specimen['tool_use_id']
+            reached_the_floor.append(specimen['tool_use_id'])
+
+        assert reached_the_floor, (
+            'the live add_memory schema repairs every corpus specimen, so none '
+            'reached the floor and this test no longer tests it'
         )
-
-        with pytest.raises(ToolError) as exc_info:
-            await server._tool_manager.call_tool('add_memory', self._arguments(specimen))
-
-        payload = _payload(exc_info)
-        mock_service.add_memory.assert_not_awaited()
-        if payload['error_type'] == 'mcp_markup_detected':
-            # A specimen recorded against an older add_memory schema can be
-            # repaired by the live one (measured: one predates ``session_id``).
-            # The caller then holds its payload in ``repaired_call``.
-            assert payload['repaired_call']['content'] in specimen['value']
-            return
-        assert payload['error_type'] == 'mcp_markup_unrepairable', payload
-        assert payload['escalation_id'] is not None, payload
-        assert _spooled(tmp_path / 'spool', payload['escalation_id']) == specimen['value']
-        assert 'NOTHING WAS PRESERVED' not in payload['hint']
 
     @pytest.mark.asyncio
     async def test_a_registered_project_named_only_in_the_residue_files_into_its_queue(
@@ -1636,14 +1693,13 @@ class TestPreservationIsUnconditional:
             residue_floor=MarkupResidueSpool(spool_dir).preserve,
         )
 
-        payload = await self._refuse(
-            server, 'add_memory', {'content': self._content_naming_its_project(_PROJECT_ID)}
+        payload = await _refused(
+            server, 'add_memory', {'content': _content_that_ate('project_id', _PROJECT_ID)}
         )
 
         records = _escalations(tmp_path)
         assert [record['id'] for record in records] == [payload['escalation_id']]
-        assert 'UNVERIFIED ROUTING' in records[0]['suggested_action']
-        assert 'never for the write' in records[0]['suggested_action']
+        assert 'UNVERIFIED' in records[0]['suggested_action']
         assert 'project=None' in records[0]['detail']
         assert not spool_dir.exists(), 'the queue stays primary; the floor is not touched'
         mock_service.add_memory.assert_not_awaited()
@@ -1665,7 +1721,7 @@ class TestPreservationIsUnconditional:
             residue_floor=MarkupResidueSpool(spool_dir).preserve,
         )
 
-        payload = await self._refuse(
+        payload = await _refused(
             server,
             'submit_task',
             {
@@ -1692,13 +1748,14 @@ class TestPreservationIsUnconditional:
             residue_floor=MarkupResidueSpool(blocker / 'spool').preserve,
         )
 
-        payload = await self._refuse(
+        payload = await _refused(
             server,
             'add_memory',
             {'content': _CLEAN_CONTENT + closer_for('invoke'), 'project_id': 'unregistered'},
         )
 
         assert payload['escalation_id'] is None
+        assert 'residue_spool_path' not in payload
         assert 'NOTHING WAS PRESERVED' in payload['hint']
         mock_service.add_memory.assert_not_awaited()
 
@@ -1767,6 +1824,7 @@ class TestPreservationFailuresAreReadable:
         status = await self._status(server)
 
         assert payload['escalation_id'] is None
+        assert 'residue_spool_path' not in payload
         residue = status['markup_residue']
         assert residue['preservation_failures'] == 1
         assert residue['last_failure']['tool'] == 'add_memory'
@@ -1786,9 +1844,21 @@ class TestPreservationFailuresAreReadable:
         payload = await self._refuse_add_memory(server)
         status = await self._status(server)
 
-        assert payload['escalation_id'] is not None
-        assert (tmp_path / 'spool').exists() is (tier == 'floor')
+        assert (payload['escalation_id'] is not None) is (tier == 'queue')
+        assert ('residue_spool_path' in payload) is (tier == 'floor')
         assert status['markup_residue']['preservation_failures'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_spooled_payload_is_reported_as_waiting(self, tmp_path):
+        """An operator sees a growing floor, not only its losses."""
+        server, _ = self._server(MarkupResidueSpool(tmp_path / 'spool'))
+
+        payload = await self._refuse_add_memory(server)
+        status = await self._status(server)
+
+        residue = status['markup_residue']
+        assert residue['spooled_files'] == 1
+        assert residue['last_preserved'] == payload['residue_spool_path']
 
     @pytest.mark.asyncio
     async def test_an_unwired_server_omits_the_field(self):
@@ -1810,66 +1880,45 @@ class TestPreservationFailuresAreReadable:
 
 
 class TestTheLastTierLogLineIsHonest:
-    """When neither the queue nor the floor held a payload, the guard's log line
-    is where it survives. That line must not claim more than it knows: other
-    copies may exist (the caller's own), and it must say why nothing durable
-    holds this one.
+    """When neither the queue nor the floor held a payload, the guard's ERROR
+    line is where it survives. Its outcome is logged as data: the tier, and
+    whether a floor was wired at all.
     """
 
-    _GUARD_LOGGER = 'fused_memory.server.markup_guard'
-
-    async def _last_tier_text(self, caplog, residue_floor: Any = None) -> str:
+    async def _last_tier_outcome(self, caplog, residue_floor: Any = None) -> dict[str, Any]:
         server, _ = _build_guarded_server(
             'add_system_record',
             known_projects={'some_other_project': '/elsewhere'},
             residue_floor=residue_floor,
         )
-        with caplog.at_level('ERROR', logger=self._GUARD_LOGGER):
+        with caplog.at_level('ERROR', logger=_GUARD_LOGGER):
             payload = await TestUnrepairableResidueIsPreserved._refuse(server)
         assert payload['escalation_id'] is None
-        return '\n'.join(
-            r.getMessage() for r in caplog.records
-            if r.name == self._GUARD_LOGGER and r.levelname == 'ERROR'
-        )
+        assert 'residue_spool_path' not in payload
+        [outcome] = _residue_outcomes(caplog)
+        assert outcome['residue_tier'] == ResidueTier.UNPRESERVED
+        return outcome
 
     @pytest.mark.asyncio
-    async def test_it_does_not_claim_to_be_the_only_copy(self, caplog):
-        text = await self._last_tier_text(caplog)
+    async def test_an_absent_floor_is_logged_as_unwired(self, caplog):
+        outcome = await self._last_tier_outcome(caplog)
 
-        assert 'only copy' not in text
-
-    @pytest.mark.asyncio
-    async def test_it_says_nothing_durable_was_preserved(self, caplog):
-        text = await self._last_tier_text(caplog)
-
-        assert 'nowhere durable' in text, text
+        assert outcome['residue_floor_wired'] is False
 
     @pytest.mark.asyncio
-    async def test_it_names_an_absent_floor(self, caplog):
-        text = await self._last_tier_text(caplog)
-
-        assert 'no residue floor is wired' in text, text
-
-    @pytest.mark.asyncio
-    async def test_it_names_a_failed_floor(self, caplog, tmp_path):
+    async def test_a_failed_floor_is_logged_as_wired(self, caplog, tmp_path):
         blocker = tmp_path / 'not-a-directory'
         blocker.write_text('occupied')
 
-        text = await self._last_tier_text(
+        outcome = await self._last_tier_outcome(
             caplog, MarkupResidueSpool(blocker / 'spool').preserve
         )
 
-        assert 'the residue floor failed' in text, text
-
-    @pytest.mark.asyncio
-    async def test_it_says_the_caller_was_told_to_keep_its_own_copy(self, caplog):
-        text = await self._last_tier_text(caplog)
-
-        assert 'keep its own copy' in text, text
+        assert outcome['residue_floor_wired'] is True
 
     @pytest.mark.asyncio
     async def test_it_still_carries_the_payload(self, caplog):
-        text = await self._last_tier_text(caplog)
+        outcome = await self._last_tier_outcome(caplog)
 
-        assert TestUnrepairableResidueIsPreserved._unrepairable('one') in text
-        assert MARKUP_RECURRENCE_ROUTING in text
+        assert TestUnrepairableResidueIsPreserved._unrepairable('one') in outcome['message']
+        assert MARKUP_RECURRENCE_ROUTING in outcome['message']

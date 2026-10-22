@@ -580,7 +580,7 @@ async def run_server():
         run_periodic_write_ops_prune,
     )
 
-    wj_data_dir = _server_data_dir(config)
+    wj_data_dir = server_data_dir(config)
     write_journal = WriteJournal(wj_data_dir)
     await write_journal.initialize()
     memory_service.set_write_journal(write_journal)
@@ -1002,7 +1002,7 @@ async def run_server():
 
         event_buffer = EventBuffer(db_path=None)
         await event_buffer.initialize()
-        _disabled_data_dir = _server_data_dir(config)
+        _disabled_data_dir = server_data_dir(config)
         ticket_store = await _build_ticket_store(_disabled_data_dir)
         task_interceptor = TaskInterceptor(
             taskmaster, None, event_buffer,
@@ -1828,7 +1828,7 @@ async def _build_task_backend(taskmaster_config, task_metadata_config):
     )
 
 
-def _server_data_dir(config: FusedMemoryConfig) -> Path:
+def server_data_dir(config: FusedMemoryConfig) -> Path:
     """The server's own data dir: reconciliation's when configured, else ``./data``."""
     return Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
 

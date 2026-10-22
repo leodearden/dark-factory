@@ -7747,7 +7747,8 @@ def create_mcp_server(
         A top-level ``markup_residue`` field is present when the markup guard's
         residue floor is wired (task 4809). A non-zero
         ``preservation_failures`` counts refused payloads this process could
-        not preserve anywhere; ``spool_dir`` is the floor to inspect.
+        not preserve anywhere; ``spooled_files`` counts the payloads waiting in
+        ``spool_dir`` for an operator.
 
         Args:
             project_id: Get stats for a specific project (optional)
