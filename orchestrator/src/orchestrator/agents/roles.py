@@ -29,8 +29,7 @@ from orchestrator.agents.sigpipe_guidance import SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
 # did not exist and the Lever-C fast-path silently always fell through to the
 # architect).  jcodemunch tools intentionally have no prefix entry here — they
 # ride inside the 'orchestrator' MCP config but are not themselves a trigger
-# for requiring a family (a role may use jcodemunch alone with no family
-# declared, e.g. reviewer_comprehensive).
+# for requiring a family.
 _FAMILY_TOOL_PREFIXES: dict[str, tuple[str, ...]] = {
     'orchestrator': ('mcp__fused-memory__', 'mcp__escalation__'),
     'plan_tools': ('mcp__plan-tools__',),
@@ -69,6 +68,24 @@ class AgentRole:
     # whenever the paired CONTRACT changes materially, invalidating any stale
     # pinned artifact for the old contract). None when prompt_spec is None.
     prompt_harness_version: str | None = None
+
+    @property
+    def strict_mcp_scope(self) -> bool:
+        """Whether this role's whole MCP surface is its declared families.
+
+        True when it declares a family, none is 'orchestrator', and every
+        mcp__ grant falls under a declared family's prefix.
+        """
+        if not self.mcp_families or 'orchestrator' in self.mcp_families:
+            return False
+        declared_prefixes = tuple(
+            prefix for family in self.mcp_families for prefix in _FAMILY_TOOL_PREFIXES[family]
+        )
+        return all(
+            tool.startswith(declared_prefixes)
+            for tool in self.allowed_tools
+            if tool.startswith('mcp__')
+        )
 
     def __post_init__(self) -> None:
         """Import-time capability assertion (W9-η, reify esc-4943-54 class).

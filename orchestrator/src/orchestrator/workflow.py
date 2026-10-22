@@ -14174,10 +14174,17 @@ class TaskWorkflow:
         if 'verdict_tools' in role.mcp_families and cwd:
             mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role)
 
-        # Strict scoping (EVAL_PROFILE, task 4757) is a no-op without a truthy
-        # --mcp-config, so a role whose families composed none gets the
-        # zero-server one rather than keeping the worktree's ambient .mcp.json.
-        if self.config.strict_mcp_config and not mcp_config:
+        # --strict-mcp-config stops the CLI unioning in the ambient project/user
+        # .mcp.json. EVAL_PROFILE scopes every role (task 4757). A role whose
+        # servers are all spawned above per invocation is scoped too, so its
+        # verdict tool is not deferred behind ToolSearch (task 3849; the
+        # reviewer trial does the same in
+        # orchestrator/src/orchestrator/evals/reviewer_trial/runner.py::_review).
+        # Strict scoping is a no-op without a truthy --mcp-config, so a role
+        # whose families composed none gets the zero-server one rather than
+        # keeping the worktree's ambient .mcp.json.
+        strict_mcp = self.config.strict_mcp_config or role.strict_mcp_scope
+        if strict_mcp and not mcp_config:
             mcp_config = no_mcp_servers_config()
 
         # Session-resume lifecycle: if the harness recovered a sidecar that
@@ -14473,7 +14480,7 @@ class TaskWorkflow:
                 allowed_tools=role.allowed_tools or None,
                 disallowed_tools=role.disallowed_tools or None,
                 mcp_config=mcp_config,
-                strict_mcp_config=self.config.strict_mcp_config,
+                strict_mcp_config=strict_mcp,
                 output_schema=output_schema,
                 sandbox_modules=sandbox_modules,
                 sandbox_extras=sandbox_extras,
