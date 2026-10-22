@@ -34,6 +34,8 @@ class GateClearance(StrEnum):
     """Footprint-disjoint from trusted drift; see ``gates.py::_disjoint_skip_blockers``."""
     reverified = 'reverified'
     """A full re-verify of the rebased tree passed."""
+    history_leg = 'history_leg'
+    """The rebased tree is the verified tree, and the project's declared history leg passed."""
 
 
 class ReverifyGateReason(StrEnum):
@@ -49,6 +51,9 @@ class ReverifyGateReason(StrEnum):
     """The branch and the intervening main delta touched a common path."""
     overlap_unknown = 'overlap_unknown'
     """The overlap probe failed, so the overlap is unknown."""
+    same_tree_history_leg = 'same_tree_history_leg'
+    """The rebased tree is the verified tree, but the project declares a history leg, so only
+    that leg runs (``merge_gate_history_pure`` with ``merge_gate_history_test_command``)."""
 
     @property
     def skip_clearance(self) -> GateClearance | None:
