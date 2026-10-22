@@ -38,7 +38,7 @@ from client_feed.fold import fold
 from client_feed.inbox import InboxRead, InboxUnusable, read_inbox
 from client_feed.policy import Policy
 from client_feed.redact import redact_paths
-from client_feed.reveals import RevealOutput, reveal_events
+from client_feed.reveals import AnswerIdentity, RevealOutput, answered_in, reveal_events
 from client_feed.sources.archive import ArchiveReadError
 from client_feed.sources.events import (
     FactoryStatus,
@@ -312,6 +312,7 @@ def _reveal_unit(
     cursor: Cursor,
     engagement: EngagementProjection | None,
     inbox: InboxRead | None,
+    answered: Counter[AnswerIdentity],
     stamp: Stamp,
     now: datetime,
     degraded: list[Degradation],
@@ -334,6 +335,7 @@ def _reveal_unit(
             state=view,
             requests=() if inbox is None else inbox.requests,
             inbox_offset=cursor.inbox_offset if inbox is None else inbox.offset,
+            answered=answered,
             stamp=stamp,
             now=now,
         ),
@@ -422,6 +424,7 @@ def run_pass(
         cursor=cursor,
         engagement=engagement,
         inbox=inbox,
+        answered=answered_in(out.uncommitted),
         stamp=stamp,
         now=now,
         degraded=degraded,

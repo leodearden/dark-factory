@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -10,7 +11,11 @@ from typing import Any
 
 from client_feed.budget import CountedSet, Granted, counted_set, judge, lines_since
 from client_feed.contract import (
+    FEED_VERSION,
     EngagementProjection,
+    EventHeader,
+    FeedEvent,
+    FeedLine,
     FeedState,
     FileRevealed,
     RefusalReason,
@@ -20,7 +25,7 @@ from client_feed.contract import (
     RevealRequested,
     TreeFile,
 )
-from client_feed.envelope import Stamp
+from client_feed.envelope import Envelope, Stamp
 from client_feed.policy import Policy
 from client_feed.sources.git import (
     ChangeStatus,
@@ -34,6 +39,22 @@ from client_feed.sources.git import (
 )
 
 Answer = FileRevealed | RevealRefused
+AnswerIdentity = tuple[str, str]
+
+_UNPLACED_SEQ = 1
+
+
+def answer_identity(event: FeedEvent) -> AnswerIdentity | None:
+    """What an answer says wherever it lands: its type and its JSON without seq and at; None for any other event."""
+    if not isinstance(event, FileRevealed | RevealRefused):
+        return None
+    return (event.type, event.model_dump_json(exclude={'seq', 'at'}))
+
+
+def answered_in(lines: Iterable[FeedLine]) -> Counter[AnswerIdentity]:
+    """The answers a stopped writer appended but never recorded in its cursor, counted by identity."""
+    keys = (answer_identity(line) for line in lines if not isinstance(line, EventHeader))
+    return Counter(key for key in keys if key is not None)
 
 
 @dataclass(frozen=True)
@@ -74,8 +95,8 @@ class _Unstamped:
     model: type[Answer]
     fields: Mapping[str, Any]
 
-    def stamped(self, stamp: Stamp, now: datetime) -> Answer:
-        return self.model(**stamp(now), **self.fields)
+    def placed(self, envelope: Envelope) -> Answer:
+        return self.model(**envelope, **self.fields)
 
 
 def _revealed(path: str, head: str, granted: Granted, *, renamed_from: str | None) -> _Unstamped:
@@ -205,6 +226,27 @@ def _counted(
     )
 
 
+def _unanswered(
+    decided: Iterable[_Unstamped],
+    answered: Counter[AnswerIdentity],
+    *,
+    project_id: str,
+    stamp: Stamp,
+    now: datetime,
+) -> tuple[Answer, ...]:
+    """The decided answers stamped in order, but each one the tail already holds consumed there, spending no seq."""
+    unplaced = Envelope(seq=_UNPLACED_SEQ, at=now, project_id=project_id, feed_version=FEED_VERSION)
+    unspent = Counter(answered)
+    events: list[Answer] = []
+    for answer in decided:
+        key = answer_identity(answer.placed(unplaced))
+        if key is not None and unspent[key] > 0:
+            unspent[key] -= 1
+        else:
+            events.append(answer.placed(stamp(now)))
+    return tuple(events)
+
+
 def reveal_events(
     root: Path,
     policy: Policy,
@@ -216,10 +258,14 @@ def reveal_events(
     state: FeedState,
     requests: Sequence[RevealRequested],
     inbox_offset: int,
+    answered: Counter[AnswerIdentity],
     stamp: Stamp,
     now: datetime,
 ) -> RevealOutput:
-    """Every revealed file followed from `since` to head, then each request answered in inbox order; the budget is what is spent after them."""
+    """Every revealed file followed from `since` to head, then each request answered in inbox order; the budget is what is spent after them.
+
+    An answer already in `answered`, the uncommitted tail, is consumed there instead of emitted again.
+    """
     counted = _counted(root, policy, files, engagement, head)
     revealed = {file.path for file in state.revealed}
     tracks = _tracks(root, state.revealed, since=since, head=head)
@@ -234,7 +280,7 @@ def reveal_events(
         decided = _follow_events(tracks, at_head, revealed)
         decided += [_answer(request, at_head, revealed) for request in requests]
     return RevealOutput(
-        events=tuple(answer.stamped(stamp, now) for answer in decided),
+        events=_unanswered(decided, answered, project_id=state.project_id, stamp=stamp, now=now),
         budget=counted.budget(revealed),
         inbox_offset=inbox_offset,
         reveals_head=head,
