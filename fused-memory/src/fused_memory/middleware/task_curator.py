@@ -3147,11 +3147,18 @@ class TaskCurator:
         gated calls share this dir safely: each authenticates from its own
         ``CLAUDE_CODE_OAUTH_TOKEN``, never from the ``.credentials.json`` they
         all rewrite (``shared/tests/test_config_dir_credentials_live.py``).
+
+        The dead-PID sweep runs on a worker thread and is not awaited: it
+        reclaims other processes' leftovers, so no call depends on it, and a
+        readdir of a large system tempdir must stall neither the server's event
+        loop nor this call (task 7335).
         """
         if self._usage_gate is None:
             return None
         if self._config_dir is None:
-            _sweep_stale_curator_config_dirs_once(self._config_dir_base)
+            asyncio.get_running_loop().run_in_executor(
+                None, _sweep_stale_curator_config_dirs_once, self._config_dir_base,
+            )
             self._config_dir = TaskConfigDir(
                 f'{_CONFIG_DIR_TASK_PREFIX}{os.getpid()}', base_dir=self._config_dir_base,
             )
