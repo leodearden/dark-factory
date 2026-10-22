@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Iterator
@@ -428,3 +429,116 @@ def test_an_author_returns_session_rulings_become_minted_human_rulings(env: Prog
     assert (ruling['id'], ruling['ruled_by'], ruling['stream']) == ('D1', 'human', 'S2')
     assert 'R7' in ruling['source']
     assert 'answers' not in ruling
+
+
+S2_PRD = 'plans/review-all-fixture-s2-prd.md'
+LOST = 'open_questions, xrefs, lead_actions, moves'
+_TIMESTAMP = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ')
+
+
+def _from_store(env: ProgramEnv, stream: str) -> subprocess.CompletedProcess[str]:
+    return env.run('apply_return.py', '--from-store', stream, '--run', RUN_ID)
+
+
+@pytest.fixture
+def authored(env: ProgramEnv) -> ProgramEnv:
+    """A home whose S1 and S2 author returns are applied."""
+    _applied(env, 'S1.author.json')
+    _applied(env, 'S2.author.json')
+    return env
+
+
+def _note(env: ProgramEnv) -> str:
+    (note,) = [line['text'] for line in _ledger(env) if line['op'] == 'note']
+    return note
+
+
+def test_from_store_records_the_decompose_the_store_shows(authored: ProgramEnv, store: FakeStore) -> None:
+    before = authored.snapshot()
+    calls_before = len(_tools_calls(store))
+    proc = _from_store(authored, 'S2')
+    assert proc.returncode == 0, _output(proc)
+    status, note = _ledger(authored)[-2:]
+    assert status == {'seq': status['seq'], 'by': 'apply_return.py', 'op': 'stream_status',
+                      'stream': 'S2', 'status': 'decomposed', 'prd_path': S2_PRD}
+    assert note['op'] == 'note' and note['seq'] == status['seq'] + 1
+    text = note['text']
+    assert 'filed 105, 106' in text and 'held none' in text and 'released 113' in text
+    assert LOST in text
+    assert _TIMESTAMP.search(text)
+    after = authored.snapshot()
+    assert sorted(name for name in after if name.startswith('returns/')) == sorted(
+        name for name in before if name.startswith('returns/'))
+    assert after.get('rulings.jsonl') == before.get('rulings.jsonl')
+    assert proc.stdout.splitlines()[0] == (
+        f'S2 decompose from store: 2 filed, 0 held, 1 released; lost: {LOST}'
+    )
+    called = set(_tools_calls(store)[calls_before:])
+    assert 'find_tasks_by_metadata' in called
+    assert called <= {'find_tasks_by_metadata', 'get_task'}
+
+
+def test_from_store_refuses_a_stream_already_decomposed(authored: ProgramEnv) -> None:
+    assert _from_store(authored, 'S2').returncode == 0
+    before = authored.snapshot()
+    proc = _from_store(authored, 'S2')
+    assert proc.returncode == 1
+    assert 'already decomposed' in _output(proc)
+    assert authored.snapshot() == before
+
+
+def test_from_store_refuses_a_stream_whose_author_return_is_not_applied(env: ProgramEnv) -> None:
+    before = env.snapshot()
+    proc = _from_store(env, 'S1')
+    assert proc.returncode == 1
+    assert 'author return is not applied' in _output(proc)
+    assert env.snapshot() == before
+
+
+def test_from_store_refuses_while_the_inbox_holds_a_usable_return(authored: ProgramEnv) -> None:
+    authored.put_inbox('S2.decompose.json')
+    before = authored.snapshot()
+    proc = _from_store(authored, 'S2')
+    assert proc.returncode == 1
+    assert 'usable return' in _output(proc)
+    assert authored.snapshot() == before
+
+
+@pytest.mark.parametrize(
+    ('content', 'why'),
+    [(json.dumps({'stream': 'S2', 'pass': 'decompose'}).ljust(40), 'under 100'),
+     ('not json ' * 20, 'does not parse')],
+    ids=['under-100-bytes', 'unparsable'],
+)
+def test_from_store_proceeds_past_a_degenerate_inbox_file_and_names_it(
+    content: str, why: str, authored: ProgramEnv,
+) -> None:
+    leftover = authored.home / 'inbox' / 'S2.decompose.json'
+    leftover.write_text(content)
+    proc = _from_store(authored, 'S2')
+    assert proc.returncode == 0, _output(proc)
+    assert leftover.read_text() == content
+    for text in (_note(authored), proc.stdout):
+        assert 'inbox/S2.decompose.json' in text and why in text
+
+
+def test_from_store_reports_a_held_leaf(authored: ProgramEnv, tmp_path: Path) -> None:
+    data = json.loads((FIXTURE_DIR / 'store.json').read_text())
+    (row,) = [task for task in data['tasks'] if task['id'] == 105]
+    row['status'] = 'deferred'
+    row['metadata']['x_seam_wait'] = {'stream': 'S1', 'contract': 'C9', 'release_owner': 'S1'}
+    held_store = tmp_path / 'store-held.json'
+    held_store.write_text(json.dumps(data))
+    with running_fake_store(store=held_store) as other:
+        proc = _from_store(dataclasses.replace(authored, store_url=other.url), 'S2')
+    assert proc.returncode == 0, _output(proc)
+    assert proc.stdout.splitlines()[0].startswith('S2 decompose from store: 1 filed, 1 held,')
+    assert '105 on S1 C9' in _note(authored)
+
+
+@pytest.mark.parametrize(
+    'args', [('--from-store', 'S2'), ('--from-store', 'S2', '--run', RUN_ID, 'inbox/S2.decompose.json')],
+    ids=['without-run', 'with-a-file'],
+)
+def test_from_store_usage_errors(args: tuple[str, ...], authored: ProgramEnv) -> None:
+    assert authored.run('apply_return.py', *args).returncode == 2
