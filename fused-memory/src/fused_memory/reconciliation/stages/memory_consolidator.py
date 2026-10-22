@@ -235,7 +235,7 @@ class MemoryConsolidator(BaseStage):
     # None when the graph was unreadable, absent, or in remediation passes.
     index_health: dict | None = None
 
-    # The overreach shadow's flags since the previous run — set by harness
+    # The overreach shadow's next page of flags not yet handed over — set by harness
     # (design.md §6.1 O4, task 6137). None when unavailable or in remediation passes.
     overreach_flags: OverreachFlagPage | None = None
 

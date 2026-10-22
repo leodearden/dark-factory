@@ -200,7 +200,7 @@ class TestTheWritePath:
     async def test_a_slow_judge_holds_up_neither_its_write_nor_a_same_group_one(self, live) -> None:
         svc = live.service
         await svc.add_memory(content=RULING, category='decisions_and_rationale', project_id=GROUP)
-        await asyncio.wait_for(live.judge.entered.wait(), 10)
+        await poll_until(live.judge.entered.is_set, message='the first judge never started')
         await svc.add_memory(content=RULING + ' Again.', category='decisions_and_rationale',
                              project_id=GROUP)
         await poll_until(lambda: svc.graphiti.add_episode.await_count == 2,
