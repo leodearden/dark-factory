@@ -1264,6 +1264,7 @@
     "orchestrator/tests/test_verify_preexisting_main_break.py": {"patch_targets": [], "private_reads": 23},
     "orchestrator/tests/test_verify_runner.py": {"patch_targets": [], "private_reads": 8},
     "orchestrator/tests/test_verify_scope_inversion_boundary.py": {"patch_targets": ["worker.run_scoped_verification", "worker.verify_failure_is_preexisting_on_main"], "private_reads": 7},
+    "orchestrator/tests/test_verify_scope_spawn_failure.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_warm_base_coherence.py": {"patch_targets": [], "private_reads": 3},
     "orchestrator/tests/test_warm_lane_abort_teardown.py": {"patch_targets": [], "private_reads": 11},
     "orchestrator/tests/test_warm_lane_disk_guard.py": {"patch_targets": [], "private_reads": 4},
