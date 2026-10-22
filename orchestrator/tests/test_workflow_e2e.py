@@ -51,6 +51,7 @@ from orchestrator.git_ops import AdvanceOutcome, GitOps, _run
 from orchestrator.scheduler import BlastRadiusResult, TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import (
+    PublishedStewardOutcome,
     StewardBudgetExhausted,
     StewardInterrupted,
     StewardReescalatedL1,
@@ -1581,9 +1582,10 @@ def _make_dismissing_steward(queue: EscalationQueue, task_id: str) -> type:
             )
             queue.submit(l1)
             if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardReescalatedL1(esc_id=l1.id),
-                )
+                for esc in pending:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id, StewardReescalatedL1(esc_id=l1.id),
+                    ))
 
         async def stop(self) -> None:
             pass
@@ -1634,13 +1636,16 @@ def _make_resolve_then_dismiss_chained_steward(
             # StewardResolved for the workflow's own L0 (steward.py:563)
             # BEFORE it ever chains a follow-on escalation of its own — so
             # the channel must carry [StewardResolved, StewardReescalatedL1],
-            # not just the trailing re-escalation.
+            # not just the trailing re-escalation — each tagged with the L0 it
+            # is about, as the real producer tags it.
             if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(
-                        resolution_text='Resolved by FakeSteward (workflow L0)',
-                    ),
-                )
+                for esc in pending:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardResolved(
+                            resolution_text='Resolved by FakeSteward (workflow L0)',
+                        ),
+                    ))
             chained = Escalation(
                 id=queue.make_id(task_id),
                 task_id=task_id,
@@ -1669,9 +1674,9 @@ def _make_resolve_then_dismiss_chained_steward(
             )
             queue.submit(l1)
             if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardReescalatedL1(esc_id=l1.id),
-                )
+                self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                    chained.id, StewardReescalatedL1(esc_id=l1.id),
+                ))
 
         async def stop(self) -> None:
             pass
@@ -5486,9 +5491,10 @@ def _make_l1_escalating_steward(
             )
             queue.submit(l1)
             if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardReescalatedL1(esc_id=l1.id),
-                )
+                for esc in pending:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id, StewardReescalatedL1(esc_id=l1.id),
+                    ))
 
         async def stop(self) -> None:
             pass
@@ -6912,9 +6918,11 @@ def _make_done_setting_steward(
                 done_provenance={'note': 'phantom-done regression test'},
             )
             if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(resolution_text='Implementation already shipped'),
-                )
+                for esc in pending:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardResolved(resolution_text='Implementation already shipped'),
+                    ))
 
         async def stop(self) -> None:
             pass

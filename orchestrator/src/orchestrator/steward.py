@@ -28,10 +28,11 @@ Lifecycle:
 The give-up contract is load-bearing for BOTH workflow waiters, which is why
 it lives here rather than in either consumer.  ``_mark_blocked`` →
 ``_await_steward_completion`` reads the published outcome off the in-process
-channel; ``run()``'s ESCALATED branch → ``_wait_for_resolution`` is
-escalation-queue-only and is woken ONLY by the dismissal (``resolve`` →
-``_resolve_callback`` → ``harness._on_escalation_resolved`` →
-``_escalation_events[task_id].set()``).  A new early return that publishes
+channel, where every outcome is tagged with the escalation it is about
+(``PublishedStewardOutcome``); ``run()``'s ESCALATED branch →
+``_wait_for_resolution`` is escalation-queue-only and is woken ONLY by the
+dismissal (``resolve`` → ``_resolve_callback`` →
+``harness._on_escalation_resolved`` → ``_escalation_events[task_id].set()``).  A new early return that publishes
 without dismissing is therefore invisible to the second waiter — it parks the
 workflow forever while this steward re-handles the record at loop speed, which
 is exactly what task 2248 shipped.
@@ -64,6 +65,7 @@ from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
     StewardBudgetExhausted,
     StewardInterrupted,
     StewardReescalatedL1,
@@ -229,7 +231,7 @@ class TaskSteward:
         # for stewards built without that wiring (most of this module's
         # unit tests, and any other caller) — _publish_outcome is a no-op
         # and the wip-gated guards below default to wip=False in that case.
-        self._outcome_channel: asyncio.Queue | None = None
+        self._outcome_channel: asyncio.Queue[PublishedStewardOutcome] | None = None
         self._wip_probe: Callable[[], Awaitable[bool]] | None = None
 
     # ------------------------------------------------------------------
@@ -243,10 +245,14 @@ class TaskSteward:
         )
         logger.info(f'Steward started for task {self.task_id}')
 
-    def set_outcome_channel(self, channel: asyncio.Queue) -> None:
+    def set_outcome_channel(
+        self, channel: asyncio.Queue[PublishedStewardOutcome],
+    ) -> None:
         """Register the in-process channel :meth:`_handle_escalation` publishes on.
 
-        Wired by :meth:`TaskWorkflow._ensure_steward_started`.  Left unset
+        Every publication is a :class:`PublishedStewardOutcome` tagged with the
+        escalation it is about.  Wired by
+        :meth:`TaskWorkflow._ensure_steward_started`.  Left unset
         (``None``) by every caller that does not need the typed outcome —
         :meth:`_publish_outcome` is then a no-op.
         """
@@ -262,8 +268,10 @@ class TaskSteward:
         """
         self._wip_probe = probe
 
-    def _publish_outcome(self, outcome: StewardOutcome) -> None:
-        """Put *outcome* on the registered channel; no-op when none is set.
+    def _publish_outcome(self, escalation_id: str, outcome: StewardOutcome) -> None:
+        """Put *outcome*, tagged with *escalation_id*, on the registered channel.
+
+        No-op when no channel is set.
 
         Synchronous (``put_nowait``, not ``await queue.put``) so it is safe
         to call from both async call sites (``_handle_escalation``) and sync
@@ -272,7 +280,9 @@ class TaskSteward:
         ``QueueFull``.
         """
         if self._outcome_channel is not None:
-            self._outcome_channel.put_nowait(outcome)
+            self._outcome_channel.put_nowait(
+                PublishedStewardOutcome(escalation_id, outcome),
+            )
 
     async def stop(self) -> None:
         """Cancel the steward loop and cleanup."""
@@ -765,7 +775,9 @@ class TaskSteward:
                 or result.output
                 or escalation.summary
             )
-            self._publish_outcome(StewardResolved(resolution_text=resolution_text))
+            self._publish_outcome(
+                escalation.id, StewardResolved(resolution_text=resolution_text),
+            )
 
     # ------------------------------------------------------------------
     # Session-aware invocation with cap-hit recovery
@@ -1304,9 +1316,10 @@ class TaskSteward:
                 f'resume-plan interruption'
             )
             self._publish_outcome(
+                escalation.id,
                 StewardResolved(
                     resolution_text=stored.resolution or escalation.summary,
-                )
+                ),
             )
             return
 
@@ -1315,7 +1328,7 @@ class TaskSteward:
             f'({outcome.reason}) with WIP present — dismissed the L0 and '
             f'published a resume-plan interruption (no L1 filed)'
         )
-        self._publish_outcome(outcome)
+        self._publish_outcome(escalation.id, outcome)
 
     # ------------------------------------------------------------------
     # Auto-escalation to level-1 (human)
@@ -1374,6 +1387,7 @@ class TaskSteward:
             f'to level 1: {reason}'
         )
         self._publish_outcome(
+            escalation.id,
             outcome if outcome is not None else StewardReescalatedL1(esc_id=reesc.id),
         )
 

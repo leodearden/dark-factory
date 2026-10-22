@@ -189,6 +189,7 @@ from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     CancellationScope,
     IllegalTransition,
     OnTerminalEntry,
+    PublishedStewardOutcome,
     RequeueKind,
     StewardBudgetExhausted,
     StewardInterrupted,
@@ -1377,7 +1378,7 @@ class TaskWorkflow:
         # lazily in _ensure_steward_started and registered on the steward via
         # set_outcome_channel — replaces the escalation-queue forensic re-read
         # that _mark_blocked used to perform.
-        self._steward_outcome_channel: asyncio.Queue | None = None
+        self._steward_outcome_channel: asyncio.Queue[PublishedStewardOutcome] | None = None
         self._config_dir: TaskConfigDir | None = None
         self._old_plan_base: str | None = None  # base commit from prior session (for revalidation diff)
         # Base commit for the current run's worktree (set in run() right after
@@ -18438,7 +18439,7 @@ class TaskWorkflow:
         channel = self._steward_outcome_channel
         if channel is None:
             return None
-        drained: list[StewardOutcome] = []
+        drained: list[PublishedStewardOutcome] = []
         while True:
             try:
                 drained.append(channel.get_nowait())
@@ -18446,7 +18447,7 @@ class TaskWorkflow:
                 break
         if not drained:
             return None
-        most_severe = max(drained, key=self._outcome_severity)
+        most_severe = max((p.outcome for p in drained), key=self._outcome_severity)
         logger.info(
             'Task %s: drained %d unconsumed steward outcome(s) after the '
             'ESCALATED wait (most severe: %r) — the escalation-queue state '
@@ -18576,13 +18577,13 @@ class TaskWorkflow:
                         with contextlib.suppress(asyncio.CancelledError):
                             await t
             if get_wait in done:
-                most_severe: StewardOutcome = get_wait.result()
+                most_severe: StewardOutcome = get_wait.result().outcome
                 # Drain any further outcomes the serial steward already
                 # published in this same grace window and reduce to the
                 # most severe (review fix — see class docstring above).
                 while True:
                     try:
-                        next_outcome: StewardOutcome = channel.get_nowait()
+                        next_outcome: StewardOutcome = channel.get_nowait().outcome
                     except asyncio.QueueEmpty:
                         break
                     if self._outcome_severity(next_outcome) > self._outcome_severity(most_severe):

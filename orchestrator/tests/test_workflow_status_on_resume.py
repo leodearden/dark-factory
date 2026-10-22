@@ -43,7 +43,7 @@ from orchestrator.workflow import (
     WorkflowState,
     _PriorImplStatus,
 )
-from orchestrator.workflow_types import StewardResolved
+from orchestrator.workflow_types import PublishedStewardOutcome, StewardResolved
 
 # ---------------------------------------------------------------------------
 # Fixtures (kept local — these tests don't share runtime with test_workflow_e2e)
@@ -240,10 +240,11 @@ def _make_granting_steward(
                     esc.id, 'Granted scope expansion',
                     resolved_by='fake-steward', granted_files=granted_files,
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(resolution_text='Granted scope expansion'),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardResolved(resolution_text='Granted scope expansion'),
+                    ))
 
         async def stop(self) -> None:
             pass

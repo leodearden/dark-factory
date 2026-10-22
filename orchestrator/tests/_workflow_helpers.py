@@ -52,7 +52,7 @@ from orchestrator.scheduler import (
 )
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow
-from orchestrator.workflow_types import StewardResolved
+from orchestrator.workflow_types import PublishedStewardOutcome, StewardResolved
 
 
 class FakeMcp:
@@ -583,10 +583,11 @@ def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
                 queue.resolve(
                     esc.id, 'Resolved by FakeSteward', resolved_by='fake-steward',
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(resolution_text='Resolved by FakeSteward'),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardResolved(resolution_text='Resolved by FakeSteward'),
+                    ))
 
         async def stop(self) -> None:
             pass
@@ -621,9 +622,10 @@ def _make_status_setting_steward(
                 queue.resolve(esc.id, 'Resolved', resolved_by='fake-steward')
             await scheduler.set_task_status(task_id, final_status)
             if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(resolution_text='Resolved'),
-                )
+                for esc in pending:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id, StewardResolved(resolution_text='Resolved'),
+                    ))
 
         async def stop(self) -> None:
             pass

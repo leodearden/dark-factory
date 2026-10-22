@@ -24,6 +24,7 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
     StewardBudgetExhausted,
     StewardInterrupted,
     StewardOutcome,
@@ -233,9 +234,9 @@ class TestAwaitStewardCompletionOverrideDismissesOrphanL0:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardInterrupted('attempt_cap', wip_commits_present=True),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-orig-0', StewardInterrupted('attempt_cap', wip_commits_present=True),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
@@ -269,9 +270,9 @@ class TestAwaitStewardCompletionOverrideDismissesOrphanL0:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-orig-0', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)

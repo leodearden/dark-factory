@@ -45,6 +45,7 @@ __all__ = [
     "BlockDisposition",
     "CancellationScope",
     "IllegalTransition",
+    "PublishedStewardOutcome",
     "RequeueKind",
     "StewardBudgetExhausted",
     "classify_failure",
@@ -877,8 +878,10 @@ class StewardBudgetExhausted:
     """
 
 
-# The workflow↔steward RPC payload carried on the per-task in-process
-# asyncio.Queue (PRD §10 / Contract §8.1-8.2 SO-1, resolved decision D6).
+# The workflow↔steward RPC payload (PRD §10 / Contract §8.1-8.2 SO-1,
+# resolved decision D6): what TaskWorkflow._await_steward_completion returns.
+# The per-task in-process asyncio.Queue carries it wrapped in a
+# PublishedStewardOutcome envelope naming the escalation it is about.
 # A PEP-604 union (not an enum-with-payload) so every variant branches
 # uniformly via isinstance/match in TaskWorkflow._mark_blocked's single
 # routing choke point.
@@ -889,6 +892,15 @@ StewardOutcome = (
     | StewardInterrupted
     | StewardBudgetExhausted
 )
+
+
+@dataclass(frozen=True)
+class PublishedStewardOutcome:
+    """A StewardOutcome as published by TaskSteward about the level-0
+    escalation ``escalation_id`` it handled."""
+
+    escalation_id: str
+    outcome: StewardOutcome
 
 
 class IllegalTransition(Exception):
