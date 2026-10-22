@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.proc_group import SigkillDispatch
 
 # The one orchestrator symbol imported at module scope (the rest are imported
 # inside each test, as this file has always done): a `parametrize` decorator is
@@ -4917,6 +4918,27 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             f'spawned SURVIVES — the caller must be able to learn that instead '
             f'of telling an operator the whole group is gone (task 4252 reviewer '
             f'finding): {result!r}'
+        )
+
+
+class TestProcessTeardownFromDispatch:
+    """ProcessTeardown.from_dispatch renders shared.proc_group's SigkillDispatch."""
+
+    @pytest.mark.parametrize(
+        ('dispatch', 'expected'),
+        [
+            (SigkillDispatch.GROUP_KILLED, ProcessTeardown.GROUP_KILLED),
+            (SigkillDispatch.DIRECT_KILLED, ProcessTeardown.DIRECT_KILLED),
+            (SigkillDispatch.NOT_SIGNALLED, ProcessTeardown.NOT_SIGNALLED),
+        ],
+    )
+    def test_maps_each_dispatch_to_its_namesake(self, dispatch, expected):
+        assert ProcessTeardown.from_dispatch(dispatch) is expected
+
+    def test_the_mapping_is_a_bijection(self):
+        assert len(SigkillDispatch) == len(ProcessTeardown)
+        assert {ProcessTeardown.from_dispatch(d) for d in SigkillDispatch} == set(
+            ProcessTeardown
         )
 
 
