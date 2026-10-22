@@ -306,37 +306,77 @@ class TestHarnessRestartPersistence:
     """Tests for restart-time rehydration of persisted scheduler pause state."""
 
     @staticmethod
+    def _seeder(tmp_path: Path) -> tuple[RunStore, Path]:
+        db_dir = tmp_path / 'data' / 'orchestrator'
+        db_dir.mkdir(parents=True, exist_ok=True)
+        db_path = db_dir / 'runs.db'
+        return RunStore(db_path), db_path
+
+    @staticmethod
+    def _harness_over(tmp_path: Path, seeder: RunStore, threshold: float) -> Harness:
+        config = OrchestratorConfig(project_root=tmp_path, digest_ewa_threshold=threshold)
+        harness = Harness(config)
+        harness._run_store = seeder
+        harness._run_id = 'new-run-id'
+        harness.event_store = EventStore(tmp_path / 'events.db', 'new-run-id')
+        return harness
+
+    @classmethod
     def _seed_and_load(
+        cls,
         tmp_path: Path,
         *,
         reason: str,
         ewa_value: float | None,
+        pause_class: PauseClass,
         threshold: float = 24.6,
     ) -> tuple[Harness, RunStore, Path]:
-        """Seed a real runs.db pause row, then run the restore path over it."""
-        db_dir = tmp_path / 'data' / 'orchestrator'
-        db_dir.mkdir(parents=True, exist_ok=True)
-        db_path = db_dir / 'runs.db'
-        seeder = RunStore(db_path)
+        """Seed a real runs.db pause row, then build a Harness over it."""
+        seeder, db_path = cls._seeder(tmp_path)
         seeder.save_scheduler_pause(
             project_id='dark_factory',
             reason=reason,
             pause_at_iso='2026-05-13T22:00:00+00:00',
             set_by_run_id='prior-run-id',
             ewa_value=ewa_value,
+            pause_class=pause_class,
         )
-        config = OrchestratorConfig(project_root=tmp_path, digest_ewa_threshold=threshold)
-        harness = Harness(config)
-        harness._run_store = seeder
-        harness._run_id = 'new-run-id'
-        harness.event_store = EventStore(tmp_path / 'events.db', 'new-run-id')
-        return harness, seeder, db_path
+        return cls._harness_over(tmp_path, seeder, threshold), seeder, db_path
+
+    @classmethod
+    def _seed_raw_and_load(
+        cls,
+        tmp_path: Path,
+        *,
+        reason: str,
+        ewa_value: float | None,
+        stored_class: str | None,
+        threshold: float = 24.6,
+    ) -> tuple[Harness, RunStore]:
+        """Seed a row whose stored pause_class bypasses the typed writer (NULL or unknown)."""
+        seeder, db_path = cls._seeder(tmp_path)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                'INSERT INTO scheduler_state '
+                '(project_id, pause_reason, pause_at, set_by_run_id, ewa_value, pause_class) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (
+                    'dark_factory', reason, '2026-05-13T22:00:00+00:00',
+                    'prior-run-id', ewa_value, stored_class,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return cls._harness_over(tmp_path, seeder, threshold), seeder
 
     @pytest.mark.asyncio
     async def test_ewa_pause_still_tripped_is_reasserted(self, tmp_path: Path) -> None:
         """A restart whose stored EWA still exceeds the threshold re-asserts the halt."""
         harness, seeder, _ = self._seed_and_load(
-            tmp_path, reason='ewa_trip_73.5900', ewa_value=73.59, threshold=24.6,
+            tmp_path, reason='ewa_trip_73.5900', ewa_value=73.59,
+            pause_class=PauseClass.EWA_RATE, threshold=24.6,
         )
 
         await harness._load_persisted_scheduler_pause()
@@ -365,7 +405,8 @@ class TestHarnessRestartPersistence:
         process boundary, a halt whose stored predicate no longer holds.
         """
         harness, seeder, _ = self._seed_and_load(
-            tmp_path, reason='ewa_trip_73.5900', ewa_value=9.0, threshold=24.6,
+            tmp_path, reason='ewa_trip_73.5900', ewa_value=9.0,
+            pause_class=PauseClass.EWA_RATE, threshold=24.6,
         )
 
         await harness._load_persisted_scheduler_pause()
@@ -374,7 +415,7 @@ class TestHarnessRestartPersistence:
             'A halt whose predicate no longer holds must not be re-asserted'
         )
         assert harness._ewa_value == pytest.approx(9.0), (
-            'Restoration into live state is scoped to ewa_trip_ pauses, whose '
+            'Restoration into live state is scoped to ewa_rate holds, whose '
             f'stored value IS the live statistic; got {harness._ewa_value}'
         )
         assert seeder.load_scheduler_pause('dark_factory') is None, (
@@ -397,13 +438,14 @@ class TestHarnessRestartPersistence:
 
     @pytest.mark.asyncio
     async def test_pre_migration_row_restores_blind(self, tmp_path: Path) -> None:
-        """A NULL ewa_value on an ewa_trip_ reason restores the halt exactly as today.
+        """A NULL ewa_value on an ewa_rate hold restores the halt blind.
 
         Fail-safe toward KEEPING the halt when the predicate is unknowable,
         never toward releasing it.
         """
         harness, seeder, _ = self._seed_and_load(
-            tmp_path, reason='ewa_trip_73.5900', ewa_value=None, threshold=24.6,
+            tmp_path, reason='ewa_trip_73.5900', ewa_value=None,
+            pause_class=PauseClass.EWA_RATE, threshold=24.6,
         )
 
         await harness._load_persisted_scheduler_pause()
@@ -419,11 +461,12 @@ class TestHarnessRestartPersistence:
         """A park-stop pause is restored blind even with a low stored EWA.
 
         Honours task 3328's 'Non-5xx park-stop pauses NEVER auto-resume': the
-        predicate re-check is scoped strictly to ewa_trip_* reasons, the one
+        predicate re-check is scoped strictly to the ewa_rate class, the one
         pause class whose predicate is a stored scalar.
         """
         harness, seeder, _ = self._seed_and_load(
-            tmp_path, reason='park-stop: 5 blocked', ewa_value=9.0, threshold=24.6,
+            tmp_path, reason='park-stop: 5 blocked', ewa_value=9.0,
+            pause_class=PauseClass.PARK_STOP, threshold=24.6,
         )
 
         await harness._load_persisted_scheduler_pause()
@@ -433,8 +476,9 @@ class TestHarnessRestartPersistence:
         )
         assert seeder.load_scheduler_pause('dark_factory') is not None
         assert harness._restored_pause_reason == 'park-stop: 5 blocked'
+        assert harness.scheduler.pause_class is PauseClass.PARK_STOP
         assert harness._ewa_value == pytest.approx(0.0), (
-            'A non-ewa_trip row carries the EWA as forensic evidence only; it '
+            'A non-ewa_rate row carries the EWA as forensic evidence only; it '
             f'must never be seeded into live state. got {harness._ewa_value}'
         )
 
@@ -442,7 +486,7 @@ class TestHarnessRestartPersistence:
     async def test_non_ewa_pause_does_not_seed_live_ewa_value(self, tmp_path: Path) -> None:
         """A park-stop restore keeps the stored EWA as forensics, not live state.
 
-        For an ``ewa_trip_*`` row the stored scalar IS the live statistic, so
+        For an ewa_rate row the stored scalar IS the live statistic, so
         restoring it is correct.  For every other pause class it is forensic
         evidence about a value that never tripped anything — seeding it into
         ``_ewa_value`` turns a restart into a head start toward the threshold.
@@ -450,13 +494,14 @@ class TestHarnessRestartPersistence:
         WARNING log and the ``scheduler_pause_restored`` event payload.
         """
         harness, _, _ = self._seed_and_load(
-            tmp_path, reason='park-stop: 5 blocked', ewa_value=22.0, threshold=24.6,
+            tmp_path, reason='park-stop: 5 blocked', ewa_value=22.0,
+            pause_class=PauseClass.PARK_STOP, threshold=24.6,
         )
 
         await harness._load_persisted_scheduler_pause()
 
         assert harness._ewa_value == pytest.approx(0.0), (
-            'A non-ewa_trip pause row must not seed live EWA state; got '
+            'A non-ewa_rate pause row must not seed live EWA state; got '
             f'{harness._ewa_value}'
         )
         # The blind halt restore is unchanged for this pause class.
@@ -483,7 +528,7 @@ class TestHarnessRestartPersistence:
         """The end-to-end carryover: a park-stop restore + resume leaves EWA at 0.
 
         ``resume_scheduler`` deliberately resets ``_ewa_value`` only when the
-        prior pause reason starts with ``ewa_trip_`` (harness.py:14965), so a
+        cleared hold's class is ewa_rate (``Harness.resume_scheduler``), so a
         value seeded from a non-EWA row would never be cleared by an operator
         resume.  It would sit in live state as a head start toward the
         threshold and the next digest step with even a modest submission ratio
@@ -491,7 +536,8 @@ class TestHarnessRestartPersistence:
         to never seed it.
         """
         harness, _, _ = self._seed_and_load(
-            tmp_path, reason='park-stop: 5 blocked', ewa_value=22.0, threshold=24.6,
+            tmp_path, reason='park-stop: 5 blocked', ewa_value=22.0,
+            pause_class=PauseClass.PARK_STOP, threshold=24.6,
         )
 
         await harness._load_persisted_scheduler_pause()
@@ -499,7 +545,7 @@ class TestHarnessRestartPersistence:
 
         assert harness.scheduler.is_paused is False, 'The operator resume must take effect'
         assert harness._ewa_value == pytest.approx(0.0), (
-            'resume_scheduler resets _ewa_value only for ewa_trip_ pauses, so a '
+            'resume_scheduler resets _ewa_value only for ewa_rate holds, so a '
             'non-EWA restore must never have seeded it; got '
             f'{harness._ewa_value}'
         )
@@ -521,6 +567,7 @@ class TestHarnessRestartPersistence:
             reason='pre-restart park-stop',
             pause_at_iso='2026-05-13T22:00:00+00:00',
             set_by_run_id='prior-run-id',
+            pause_class=PauseClass.PARK_STOP,
         )
 
         # Build a fresh Harness (without calling run()) and inject the real RunStore.
@@ -539,6 +586,7 @@ class TestHarnessRestartPersistence:
         assert harness.scheduler.pause_reason == 'pre-restart park-stop', (
             f'Expected pause_reason "pre-restart park-stop"; got {harness.scheduler.pause_reason!r}'
         )
+        assert harness.scheduler.pause_class is PauseClass.PARK_STOP
 
         # Assert the persisted row was NOT re-written on restart: re-load from
         # disk and check every field still matches the seed values.  This is
@@ -552,6 +600,9 @@ class TestHarnessRestartPersistence:
             'set_by_run_id': 'prior-run-id',
             # Task 4559: the seed above omits ewa_value, so it reads back NULL.
             'ewa_value': None,
+            'pause_class': PauseClass.PARK_STOP,
+            'hold_owner': None,
+            'expires_at': None,
         }, (
             f'Persisted row must be unchanged after restart load (no re-write '
             f'with new run_id); got {reloaded!r}'
@@ -577,6 +628,7 @@ class TestHarnessRestartPersistence:
             reason='pre-restart park-stop',
             pause_at_iso='2026-05-13T22:00:00+00:00',
             set_by_run_id='prior-run-007',
+            pause_class=PauseClass.PARK_STOP,
         )
 
         # Build a Harness with a real EventStore so we can query emitted events.
@@ -609,6 +661,69 @@ class TestHarnessRestartPersistence:
         assert data['restored_from_run_id'] == 'prior-run-007', (
             f'Expected restored_from_run_id "prior-run-007"; got {data["restored_from_run_id"]!r}'
         )
+        assert data['pause_class'] == 'park_stop'
+
+    @pytest.mark.asyncio
+    async def test_ewa_rate_class_is_retested_whatever_its_reason(self, tmp_path: Path) -> None:
+        """The class, not the reason prefix, decides the restart re-test (INV-1)."""
+        harness, seeder, _ = self._seed_and_load(
+            tmp_path, reason='digest halt', ewa_value=9.0,
+            pause_class=PauseClass.EWA_RATE, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness.scheduler.is_paused is False
+        assert seeder.load_scheduler_pause('dark_factory') is None
+
+    @pytest.mark.asyncio
+    async def test_legacy_null_class_row_reasserts_as_operator(self, tmp_path: Path) -> None:
+        """A row written before pause_class existed keeps its halt (PRD open question 3)."""
+        harness, seeder = self._seed_raw_and_load(
+            tmp_path, reason='ewa_trip_73.5900', ewa_value=9.0, stored_class=None,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness.scheduler.is_paused is True
+        assert harness.scheduler.pause_class is PauseClass.OPERATOR
+        assert harness._ewa_value == pytest.approx(0.0)
+        assert harness._restored_pause_reason == 'ewa_trip_73.5900'
+        assert seeder.load_scheduler_pause('dark_factory') is not None
+        assert harness.event_store is not None
+        [row] = _query_events(harness.event_store, 'scheduler_pause_restored')
+        data = json.loads(row['data'])
+        assert data['pause_class'] == 'operator'
+        assert data['reasserted'] is True
+
+    @pytest.mark.asyncio
+    async def test_unrecognised_stored_class_reasserts_as_operator(self, tmp_path: Path) -> None:
+        harness, _ = self._seed_raw_and_load(
+            tmp_path, reason='ewa_trip_73.5900', ewa_value=9.0, stored_class='bogus',
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness.scheduler.is_paused is True
+        assert harness.scheduler.pause_class is PauseClass.OPERATOR
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'pause_class', [PauseClass.COST_CEILING, PauseClass.WATCHER_GUARD],
+    )
+    async def test_reassert_classes_restore_blind_with_their_own_class(
+        self, tmp_path: Path, pause_class: PauseClass,
+    ) -> None:
+        harness, seeder, _ = self._seed_and_load(
+            tmp_path, reason='held', ewa_value=9.0, pause_class=pause_class,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness.scheduler.is_paused is True
+        assert harness.scheduler.pause_class is pause_class
+        assert harness._ewa_value == pytest.approx(0.0)
+        assert seeder.load_scheduler_pause('dark_factory') is not None
 
 
 class TestParkStopE2E:
@@ -2391,9 +2506,9 @@ class TestHarnessEwaTrip:
     async def test_non_ewa_pause_is_not_refreshed(
         self, tmp_path: Path, _cost_store_factory
     ) -> None:
-        """A park-stop halt keeps its trip-time evidence — the refresh is ewa_trip_ only.
+        """A park-stop halt keeps its trip-time evidence — the refresh is ewa_rate only.
 
-        Same scoping as the restore-time predicate: ``ewa_trip_`` is the one
+        Same scoping as the restore-time predicate: ewa_rate is the one
         pause class whose stored scalar IS the live statistic.  For every other
         class the value is forensic evidence ABOUT that pause, and overwriting
         it with an unrelated later EWA would destroy it.
@@ -2416,6 +2531,50 @@ class TestHarnessEwaTrip:
         harness._last_digest_submit_count = 0
 
         await harness._maybe_write_digest()
+
+        mock_run_store.refresh_scheduler_pause_ewa.assert_not_called()
+
+    async def _drain_step_under_hold(
+        self, tmp_path: Path, cost_store_factory, reason: str, pause_class: PauseClass,
+    ) -> MagicMock:
+        """Hold a pause, then run one pure-drain digest step; return the RunStore spy."""
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=24.6,
+            digest_ewa_alpha=0.3,
+        )
+        harness.cost_store = await cost_store_factory()
+        harness._ewa_value = 73.59
+        await harness.pause_scheduler(reason, pause_class)
+        mock_run_store.reset_mock()
+        harness._escalation_event_count = 10
+        harness._last_digest_event_count = 0
+        harness._escalation_submit_count = 0
+        harness._last_digest_submit_count = 0
+
+        await harness._maybe_write_digest()
+
+        return mock_run_store
+
+    @pytest.mark.asyncio
+    async def test_held_ewa_rate_hold_is_refreshed_whatever_its_reason(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        mock_run_store = await self._drain_step_under_hold(
+            tmp_path, _cost_store_factory, 'digest halt', PauseClass.EWA_RATE,
+        )
+
+        mock_run_store.refresh_scheduler_pause_ewa.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_operator_hold_with_an_ewa_reason_is_not_refreshed(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        mock_run_store = await self._drain_step_under_hold(
+            tmp_path, _cost_store_factory, 'ewa_trip_73.5900', PauseClass.OPERATOR,
+        )
 
         mock_run_store.refresh_scheduler_pause_ewa.assert_not_called()
 
