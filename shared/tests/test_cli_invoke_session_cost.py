@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -184,7 +184,7 @@ async def _retry(
     return invoke_fn
 
 
-def _second_call_kwargs(invoke_fn: AsyncMock) -> dict[str, Any]:
+def _second_call_kwargs(invoke_fn: AsyncMock) -> Mapping[str, Any]:
     assert invoke_fn.await_count == 2
     return invoke_fn.call_args_list[1].kwargs
 
