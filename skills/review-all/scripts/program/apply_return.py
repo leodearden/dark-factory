@@ -317,20 +317,6 @@ def _item_rejections(ret: state.PrdReturn, snapshot: home_writer.Snapshot) -> li
     )]
 
 
-def _prd_path_rejections(
-    ret: state.PrdReturn, snapshot: home_writer.Snapshot, target: _Target,
-) -> list[state.Rejection]:
-    if target.amendment is None or ret.pass_ not in _SEAT_STATUS:
-        return []
-    recorded = state.stream_views(snapshot.program, snapshot.ledger)[ret.stream].prd_path
-    if ret.prd_path == recorded:
-        return []
-    return [state.Rejection(
-        'prd_path', state.RejectionClass.CONTRADICTION,
-        f'{ret.prd_path!r} is not {ret.stream}\'s recorded PRD {recorded!r}; an amendment may not move it',
-    )]
-
-
 def _checked_return(
     home: state.Home, inbox_file: Path, raw: bytes, snapshot: home_writer.Snapshot,
     store: state.StoreView,
@@ -378,7 +364,7 @@ def plan_application(
     target = _application_target(home, returns_file, raw, amend=amend)
     if isinstance(target, Refused):
         return target
-    rejections = _item_rejections(ret, snapshot) + _prd_path_rejections(ret, snapshot, target)
+    rejections = _item_rejections(ret, snapshot)
     if rejections:
         return _refused(rejections)
     return_name = _home_relative(home, target.path)

@@ -415,6 +415,25 @@ def test_an_amendment_may_not_move_the_streams_prd(env: ProgramEnv) -> None:
     assert env.snapshot() == before
 
 
+def _moved_with_adopted_tasks(data: dict[str, Any]) -> None:
+    data['prd_path'] = 'plans/elsewhere-prd.md'
+    for filed in data['filed']:
+        filed['adopted'] = True
+
+
+def test_a_decompose_may_not_move_the_streams_prd(env: ProgramEnv) -> None:
+    _applied(env, 'S1.author.json')
+    inbox_file = _inbox_variant(env, 'S1.decompose.json', _moved_with_adopted_tasks)
+    before = env.snapshot()
+    for args in (('--check', inbox_file), (inbox_file,)):
+        proc = env.run('apply_return.py', *args)
+        assert proc.returncode == 1, _output(proc)
+        (moved,) = _contradictions(_output(proc))
+        assert moved.startswith('contradiction: prd_path:')
+        assert 'plans/elsewhere-prd.md' in moved and S1_PRD in moved
+    assert env.snapshot() == before
+
+
 def _with_session_ruling(data: dict[str, Any]) -> None:
     data['rulings_in_session'] = [{
         'id': 'R7', 'question': 'Does S2 keep its own retry budget?', 'ruling': 'it does',

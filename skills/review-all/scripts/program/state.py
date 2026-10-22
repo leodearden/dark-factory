@@ -1754,7 +1754,7 @@ def _check_form(data: Any, program: Program) -> tuple[list[Rejection], PrdReturn
 def validate_return(
     text: str, *, program: Program, ledger: Sequence[Mapping[str, Any]], store: StoreView,
 ) -> ReturnCheck:
-    """Validate one return block: form first; a form-valid return is then checked against the store."""
+    """Validate one return block: form first, then against the ledger, and a decompose against the store."""
     try:
         data = json.loads(text)
     except ValueError as bad:
@@ -1763,9 +1763,11 @@ def validate_return(
     rejections, value = _check_form(data, program)
     if value is None:
         return ReturnCheck(tuple(rejections), None, None)
-    if value.pass_ is not Pass.DECOMPOSE:
-        return ReturnCheck((), value, None)
-    contradictions, measured_at = _check_store(value, stream_views(program, ledger), store)
+    views = stream_views(program, ledger)
+    contradictions, measured_at = _moved_prd_rejections(value, views[value.stream]), None
+    if value.pass_ is Pass.DECOMPOSE:
+        found, measured_at = _check_store(value, views, store)
+        contradictions += found
     return ReturnCheck(tuple(contradictions), None if contradictions else value, measured_at)
 
 
@@ -1797,6 +1799,16 @@ def _contradiction(field: str, reason: str) -> Rejection:
 def _authored_rejections(view: StreamView) -> list[Rejection]:
     reason = unauthored_reason(view)
     return [] if reason is None else [_contradiction('pass', reason)]
+
+
+def _moved_prd_rejections(ret: PrdReturn, view: StreamView) -> list[Rejection]:
+    """Once a stream is authored its PRD path is fixed: no later return may move it."""
+    if not view.authored or ret.prd_path is None or ret.prd_path == view.prd_path:
+        return []
+    return [_contradiction(
+        'prd_path', f'{ret.prd_path!r} is not {ret.stream}\'s recorded PRD {view.prd_path!r}; '
+        'a return may not move it',
+    )]
 
 
 def _filed_key_rejections(ret: PrdReturn, view: StreamView) -> list[Rejection]:
