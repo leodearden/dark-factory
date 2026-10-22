@@ -299,19 +299,22 @@ class TestAwaitStewardCompletionIsEscalationScoped:
     """
 
     @staticmethod
-    def _scoped_workflow(tmp_path: Path, *, timeout: float) -> TaskWorkflow:
+    def _scoped_workflow(
+        tmp_path: Path, *, timeout: float,
+    ) -> tuple[TaskWorkflow, asyncio.Queue[PublishedStewardOutcome]]:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = timeout
         wf.escalation_queue = None
-        wf._steward_outcome_channel = asyncio.Queue()
+        channel: asyncio.Queue[PublishedStewardOutcome] = asyncio.Queue()
+        wf._steward_outcome_channel = channel
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
-        return wf
+        return wf, channel
 
     async def test_foreign_outcome_alone_does_not_end_the_wait(
         self, tmp_path: Path,
     ):
-        wf = self._scoped_workflow(tmp_path, timeout=0.2)
-        wf._steward_outcome_channel.put_nowait(
+        wf, channel = self._scoped_workflow(tmp_path, timeout=0.2)
+        channel.put_nowait(
             PublishedStewardOutcome('esc-A', StewardResolved('older fixed')),
         )
         wf._worktree_has_wip_commits = AsyncMock(return_value=False)
@@ -321,15 +324,14 @@ class TestAwaitStewardCompletionIsEscalationScoped:
         )
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
-        assert wf._steward_outcome_channel.empty(), (
+        assert channel.empty(), (
             'the foreign outcome must be consumed and discarded, not re-buffered'
         )
 
     async def test_own_outcome_after_a_foreign_one_ends_the_wait(
         self, tmp_path: Path,
     ):
-        wf = self._scoped_workflow(tmp_path, timeout=5.0)
-        channel = wf._steward_outcome_channel
+        wf, channel = self._scoped_workflow(tmp_path, timeout=5.0)
         channel.put_nowait(
             PublishedStewardOutcome('esc-A', StewardResolved('older fixed')),
         )
@@ -350,11 +352,11 @@ class TestAwaitStewardCompletionIsEscalationScoped:
     async def test_burst_reduction_ignores_foreign_outcomes(
         self, tmp_path: Path,
     ):
-        wf = self._scoped_workflow(tmp_path, timeout=5.0)
-        wf._steward_outcome_channel.put_nowait(
+        wf, channel = self._scoped_workflow(tmp_path, timeout=5.0)
+        channel.put_nowait(
             PublishedStewardOutcome('esc-B', StewardResolved('mine')),
         )
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+        channel.put_nowait(PublishedStewardOutcome(
             'esc-A', StewardInterrupted('timeout', wip_commits_present=False),
         ))
 
@@ -369,8 +371,8 @@ class TestAwaitStewardCompletionIsEscalationScoped:
     async def test_unscoped_wait_accepts_any_publication(
         self, tmp_path: Path,
     ):
-        wf = self._scoped_workflow(tmp_path, timeout=5.0)
-        wf._steward_outcome_channel.put_nowait(
+        wf, channel = self._scoped_workflow(tmp_path, timeout=5.0)
+        channel.put_nowait(
             PublishedStewardOutcome('esc-A', StewardResolved('x')),
         )
 
