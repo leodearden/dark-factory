@@ -292,6 +292,22 @@ class TestForeignTagKeysAndSpelling:
         filtered = _filter([_result('1', 'Fact.', metadata={'project_id': 'reify'})])
         assert (filtered.kept, filtered.dropped) == ((), 1)
 
+    @pytest.mark.parametrize(('raw', 'own'), [
+        ('Know-Live', False),
+        ('know_live', False),
+        ('dark--factory', False),
+        ('Dark_Factory', True),
+        ('  dark_factory  ', True),
+        ('df', False),
+        ('reify', False),
+    ])
+    def test_own_project_is_fused_memorys_project_id_rule(self, raw, own):
+        filtered = filter_foreign_project_results(
+            [_result('1', 'Fact.', metadata={'project_id': raw})], 'dark-factory',
+        )
+
+        assert _ids(filtered.kept) == (['1'] if own else [])
+
     def test_non_string_tag_is_treated_as_untagged(self):
         filtered = _filter([_result('1', 'Fact.', metadata={'project_id': 123})])
 

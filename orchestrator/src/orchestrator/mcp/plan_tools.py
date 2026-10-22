@@ -1958,9 +1958,6 @@ def _mark_step_committed(
 # the functions), so a test that substitutes either one still steers the sink
 # a `create_server` already built.
 
-#: Where the queue lives under project_root — see ``markup_sink``.
-_MARKUP_QUEUE_DIRNAME = markup_sink.MARKUP_QUEUE_DIRNAME
-
 #: Filed-by attribution. Names the GUARD, not the leaking agent.
 _MARKUP_AGENT_ROLE = 'plan-tools-markup-guard'
 

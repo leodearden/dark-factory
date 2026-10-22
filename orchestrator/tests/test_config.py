@@ -10,6 +10,7 @@ from typing import Any, cast
 import pytest
 import yaml
 from pydantic import ValidationError
+from shared.project_id import project_id_for_root
 
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.config import (
@@ -290,7 +291,7 @@ class TestDefaults:
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = OrchestratorConfig()
         assert config.fused_memory.url == 'http://localhost:8002'
-        assert config.fused_memory.project_id == 'dark_factory'
+        assert config.fused_memory.project_id == project_id_for_root(tmp_path)
         assert config.fused_memory.config_path == 'fused-memory/config/config.yaml'
         # server_command must contain '--project' followed by 'fused-memory' (no ../)
         cmd = config.fused_memory.server_command

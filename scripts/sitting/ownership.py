@@ -29,8 +29,8 @@ from orchestrator.session_registry import (
     RESULT_FILENAME,
     TERMINAL_STATUSES,
     SessionRecord,
-    normalize_project_token,
 )
+from shared.project_id import fold_project_token
 from shared.task_deferral import CarriedByDeferral, InvalidRecord, parse_record
 from shared.task_statuses import TaskStatus
 from sitting.inventory import ItemKey, OpenItem, Shortfall, cited_ids, parse_stamp
@@ -130,7 +130,7 @@ def index_sessions(sessions_root: Path) -> SessionIndex:
         if record.escalation_id:
             by_escalation[record.escalation_id].append(session)
         if record.task_id:
-            by_task[(normalize_project_token(record.project), str(record.task_id))].append(session)
+            by_task[(fold_project_token(record.project), str(record.task_id))].append(session)
     return SessionIndex(
         root, True,
         MappingProxyType({key: tuple(found) for key, found in by_escalation.items()}),
@@ -392,7 +392,7 @@ def _read_outcome(session: IndexedSession) -> str | None:
 
 
 def _same_project(session: IndexedSession, item: OpenItem) -> bool:
-    return normalize_project_token(session.record.project) in ('', item.project)
+    return fold_project_token(session.record.project) in ('', item.project)
 
 
 def _started_at_or_after(session: IndexedSession, filed: datetime | None) -> bool:
