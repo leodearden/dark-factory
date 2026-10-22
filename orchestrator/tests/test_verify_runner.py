@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, ClassVar
@@ -14,7 +15,7 @@ from _gate_fixtures import gate_argv, gated_remote_runner
 from _orch_helpers import pydantic_spec, wait_responsive
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.event_store import EventType
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     HEARTBEAT_STOP_JOIN_SECS,
@@ -23,6 +24,7 @@ from orchestrator.verify_runner import (
     UnscopedTypecheckSpec,
     VerifyCommand,
     VerifyRunner,
+    VerifyRunnerPool,
     result_from_dict,
     result_from_json,
     result_to_dict,
@@ -1673,6 +1675,49 @@ class TestDispatchChainItems:
         data = kwargs['data']
         assert data['runner'] == 'local'      # the fallback ran
         assert data['chain_items'] == 7       # ...and telemetry survived it
+
+
+@pytest.mark.asyncio
+class TestDispatchDurationWiring:
+    """The persisted merge_verify payload's ``duration_ms`` is the runner's real wall time.
+
+    It rides in ``data`` only; the events.duration_ms column stays NULL, so
+    scripts/merge-deep-canary-predicate.sh reads its verify_p90 from here.
+    """
+
+    async def test_persisted_merge_verify_payload_carries_the_runner_wall_time(self, tmp_path):
+        async def _slow_pass(*_args, **_kwargs):
+            await asyncio.sleep(0.2)
+            return _make_pass_result()
+
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.is_local = True
+        fake_runner.run_merge_verify = AsyncMock(side_effect=_slow_pass)
+        db_path = tmp_path / 'runs.db'
+        pool = VerifyRunnerPool(
+            [fake_runner],
+            event_store=EventStore(db_path, 'run-duration'),
+            task_id='t-dur',
+        )
+
+        t0 = time.monotonic()
+        await pool.dispatch('sha-dur', _make_spec(), chain_items=2)
+        outer_ms = (time.monotonic() - t0) * 1000
+
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT data, duration_ms FROM events WHERE event_type = 'merge_verify'"
+            ).fetchall()
+        finally:
+            conn.close()
+        assert len(rows) == 1, rows
+        (data, duration_column), = rows
+        assert duration_column is None, rows
+        duration_ms = json.loads(data)['duration_ms']
+        assert isinstance(duration_ms, int) and not isinstance(duration_ms, bool), duration_ms
+        assert 150 <= duration_ms <= outer_ms + 1, (duration_ms, outer_ms)
 
 
 # ---------------------------------------------------------------------------
