@@ -23,6 +23,10 @@ DEFAULT_BY = 'apply_return.py'
 
 _Entry = tuple[state.LedgerOp, dict[str, Any]]
 _StoreFactory = Callable[[state.Program], state.StoreView]
+_ReaderFactory = Callable[[state.Program], state.StoreReader]
+
+DEGENERATE_BYTES = 100
+LOST_WITH_THE_RETURN = ('open_questions', 'xrefs', 'lead_actions', 'moves')
 
 
 class RefusalKind(enum.StrEnum):
@@ -33,8 +37,10 @@ class RefusalKind(enum.StrEnum):
 
 @dataclass(frozen=True)
 class Applied:
+    """What was (or, from ``check``, would be) appended; ``returns_file`` is None for a reconstruction."""
+
     stem: str
-    returns_file: Path
+    returns_file: Path | None
     ledger: tuple[dict[str, Any], ...]
     rulings: tuple[dict[str, Any], ...]
     digest: str
@@ -418,8 +424,9 @@ def apply(
         )
         if isinstance(outcome, Applied):
             home_writer.append(home, home_writer.Lines(outcome.ledger, outcome.rulings))
-            outcome.returns_file.parent.mkdir(exist_ok=True)
-            os.replace(inbox_file, outcome.returns_file)
+            if outcome.returns_file is not None:
+                outcome.returns_file.parent.mkdir(exist_ok=True)
+                os.replace(inbox_file, outcome.returns_file)
     return outcome
 
 
@@ -431,18 +438,192 @@ def check(inbox_file: Path, *, store_factory: _StoreFactory = state.open_reader)
     )
 
 
+def degeneracy(inbox_file: Path) -> str | None:
+    """Why *inbox_file* is no usable return (absent, under DEGENERATE_BYTES, unparsable), else None."""
+    if not inbox_file.exists():
+        return 'absent'
+    raw = inbox_file.read_bytes()
+    if len(raw) < DEGENERATE_BYTES:
+        return f'{len(raw)} bytes, under {DEGENERATE_BYTES}'
+    try:
+        data = json.loads(raw)
+    except ValueError as bad:
+        return f'does not parse: {bad}'
+    return None if isinstance(data, dict) else 'is not a JSON object'
+
+
+def _unknown_stream(snapshot: home_writer.Snapshot, home: state.Home, stream: str) -> Refused | None:
+    program = snapshot.program
+    if stream in program.stream_ids:
+        return None
+    return _refused([state.Rejection(
+        'stream', state.RejectionClass.FORM,
+        f'{stream!r} is no stream of {program.run_id}: {list(program.stream_ids)}',
+    )])
+
+
+def _unauthored_stream(snapshot: home_writer.Snapshot, home: state.Home, stream: str) -> Refused | None:
+    if state.stream_views(snapshot.program, snapshot.ledger)[stream].authored:
+        return None
+    return _refused([state.Rejection(
+        'stream', state.RejectionClass.CONTRADICTION,
+        f'{stream} author return is not applied: the ledger has no stream_status authored line '
+        f'for {stream}',
+    )])
+
+
+def _decomposed_stream(snapshot: home_writer.Snapshot, home: state.Home, stream: str) -> Refused | None:
+    decomposed = [
+        line['seq'] for line in snapshot.ledger
+        if line['op'] == state.LedgerOp.STREAM_STATUS and line['stream'] == stream
+        and line['status'] == state.StreamStatus.DECOMPOSED
+    ]
+    if not decomposed:
+        return None
+    return Refused(RefusalKind.APPLICATION, (
+        f'{stream} is already decomposed per the ledger (seq {decomposed[0]})',))
+
+
+def _usable_inbox(snapshot: home_writer.Snapshot, home: state.Home, stream: str) -> Refused | None:
+    inbox_file = home.inbox_file(stream, state.Pass.DECOMPOSE)
+    if degeneracy(inbox_file) is not None:
+        return None
+    return Refused(RefusalKind.APPLICATION, (
+        f'{_home_relative(home, inbox_file)} holds a usable return; apply it: '
+        f'apply_return.py {inbox_file}',))
+
+
+_FROM_STORE_REFUSALS = (_unknown_stream, _unauthored_stream, _decomposed_stream, _usable_inbox)
+
+
+def _seam_wait(row: state.TaskRow) -> Mapping[str, Any]:
+    wait = row.metadata.get(state.SEAM_WAIT_KEYS.key)
+    return wait if isinstance(wait, Mapping) else {}
+
+
+def _is_held(row: state.TaskRow) -> bool:
+    return (state.SEAM_WAIT_KEYS.key in row.metadata
+            and state.SEAM_RELEASED_KEYS.key not in row.metadata)
+
+
+def _released_by(row: state.TaskRow, stream: str) -> Mapping[str, Any] | None:
+    released = row.metadata.get(state.SEAM_RELEASED_KEYS.key)
+    by_field = state.SEAM_RELEASED_KEYS.fields[0]
+    return released if isinstance(released, Mapping) and released.get(by_field) == stream else None
+
+
+@dataclass(frozen=True)
+class _Reconstruction:
+    """A stream's decompose as the store shows it."""
+
+    filed: tuple[state.TaskRow, ...]
+    held: tuple[state.TaskRow, ...]
+    released: tuple[state.TaskRow, ...]
+
+
+def _reconstructed(
+    rows: Sequence[state.TaskRow], views: Mapping[str, state.StreamView], stream: str,
+) -> _Reconstruction:
+    own = [row for row in rows if state.stream_of(row, views) == stream]
+    return _Reconstruction(
+        filed=tuple(row for row in own if not _is_held(row)),
+        held=tuple(row for row in own if _is_held(row)),
+        released=tuple(row for row in rows if _released_by(row, stream) is not None),
+    )
+
+
+def _filed_text(rows: Sequence[state.TaskRow]) -> str:
+    return ', '.join(str(row.task_id) for row in rows) or 'none'
+
+
+def _held_leaf_text(row: state.TaskRow) -> str:
+    stream_field, contract_field, owner_field = state.SEAM_WAIT_KEYS.fields
+    wait = _seam_wait(row)
+    return (f'{row.task_id} on {wait.get(stream_field)} {wait.get(contract_field)} '
+            f'(release owner {wait.get(owner_field)})')
+
+
+def _held_text(rows: Sequence[state.TaskRow]) -> str:
+    return ', '.join(_held_leaf_text(row) for row in rows) or 'none'
+
+
+def _released_text(rows: Sequence[state.TaskRow], stream: str) -> str:
+    onto_field = state.SEAM_RELEASED_KEYS.fields[2]
+    return ', '.join(
+        f'{row.task_id} onto {list((_released_by(row, stream) or {}).get(onto_field, ()))}'
+        for row in rows
+    ) or 'none'
+
+
+def _note_text(stream: str, found: _Reconstruction, measured_at: str, leftover: str | None) -> str:
+    text = (
+        f'{stream} decompose reconstructed from the store read at {measured_at}: '
+        f'filed {_filed_text(found.filed)}; held {_held_text(found.held)}; '
+        f'released {_released_text(found.released, stream)}; '
+        f'lost with the return: {", ".join(LOST_WITH_THE_RETURN)}'
+    )
+    return text if leftover is None else f'{text}; {leftover}'
+
+
+def _from_store_digest(stream: str, found: _Reconstruction, leftover: str | None) -> str:
+    digest = (
+        f'{stream} decompose from store: {len(found.filed)} filed, {len(found.held)} held, '
+        f'{len(found.released)} released; lost: {", ".join(LOST_WITH_THE_RETURN)}'
+    )
+    return digest if leftover is None else f'{digest}; {leftover}'
+
+
+def _reconstruction_applied(
+    snapshot: home_writer.Snapshot, home: state.Home, stream: str, by: str,
+    reader: state.StoreReader,
+) -> Applied:
+    views = state.stream_views(snapshot.program, snapshot.ledger)
+    prd_paths = [view.prd_path for view in views.values() if view.authored and view.prd_path]
+    read = reader.program_tasks(snapshot.program.run_id, prd_paths)
+    found = _reconstructed(read.rows, views, stream)
+    inbox_file = home.inbox_file(stream, state.Pass.DECOMPOSE)
+    leftover = (f'{_home_relative(home, inbox_file)} left in place: {degeneracy(inbox_file)}'
+                if inbox_file.exists() else None)
+    lines = home_writer.stamp(snapshot, by, [
+        (state.LedgerOp.STREAM_STATUS, {'stream': stream, 'status': str(state.StreamStatus.DECOMPOSED),
+                                        'prd_path': views[stream].prd_path}),
+        (state.LedgerOp.NOTE, {'text': _note_text(stream, found, read.measured_at, leftover)}),
+    ], ())
+    return Applied(
+        stem=home.returns_file(stream, state.Pass.DECOMPOSE).stem, returns_file=None,
+        ledger=lines.ledger, rulings=lines.rulings,
+        digest=_from_store_digest(stream, found, leftover), needs_human=(),
+        measured_at=read.measured_at,
+    )
+
+
+def from_store(
+    home: state.Home, stream: str, *, by: str = DEFAULT_BY,
+    store_factory: _ReaderFactory = state.open_reader,
+) -> Applied | Refused:
+    """Record *stream*'s decompose from the store when its session left no usable return; files nothing."""
+    with home_writer.locked(home) as snapshot:
+        for refusal_of in _FROM_STORE_REFUSALS:
+            refusal = refusal_of(snapshot, home, stream)
+            if refusal is not None:
+                return refusal
+        applied = _reconstruction_applied(snapshot, home, stream, by, store_factory(snapshot.program))
+        home_writer.append(home, home_writer.Lines(applied.ledger, applied.rulings))
+    return applied
+
+
 _CLOSING: Mapping[RefusalKind, str] = {
-    RefusalKind.FORM: 'nothing written; fix {file} and re-apply',
+    RefusalKind.FORM: 'nothing written; fix {subject} and re-apply',
     RefusalKind.CONTRADICTION: 'nothing written; the store contradicts the return — stop for the lead',
-    RefusalKind.APPLICATION: 'nothing written; {file} is left where it is',
+    RefusalKind.APPLICATION: 'nothing written; {subject} was not applied',
 }
 
 
-def _report(outcome: Applied | Refused, source: Path, *, prefix: str = '') -> int:
+def _report(outcome: Applied | Refused, subject: str | Path, *, prefix: str = '') -> int:
     if isinstance(outcome, Refused):
         for line in outcome.lines:
             print(line, file=sys.stderr)
-        print(_CLOSING[outcome.kind].format(file=source), file=sys.stderr)
+        print(_CLOSING[outcome.kind].format(subject=subject), file=sys.stderr)
         return 1
     print(prefix + outcome.digest)
     if outcome.measured_at is not None:
@@ -481,8 +662,8 @@ def _run(args: argparse.Namespace) -> int:
         return _report(check(args.check), args.check, prefix='check ok: ')
     if args.file is not None:
         return _report(apply(args.file, amend=args.amend), args.file)
-    print('refused: --from-store is not implemented yet', file=sys.stderr)
-    return 1
+    outcome = from_store(state.run_home(args.run), args.from_store)
+    return _report(outcome, f'--from-store {args.from_store}')
 
 
 def main(argv: Sequence[str] | None = None) -> int:
