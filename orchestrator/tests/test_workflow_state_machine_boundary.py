@@ -104,6 +104,7 @@ from orchestrator.workflow_types import (
     STATE_TO_STATUS,
     BlockDisposition,
     IllegalTransition,
+    PublishedStewardOutcome,
     RequeueKind,
     StewardInterrupted,
     StewardResolved,
@@ -1777,8 +1778,10 @@ class TestStewardOutcomeRouting:
 
         mock_invoke.assert_not_called()
         steward.escalation_queue.submit.assert_not_called()  # type: ignore[attr-defined]  # no L1 filed
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='attempt_cap', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='attempt_cap', wip_commits_present=True,
+            ),
         )
 
     # -- Row 9 cancel-safety guard --------------------------------------------

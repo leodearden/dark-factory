@@ -40,7 +40,11 @@ from escalation.classify import effective_benign
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, ResolveOutcome
 
-from orchestrator.workflow_types import StewardInterrupted, StewardResolved
+from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
+    StewardInterrupted,
+    StewardResolved,
+)
 
 
 @pytest.fixture
@@ -167,8 +171,10 @@ class TestDismissalWonTheRace:
         _assert_dismissed_own_l0(steward, esc.id)
         # Task-2060 resume-plan semantics: a dismissal is NOT an L1 hand-off.
         steward.escalation_queue.submit.assert_not_called()
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='attempt_cap', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='attempt_cap', wip_commits_present=True,
+            ),
         )
         assert channel.empty(), 'exactly one outcome must be published'
         assert esc.id in steward._capped_escalations
@@ -188,8 +194,10 @@ class TestDismissalWonTheRace:
         mock_invoke.assert_not_called()
         _assert_dismissed_own_l0(steward, esc.id)
         steward.escalation_queue.submit.assert_not_called()
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='timeout', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='timeout', wip_commits_present=True,
+            ),
         )
         assert channel.empty(), 'exactly one outcome must be published'
         assert esc.id in steward._capped_escalations
@@ -216,8 +224,10 @@ class TestDismissalWonTheRace:
             await steward._handle_escalation(esc)
 
         _assert_dismissed_own_l0(steward, esc.id)
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='timeout', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='timeout', wip_commits_present=True,
+            ),
         )
         assert channel.empty(), 'exactly one outcome must be published'
 
@@ -251,9 +261,11 @@ class TestInFlightResolveWonTheRace:
         # The give-up contract is UNCHANGED: the dismissal is still attempted.
         _assert_dismissed_own_l0(steward, esc.id)
         steward.escalation_queue.submit.assert_not_called()
-        assert channel.get_nowait() == StewardResolved(
-            resolution_text=(
-                'root cause was a stale lockfile; removed it and verify is green'
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardResolved(
+                resolution_text=(
+                    'root cause was a stale lockfile; removed it and verify is green'
+                ),
             ),
         ), 'a lost race is a RESOLUTION, not a benign interruption'
         assert channel.empty(), 'exactly one outcome must be published'
@@ -285,8 +297,10 @@ class TestInFlightResolveWonTheRace:
         mock_invoke.assert_not_called()
         _assert_dismissed_own_l0(steward, esc.id)
         steward.escalation_queue.submit.assert_not_called()
-        assert channel.get_nowait() == StewardResolved(
-            resolution_text='fixed the flaky fixture',
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardResolved(
+                resolution_text='fixed the flaky fixture',
+            ),
         )
         assert channel.empty()
         assert esc.id in steward._capped_escalations
@@ -309,8 +323,10 @@ class TestInFlightResolveWonTheRace:
         with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock):
             await steward._handle_escalation(esc)
 
-        assert channel.get_nowait() == StewardResolved(
-            resolution_text='verify loop will not converge',
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardResolved(
+                resolution_text='verify loop will not converge',
+            ),
         )
 
     async def test_lost_race_does_not_log_the_misleading_dismissal_warning(
@@ -406,8 +422,10 @@ class TestAnAgentDismissalWonTheRace:
         # The give-up contract is UNCHANGED: the dismissal is still attempted.
         _assert_dismissed_own_l0(steward, esc.id)
         steward.escalation_queue.submit.assert_not_called()
-        assert channel.get_nowait() == StewardResolved(
-            resolution_text='abandoning: the premise is false, this needs a new task',
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardResolved(
+                resolution_text='abandoning: the premise is false, this needs a new task',
+            ),
         ), (
             'an agent that deliberately abandoned the record did not leave the '
             'steward cut short — resuming the plan for it is the misreport this '
@@ -452,8 +470,10 @@ class TestAnAgentDismissalWonTheRace:
                 status='dismissed', resolved_by='harness-orphan-reaper',
             )
 
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='timeout', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='timeout', wip_commits_present=True,
+            ),
         )
         assert channel.empty()
         text = '\n'.join(r.getMessage() for r in caplog.records)
@@ -527,8 +547,10 @@ class TestLateResolutionSurvivesTheAutoDismiss:
             "stamp is DERIVED as benign — this is the state esc-3902-1 reported"
         )
         assert effective_benign(stored) == ('benign', 'stamped')
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='timeout', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='timeout', wip_commits_present=True,
+            ),
         )
 
         # --- the in-flight resolve_issue lands microseconds later ------------
