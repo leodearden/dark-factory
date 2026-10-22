@@ -121,13 +121,11 @@ def curation_backlog_anchor(reason: DeferReason) -> str:
 
 
 def _curation_backlog_action(reason: DeferReason) -> str:
-    envelope = (
+    return (
         'These submissions are parked and retried automatically on backoff until the '
-        'curator reaches a verdict; nothing is lost and nothing should be re-submitted.'
+        'curator reaches a verdict; nothing is lost and nothing should be re-submitted. '
+        f'{backlog_remediation(reason)}'
     )
-    if backlog_severity(reason) == 'blocking':
-        envelope += ' This outage will not clear by itself.'
-    return f'{envelope} {backlog_remediation(reason)}'
 
 
 def is_dedup_outage(health: DedupHealth, cfg: DedupOutageDetectorConfig) -> bool:

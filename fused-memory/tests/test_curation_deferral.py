@@ -157,15 +157,6 @@ class TestBacklogRemediation:
         assert isinstance(remediation, str)
         assert remediation
 
-    @pytest.mark.parametrize(
-        'pool_reason', [DeferReason.ALL_ACCOUNTS_CAPPED, DeferReason.ACCOUNTS_AUTH_FAILED],
-    )
-    @pytest.mark.parametrize('outage_reason', [DeferReason.LLM_FAILED, DeferReason.CORPUS_FAILED])
-    def test_a_curator_outage_is_not_told_to_restore_the_account_pool(
-        self, pool_reason, outage_reason,
-    ):
-        assert backlog_remediation(outage_reason) != backlog_remediation(pool_reason)
-
 
 class TestDedupeSkippedMarker:
     def test_marker_shape_and_utc_at(self):

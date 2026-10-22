@@ -60,20 +60,21 @@ def backlog_remediation(reason: DeferReason) -> str:
             )
         case DeferReason.ACCOUNTS_AUTH_FAILED:
             return (
-                "Every curator account failed authentication; restore the accounts' "
-                'credentials to resume curation.'
+                'Every curator account failed authentication, which will not clear by '
+                "itself; restore the accounts' credentials to resume curation."
             )
         case DeferReason.LLM_FAILED:
             return (
-                "The curator's LLM call is failing; read the curator_failure escalations "
-                'and the fused-memory log for the failing subtype or exception (for example '
-                'the claude binary missing from the service PATH). A submission the curator '
-                'can never judge may be withdrawn with cancel_ticket.'
+                "The curator's LLM call is failing and is not known to recover by itself; "
+                'read the curator_failure escalations and the fused-memory log for the '
+                'failing subtype or exception (for example the claude binary missing from '
+                'the service PATH). A submission the curator can never judge may be '
+                'withdrawn with cancel_ticket.'
             )
         case DeferReason.CORPUS_FAILED:
             return (
-                "The curator could not assemble its candidate corpus; Qdrant, the embedder "
-                'or the task backend is failing.'
+                'The curator could not assemble its candidate corpus and is not known to '
+                'recover by itself; Qdrant, the embedder or the task backend is failing.'
             )
         case DeferReason.ZERO_OUTPUT_BREAKER_OPEN:
             return (
@@ -83,8 +84,8 @@ def backlog_remediation(reason: DeferReason) -> str:
             )
         case DeferReason.CURATOR_RAISED:
             return (
-                'The curator raised instead of deciding, which is a code defect; read the '
-                'traceback logged by the fused-memory ticket worker.'
+                'The curator raised instead of deciding, a code defect that will not clear '
+                'by itself; read the traceback logged by the fused-memory ticket worker.'
             )
         case _:
             assert_never(reason)

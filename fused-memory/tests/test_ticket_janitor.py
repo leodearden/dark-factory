@@ -1533,6 +1533,18 @@ class TestCurationBacklogEscalation:
         assert backlog_remediation(DeferReason.ALL_ACCOUNTS_CAPPED) in capped_record.suggested_action
 
     @pytest.mark.asyncio
+    async def test_a_possibly_transient_blocking_record_does_not_claim_it_never_clears(
+        self, store, tmp_path, pid,
+    ):
+        await _park(store, pid, title='corpus', reason=DeferReason.CORPUS_FAILED, deferrals=2)
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        [record] = self._pending(tmp_path, DeferReason.CORPUS_FAILED)
+        assert record.severity == 'blocking'
+        assert 'will not clear by itself' not in record.suggested_action
+
+    @pytest.mark.asyncio
     async def test_the_detail_lists_at_most_twenty_tickets(self, store, tmp_path, pid):
         parked_oldest_first = [
             await _park(store, pid, title=f't{n}', deferrals=2) for n in range(21)
