@@ -509,6 +509,74 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     task 5244's archived junits: 90,933 cases, 3,199 duplicate ids before redaction and 3,220
     after). A join must not assume one case per id.
 
+- 2026-10-22, from δ (task 6971). These bind ζ (6973) and the portal:
+  - (a) A request is refused for the first reason that holds, in the order `not_in_tree`,
+    `not_visible`, `symlink`, `not_revealable` (a `never_reveal_globs` match, or a blob that is not
+    UTF-8), `over_budget` (`client-feed/src/client_feed/budget.py::judge`). A submodule is refused as
+    `symlink`. Tree membership is the request's raw `path` text looked up among the paths `git
+    ls-tree` lists at main's head (`client-feed/src/client_feed/sources/git.py::tree_entries`); it is
+    never normalized, joined to a directory or opened on disk. Content is read only after the path,
+    visibility and kind checks, by the entry's blob sha through `git cat-file --batch`
+    (`client-feed/src/client_feed/sources/git.py::blob_reader`).
+  - (b) A path costs `max(lines, reveal_floor_lines)` only inside the counted set, and 0 outside it
+    (`client-feed/src/client_feed/budget.py::CountedSet.cost`). The counted set is head's production
+    files that match neither `free_globs` nor `never_reveal_globs` and have more than 0 chargeable
+    lines (`client-feed/src/client_feed/budget.py::counted_set`). `spent_lines` is not a running
+    total: it is recomputed at head from the revealed set, so a path that leaves the counted set
+    stops costing (`client-feed/src/client_feed/budget.py::CountedSet.spent`). A path already
+    revealed is granted again without a budget check
+    (`client-feed/src/client_feed/budget.py::CountedSet.grantable`). With a `delivered_commit`, a
+    file's chargeable lines are the lines it added or changed since that commit. Paths are paired by
+    `git diff-tree -M`, and each changed blob pair's added lines are counted by
+    `client-feed/src/client_feed/policy.py::Policy.counted_lines`, not by numstat
+    (`client-feed/src/client_feed/budget.py::lines_since`). A file added since then is charged all
+    its counted lines, and a pure rename is charged none.
+  - (c) `RevealBudget` is said only inside `tree_snapshot`. When the budget changes and the tree
+    does not, the state's tree is re-emitted at the same commit with the new budget
+    (`client-feed/src/client_feed/value_events.py::budget_event`). Two `tree_snapshot` lines with one
+    `commit` are therefore not a duplicate: the later one's budget is current.
+  - (d) The engagement is read first in each pass
+    (`client-feed/src/client_feed/engagement.py::read_engagement`). A missing, unreadable (a symlink
+    included) or invalid file, or a `delivered_commit` the repository does not hold, is named
+    `engagement` in `degraded` (`client-feed/src/client_feed/engagement.py::EngagementUnusable`).
+    Reveals are then disabled for that pass: the inbox is not read, its offset is held, nothing is
+    followed, and a new tree's budget uses §4.12's null `delivered_commit` rule. A `project_id` other
+    than the policy's is the refusal
+    `client-feed/src/client_feed/engagement.py::EngagementProjectMismatch`, a `FeedError`: the pass
+    stops before anything is appended, and the CLI exits 1. `heartbeat.engagement_version` echoes
+    only a usable engagement's version, and is null otherwise
+    (`client-feed/src/client_feed/publisher.py::run_pass`).
+  - (e) An inbox that cannot be read (unreadable, a symlink, or shorter than the cursor's offset) is
+    `inbox` in `degraded`, and its offset is held
+    (`client-feed/src/client_feed/inbox.py::InboxUnusable`). A line that is not a reveal request is
+    rejected, never raised: it is counted under `inbox`, and the tail moves past it with the requests
+    around it (`client-feed/src/client_feed/publisher.py::_inbox_unit`).
+  - (f) Follow-head walks main's first-parent commits after `Cursor.reveals_head` through head,
+    oldest first, in one `git log --first-parent -M --raw`
+    (`client-feed/src/client_feed/sources/git.py::first_parent_changes`,
+    `client-feed/src/client_feed/reveals.py::_tracks`). A revealed file whose blob changed is
+    re-emitted at head, and a renamed one is emitted at its new path with `renamed_from`. Its reveal
+    ends with a `file_revealed` at its revealed path with `deleted: true` when the path is deleted,
+    or when at head it is no longer revealable. A followed path is never refused for budget. A path
+    recreated after its delete is not followed, and a change reverted within the walk emits nothing
+    (`client-feed/src/client_feed/reveals.py::_follow_events`). When `reveals_head` is null or no
+    longer an ancestor of head, each revealed file is diffed from its own `commit` to head instead.
+    In one pass the ends come first, then the re-emits, then the inbox's answers in inbox order.
+  - (g) The revealed set's only home is `state.revealed` (path, commit, lines), folded from
+    `file_revealed` (`client-feed/src/client_feed/fold.py::_apply_file_revealed`). `cursor.json`
+    holds `reveals_head` and `inbox_offset`, and no per-path blob shas
+    (`client-feed/src/client_feed/feed_io.py::Cursor`). Both move only when the reveal unit runs and
+    succeeds; an inbox read holding no request moves its offset alone
+    (`client-feed/src/client_feed/publisher.py::_advanced`). After a crash between the append and
+    the cursor, an answer whose identity (its type and its JSON without `seq` and `at`) is in the
+    uncommitted tail is consumed there and not emitted again
+    (`client-feed/src/client_feed/reveals.py::answer_identity`).
+  - (h) The portal's `in-v1` fixture is vendored byte for byte at
+    `client-feed/tests/fixtures/in-v1` from scoping-intake
+    `f5cea40d8354190c9fa0cce260b2e69adc79ea3a`. Its `delivered_commit` is a fixture sha that no test
+    repository holds, so read as vendored it disables reveals. A test that needs a usable engagement
+    sets it to null after reading the vendored file (`client-feed/tests/test_in_v1_fixture.py`).
+
 ## 13. Open questions (tactical)
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
