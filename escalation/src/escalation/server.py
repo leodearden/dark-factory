@@ -73,6 +73,7 @@ from escalation.models import (
     Escalation,
     EvidenceEntry,
     max_severity,
+    normalised_severity,
 )
 from escalation.pins import classify_pins
 from escalation.project_root_guard import ProjectRootGuard
@@ -255,6 +256,35 @@ def _info_only_refusal(members: dict[str, Escalation | None]) -> dict[str, Any]:
         'members': list(usable),
         'unusable': unusable,
         'derived_severity': 'info',
+    }
+
+
+def _park_on_info_refusal(rec: Escalation) -> dict[str, Any] | None:
+    """The ``park_on_info`` refusal for parking an info-severity *rec*, else None.
+
+    An info record never pins its task (``escalation/src/escalation/pins.py::classify_pins``
+    link 1), so a park could not hold the task it blocks (task 6578).
+    """
+    if normalised_severity(rec.severity) != 'info':
+        return None
+    return {
+        'error': (
+            f'refusing to park info-severity escalation {rec.id} (task '
+            f'{rec.task_id}): an info record never pins its task (pins.py '
+            'link 1), so the park could not hold it and the stranded-blocked '
+            'sweep would re-pend it'
+        ),
+        'code': 'park_on_info',
+        'hint': (
+            f'to hold task {rec.task_id}, defer it on fused-memory: '
+            f"set_task_status(id='{rec.task_id}', status='deferred', "
+            f"deferral={{'kind': 'until_condition', 'condition': 'Leo rules "
+            f"{rec.id}', 'reason': '<one line>'}}) -- see "
+            'docs/task-authoring.md §9 "Deferring a task". Otherwise leave '
+            f"{rec.id} pending, or close it with action='close_only'."
+        ),
+        'escalation_id': rec.id,
+        'task_id': rec.task_id,
     }
 
 
@@ -2541,6 +2571,10 @@ def create_server(
                 ),
                 'code': 'illegal_transition',
             }
+
+        # See "Gate precedence" in this docstring.
+        if action == 'park' and (refusal := _park_on_info_refusal(rec)) is not None:
+            return refusal
 
         if action == 'park':
             # Version-a: park keeps the escalation open at L2.
