@@ -65,7 +65,7 @@ from typing import Any
 
 import pytest
 import toolcall_markup_corpus_extract as extract
-from _schema_outage import install_schema_outage
+from _schema_outage import assert_reported_once_by_shared_reader, install_schema_outage
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
@@ -922,11 +922,7 @@ class TestAnUnresolvableSchemaFailsSafe:
         with caplog.at_level(logging.WARNING):
             await h.call('submit_task', self.OVERRIDE_CALL)
 
-        shared_records = [r for r in caplog.records if r.name.startswith('shared.')]
-        assert [(r.name, r.levelno) for r in shared_records if r.exc_info] == [
-            ('shared.mcp_tool_schema', logging.WARNING)
-        ]
-        assert [r for r in shared_records if r.levelno >= logging.ERROR] == []
+        assert_reported_once_by_shared_reader(caplog.records)
 
 
 class TestB2TotalDrift:
