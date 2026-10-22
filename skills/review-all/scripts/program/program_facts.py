@@ -100,6 +100,14 @@ class StoreFacts:
         return tuple(row for row in self.rows if state.SEAM_WAIT_KEYS.key in row.metadata)
 
     @property
+    def held(self) -> tuple[tuple[str, state.TaskRow], ...]:
+        """Each unreleased held leaf, with the stream it belongs to."""
+        return tuple(
+            (stream, row) for stream, rows in self.by_stream.items() for row in rows
+            if program_state(row) is ProgramState.HELD
+        )
+
+    @property
     def is_empty(self) -> bool:
         return not any(self.by_stream.values())
 

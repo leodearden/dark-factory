@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import enum
+import json
 import os
 import string
 import sys
@@ -500,10 +501,10 @@ def _roster_lines(home: HomeRead, store: StoreFacts) -> list[str]:
     lines = []
     for stream in run.program.stream_ids:
         rows = store.by_stream[stream]
-        held = [row for row in rows if program_facts.program_state(row) is ProgramState.HELD]
+        held = sum(1 for held_in, _ in store.held if held_in == stream)
         lines.append(' · '.join([
             stream, f'wave {waves[stream]}', str(run.views[stream].status or NO_STATUS),
-            f'filed {len(rows)}', f'held {len(held)}', f'gate deps {len(store.gate_deps(stream))}',
+            f'filed {len(rows)}', f'held {held}', f'gate deps {len(store.gate_deps(stream))}',
             f'open actions {sum(1 for a in actions if a.stream == stream)}',
             f'open questions {sum(1 for q in pending if q.ref.stream == stream)}',
         ]))
@@ -511,11 +512,7 @@ def _roster_lines(home: HomeRead, store: StoreFacts) -> list[str]:
         state.UNSTREAMED, f'filed {len(store.by_stream[state.UNSTREAMED])}',
         f'gate deps {len(store.gate_deps(state.UNSTREAMED))}',
     ]))
-    lines += [
-        _held_leaf_line(stream, row, store)
-        for stream, rows in store.by_stream.items() for row in rows
-        if program_facts.program_state(row) is ProgramState.HELD
-    ]
+    lines += [_held_leaf_line(stream, row, store) for stream, row in store.held]
     lines.append(_chain_line(run.program.run_id, state.TriggerChainRole.HUMAN_GATE, store.gate))
     return lines
 
@@ -585,6 +582,124 @@ def _sitting(args: argparse.Namespace) -> Exit:
     return Exit.DONE
 
 
+INHERITED_DUTIES: tuple[tuple[str, str], ...] = (
+    ('launched_from', 'launched_from'),
+    ('fable_seats', 'fable_seats'),
+    ('--yes', 'yes'),
+)
+"""Each duty a successor lead inherits, as (label, key of the run record's ``method.extra``)."""
+SETTLED_STATUSES = frozenset({state.StreamStatus.DECOMPOSED, state.StreamStatus.RECORDED})
+
+
+def _record_extra(path: Path) -> Mapping[str, Any] | str:
+    """The run record's ``method.extra``, or why it cannot be read."""
+    try:
+        record = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return f'the run record {path} is absent'
+    except (OSError, ValueError) as bad:
+        return f'the run record {path} is unreadable: {bad}'
+    method = record.get('method') if isinstance(record, Mapping) else None
+    extra = method.get('extra') if isinstance(method, Mapping) else None
+    if not isinstance(extra, Mapping):
+        return f'the run record {path} carries no method.extra object'
+    return extra
+
+
+def _sources(home: HomeRead, store: StoreFacts) -> list[str]:
+    run_home, program = home.run.home, home.run.program
+    return [
+        f'- the run home {run_home.root}; it is authoritative',
+        f'- {run_home.program_json}: the deliberation\'s outputs, written once by record.py init',
+        f'- {run_home.rulings}: the rulings, appended by record.py rule and apply_return.py',
+        f'- {run_home.ledger}: stream status, amendments, actions, notes and commits, '
+        'appended by apply_return.py',
+        f'- the task store: fused-memory under project_root {program.project_root}, '
+        'read through program_doc.py --roster',
+        f'- the published doc {state.published_doc(program)} and its snapshot '
+        f'{state.snapshot_dir(program)}, written by program_doc.py --publish',
+        f'- the run record {Path(program.project_root) / program.record_path}',
+    ]
+
+
+def _commit_line(line: Mapping[str, Any]) -> str:
+    return f'- {line["sha"]} · {len(line["paths"])} path(s) · measured at {line["measured_at"]}'
+
+
+def _state(home: HomeRead, store: StoreFacts) -> list[str]:
+    run = home.run
+    commits = [_commit_line(line) for line in run.ledger if line['op'] == state.LedgerOp.COMMIT]
+    inbox = run.home.root / 'inbox'
+    waiting = sorted(path.name for path in inbox.iterdir()) if inbox.is_dir() else []
+    return [
+        '### Committed', '',
+        *(commits or ['- no wave commit is recorded in the ledger']),
+        '', '### In flight', '',
+        *(f'- stream {view.id} · {view.status or NO_STATUS} · PRD {view.prd_path or ABSENT}'
+          for view in run.views.values()),
+        f'- inbox: {_listed(waiting)}',
+        f'- store read {store.measured_at}',
+    ]
+
+
+def _duties(extra: Mapping[str, Any] | str) -> list[str]:
+    if isinstance(extra, str):
+        return [f'- {extra}: no inherited duty can be read from it']
+    return [
+        f'- {label}: {_line(_text(extra[key])) if key in extra else "not recorded in method.extra"}'
+        for label, key in INHERITED_DUTIES
+    ]
+
+
+def _remaining(home: HomeRead, store: StoreFacts) -> list[str]:
+    run = home.run
+    waves = state.waves(run.views)
+    lines = [
+        f'- stream {view.id} · wave {waves[view.id]} · {view.status or NO_STATUS} · '
+        'cleared by apply_return.py on its decompose return'
+        for view in run.views.values() if view.status not in SETTLED_STATUSES
+    ]
+    lines += [
+        f'- {_held_leaf_line(stream, row, store)} · cleared by its release owner\'s release'
+        for stream, row in store.held
+    ]
+    lines += [
+        f'- action {action.id} · {action.lead_op} · task {action.task} · target {_text(action.target)} · '
+        'cleared by its action_result ledger line'
+        for action in program_facts.open_actions(run.ledger)
+    ]
+    lines += [
+        f'- question {question.ref} · cleared by record.py rule --answers {question.ref}'
+        for question in program_facts.pending_questions(home)
+    ]
+    return lines or ['- nothing remains']
+
+
+def handoff_text(home: HomeRead, store: StoreFacts, extra: Mapping[str, Any] | str) -> str:
+    sections = (
+        ('Sources of truth', _sources(home, store)),
+        ('State', _state(home, store)),
+        ('Inherited duties', _duties(extra)),
+        ('Remaining work', _remaining(home, store)),
+    )
+    body = '\n\n'.join('\n'.join([f'## {title}', '', *lines]) for title, lines in sections)
+    return (f'# Handoff — /review-all program {home.run.program.run_id}\n\n'
+            'Start here, then run program_doc.py --roster.\n\n'
+            f'{body}\n')
+
+
+def _handoff(args: argparse.Namespace) -> Exit:
+    home, store = _read(args)
+    program = home.run.program
+    extra = _record_extra(Path(program.project_root) / program.record_path)
+    if isinstance(extra, str):
+        print(f'warning: {extra}; HANDOFF.md says so under Inherited duties', file=sys.stderr)
+    _write_atomic(home.run.home.handoff, handoff_text(home, store, extra).encode('utf-8'))
+    print(f'wrote {home.run.home.handoff}')
+    print(f'store read {store.measured_at}')
+    return Exit.DONE
+
+
 @dataclass(frozen=True)
 class _Mode:
     """A mode of the CLI: the flag that selects it, what it does, and the verb its failure names.
@@ -603,6 +718,7 @@ _MODES = (
     _Mode('publish', 'publish', _publish, renders=True),
     _Mode('roster', 'print the roster', _roster, renders=False),
     _Mode('sitting', 'print the sitting', _sitting, renders=False),
+    _Mode('handoff', 'write the handoff', _handoff, renders=False),
 )
 
 
@@ -635,6 +751,8 @@ def _parser() -> argparse.ArgumentParser:
     modes.add_argument('--sitting', type=int, metavar='WAVE',
                        help="print WAVE's pending design questions as screens of "
                             f'{SCREEN_SIZE}; reads the run home only, never the store')
+    modes.add_argument('--handoff', action='store_true',
+                       help="write the home's HANDOFF.md for a successor lead")
     return parser
 
 
