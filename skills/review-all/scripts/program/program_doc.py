@@ -141,16 +141,16 @@ def _conventions_extra(home: HomeRead, store: StoreFacts) -> str:
     return _bullets(program_facts.program_section(home, state.ProgramSection.CONVENTIONS_EXTRA))
 
 
-_DECISION_FIELDS = ('stream', 'item', 'question', 'ruling', 'options', 'consequence', 'keys', 'answers')
+_DECISION_FIELDS = (
+    'source', 'stream', 'item', 'question', 'ruling', 'options', 'consequence', 'keys', 'answers',
+)
+"""Each ruling field a decision shows when the ruling gives it a value: every field is text or a list."""
 
 
 def _decision(current: program_facts.CurrentRuling) -> str:
     ruling = current.ruling
     parts = [ruling['id'], ruling['ruled_by'], ruling['date']]
-    parts += [
-        f'{name}: {_text(ruling[name])}' for name in _DECISION_FIELDS
-        if ruling.get(name) not in (None, '', ())
-    ]
+    parts += [f'{name}: {_text(ruling[name])}' for name in _DECISION_FIELDS if ruling.get(name)]
     if current.superseded:
         parts.append(f'supersedes {_listed(current.superseded)}')
     if ruling.get('reask', False):
@@ -353,12 +353,13 @@ def _write_atomic(path: Path, data: bytes) -> None:
 
 
 def _write_render(home: HomeRead, text: str) -> Path:
+    """The snapshot first and the doc last, so a freshly written doc means its snapshot is complete."""
     run_home, program = home.run.home, home.run.program
-    doc = run_home.render_doc(program)
     run_home.render_state_dir.mkdir(parents=True, exist_ok=True)
-    _write_atomic(doc, text.encode('utf-8'))
     for name, data in home.files.items():
         _write_atomic(run_home.render_state_dir / name, data)
+    doc = run_home.render_doc(program)
+    _write_atomic(doc, text.encode('utf-8'))
     return doc
 
 
@@ -448,21 +449,41 @@ def _refuse_missing_parents(copies: Sequence[Copy], made: Path) -> None:
 
 
 def copy_plan(render: Render) -> tuple[Copy, ...]:
-    """Every copy publish makes, in order, each refusal checked before any is made."""
+    """Every copy publish makes, in the order it makes them, each refusal checked before any is made.
+
+    The program doc comes last, so a published doc that changed means every copy before it landed.
+    """
     run, program = render.home.run, render.home.run.program
     if not Path(program.project_root).is_dir():
         raise state.StateError(f'project_root {program.project_root} is not a directory; nothing published')
     snapshot = state.snapshot_dir(program)
     copies = [
-        Copy(render.doc, state.published_doc(program), 'the program doc'),
         *(Copy(run.home.render_state_dir / name, snapshot / name, 'the snapshot')
           for name in render.home.files),
+        *(copy for stream in program.stream_ids for copy in _drafts(run, stream)),
+        Copy(render.doc, state.published_doc(program), 'the program doc'),
     ]
-    for stream in program.stream_ids:
-        copies += _drafts(run, stream)
     _refuse_clashes(copies)
     _refuse_missing_parents(copies, snapshot)
     return tuple(copies)
+
+
+def _checkout_path(copy: Copy, root: Path) -> str:
+    return copy.destination.relative_to(root).as_posix()
+
+
+def _copy_all(copies: Sequence[Copy], root: Path) -> None:
+    """Make each copy in order; a failure names the copies already made and leaves the doc as it was."""
+    made: list[Copy] = []
+    try:
+        for copy in copies:
+            _write_atomic(copy.destination, copy.source.read_bytes())
+            made.append(copy)
+    except OSError as failed:
+        copied = ', '.join(_checkout_path(copy, root) for copy in made) or 'nothing'
+        raise state.StateError(
+            f'{failed}; copied before it: {copied}; the published doc is unchanged, re-run --publish'
+        ) from None
 
 
 def _publish(args: argparse.Namespace) -> Exit:
@@ -471,13 +492,12 @@ def _publish(args: argparse.Namespace) -> Exit:
         return Exit.REFUSED
     copies = copy_plan(render)
     program = render.home.run.program
-    state.snapshot_dir(program).mkdir(exist_ok=True)
-    for copy in copies:
-        _write_atomic(copy.destination, copy.source.read_bytes())
     root = Path(program.project_root)
+    state.snapshot_dir(program).mkdir(exist_ok=True)
+    _copy_all(copies, root)
     print(f'published {len(copies)} paths into {root}; commit them with one git commit --only')
     for copy in copies:
-        print(copy.destination.relative_to(root).as_posix())
+        print(_checkout_path(copy, root))
     print(f'store read {render.store.measured_at}')
     return Exit.DONE
 
@@ -616,10 +636,9 @@ def _sources(home: HomeRead, store: StoreFacts) -> list[str]:
     run_home, program = home.run.home, home.run.program
     return [
         f'- the run home {run_home.root}; it is authoritative',
-        f'- {run_home.program_json}: the deliberation\'s outputs, written once by record.py init',
-        f'- {run_home.rulings}: the rulings, appended by record.py rule and apply_return.py',
-        f'- {run_home.ledger}: stream status, amendments, actions, notes and commits, '
-        'appended by apply_return.py',
+        f'- {run_home.program_json}: the deliberation\'s outputs',
+        f'- {run_home.rulings}: the rulings',
+        f'- {run_home.ledger}: the ledger, one line per event (ops: {_listed(state.LedgerOp)})',
         f'- the task store: fused-memory under project_root {program.project_root}, '
         'read through program_doc.py --roster',
         f'- the published doc {state.published_doc(program)} and its snapshot '
@@ -635,7 +654,7 @@ def _commit_line(line: Mapping[str, Any]) -> str:
 def _state(home: HomeRead, store: StoreFacts) -> list[str]:
     run = home.run
     commits = [_commit_line(line) for line in run.ledger if line['op'] == state.LedgerOp.COMMIT]
-    inbox = run.home.root / 'inbox'
+    inbox = run.home.root / 'inbox'  # state.Home gains the accessor: ticket tkt_0RW3S2N4DWY5AF1TJVWHT4Z5ME
     waiting = sorted(path.name for path in inbox.iterdir()) if inbox.is_dir() else []
     return [
         '### Committed', '',

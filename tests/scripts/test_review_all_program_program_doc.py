@@ -57,8 +57,8 @@ class DocRun:
 
 
 @contextlib.contextmanager
-def _doc_run(tmp_path: Path, *store_flags: str) -> Iterator[DocRun]:
-    copy = StoreCopy.of('store.json', tmp_path)
+def _doc_run(tmp_path: Path, *store_flags: str, store: str = 'store.json') -> Iterator[DocRun]:
+    copy = StoreCopy.of(store, tmp_path)
     with running_fake_store(*store_flags, store=copy.path) as fake:
         env = ProgramEnv.under(tmp_path / 'run', fake.url)
         project = tmp_path / 'project'
@@ -208,6 +208,14 @@ def test_inv13_a_store_without_program_tasks_says_so_instead_of_an_empty_table(r
     assert not [line for line in filed if line.startswith('|')]
 
 
+def test_the_trigger_chain_names_the_completion_gate_once_it_is_filed(tmp_path: Path) -> None:
+    with _doc_run(tmp_path, store='store-final.json') as run:
+        filed = _section(_rendered(run), FILED)
+
+    assert any(re.search(r'completion gate 111\b', line) for line in filed)
+    assert not any('no completion_gate task' in line for line in filed)
+
+
 def test_b11_a_store_that_dropped_include_rows_renders_nothing(tmp_path: Path) -> None:
     with _doc_run(tmp_path, '--no-include-rows') as run:
         proc = run.doc()
@@ -255,6 +263,18 @@ def test_b12_a_superseded_ruling_shows_only_its_successor_naming_it(run: DocRun)
     assert 'supersedes D1' in d2
     assert not [line for line in decisions if line.startswith('- D1 ')]
     assert not [line for line in decisions if 'alpha owns C1' in line]
+
+
+def test_a_decision_shows_only_the_fields_its_ruling_gives(run: DocRun) -> None:
+    proc = run.env.run('record.py', 'rule', '--run', RUN_ID, '--by', 'lead', '--question', 'q?',
+                       '--ruling', 'keep the name', '--source', 'sitting 1')
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    l1 = _bullet(_section(_rendered(run), DECISIONS), 'L1')
+
+    assert 'source: sitting 1' in l1 and 'ruling: keep the name' in l1
+    for empty in ('options:', 'consequence:', 'keys:', 'answers:', 'stream:'):
+        assert empty not in l1, l1
 
 
 def test_a_reask_ruling_is_marked_as_one(run: DocRun) -> None:
@@ -389,12 +409,8 @@ def test_render_flags_outside_a_render_are_usage_errors(
     assert flag in proc.stderr
 
 
-DOC_PATHS = (
-    f'plans/{DOC_NAME}',
-    'plans/review-all-program-fixture-20261019.state/program.json',
-    'plans/review-all-program-fixture-20261019.state/rulings.jsonl',
-    'plans/review-all-program-fixture-20261019.state/ledger.jsonl',
-)
+DOC_PATH = f'plans/{DOC_NAME}'
+SNAPSHOT_PATHS = tuple(f'plans/review-all-program-fixture-20261019.state/{name}' for name in STATE_FILES)
 S1_DRAFTS = ('review-all-fixture-s1-prd.md', 'review-all-fixture-s1-prd.capability-manifest.yaml')
 
 
@@ -423,11 +439,11 @@ def _published_files(run: DocRun) -> dict[str, bytes]:
 
 
 def test_b6_publish_copies_the_render_and_its_snapshot_and_lists_the_paths(decomposed: DocRun) -> None:
-    assert _publish(decomposed) == list(DOC_PATHS)
+    assert _publish(decomposed) == [*SNAPSHOT_PATHS, DOC_PATH]
 
     render = decomposed.home / 'render'
-    assert (decomposed.project / DOC_PATHS[0]).read_bytes() == decomposed.render_doc.read_bytes()
-    for path, name in zip(DOC_PATHS[1:], STATE_FILES, strict=True):
+    assert (decomposed.project / DOC_PATH).read_bytes() == decomposed.render_doc.read_bytes()
+    for path, name in zip(SNAPSHOT_PATHS, STATE_FILES, strict=True):
         assert (decomposed.project / path).read_bytes() == (render / '.state' / name).read_bytes()
     assert not list(decomposed.project.rglob('.git'))
 
@@ -437,7 +453,7 @@ def test_publish_copies_each_streams_drafts_into_plans(decomposed: DocRun) -> No
 
     paths = _publish(decomposed)
 
-    assert paths == [*DOC_PATHS, *(f'plans/{name}' for name in sorted(S1_DRAFTS))]
+    assert paths == [*SNAPSHOT_PATHS, *(f'plans/{name}' for name in sorted(S1_DRAFTS)), DOC_PATH]
     for draft in drafts:
         assert (decomposed.project / 'plans' / draft.name).read_bytes() == draft.read_bytes()
 
@@ -471,7 +487,50 @@ def test_two_streams_publishing_one_name_publish_nothing(decomposed: DocRun) -> 
     assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
     assert 'shared-name.md' in proc.stderr
     assert 'S1' in proc.stderr and 'S3' in proc.stderr
-    assert not (decomposed.project / DOC_PATHS[0]).exists()
+    assert not (decomposed.project / DOC_PATH).exists()
+
+
+@pytest.mark.parametrize('make', [
+    pytest.param(lambda entry, draft: entry.symlink_to(draft), id='symlink'),
+    pytest.param(lambda entry, draft: entry.mkdir(), id='directory'),
+])
+def test_a_draft_entry_that_is_no_regular_file_publishes_nothing(
+    decomposed: DocRun, make: Callable[[Path, Path], None],
+) -> None:
+    draft = _draft(decomposed, 'S1', S1_DRAFTS[0])
+    entry = draft.with_name('not-a-file.md')
+    make(entry, draft)
+
+    proc = decomposed.doc('--publish')
+
+    assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
+    assert f'{entry} is not a regular file' in proc.stderr
+    assert _published_files(decomposed) == {}
+
+
+def test_a_publish_that_fails_partway_names_what_it_copied_and_leaves_the_doc(
+    decomposed: DocRun,
+) -> None:
+    _draft(decomposed, 'S1', S1_DRAFTS[0])
+    (decomposed.project / 'plans' / S1_DRAFTS[0]).mkdir()
+
+    proc = decomposed.doc('--publish')
+
+    assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
+    (copied,) = re.findall(r'copied before it: (.*?); ', proc.stderr)
+    assert copied.split(', ') == list(SNAPSHOT_PATHS)
+    assert not (decomposed.project / DOC_PATH).exists()
+
+
+def test_publish_into_a_missing_plans_dir_names_it(decomposed: DocRun) -> None:
+    plans = decomposed.project / 'plans'
+    plans.rmdir()
+
+    proc = decomposed.doc('--publish')
+
+    assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
+    assert f'{plans} does not exist' in proc.stderr
+    assert not plans.exists()
 
 
 def test_publish_without_the_checkout_names_project_root(decomposed: DocRun) -> None:
@@ -516,6 +575,16 @@ def test_an_action_result_closes_the_action_on_the_roster(decomposed: DocRun) ->
     _append(decomposed, 'action_result', id='A1', state='applied', batch=1, detail='noted')
 
     assert ' · open actions 1 · ' in _roster_line(_roster(decomposed), 'S1 · ')
+
+
+def test_an_action_from_a_return_no_stream_status_names_is_refused_named(run: DocRun) -> None:
+    _append(run, 'action', id='A1', lead_op='note', task=101, target=None, text='orphan',
+            needs_human=False, **{'return': 'S9.author.json'})
+
+    proc = run.doc('--roster')
+
+    assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
+    assert 'S9.author.json' in proc.stderr and 'no stream_status line' in proc.stderr
 
 
 def test_a_ruling_closes_the_question_on_the_roster(decomposed: DocRun) -> None:
@@ -694,6 +763,26 @@ def test_a_handoff_without_the_run_record_names_the_absent_record(decomposed: Do
 
     assert any(str(decomposed.project / RECORD_PATH) in line for line in duties)
     assert not _opening(duties, '- launched_from: ')
+
+
+@pytest.mark.parametrize(('record', 'why'), [
+    pytest.param('{not json', 'is unreadable', id='not-json'),
+    pytest.param('{"method": {}}', 'carries no method.extra object', id='no-method-extra'),
+])
+def test_a_handoff_over_a_record_without_readable_duties_says_why(
+    decomposed: DocRun, record: str, why: str,
+) -> None:
+    path = decomposed.project / RECORD_PATH
+    path.write_text(record, encoding='utf-8')
+
+    proc = decomposed.doc('--handoff')
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert why in proc.stderr
+    duties = _section((decomposed.home / 'HANDOFF.md').read_text(encoding='utf-8'),
+                      '## Inherited duties')
+    (line,) = _opening(duties, '- ')
+    assert str(path) in line and why in line
 
 
 def test_the_handoff_lists_the_wave_commits_the_ledger_records(recorded: DocRun) -> None:
