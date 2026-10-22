@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import agent_result, pool_with_ids
+from _curator_helpers import agent_result, empty_corpus, pool_with_ids
 from escalation.queue import EscalationQueue
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import CapHit
@@ -399,12 +399,6 @@ async def _frozen_gate() -> UsageGate:
     return gate
 
 
-async def _an_empty_corpus(
-    self: TaskCurator, candidate: CandidateTask, project_id: str, project_root: str,
-) -> tuple[list, dict[str, int], PoolWithheld]:
-    return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-
 @pytest.mark.asyncio
 async def test_submitter_never_hangs_on_a_frozen_pool(server):
     gate = await _frozen_gate()
@@ -416,7 +410,7 @@ async def test_submitter_never_hangs_on_a_frozen_pool(server):
     await _bounded(interceptor.start())
 
     try:
-        with patch.object(TaskCurator, '_build_corpus', _an_empty_corpus):
+        with patch.object(TaskCurator, '_build_corpus', empty_corpus):
             ticket_id = await _submit(interceptor, 'Frozen work')
             answer = await _resolve(interceptor, ticket_id)
     finally:

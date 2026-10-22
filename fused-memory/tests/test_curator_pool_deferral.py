@@ -16,7 +16,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _curator_helpers import EMPTY_POOL_SIZES, agent_result, make_config, pool_with_ids, prepared
+from _curator_helpers import (
+    agent_result,
+    empty_corpus,
+    escalator_double,
+    make_config,
+    pool_with_ids,
+    prepared,
+)
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import AuthFailed, CapHit, InvocationOutcome
@@ -25,7 +32,6 @@ from shared.usage_gate import PoolFrozen, UsageGate
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.task_curator import (
     CuratorDecision,
-    PoolWithheld,
     PreparedCandidate,
     TaskCurator,
 )
@@ -57,13 +63,6 @@ async def _curate_batch(
     return await asyncio.wait_for(
         curator.curate_batch_prepared(bundles, 'p', '/x'), DEADLINE_SECS,
     )
-
-
-def _escalator() -> AsyncMock:
-    escalator = AsyncMock()
-    escalator.report_failure = AsyncMock(return_value=None)
-    escalator.report_consecutive_degraded = AsyncMock(return_value=None)
-    return escalator
 
 
 async def _frozen_gate(outcome: InvocationOutcome) -> UsageGate:
@@ -135,7 +134,7 @@ class TestCurateDefersOnUnavailablePool:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('error', [_capped, _frozen], ids=['capped', 'frozen'])
     async def test_all_accounts_capped_defers_and_reports_nothing(self, error):
-        escalator = _escalator()
+        escalator = escalator_double()
         curator = TaskCurator(config=make_config(), taskmaster=None, escalator=escalator)
 
         with patch(INVOKE, new=AsyncMock(side_effect=error())):
@@ -169,7 +168,7 @@ class TestCurateDefersOnUnavailablePool:
 
     @pytest.mark.asyncio
     async def test_a_defer_neither_advances_nor_resets_the_degraded_streak(self):
-        escalator = _escalator()
+        escalator = escalator_double()
         curator = TaskCurator(config=make_config(), taskmaster=None, escalator=escalator)
         unusable = agent_result({'action': 'bogus'})
         invoke = AsyncMock(side_effect=[unusable] * 4 + [_capped(), unusable])
@@ -232,9 +231,6 @@ class TestBatchDefersOnUnavailablePool:
         )
         invoke = AsyncMock(side_effect=[batch_failed, _capped(), _capped()])
 
-        async def empty_corpus(*_args, **_kwargs):
-            return [], dict(EMPTY_POOL_SIZES), PoolWithheld()
-
         with patch(INVOKE, new=invoke), \
              patch.object(curator, '_build_corpus', side_effect=empty_corpus):
             decisions = await _curate_batch(curator, [prepared('A'), prepared('B')])
@@ -245,7 +241,7 @@ class TestBatchDefersOnUnavailablePool:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('error', [_capped, _frozen], ids=['capped', 'frozen'])
     async def test_curate_batch_prepared_never_raises_pool_unavailable(self, error):
-        escalator = _escalator()
+        escalator = escalator_double()
         curator = TaskCurator(config=make_config(), taskmaster=None, escalator=escalator)
 
         with patch(INVOKE, new=AsyncMock(side_effect=error())):

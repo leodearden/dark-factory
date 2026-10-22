@@ -13,8 +13,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _curator_helpers import (
-    EMPTY_POOL_SIZES,
     agent_result,
+    empty_corpus,
+    escalator_double,
     make_config,
     pool_with_ids,
     prepared,
@@ -28,18 +29,12 @@ from fused_memory.middleware.task_curator import (
     PoolWithheld,
     PreparedCandidate,
     TaskCurator,
+    empty_pool_sizes,
 )
 
 INVOKE = 'fused_memory.middleware.task_curator.invoke_with_cap_retry'
 DEADLINE_SECS = 30.0
 ZOT_ESCALATION_ID = 'esc-curator-7'
-
-
-def _escalator() -> AsyncMock:
-    escalator = AsyncMock()
-    escalator.report_failure = AsyncMock(return_value=None)
-    escalator.report_consecutive_degraded = AsyncMock(return_value=None)
-    return escalator
 
 
 def _curator(escalator: AsyncMock | None = None, *, breaker_cooldown: float = 600.0) -> TaskCurator:
@@ -87,11 +82,11 @@ async def _open_breaker(curator: TaskCurator, project_id: str = 'p') -> None:
 class TestCurateDefersOnCuratorOutage:
     @pytest.mark.asyncio
     async def test_a_failed_corpus_defers_and_is_not_cached(self):
-        escalator = _escalator()
+        escalator = escalator_double()
         curator = _curator(escalator)
         corpus = AsyncMock(side_effect=[
             RuntimeError('qdrant down'),
-            (pool_with_ids(('42', 'pending')), {**EMPTY_POOL_SIZES, 'module': 1}, PoolWithheld()),
+            (pool_with_ids(('42', 'pending')), {**empty_pool_sizes(), 'module': 1}, PoolWithheld()),
         ])
         invoke = AsyncMock(return_value=_combine_into_42())
 
@@ -107,7 +102,7 @@ class TestCurateDefersOnCuratorOutage:
 
     @pytest.mark.asyncio
     async def test_a_non_zot_llm_failure_defers_and_keeps_its_diagnostics(self):
-        escalator = _escalator()
+        escalator = escalator_double()
         curator = _curator(escalator)
         invoke = AsyncMock(return_value=_max_turns())
 
@@ -127,7 +122,7 @@ class TestCurateDefersOnCuratorOutage:
         ids=['runtime-error', 'claude-binary-missing'],
     )
     async def test_an_unexpected_llm_exception_defers_and_reports(self, error):
-        escalator = _escalator()
+        escalator = escalator_double()
         curator = _curator(escalator)
 
         with patch(INVOKE, new=AsyncMock(side_effect=error)):
@@ -140,7 +135,7 @@ class TestCurateDefersOnCuratorOutage:
 
     @pytest.mark.asyncio
     async def test_an_open_breaker_defers_without_calling_the_llm(self):
-        curator = _curator(_escalator())
+        curator = _curator(escalator_double())
         await _open_breaker(curator)
         invoke = AsyncMock(return_value=zot_agent_result())
 
@@ -154,7 +149,7 @@ class TestCurateDefersOnCuratorOutage:
 
     @pytest.mark.asyncio
     async def test_a_zot_on_the_candidates_own_call_still_creates(self):
-        escalator = _escalator()
+        escalator = escalator_double()
         escalator.report_failure = AsyncMock(return_value=ZOT_ESCALATION_ID)
         curator = _curator(escalator)
 
@@ -167,7 +162,7 @@ class TestCurateDefersOnCuratorOutage:
 
     @pytest.mark.asyncio
     async def test_a_defer_neither_advances_nor_resets_the_degraded_streak(self):
-        escalator = _escalator()
+        escalator = escalator_double()
         cooldown = 0.2
         curator = _curator(escalator, breaker_cooldown=cooldown)
         unusable = agent_result({'action': 'bogus'})
@@ -212,14 +207,10 @@ async def _curate_batch(
     )
 
 
-async def _empty_corpus(*_args, **_kwargs):
-    return [], dict(EMPTY_POOL_SIZES), PoolWithheld()
-
-
 class TestBatchDefersOnCuratorOutage:
     @pytest.mark.asyncio
     async def test_a_failed_corpus_bundle_defers_and_stays_out_of_the_prompt(self):
-        curator = _curator(_escalator())
+        curator = _curator(escalator_double())
         batch = [
             prepared('Healthy alpha'),
             prepared('Broken beta', corpus_error='qdrant down'),
@@ -245,7 +236,7 @@ class TestBatchDefersOnCuratorOutage:
 
     @pytest.mark.asyncio
     async def test_an_open_breaker_defers_every_llm_bound_candidate(self):
-        curator = _curator(_escalator())
+        curator = _curator(escalator_double())
         await _open_breaker(curator)
         invoke = AsyncMock(return_value=zot_agent_result())
 
@@ -263,7 +254,7 @@ class TestBatchDefersOnCuratorOutage:
 
     @pytest.mark.asyncio
     async def test_breaker_deferrals_neither_advance_nor_reset_the_degraded_streak(self):
-        escalator = _escalator()
+        escalator = escalator_double()
         cooldown = 0.2
         curator = _curator(escalator, breaker_cooldown=cooldown)
         unusable = agent_result({'action': 'bogus'})
@@ -285,14 +276,14 @@ class TestBatchDefersOnCuratorOutage:
 
     @pytest.mark.asyncio
     async def test_failed_bisect_leaves_defer(self):
-        curator = _curator(_escalator())
+        curator = _curator(escalator_double())
         batch_failed = AgentResult(
             success=False, output='boom', subtype='error_max_turns', cost_usd=0.0,
         )
         invoke = AsyncMock(side_effect=[batch_failed, _max_turns(), _max_turns()])
 
         with patch(INVOKE, new=invoke), \
-             patch.object(curator, '_build_corpus', side_effect=_empty_corpus):
+             patch.object(curator, '_build_corpus', side_effect=empty_corpus):
             decisions = await _curate_batch(curator, [prepared('Alpha'), prepared('Beta')])
 
         assert [(d.action, d.defer_reason) for d in decisions] == [

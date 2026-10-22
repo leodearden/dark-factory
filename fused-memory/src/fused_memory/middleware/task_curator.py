@@ -51,7 +51,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from shared.cli_invoke import (
     AgentResult,
@@ -598,6 +598,14 @@ class PoolWithheld:
         return block
 
 
+POOL_SOURCES: Final = ('anchor', 'module', 'embedding', 'dependency')
+
+
+def empty_pool_sizes() -> dict[str, int]:
+    """Per-source pool sizes of a decision reached without a corpus."""
+    return dict.fromkeys(POOL_SOURCES, 0)
+
+
 @dataclass
 class _PoolEntry:
     """One task as seen by the curator — extracted from raw taskmaster data."""
@@ -610,7 +618,7 @@ class _PoolEntry:
     module_keys: list[str]
     status: str
     priority: str
-    source: str  # anchor | module | embedding | dependency
+    source: str  # one of POOL_SOURCES
     combine_eligible: bool
 
     def render(self, desc_cap: int, details_cap: int) -> str:
@@ -1237,7 +1245,7 @@ class TaskCurator:
             action='drop',
             target_id=cached_id,
             justification='pre-llm-exact-match',
-            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            pool_sizes=empty_pool_sizes(),
             latency_ms=0,
         )
 
@@ -1310,7 +1318,7 @@ class TaskCurator:
             target_fingerprint=None,
             rewritten_task=None,
             justification=f'cancelled-premise-blocklist: {entry.name}: {entry.reason}',
-            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            pool_sizes=empty_pool_sizes(),
             latency_ms=0,
         )
         self._store_cache(payload_hash, decision)
@@ -1458,7 +1466,7 @@ class TaskCurator:
             target_fingerprint=None,
             rewritten_task=None,
             justification=f'recon-premise-refuted: {entry.name}: {entry.reason}',
-            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            pool_sizes=empty_pool_sizes(),
             latency_ms=0,
         )
         # Deliberately NOT self._store_cache(...)'d — see docstring. The guard
@@ -1680,7 +1688,7 @@ class TaskCurator:
             target_fingerprint=None,
             rewritten_task=None,
             justification=f'operational-ask-registry: {entry.name}: {entry.reason}',
-            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            pool_sizes=empty_pool_sizes(),
             latency_ms=0,
         )
         # Deliberately NOT self._store_cache(...)'d — see docstring.
@@ -1909,7 +1917,7 @@ class TaskCurator:
             )
             return CuratorDecision.deferred(
                 DeferReason.ZERO_OUTPUT_BREAKER_OPEN,
-                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                pool_sizes=empty_pool_sizes(),
                 latency_ms=int((time.monotonic() - start) * 1000),
             )
 
@@ -1931,7 +1939,7 @@ class TaskCurator:
                 )
                 return CuratorDecision.deferred(
                     DeferReason.CORPUS_FAILED,
-                    pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                    pool_sizes=empty_pool_sizes(),
                     latency_ms=int((time.monotonic() - start) * 1000),
                 )
 
@@ -2083,7 +2091,7 @@ class TaskCurator:
                 exc_info=True,
             )
             pool = []
-            pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            pool_sizes = empty_pool_sizes()
             withheld = PoolWithheld()
             corpus_error = str(exc)
         # batch_index=0 is fine for the estimate — only a couple of digits of
@@ -2244,7 +2252,7 @@ class TaskCurator:
             if refusal is not None:
                 # `replace` (not a fresh CuratorDecision) so the inherited
                 # refusal is FIELD-IDENTICAL to the one it copies — including
-                # the guards' pool_sizes={'anchor': 0, ...}/latency_ms=0
+                # the guards' pool_sizes=empty_pool_sizes()/latency_ms=0
                 # observability shape. A byte-identical duplicate should not
                 # persist a differently-shaped row in tickets.db / the decision
                 # log than the twin it inherited from. Only batch_target_index
@@ -2369,7 +2377,7 @@ class TaskCurator:
             for _k in llm_k_list:
                 decided_without_llm[_k] = CuratorDecision.deferred(
                     DeferReason.ZERO_OUTPUT_BREAKER_OPEN,
-                    pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                    pool_sizes=empty_pool_sizes(),
                     latency_ms=int((time.monotonic() - start) * 1000),
                 )
             llm_k_list = []
@@ -3063,10 +3071,7 @@ class TaskCurator:
         )
 
         pool_sizes = {
-            'anchor': sum(1 for e in pool if e.source == 'anchor'),
-            'module': sum(1 for e in pool if e.source == 'module'),
-            'embedding': sum(1 for e in pool if e.source == 'embedding'),
-            'dependency': sum(1 for e in pool if e.source == 'dependency'),
+            source: sum(1 for e in pool if e.source == source) for source in POOL_SOURCES
         }
         withheld = PoolWithheld(
             by_source={

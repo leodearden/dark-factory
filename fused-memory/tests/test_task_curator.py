@@ -16,9 +16,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _curator_helpers import agent_result as _agent_result
+from _curator_helpers import empty_corpus, escalator_double, zot_agent_result
 from _curator_helpers import make_config as _make_config
 from _curator_helpers import pool_with_ids as _pool_with_ids
-from _curator_helpers import zot_agent_result
 from shared.cli_invoke import AgentResult
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import (
@@ -62,6 +62,7 @@ from fused_memory.middleware.task_curator import (
     _trim_pool,
     clip_for_prompt,
     embedding_text,
+    empty_pool_sizes,
     exception_summary,
     flatten_task_tree,
     is_combine_eligible_status,
@@ -1241,17 +1242,11 @@ class TestConsecutiveDegradedAlarm:
 
     @staticmethod
     def _curator_with_escalator():
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
+        escalator = escalator_double()
         curator = TaskCurator(
             config=_make_config(), taskmaster=None, escalator=escalator,
         )
         return curator, escalator
-
-    @staticmethod
-    async def _empty_corpus(*a, **k):
-        return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
     @staticmethod
     async def _curate(curator, i):
@@ -1278,7 +1273,7 @@ class TestConsecutiveDegradedAlarm:
             *[_agent_result({'action': 'bogus'})] * 5,
         ]
 
-        with patch.object(curator, '_build_corpus', side_effect=self._empty_corpus), \
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
                    new=AsyncMock(side_effect=responses)):
             for i in range(5):
@@ -1309,7 +1304,7 @@ class TestConsecutiveDegradedAlarm:
         unusable = _agent_result({'action': 'bogus'})
         healthy = _agent_result({'action': 'create', 'justification': 'genuinely new'})
 
-        with patch.object(curator, '_build_corpus', side_effect=self._empty_corpus), \
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
                    new=AsyncMock(side_effect=[unusable, healthy] * 5)):
             for i in range(5):
@@ -1489,13 +1484,6 @@ class TestExceptionSummary:
         assert exception_summary(TimeoutError()) == 'TimeoutError'
 
 
-_EMPTY_POOL_SIZES = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
-
-
-async def _empty_corpus(*_args, **_kwargs):
-    return [], dict(_EMPTY_POOL_SIZES), PoolWithheld()
-
-
 async def _invocation_rows(db_path: Path) -> list[dict]:
     import aiosqlite
 
@@ -1526,7 +1514,7 @@ class TestCuratorInvocationLedger:
             {'action': 'create', 'justification': 'x'},
         ))
 
-        with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
             await curator.curate(CandidateTask(title='T'), 'proj-a', str(tmp_path))
 
@@ -1558,7 +1546,7 @@ class TestCuratorInvocationLedger:
             {'candidate_index': 1, 'action': 'create', 'justification': 'n1'},
         ]}))
 
-        with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
             await curator.curate_batch(
                 [CandidateTask(title='T0'), CandidateTask(title='T1')],
@@ -1581,7 +1569,7 @@ class TestCuratorInvocationLedger:
             {'action': 'create', 'justification': 'x'},
         ))
 
-        with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
             await curator.curate(CandidateTask(title='T'), 'proj-c', str(tmp_path))
 
@@ -1607,7 +1595,7 @@ class TestCuratorInvocationLedger:
                 structured_output={'action': 'create', 'justification': 'new work'},
                 duration_ms=1234, cost_usd=0.01,
             )
-            with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+            with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
                  patch('shared.cli_invoke.invoke_claude_agent',
                        new=AsyncMock(return_value=served)):
                 decision = await curator.curate(
@@ -1641,7 +1629,7 @@ class TestCuratorInvocationLedger:
                 success=False, output='', structured_output=None,
                 timed_out=True, duration_ms=180_000,
             )
-            with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+            with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
                  patch('shared.cli_invoke.invoke_claude_agent',
                        new=AsyncMock(return_value=hung)):
                 decision = await curator.curate(
@@ -1862,7 +1850,7 @@ class TestZeroOutputTimeoutAcceptance:
 
 def _prepared(candidate: CandidateTask) -> PreparedCandidate:
     return PreparedCandidate(
-        candidate=candidate, pool=[], pool_sizes=dict(_EMPTY_POOL_SIZES), prompt_tokens=0,
+        candidate=candidate, pool=[], pool_sizes=empty_pool_sizes(), prompt_tokens=0,
     )
 
 
@@ -2385,9 +2373,7 @@ class TestDegradedStreakBatchReset:
     def _curator_with_escalator():
         config = _make_config()
         config.curator.degraded_streak_threshold = 5
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
+        escalator = escalator_double()
         curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
         return curator, escalator
 
@@ -2638,17 +2624,11 @@ class TestPayloadFailureDegradedness:
 
     @staticmethod
     def _curator_with_escalator():
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
+        escalator = escalator_double()
         curator = TaskCurator(
             config=_make_config(), taskmaster=None, escalator=escalator,
         )
         return curator, escalator
-
-    @staticmethod
-    async def _empty_corpus(*a, **k):
-        return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
     # (marker, raw decision payload) for each payload-failure branch reachable
     # with an EMPTY pool, i.e. without a state veto intercepting first.
@@ -2696,7 +2676,7 @@ class TestPayloadFailureDegradedness:
         curator, escalator = self._curator_with_escalator()
         result = AgentResult(success=True, output='', cost_usd=0.01,
                              structured_output=payload)
-        with patch.object(curator, '_build_corpus', side_effect=self._empty_corpus), \
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
                    new=AsyncMock(return_value=result)):
             for i in range(8):
