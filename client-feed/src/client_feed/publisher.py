@@ -28,13 +28,17 @@ from client_feed.contract import (
     Heartbeat,
     NonNegativeInt,
     Source,
+    TreeFile,
+    TreeSnapshot,
 )
 from client_feed.engagement import EngagementUnusable, read_engagement
 from client_feed.envelope import Stamp
 from client_feed.feed_io import Cursor, OutDir
 from client_feed.fold import fold
+from client_feed.inbox import InboxRead, InboxUnusable, read_inbox
 from client_feed.policy import Policy
 from client_feed.redact import redact_paths
+from client_feed.reveals import RevealOutput, reveal_events
 from client_feed.sources.archive import ArchiveReadError
 from client_feed.sources.events import (
     FactoryStatus,
@@ -53,6 +57,7 @@ from client_feed.sources.tree import VisibleTree, visible_tree
 from client_feed.stream_events import Identity, StreamOutput, identity, stream_events
 from client_feed.value_events import (
     branch_event,
+    budget_event,
     factory_event,
     prd_events,
     task_events,
@@ -64,7 +69,7 @@ TASKS_RESCAN_PASSES: Final = 60
 UNKNOWN_MERGE_GRACE: Final = timedelta(hours=1)
 
 _NO_ESCALATIONS: Final = OpenEscalations(by_task=MappingProxyType({}))
-_SOURCE_ERRORS: Final = (StoreReadError, GitError, ArchiveReadError, EngagementUnusable)
+_SOURCE_ERRORS: Final = (StoreReadError, GitError, ArchiveReadError, EngagementUnusable, InboxUnusable)
 
 _log = logging.getLogger(__name__)
 
@@ -81,11 +86,16 @@ class PassReport(BaseModel):
     degraded: tuple[Degradation, ...]
 
 
-def _source_of(exc: StoreReadError | GitError | ArchiveReadError | EngagementUnusable) -> Source:
+_SourceError = StoreReadError | GitError | ArchiveReadError | EngagementUnusable | InboxUnusable
+
+
+def _source_of(exc: _SourceError) -> Source:
     if isinstance(exc, StoreReadError):
         return exc.source
     if isinstance(exc, EngagementUnusable):
         return Source.ENGAGEMENT
+    if isinstance(exc, InboxUnusable):
+        return Source.INBOX
     return Source.GIT if isinstance(exc, GitError) else Source.ARCHIVE
 
 
@@ -262,10 +272,105 @@ def _summaries_unit(
     )
 
 
+def _inbox_unit(policy: Policy, cursor: Cursor, degraded: list[Degradation]) -> InboxRead | None:
+    """The requests past the cursor's offset; lines that are no request are named, and the tail moves past them."""
+    inbox = _guarded(lambda: read_inbox(policy.in_dir, offset=cursor.inbox_offset), degraded)
+    if inbox is not None and inbox.rejected:
+        reason = f'rejected {len(inbox.rejected)} inbox lines that are not reveal requests'
+        offsets = ', '.join(str(line.offset) for line in inbox.rejected)
+        _log.warning('source %s %s (offsets %s)', Source.INBOX, reason, offsets)
+        degraded.append(Degradation(source=Source.INBOX, reason=reason))
+    return inbox
+
+
+def _head_files(git: _Git, view: FeedState) -> tuple[TreeFile, ...] | None:
+    """Head's visible files: the tree read this pass, else the state's tree when it is at head."""
+    if git.tree is not None:
+        return git.tree.files
+    if view.tree is not None and view.tree.commit == git.head:
+        return view.tree.files
+    return None
+
+
+def _reveal_work(
+    git: _Git, view: FeedState, cursor: Cursor, engagement: EngagementProjection, inbox: InboxRead | None
+) -> bool:
+    """A new tree, a request, main past where reveals were followed, or another engagement version."""
+    return (
+        git.tree is not None
+        or (inbox is not None and bool(inbox.requests))
+        or cursor.reveals_head != git.head
+        or engagement.engagement_version != view.engagement_version
+    )
+
+
+def _reveal_unit(
+    policy: Policy,
+    *,
+    git: _Git | None,
+    view: FeedState,
+    cursor: Cursor,
+    engagement: EngagementProjection | None,
+    inbox: InboxRead | None,
+    stamp: Stamp,
+    now: datetime,
+    degraded: list[Degradation],
+) -> RevealOutput | None:
+    """The reveal events at main's head, when the engagement is usable, head's files are known and there is work."""
+    if engagement is None or git is None or git.head is None:
+        return None
+    files = _head_files(git, view)
+    if files is None or not _reveal_work(git, view, cursor, engagement, inbox):
+        return None
+    head = git.head
+    return _guarded(
+        lambda: reveal_events(
+            policy.project_root,
+            policy,
+            head=head,
+            files=files,
+            engagement=engagement,
+            state=view,
+            requests=() if inbox is None else inbox.requests,
+            inbox_offset=cursor.inbox_offset if inbox is None else inbox.offset,
+            stamp=stamp,
+            now=now,
+        ),
+        degraded,
+    )
+
+
+def _tree_snapshot(
+    policy: Policy,
+    tree: VisibleTree | None,
+    reveals: RevealOutput | None,
+    view: FeedState,
+    stamp: Stamp,
+    now: datetime,
+) -> TreeSnapshot | None:
+    """A new tree with the reveal unit's budget, else PRD §4.12's null rule; with no new tree, a changed budget re-emits the state's."""
+    if tree is None:
+        return None if reveals is None else budget_event(reveals.budget, state=view, stamp=stamp, now=now)
+    if reveals is None:
+        budget = counted_set(policy, tree.files).budget([file.path for file in view.revealed])
+    else:
+        budget = reveals.budget
+    return tree_event(tree, budget=budget, stamp=stamp, now=now)
+
+
 def _advanced(
-    cursor: Cursor, *, events_id: int | None, tasks: TasksRead | None, tree: VisibleTree | None
+    cursor: Cursor,
+    *,
+    events_id: int | None,
+    tasks: TasksRead | None,
+    tree: VisibleTree | None,
+    inbox: InboxRead | None,
+    reveals: RevealOutput | None,
 ) -> Cursor:
-    """Each source position past what this pass read, where its unit succeeded; head and line counts move with the tree."""
+    """Each source position past what this pass read, where its unit succeeded; head and line counts move with the tree.
+
+    The inbox offset and reveals_head move with a reveal unit that ran; an inbox read holding no request moves its offset alone.
+    """
     update: dict[str, object] = {}
     if events_id is not None:
         update['events_id'] = events_id
@@ -273,13 +378,17 @@ def _advanced(
         update['tasks_updated_at'] = tasks.cursor
     if tree is not None:
         update |= {'head': tree.commit, 'line_counts': tree.line_counts}
+    if reveals is not None:
+        update |= {'inbox_offset': reveals.inbox_offset, 'reveals_head': reveals.reveals_head}
+    elif inbox is not None and not inbox.requests:
+        update['inbox_offset'] = inbox.offset
     return cursor.model_copy(update=update)
 
 
 def run_pass(
     policy: Policy, out: OutDir, *, now: datetime, rescan_tasks: bool = True
 ) -> PassReport:
-    """Read every source, append what is news in the order tasks, stream, factory, branches, tree, PRDs, heartbeat.
+    """Read every source, append what is news in the order tasks, stream, factory, branches, reveals, tree, PRDs, heartbeat.
 
     A source that cannot be read is named in the heartbeat's degraded and holds only its own cursor fields.
     """
@@ -304,11 +413,20 @@ def run_pass(
     )
     factory = None if store is None else factory_event(store.factory, state=view, stamp=stamp, now=now)
     branches = None if git is None else branch_event(git.branches, state=view, stamp=stamp, now=now)
+    inbox = None if engagement is None else _inbox_unit(policy, cursor, degraded)
+    reveals = _reveal_unit(
+        policy,
+        git=git,
+        view=view,
+        cursor=cursor,
+        engagement=engagement,
+        inbox=inbox,
+        stamp=stamp,
+        now=now,
+        degraded=degraded,
+    )
     tree = None if git is None or git.tree is None else git.tree
-    snapshot = None
-    if tree is not None:
-        budget = counted_set(policy, tree.files).budget([file.path for file in view.revealed])
-        snapshot = tree_event(tree, budget=budget, stamp=stamp, now=now)
+    snapshot = _tree_snapshot(policy, tree, reveals, view, stamp, now)
     prds = prd_events(
         tasks=view.tasks.values(),
         state=view,
@@ -327,12 +445,17 @@ def run_pass(
     events: list[FeedEvent] = [
         *upserts,
         *(() if stream is None else stream.events),
-        *(event for event in (factory, branches, snapshot) if event is not None),
+        *(event for event in (factory, branches) if event is not None),
+        *(() if reveals is None else reveals.events),
+        *(() if snapshot is None else (snapshot,)),
         *prds,
         heartbeat,
     ]
     events_id = None if store is None or stream is None else store.cursor
-    out.commit(events, _advanced(cursor, events_id=events_id, tasks=tasks, tree=tree))
+    advanced = _advanced(
+        cursor, events_id=events_id, tasks=tasks, tree=tree, inbox=inbox, reveals=reveals
+    )
+    out.commit(events, advanced)
     return PassReport(
         appended=len(events), watermark_seq=out.state.watermark_seq, degraded=heartbeat.degraded
     )

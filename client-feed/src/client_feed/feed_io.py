@@ -62,6 +62,7 @@ class Cursor(BaseModel):
     head: CommitSha | None = None
     inbox_offset: NonNegativeInt = 0
     line_counts: LineCounts | None = None
+    reveals_head: CommitSha | None = None
 
 
 class FeedIoProblem(StrEnum):
@@ -70,6 +71,7 @@ class FeedIoProblem(StrEnum):
     CURSOR_AHEAD = 'cursor_ahead'
     ROTATION_TARGET_EXISTS = 'rotation_target_exists'
     INBOX_REWOUND = 'inbox_rewound'
+    UNREADABLE = 'unreadable'
 
 
 class FeedIoError(Exception):

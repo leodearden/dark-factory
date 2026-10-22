@@ -417,7 +417,7 @@ def _delivered_project(tmp_path: Path, *, proportion: float) -> Project:
     )
     repo = project.repo
     c1 = repo.rev('main')
-    repo.write('src/a.py', B_FILES['src/a.py'] + numbered('grown', 60))
+    repo.write('src/a.py', numbered('a', 200) + numbered('grown', 60))
     repo.write('src/n.py', numbered('n', 30))
     repo.commit('c2', when=at(10))
     write_engagement(project.in_dir, project_id=PROJECT, delivered=c1)
