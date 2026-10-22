@@ -8,6 +8,7 @@ curator injected through the interceptor's ``curator=`` constructor argument.
 
 import asyncio
 import json
+import logging
 from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
@@ -543,6 +544,28 @@ class TestCuratorEscapeParks:
         assert await _resolve(interceptor, ticket_id) == PARKED_LLM_FAILED_ANSWER
         assert await _parked_row(store, ticket_id) == _parked(DeferReason.LLM_FAILED)
         assert taskmaster.add_task_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('escape', ['per-item-fallback', 'unprepared-backfill'])
+    async def test_a_parked_escape_logs_its_failure_against_the_ticket(
+        self, make_interceptor, caplog, escape,
+    ):
+        """The parked row records only the defer reason, so the failure itself is logged."""
+        curator = _ScriptedCurator({'Work': [CuratorFailureError('claude not on PATH')]})
+        if escape == 'per-item-fallback':
+            curator.batch_raises.append(CuratorFailureError('batch down'))
+        else:
+            curator.prepare_raises.add('Work')
+        interceptor = make_interceptor(curator)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+            ticket_id = await _submit(interceptor, 'Work')
+            assert await _resolve(interceptor, ticket_id) == PARKED_LLM_FAILED_ANSWER
+
+        assert [
+            r.levelno for r in caplog.records
+            if ticket_id in r.getMessage() and 'claude not on PATH' in r.getMessage()
+        ] == [logging.WARNING]
 
     @pytest.mark.asyncio
     async def test_a_curator_that_raises_instead_of_deciding_parks(self, make_interceptor, store, taskmaster):

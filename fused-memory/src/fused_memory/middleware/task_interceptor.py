@@ -457,22 +457,35 @@ def _format_ticket_result(row: dict) -> dict:
     return result
 
 
-def _decision_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
+def _decision_after_curator_failure(
+    ticket_id: str, exc: CuratorFailureError,
+) -> tuple[CuratorDecision, str | None]:
     """Decide a ticket whose curation raised out of ``curate()``.
 
-    A zero-output hang degrades to create with the ZOT marker, so the
+    Returns the decision and the degrade reason a create records. A
+    zero-output hang degrades to create with the ZOT marker, so the
     no-orchestrator path still gets swept and stamped even though no
     escalation could be filed for it. Any other failure defers, so the ticket
-    is parked until the curator can judge it.
+    is parked until the curator can judge it; a parked row records only its
+    defer reason, so it gets no degrade reason and the failure is logged here.
     """
     if not exc.zero_output_timeout:
-        return CuratorDecision.deferred(DeferReason.LLM_FAILED)
-    return CuratorDecision(
+        logger.warning(
+            'ticket %s: curator.curate raised CuratorFailureError, deferring curation: %s',
+            ticket_id, exc,
+        )
+        return CuratorDecision.deferred(DeferReason.LLM_FAILED), None
+    logger.warning(
+        'ticket %s: curator.curate hung with zero output, degrading to create: %s',
+        ticket_id, exc,
+    )
+    decision = CuratorDecision(
         action='create',
         justification=f'curator-failed: {exception_summary(exc)}',
         degraded=True,
         degraded_by_zot=True,
     )
+    return decision, str(exc)
 
 
 # The label a non-create decision carries when its ticket still ends in a
@@ -5362,14 +5375,9 @@ class TaskInterceptor:
                     try:
                         decision = await curator.curate(candidate, project_id, project_root)
                     except CuratorFailureError as exc:
-                        logger.warning(
-                            '_process_add_ticket: curator.curate raised CuratorFailureError '
-                            'for %s; deferring unless it hung with zero output. reason=%s',
-                            ticket_id,
-                            exc,
+                        decision, curator_degrade_reason = _decision_after_curator_failure(
+                            ticket_id, exc,
                         )
-                        curator_degrade_reason = str(exc)
-                        decision = _decision_after_curator_failure(exc)
 
                 status, task_id, reason, result_dict, _ = await self._dispatch_ticket_decision(
                     ticket_id=ticket_id,
@@ -5712,8 +5720,9 @@ class TaskInterceptor:
                                 project_root,
                             )
                         except CuratorFailureError as e:
-                            rec.decision = _decision_after_curator_failure(e)
-                            rec.degrade_reason = str(e)
+                            rec.decision, rec.degrade_reason = _decision_after_curator_failure(
+                                rec.ticket.ticket_id, e,
+                            )
                 except Exception:
                     logger.exception(
                         '_process_add_tickets_batch_prepared: '
@@ -5744,8 +5753,9 @@ class TaskInterceptor:
                             project_root,
                         )
                     except CuratorFailureError as exc:
-                        rec.decision = _decision_after_curator_failure(exc)
-                        rec.degrade_reason = str(exc)
+                        rec.decision, rec.degrade_reason = _decision_after_curator_failure(
+                            rec.ticket.ticket_id, exc,
+                        )
 
             # ── Topologically-ordered dispatch ────────────────────────────────
             # Records with a target wait for that target to be dispatched
