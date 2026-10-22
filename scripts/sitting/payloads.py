@@ -115,6 +115,10 @@ class AgreedMarker:
 def resolve_issue_payload(
     escalation_id: str, resolution: str, action: str, *, resolved_by: str, resolution_turns: int,
 ) -> ApplyPayload:
+    """The call's arguments only: the server may still refuse a legal action, e.g. ``declared_pin_refused``,
+    or ``park_on_info`` for an info-severity record (``escalation/src/escalation/server.py::resolve_issue``
+    "Gate precedence"). Any returned ``code`` stops that item's apply (``skills/escalation-watcher/SKILL.md``
+    "Applying Leo's answers, in order")."""
     if action not in RESOLVE_ACTIONS:
         raise ValueError(f'unknown resolve action {action!r}; expected one of {list(RESOLVE_ACTIONS)}')
     _require_positive_int('resolution_turns', resolution_turns)
