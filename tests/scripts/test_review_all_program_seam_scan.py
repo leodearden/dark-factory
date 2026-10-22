@@ -8,16 +8,18 @@ names, not prose.
 """
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from review_all_program_seeded_run import RUN_ID, SeededRun, seeded_run
+from review_all_program_seeded_run import FIXTURE_HOME, RUN_ID, SeededRun, seeded_run
 
 SCRIPT = 'seam_scan.py'
 LISTED = 0
+UNSCANNED = 2
 S1_PRD_PATH = 'plans/review-all-fixture-s1-prd.md'
 G4_COLUMNS = ['Other PRD', 'Direction', 'Seam mechanism', 'Owner', 'Status']
 NONE_LINE = 'no non-terminal task outside the program declares any touched path'
@@ -96,3 +98,46 @@ def test_no_candidate_prints_the_none_line(scan: SeededRun) -> None:
     assert result.returncode == LISTED, result.stdout + result.stderr
     assert _candidate_rows(result) == {}
     assert result.stdout.splitlines()[-1] == NONE_LINE
+
+
+def test_a_stream_with_no_applied_author_return_is_unscanned(scan: SeededRun) -> None:
+    result = scan.run(SCRIPT, 'S2', '--run', RUN_ID)
+
+    assert result.returncode == UNSCANNED, result.stdout + result.stderr
+    assert str(scan.home.returns_file('S2', 'author')) in result.stderr
+    assert 'author return' in result.stderr
+    assert _candidate_rows(result) == {}
+
+
+def test_a_stream_outside_the_program_is_unscanned(scan: SeededRun) -> None:
+    result = scan.run(SCRIPT, 'S9', '--run', RUN_ID)
+
+    assert result.returncode == UNSCANNED, result.stdout + result.stderr
+    for stream in ('S9', 'S1', 'S2', 'S3'):
+        assert stream in result.stderr, result.stderr
+
+
+def test_a_store_without_include_rows_is_unscanned(tmp_path: Path) -> None:
+    with seeded_run(tmp_path, returns=('S1',), store_flags=('--no-include-rows',)) as run:
+        result = _scan_s1(run)
+
+    assert result.returncode == UNSCANNED, result.stdout + result.stderr
+    assert 'include_rows' in result.stderr
+    assert NONE_LINE not in result.stdout
+
+
+def test_a_return_touching_nothing_prints_the_none_line(scan: SeededRun) -> None:
+    untouched = json.loads(FIXTURE_HOME.returns_file('S1', 'author').read_text())
+    untouched['touches'] = []
+    scan.home.returns_file('S1', 'author').write_text(json.dumps(untouched))
+
+    result = _scan_s1(scan)
+
+    assert result.returncode == LISTED, result.stdout + result.stderr
+    header = [line for line in result.stdout.splitlines() if line.startswith('seam_scan: S1')]
+    assert len(header) == 1 and re.search(r'\b0 paths\b', header[0]), result.stdout
+    assert result.stdout.splitlines()[-1] == NONE_LINE
+
+
+def test_no_run_argument_is_unscanned(scan: SeededRun) -> None:
+    assert scan.run(SCRIPT, 'S1').returncode == UNSCANNED
