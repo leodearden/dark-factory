@@ -150,8 +150,6 @@ CONFIG_DIR_ARCHIVAL_EXCEPTIONS = governed_exceptions(
     default=Policy('inv12-config-dir-unarchived-by-design'),
     default_covers=3,
     dispositions={
-        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._resume_guard_reason': Debt(TaskRef(3972)),
-        'fused-memory/src/fused_memory/reconciliation/stages/base.py::BaseStage.run': Debt(TaskRef(3972)),
         'fused-memory/src/fused_memory/middleware/task_curator.py::TaskCurator._transcript_config_dir': Debt(TaskRef(6008)),
     },
 )
@@ -214,8 +212,8 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
         'fused-memory/src/fused_memory/reconciliation/event_queue.py::EventQueue.close::c8191bbaf10a': Debt(TaskRef(6085)),
         'fused-memory/src/fused_memory/reconciliation/event_queue.py::EventQueue._commit_with_retry::93d589ee10dd': Debt(TaskRef(6085)),
         'fused-memory/src/fused_memory/reconciliation/event_queue.py::EventQueue._enqueue_on_loop::f46e02910e17': Debt(TaskRef(6085)),
-        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_one_run::361d4c634750': Debt(TicketRef('tkt_0RT88VW7RRECTHNCVTJXD6M5RJ')),
-        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._persist_stage_reports_then_gc_config_dir::361d4c634750': Debt(TicketRef('tkt_0RT88VW7RRECTHNCVTJXD6M5RJ')),
+        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_one_run::f05da1451b63': Debt(TaskRef(5270)),
+        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._persist_stage_reports_then_gc_config_dir::f05da1451b63': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_stale_runs::0787c60051a4': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_stale_runs::cc7999e2d4b6': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._resume_interrupted_runs::bc3672ec502c': Debt(TaskRef(5270)),
