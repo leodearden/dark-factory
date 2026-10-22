@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import enum
-import json
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -18,12 +17,13 @@ from typing import Any, NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import run_cli
 import state
 
 
 class Exit(enum.IntEnum):
     LISTED = 0
-    UNSCANNED = 2
+    UNSCANNED = run_cli.COULD_NOT_RUN
 
 
 _EXIT_MEANINGS: Mapping[Exit, str] = {
@@ -58,28 +58,6 @@ class Scan(NamedTuple):
     measured_at: str | None
 
 
-@dataclass(frozen=True)
-class Run:
-    """The run home and what it holds: the program, the ledger, and the authored prd paths."""
-
-    home: state.Home
-    program: state.Program
-    ledger: tuple[Mapping[str, Any], ...]
-    prd_paths: tuple[str, ...]
-
-
-def _load_run(run_id: str) -> Run:
-    home = state.run_home(run_id)
-    try:
-        data = json.loads(home.program_json.read_text())
-    except ValueError as bad:
-        raise state.StateError(f'{home.program_json} is not JSON: {bad}') from None
-    program = state.parse_program(data)
-    ledger = state.read_ledger(home)
-    views = state.stream_views(program, ledger)
-    return Run(home, program, ledger, tuple(v.prd_path for v in views.values() if v.prd_path))
-
-
 def _require_stream(program: state.Program, stream: str) -> None:
     if stream not in program.stream_ids:
         raise state.StateError(
@@ -88,7 +66,7 @@ def _require_stream(program: state.Program, stream: str) -> None:
         )
 
 
-def _parsed_return(run: Run, path: Path, reader: state.StoreReader) -> state.PrdReturn:
+def _parsed_return(run: run_cli.Run, path: Path, reader: state.StoreReader) -> state.PrdReturn:
     check = state.validate_return(
         path.read_text(), program=run.program, ledger=run.ledger, store=reader,
     )
@@ -99,7 +77,7 @@ def _parsed_return(run: Run, path: Path, reader: state.StoreReader) -> state.Prd
     return check.value
 
 
-def _author_return(run: Run, stream: str, reader: state.StoreReader) -> state.PrdReturn:
+def _author_return(run: run_cli.Run, stream: str, reader: state.StoreReader) -> state.PrdReturn:
     """The stream's applied author return, the single home of its touches."""
     path = run.home.returns_file(stream, state.Pass.AUTHOR)
     if not path.is_file():
@@ -149,7 +127,7 @@ def _candidates(
     return tuple(c for c in found if c.declared or c.anchored)
 
 
-def _scan(reader: state.StoreReader, run: Run, touches: Sequence[str]) -> Scan:
+def _scan(reader: state.StoreReader, run: run_cli.Run, touches: Sequence[str]) -> Scan:
     if not touches:
         return Scan((), None)
     reads = (
@@ -192,18 +170,12 @@ def _report(ret: state.PrdReturn, scan: Scan) -> None:
         print(NONE_LINE)
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(__doc__ or '').partition('\n')[0],
-        epilog='exit codes: ' + '; '.join(f'{int(e)} {m}' for e, m in _EXIT_MEANINGS.items()),
-    )
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('stream', help='the stream whose applied author return to scan')
-    parser.add_argument('--run', required=True, help='the run id whose home holds the return')
-    return parser
 
 
-def _scan_stream(run_id: str, stream: str) -> Exit:
-    run = _load_run(run_id)
+def _scan_stream(run: run_cli.Run, args: argparse.Namespace) -> Exit:
+    stream: str = args.stream
     _require_stream(run.program, stream)
     reader = state.open_reader(run.program)
     ret = _author_return(run, stream, reader)
@@ -212,12 +184,10 @@ def _scan_stream(run_id: str, stream: str) -> Exit:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-    try:
-        return _scan_stream(args.run, args.stream)
-    except (state.StateError, OSError) as failed:
-        print(f'seam_scan: cannot scan: {failed}', file=sys.stderr)
-        return Exit.UNSCANNED
+    return run_cli.main(
+        __doc__, _EXIT_MEANINGS, _scan_stream, failure='cannot scan',
+        add_arguments=_add_arguments, argv=argv,
+    )
 
 
 if __name__ == '__main__':

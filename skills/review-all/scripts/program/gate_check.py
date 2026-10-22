@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import enum
-import json
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -16,13 +15,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import run_cli
 import state
 
 
 class Exit(enum.IntEnum):
     CORRECT = 0
     DEFECTIVE = 1
-    UNCHECKED = 2
+    UNCHECKED = run_cli.COULD_NOT_RUN
     NO_GATE = 3
 
 
@@ -191,18 +191,6 @@ def judge(reads: Reads) -> Verdict:
     )
 
 
-def _load_home(run_id: str) -> tuple[state.Program, tuple[str, ...]]:
-    """The run's program, and the prd paths of its authored streams after the ledger."""
-    home = state.run_home(run_id)
-    try:
-        data = json.loads(home.program_json.read_text())
-    except ValueError as bad:
-        raise state.StateError(f'{home.program_json} is not JSON: {bad}') from None
-    program = state.parse_program(data)
-    views = state.stream_views(program, state.read_ledger(home))
-    return program, tuple(view.prd_path for view in views.values() if view.prd_path)
-
-
 def _read_store(
     reader: state.StoreReader, run_id: str, prd_paths: tuple[str, ...], gate_read: state.StoreRead,
 ) -> Reads:
@@ -252,34 +240,20 @@ def _report(verdict: Verdict) -> None:
         print(f'gate {gate.task_id}: correct')
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(__doc__ or '').partition('\n')[0],
-        epilog='exit codes: ' + '; '.join(f'{int(e)} {m}' for e, m in _EXIT_MEANINGS.items()),
-    )
-    parser.add_argument('--run', required=True, help='the run id whose home and gate to check')
-    return parser
-
-
-def _check(run_id: str) -> Exit:
-    program, prd_paths = _load_home(run_id)
-    reader = state.open_reader(program)
+def _check(run: run_cli.Run, _args: argparse.Namespace) -> Exit:
+    run_id = run.program.run_id
+    reader = state.open_reader(run.program)
     gate_read = reader.gate(run_id)
     if not gate_read.rows:
         print(f'no human_gate task carries trigger_chain.run_id = {run_id}')
         return Exit.NO_GATE
-    verdict = judge(_read_store(reader, run_id, prd_paths, gate_read))
+    verdict = judge(_read_store(reader, run_id, run.prd_paths, gate_read))
     _report(verdict)
     return Exit.DEFECTIVE if verdict.defects else Exit.CORRECT
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-    try:
-        return _check(args.run)
-    except (state.StateError, OSError) as failed:
-        print(f'gate_check: cannot check: {failed}', file=sys.stderr)
-        return Exit.UNCHECKED
+    return run_cli.main(__doc__, _EXIT_MEANINGS, _check, failure='cannot check', argv=argv)
 
 
 if __name__ == '__main__':

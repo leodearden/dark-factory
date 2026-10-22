@@ -8,6 +8,7 @@ the defect kind each line starts with and the task ids it names, not prose.
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
@@ -159,6 +160,19 @@ def test_a_run_with_no_home_is_unchecked(interim: SeededRun) -> None:
 
     assert result.returncode == UNCHECKED, result.stdout + result.stderr
     assert 'program.json' in result.stderr
+    _assert_unjudged(result)
+
+
+def test_a_home_holding_another_runs_program_is_unchecked(interim: SeededRun) -> None:
+    other = 'review-all-other-20261019'
+    misfiled = interim.homes_root / other / 'program.json'
+    misfiled.parent.mkdir()
+    shutil.copyfile(interim.home.program_json, misfiled)
+
+    result = interim.run(SCRIPT, '--run', other)
+
+    assert result.returncode == UNCHECKED, result.stdout + result.stderr
+    assert str(misfiled) in result.stderr and RUN_ID in result.stderr, result.stderr
     _assert_unjudged(result)
 
 
