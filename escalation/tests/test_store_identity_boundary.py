@@ -9,6 +9,8 @@ reconciliation-stage consumer side, is
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,7 @@ import pytest
 from _pending_tool_fixtures import _file
 from fastmcp import Client, FastMCP
 from fastmcp.client.client import CallToolResult
+from fastmcp.client.transports import StreamableHttpTransport
 from mcp.types import TextContent
 
 from escalation.queue import EscalationQueue
@@ -209,6 +212,31 @@ async def test_b4_description_carries_identity(
         description = tool.description or ''
         assert str(recon_identity.queue_dir) in description, tool.name
         assert 'kind=reconciliation' in description, tool.name
+
+
+def test_b5_empty_pending_read_is_attributable_to_its_store(
+    tmp_path: Path, serve_escalation_mcp: Callable[..., tuple[str, int, EscalationQueue]],
+) -> None:
+    seeding = stores.recon_queue(tmp_path)
+    identity = stores.recon_identity(seeding)
+    stage_record = _file(seeding, 'recon-run-1', agent_role='reconciliation-stage1')
+    base_url, _port, _queue = serve_escalation_mcp(seeding.queue_dir, store_identity=identity)
+
+    async def agent_on_8103() -> tuple[CallToolResult, CallToolResult, dict[str, str]]:
+        async with Client(StreamableHttpTransport(f'{base_url}/mcp/')) as client:
+            everything = await client.call_tool('get_pending_escalations', {})
+            for_task = await client.call_tool('get_pending_escalations', {'task_id': TASK})
+            tools = await client.list_tools()
+        return everything, for_task, {tool.name: tool.description or '' for tool in tools}
+
+    everything, for_task, descriptions = asyncio.run(agent_on_8103())
+
+    assert [e['id'] for e in listed(everything)] == [stage_record.id]
+    assert listed(for_task) == []
+    description = descriptions['get_pending_escalations']
+    assert str(identity.queue_dir) in description
+    assert 'kind=reconciliation' in description
+    assert 'get_task_escalation_history' in description
 
 
 @pytest.mark.asyncio
