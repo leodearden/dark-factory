@@ -321,11 +321,11 @@ path. It writes nowhere but O. The portal account reads O and nothing under R.
 | B10 | Waiting on Leo | task 9 blocked with an open `escalation_created` level 2 | `task_upserted.waiting_on == "leo"`; after `escalation_resolved`, `"factory"` |
 | B11 | Visible set | tree with `dark-factory-orchestrator.yaml`, `.mcp.json`, `plans/review.md`, `src/a.py`; policy visible `src/**`, `tests/**` | `tree_snapshot.files` lists only `src/a.py`; a reveal of `.mcp.json` is `reveal_refused not_visible` |
 | B12 | Reveal within budget | 1,000 counted lines, proportion 0.25, floor 50; request a 200-line production file | `file_revealed` with content; `spent_lines == 200` |
-| B13 | Reveal over budget and floor | spent 200 of 250; request a 100-line file; then a 10-line file | both `reveal_refused over_budget` (the second costs 50) |
+| B13 | Reveal over budget and floor | spent 210 of 250; request a 100-line file; then a 10-line file | both `reveal_refused over_budget` (the first costs 100: 310 > 250; the second costs the floor 50: 260 > 250) |
 | B14 | Free set | request a test file | granted; `spent_lines` unchanged |
 | B15 | Hostile paths | requests for `../x`, `/etc/passwd`, a symlink entry, an untracked path | four `reveal_refused` with reasons `not_in_tree`, `not_in_tree`, `symlink`, `not_in_tree`; nothing read outside the tree (B1's hook) |
 | B16 | Follow head | a revealed file changes in a later commit; another is renamed; a third deleted then recreated | re-emitted; `renamed_from`; `deleted: true` then no content until a new request |
-| B17 | Paid code free | `delivered_commit` set; a file unchanged since it | excluded from counted lines; its reveal costs 0 |
+| B17 | Paid code free | `delivered_commit` set; a file unchanged since it | outside the counted set: excluded from counted lines, and its reveal costs 0 |
 | B18 | Restart and torn tail | kill mid-append leaving a partial line; restart | the torn line is truncated and logged; no duplicate `seq`; no re-emitted `merge_landed`; `cursor.json` consistent |
 | B19 | Degraded source | runs.db unreadable | heartbeat `degraded` names `events`; other sources still publish |
 | B20 | Criteria | criteria.yaml with C-1..C-3; a junit and map binding C-1 pass, C-2 fail, none for C-3 | `criteria_results {verify}`: passed, failed, not_run |
