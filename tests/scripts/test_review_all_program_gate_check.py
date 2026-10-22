@@ -164,3 +164,71 @@ def test_a_run_with_no_home_is_unchecked(interim: SeededRun) -> None:
 
 def test_no_run_argument_is_unchecked(interim: SeededRun) -> None:
     assert interim.run(SCRIPT).returncode == UNCHECKED
+
+
+COMPLETION_GATE = 111
+ESCAPEE = 104
+ESCAPEE_PRD_PATH = 'plans/review-all-fixture-s1-prd.md'
+
+
+@pytest.fixture
+def final(tmp_path: Path) -> Iterator[SeededRun]:
+    with seeded_run(tmp_path, store='store-final.json') as run:
+        yield run
+
+
+def test_final_gate_over_a_program_with_an_untagged_open_task_is_defective(
+    final: SeededRun,
+) -> None:
+    result = _check(final)
+
+    assert result.returncode == DEFECTIVE, result.stdout + result.stderr
+    form = _lines(result, 'final form')
+    assert len(form) == 1, result.stdout
+    assert re.search(rf'human gate {GATE}\b', form[0]), form
+    assert re.search(rf'completion gate {COMPLETION_GATE}\b', form[0]), form
+    assert _task_ids(result, ESCAPES) == {ESCAPEE}
+    assert ESCAPEE_PRD_PATH in _lines(result, ESCAPES)[0]
+    assert _lines(result, MISSING) == []
+    assert _lines(result, FOREIGN) == []
+
+
+def test_final_gate_is_correct_once_the_escapee_carries_the_run(final: SeededRun) -> None:
+    final.store.edit({ESCAPEE: {'metadata': {'x_finding_run': RUN_ID}}})
+
+    _assert_correct(_check(final))
+
+
+def test_final_gate_must_depend_on_its_completion_gate_only(final: SeededRun) -> None:
+    final.store.edit({GATE: {'dependencies': [101]}})
+
+    result = _check(final)
+
+    assert result.returncode == DEFECTIVE, result.stdout + result.stderr
+    assert _task_ids(result, MISSING) == {COMPLETION_GATE}
+    assert _task_ids(result, FOREIGN) == {101}
+
+
+@pytest.mark.parametrize('status', ['cancelled', 'done'])
+def test_a_terminal_escapee_is_not_reported(final: SeededRun, status: str) -> None:
+    final.store.edit({ESCAPEE: {'status': status}})
+
+    _assert_correct(_check(final))
+
+
+def test_a_task_carrying_another_runs_tag_escapes(final: SeededRun) -> None:
+    final.store.edit({ESCAPEE: {'metadata': {'x_finding_run': 'review-all-other-20261001'}}})
+
+    result = _check(final)
+
+    assert result.returncode == DEFECTIVE, result.stdout + result.stderr
+    assert _task_ids(result, ESCAPES) == {ESCAPEE}
+
+
+def test_an_empty_final_program_is_defective(final: SeededRun) -> None:
+    final.store.keep_only({GATE, COMPLETION_GATE, 201})
+
+    result = _check(final)
+
+    assert result.returncode == DEFECTIVE, result.stdout + result.stderr
+    assert len(_lines(result, EMPTY)) == 1, result.stdout
