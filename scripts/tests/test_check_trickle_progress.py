@@ -23,9 +23,14 @@ import subprocess
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
+import pytest
 from legibility import trickle_state
+
+_BUDGET_REMEDY = trickle_state.BARREN_REMEDIES[trickle_state.BarrenDoor.BUDGET]
+_SAMPLING_CUT_REMEDY = trickle_state.BARREN_REMEDIES[
+    trickle_state.BarrenDoor.SAMPLING_CUT
+]
 
 SCRIPT = Path(__file__).parent.parent / "legibility" / "check_trickle_progress.py"
 
@@ -72,33 +77,36 @@ def _run_probe(tmp_path, *args, extra_env=None, cwd=None):
     return result, git_marker
 
 
-# Counters AND exit code per entry, so a failed streak can follow
-# productive nights in one seed. exit_code is per-ENTRY rather than
-# per-seed because that is the only shape that can express the history the
-# regression needs: productive nights, then a crash.
+# Exit code, cap deferral AND counters per entry, so a failed or deferred
+# night can follow productive or barren ones in one seed: the histories the
+# verdicts need are productive nights then a crash, and a barren streak then
+# a capped night.
 _SEED_OUTCOMES = {
-    "productive": (0, dict(selected_count=2)),
-    "quiet": (0, dict(zero_signal_dropped=5)),
-    "barren-budget": (0, dict(budget_skipped=4)),
-    "barren-cut": (0, dict(below_sampling_cut=3)),
+    "productive": (0, False, dict(selected_count=2)),
+    "quiet": (0, False, dict(zero_signal_dropped=5)),
+    "barren-budget": (0, False, dict(budget_skipped=4)),
+    "barren-cut": (0, False, dict(below_sampling_cut=3)),
     # Signal in, run broke downstream -- the 2026-08-18 reify shape.
-    "failed": (1, dict(selected_count=1)),
+    "failed": (1, False, dict(selected_count=1)),
     # Failed with NOTHING selected -- `run_nightly` pre-seeds
     # `NightlyResult(exit_code=1, ...)` BEFORE the digest stage and records
     # that sentinel when any later stage raises, so a night whose sampler
     # selected nothing (a quiet night, a codebook/merge crash, an extractor
     # crash) records `failed` with selected_count=0. Distinct seed entry
     # because the verdict's claim about WHERE the pipeline broke differs.
-    "failed-early": (1, dict()),
+    "failed-early": (1, False, dict()),
+    # Signal in, coding deferred by the usage cap at a clean exit.
+    "deferred": (0, True, dict(selected_count=2)),
 }
 
 
 def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
-          recorded_at=None):
+          recorded_at=None, escalated_on=()):
     """Build a real state file by driving record_run for each entry in
     *outcomes* (a key of :data:`_SEED_OUTCOMES`). The LAST entry's
     recorded_at is *recorded_at* (default: now), so freshness is exercised
-    against the real writer.
+    against the real writer. The entries whose positions are in
+    *escalated_on* record ``barren_escalated=True``; every other one False.
 
     The state root stays SET for the remainder of the test. It is the same
     root ``_run_probe`` pins into the child env, so nothing needs it
@@ -114,15 +122,12 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
     monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / "state"))
     stamp = recorded_at or datetime.now(UTC)
 
-    doc = None
+    state = None
     for i, outcome in enumerate(outcomes):
         # Space earlier runs a day apart, ending on `stamp`.
         at = stamp - timedelta(days=(len(outcomes) - 1 - i))
-        entry_exit_code, counters = _SEED_OUTCOMES[outcome]
-        # Annotated: without it the counter values infer as a narrow union
-        # that pyright then checks positionally against record_run's later
-        # keyword parameters when splatted as **full.
-        full: dict[str, Any] = dict(
+        entry_exit_code, capped, counters = _SEED_OUTCOMES[outcome]
+        full: dict[str, int] = dict(
             zero_signal_dropped=0, dedupe_collapsed=0, below_sampling_cut=0,
             budget_skipped=0, selected_count=0,
         )
@@ -130,15 +135,28 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
         # conservation identity by construction.
         full.update(counters)
         full["total_records"] = sum(full.values())
-        doc = trickle_state.record_run(
+        state = trickle_state.record_run(
             project_id,
-            target_date=at.date() if hasattr(at, "date") else date(2026, 7, 1),
-            recorded_at=at,
-            exit_code=entry_exit_code,
-            census=None,
-            **full,
+            trickle_state.NightRun(
+                target_date=at.date(),
+                recorded_at=at,
+                exit_code=entry_exit_code,
+                counters=trickle_state.RunCounters(**full),
+                census=None,
+                capped=capped,
+            ),
+            barren_escalated=i in escalated_on,
         )
-    return doc
+    return state
+
+
+def _rewrite_state(project_id, edit):
+    """Apply *edit* to the recorded JSON document in place, to hand-write a
+    document the current writer would not produce."""
+    path = trickle_state.trickle_state_path(project_id)
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    edit(doc)
+    path.write_text(json.dumps(doc), encoding="utf-8")
 
 
 def _assert_no_git(git_marker):
@@ -188,12 +206,17 @@ def test_probe_reads_the_path_the_writer_wrote_under_a_divergent_environment(
     monkeypatch.setenv("HOME", str(tmp_path / "writer-home"))
     trickle_state.record_run(
         "dark_factory",
-        target_date=date(2026, 7, 1),
-        recorded_at=datetime.now(UTC),
-        exit_code=0,
-        total_records=2, zero_signal_dropped=0, dedupe_collapsed=0,
-        below_sampling_cut=0, budget_skipped=0, selected_count=2,
-        census=None,
+        trickle_state.NightRun(
+            target_date=date(2026, 7, 1),
+            recorded_at=datetime.now(UTC),
+            exit_code=0,
+            counters=trickle_state.RunCounters(
+                total_records=2, zero_signal_dropped=0, dedupe_collapsed=0,
+                below_sampling_cut=0, budget_skipped=0, selected_count=2,
+            ),
+            census=None,
+        ),
+        barren_escalated=False,
     )
 
     # Asserted, not assumed: both sides must land on ONE tmp root. That is
@@ -260,15 +283,16 @@ def test_streak_above_threshold_exits_nonzero(tmp_path, monkeypatch):
 
 
 def test_budget_door_streak_names_the_budget_remedy(tmp_path, monkeypatch):
-    _seed(tmp_path, monkeypatch, outcomes=["barren-budget"] * 3)
+    _seed(tmp_path, monkeypatch, outcomes=["barren-budget"] * 3, escalated_on=(2,))
     result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
 
     assert result.returncode != 0
-    assert "max_daily_digest_bytes" in result.stderr
+    assert _BUDGET_REMEDY in result.stderr
     assert "top_fraction" not in result.stderr, (
         "the two doors have DIFFERENT remedies and must never be conflated "
         "(SampleResult's own docstring)"
     )
+    assert "barren_escalated=True" in result.stderr
     _assert_no_git(git_marker)
 
 
@@ -277,9 +301,27 @@ def test_sampling_cut_streak_names_the_sampling_remedy(tmp_path, monkeypatch):
     result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
 
     assert result.returncode != 0
-    assert "top_fraction" in result.stderr or "per_stratum_min" in result.stderr
+    assert _SAMPLING_CUT_REMEDY in result.stderr
     assert "max_daily_digest_bytes" not in result.stderr, (
         "raising the byte budget does nothing for a below_sampling_cut record"
+    )
+    assert "barren_escalated=False" in result.stderr
+    _assert_no_git(git_marker)
+
+
+@pytest.mark.parametrize(
+    ("streak", "threshold", "fails"),
+    [(2, 3, False), (3, 3, True), (4, 3, True), (4, 5, False), (5, 5, True)],
+)
+def test_the_barren_verdict_fires_once_the_streak_reaches_the_threshold(
+    tmp_path, monkeypatch, streak, threshold, fails,
+):
+    _seed(tmp_path, monkeypatch, outcomes=["barren-budget"] * streak)
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", threshold)
+
+    assert (result.returncode != 0) is fails, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
     _assert_no_git(git_marker)
 
@@ -347,6 +389,7 @@ def test_stale_recorder_exits_nonzero(tmp_path, monkeypatch):
     )
     assert "72" in result.stderr, "must name the window"
     assert "100" in result.stderr or "h" in result.stderr, "must name the age"
+    assert "barren_escalated=False" in result.stderr
     _assert_no_git(git_marker)
 
 
@@ -362,33 +405,34 @@ def test_just_inside_the_freshness_window_exits_zero(tmp_path, monkeypatch):
     _assert_no_git(git_marker)
 
 
-def test_unparseable_recorded_at_is_its_own_verdict(tmp_path, monkeypatch):
-    """Freshness that CANNOT BE ASSESSED is a third thing, distinct from
-    fresh and from stale, and it names its own remedy.
-
-    Covers the branch the shared ``trickle_state.recorded_age_hours``
-    refactor routes through: ``test_stale_recorder_exits_nonzero`` and
-    ``test_just_inside_the_freshness_window_exits_zero`` already pin the
-    age boundary, so this closes the one gap in that refactor's regression
-    net."""
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("recorded_at", "not-a-timestamp"),
+        ("outcome", "exploded"),
+        ("consecutive_barren_runs", "three"),
+    ],
+)
+def test_an_invalid_field_reads_as_the_unreadable_verdict_naming_it(
+    tmp_path, monkeypatch, field, bad_value,
+):
+    """A document the codec rejects is unreadable, whichever field broke,
+    and the verdict carries the codec's reason so the operator sees which."""
     _seed(tmp_path, monkeypatch, outcomes=["productive"])
-    path = trickle_state.trickle_state_path("dark_factory")
-    doc = json.loads(path.read_text(encoding="utf-8"))
-    doc["recorded_at"] = "not-a-timestamp"
-    path.write_text(json.dumps(doc), encoding="utf-8")
+    _rewrite_state("dark_factory", lambda doc: doc.update({field: bad_value}))
 
     result, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72)
 
-    assert result.returncode != 0, (
+    assert result.returncode == 1, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    lowered = result.stderr.lower()
-    assert "recorded_at" in lowered, "must name the field it could not read"
-    assert "freshness" in lowered and "cannot be assessed" in lowered
-    # This file's contract: every failure verdict is DISTINCT and names its
-    # OWN remedy, so an operator is never sent to the wrong one.
-    assert "barren" not in lowered
-    assert "consecutive_failed_runs" not in lowered
+    [verdict] = [
+        line for line in result.stderr.splitlines() if line.startswith("ERROR:")
+    ]
+    lowered = verdict.lower()
+    assert "unreadable" in lowered or "corrupt" in lowered
+    assert field in verdict, "the verdict must name the field it could not read"
+    assert "never recorded a run" not in lowered
     _assert_no_git(git_marker)
 
 
@@ -504,6 +548,7 @@ def test_the_failed_verdict_is_distinct_from_the_barren_one(
     assert "exit_code" in stderr or "exit code" in stderr
     assert "last_productive_at" in stderr
     assert "journalctl" in stderr, "must name where to read the crash"
+    assert "barren_escalated=False" in stderr
 
     assert "max_daily_digest_bytes" not in stderr, (
         "raising the byte budget does nothing for a run that crashed"
@@ -719,4 +764,93 @@ def test_a_barren_streak_under_a_barren_run_keeps_the_door_verdict(
         "the last run WAS barren; this is the door verdict, not the "
         "carry-forward one"
     )
+    _assert_no_git(git_marker)
+
+
+# ---------------------------------------------------------------------------
+# The recorded barren_escalated fact, and the deferred outcome (task 6744)
+# ---------------------------------------------------------------------------
+
+
+def test_the_ok_line_prints_a_recorded_escalation(tmp_path, monkeypatch):
+    _seed(tmp_path, monkeypatch, outcomes=["barren-budget"] * 3, escalated_on=(2,))
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 5)
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "last run was barren" in result.stdout
+    assert "barren_escalated=True" in result.stdout
+    _assert_no_git(git_marker)
+
+
+def test_the_ok_line_prints_no_escalation_after_a_productive_night(
+    tmp_path, monkeypatch
+):
+    _seed(tmp_path, monkeypatch, outcomes=["productive"])
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode == 0
+    assert "barren_escalated=False" in result.stdout
+    _assert_no_git(git_marker)
+
+
+def test_a_document_from_before_the_field_reads_unrecorded(tmp_path, monkeypatch):
+    _seed(tmp_path, monkeypatch, outcomes=["productive"])
+    _rewrite_state("dark_factory", lambda doc: doc.pop("barren_escalated"))
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "barren_escalated=unrecorded" in result.stdout
+    _assert_no_git(git_marker)
+
+
+def test_a_deferred_night_reads_healthy_and_keeps_last_productive_at(
+    tmp_path, monkeypatch
+):
+    productive = _seed(tmp_path, monkeypatch, outcomes=["productive"])
+    assert productive is not None and productive.last_productive_at is not None
+    _seed(tmp_path, monkeypatch, outcomes=["deferred"])
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "last run was deferred" in result.stdout
+    assert (
+        f"last_productive_at={productive.last_productive_at.isoformat()}"
+        in result.stdout
+    )
+    _assert_no_git(git_marker)
+
+
+def test_a_barren_streak_carried_under_a_deferred_night_names_the_deferral(
+    tmp_path, monkeypatch
+):
+    """A capped night coded nothing, so it re-observed neither door: the
+    streak stands unresolved, and the remedy is to wait for a completed run,
+    not to read the journal for a crash that did not happen."""
+    _seed(
+        tmp_path, monkeypatch,
+        outcomes=["barren-budget"] * 3 + ["deferred"], escalated_on=(2,),
+    )
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode == 1, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    stderr = result.stderr
+    assert "deferred" in stderr
+    assert "usage cap" in stderr
+    assert "journalctl" not in stderr
+    assert "max_daily_digest_bytes" not in stderr
+    assert "top_fraction" not in stderr
+    assert "barren_escalated=False" in stderr
     _assert_no_git(git_marker)
