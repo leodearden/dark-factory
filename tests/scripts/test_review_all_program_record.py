@@ -147,6 +147,11 @@ def _rule(env: ProgramEnv, *args: str, by: str = 'human') -> subprocess.Complete
 _HUMAN = ('--option', 'alpha', '--option', 'beta', '--consequence', 'beta imports the contract')
 
 
+def _recorded_bytes(env: ProgramEnv) -> dict[str, bytes]:
+    """The home's non-empty files: a refused append may leave an empty JSONL, which records nothing."""
+    return {path: data for path, data in env.snapshot().items() if data}
+
+
 def _rulings(env: ProgramEnv) -> tuple[Any, ...]:
     return state.read_rulings(state.Home(env.home))
 
@@ -203,11 +208,11 @@ def test_b12_a_superseding_ruling_leaves_the_superseded_line_untouched(home: Pro
 def test_rule_refuses_and_writes_nothing(
     args: tuple[str, ...], named: str, asked: ProgramEnv,
 ) -> None:
-    before = asked.snapshot()
+    before = _recorded_bytes(asked)
     proc = _rule(asked, *args)
     assert proc.returncode == 1
     assert named in _output(proc)
-    assert asked.snapshot() == before
+    assert _recorded_bytes(asked) == before
 
 
 def _line_naming(text: str, item: str) -> str:
