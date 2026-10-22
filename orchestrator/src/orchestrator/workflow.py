@@ -14833,6 +14833,10 @@ class TaskWorkflow:
                     'model_id': result.model_id,
                     'capped': capped,
                     'capped_reason': capped_reason,
+                    # How cost_usd was derived (shared.process_cost, task
+                    # 5818); mirrors the steward emitter.
+                    'cost_basis': result.cost_basis.value,
+                    'cost_delta_clamped': result.cost_delta_clamped,
                 },
             )
 
