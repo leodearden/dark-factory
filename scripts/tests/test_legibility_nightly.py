@@ -1741,8 +1741,6 @@ _AUTH_403 = {
 _CAPPED = {'is_error': True, 'rc': 1, 'result': REAL_CLI_CAP_HIT_MESSAGES[2]}
 """A verbatim cap whose "resets in 3 hours" parses to a FUTURE reset, so the
 gate's reset sweep cannot reopen the account mid-test."""
-_EXIT_ZERO_BANNER = {'result': REAL_CLI_CAP_HIT_MESSAGES[2]}
-"""The same banner delivered as an rc-0, ``is_error`` false reply (task 5637)."""
 
 
 _REAL_OPEN_POOLED_RUNNER = session_runner.open_pooled_runner
@@ -1906,16 +1904,13 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
             'a capped night is weather (task 4503): nothing belongs in journalctl -p err'
         )
 
-    @pytest.mark.parametrize(
-        'capped', [_CAPPED, _EXIT_ZERO_BANNER], ids=['nonzero-exit', 'exit-zero'],
-    )
     def test_one_capped_account_is_weather_the_digest_codes_on_the_next(
-        self, tmp_path, night, capped,
+        self, tmp_path, night,
     ):
         """The commonest night: the first account is capped, the second is
-        not. Either way the cap arrives, the digest must complete next door."""
+        not. The digest must complete next door."""
         fake, roster, _home, _opened = night
-        fake.plan({roster.token(_P): capped}, default={'result': _EMPTY_VERDICT})
+        fake.plan({roster.token(_P): _CAPPED}, default={'result': _EMPTY_VERDICT})
 
         result, _escalations = _run_one_digest_night(tmp_path)
 

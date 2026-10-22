@@ -536,7 +536,7 @@ class InvokeSlot:
 
         async with gate.invoke_slot() as slot:
             result = await run_agent(oauth_token=slot.token)
-            if slot.detect_cap_hit(result.stderr, result.output):
+            if not result.success and slot.detect_cap_hit(result.stderr, result.output):
                 continue  # probe slot released by detect_cap_hit
             slot.confirm(result.cost_usd)
             break  # probe slot released by confirm
@@ -1605,7 +1605,9 @@ class UsageGate:
             while True:
                 async with gate.invoke_slot() as slot:
                     result = await run_agent(oauth_token=slot.token)
-                    if slot.detect_cap_hit(result.stderr, result.output):
+                    if not result.success and slot.detect_cap_hit(
+                        result.stderr, result.output,
+                    ):
                         continue   # probe settled by cap detection
                     slot.confirm(result.cost_usd)
                     break          # probe settled by confirm
@@ -1642,6 +1644,10 @@ class UsageGate:
         ``_run_probe`` regime). CliLocalError now outranks CapHit/NearCap
         uniformly here, exactly as it already did at the cli_invoke layer
         (reify-3604).
+
+        Callers offer it only results that FAILED
+        (``shared/src/shared/cli_invoke.py::invoke_with_cap_retry``): a
+        successful reply that merely quotes a banner would read as a cap here.
 
         Returns True if a cap-hit or near-cap pattern was detected **and** an
         account was successfully resolved and mutated.  Returns False both when
