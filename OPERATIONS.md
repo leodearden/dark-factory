@@ -1275,10 +1275,13 @@ takes no arguments: it always re-reads that process's own
   leg declared the gate skips (`merge_reverify_gate` row `reason: same_tree`,
   `gate_retry` row `gate_clearance: same_tree`). Dark-factory ships it `true`
   with a history leg, so a same-tree rebase runs only that leg (`reason:
-  same_tree_history_leg`, `gate_clearance: history_leg`); a red leg blocks the
-  merge exactly as a red re-verify does. Green-tier for the same reason as the
-  bullet above: read per gate evaluation, and it only decides whether one more
-  verify runs.
+  same_tree_history_leg`, `gate_clearance: history_leg`). The leg runs through
+  `merge_lane/worker.py::_run_post_merge_verify` (runner `history-leg`, with
+  its own `merge_verify` row), so a red or unrunnable leg gets the same disk
+  guard, ENOSPC and infra-transient retry, transient-infra hold, main-health
+  probe, timeout loop-breaker and task-fault reason as a red re-verify.
+  Green-tier for the same reason as the bullet above: read per gate
+  evaluation, and it only decides whether one more verify runs.
 - `merge_gate_history_test_command` (task 7248; default unset). The shell
   command, run from the merge worktree root, that runs exactly the gate's
   history-reading tests. Dark-factory's leg runs the `reads_git_history`
