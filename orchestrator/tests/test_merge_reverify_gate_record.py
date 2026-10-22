@@ -24,10 +24,11 @@ from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import git_env_with_ceiling
 from df_pytest_isolation import git_redirect_env
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeOutcome, MergeRequest, QueuedBranch
+from orchestrator.merge_lane.disposition import MergeFailureDisposition
 from orchestrator.merge_lane.gates import _reverify_rebased_tree, note_queue_verified_main_tip
 from orchestrator.merge_lane.reverify_gate_decision import (
     MAX_RECORDED_OVERLAP_PATHS,
@@ -36,8 +37,13 @@ from orchestrator.merge_lane.reverify_gate_decision import (
     ReverifyGateReason,
     emit_reverify_gate_decision,
 )
-from orchestrator.merge_lane.worker import _run_post_merge_verify
+from orchestrator.merge_lane.worker import (
+    MAIN_HEALTH_RED_REASON_PREFIX,
+    TRANSIENT_INFRA_REASON_PREFIX,
+    _run_post_merge_verify,
+)
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_categories import FailureCategory
 
 _SHAS = {
     'merge_sha': 'a' * 40,
@@ -214,6 +220,16 @@ def _drift_elsewhere(repo: Path) -> str:
     return _git(repo, 'rev-parse', 'HEAD')
 
 
+_MAIN_SOURCE_FILE = 'app.py'
+
+
+def _drift_adding_a_source_file(repo: Path) -> str:
+    (repo / _MAIN_SOURCE_FILE).write_text('VALUE = 1\n')
+    _git(repo, 'add', '--', _MAIN_SOURCE_FILE)
+    _git(repo, 'commit', '-m', 'drift: a source file lands on main')
+    return _git(repo, 'rev-parse', 'HEAD')
+
+
 def _queue_landed(drift: Drift) -> Drift:
     def landed(repo: Path) -> str:
         sha = drift(repo)
@@ -312,16 +328,18 @@ async def _gate(
     *,
     merge_sha: str | None = None,
     rebased_from: str | None = None,
+    timeouts: dict[str, int] | None = None,
+    max_enospc: int = 1,
 ) -> MergeOutcome | GateClearance:
     return await _reverify_rebased_tree(
         scene.git_ops, rebased.request, rebased.merge_wt,
         verified_merge_sha=rebased.verified,
         rebased_from=rebased.rebased_from if rebased_from is None else rebased_from,
         rebased_onto=rebased.rebased_onto,
-        timeouts={},
+        timeouts={} if timeouts is None else timeouts,
         enospc_retries={},
         max_timeouts=3,
-        max_enospc=1,
+        max_enospc=max_enospc,
         merge_sha=rebased.rebased_sha if merge_sha is None else merge_sha,
         run_post_merge_verify=functools.partial(_run_post_merge_verify, verifier=verifier),
         event_store=scene.store,
@@ -339,12 +357,20 @@ def _check_out_the_verified_tree(scene: _Scene, rebased: _Rebased) -> str:
 
 
 def _history_leg_config(
-    scene: _Scene, command: str, *, history_pure: bool = True,
+    scene: _Scene, command: str, *, history_pure: bool = True, **overrides: Any,
 ) -> OrchestratorConfig:
     return scene.config(
         merge_verify_breadth='full', merge_gate_history_pure=history_pure,
-        merge_gate_history_test_command=command,
+        merge_gate_history_test_command=command, **overrides,
     )
+
+
+def _scoped_to(rebased: _Rebased, module: ModuleConfig, task_files: list[str]) -> _Rebased:
+    """*rebased* with its request scoped to *module* and *task_files*."""
+    request = dataclasses.replace(
+        rebased.request, module_configs=[module], task_files=task_files,
+    )
+    return dataclasses.replace(rebased, request=request)
 
 
 @pytest.mark.asyncio
@@ -518,6 +544,8 @@ class TestReverifyGateRecordsItsDecision:
         assert (row['reason'], row['reverify'], row['merge_sha'], row['verified_merge_sha']) == (
             'same_tree_history_leg', True, same_tree_sha, rebased.verified,
         )
+        [verify_row] = scene.verify_rows(same_tree_sha)
+        assert (verify_row['passed'], verify_row['runner']) == (True, 'history-leg'), verify_row
 
     async def test_a_red_history_leg_blocks_and_cleans_up_the_merge_worktree(
         self, tmp_path: Path,
@@ -537,6 +565,108 @@ class TestReverifyGateRecordsItsDecision:
         assert 'history leg' in outcome.reason, outcome.reason
         assert not merge_wt_survived
         assert verifier.entered_count == 0
+
+    async def test_the_disk_guard_runs_before_a_history_leg(self, tmp_path: Path) -> None:
+        scene = _scene(tmp_path)
+        disk_reason = f'{TRANSIENT_INFRA_REASON_PREFIX}: pre-verify disk guard (test)'
+        leg_head = tmp_path / 'leg-head'
+        async with _rebased_merge(
+            scene, _history_leg_config(scene, f'git rev-parse HEAD > {leg_head}'),
+            _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            outcome = await _gate(
+                scene, rebased, FakeVerifier(disk_reason=disk_reason), merge_sha=same_tree_sha,
+            )
+            merge_wt_survived = rebased.merge_wt.exists()
+
+        assert isinstance(outcome, MergeOutcome), outcome
+        assert (outcome.status, outcome.reason, outcome.verify_skipped) == (
+            'blocked', disk_reason, True,
+        )
+        assert not leg_head.exists()
+        assert not merge_wt_survived
+
+    async def test_a_persistent_enospc_history_leg_is_retried_once_then_held_as_infra(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        runs = tmp_path / 'runs'
+        leg = (
+            f"echo run >> {runs}; "
+            f"echo 'OSError: [Errno 28] No space left on device' >&2; exit 1"
+        )
+        async with _rebased_merge(
+            scene, _history_leg_config(scene, leg), _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            outcome = await _gate(
+                scene, rebased, FakeVerifier(), merge_sha=same_tree_sha, max_enospc=1,
+            )
+            merge_wt_survived = rebased.merge_wt.exists()
+
+        assert isinstance(outcome, MergeOutcome), outcome
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), outcome.reason
+        assert runs.read_text().splitlines() == ['run', 'run']
+        assert not merge_wt_survived
+
+    async def test_a_persistent_infra_transient_history_leg_is_retried_then_held(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        runs = tmp_path / 'runs'
+        leg = f"echo run >> {runs}; echo 'INTERNALERROR> boom'; exit 3"
+        async with _rebased_merge(
+            scene, _history_leg_config(scene, leg), _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            outcome = await _gate(
+                scene, rebased, FakeVerifier(), merge_sha=same_tree_sha, max_enospc=1,
+            )
+
+        assert isinstance(outcome, MergeOutcome), outcome
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), outcome.reason
+        assert FailureCategory.PYTEST_INTERNALERROR.value in outcome.reason, outcome.reason
+        assert runs.read_text().splitlines() == ['run', 'run']
+
+    async def test_a_timed_out_history_leg_feeds_the_timeout_loop_breaker(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        timeouts: dict[str, int] = {}
+        async with _rebased_merge(
+            scene,
+            _history_leg_config(scene, 'sleep 60', merge_verify_cold_command_timeout_secs=2),
+            _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            outcome = await _gate(
+                scene, rebased, FakeVerifier(), merge_sha=same_tree_sha, timeouts=timeouts,
+            )
+
+        assert isinstance(outcome, MergeOutcome), outcome
+        assert outcome.status == 'blocked', outcome
+        assert '[category: ' in outcome.reason, outcome.reason
+        assert timeouts == {rebased.request.task_id: 1}
+
+    async def test_a_history_leg_red_already_red_on_bare_main_is_main_health_red(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        red_on_main = 'echo red-on-main; exit 3'
+        config = _history_leg_config(scene, red_on_main).model_copy(
+            update={'escalate_preexisting_main_break': True},
+        )
+        async with _rebased_merge(scene, config, _drift_adding_a_source_file) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            scoped = _scoped_to(
+                rebased, ModuleConfig(prefix='', test_command=red_on_main), [_MAIN_SOURCE_FILE],
+            )
+            outcome = await _gate(scene, scoped, FakeVerifier(), merge_sha=same_tree_sha)
+
+        assert isinstance(outcome, MergeOutcome), outcome
+        assert outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), outcome.reason
+        assert outcome.disposition is MergeFailureDisposition.MAIN_RED, outcome
 
     async def test_a_declared_history_leg_does_not_run_when_the_tree_moved(
         self, tmp_path: Path,
