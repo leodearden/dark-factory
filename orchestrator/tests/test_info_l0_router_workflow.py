@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _curator_fake import FakeCurator
+from _orch_helpers import wait_responsive
 from _workflow_helpers import (
     AgentStub,
     FakeScheduler,
@@ -353,7 +354,7 @@ class TestExitFinalizerRoutesInfoNotes:
 
         workflow._drive = _drive  # type: ignore[method-assign]
         running = asyncio.create_task(workflow.run())
-        await asyncio.wait_for(driving.wait(), 10)
+        await wait_responsive(driving.wait(), label='the workflow is driving')
         await _scheduler(workflow).set_task_status(TASK_ID, 'done')
         workflow._cancel_event.set()
         report = await asyncio.wait_for(running, 10)
