@@ -133,13 +133,18 @@ def judge_interim(reads: Reads) -> tuple[Defect, ...]:
 def _load_home(run_id: str) -> tuple[state.Program, tuple[str, ...]]:
     """The run's program, and the prd paths of its authored streams after the ledger."""
     home = state.run_home(run_id)
-    program = state.parse_program(json.loads(home.program_json.read_text()))
+    try:
+        data = json.loads(home.program_json.read_text())
+    except ValueError as bad:
+        raise state.StateError(f'{home.program_json} is not JSON: {bad}') from None
+    program = state.parse_program(data)
     views = state.stream_views(program, state.read_ledger(home))
     return program, tuple(view.prd_path for view in views.values() if view.prd_path)
 
 
-def _read_store(reader: state.StoreReader, run_id: str, prd_paths: tuple[str, ...]) -> Reads:
-    gate_read = reader.gate(run_id)
+def _read_store(
+    reader: state.StoreReader, run_id: str, prd_paths: tuple[str, ...], gate_read: state.StoreRead,
+) -> Reads:
     program_read = reader.program_tasks(run_id, prd_paths)
     gate = gate_read.rows[0]
     program_ids = {row.task_id for row in program_read.rows}
@@ -186,13 +191,26 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-    program, prd_paths = _load_home(args.run)
-    reads = _read_store(state.open_reader(program), args.run, prd_paths)
+def _check(run_id: str) -> Exit:
+    program, prd_paths = _load_home(run_id)
+    reader = state.open_reader(program)
+    gate_read = reader.gate(run_id)
+    if not gate_read.rows:
+        print(f'no human_gate task carries trigger_chain.run_id = {run_id}')
+        return Exit.NO_GATE
+    reads = _read_store(reader, run_id, prd_paths, gate_read)
     verdict = Verdict(ChainForm.INTERIM, reads.gate, judge_interim(reads), reads.measured_at)
     _report(verdict)
     return Exit.DEFECTIVE if verdict.defects else Exit.CORRECT
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        return _check(args.run)
+    except (state.StateError, OSError) as failed:
+        print(f'gate_check: cannot check: {failed}', file=sys.stderr)
+        return Exit.UNCHECKED
 
 
 if __name__ == '__main__':
