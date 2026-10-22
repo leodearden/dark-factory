@@ -160,8 +160,8 @@ def _ignored_scratch_root() -> pathlib.Path:
 
 
 @contextlib.contextmanager
-def _probe_under_repo_root(source: str) -> Iterator[pathlib.Path]:
-    """A throwaway probe test file carrying *source* under REPO_ROOT, removed afterwards.
+def _probe_under_repo_root(filename: str, source: str) -> Iterator[pathlib.Path]:
+    """A throwaway probe test file *filename* carrying *source* under REPO_ROOT, removed afterwards.
 
     Inside the repo, not in ``tmp_path``: see ``PROBE_SCRATCH_ROOT`` for the
     measurement that rules ``tmp_path`` out, and for why it nests inside an
@@ -172,7 +172,7 @@ def _probe_under_repo_root(source: str) -> Iterator[pathlib.Path]:
         tempfile.mkdtemp(dir=_ignored_scratch_root(), prefix=PROBE_DIR_PREFIX)
     )
     try:
-        probe = directory / 'test_root_bound_timeout_probe.py'
+        probe = directory / filename
         probe.write_text(source, encoding='utf-8')
         yield probe
     finally:
@@ -182,7 +182,7 @@ def _probe_under_repo_root(source: str) -> Iterator[pathlib.Path]:
 @pytest.fixture
 def root_bound_probe() -> Iterator[pathlib.Path]:
     """The per-test-timeout probe, placed by ``_probe_under_repo_root``."""
-    with _probe_under_repo_root(_PROBE_SRC) as probe:
+    with _probe_under_repo_root('test_root_bound_timeout_probe.py', _PROBE_SRC) as probe:
         yield probe
 
 
@@ -323,7 +323,9 @@ def test_the_root_bound_probe_leaves_the_hosts_default_temp_root_untouched(
     before = _listing(host)
     monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
 
-    with _probe_under_repo_root(_TEMPROOT_RECORDER_SRC) as probe:
+    with _probe_under_repo_root(
+        'test_temproot_recorder_probe.py', _TEMPROOT_RECORDER_SRC,
+    ) as probe:
         result = _run_probe(probe)
         recorded = probe.with_name('inherited-temproot')
         inherited = recorded.read_text(encoding='utf-8') if recorded.exists() else None
