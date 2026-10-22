@@ -10,7 +10,7 @@ import argparse
 import enum
 import json
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,7 +28,7 @@ class Exit(enum.IntEnum):
 
 _EXIT_MEANINGS: Mapping[Exit, str] = {
     Exit.CORRECT: 'the human gate is correct',
-    Exit.DEFECTIVE: 'the human gate is defective; each defect is one line',
+    Exit.DEFECTIVE: 'the human gate is defective (one line per defect)',
     Exit.UNCHECKED: 'the check could not run (usage, run home, or store)',
     Exit.NO_GATE: 'no human_gate task carries the run',
 }
@@ -36,6 +36,7 @@ _EXIT_MEANINGS: Mapping[Exit, str] = {
 
 class ChainForm(enum.StrEnum):
     INTERIM = 'interim'
+    FINAL = 'final'
 
 
 class DefectKind(enum.StrEnum):
@@ -57,19 +58,27 @@ class Defect:
 
 @dataclass(frozen=True)
 class Reads:
-    """Everything one judgement reads: the gate, the program rows, and the gate's other deps."""
+    """Everything one judgement reads: both gates, the program rows, and the gate's other deps."""
 
     run_id: str
     prd_paths: tuple[str, ...]
     gate: state.TaskRow
+    completion_gate: state.TaskRow | None
     program: tuple[state.TaskRow, ...]
     outsiders: Mapping[int, state.TaskRow | None]
     measured_at: str
+
+    @property
+    def form(self) -> ChainForm:
+        """§3 when a completion_gate sibling is in the store, else §4."""
+        return ChainForm.INTERIM if self.completion_gate is None else ChainForm.FINAL
 
     def in_program(self, task_id: int) -> bool:
         return any(row.task_id == task_id for row in self.program)
 
     def row(self, task_id: int) -> state.TaskRow | None:
+        if self.completion_gate is not None and self.completion_gate.task_id == task_id:
+            return self.completion_gate
         for row in self.program:
             if row.task_id == task_id:
                 return row
@@ -80,6 +89,7 @@ class Reads:
 class Verdict:
     form: ChainForm
     gate: state.TaskRow
+    completion_gate: state.TaskRow | None
     defects: tuple[Defect, ...]
     measured_at: str
 
@@ -130,6 +140,57 @@ def judge_interim(reads: Reads) -> tuple[Defect, ...]:
     return (*_empty_program(reads), *missing, *foreign)
 
 
+_FINAL_RULE = "the final form's human gate depends on its completion gate only"
+
+
+def _completion_gate_missing(reads: Reads) -> tuple[Defect, ...]:
+    completion = reads.completion_gate
+    if completion is None or completion.task_id in reads.gate.dependencies:
+        return ()
+    return (Defect(
+        DefectKind.MISSING, completion.task_id,
+        f'not a dependency of the human gate: {_FINAL_RULE}', completion,
+    ),)
+
+
+def _escapee(reads: Reads, row: state.TaskRow) -> Defect:
+    tag = row.metadata.get('x_finding_run')
+    carries = 'no x_finding_run' if tag is None else f'x_finding_run {tag}'
+    return Defect(
+        DefectKind.ESCAPES, row.task_id,
+        f'prd_path {row.metadata.get("prd_path")}, {carries}: the completion measure counts '
+        f'only x_finding_run = {reads.run_id}',
+        row,
+    )
+
+
+def judge_final(reads: Reads) -> tuple[Defect, ...]:
+    """§3: the gate depends on its completion gate only, whose measure must count every open task."""
+    completion_id = reads.completion_gate.task_id if reads.completion_gate else None
+    foreign = tuple(
+        Defect(DefectKind.FOREIGN, dep, _FINAL_RULE, reads.row(dep))
+        for dep in reads.gate.dependencies if dep != completion_id
+    )
+    escapes = tuple(
+        _escapee(reads, row) for row in reads.program
+        if _is_open(row) and row.metadata.get('x_finding_run') != reads.run_id
+    )
+    return (*_empty_program(reads), *_completion_gate_missing(reads), *foreign, *escapes)
+
+
+_JUDGEMENTS: Mapping[ChainForm, Callable[[Reads], tuple[Defect, ...]]] = {
+    ChainForm.INTERIM: judge_interim,
+    ChainForm.FINAL: judge_final,
+}
+
+
+def judge(reads: Reads) -> Verdict:
+    return Verdict(
+        reads.form, reads.gate, reads.completion_gate, _JUDGEMENTS[reads.form](reads),
+        reads.measured_at,
+    )
+
+
 def _load_home(run_id: str) -> tuple[state.Program, tuple[str, ...]]:
     """The run's program, and the prd paths of its authored streams after the ledger."""
     home = state.run_home(run_id)
@@ -145,17 +206,20 @@ def _load_home(run_id: str) -> tuple[state.Program, tuple[str, ...]]:
 def _read_store(
     reader: state.StoreReader, run_id: str, prd_paths: tuple[str, ...], gate_read: state.StoreRead,
 ) -> Reads:
+    completion_read = reader.completion_gate(run_id)
     program_read = reader.program_tasks(run_id, prd_paths)
     gate = gate_read.rows[0]
-    program_ids = {row.task_id for row in program_read.rows}
+    known_ids = {row.task_id for row in (*program_read.rows, *completion_read.rows)}
     outsider_reads = {
-        dep: reader.task(dep) for dep in gate.dependencies if dep not in program_ids
+        dep: reader.task(dep) for dep in gate.dependencies if dep not in known_ids
     }
     return Reads(
-        run_id=run_id, prd_paths=prd_paths, gate=gate, program=program_read.rows,
+        run_id=run_id, prd_paths=prd_paths, gate=gate,
+        completion_gate=completion_read.rows[0] if completion_read.rows else None,
+        program=program_read.rows,
         outsiders={dep: read.rows[0] if read.rows else None for dep, read in outsider_reads.items()},
         measured_at=min(read.measured_at for read in (
-            gate_read, program_read, *outsider_reads.values())),
+            gate_read, completion_read, program_read, *outsider_reads.values())),
     )
 
 
@@ -168,16 +232,22 @@ def _subject(defect: Defect) -> str:
     return ''
 
 
+def _form_line(verdict: Verdict) -> str:
+    gates = [('human gate', verdict.gate), ('completion gate', verdict.completion_gate)]
+    named = ', '.join(f'{role} {row.task_id} ({row.status})' for role, row in gates if row)
+    return f'{verdict.form} form: {named}; store read {verdict.measured_at}'
+
+
 def _report(verdict: Verdict) -> None:
     gate = verdict.gate
-    print(f'{verdict.form} form: human gate {gate.task_id} ({gate.status}); '
-          f'store read {verdict.measured_at}')
+    print(_form_line(verdict))
     for defect in verdict.defects:
         print(f'{defect.kind}: {_subject(defect)}{defect.reason}')
     count = len(verdict.defects)
     if count:
-        noun = 'defect' if count == 1 else 'defects'
-        print(f'gate {gate.task_id}: {count} {noun}; correct them before the human commits the gate')
+        noun, pronoun = ('defect', 'it') if count == 1 else ('defects', 'them')
+        print(f'gate {gate.task_id}: {count} {noun}; correct {pronoun} before the human commits '
+              'the gate')
     else:
         print(f'gate {gate.task_id}: correct')
 
@@ -198,8 +268,7 @@ def _check(run_id: str) -> Exit:
     if not gate_read.rows:
         print(f'no human_gate task carries trigger_chain.run_id = {run_id}')
         return Exit.NO_GATE
-    reads = _read_store(reader, run_id, prd_paths, gate_read)
-    verdict = Verdict(ChainForm.INTERIM, reads.gate, judge_interim(reads), reads.measured_at)
+    verdict = judge(_read_store(reader, run_id, prd_paths, gate_read))
     _report(verdict)
     return Exit.DEFECTIVE if verdict.defects else Exit.CORRECT
 
