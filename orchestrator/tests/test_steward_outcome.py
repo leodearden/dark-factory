@@ -284,3 +284,98 @@ class TestAwaitStewardCompletionOverrideDismissesOrphanL0:
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
         wf.escalation_queue.resolve.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestAwaitStewardCompletionIsEscalationScoped:
+    """Task 5563: an outcome published for escalation X never ends a wait
+    scoped to escalation Y.
+
+    The steward works pending L0s oldest-first, so it can still be busy with
+    an older L0 A when ``_mark_blocked`` files B and starts waiting.  A's
+    outcome must be discarded rather than resolve B's wait; only B's own
+    outcome, the grace deadline or a cancel ends it.  ``escalation_id=None``
+    is the explicit unscoped mode, where any publication ends the wait.
+    """
+
+    @staticmethod
+    def _scoped_workflow(tmp_path: Path, *, timeout: float) -> TaskWorkflow:
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.steward_completion_timeout = timeout
+        wf.escalation_queue = None
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        return wf
+
+    async def test_foreign_outcome_alone_does_not_end_the_wait(
+        self, tmp_path: Path,
+    ):
+        wf = self._scoped_workflow(tmp_path, timeout=0.2)
+        wf._steward_outcome_channel.put_nowait(
+            PublishedStewardOutcome('esc-A', StewardResolved('older fixed')),
+        )
+        wf._worktree_has_wip_commits = AsyncMock(return_value=False)
+
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id='esc-B'), 5,
+        )
+
+        assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
+        assert wf._steward_outcome_channel.empty(), (
+            'the foreign outcome must be consumed and discarded, not re-buffered'
+        )
+
+    async def test_own_outcome_after_a_foreign_one_ends_the_wait(
+        self, tmp_path: Path,
+    ):
+        wf = self._scoped_workflow(tmp_path, timeout=5.0)
+        channel = wf._steward_outcome_channel
+        channel.put_nowait(
+            PublishedStewardOutcome('esc-A', StewardResolved('older fixed')),
+        )
+        own = StewardInterrupted('attempt_cap', wip_commits_present=False)
+
+        async def _publish_own() -> None:
+            await asyncio.sleep(0.05)
+            channel.put_nowait(PublishedStewardOutcome('esc-B', own))
+
+        publisher = asyncio.create_task(_publish_own())
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id='esc-B'), 5,
+        )
+        await publisher
+
+        assert outcome == own
+
+    async def test_burst_reduction_ignores_foreign_outcomes(
+        self, tmp_path: Path,
+    ):
+        wf = self._scoped_workflow(tmp_path, timeout=5.0)
+        wf._steward_outcome_channel.put_nowait(
+            PublishedStewardOutcome('esc-B', StewardResolved('mine')),
+        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-A', StewardInterrupted('timeout', wip_commits_present=False),
+        ))
+
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id='esc-B'), 5,
+        )
+
+        assert outcome == StewardResolved('mine'), (
+            "a foreign, more severe outcome must not be ranked against B's own"
+        )
+
+    async def test_unscoped_wait_accepts_any_publication(
+        self, tmp_path: Path,
+    ):
+        wf = self._scoped_workflow(tmp_path, timeout=5.0)
+        wf._steward_outcome_channel.put_nowait(
+            PublishedStewardOutcome('esc-A', StewardResolved('x')),
+        )
+
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id=None), 5,
+        )
+
+        assert outcome == StewardResolved('x')
