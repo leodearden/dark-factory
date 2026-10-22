@@ -571,11 +571,8 @@ class TestCampaignBriefing:
         assert f'repeated: {repeated}' in result.output
         run_trial.assert_not_called()
 
-    @pytest.mark.parametrize('briefings', ['d2,diff-only'])
-    def test_d2_before_diff_only_is_a_usage_error(
-        self, tmp_path: Path, briefings: str,
-    ) -> None:
-        result, run_trial = self._invoke(tmp_path, '--arms', 'variant_a', '--briefing', briefings)
+    def test_d2_before_diff_only_is_a_usage_error(self, tmp_path: Path) -> None:
+        result, run_trial = self._invoke(tmp_path, '--arms', 'variant_a', '--briefing', 'd2,diff-only')
 
         assert result.exit_code == 2, f'{result.output}\n{result.exception!r}'
         assert 'diff-only' in result.output and 'first' in result.output
