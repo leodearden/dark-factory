@@ -19,22 +19,30 @@ an adjudication log.
 
 from __future__ import annotations
 
+import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
 from orchestrator.evals.reviewer_trial.corpus import CorpusManifest
+from orchestrator.evals.reviewer_trial.key_pooling import PoolingLog, audit_pooling
 from orchestrator.evals.reviewer_trial.mining import audit_corpus
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 from orchestrator.evals.reviewer_trial.scorer import score_panel_run
 
+_REPO_ROOT = Path(__file__).parents[2]
 _PKG_DIR = (
     Path(__file__).parent.parent
     / 'src' / 'orchestrator' / 'evals' / 'reviewer_trial'
 )
 _MANIFEST_PATH = _PKG_DIR / 'corpus' / 'manifest.json'
 _ADJUDICATION_LOG_PATH = _PKG_DIR / 'corpus' / 'adjudication_log.jsonl'
+_POOLING_LOG_PATH = _PKG_DIR / 'corpus' / 'pooling_log.jsonl'
+_POOLING_RUN_2026_10_22 = (
+    'orchestrator/src/orchestrator/evals/reviewer_trial/corpus/pooling_runs/2026-10-22'
+)
 
 
 def _load_real_manifest() -> CorpusManifest:
@@ -75,6 +83,63 @@ class TestCorpusIntegrity:
     def test_documented_spot_check_subset_is_non_empty(self) -> None:
         log = AdjudicationLog.load(_ADJUDICATION_LOG_PATH)
         assert log.spot_check_subset(), 'adjudication_log has no flagged spot-check subset'
+
+
+class TestPooledAnswerKey:
+    """The pooled answer-key issues (task 7367) each carry a pooling-log
+    record, and the 2026-10-22 pooling run landed whole."""
+
+    def test_pooling_log_accounts_for_every_pooled_issue(self) -> None:
+        manifest = _load_real_manifest()
+
+        audit = audit_pooling(manifest, PoolingLog.load(_POOLING_LOG_PATH))
+
+        assert audit.ok, (
+            f'duplicate={audit.duplicate_records} dangling={audit.dangling_records} '
+            f'unrecorded={audit.unrecorded_issues}'
+        )
+
+    def test_2026_10_22_pooling_landed_whole(self) -> None:
+        manifest = _load_real_manifest()
+        records = [
+            r for r in PoolingLog.load(_POOLING_LOG_PATH).records
+            if r.pooling_run == _POOLING_RUN_2026_10_22
+        ]
+        key = {(d.diff_id, gt.id): gt for d in manifest.diffs for gt in d.ground_truth}
+
+        severities = Counter(key[(r.diff_id, r.issue_id)].severity for r in records)
+
+        assert len(records) == 201
+        assert len({r.diff_id for r in records}) == 37
+        assert severities == {'blocking': 30, 'suggestion': 171}
+        assert all(r.pooling_date == '2026-10-22' for r in records)
+        assert all(r.provenance['finding_ids'] for r in records)
+
+    def test_every_pooling_run_is_a_directory_in_this_checkout(self) -> None:
+        runs = {r.pooling_run for r in PoolingLog.load(_POOLING_LOG_PATH).records}
+
+        assert runs, 'pooling log is empty'
+        assert not [run for run in runs if not (_REPO_ROOT / run).is_dir()]
+
+    def test_2026_10_22_finding_ids_resolve_in_the_runs_unblinding_key(self) -> None:
+        run_dir = _REPO_ROOT / _POOLING_RUN_2026_10_22
+        key = json.loads((run_dir / 'pooling' / 'key' / 'key.json').read_text())
+        finding_ids = [
+            finding_id
+            for r in PoolingLog.load(_POOLING_LOG_PATH).records
+            if r.pooling_run == _POOLING_RUN_2026_10_22
+            for finding_id in r.provenance['finding_ids']
+        ]
+
+        assert finding_ids
+        assert not [finding_id for finding_id in finding_ids if finding_id not in key]
+
+    def test_adjudication_log_has_one_entry_per_diff_id(self) -> None:
+        log = AdjudicationLog.load(_ADJUDICATION_LOG_PATH)
+
+        counts = Counter(entry.diff_id for entry in log.entries)
+
+        assert not [diff_id for diff_id, n in counts.items() if n > 1]
 
 
 class TestScorerStructuralGreen:
