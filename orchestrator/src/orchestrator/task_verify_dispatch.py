@@ -8,7 +8,7 @@ downward only: this module must never import ``orchestrator.merge_lane`` or
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import functools
 import json
 import logging
 import time
@@ -269,6 +269,11 @@ def _worktree_reader(worktree: Path) -> Callable[[str], str | None]:
     return read
 
 
+async def _reap(task: asyncio.Future[Any]) -> None:
+    task.cancel()
+    await asyncio.wait({task})
+
+
 class TaskVerifyDispatcher:
     """Routes each task verify to a leased remote host or to *run_local*.
 
@@ -417,16 +422,14 @@ class TaskVerifyDispatcher:
         self, lease: HostLease, remote: asyncio.Future[VerifyResult] | None,
     ) -> None:
         """Release *lease*; a remote verify still in flight (only on cancellation) is
-        cancelled on its host first, while its dispatch is live (PRD §4.8)."""
+        cancelled on its host while its dispatch is live, then reaped, and only then is
+        its slot freed or PARKED (PRD §4.3 exclusive use, §4.8)."""
         if remote is None or remote.done():
             await self._pool.release(lease)
             return
-        try:
-            await asyncio.shield(self._pool.cancel_and_release(lease))
-        finally:
-            remote.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await remote
+        await asyncio.shield(
+            self._pool.cancel_and_release(lease, unwind=functools.partial(_reap, remote)),
+        )
 
     async def _scope_of(self, call: _VerifyCall) -> _TaskScope:
         tip = await run_git(['git', 'rev-parse', 'HEAD'], cwd=call.worktree)
