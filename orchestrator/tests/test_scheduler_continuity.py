@@ -127,24 +127,18 @@ class TestBoundedProbeOccupancy:
         assert reader.threads and reader.threads[0] != threading.get_ident()
 
     async def test_the_tick_never_waits_on_git(self, store, clock):
-        release = threading.Event()
-        blocked: list[int] = []
-
-        def blocked_reader() -> dict[str, BranchWork]:
-            blocked.append(threading.get_ident())
-            release.wait(timeout=30)
-            return {}
-
-        scheduler = _scheduler(blocked_reader, event_store=store, clock=clock)
+        reader = BlockingCall[dict[str, BranchWork]]({})
+        scheduler = _scheduler(reader, event_store=store, clock=clock)
         scheduler.get_tasks = AsyncMock(return_value=_tasks(3))
         try:
             assignment = await asyncio.wait_for(scheduler.acquire_next(), timeout=5)
             assert isinstance(assignment, TaskAssignment)
-            assert not release.is_set()
+            await reader.entered()
+            assert reader.blocked
         finally:
-            release.set()
+            reader.release()
         await scheduler.work_product.join()
-        assert len(blocked) == 1
+        assert reader.calls == 1
 
     async def test_closing_the_scheduler_abandons_a_slow_refresh_and_stops_probing(self, store, clock):
         reader = BlockingCall[dict[str, BranchWork]]({})

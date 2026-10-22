@@ -314,25 +314,20 @@ class TestWorkProductProbe:
         assert load.threads and load.threads[0] != threading.get_ident()
 
     async def test_poll_never_waits_and_never_overlaps_refreshes(self):
-        rig, counting = _Rig(), _counting_load()
-        release = threading.Event()
-
-        def blocked_load() -> WorkProductSnapshot:
-            release.wait(timeout=30)
-            return FRESH
+        rig, counting, load = _Rig(), _counting_load(), BlockingCall(FRESH)
 
         try:
             started_at = time.monotonic()
-            rig.probe.poll(blocked_load)
+            rig.probe.poll(load)
             assert time.monotonic() - started_at < 1.0
-            await asyncio.sleep(0.05)
+            await load.entered()
             assert rig.probe.snapshot is WorkProductSnapshot.EMPTY
 
             rig.clock[0] = TTL + 1
             rig.probe.poll(counting)
-            assert counting.calls == 0
+            assert load.blocked
         finally:
-            release.set()
+            load.release()
         await rig.probe.join()
 
         assert rig.probe.snapshot is FRESH
@@ -432,10 +427,13 @@ class TestWorkProductProbeClose:
     async def test_a_refresh_cancelled_before_it_first_runs_does_not_wedge_the_next_window(self):
         rig, load = _Rig(), _counting_load()
         rig.probe.poll(load)
-        [refresh] = [t for t in asyncio.all_tasks() if t.get_name() == 'continuity-probe-refresh']
+        current = asyncio.current_task()
+        stragglers = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+        assert stragglers, 'poll started no refresh for the sweep to cancel'
 
-        refresh.cancel()
-        await asyncio.wait({refresh})
+        for straggler in stragglers:
+            straggler.cancel()
+        await asyncio.wait(stragglers)
         await rig.refresh_next_window(load)
 
         assert load.calls == 1
