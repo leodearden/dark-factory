@@ -191,7 +191,7 @@ def _outcome(testcase: ET.Element) -> tuple[CaseOutcome, str | None]:
 
 
 def _case(testcase: ET.Element) -> CaseResult:
-    """A case as the junit records it, its id as the feed spells it; binding it to a criterion is the criteria join's (client-feed PRD ε)."""
+    """A case as the junit records it; binding it to a criterion is the criteria join's (client-feed PRD ε)."""
     seconds = _seconds(testcase.get('time'))
     outcome, exception_type = _outcome(testcase)
     return CaseResult(

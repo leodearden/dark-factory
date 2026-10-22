@@ -32,7 +32,6 @@ from client_feed.contract import (
     VerifyLeg,
     VerifyTestResults,
 )
-from client_feed.redact import redact_paths
 from client_feed.sources.archive import (
     ArchivedRun,
     ArchivedTests,
@@ -356,13 +355,10 @@ def test_b22_a_case_id_holding_a_path_reaches_the_feed_redacted(tmp_path: Path) 
             red('test_root[/home/someone/private/x.py]', 'failure'),
         ),
     )
-    failed_id = redact_paths('tests.test_a::test_root[/home/someone/private/x.py]')
+    failed_id = 'tests.test_a::test_root[[path]]'
 
     assert set(by_id(tests)) == {
-        redact_paths(
-            'tests.test_eval_lane_containment::'
-            'test_eval_worktree_root_is_recognised[/home/leo/src/dark-factory]'
-        ),
+        'tests.test_eval_lane_containment::test_eval_worktree_root_is_recognised[[path]]',
         failed_id,
     }
     assert by_id(tests)[failed_id].outcome is CaseOutcome.FAILED
