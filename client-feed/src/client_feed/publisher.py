@@ -328,6 +328,7 @@ def _reveal_unit(
             policy.project_root,
             policy,
             head=head,
+            since=cursor.reveals_head,
             files=files,
             engagement=engagement,
             state=view,
