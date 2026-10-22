@@ -413,7 +413,9 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     # classifies ENV_TRANSIENT. That is a branch break wearing a host label,
     # so the leg keeps its veto. The row flips back to True only once shape-1
     # carries a POSITIVE worktree-removal anchor rather than being matched by
-    # the absence of a rustc span.
+    # the absence of a rustc span, AND the scope-spawn-failure arm
+    # (``verify_classify.py::_SCOPE_SPAWN_FAILURE_RE``, task 7258) stops being
+    # text evidence that a branch could print as a leg's sole output.
     FailureCategory.ENV_TRANSIENT: CategoryPolicy(
         severity_rank=16, archive=True, preexisting_probe=False,
         is_infra_transient=True, verdict_indeterminate=False,
