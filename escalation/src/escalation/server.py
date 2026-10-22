@@ -4106,7 +4106,7 @@ def create_server(
             if _task_metadata is None:
                 _task_metadata = await git_authority.task_metadata(
                     harness,
-                    full_branch.removeprefix(orch_config.git.branch_prefix),
+                    bare_queued_branch_id(branch, orch_config.git.branch_prefix),
                     site='merge_request',
                 )
             return _task_metadata
@@ -4249,8 +4249,8 @@ def create_server(
                 if _degenerate_verdict is not None:
                     return _degenerate_verdict
                 try:
-                    # Derive the id from the branch, exactly as merge_status
-                    # does (server.py `tid = full_branch.removeprefix(prefix)`),
+                    # Derive the id from the branch, as _task_metadata_once
+                    # does through bare_queued_branch_id,
                     # NOT from the caller-supplied task_id parameter (review
                     # #6).  merge_request takes task_id and branch as two
                     # independent parameters; keying the metadata off one and
@@ -5101,9 +5101,8 @@ def create_server(
                     f'{path.name.removeprefix(gops.config.iact_prefix)}'
                 )
         else:
-            branch = path_or_branch
-            branch = canonical_queued_branch_name(branch, gops.config.branch_prefix)
-            slug = branch.removeprefix(gops.config.branch_prefix)
+            branch = canonical_queued_branch_name(path_or_branch, gops.config.branch_prefix)
+            slug = bare_queued_branch_id(path_or_branch, gops.config.branch_prefix)
             path = gops.worktree_base / f'{gops.config.iact_prefix}{slug}'
 
         # Runtime-only reverse import — mirrors claim_warm_worktree above.
@@ -5308,8 +5307,9 @@ def create_server(
         """Return the current merge state for a merge request.
 
         Accepts one of: request_id (authoritative), branch (most-recent; bare
-        or carrying the configured prefix), or task_id (most-recent).  Tiers,
-        by strength of claim
+        or carrying ``orch_config.git.branch_prefix``, matched literally when
+        no ``orch_config`` is attached), or task_id (most-recent).  Tiers, by
+        strength of claim
         (``plans/merge-status-durable-non-landed-prd.md`` D5):
 
             live snapshot → event store (this run) → git authority
