@@ -26,6 +26,7 @@ import orchestrator.digest as digest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
+from orchestrator.pause_policy import PauseClass
 from orchestrator.run_store import RunStore
 
 # ---------------------------------------------------------------------------
@@ -106,10 +107,40 @@ class TestHarnessPauseScheduler:
         """pause_scheduler() delegates to scheduler.pause() — is_paused and reason are set."""
         harness, _, _ = _make_harness_with_mocks(tmp_path)
 
-        await harness.pause_scheduler('test reason')
+        await harness.pause_scheduler('test reason', PauseClass.OPERATOR)
 
         assert harness.scheduler.is_paused is True
         assert harness.scheduler.pause_reason == 'test reason'
+
+    @pytest.mark.asyncio
+    async def test_pause_scheduler_carries_its_class(self, tmp_path: Path) -> None:
+        """The class reaches memory, the persisted row and the scheduler_paused event."""
+        harness, mock_run_store, event_store = _make_harness_with_mocks(tmp_path)
+
+        await harness.pause_scheduler('x', PauseClass.COST_CEILING)
+
+        assert harness.scheduler.pause_class is PauseClass.COST_CEILING
+        mock_run_store.save_scheduler_pause.assert_called_once()
+        assert (
+            mock_run_store.save_scheduler_pause.call_args.kwargs['pause_class']
+            is PauseClass.COST_CEILING
+        )
+        [row] = _query_events(event_store, 'scheduler_paused')
+        data = json.loads(row['data'])
+        assert data['reason'] == 'x'
+        assert data['pause_class'] == 'cost_ceiling'
+
+    @pytest.mark.asyncio
+    async def test_pause_class_survives_a_real_run_store(self, tmp_path: Path) -> None:
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        run_store = RunStore(tmp_path / 'runs.db')
+        harness._run_store = run_store
+
+        await harness.pause_scheduler('x', PauseClass.COST_CEILING)
+
+        record = run_store.load_scheduler_pause(harness.config.fused_memory.project_id)
+        assert record is not None
+        assert record['pause_class'] is PauseClass.COST_CEILING
 
     @pytest.mark.asyncio
     async def test_pause_persists_current_ewa_value(self, tmp_path: Path) -> None:
@@ -121,7 +152,7 @@ class TestHarnessPauseScheduler:
         harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
         harness._ewa_value = 73.59
 
-        await harness.pause_scheduler('ewa_trip_73.5900')
+        await harness.pause_scheduler('ewa_trip_73.5900', PauseClass.EWA_RATE)
 
         mock_run_store.save_scheduler_pause.assert_called_once()
         recorded = mock_run_store.save_scheduler_pause.call_args.kwargs.get('ewa_value')
@@ -133,9 +164,8 @@ class TestHarnessPauseScheduler:
     async def test_non_ewa_pause_also_persists_ewa_value(self, tmp_path: Path) -> None:
         """Every pause class records the EWA — it is evidence, not a trip flag.
 
-        The pause CLASS is carried by the reason string, and the restore-time
-        predicate keys on that reason, never on the presence of a value.  So a
-        park-stop pause records the EWA too: it is forensic context for the
+        The restore-time predicate keys on the pause class, never on the
+        presence of a value.  So a park-stop pause records the EWA too: it is forensic context for the
         operator reading the row, and recording it uniformly is what makes the
         evidence-vs-halt split structural to pause_scheduler rather than
         EWA-specific.
@@ -143,7 +173,7 @@ class TestHarnessPauseScheduler:
         harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
         harness._ewa_value = 4.2
 
-        await harness.pause_scheduler('park-stop: 5 blocked')
+        await harness.pause_scheduler('park-stop: 5 blocked', PauseClass.PARK_STOP)
 
         mock_run_store.save_scheduler_pause.assert_called_once()
         recorded = mock_run_store.save_scheduler_pause.call_args.kwargs.get('ewa_value')
@@ -156,7 +186,7 @@ class TestHarnessPauseScheduler:
         """pause_scheduler() calls run_store.save_scheduler_pause with the correct args."""
         harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
 
-        await harness.pause_scheduler('test reason')
+        await harness.pause_scheduler('test reason', PauseClass.OPERATOR)
 
         mock_run_store.save_scheduler_pause.assert_called_once()
         call_kwargs = mock_run_store.save_scheduler_pause.call_args
@@ -185,7 +215,7 @@ class TestHarnessPauseScheduler:
         """pause_scheduler() emits EventType.scheduler_paused with reason in data."""
         harness, _, event_store = _make_harness_with_mocks(tmp_path)
 
-        await harness.pause_scheduler('my pause reason')
+        await harness.pause_scheduler('my pause reason', PauseClass.OPERATOR)
 
         rows = _query_events(event_store, 'scheduler_paused')
         assert len(rows) == 1, f'Expected 1 scheduler_paused event; got {len(rows)}'
@@ -199,7 +229,7 @@ class TestHarnessPauseScheduler:
         """resume_scheduler() delegates to scheduler.resume() and cleans up state."""
         harness, mock_run_store, event_store = _make_harness_with_mocks(tmp_path)
 
-        await harness.pause_scheduler('will be resumed')
+        await harness.pause_scheduler('will be resumed', PauseClass.OPERATOR)
         await harness.resume_scheduler()
 
         assert harness.scheduler.is_paused is False
@@ -207,6 +237,35 @@ class TestHarnessPauseScheduler:
         mock_run_store.clear_scheduler_pause.assert_called_once()
         rows = _query_events(event_store, 'scheduler_resumed')
         assert len(rows) == 1, f'Expected 1 scheduler_resumed event; got {len(rows)}'
+
+    @pytest.mark.asyncio
+    async def test_resume_resets_ewa_for_an_ewa_rate_hold_whatever_its_reason(
+        self, tmp_path: Path,
+    ) -> None:
+        """The EWA reset follows the held class, not the reason prose (INV-1)."""
+        harness, _, event_store = _make_harness_with_mocks(tmp_path)
+        harness._ewa_value = 73.59
+        await harness.pause_scheduler('digest halt', PauseClass.EWA_RATE)
+
+        await harness.resume_scheduler()
+
+        assert harness._ewa_value == 0.0
+        [row] = _query_events(event_store, 'scheduler_resumed')
+        assert json.loads(row['data'])['pause_class'] == 'ewa_rate'
+
+    @pytest.mark.asyncio
+    async def test_resume_leaves_ewa_for_another_class_even_with_an_ewa_reason(
+        self, tmp_path: Path,
+    ) -> None:
+        harness, _, event_store = _make_harness_with_mocks(tmp_path)
+        harness._ewa_value = 73.59
+        await harness.pause_scheduler('ewa_trip_73.5900', PauseClass.OPERATOR)
+
+        await harness.resume_scheduler()
+
+        assert harness._ewa_value == pytest.approx(73.59)
+        [row] = _query_events(event_store, 'scheduler_resumed')
+        assert json.loads(row['data'])['pause_class'] == 'operator'
 
 
 class TestHarnessSchedulerParkStopWiring:
@@ -230,7 +289,9 @@ class TestHarnessSchedulerParkStopWiring:
         )
 
         # Call the callback directly (simulating a trip event fired by the scheduler).
-        await harness.scheduler._callbacks.on_park_stop_trip('integration-reason')
+        await harness.scheduler._callbacks.on_park_stop_trip(
+            'integration-reason', PauseClass.PARK_STOP,
+        )
 
         assert harness.scheduler.is_paused is True, (
             'Scheduler must be paused after the trip callback is invoked'
@@ -238,6 +299,7 @@ class TestHarnessSchedulerParkStopWiring:
         assert harness.scheduler.pause_reason == 'integration-reason', (
             f'Expected pause_reason "integration-reason"; got {harness.scheduler.pause_reason!r}'
         )
+        assert harness.scheduler.pause_class is PauseClass.PARK_STOP
 
 
 class TestHarnessRestartPersistence:
@@ -664,7 +726,8 @@ class TestSchedulerPauseEscalation:
         harness._escalation_queue = queue
 
         await harness.pause_scheduler(
-            'park-stop: 15 tasks transitioned to blocked within 1.0h (threshold=15)'
+            'park-stop: 15 tasks transitioned to blocked within 1.0h (threshold=15)',
+            PauseClass.PARK_STOP,
         )
 
         sentinel = [e for e in queue.get_pending() if e.task_id == '__scheduler__']
@@ -687,8 +750,8 @@ class TestSchedulerPauseEscalation:
         queue = EscalationQueue(tmp_path / 'esc')
         harness._escalation_queue = queue
 
-        await harness.pause_scheduler('first reason')
-        await harness.pause_scheduler('second reason')
+        await harness.pause_scheduler('first reason', PauseClass.OPERATOR)
+        await harness.pause_scheduler('second reason', PauseClass.OPERATOR)
 
         sentinel = [e for e in queue.get_pending() if e.task_id == '__scheduler__']
         assert len(sentinel) == 1, (
@@ -701,7 +764,7 @@ class TestSchedulerPauseEscalation:
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         assert harness._escalation_queue is None
         # Must not raise despite the missing queue.
-        await harness.pause_scheduler('no-queue reason')
+        await harness.pause_scheduler('no-queue reason', PauseClass.OPERATOR)
         assert harness.scheduler.is_paused is True
 
     @pytest.mark.asyncio
@@ -715,6 +778,7 @@ class TestSchedulerPauseEscalation:
             reason='park-stop: 15 tasks transitioned to blocked within 1.0h (threshold=15)',
             pause_at_iso='2026-05-27T09:00:00+00:00',
             set_by_run_id='prior-run-xyz',
+            pause_class=PauseClass.PARK_STOP,
         )
 
         harness, _, _ = _make_harness_with_mocks(tmp_path)
@@ -744,6 +808,7 @@ class TestSchedulerPauseEscalation:
             reason='park-stop: prior',
             pause_at_iso='2026-05-27T09:00:00+00:00',
             set_by_run_id='prior-run-xyz',
+            pause_class=PauseClass.PARK_STOP,
         )
 
         harness, _, _ = _make_harness_with_mocks(tmp_path)
@@ -836,7 +901,7 @@ class TestHarnessIdleWhilePaused:
         harness.scheduler.get_statuses = AsyncMock(
             return_value=({'1': 'pending'}, None),
         )
-        harness.scheduler.pause('test idle pause')
+        harness.scheduler.pause('test idle pause', PauseClass.OPERATOR)
 
         class _IdleLoopStuck(Exception):
             pass
@@ -1228,6 +1293,7 @@ class TestHarnessCostCeiling:
         assert harness.scheduler.pause_reason == 'cost_ceiling_watcher_exceeded', (
             f'Expected cost_ceiling_watcher_exceeded; got {harness.scheduler.pause_reason!r}'
         )
+        assert harness.scheduler.pause_class is PauseClass.COST_CEILING
         mock_run_store.save_scheduler_pause.assert_called_once()
         call_args = mock_run_store.save_scheduler_pause.call_args
         kwargs = {**call_args.kwargs}
@@ -1282,6 +1348,7 @@ class TestHarnessCostCeiling:
         assert harness.scheduler.pause_reason == 'cost_ceiling_orch_exceeded', (
             f'Expected cost_ceiling_orch_exceeded; got {harness.scheduler.pause_reason!r}'
         )
+        assert harness.scheduler.pause_class is PauseClass.COST_CEILING
 
     @pytest.mark.asyncio
     async def test_enforce_cost_ceilings_both_under_no_pause(
@@ -1389,7 +1456,7 @@ class TestHarnessCostCeiling:
         harness.cost_store = store
 
         # Pre-pause the scheduler.
-        await harness.pause_scheduler('pre-existing-pause')
+        await harness.pause_scheduler('pre-existing-pause', PauseClass.OPERATOR)
         mock_run_store.reset_mock()  # clear prior call count
 
         # Even with watcher rows above threshold, no new pause call should be made.
@@ -2187,6 +2254,8 @@ class TestHarnessEwaTrip:
         assert recorded_reason.startswith('ewa_trip_'), (
             f'RunStore reason must start with ewa_trip_; got {recorded_reason!r}'
         )
+        assert call_kwargs.kwargs['pause_class'] is PauseClass.EWA_RATE
+        assert harness.scheduler.pause_class is PauseClass.EWA_RATE
 
     @pytest.mark.asyncio
     async def test_ewa_trip_already_paused_no_second_pause(
@@ -2215,7 +2284,7 @@ class TestHarnessEwaTrip:
         harness._last_digest_submit_count = 0
 
         # Pre-pause the scheduler.
-        await harness.pause_scheduler('pre-existing-pause')
+        await harness.pause_scheduler('pre-existing-pause', PauseClass.OPERATOR)
         mock_run_store.reset_mock()  # clear the prior save_scheduler_pause call
 
         await harness._maybe_write_digest()
@@ -2289,7 +2358,7 @@ class TestHarnessEwaTrip:
         )
         harness.cost_store = await _cost_store_factory()
         harness._ewa_value = 73.59               # the recorded 2026-08-20 trip value
-        await harness.pause_scheduler('ewa_trip_73.5900')
+        await harness.pause_scheduler('ewa_trip_73.5900', PauseClass.EWA_RATE)
         mock_run_store.reset_mock()              # drop the pause-time save
 
         # A pure-drain window: resolutions advance the GATE, nothing advances
@@ -2338,7 +2407,7 @@ class TestHarnessEwaTrip:
         )
         harness.cost_store = await _cost_store_factory()
         harness._ewa_value = 4.2
-        await harness.pause_scheduler('park-stop: 5 blocked')
+        await harness.pause_scheduler('park-stop: 5 blocked', PauseClass.PARK_STOP)
         mock_run_store.reset_mock()
 
         harness._escalation_event_count = 10
@@ -2397,7 +2466,7 @@ class TestHarnessEwaTrip:
         )
         harness.cost_store = await _cost_store_factory()
         harness._ewa_value = 73.59
-        await harness.pause_scheduler('ewa_trip_73.5900')
+        await harness.pause_scheduler('ewa_trip_73.5900', PauseClass.EWA_RATE)
         mock_run_store.reset_mock()
         mock_run_store.refresh_scheduler_pause_ewa.side_effect = sqlite3.OperationalError(
             'database is locked'
@@ -2749,6 +2818,7 @@ class TestForceHaltScheduler:
             'was_paused': False,
             'prior_reason': None,
             'reason': 'operator halt: bad main',
+            'pause_class': 'operator',
         }
         assert harness.scheduler.is_paused is True
         assert harness.scheduler.pause_reason == 'operator halt: bad main'
@@ -2789,5 +2859,30 @@ class TestForceHaltScheduler:
         resume = await harness.force_resume_scheduler('all clear')
 
         assert resume['resumed'] is True
+        assert resume['prior_pause_class'] == 'operator'
         assert harness.scheduler.is_paused is False
         mock_run_store.clear_scheduler_pause.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_force_halt_defaults_to_the_operator_class(self, tmp_path: Path) -> None:
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+
+        result = await harness.force_halt_scheduler('quiesce for migration')
+
+        assert harness.scheduler.pause_class is PauseClass.OPERATOR
+        assert (
+            mock_run_store.save_scheduler_pause.call_args.kwargs['pause_class']
+            is PauseClass.OPERATOR
+        )
+        assert result['pause_class'] == 'operator'
+
+    @pytest.mark.asyncio
+    async def test_force_halt_persists_a_breaker_class(self, tmp_path: Path) -> None:
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+
+        await harness.force_halt_scheduler('t', pause_class=PauseClass.NO_LANDINGS)
+
+        assert (
+            mock_run_store.save_scheduler_pause.call_args.kwargs['pause_class']
+            is PauseClass.NO_LANDINGS
+        )
