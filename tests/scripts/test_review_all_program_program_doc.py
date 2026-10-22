@@ -386,3 +386,98 @@ def test_render_flags_outside_a_render_are_usage_errors(
 
     assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
     assert flag in proc.stderr
+
+
+DOC_PATHS = (
+    f'plans/{DOC_NAME}',
+    'plans/review-all-program-fixture-20261019.state/program.json',
+    'plans/review-all-program-fixture-20261019.state/rulings.jsonl',
+    'plans/review-all-program-fixture-20261019.state/ledger.jsonl',
+)
+S1_DRAFTS = ('review-all-fixture-s1-prd.md', 'review-all-fixture-s1-prd.capability-manifest.yaml')
+
+
+def _publish(run: DocRun) -> list[str]:
+    """``--publish``'s path list: the lines between its ``published`` header and ``store read``."""
+    proc = run.doc('--publish')
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = proc.stdout.splitlines()
+    (header,) = [i for i, line in enumerate(lines) if line.startswith('published ')]
+    (footer,) = [i for i, line in enumerate(lines) if line.startswith('store read ')]
+    return lines[header + 1:footer]
+
+
+def _draft(run: DocRun, stream: str, name: str) -> Path:
+    path = run.home / 'prds' / stream / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'{stream} draft {name}\n', encoding='utf-8')
+    return path
+
+
+def _published_files(run: DocRun) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(run.project)): path.read_bytes()
+        for path in sorted(run.project.rglob('*')) if path.is_file()
+    }
+
+
+def test_b6_publish_copies_the_render_and_its_snapshot_and_lists_the_paths(decomposed: DocRun) -> None:
+    assert _publish(decomposed) == list(DOC_PATHS)
+
+    render = decomposed.home / 'render'
+    assert (decomposed.project / DOC_PATHS[0]).read_bytes() == decomposed.render_doc.read_bytes()
+    for path, name in zip(DOC_PATHS[1:], STATE_FILES, strict=True):
+        assert (decomposed.project / path).read_bytes() == (render / '.state' / name).read_bytes()
+    assert not list(decomposed.project.rglob('.git'))
+
+
+def test_publish_copies_each_streams_drafts_into_plans(decomposed: DocRun) -> None:
+    drafts = [_draft(decomposed, 'S1', name) for name in S1_DRAFTS]
+
+    paths = _publish(decomposed)
+
+    assert paths == [*DOC_PATHS, *(f'plans/{name}' for name in sorted(S1_DRAFTS))]
+    for draft in drafts:
+        assert (decomposed.project / 'plans' / draft.name).read_bytes() == draft.read_bytes()
+
+
+def test_a_second_publish_over_an_unchanged_program_changes_nothing(decomposed: DocRun) -> None:
+    _draft(decomposed, 'S1', S1_DRAFTS[0])
+    first = _publish(decomposed)
+    published = _published_files(decomposed)
+
+    assert _publish(decomposed) == first
+    assert _published_files(decomposed) == published
+
+
+def test_publish_self_checks_against_the_doc_it_would_overwrite(decomposed: DocRun) -> None:
+    published = _published(decomposed, extra='\n## Coordinator interventions\n\n- by hand\n')
+    before = published.read_bytes()
+
+    proc = decomposed.doc('--publish')
+
+    assert proc.returncode == REFUSED, proc.stdout + proc.stderr
+    assert '## Coordinator interventions' in proc.stderr
+    assert published.read_bytes() == before
+
+
+def test_two_streams_publishing_one_name_publish_nothing(decomposed: DocRun) -> None:
+    _draft(decomposed, 'S1', 'shared-name.md')
+    _draft(decomposed, 'S3', 'shared-name.md')
+
+    proc = decomposed.doc('--publish')
+
+    assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
+    assert 'shared-name.md' in proc.stderr
+    assert 'S1' in proc.stderr and 'S3' in proc.stderr
+    assert not (decomposed.project / DOC_PATHS[0]).exists()
+
+
+def test_publish_without_the_checkout_names_project_root(decomposed: DocRun) -> None:
+    (decomposed.project / 'plans').rmdir()
+    decomposed.project.rmdir()
+
+    proc = decomposed.doc('--publish')
+
+    assert proc.returncode == COULD_NOT_RUN, proc.stdout + proc.stderr
+    assert 'project_root' in proc.stderr
