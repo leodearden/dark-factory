@@ -5,12 +5,12 @@ payload carries every fact and the events.duration_ms column stays NULL.
 """
 from __future__ import annotations
 
-import re
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from canary_predicate_summary import metric, n_deep_verifies, verdict
 from cli_subprocess_timeout import cli_timeout_from_env
 
 _PREDICATE = Path(__file__).resolve().parents[1] / 'merge-deep-canary-predicate.sh'
@@ -28,25 +28,6 @@ def _run(db_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
         ['bash', str(_PREDICATE), '--runs-db', str(db_path), *args],
         capture_output=True, text=True, timeout=_PREDICATE_TIMEOUT,
     )
-
-
-def _metric(stdout: str, name: str) -> float | None:
-    match = re.search(rf'{name}=([^(]+)\(', stdout)
-    assert match, stdout
-    raw = match.group(1)
-    return None if raw == 'n/a' else float(raw)
-
-
-def _verdict(stdout: str, name: str) -> str:
-    match = re.search(rf'{name}=[^(]+\((\w+) ', stdout)
-    assert match, stdout
-    return match.group(1)
-
-
-def _n_deep(stdout: str) -> int:
-    match = re.search(r'n_deep_verifies=(\d+)', stdout)
-    assert match, stdout
-    return int(match.group(1))
 
 
 def _seed_verify(conn, ts: datetime, *, passed: bool, duration_ms=_ABSENT, chain_items: int = 2):
@@ -87,9 +68,9 @@ class TestVerifyP90ReadsThePayloadDuration:
         result = _run(runs_db_path)
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
-        assert _metric(result.stdout, 'verify_p90_secs') == 540.0
-        assert _metric(result.stdout, 'deep_fail_rate') == 0.0
-        assert _metric(result.stdout, 'items_per_verify') == 2.0
+        assert metric(result.stdout, 'verify_p90_secs') == 540.0
+        assert metric(result.stdout, 'deep_fail_rate') == 0.0
+        assert metric(result.stdout, 'items_per_verify') == 2.0
 
     def test_p90_over_the_bound_holds(self, runs_db_path, runs_db):
         for i, duration_ms in enumerate((6_000_000, 7_000_000)):
@@ -99,10 +80,10 @@ class TestVerifyP90ReadsThePayloadDuration:
         result = _run(runs_db_path)
 
         assert result.returncode == 1, f'{result.stdout=} {result.stderr=}'
-        assert _metric(result.stdout, 'verify_p90_secs') == 7000.0
-        assert _verdict(result.stdout, 'verify_p90_secs') == 'FAIL'
-        assert _verdict(result.stdout, 'deep_fail_rate') == 'ok'
-        assert _verdict(result.stdout, 'items_per_verify') == 'ok'
+        assert metric(result.stdout, 'verify_p90_secs') == 7000.0
+        assert verdict(result.stdout, 'verify_p90_secs') == 'FAIL'
+        assert verdict(result.stdout, 'deep_fail_rate') == 'ok'
+        assert verdict(result.stdout, 'items_per_verify') == 'ok'
 
     def test_non_numeric_payload_durations_are_not_durations(self, runs_db_path, runs_db):
         for i, duration_ms in enumerate((True, None, '600000', _ABSENT, 300_000)):
@@ -112,7 +93,7 @@ class TestVerifyP90ReadsThePayloadDuration:
         result = _run(runs_db_path)
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
-        assert _metric(result.stdout, 'verify_p90_secs') == 300.0
+        assert metric(result.stdout, 'verify_p90_secs') == 300.0
 
 
 class TestWindowEdges:
@@ -123,10 +104,10 @@ class TestWindowEdges:
         result = _run(runs_db_path, *_NOW_ARGS)
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
-        assert _n_deep(result.stdout) == 1
-        assert _metric(result.stdout, 'deep_fail_rate') == 0.0
-        assert _metric(result.stdout, 'items_per_verify') == 2.0
-        assert _metric(result.stdout, 'verify_p90_secs') == 600.0
+        assert n_deep_verifies(result.stdout) == 1
+        assert metric(result.stdout, 'deep_fail_rate') == 0.0
+        assert metric(result.stdout, 'items_per_verify') == 2.0
+        assert metric(result.stdout, 'verify_p90_secs') == 600.0
 
     def test_window_is_half_open_at_the_cutoff_and_closed_at_now(self, runs_db_path, runs_db):
         _seed_intruder(runs_db, _CUTOFF, finalized_ts=_CUTOFF)
@@ -135,7 +116,7 @@ class TestWindowEdges:
         result = _run(runs_db_path, *_NOW_ARGS)
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
-        assert _n_deep(result.stdout) == 1
+        assert n_deep_verifies(result.stdout) == 1
 
     def test_rows_after_now_are_outside_the_window(self, runs_db_path, runs_db):
         _seed_inside(runs_db, _AS_OF - timedelta(hours=1))
@@ -144,7 +125,7 @@ class TestWindowEdges:
         result = _run(runs_db_path, *_NOW_ARGS)
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
-        assert _n_deep(result.stdout) == 1
+        assert n_deep_verifies(result.stdout) == 1
 
     def test_default_now_is_the_wall_clock(self, runs_db_path, runs_db):
         now = datetime.now(UTC)
@@ -154,7 +135,7 @@ class TestWindowEdges:
         result = _run(runs_db_path, '--window-days', '7')
 
         assert result.returncode == 0, f'{result.stdout=} {result.stderr=}'
-        assert _n_deep(result.stdout) == 1
+        assert n_deep_verifies(result.stdout) == 1
 
 
 class TestUsageFaultsExitTwo:

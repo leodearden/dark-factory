@@ -9,7 +9,6 @@ an edit to any of them must keep this file green, or those four surfaces disagre
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -17,6 +16,7 @@ from pathlib import Path
 
 import analyze_speculation_depth
 import merge_lane_throughput
+from canary_predicate_summary import metric, n_deep_verifies
 from cli_subprocess_timeout import cli_timeout_from_env
 from orchestrator.chain_telemetry import ChainBucket, summarize_chain_telemetry
 from orchestrator.event_store import EventStore
@@ -109,12 +109,8 @@ class TestReaderAgreement:
         # 1 is expected: the 0.5 deep-fail rate exceeds the default 0.35 bound and the rows carry
         # no duration; 2 is an infra fault.
         assert result.returncode in (0, 1), f'{result.returncode=} {result.stdout=} {result.stderr=}'
-        n_deep = re.search(r'n_deep_verifies=(\d+)', result.stdout)
-        fail_rate = re.search(r'deep_fail_rate=([^(]+)\(', result.stdout)
-        items_per = re.search(r'items_per_verify=([^(]+)\(', result.stdout)
-        assert n_deep and fail_rate and items_per, result.stdout
-        assert int(n_deep.group(1)) == TRUE_DEEP_VERIFIES, result.stdout
-        assert float(fail_rate.group(1)) == round(TRUE_DEEP_FAIL_RATE, 4), result.stdout
-        assert float(items_per.group(1)) == round(TRUE_ITEMS_LANDED_PER_DEEP_VERIFY, 4), (
-            result.stdout
-        )
+        assert n_deep_verifies(result.stdout) == TRUE_DEEP_VERIFIES, result.stdout
+        assert metric(result.stdout, 'deep_fail_rate') == round(TRUE_DEEP_FAIL_RATE, 4), result.stdout
+        assert metric(result.stdout, 'items_per_verify') == round(
+            TRUE_ITEMS_LANDED_PER_DEEP_VERIFY, 4
+        ), result.stdout
