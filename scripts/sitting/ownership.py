@@ -26,9 +26,11 @@ from typing import Any, Literal
 
 from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path
 from orchestrator.session_registry import (
+    OWNING_OUTCOMES,
     RESULT_FILENAME,
     TERMINAL_STATUSES,
     SessionRecord,
+    parse_result_outcome,
 )
 from shared.project_id import fold_project_token
 from shared.task_deferral import CarriedByDeferral, InvalidRecord, parse_record
@@ -45,8 +47,6 @@ LEGACY_COALESCE_KEY = 'x_coalesced_into'
 FOLLOWUP_KEYS: tuple[str, ...] = ('x_origin_escalation', 'origin_escalation')
 HANDOVER_CANDIDATES: tuple[str, ...] = ('data/escalations/l2-handover.md', 'plans/l2-watcher-handover-*.md')
 
-RESULT_OUTCOMES: tuple[str, ...] = ('done', 'blocked', 'abandoned', 'handed-off')
-OWNING_OUTCOMES = frozenset({'done', 'handed-off'})
 TERMINAL_TASK_STATUSES = frozenset({'done', 'cancelled'})
 UNBLOCK_ROLE = 'unblock'
 
@@ -137,21 +137,6 @@ def index_sessions(sessions_root: Path) -> SessionIndex:
         MappingProxyType({key: tuple(found) for key, found in by_task.items()}),
         tuple(shortfalls),
     )
-
-
-def parse_result_outcome(text: str) -> str | None:
-    """The spawn contract's ``outcome:`` header value, or None when absent or not a contract outcome."""
-    lines = text.lstrip().splitlines()
-    if lines and lines[0].strip() == '---':
-        lines = lines[1:]
-    for line in lines:
-        if not line.strip() or line.strip() == '---':
-            return None
-        key, sep, value = line.partition(':')
-        if sep and key.strip() == 'outcome':
-            outcome = value.strip()
-            return outcome if outcome in RESULT_OUTCOMES else None
-    return None
 
 
 def load_task_rows(project_root: Path | str, task_ids: Iterable[str] | None = None) -> TaskRows:
