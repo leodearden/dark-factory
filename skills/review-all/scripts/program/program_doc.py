@@ -16,12 +16,13 @@ import sys
 import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import program_facts
+import questions
 import run_cli
 import state
 from program_facts import HomeRead, ProgramState, StoreFacts
@@ -527,6 +528,63 @@ def _roster(args: argparse.Namespace) -> Exit:
     return Exit.DONE
 
 
+SCREEN_SIZE = 4
+CLOSING_BLOCK = 'lead_rulable — one uncontested yes/no block'
+NOTHING_PENDING = 'nothing pending'
+
+
+def _draft(run: run_cli.Run, stream: str) -> str:
+    prd_path = run.views[stream].prd_path
+    if prd_path is None:
+        return f'no PRD is recorded for {stream}'
+    return str(draft_copy(run, stream, PurePosixPath(prd_path).name).source)
+
+
+def _sitting_item(run: run_cli.Run, question: questions.RecordedQuestion) -> list[str]:
+    """One item in the shape the sitting puts it: the question, its options, recommendation and draft."""
+    return [
+        f'{question.ref} [{question.source}] {_line(question.question)}',
+        f'  options: {" · ".join(map(_line, question.options)) or NONE}',
+        f'  recommendation: {_line(question.recommendation)}',
+        f'  draft: {_draft(run, question.ref.stream)}',
+    ]
+
+
+def _wave_streams(run: run_cli.Run, wave: int) -> frozenset[str]:
+    waves = state.waves(run.views)
+    streams = frozenset(stream for stream, number in waves.items() if number == wave)
+    if not streams:
+        known = ', '.join(map(str, sorted(set(waves.values()))))
+        raise state.StateError(f'wave {wave} is no wave of {run.program.run_id}; its waves are {known}')
+    return streams
+
+
+def _sitting_lines(home: HomeRead, wave: int) -> list[str]:
+    run = home.run
+    streams = _wave_streams(run, wave)
+    pending = [q for q in program_facts.pending_questions(home) if q.ref.stream in streams]
+    if not pending:
+        return [NOTHING_PENDING]
+    screened = [q for q in pending if not q.lead_rulable]
+    lead_rulable = [q for q in pending if q.lead_rulable]
+    screens = [screened[i:i + SCREEN_SIZE] for i in range(0, len(screened), SCREEN_SIZE)]
+    lines = [f'sitting wave {wave}: {len(screened)} pending on {len(screens)} screen(s), '
+             f'{len(lead_rulable)} lead_rulable']
+    for number, screen in enumerate(screens, 1):
+        lines.append(f'screen {number} of {len(screens)}')
+        lines += [line for question in screen for line in _sitting_item(run, question)]
+    if lead_rulable:
+        lines.append(CLOSING_BLOCK)
+        lines += [line for question in lead_rulable for line in _sitting_item(run, question)]
+    return lines
+
+
+def _sitting(args: argparse.Namespace) -> Exit:
+    for line in _sitting_lines(program_facts.read_home(args.run), args.sitting):
+        print(line)
+    return Exit.DONE
+
+
 @dataclass(frozen=True)
 class _Mode:
     """A mode of the CLI: the flag that selects it, what it does, and the verb its failure names.
@@ -544,11 +602,17 @@ _RENDER = _Mode(None, 'render', _render, renders=True)
 _MODES = (
     _Mode('publish', 'publish', _publish, renders=True),
     _Mode('roster', 'print the roster', _roster, renders=False),
+    _Mode('sitting', 'print the sitting', _sitting, renders=False),
 )
 
 
+def _given(value: object) -> bool:
+    """Whether a mode flag was given: a switch is True when it was, ``--sitting 0`` is still given."""
+    return value is not None and value is not False
+
+
 def _selected(args: argparse.Namespace) -> _Mode:
-    return next((mode for mode in _MODES if getattr(args, mode.flag) not in (None, False)), _RENDER)
+    return next((mode for mode in _MODES if _given(getattr(args, mode.flag))), _RENDER)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -568,6 +632,9 @@ def _parser() -> argparse.ArgumentParser:
                             'into the checkout and list the paths for one commit')
     modes.add_argument('--roster', action='store_true',
                        help='print one line per stream, each unreleased held leaf and the gate')
+    modes.add_argument('--sitting', type=int, metavar='WAVE',
+                       help="print WAVE's pending design questions as screens of "
+                            f'{SCREEN_SIZE}; reads the run home only, never the store')
     return parser
 
 
