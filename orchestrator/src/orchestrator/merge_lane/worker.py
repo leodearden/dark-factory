@@ -100,6 +100,7 @@ from orchestrator.merge_lane.gates import (
     _reverify_rebased_tree,
     _run_unscoped_typechecks,
 )
+from orchestrator.merge_lane.history_leg import HistoryLegRunner
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import patch_content_contained
 from orchestrator.merge_lane.liveness import (
@@ -2373,6 +2374,42 @@ def _placeholder_local_runner(
     )
 
 
+def _local_merge_verify_runner(
+    merge_wt: Path,
+    req: MergeRequest,
+    effective_module_configs: list[ModuleConfig],
+    task_files_tuple: tuple[str, ...] | None,
+    *,
+    verifier: VerifyPort,
+    event_store: EventStore | None,
+    history_leg_command: str | None,
+) -> VerifyRunner:
+    """The runner a local merge verify dispatches to.
+
+    The full gate's scoped + unscoped bundle, or only the project's declared
+    history leg when *history_leg_command* is set (task 7248).
+    """
+    archive_root = req.config.project_root / 'data' / 'verify-logs'
+    if history_leg_command is not None:
+        return HistoryLegRunner(
+            merge_wt, req.config, history_leg_command,
+            task_id=req.task_id, archive_root=archive_root,
+        )
+    # INV-1 (task 2883): the dispatching store lets run_scoped's merge gate
+    # emit trivial_pass_escalated. The merge-flake gate's side-effects are NOT
+    # threaded here: task ε moved them to the dispatcher
+    # (_run_post_merge_verify), driven off the FlakeSuppression the returned
+    # VerifyResult carries.
+    return LocalRunner(
+        merge_wt, req.config, effective_module_configs, task_files_tuple,
+        run_scoped=verifier.run_scoped,
+        run_unscoped=verifier.run_unscoped_typechecks,
+        task_id=req.task_id,
+        archive_root=archive_root,
+        event_store=event_store,
+    )
+
+
 async def _record_flake_observation(
     result: VerifyResult,
     req: MergeRequest,
@@ -2445,6 +2482,7 @@ async def _run_post_merge_verify(
     merge_base_sha: str | None = None,
     main_sha: str | None = None,
     verifier: VerifyPort = PRODUCTION_VERIFIER,
+    history_leg_command: str | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -2596,6 +2634,12 @@ async def _run_post_merge_verify(
         main_sha: Dispatch-time main SHA (``item.base_sha``) paired with
             *merge_base_sha*; see above.  Both must be non-``None`` for
             classification to run.
+        history_leg_command: The project's declared same-tree history leg
+            (task 7248), passed only by ``gates.py::_reverify_rebased_tree``.
+            When set, the LOCAL pool runs only this command, through
+            ``history_leg.py::HistoryLegRunner``, instead of the full gate;
+            every step around the dispatch is unchanged.  ``None`` (default)
+            runs the full gate.
     """
     # Normalize the narrowed-budget counter dict once up front (task 2835):
     # None (the default for every unmigrated caller) becomes a fresh,
@@ -2768,18 +2812,10 @@ async def _run_post_merge_verify(
         # controls that intentionally leave archive_root=None — they are never
         # constructed here and are auto-excluded by LocalRunner's default.
         pool = VerifyRunnerPool(
-            [LocalRunner(
-                merge_wt, req.config, effective_module_configs, task_files_tuple,
-                run_scoped=verifier.run_scoped,
-                run_unscoped=verifier.run_unscoped_typechecks,
-                task_id=req.task_id,
-                archive_root=req.config.project_root / 'data' / 'verify-logs',
-                # INV-1 (task 2883): thread the dispatching store so run_scoped's
-                # merge gate emits trivial_pass_escalated.  The merge-flake gate's
-                # own side-effects are NOT threaded here — task ε moved them to the
-                # dispatcher (_run_post_merge_verify), driven off the
-                # FlakeSuppression the returned VerifyResult carries.
-                event_store=event_store,
+            [_local_merge_verify_runner(
+                merge_wt, req, effective_module_configs, task_files_tuple,
+                verifier=verifier, event_store=event_store,
+                history_leg_command=history_leg_command,
             )],
             event_store=event_store,
             task_id=req.task_id,

@@ -32,7 +32,6 @@ from typing import TYPE_CHECKING, Literal
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S, GitOps, _run
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
-from orchestrator.merge_lane.history_leg import run_history_leg
 from orchestrator.merge_lane.reverify_gate_decision import (
     MAX_LOGGED_OVERLAP_PATHS,
     GateClearance,
@@ -3450,9 +3449,10 @@ async def _reverify_rebased_tree(
        turn red on the same tree under a new parent, so for a project that
        cannot name those tests the key stays False and the tree is
        re-verified.  When the project declares that command, only it runs, on
-       *merge_wt* (``history_leg.py::run_history_leg``): a pass clears as
-       ``GateClearance.history_leg``, a failure is the ``MergeOutcome`` with
-       *merge_wt* already cleaned up.  Under the precondition a gate that
+       *merge_wt*, through *run_post_merge_verify* with
+       ``history_leg_command``: a pass clears as
+       ``GateClearance.history_leg``, and a red or unrunnable leg gets the
+       re-verify's full failure handling.  Under the precondition a gate that
        passed tree T sees exactly T again, and neither premise of
        :func:`_disjoint_skip_blockers` is consulted.
     1. **Disjoint** (``_rebase_delta_touched_overlap`` is empty) with no
@@ -3489,7 +3489,8 @@ async def _reverify_rebased_tree(
         legacy single-keep behaviour (only ``merge_wt`` is protected).
     run_post_merge_verify:
         The worker's ``_run_post_merge_verify``, which this gate delegates the
-        re-verify to when it fires.
+        re-verify to when it fires, and the declared history leg to, as
+        ``history_leg_command``, on a same tree.
     event_store:
         Receives the decision row, and is forwarded to the re-verify.
     """
@@ -3504,14 +3505,11 @@ async def _reverify_rebased_tree(
     emit_reverify_gate_decision(event_store, decision)
     if (clearance := decision.reason.skip_clearance) is not None:
         return clearance
-    if (
-        decision.reason is ReverifyGateReason.same_tree_history_leg
-        and (command := _declared_history_leg(req)) is not None
-    ):
-        failure = await run_history_leg(
-            git_ops, req, merge_wt, command=command, merge_sha=merge_sha,
-        )
-        return GateClearance.history_leg if failure is None else failure
+    history_leg = (
+        _declared_history_leg(req)
+        if decision.reason is ReverifyGateReason.same_tree_history_leg
+        else None
+    )
     failure = await run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts=timeouts,
@@ -3521,8 +3519,11 @@ async def _reverify_rebased_tree(
         merge_sha=merge_sha,
         keep_worktrees=keep_worktrees,
         event_store=event_store,
+        history_leg_command=history_leg,
     )
-    return GateClearance.reverified if failure is None else failure
+    if failure is not None:
+        return failure
+    return GateClearance.reverified if history_leg is None else GateClearance.history_leg
 
 
 async def _check_post_merge_pyright(

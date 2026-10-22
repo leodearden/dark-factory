@@ -580,7 +580,7 @@ class TestReverifyGateRecordsItsDecision:
             )
             merge_wt_survived = rebased.merge_wt.exists()
 
-        assert isinstance(outcome, MergeOutcome), outcome
+        assert not isinstance(outcome, GateClearance), outcome
         assert (outcome.status, outcome.reason, outcome.verify_skipped) == (
             'blocked', disk_reason, True,
         )
@@ -605,7 +605,7 @@ class TestReverifyGateRecordsItsDecision:
             )
             merge_wt_survived = rebased.merge_wt.exists()
 
-        assert isinstance(outcome, MergeOutcome), outcome
+        assert not isinstance(outcome, GateClearance), outcome
         assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), outcome.reason
         assert runs.read_text().splitlines() == ['run', 'run']
         assert not merge_wt_survived
@@ -624,7 +624,7 @@ class TestReverifyGateRecordsItsDecision:
                 scene, rebased, FakeVerifier(), merge_sha=same_tree_sha, max_enospc=1,
             )
 
-        assert isinstance(outcome, MergeOutcome), outcome
+        assert not isinstance(outcome, GateClearance), outcome
         assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), outcome.reason
         assert FailureCategory.PYTEST_INTERNALERROR.value in outcome.reason, outcome.reason
         assert runs.read_text().splitlines() == ['run', 'run']
@@ -644,7 +644,7 @@ class TestReverifyGateRecordsItsDecision:
                 scene, rebased, FakeVerifier(), merge_sha=same_tree_sha, timeouts=timeouts,
             )
 
-        assert isinstance(outcome, MergeOutcome), outcome
+        assert not isinstance(outcome, GateClearance), outcome
         assert outcome.status == 'blocked', outcome
         assert '[category: ' in outcome.reason, outcome.reason
         assert timeouts == {rebased.request.task_id: 1}
@@ -664,7 +664,7 @@ class TestReverifyGateRecordsItsDecision:
             )
             outcome = await _gate(scene, scoped, FakeVerifier(), merge_sha=same_tree_sha)
 
-        assert isinstance(outcome, MergeOutcome), outcome
+        assert not isinstance(outcome, GateClearance), outcome
         assert outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), outcome.reason
         assert outcome.disposition is MergeFailureDisposition.MAIN_RED, outcome
 

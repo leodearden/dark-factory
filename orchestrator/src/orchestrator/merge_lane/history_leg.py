@@ -1,70 +1,67 @@
-"""Run a project's declared merge-gate history leg against a merge worktree (task 7248).
+"""The verify runner for a project's declared merge-gate history leg (task 7248).
 
-A project whose gate verdict is a function of the tree alone, except for a
-declared set of history-reading tests, names those tests' command in
-``OrchestratorConfig.merge_gate_history_test_command``. On a same-tree rebase
-``gates.py::_reverify_rebased_tree`` runs only that command, through
-:func:`run_history_leg`, instead of the full re-verify: the tree already
-passed, and only a test that reads git history can see the new parent.
-
-The leg runs through ``verify.run_verification`` as a one-command module, so it
-keeps every verify invariant: target-env stripping, admission, timeouts and
-archive logging.
+On a same-tree rebase a project that declares
+``OrchestratorConfig.merge_gate_history_test_command`` re-runs only that
+command, through ``worker.py::_run_post_merge_verify``, which builds a
+:class:`HistoryLegRunner` in place of the full gate's ``LocalRunner``. So a
+red or unrunnable leg gets every failure path a red re-verify gets; this
+module only runs the command and reports a result that cannot be mistaken for
+the whole gate's.
 """
 
 from __future__ import annotations
 
-import contextlib
-import logging
+import dataclasses
 from pathlib import Path
+from typing import ClassVar
 
-from orchestrator.config import ModuleConfig
-from orchestrator.git_ops import GitOps
-from orchestrator.merge_lane.types import MergeOutcome, MergeRequest
-from orchestrator.verify import run_verification
-
-logger = logging.getLogger('orchestrator.merge_lane')
+from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify import VerifyResult, run_verification
+from orchestrator.verify_runner import MergeVerifySpec
 
 HISTORY_LEG_PREFIX = 'merge-gate-history'
 
 
-async def run_history_leg(
-    git_ops: GitOps,
-    req: MergeRequest,
-    merge_wt: Path,
-    *,
-    command: str,
-    merge_sha: str,
-) -> MergeOutcome | None:
-    """Run *command* in *merge_wt*: ``None`` on a pass, else a blocking outcome.
+class HistoryLegRunner:
+    """A local ``VerifyRunner`` that runs only the declared history leg command.
 
-    On a failure *merge_wt* is cleaned up before the outcome is returned, as
-    ``worker.py::_run_post_merge_verify`` does for a red re-verify.
+    Its result carries no per-test ids: they would describe only the leg's
+    subset of the gate, yet the pass path seeds main's failing-id baseline
+    from them and the main-health probe diffs them as the whole gate's.
     """
-    async with contextlib.AsyncExitStack() as stack:
-        if req.config.git.persistent_merge_worktree and git_ops.is_persistent_merge_lane(
-            merge_wt,
-        ):
-            await stack.enter_async_context(git_ops.merge_verify_lease())
-        verify = await run_verification(
-            merge_wt, req.config,
-            ModuleConfig(prefix=HISTORY_LEG_PREFIX, test_command=command),
+
+    name: str = 'history-leg'
+    is_local: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        merge_wt: Path,
+        config: OrchestratorConfig,
+        command: str,
+        *,
+        task_id: str | None,
+        archive_root: Path | None,
+    ) -> None:
+        self._merge_wt = merge_wt
+        self._config = config
+        self._command = command
+        self._task_id = task_id
+        self._archive_root = archive_root
+
+    async def health(self) -> bool:
+        return True
+
+    async def run_merge_verify(self, merge_sha: str, spec: MergeVerifySpec) -> VerifyResult:
+        result = await run_verification(
+            self._merge_wt, self._config,
+            ModuleConfig(prefix=HISTORY_LEG_PREFIX, test_command=self._command),
             max_retries=0, is_merge_verify=True, role='merge',
-            task_id=req.task_id,
-            archive_root=req.config.project_root / 'data' / 'verify-logs',
+            task_id=self._task_id, archive_root=self._archive_root,
         )
-    if verify.passed:
-        return None
-    reason = (
-        f'Post-merge verification failed: history leg on same-tree rebase '
-        f'{merge_sha[:8]}: {verify.summary}'
-    )
-    if verify.category:
-        reason = f'{reason} [category: {verify.category}]'
-    logger.warning('Task %s: %s', req.task_id, reason)
-    await git_ops.cleanup_merge_worktree(merge_wt)
-    return MergeOutcome(
-        'blocked', reason=reason,
-        failure_category=verify.category,
-        failure_cause_hint=verify.cause_hint,
-    )
+        return dataclasses.replace(
+            result,
+            summary=f'history leg: {result.summary}',
+            failing_test_ids=None,
+            skipped_test_ids=None,
+            failing_test_ids_by_module=None,
+        )
