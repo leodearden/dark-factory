@@ -13,6 +13,7 @@ from _recording_event_store import _RecordingEventStore
 from shared.locking import directory_locks
 from shared.task_metadata_wire import coerce_task_metadata
 
+from orchestrator.already_landed_tick_view import AlreadyLandedTickView
 from orchestrator.config import (
     TIER_BASE,
     TIER_WIDTH,
@@ -29,6 +30,7 @@ from orchestrator.scheduler import (
     ExternalResolverError,
     ModuleLockTable,
     Scheduler,
+    SchedulerCallbacks,
     TickContext,
     files_to_modules,
     normalize_lock,
@@ -13515,6 +13517,83 @@ class TestConsultAlreadyLanded:
             'a raising gate hook should be logged, not silently swallowed'
         )
 
+    async def test_tick_view_is_read_once_and_threaded_with_each_candidate(self):
+        view = AlreadyLandedTickView(local_branches=frozenset())
+        reader = AsyncMock(return_value=view)
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+        candidates = [_pending_task(tid) for tid in ('A', 'B', 'C')]
+
+        await scheduler._consult_already_landed(candidates)
+
+        reader.assert_awaited_once()
+        assert gate.await_count == len(candidates)
+        for call, candidate in zip(gate.await_args_list, candidates, strict=True):
+            assert call.args == (candidate['id'],)
+            assert call.kwargs['task'] is candidate
+            assert call.kwargs['tick_view'] is view
+
+    async def test_without_a_reader_the_gate_gets_no_tick_view(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+        candidate = _pending_task('Z')
+
+        await scheduler._consult_already_landed([candidate])
+
+        (call,) = gate.await_args_list
+        assert call.kwargs['task'] is candidate
+        assert call.kwargs['tick_view'] is None
+
+    async def test_a_raising_reader_fails_open_to_per_candidate_reads(self, caplog):
+        caplog.set_level('WARNING')
+        reader = AsyncMock(side_effect=RuntimeError('for-each-ref hiccup'))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
+        scheduler._already_landed_gate = gate
+
+        result = await scheduler._consult_already_landed(
+            [_pending_task('Z'), _pending_task('Y')]
+        )
+
+        assert result == {'Z'}
+        assert {call.args[0] for call in gate.await_args_list} == {'Z', 'Y'}
+        assert all(call.kwargs['tick_view'] is None for call in gate.await_args_list)
+        assert any(record.levelname == 'WARNING' for record in caplog.records)
+
+    async def test_without_a_gate_the_tick_view_is_not_read(self):
+        reader = AsyncMock(return_value=AlreadyLandedTickView(local_branches=frozenset()))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+
+        assert await scheduler._consult_already_landed([_pending_task('Z')]) == set()
+        reader.assert_not_awaited()
+
+    async def test_with_no_candidates_the_tick_view_is_not_read(self):
+        reader = AsyncMock(return_value=AlreadyLandedTickView(local_branches=frozenset()))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+        scheduler._already_landed_gate = AsyncMock(return_value=False)
+
+        assert await scheduler._consult_already_landed([]) == set()
+        reader.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # acquire_next() honors the already-landed gate (task 2313).
@@ -13536,27 +13615,33 @@ class TestAcquireNextAlreadyLandedGate:
         scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
-        scheduler._already_landed_gate = AsyncMock(return_value=True)
+        gate = AsyncMock(return_value=True)
+        scheduler._already_landed_gate = gate
 
         result = await scheduler.acquire_next()
 
         assert result is None, 'a gated task must not be dispatched this tick'
         assert 'Z' not in scheduler._dispatched
-        scheduler._already_landed_gate.assert_awaited_once_with('Z')
+        (call,) = gate.await_args_list
+        assert call.args == ('Z',)
+        assert call.kwargs['task']['id'] == 'Z'
 
     async def test_gate_false_dispatches_normally(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
-        scheduler._already_landed_gate = AsyncMock(return_value=False)
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
 
         result = await scheduler.acquire_next()
 
         assert result is not None
         assert result.task_id == 'Z'
         assert 'Z' in scheduler._dispatched
-        scheduler._already_landed_gate.assert_awaited_once_with('Z')
+        (call,) = gate.await_args_list
+        assert call.args == ('Z',)
+        assert call.kwargs['task']['id'] == 'Z'
 
     async def test_gated_pinned_candidate_is_not_dispatched(self, tmp_path):
         """Pin-loop parity: a gated PINNED candidate must also be skipped."""
@@ -13569,7 +13654,7 @@ class TestAcquireNextAlreadyLandedGate:
         scheduler = Scheduler(config, override_store=store)
         scheduler.finish_startup()
         scheduler._project_root = '/proj'
-        scheduler._already_landed_gate = AsyncMock(side_effect=lambda task_id: task_id == 'Z')
+        scheduler._already_landed_gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
 
         task_z = _pending_task('Z', files=['z/src'])
         task_y = _pending_task('Y', files=['y/src'])

@@ -4088,6 +4088,66 @@ class TestResolveBranchSha:
 
 
 @pytest.mark.asyncio
+class TestListLocalBranches:
+    async def test_fresh_repo_lists_main(self, git_ops: GitOps):
+        branches = await git_ops.list_local_branches()
+
+        assert isinstance(branches, frozenset)
+        assert 'main' in branches
+
+    async def test_lists_a_created_task_branch_by_its_full_name(
+        self, git_ops: GitOps,
+    ):
+        await git_ops.create_worktree('lb-1')
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        assert 'task/lb-1' in branches
+
+    async def test_a_deleted_branch_is_no_longer_listed(self, git_ops: GitOps):
+        wt_info = await git_ops.create_worktree('lb-1')
+        assert wt_info is not None
+        await git_ops.cleanup_worktree(wt_info.path, 'lb-1')
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        assert 'task/lb-1' not in branches
+
+    async def test_agrees_with_resolve_branch_sha(self, git_ops: GitOps):
+        await git_ops.create_worktree('lb-2')
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        for name in branches:
+            assert await git_ops.resolve_branch_sha(name) is not None, name
+        assert 'task/lb-absent' not in branches
+        assert await git_ops.resolve_branch_sha('task/lb-absent') is None
+
+    async def test_returns_none_outside_a_git_repository(
+        self, git_config: GitConfig, tmp_path: Path,
+    ):
+        not_a_repo = tmp_path / 'not-a-repo'
+        not_a_repo.mkdir()
+
+        assert await GitOps(git_config, not_a_repo).list_local_branches() is None
+
+    async def test_a_branch_sharing_its_name_with_a_tag_keeps_its_exact_name(
+        self, git_ops: GitOps,
+    ):
+        for cmd in (['git', 'tag', 'dup'], ['git', 'branch', 'dup']):
+            rc, _, stderr = await _run(cmd, cwd=git_ops.project_root)
+            assert rc == 0, stderr
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        assert 'dup' in branches
+
+
+@pytest.mark.asyncio
 class TestFindMergeMarker:
     """Real-git tests for GitOps.find_merge_marker.
 
