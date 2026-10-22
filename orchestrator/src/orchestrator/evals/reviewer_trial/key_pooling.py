@@ -61,6 +61,38 @@ class PoolingLog:
         ))
 
 
+@dataclass(frozen=True)
+class PoolingAudit:
+    """(diff_id, issue_id) pairs breaking the pooling log <-> answer key bijection."""
+
+    duplicate_records: tuple[tuple[str, str], ...]
+    dangling_records: tuple[tuple[str, str], ...]
+    unrecorded_issues: tuple[tuple[str, str], ...]
+
+    @property
+    def ok(self) -> bool:
+        return not (self.duplicate_records or self.dangling_records or self.unrecorded_issues)
+
+
+def audit_pooling(manifest: CorpusManifest, log: PoolingLog) -> PoolingAudit:
+    """Report every pooling-log record and pooled key issue that lacks its counterpart.
+
+    A key issue counts as pooled when its mutation_type is one the log's
+    records reference, so no mutation_type spelling is assumed.
+    """
+    key = {(diff.diff_id, gt.id): gt for diff in manifest.diffs for gt in diff.ground_truth}
+    counts = Counter((record.diff_id, record.issue_id) for record in log.records)
+    pooled_types = {key[pair].mutation_type for pair in counts if pair in key}
+    return PoolingAudit(
+        duplicate_records=tuple(sorted(pair for pair, n in counts.items() if n > 1)),
+        dangling_records=tuple(sorted(pair for pair in counts if pair not in key)),
+        unrecorded_issues=tuple(sorted(
+            pair for pair, gt in key.items()
+            if gt.mutation_type in pooled_types and pair not in counts
+        )),
+    )
+
+
 def fold_pooled_issues(
     manifest: CorpusManifest,
     log: PoolingLog,
