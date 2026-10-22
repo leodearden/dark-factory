@@ -75,6 +75,7 @@ import os
 import signal
 import time
 from collections.abc import Iterable
+from enum import Enum, auto
 from pathlib import Path
 from typing import NamedTuple
 
@@ -354,7 +355,18 @@ async def terminate_process_group(
             await asyncio.wait_for(proc.wait(), grace_secs)
 
 
-def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> None:
+class SigkillDispatch(Enum):
+    """Which SIGKILL :func:`sigkill_process_group` dispatched — never what died."""
+
+    #: ``os.killpg`` returned: the whole group was signalled.
+    GROUP_KILLED = auto()
+    #: Only ``proc.kill()``, after the group kill was refused or failed.
+    DIRECT_KILLED = auto()
+    #: Nothing: the leader was already reaped.
+    NOT_SIGNALLED = auto()
+
+
+def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> SigkillDispatch:
     """SIGKILL group *pgid* at once; signal-only, never raises, never reaps.
 
     *pgid* must be the value frozen at a ``start_new_session=True`` spawn of
@@ -368,9 +380,16 @@ def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> None:
     An already-reaped *proc* gets no signal (its pid may be recycled).  A
     refused or failed group kill degrades to a direct ``proc.kill()``, which is
     safe while the pid is unreaped.
+
+    Returns the :class:`SigkillDispatch` naming which of those it dispatched.
     """
     if proc.returncode is not None:
-        return
+        logger.debug(
+            'sigkill_process_group: proc %s already reaped — not signalling '
+            '(its pid may be recycled)',
+            proc.pid,
+        )
+        return SigkillDispatch.NOT_SIGNALLED
 
     reason = unsafe_pgid_reason(pgid, proc.pid)
     if reason is not None:
@@ -382,13 +401,22 @@ def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> None:
         )
         with contextlib.suppress(ProcessLookupError, OSError):
             proc.kill()
-        return
+        return SigkillDispatch.DIRECT_KILLED
 
     try:
         os.killpg(pgid, signal.SIGKILL)
-    except OSError:
+    except OSError as exc:
+        logger.debug(
+            'sigkill_process_group: killpg(%s) failed (%s: %s) — falling back '
+            'to direct kill()',
+            pgid,
+            type(exc).__name__,
+            exc,
+        )
         with contextlib.suppress(ProcessLookupError, OSError):
             proc.kill()
+        return SigkillDispatch.DIRECT_KILLED
+    return SigkillDispatch.GROUP_KILLED
 
 
 # ---------------------------------------------------------------------------
