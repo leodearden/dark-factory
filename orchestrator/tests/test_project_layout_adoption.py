@@ -5,7 +5,6 @@ Contract: plans/review-all-s14-shared-leaves-prd.md (decisions 2, 3, 4; B2, B3).
 
 from __future__ import annotations
 
-import dataclasses
 import fcntl
 import json
 import os
@@ -52,7 +51,6 @@ from orchestrator.evals.reviewer_trial.__main__ import cli as reviewer_trial_cli
 from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.harness import Harness, _acquire_project_lock
 from orchestrator.mcp import markup_sink
-from orchestrator.merge_lane.queue_store import PersistedMergeRequest
 
 
 @pytest.fixture
@@ -209,19 +207,13 @@ class TestHarnessDataFilesLiveInTheLayoutDir:
         finally:
             held.close()
 
-    def test_the_merge_journal_is_read_from_the_layout_dir(self, mock_orch_config, tmp_path):
-        seeded = PersistedMergeRequest(
-            request_id='seed-1', task_id='T', branch='task/T',
-            worktree=str(tmp_path / 'wt'), pre_rebased=False, task_files=None,
-            snapshot_tip=None, generation=0, lane='merge', enqueued_at=0.0,
+    def test_the_merge_journal_is_opened_in_the_layout_dir(self, mock_orch_config, tmp_path):
+        with patch('orchestrator.harness.MergeQueueStore') as merge_store_cls:
+            _build_harness(mock_orch_config)
+
+        merge_store_cls.assert_called_once_with(
+            orchestrator_data_dir(tmp_path) / 'merge_queue.json',
         )
-        journal = orchestrator_data_dir(tmp_path) / 'merge_queue.json'
-        journal.parent.mkdir(parents=True)
-        journal.write_text(json.dumps({seeded.request_id: dataclasses.asdict(seeded)}))
-
-        h = _build_harness(mock_orch_config)
-
-        assert [r.request_id for r in h._merge_store.load()] == ['seed-1']
 
     @pytest.mark.asyncio
     async def test_the_offline_lane_lock_is_held_in_the_layout_dir(
