@@ -682,6 +682,11 @@ def _append_amendment_capped(
     return True, dropped
 
 
+def amendment_room(esc: Escalation) -> int:
+    """How many more amendments *esc* takes before the cap sheds its oldest one."""
+    return max(0, _MAX_AMENDMENTS - len(esc.amendments))
+
+
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
     """Yield all ``esc-*.json`` paths from *escalations_dir* and its archive subtree.
 

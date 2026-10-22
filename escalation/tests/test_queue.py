@@ -37,6 +37,7 @@ from escalation.queue import (
     AmendmentOutcome,
     EscalationQueue,
     ResolveOutcome,
+    amendment_room,
     iter_all_escalation_paths,
 )
 
@@ -388,6 +389,30 @@ class TestDismissAllPendingKeep:
         queue.dismiss_all_pending('Stale from prior run', keep=keep)
 
         assert queue.get('esc-5-1').status == 'pending'  # type: ignore[union-attr]
+
+
+class TestAmendmentRoom:
+    """``amendment_room`` is zero exactly when the next amend would shed the oldest."""
+
+    @staticmethod
+    def _room(queue: EscalationQueue) -> int:
+        record = queue.get('esc-1-1')
+        assert record is not None
+        return amendment_room(record)
+
+    def test_room_counts_down_to_the_amend_that_sheds(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1', level=1))
+
+        rooms = []
+        for i in range(_MAX_AMENDMENTS):
+            rooms.append(self._room(queue))
+            assert queue.amend('esc-1-1', summary=f'pass {i}', agent_role='test')['dropped'] == 0
+
+        assert rooms == list(range(_MAX_AMENDMENTS, 0, -1))
+        assert self._room(queue) == 0
+        assert queue.amend('esc-1-1', summary='one more', agent_role='test')['dropped'] == 1
+        assert self._room(queue) == 0
 
 
 class TestDismissAllPendingAgeAwareDegrades:

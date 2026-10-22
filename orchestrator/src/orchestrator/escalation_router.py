@@ -16,6 +16,7 @@ import logging
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Literal, Protocol, assert_never
 
 from escalation.categories import EscalationCategory
@@ -34,7 +35,7 @@ from escalation.disposition import (
     route_info_l0,
 )
 from escalation.models import Escalation, normalised_severity
-from escalation.queue import EscalationQueue
+from escalation.queue import EscalationQueue, ResolveOutcome, amendment_room
 from shared.mcp_envelope import parse_tool_result
 from shared.task_submit import (
     SubmitFailed,
@@ -199,25 +200,45 @@ class RouteContext:
     exit_kind: ExitKind
 
 
-ALREADY_TERMINAL = 'already-terminal'
-CONVERT_PENDING = 'convert-pending'
-PROMOTED = 'promoted'
-DEFERRED = 'defer'
-ROUTER_ERROR = 'router-error'
+class Outcome(StrEnum):
+    """What ``apply`` did to one record."""
+
+    CLOSED = 'closed'
+    ALREADY_TERMINAL = 'already-terminal'
+    CONVERT_PENDING = 'convert-pending'
+    PROMOTED = 'promoted'
+    DEFERRED = 'defer'
+    ROUTER_ERROR = 'router-error'
+
+
 DISPATCH_TIMEOUT_SECS = 15.0
 RESOLVE_WAIT_SECS = 2.0
 
 
 @dataclass(frozen=True)
 class Applied:
-    """What ``apply`` did to one record; ``disposition_class`` is the event's ``class``."""
+    """What ``apply`` did to one record; a close also names the class it stamped."""
 
     escalation_id: str
-    disposition_class: str
+    outcome: Outcome
+    resolution_class: str | None = None
     reason: str | None = None
     ticket: str | None = None
     promoted_to: str | None = None
     curator_unreachable: bool = False
+
+    def __post_init__(self) -> None:
+        if (self.outcome is Outcome.CLOSED) != (self.resolution_class is not None):
+            raise ValueError(
+                f'Applied for {self.escalation_id}: resolution_class must be set exactly '
+                f'when the outcome is closed (outcome={self.outcome}, '
+                f'resolution_class={self.resolution_class!r})'
+            )
+
+    @property
+    def event_class(self) -> str:
+        """The ``info_l0_dispositioned`` event's ``class``: the stamped class, else the outcome."""
+        return self.resolution_class or str(self.outcome)
 
 
 @dataclass(frozen=True)
@@ -248,7 +269,7 @@ async def _apply(
     try:
         current = ports.queue.get(record.id)
         if current is None or current.status != 'pending':
-            return Applied(record.id, ALREADY_TERMINAL)
+            return Applied(record.id, Outcome.ALREADY_TERMINAL)
         applied = await _perform(action, current, ports, context)
     except Exception:
         logger.exception(
@@ -269,21 +290,20 @@ async def _perform(
 ) -> Applied:
     match action:
         case Addressed() | ObservationConsumed():
-            _close(record, action.resolution_class, '', ports, context)
-            return Applied(record.id, action.resolution_class)
+            return _close(record, action.resolution_class, '', ports, context)
         case StatusInfo(class_key=class_key):
             note = (
                 f': mechanical {class_key} notice, listed in the aggregate for '
                 f'{status_info_sentinel(class_key)}'
             )
-            _close(record, StatusInfo.resolution_class, note, ports, context)
-            return Applied(record.id, StatusInfo.resolution_class, reason=class_key)
+            closed = _close(record, StatusInfo.resolution_class, note, ports, context)
+            return replace(closed, reason=class_key)
         case ConvertViaCurator(payload=candidate):
             return await _convert(record, candidate, ports, context)
         case PromoteWithHint(reason=reason):
             return _promote(record, reason, ports, context)
         case Defer(reason=reason):
-            return Applied(record.id, DEFERRED, reason=str(reason))
+            return Applied(record.id, Outcome.DEFERRED, reason=str(reason))
         case _HoldOutcome(hold=hold, verdict=verdict):
             return _finish(record, hold, verdict, ports, context)
         case _:
@@ -293,13 +313,14 @@ async def _perform(
 def _close(
     record: Escalation, resolution_class: str, note: str, ports: RouterPorts,
     context: RouteContext,
-) -> None:
+) -> Applied:
     ports.queue.resolve(
         record.id,
         f'{resolution_class} — closed by the info-L0 router ({context.by}, exit '
         f'{context.exit_kind}){note}',
         dismiss=True, resolved_by=ROUTER_ID, resolution_class=resolution_class,
     )
+    return Applied(record.id, Outcome.CLOSED, resolution_class=resolution_class)
 
 
 async def _convert(
@@ -317,10 +338,12 @@ async def _convert(
         return replace(applied, curator_unreachable=True)
     match parse_submit_task_result(response):
         case SubmittedTicket(ticket_id=ticket):
-            ports.queue.stamp_triage(
+            held = ports.queue.stamp_triage(
                 record.id, triaged_by=ROUTER_ID, triage_note=hold_note(ticket, datetime.now(UTC)),
             )
-            return Applied(record.id, CONVERT_PENDING, ticket=ticket)
+            if held is None:
+                return Applied(record.id, Outcome.ALREADY_TERMINAL, ticket=ticket)
+            return Applied(record.id, Outcome.CONVERT_PENDING, ticket=ticket)
         case SubmittedTask(task_id=task_id):
             return _close_converted(record, task_id, None, ports, context)
         case SubmitFailed(reason=cause):
@@ -355,8 +378,8 @@ def _close_converted(
     context: RouteContext,
 ) -> Applied:
     via = f' via curator ticket {ticket}' if ticket else ''
-    _close(record, CONVERTED_CLASS, f': converted:{task_id}{via}', ports, context)
-    return Applied(record.id, CONVERTED_CLASS, ticket=ticket)
+    closed = _close(record, CONVERTED_CLASS, f': converted:{task_id}{via}', ports, context)
+    return replace(closed, ticket=ticket)
 
 
 def _finish(
@@ -382,7 +405,12 @@ def _promote(
     record: Escalation, reason: PromoteReason, ports: RouterPorts, context: RouteContext,
     *, cause: str = '',
 ) -> Applied:
-    """The D5 fallback: one L1 hinting conversion, then the L0 dismissed citing it."""
+    """The D5 fallback: the L0 dismissed citing one L1 that hints conversion.
+
+    The dismissal is written first, so a record no pass can dismiss is never
+    promoted again by the next one; an L1 that then fails to file leaves the
+    note's full text in the ERROR log.
+    """
     l1 = Escalation(
         id=ports.queue.make_id(record.task_id),
         task_id=record.task_id,
@@ -396,18 +424,27 @@ def _promote(
         level=1,
         filing_claimant_run_id=ports.filing_claimant_run_id,
     )
-    ports.queue.submit(l1)
+    dismissal: ResolveOutcome = {
+        'applied': False, 'prior_status': None, 'prior_resolved_by': None,
+        'late_resolution_captured': False, 'resolution_class_corrected': None,
+    }
+    ports.queue.resolve(
+        record.id,
+        f'Promoted by the info-L0 router ({context.by}) to {l1.id}: {reason}',
+        dismiss=True, resolved_by=ROUTER_ID, outcome=dismissal,
+    )
+    if not dismissal['applied']:
+        return Applied(record.id, Outcome.ALREADY_TERMINAL, reason=str(reason))
     try:
-        ports.queue.resolve(
-            record.id,
-            f'Promoted by the info-L0 router ({context.by}) to {l1.id}: {reason}',
-            dismiss=True, resolved_by=ROUTER_ID,
-        )
+        ports.queue.submit(l1)
     except Exception:
         logger.exception(
-            'info-l0-router: filed %s for %s but could not dismiss the L0', l1.id, record.id,
+            'info-l0-router: dismissed %s but could not file its fallback L1 %s; the '
+            'note survives only in this log line: %s',
+            record.id, l1.id, l1.detail,
         )
-    return Applied(record.id, PROMOTED, reason=str(reason), promoted_to=l1.id)
+        return Applied(record.id, Outcome.ROUTER_ERROR, reason=str(reason))
+    return Applied(record.id, Outcome.PROMOTED, reason=str(reason), promoted_to=l1.id)
 
 
 def _filing_category(category: str) -> str:
@@ -442,7 +479,7 @@ def _recover(
     action: _Action, record: Escalation, ports: RouterPorts, context: RouteContext,
 ) -> Applied:
     if isinstance(action, PromoteWithHint):
-        return Applied(record.id, ROUTER_ERROR, reason=str(action.reason))
+        return Applied(record.id, Outcome.ROUTER_ERROR, reason=str(action.reason))
     try:
         return _promote(
             record, PromoteReason.ROUTER_ERROR, ports, context,
@@ -453,7 +490,7 @@ def _recover(
             'info-l0-router: could not file the router_error L1 for %s (by=%s)',
             record.id, context.by,
         )
-        return Applied(record.id, ROUTER_ERROR, reason=str(PromoteReason.ROUTER_ERROR))
+        return Applied(record.id, Outcome.ROUTER_ERROR, reason=str(PromoteReason.ROUTER_ERROR))
 
 
 def _emit(applied: Applied, record: Escalation, ports: RouterPorts, context: RouteContext) -> None:
@@ -465,7 +502,7 @@ def _emit(applied: Applied, record: Escalation, ports: RouterPorts, context: Rou
             task_id=record.task_id,
             data={
                 'escalation_id': record.id,
-                'class': applied.disposition_class,
+                'class': applied.event_class,
                 'by': context.by,
                 'exit_kind': str(context.exit_kind),
                 'ticket': applied.ticket,
@@ -528,7 +565,7 @@ class InfoL0Sweep:
         applied = await _apply(
             _HoldOutcome(hold, verdict), record, self._ports, RouteContext(self._by, exit_kind),
         )
-        self._tally[applied.disposition_class] += 1
+        self._tally[applied.event_class] += 1
         return applied
 
     def close(self) -> None:
@@ -564,10 +601,10 @@ class InfoL0Sweep:
         return disposition
 
     def _note(self, record: Escalation, disposition: Disposition, applied: Applied) -> None:
-        self._tally[applied.disposition_class] += 1
+        self._tally[applied.event_class] += 1
         if applied.curator_unreachable:
             self._curator_unreachable = True
-        if isinstance(disposition, StatusInfo) and applied.disposition_class == StatusInfo.resolution_class:
+        if isinstance(disposition, StatusInfo) and applied.outcome is Outcome.CLOSED:
             self._status_info.setdefault(disposition.class_key, []).append(record)
 
     async def _ask_curator(self, hold: RouterHold) -> TicketVerdict:
@@ -591,21 +628,30 @@ class InfoL0Sweep:
     def _file_or_amend(
         self, sentinel: str, records: list[Escalation], *, summary: str, suggested_action: str,
     ) -> None:
+        """Amend the newest open aggregate for *sentinel*, or file a fresh one.
+
+        A fresh one is filed when none is open, when the newest has no
+        amendment left before the queue would shed an earlier pass's listing,
+        and when the amend did not land (the aggregate closed meanwhile).
+        """
         queue = self._ports.queue
         listing = '\n'.join(f'{r.id} (task {r.task_id})' for r in records)
         try:
-            open_aggregates = [
-                esc for esc in queue.get_by_task(
-                    sentinel, status='pending', level=1, agent_role=AGGREGATE_ROLE,
+            newest = max(
+                (
+                    esc for esc in queue.get_by_task(
+                        sentinel, status='pending', level=1, agent_role=AGGREGATE_ROLE,
+                    )
+                    if esc.category == AGGREGATE_CATEGORY
+                ),
+                key=lambda esc: esc.timestamp, default=None,
+            )
+            if newest is not None and amendment_room(newest) > 0:
+                amended = queue.amend(
+                    newest.id, agent_role=AGGREGATE_ROLE, summary=summary, detail=listing,
                 )
-                if esc.category == AGGREGATE_CATEGORY
-            ]
-            if open_aggregates:
-                queue.amend(
-                    open_aggregates[0].id, agent_role=AGGREGATE_ROLE, summary=summary,
-                    detail=listing,
-                )
-                return
+                if amended['status'] in ('amended', 'repeat_framing'):
+                    return
             queue.submit(Escalation(
                 id=queue.make_id(sentinel),
                 task_id=sentinel,

@@ -22,7 +22,7 @@ from escalation.disposition import (
     StatusInfo,
 )
 from escalation.models import Escalation
-from escalation.queue import EscalationQueue
+from escalation.queue import EscalationQueue, amendment_room
 
 from orchestrator.escalation_router import (
     AGGREGATE_CATEGORY,
@@ -30,9 +30,11 @@ from orchestrator.escalation_router import (
     FALLBACK_ACTION,
     OVERFLOW_SENTINEL,
     ROUTER_ID,
+    Applied,
     Converted,
     Failed,
     InfoL0Sweep,
+    Outcome,
     Refused,
     RouteContext,
     RouterHold,
@@ -188,6 +190,24 @@ class TestClassifyTicket:
         assert isinstance(classify_ticket(body), Undecided)
 
 
+class TestApplied:
+    def test_a_close_names_its_class_and_the_event_class_is_that_class(self):
+        applied = Applied('esc-42-1', Outcome.CLOSED, resolution_class='status-info')
+        assert applied.event_class == 'status-info'
+
+    def test_any_other_outcome_is_its_own_event_class(self):
+        assert Applied('esc-42-1', Outcome.CONVERT_PENDING).event_class == 'convert-pending'
+
+    @pytest.mark.parametrize(('outcome', 'resolution_class'), [
+        (Outcome.CLOSED, None), (Outcome.PROMOTED, 'addressed'),
+    ])
+    def test_a_class_without_a_close_or_a_close_without_a_class_is_refused(
+        self, outcome, resolution_class,
+    ):
+        with pytest.raises(ValueError, match='esc-42-1'):
+            Applied('esc-42-1', outcome, resolution_class=resolution_class)
+
+
 # ---------------------------------------------------------------------------
 # The applier
 # ---------------------------------------------------------------------------
@@ -238,6 +258,22 @@ def _dispositions(events: EventStore) -> list[dict]:
 
 def _router_l1s(queue: EscalationQueue, task_id: str) -> list[Escalation]:
     return queue.get_by_task(task_id, status='pending', level=1, agent_role=AGGREGATE_ROLE)
+
+
+def _break_resolve(
+    queue: EscalationQueue, esc_id: str, monkeypatch, *, times: int | None = None,
+) -> None:
+    """Make ``resolve`` of *esc_id* raise, *times* times or for good."""
+    real_resolve = queue.resolve
+    failures = [0]
+
+    def resolve(escalation_id, *args, **kwargs):
+        if escalation_id == esc_id and (times is None or failures[0] < times):
+            failures[0] += 1
+            raise OSError('disk full')
+        return real_resolve(escalation_id, *args, **kwargs)
+
+    monkeypatch.setattr(queue, 'resolve', resolve)
 
 
 def _convert(record: Escalation) -> ConvertViaCurator:
@@ -331,6 +367,27 @@ class TestApplyConverts:
         assert (row['data']['class'], row['data']['ticket']) == ('convert-pending', 'tkt_1')
 
     @pytest.mark.asyncio
+    async def test_a_record_closed_while_its_ticket_was_filed_is_not_held(
+        self, queue, events, curator,
+    ):
+        record = _seed(queue)
+
+        async def submit_then_close(name: str, arguments: dict, *, timeout: float = 15) -> dict:
+            queue.resolve(record.id, 'steward fixed it', resolved_by='claude-task-42-steward')
+            return await curator(name, arguments, timeout=timeout)
+
+        ports = RouterPorts(queue, events, submit_then_close, '/srv/project', FILER_RUN_ID)
+        applied = await apply(_convert(record), record, ports, CONTEXT)
+
+        assert (applied.outcome, applied.ticket) == (Outcome.ALREADY_TERMINAL, 'tkt_1')
+        after = _current(queue, record.id)
+        assert (after.status, after.resolved_by, after.triaged_by) == (
+            'resolved', 'claude-task-42-steward', None,
+        )
+        (row,) = _dispositions(events)
+        assert (row['data']['class'], row['data']['ticket']) == ('already-terminal', 'tkt_1')
+
+    @pytest.mark.asyncio
     async def test_the_suggestion_hash_is_stable_per_escalation_id(self, queue, ports, curator):
         first, second = _seed(queue), _seed(queue)
         await apply(_convert(first), first, ports, CONTEXT)
@@ -393,6 +450,25 @@ class TestApplyPromotes:
         assert l1.id in (dismissed.resolution or '')
 
     @pytest.mark.asyncio
+    async def test_a_record_closed_before_its_dismissal_files_no_l1(
+        self, queue, events, ports, monkeypatch,
+    ):
+        record = _seed(queue)
+        real_resolve = queue.resolve
+
+        def steward_wins(escalation_id, *args, **kwargs):
+            if kwargs.get('resolved_by') == ROUTER_ID:
+                real_resolve(escalation_id, 'steward fixed it', resolved_by='claude-task-42-steward')
+            return real_resolve(escalation_id, *args, **kwargs)
+
+        monkeypatch.setattr(queue, 'resolve', steward_wins)
+        applied = await apply(PromoteWithHint(PromoteReason.CONVERSION_CAP), record, ports, CONTEXT)
+
+        assert applied.outcome is Outcome.ALREADY_TERMINAL
+        assert _router_l1s(queue, '42') == []
+        assert _current(queue, record.id).resolved_by == 'claude-task-42-steward'
+
+    @pytest.mark.asyncio
     async def test_an_empty_detail_starts_the_l1_with_the_summary(self, queue, ports):
         record = _seed(queue, detail='', summary='just a summary line')
         await apply(PromoteWithHint(PromoteReason.CONVERSION_CAP), record, ports, CONTEXT)
@@ -401,28 +477,19 @@ class TestApplyPromotes:
 
 
 class TestApplyNeverRaises:
-    @staticmethod
-    def _break_resolve(queue: EscalationQueue, esc_id: str, monkeypatch) -> None:
-        real_resolve = queue.resolve
-
-        def resolve(escalation_id, *args, **kwargs):
-            if escalation_id == esc_id:
-                raise OSError('disk full')
-            return real_resolve(escalation_id, *args, **kwargs)
-
-        monkeypatch.setattr(queue, 'resolve', resolve)
-
     @pytest.mark.asyncio
-    async def test_a_failing_queue_write_files_a_router_error_l1(
+    async def test_a_failed_close_files_a_router_error_l1_once_the_record_can_be_dismissed(
         self, queue, events, ports, monkeypatch, caplog,
     ):
         record = _seed(queue)
-        self._break_resolve(queue, record.id, monkeypatch)
+        _break_resolve(queue, record.id, monkeypatch, times=1)
         with caplog.at_level(logging.ERROR, logger='orchestrator.escalation_router'):
-            await apply(Addressed(), record, ports, CONTEXT)
+            applied = await apply(Addressed(), record, ports, CONTEXT)
 
+        assert applied.outcome is Outcome.PROMOTED
         (l1,) = _router_l1s(queue, '42')
         assert 'router_error' in l1.detail
+        assert _current(queue, record.id).status == 'dismissed'
         errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
         assert any(
             record.id in message and 'Addressed' in message and 'orphan-reaper' in message
@@ -430,18 +497,53 @@ class TestApplyNeverRaises:
         )
 
     @pytest.mark.asyncio
+    async def test_a_record_that_cannot_be_dismissed_is_never_promoted(
+        self, queue, events, ports, monkeypatch,
+    ):
+        record = _seed(queue)
+        _break_resolve(queue, record.id, monkeypatch)
+
+        for _pass in range(2):
+            applied = await apply(Addressed(), _current(queue, record.id), ports, CONTEXT)
+            assert applied.outcome is Outcome.ROUTER_ERROR
+
+        assert _router_l1s(queue, '42') == []
+        assert _current(queue, record.id).status == 'pending'
+        assert [row['data']['class'] for row in _dispositions(events)] == ['router-error'] * 2
+
+    @pytest.mark.asyncio
+    async def test_a_dismissed_note_whose_l1_cannot_be_filed_is_logged_whole(
+        self, queue, events, ports, monkeypatch, caplog,
+    ):
+        record = _seed(queue, detail='The only copy of this finding.')
+
+        def submit(_escalation):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(queue, 'submit', submit)
+        with caplog.at_level(logging.ERROR, logger='orchestrator.escalation_router'):
+            applied = await apply(PromoteWithHint(PromoteReason.CONVERSION_CAP), record, ports, CONTEXT)
+
+        assert applied.outcome is Outcome.ROUTER_ERROR
+        assert _current(queue, record.id).status == 'dismissed'
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any(record.id in m and 'The only copy of this finding.' in m for m in errors)
+        (row,) = _dispositions(events)
+        assert row['data']['class'] == 'router-error'
+
+    @pytest.mark.asyncio
     async def test_when_filing_also_fails_apply_still_returns(
         self, queue, events, ports, monkeypatch,
     ):
         record = _seed(queue)
-        self._break_resolve(queue, record.id, monkeypatch)
+        _break_resolve(queue, record.id, monkeypatch)
 
         def submit(_escalation):
             raise OSError('disk full')
 
         monkeypatch.setattr(queue, 'submit', submit)
         applied = await apply(Addressed(), record, ports, CONTEXT)
-        assert applied.disposition_class == 'router-error'
+        assert applied.outcome is Outcome.ROUTER_ERROR
         (row,) = _dispositions(events)
         assert row['data']['class'] == 'router-error'
 
@@ -591,6 +693,71 @@ class TestSweepStatusInfoAggregates:
         second.close()
         (fresh,) = _aggregates(queue, status_info_sentinel(STARVATION))
         assert fresh.id != old.id
+
+    @pytest.mark.asyncio
+    async def test_a_mechanical_note_the_router_could_not_close_is_not_listed(
+        self, queue, ports, monkeypatch,
+    ):
+        failing, closing = self._mechanical(queue, STARVATION, 2)
+        _break_resolve(queue, failing.id, monkeypatch, times=1)
+        sweep = _sweep(ports)
+        await _route_all(sweep, [failing, closing])
+        sweep.close()
+
+        (aggregate,) = _aggregates(queue, status_info_sentinel(STARVATION))
+        assert closing.id in aggregate.detail
+        assert failing.id not in aggregate.detail
+
+    @pytest.mark.asyncio
+    async def test_an_aggregate_closed_before_its_amend_lands_is_replaced(
+        self, queue, ports, monkeypatch,
+    ):
+        first = _sweep(ports)
+        await _route_all(first, self._mechanical(queue, STARVATION, 1))
+        first.close()
+        (old,) = _aggregates(queue, status_info_sentinel(STARVATION))
+        real_amend = queue.amend
+
+        def watcher_closes_first(escalation_id, **kwargs):
+            queue.resolve(escalation_id, 'digest read', resolved_by='escalation-watcher-auto')
+            return real_amend(escalation_id, **kwargs)
+
+        monkeypatch.setattr(queue, 'amend', watcher_closes_first)
+        later = _seed(queue, task_id='650', agent_role=STARVATION, category='infra_issue')
+        second = _sweep(ports)
+        await _route_all(second, [later])
+        second.close()
+
+        (fresh,) = _aggregates(queue, status_info_sentinel(STARVATION))
+        assert fresh.id != old.id
+        assert later.id in fresh.detail
+
+    @pytest.mark.asyncio
+    async def test_a_full_aggregate_rolls_over_rather_than_shed_a_listing(self, queue, ports):
+        sentinel = status_info_sentinel(STARVATION)
+
+        async def one_pass(task_id: int) -> Escalation:
+            record = _seed(queue, task_id=str(task_id), agent_role=STARVATION, category='infra_issue')
+            sweep = _sweep(ports)
+            await _route_all(sweep, [record])
+            sweep.close()
+            return record
+
+        await one_pass(800)
+        (full,) = _aggregates(queue, sentinel)
+        task_id = 801
+        while amendment_room(_current(queue, full.id)) > 0:
+            await one_pass(task_id)
+            task_id += 1
+
+        overflow = await one_pass(task_id)
+        (fresh,) = [a for a in _aggregates(queue, sentinel) if a.id != full.id]
+        assert overflow.id in fresh.detail
+        assert _current(queue, full.id).amendments_truncated == 0
+
+        later = await one_pass(task_id + 1)
+        assert later.id in _current(queue, fresh.id).amendments[-1]['detail']
+        assert _current(queue, full.id).amendments_truncated == 0
 
     def test_a_sweep_that_routed_nothing_files_nothing(self, queue, ports):
         _sweep(ports).close()
