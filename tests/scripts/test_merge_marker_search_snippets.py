@@ -165,10 +165,24 @@ git log main --extended-regexp --format='%H%x09%s' --grep='^Merge task/[0-9]+ in
 ```
 
 Split with `awk -F'\t' '{print $1}'`, never use the bare `--grep ... --max-count=1`, and note that `--grep="Merge task/<task-id> into main"` alone is no command.
+
+Or pre-filter on the bare branch name:
+
+```bash
+S="Merge task/<TASK_ID> into main"
+git log main --fixed-strings --grep="task/<TASK_ID>" --format='%H%x09%s' \
+  | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'
+```
+
+A careless bare-branch rewrite: `git log main --grep=task/42 --max-count=1 --format=%H`.
 """
 
 _SYNTHETIC_FENCED_SHELL = r"""S="Merge task/<TASK_ID> into main"
 git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+  | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'"""
+
+_SYNTHETIC_BARE_BRANCH_FENCED_SHELL = r"""S="Merge task/<TASK_ID> into main"
+git log main --fixed-strings --grep="task/<TASK_ID>" --format='%H%x09%s' \
   | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'"""
 
 _SYNTHETIC_INLINE_SHELL = (
@@ -191,6 +205,10 @@ def test_marker_search_extractor_reads_every_snippet_shape() -> None:
         MarkerSearch('skills/synthetic.md', 18, 'git log -1 --format=%H --grep "${S}"'),
         MarkerSearch(
             'skills/synthetic.md', 18, '''git rev-list -1 main --grep="^Merge branch 'task/42'"''',
+        ),
+        MarkerSearch('skills/synthetic.md', 28, _SYNTHETIC_BARE_BRANCH_FENCED_SHELL),
+        MarkerSearch(
+            'skills/synthetic.md', 34, 'git log main --grep=task/42 --max-count=1 --format=%H',
         ),
     ]
 
@@ -219,6 +237,7 @@ def _skill_marker_searches() -> list[MarkerSearch]:
 
 
 _LIVE_MARKER_SEARCHES = _skill_marker_searches()
+_NORMATIVE_MARKER_SEARCH_SOURCE = 'skills/_shared/deriving-landed-sha.md'
 
 
 def _search_id(search: MarkerSearch) -> str:
@@ -346,6 +365,10 @@ def test_skills_present_marker_searches() -> None:
         'no merge-marker search (a code snippet whose git log or git rev-list greps for '
         '$S or a merge subject) was found in skills/**/*.md, so the parametrised guards below collected '
         'nothing and would pass without running a single snippet'
+    )
+    assert _NORMATIVE_MARKER_SEARCH_SOURCE in {search.source for search in _LIVE_MARKER_SEARCHES}, (
+        f'{_NORMATIVE_MARKER_SEARCH_SOURCE} presents no merge-marker search the selector '
+        'recognises, so its step-1 command, the normative copy, is no longer under guard'
     )
 
 
