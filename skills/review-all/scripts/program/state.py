@@ -854,9 +854,17 @@ def fused_memory_url(
     return url
 
 
+_UTC_STAMP = '%Y-%m-%dT%H:%M:%SZ'
+
+
 def now_utc() -> str:
     """The one clock for ``at`` and ``measured_at``: ISO-8601 UTC, second precision."""
-    return datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+    return datetime.now(UTC).strftime(_UTC_STAMP)
+
+
+def date_of(stamp: str) -> str:
+    """The UTC date of a ``now_utc`` stamp, so a ruling's ``date`` and its batch's ``at`` agree."""
+    return datetime.strptime(stamp, _UTC_STAMP).date().isoformat()
 
 
 @dataclass(frozen=True)
@@ -969,10 +977,17 @@ def next_seq(existing: Sequence[Mapping[str, Any]]) -> int:
     return len(existing) + 1
 
 
+def next_action_id(ledger: Iterable[Mapping[str, Any]]) -> str:
+    """``A<n>``: one counter across every ``action`` line of the ledger, in seq order."""
+    return f'A{1 + sum(1 for line in ledger if line.get("op") == LedgerOp.ACTION)}'
+
+
 def _check_ledger_entry(prior: Sequence[Mapping[str, Any]], line: Mapping[str, Any]) -> None:
     check_ledger_line(line)
     if line['seq'] != next_seq(prior):
         raise LedgerRefused(f'{line["op"]} line: expected seq {next_seq(prior)}, got {line["seq"]}')
+    if line['op'] == LedgerOp.ACTION and line['id'] != next_action_id(prior):
+        raise LedgerRefused(f'action line: expected id {next_action_id(prior)!r}, got {line["id"]!r}')
 
 
 def append_ledger(home: Home, lines: Sequence[Mapping[str, Any]]) -> None:

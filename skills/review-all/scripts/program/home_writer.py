@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import fcntl
+import itertools
 import json
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
 import state
@@ -76,20 +76,30 @@ def _stamped(stamps: dict[str, Any], fields: Mapping[str, Any]) -> dict[str, Any
     return {**stamps, **fields}
 
 
+def _ledger_stamps(
+    snapshot: Snapshot, batch: Sequence[Mapping[str, Any]], op: state.LedgerOp, at: str, by: str,
+) -> dict[str, Any]:
+    stamps: dict[str, Any] = {
+        'seq': state.next_seq(snapshot.ledger) + len(batch), 'at': at, 'by': by, 'op': str(op),
+    }
+    if op is state.LedgerOp.ACTION:
+        stamps['id'] = state.next_action_id(itertools.chain(snapshot.ledger, batch))
+    return stamps
+
+
 def stamp(
     snapshot: Snapshot, by: str,
     ledger_entries: Sequence[tuple[state.LedgerOp, Mapping[str, Any]]],
     ruling_entries: Sequence[tuple[state.RuledBy, Mapping[str, Any]]],
 ) -> Lines:
-    """Number the ledger lines after the snapshot's and mint the rulings' ids; each line is checked."""
+    """Number the ledger lines after the snapshot's and mint action and ruling ids; each line is checked."""
     at = state.now_utc()
     ledger: list[dict[str, Any]] = []
     for op, fields in ledger_entries:
-        seq = state.next_seq([*snapshot.ledger, *ledger])
-        line = _stamped({'seq': seq, 'at': at, 'by': by, 'op': str(op)}, fields)
+        line = _stamped(_ledger_stamps(snapshot, ledger, op, at, by), fields)
         state.check_ledger_line(line)
         ledger.append(line)
-    today = datetime.now(UTC).date().isoformat()
+    today = state.date_of(at)
     rulings: list[dict[str, Any]] = []
     for ruled_by, fields in ruling_entries:
         ruling_id = state.next_ruling_id([*snapshot.rulings, *rulings], ruled_by)

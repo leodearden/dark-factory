@@ -109,7 +109,7 @@ def _target_json(target: Any) -> Any:
 
 
 def _action_entries(ret: state.PrdReturn, return_name: str) -> list[_Entry]:
-    """One unnumbered ``action`` entry per lead action; ``_numbered_actions`` gives the ids."""
+    """One ``action`` entry per lead action; ``home_writer.stamp`` mints its id."""
     return [
         (state.LedgerOp.ACTION, {
             'lead_op': str(action.op), 'task': action.task, 'target': _target_json(action.target),
@@ -117,18 +117,6 @@ def _action_entries(ret: state.PrdReturn, return_name: str) -> list[_Entry]:
         })
         for action in ret.lead_actions
     ]
-
-
-def _numbered_actions(entries: Iterable[_Entry], ledger: Iterable[Mapping[str, Any]]) -> list[_Entry]:
-    """Action ids ``A<n>``, dense across every action line the ledger holds."""
-    number = 1 + sum(1 for line in ledger if line['op'] == state.LedgerOp.ACTION)
-    numbered: list[_Entry] = []
-    for op, fields in entries:
-        if op is state.LedgerOp.ACTION:
-            fields = {'id': f'A{number}', **fields}
-            number += 1
-        numbered.append((op, fields))
-    return numbered
 
 
 _SEAT_STATUS: Mapping[state.Pass, state.StreamStatus] = {
@@ -367,9 +355,7 @@ def _stamped(snapshot: home_writer.Snapshot, by: str, entries: _Entries) -> home
     """The entries stamped; a session ruling the rulings file would refuse is a form rejection."""
     rulings = [(state.RuledBy.HUMAN, fields) for _, fields in entries.rulings]
     try:
-        return home_writer.stamp(
-            snapshot, by, _numbered_actions(entries.ledger, snapshot.ledger), rulings,
-        )
+        return home_writer.stamp(snapshot, by, entries.ledger, rulings)
     except home_writer.RulingRefused as refused:
         index, _ = entries.rulings[refused.index]
         return _refused([state.Rejection(

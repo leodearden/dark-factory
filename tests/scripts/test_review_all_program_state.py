@@ -577,6 +577,41 @@ def test_an_action_line_refuses_a_lead_op_outside_the_vocabulary(tmp_path: Path)
         state.append_ledger(home, [line])
 
 
+def _action(seq: int, action_id: str) -> dict[str, Any]:
+    return _line(seq, 'action', id=action_id, lead_op='note', task=102, target=None,
+                 text='Route callers after 101.', needs_human=False) | {
+        'return': 'returns/S1.decompose.json'}
+
+
+def test_next_action_id_counts_the_ledgers_action_lines() -> None:
+    ledger = [_authored(1, 'S1'), _action(2, 'A1'), _line(3, 'note', text='n'), _action(4, 'A2')]
+    assert state.next_action_id(ledger[:1]) == 'A1'
+    assert state.next_action_id(ledger) == 'A3'
+
+
+@pytest.mark.parametrize('action_id', ['A1', 'A3', 'B2'])
+def test_append_ledger_refuses_an_action_id_that_is_not_the_next(
+    action_id: str, tmp_path: Path,
+) -> None:
+    home = state.Home(tmp_path)
+    state.append_ledger(home, [_action(1, 'A1')])
+    with pytest.raises(state.LedgerRefused) as caught:
+        state.append_ledger(home, [_action(2, action_id)])
+    assert "expected id 'A2'" in str(caught.value)
+    assert f'got {action_id!r}' in str(caught.value)
+
+
+def test_read_ledger_refuses_a_hand_edited_duplicate_action_id(tmp_path: Path) -> None:
+    home = state.Home(tmp_path)
+    home.ledger.write_text(''.join(json.dumps(line) + '\n' for line in (_action(1, 'A1'), _action(2, 'A1'))))
+    with pytest.raises(state.LedgerRefused, match='line 2'):
+        state.read_ledger(home)
+
+
+def test_date_of_is_the_utc_date_of_a_now_utc_stamp() -> None:
+    assert state.date_of('2026-10-19T23:59:59Z') == '2026-10-19'
+
+
 def test_read_ledger_refuses_a_hand_edited_gap(tmp_path: Path) -> None:
     home = state.Home(tmp_path)
     home.ledger.write_text(
