@@ -17059,6 +17059,7 @@ class TaskWorkflow:
             # SAME-signature L1 should suppress the steward-facing L0 (task 2757):
             # an unrelated open L1 (different category) must not silently drop a
             # new root cause's L0.
+            awaited_escalation_id: str | None = None
             if not self.escalation_queue.has_open_l1(self.task_id, category=category):
                 from escalation.models import Escalation
 
@@ -17096,6 +17097,7 @@ class TaskWorkflow:
                             key_fn=content_fingerprint_key,
                         ),
                     )
+                    awaited_escalation_id = result['id']
                     # Emit escalation_created only when this task is the parent
                     # (status='queued' means a new parent was filed, not a child fold).
                     if result.get('status') == 'queued' and self.event_store:
@@ -17115,6 +17117,7 @@ class TaskWorkflow:
                     # own blocked state.
                 else:
                     self.escalation_queue.submit(esc)
+                    awaited_escalation_id = esc.id
                     if self.event_store:
                         self.event_store.emit(
                             EventType.escalation_created,
@@ -17126,7 +17129,10 @@ class TaskWorkflow:
             # Give the steward a chance to resolve the escalation
             await self._ensure_steward_started()
             if self._steward:
-                outcome = await self._await_steward_completion(escalation_id=None)
+                # Scoped to the filed record (task 5563); see _await_steward_completion.
+                outcome = await self._await_steward_completion(
+                    escalation_id=awaited_escalation_id,
+                )
 
                 async def _requeue() -> WorkflowOutcome:
                     if self.event_store:
