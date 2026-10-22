@@ -73,6 +73,7 @@ _CONSISTENT_DECISIONS = {
     ),
     ReverifyGateReason.overlap: _decision(ReverifyGateReason.overlap, overlap=('x.txt',)),
     ReverifyGateReason.overlap_unknown: _decision(ReverifyGateReason.overlap_unknown),
+    ReverifyGateReason.same_tree_history_leg: _decision(ReverifyGateReason.same_tree_history_leg),
 }
 
 _SKIPS = {ReverifyGateReason.same_tree, ReverifyGateReason.disjoint}
@@ -138,6 +139,15 @@ class TestReverifyGateDecisionRecord:
         assert reason.skip_clearance is expected
         assert reason.reverifies is (expected is None)
         assert _CONSISTENT_DECISIONS[reason].reverifies is reason.reverifies
+
+    def test_the_history_leg_clearance_is_earned_by_running_the_leg_never_by_a_skip(
+        self,
+    ) -> None:
+        assert GateClearance.history_leg.value == 'history_leg'
+        assert all(
+            reason.skip_clearance is not GateClearance.history_leg
+            for reason in ReverifyGateReason
+        )
 
     def test_emit_writes_one_runs_db_row(self, tmp_path: Path) -> None:
         store = EventStore(tmp_path / 'runs.db', 'run-5064')
