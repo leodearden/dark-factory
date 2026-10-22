@@ -455,7 +455,8 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
             # stale the moment the kernel may recycle that pid.  So dispatch no
             # signal at all once the process has been reaped, mirroring
             # `shared.proc_group.terminate_process_group` step 1 and
-            # `deterministic_runner._terminate_process_tree`.
+            # `shared.proc_group.sigkill_process_group`'s reaped-leader
+            # short-circuit.
             #
             # `Popen.communicate(timeout=...)` deliberately does NOT reap on
             # timeout, so `returncode` is normally None here and the kill still
@@ -468,9 +469,9 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
             # pipe open times out with the leader an unreaped zombie whose pid
             # the kernel cannot recycle — so the frozen pgid is still valid and
             # the group must be killed, or the helper holds a lane flock for
-            # minutes and turns one timeout into a cascade.  This spelling is a
-            # literal mirror of `deterministic_runner._terminate_process_tree`,
-            # so both sites this task closed enforce the same two-part rule the
+            # minutes and turns one timeout into a cascade.  This spelling
+            # mirrors `shared.proc_group.sigkill_process_group`'s reaped-leader
+            # short-circuit, so both sites enforce the same two-part rule the
             # killpg guard's failure message states.
             if proc.returncode is None:
                 try:

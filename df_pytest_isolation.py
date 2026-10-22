@@ -1789,6 +1789,11 @@ def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
     ``TimeoutExpired``, and masking that with a signalling error would replace
     a legible timeout with a confusing one. ``ProcessLookupError`` is the
     ordinary case of a child that exited between the timeout and the signal.
+
+    The ``Popen`` sibling of
+    ``shared/src/shared/proc_group.py::sigkill_process_group``, ported rather
+    than imported per this module's import constraint (see the module
+    docstring), so a fix to either belongs in both.
     """
     reason = _unsafe_pgid_reason(pgid)
     if reason is not None:
