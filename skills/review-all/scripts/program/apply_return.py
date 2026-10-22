@@ -434,11 +434,13 @@ def apply(
     return outcome
 
 
-def check(inbox_file: Path, *, store_factory: _StoreFactory = state.open_reader) -> Applied | Refused:
+def check(
+    inbox_file: Path, *, amend: bool = False, store_factory: _StoreFactory = state.open_reader,
+) -> Applied | Refused:
     """What ``apply`` would do with *inbox_file*, without the lock and without writing."""
     snapshot = home_writer.read(home_of(inbox_file))
     return plan_application(
-        snapshot, inbox_file, amend=False, store=store_factory(snapshot.program),
+        snapshot, inbox_file, amend=amend, store=store_factory(snapshot.program),
     )
 
 
@@ -636,13 +638,13 @@ def _validated(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Non
         parser.error('give exactly one of FILE, --check FILE or --from-store STREAM')
     if (args.from_store is None) != (args.run is None):
         parser.error('--from-store and --run go together')
-    if args.amend and args.file is None:
-        parser.error('--amend applies a FILE')
+    if args.amend and args.from_store is not None:
+        parser.error('--amend goes with FILE or --check FILE')
 
 
 def _run(args: argparse.Namespace) -> int:
     if args.check is not None:
-        return _report(check(args.check), args.check, prefix='check ok: ')
+        return _report(check(args.check, amend=args.amend), args.check, prefix='check ok: ')
     if args.file is not None:
         return _report(apply(args.file, amend=args.amend), args.file)
     outcome = from_store(state.run_home(args.run), args.from_store)

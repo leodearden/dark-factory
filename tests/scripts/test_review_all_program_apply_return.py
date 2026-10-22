@@ -429,6 +429,29 @@ def test_b16_amend_appends_only_the_delta_and_keeps_the_first_file(env: ProgramE
     assert sorted(str(ref) for ref in recorded) == ['S1:Q1', 'S1:Q2', 'S1:Q3']
 
 
+def test_b16_check_with_amend_reports_the_amendment_digest_and_writes_nothing(
+    env: ProgramEnv,
+) -> None:
+    _applied(env, 'S1.author.json')
+    inbox_file = env.put_inbox('S1.author.amend.json')
+    before = env.snapshot()
+    unamended = env.run('apply_return.py', '--check', inbox_file)
+    assert unamended.returncode == 1
+    assert '--amend' in _output(unamended)
+    checked = env.run('apply_return.py', '--check', inbox_file, '--amend')
+    assert checked.returncode == 0, _output(checked)
+    assert env.snapshot() == before
+    applied = _amended_author(env)
+    assert applied.returncode == 0, _output(applied)
+    assert checked.stdout.splitlines()[0] == f'check ok: {applied.stdout.splitlines()[0]}'
+
+
+def test_amend_with_from_store_is_a_usage_error(env: ProgramEnv) -> None:
+    proc = env.run('apply_return.py', '--from-store', 'S2', '--run', RUN_ID, '--amend')
+    assert proc.returncode == 2
+    assert '--amend goes with FILE or --check FILE' in _output(proc)
+
+
 def _first_author(env: ProgramEnv) -> None:
     _applied(env, 'S1.author.json')
 
