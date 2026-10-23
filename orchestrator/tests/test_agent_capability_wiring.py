@@ -470,6 +470,26 @@ class TestInvokeDerivesGatingFromRole:
             'role.mcp_families, not role.name in _PLAN_TOOLS_ROLES.'
         )
 
+    @pytest.mark.parametrize(
+        ('family', 'server'), [('plan_tools', 'plan-tools'), ('verdict_tools', 'verdict-tools')],
+    )
+    async def test_agent_side_server_gets_the_task_root(
+        self, family, server, config, git_ops, task_assignment,
+    ):
+        """Task 3155: the agent-side server is launched on the same task root
+        the workflow reads, or the agent writes plan/verdicts where nobody looks."""
+        role = AgentRole(
+            name=f'probe_{family}', system_prompt='x', allowed_tools=[],
+            mcp_families=frozenset({family}),
+        )
+        call_kwargs, _workflow, cwd = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        args = call_kwargs['mcp_config']['mcpServers'][server]['args']
+        idx = args.index('--task-root')
+        assert args[idx + 1] == str(
+            TaskArtifacts.task_root_for(cwd.parent, task_assignment.task_id)
+        )
+
     async def test_orchestrator_family_wires_mcp_config_regardless_of_name(
         self, config, git_ops, task_assignment,
     ):
