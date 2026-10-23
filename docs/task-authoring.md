@@ -2212,7 +2212,9 @@ were prose.
 - Four keys are the exception: a `replace` must carry `done_provenance`,
   `defects` and `defect_test_retirements` (§8) and `deferral` (§9
   "Deferring a task") exactly as stored, present if stored and absent if
-  not. Otherwise the call is refused and nothing is written. Send those
+  not; a stored blob that is corrupt or not a JSON object counts as
+  storing none of them. Otherwise the call is refused and nothing is
+  written. Send those
   keys back exactly as you read them
   (`sqlite_task_backend.py::_assert_passthrough_only_keys`,
   `sqlite_task_backend.py::_assert_deferral_unchanged`).
@@ -2224,8 +2226,8 @@ were prose.
   on any scalar collision, and never removes a key. So append to `details`
   in one call, and rotate `description` and `metadata` in a separate call
   with `append` omitted and `metadata_mode='replace'`.
-- No column has a length cap of its own. The only size rule is the
-  whole-task threshold above.
+- No column has a length cap of its own. The only size guidance is the
+  whole-task threshold above, and no write is refused for exceeding it.
 - Re-read the task from the store afterwards and confirm the status, the
   gate markers and the untouched columns survived.
 
