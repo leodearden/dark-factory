@@ -29,7 +29,12 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'normalize_topic_slugs.py'
 
@@ -2322,7 +2327,7 @@ class TestRunApplyStoreMutationPreflight:
 
         await run_sweep(service, projects=('dark_factory',), apply=True)
 
-        assert calls == [{'operation': 'normalize_topic_slugs --apply'}]
+        assert [call['operation'] for call in calls] == ['normalize_topic_slugs --apply']
 
     @pytest.mark.asyncio
     async def test_a_dry_run_never_probes(self, monkeypatch):
@@ -2366,6 +2371,22 @@ class TestRunApplyStoreMutationPreflight:
         assert 'fail-closed' in message.lower()
         # The remedy must name the hazard, not merely the denial.
         assert 'two topic values' in message or 'half' in message.lower()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_logs_exactly_one_fail_closed_diagnosis(
+        self, monkeypatch, caplog,
+    ):
+        deny(_mod, monkeypatch)
+        service, _corpus = _run_service({'dark_factory': []})
+
+        with (
+            caplog.at_level('ERROR', logger='normalize_topic_slugs'),
+            pytest.raises(_mod.StoreMutationUnavailable),
+        ):
+            await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        (record,) = fail_closed_records(caplog, 'normalize_topic_slugs')
+        assert SENTINEL in record.getMessage()
 
 
 def _error_log(caplog) -> str:

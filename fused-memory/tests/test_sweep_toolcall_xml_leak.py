@@ -48,7 +48,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 from fused_memory.models import SourceStore
 
@@ -1689,6 +1694,19 @@ class TestRunApplyStoreMutationPreflight:
 
         service.scan_memory_content.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_the_refusal_logs_its_fail_closed_diagnosis(self, monkeypatch, caplog):
+        """``main`` prints only the partial report, so this script's own logger
+        carries the one record saying what was refused and what to do."""
+        deny(_mod, monkeypatch)
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        with caplog.at_level(logging.ERROR), pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(_args(apply=True), service)
+
+        (record,) = fail_closed_records(caplog, 'sweep_toolcall_xml_leak')
+        assert SENTINEL in record.getMessage()
+
     def test_the_refusal_is_loud_and_reaches_mains_fatal_abort_path(
         self, monkeypatch, capsys
     ):
@@ -1741,9 +1759,8 @@ class TestRunApplyStoreMutationPreflight:
         assert _mod.resolve_exit_code(report) == 0
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment repairs exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         service = _service([_match('r', _TAIL_LEAK)])
 
         report = await _mod.run(_args(apply=True), service)
