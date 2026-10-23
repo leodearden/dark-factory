@@ -195,3 +195,140 @@ def test_an_unknown_stream_is_refused_and_nothing_is_written(run: BriefRun) -> N
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert 'S9' in proc.stderr
     assert not (run.home / 'briefs').exists()
+
+
+D1_KEY = 'fk-0000000000d1'
+GREP_RULE = 'grep -c over src/fixture'
+
+
+def rule(run: BriefRun, *args: str) -> str:
+    """Record one human ruling with the real ``record.py rule``; returns its minted id."""
+    proc = run.env.run(
+        'record.py', 'rule', '--run', RUN_ID, '--by', 'human', '--question', 'Which way?',
+        '--ruling', 'this way', '--source', 'the sitting', '--option', 'this way',
+        '--option', 'that way', '--consequence', 'the PRD goes this way', *args,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc.stdout.split()[1]
+
+
+def bullets(lines: list[str]) -> list[str]:
+    return [line[2:] for line in lines if line.startswith('- ')]
+
+
+def stream_cells(text: str) -> dict[str, str]:
+    """The stream section's ``- <column>: <cell>`` lines, by column."""
+    return dict(entry.split(': ', 1) for entry in bullets(section(text, _section_heading('STREAM'))))
+
+
+def finding_text(run: BriefRun, key: str) -> str:
+    (finding,) = [f for f in json.loads(run.record.read_text())['findings'] if f['key'] == key]
+    return finding['statement']
+
+
+def filings_rows(text: str) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in fenced(section(text, _section_heading('FILINGS')), 'jsonl')]
+
+
+def test_the_stream_row_findings_and_filings_follow_the_ledgers_amendments(run: BriefRun) -> None:
+    state = load_program_module('state')
+    home = state.Home(run.home)
+    state.append_ledger(home, [{
+        'seq': state.next_seq(state.read_ledger(home)), 'at': state.now_utc(), 'by': 'test',
+        'op': str(state.LedgerOp.AMEND_STREAM), 'stream': 'S1', 'field': str(state.StreamField.KEYS),
+        'change': str(state.AmendChange.ADD), 'value': D1_KEY, 'ruling': 'D1',
+    }])
+
+    text = run.written('S1', 'author')
+
+    cells = stream_cells(text)
+    s1 = json.loads((FIXTURE_DIR / 'program.json').read_text())['streams'][0]
+    for value in (s1['name'], s1['slug'], s1['remedy']):
+        assert value in cells.values(), value
+    assert cells['Wave'] == '1'
+    assert set(cells['Finding keys'].split(', ')) == {*s1['keys'], D1_KEY}
+    assert finding_text(run, D1_KEY) in '\n'.join(section(text, _section_heading('FINDINGS')))
+    assert [row['disposition'] for row in filings_rows(text) if row['key'] == D1_KEY] == ['filed:107']
+
+
+def test_the_findings_carry_statements_measurements_and_the_dispute_beside_the_verdict(
+    run: BriefRun,
+) -> None:
+    text = run.written('S1', 'author')
+
+    findings = section(text, _section_heading('FINDINGS'))
+    body = '\n'.join(findings)
+    for key in ('fk-0000000000a1', 'fk-0000000000a2'):
+        assert finding_text(run, key) in body, key
+    assert sum(GREP_RULE in line for line in findings) == 2
+    (disputed,) = [line for line in findings if 'weakened' in line]
+    assert 'confirmed' in disputed
+    assert 'two of the three private imports are test-only' in disputed
+    assert finding_text(run, 'fk-0000000000b1') not in text
+
+
+def test_the_filings_rows_are_the_records_rows_for_the_streams_keys_verbatim(run: BriefRun) -> None:
+    text = run.written('S1', 'author')
+
+    assert filings_rows(text) == [S1_FILING]
+
+
+def test_the_xrefs_addressed_to_the_stream_are_carried(run: BriefRun) -> None:
+    run.applied('S2.author.json')
+
+    xrefs = '\n'.join(section(run.written('S1', 'author'), _section_heading('XREFS')))
+
+    assert 'C2 is delivered by S2 α and releases S1 ζ.' in xrefs
+    assert 'S2' in xrefs
+
+
+def test_only_current_non_reask_rulings_binding_the_stream_are_carried(run: BriefRun) -> None:
+    assert rule(run, '--stream', 'S1') == 'D1'
+    assert rule(run, '--supersedes', 'D1', '--stream', 'S1') == 'D2'
+    assert rule(run, '--stream', 'S3') == 'D3'
+    assert rule(run) == 'D4'
+    run.applied('S1.author.json')
+    assert rule(run, '--answers', 'S1:Q1', '--reask') == 'D5'
+
+    rulings = bullets(section(run.written('S1', 'author'), _section_heading('RULINGS')))
+
+    assert {line.split()[0] for line in rulings} == {'D2', 'D4'}
+    (d2,) = [line for line in rulings if line.split()[0] == 'D2']
+    assert 'D1' in d2.replace(',', ' ').split()
+
+
+def test_the_author_brief_states_the_sitting_rule(run: BriefRun) -> None:
+    sitting = '\n'.join(section(run.written('S1', 'author'), _section_heading('SITTING')))
+
+    assert 'lead_rulable' in sitting
+
+
+def test_a_brief_is_rebuilt_from_state_on_every_run(run: BriefRun) -> None:
+    run.written('S1', 'author')
+    ruling_id = rule(run, '--stream', 'S1')
+
+    rulings = bullets(section(run.written('S1', 'author'), _section_heading('RULINGS')))
+
+    assert ruling_id in {line.split()[0] for line in rulings}
+
+
+def test_an_absent_run_record_is_refused_naming_it(run: BriefRun) -> None:
+    run.record.unlink()
+
+    proc = run.brief('S1', 'author')
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert str(run.record) in proc.stderr
+    assert not (run.home / 'briefs' / 'S1.author.md').exists()
+
+
+def test_a_finding_without_a_statement_is_refused_naming_the_field(run: BriefRun) -> None:
+    record = json.loads(run.record.read_text())
+    del record['findings'][0]['statement']
+    run.record.write_text(json.dumps(record), encoding='utf-8')
+
+    proc = run.brief('S1', 'author')
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert 'findings[0].statement' in proc.stderr
+    assert not (run.home / 'briefs' / 'S1.author.md').exists()
