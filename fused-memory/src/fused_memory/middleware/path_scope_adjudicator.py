@@ -48,6 +48,7 @@ from shared.cli_invoke import (
     AgentResult,  # noqa: F401 (re-exported for tests)
     invoke_with_cap_retry,
     is_zero_output_timeout,
+    no_mcp_servers_config,
 )
 from shared.neutral_cwd import neutral_cli_cwd
 
@@ -364,6 +365,8 @@ class PathScopeAdjudicator:
                 max_budget_usd=self._config.max_budget_usd,
                 disallowed_tools=['*'],
                 output_schema=ADJUDICATION_SCHEMA,
+                mcp_config=no_mcp_servers_config(),
+                strict_mcp_config=True,
                 permission_mode='bypassPermissions',
                 timeout_seconds=self._config.timeout_seconds,
                 cap_wait_sanity_secs=_ADJUDICATOR_CAP_WAIT_SANITY_SECS,
