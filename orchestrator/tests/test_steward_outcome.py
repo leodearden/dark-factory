@@ -349,6 +349,45 @@ class TestAwaitStewardCompletionIsEscalationScoped:
 
         assert outcome == own
 
+    async def test_cancel_after_a_discarded_foreign_outcome_forces_no_wip(
+        self, tmp_path: Path,
+    ):
+        wf, channel = self._scoped_workflow(tmp_path, timeout=5.0)
+        channel.put_nowait(
+            PublishedStewardOutcome('esc-A', StewardResolved('older fixed')),
+        )
+        wf._worktree_has_wip_commits = AsyncMock(return_value=True)
+
+        async def _cancel_later() -> None:
+            await asyncio.sleep(0.05)
+            wf._cancel_event.set()
+
+        canceller = asyncio.create_task(_cancel_later())
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id='esc-B'), 2,
+        )
+        await canceller
+
+        assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
+        assert channel.empty()
+
+    async def test_own_outcome_queued_behind_a_foreign_one_ends_the_wait(
+        self, tmp_path: Path,
+    ):
+        wf, channel = self._scoped_workflow(tmp_path, timeout=5.0)
+        own = StewardInterrupted('attempt_cap', wip_commits_present=False)
+        channel.put_nowait(
+            PublishedStewardOutcome('esc-A', StewardResolved('older fixed')),
+        )
+        channel.put_nowait(PublishedStewardOutcome('esc-B', own))
+
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id='esc-B'), 2,
+        )
+
+        assert outcome == own
+        assert channel.empty()
+
     async def test_burst_reduction_ignores_foreign_outcomes(
         self, tmp_path: Path,
     ):

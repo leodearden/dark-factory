@@ -39,7 +39,6 @@ from orchestrator.git_ops import WorktreeConflictError
 from orchestrator.merge_lane.gates import PlanFilesTouchedResult
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import (
-    PublishedStewardOutcome,
     StewardInterrupted,
     StewardReescalatedL1,
     StewardResolved,
@@ -50,6 +49,7 @@ from orchestrator.workflow import (
     WorkflowState,
     _meta_root_for_worktree,
 )
+from orchestrator.workflow_types import PublishedStewardOutcome
 
 
 def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:

@@ -51,7 +51,6 @@ from orchestrator.git_ops import AdvanceOutcome, GitOps, _run
 from orchestrator.scheduler import BlastRadiusResult, TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import (
-    PublishedStewardOutcome,
     StewardBudgetExhausted,
     StewardInterrupted,
     StewardReescalatedL1,
@@ -61,6 +60,7 @@ from orchestrator.workflow import (
     WorkflowOutcome,
     WorkflowState,
 )
+from orchestrator.workflow_types import PublishedStewardOutcome
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1604,12 +1604,17 @@ def _make_resolve_then_dismiss_chained_steward(
 
     Mirrors the live failure mode that drove the original Fix A: the
     steward chains a fresh L0 and gives up on it rather than the one the
-    workflow itself submitted (``created_l0_id``).  Publishes
-    ``StewardResolved`` (for the resolved workflow L0) THEN
-    ``StewardReescalatedL1`` (for the chained give-up) — the same dual
-    publish the real steward performs — so the workflow's drain+reduce
-    (task 2248 / W9-delta review fix) must see past the leading
-    ``StewardResolved`` to route to ESCALATED.
+    workflow itself submitted (``created_l0_id``).  Like the real producer it
+    publishes one envelope per L0: ``StewardResolved`` tagged with each
+    workflow L0, THEN ``StewardReescalatedL1`` tagged with the chained L0.
+
+    Neither waiter reaches ESCALATED through that trailing publication.
+    ``_mark_blocked``'s wait is scoped to its own L0 (task 5563), so the
+    chained outcome is foreign and discarded; ESCALATED comes from the
+    ``has_open_l1`` source-of-truth override in
+    ``TaskWorkflow._await_steward_completion``, which replaces the in-scope
+    ``StewardResolved``.  ``run()``'s ESCALATED wait never routes on the
+    channel at all: its tail reads the open L1 from the escalation queue.
     """
     from escalation.models import Escalation
 
@@ -1631,13 +1636,9 @@ def _make_resolve_then_dismiss_chained_steward(
                     esc.id, 'Resolved by FakeSteward (workflow L0)',
                     resolved_by='fake-steward',
                 )
-            # Faithful to the real steward's dual publish (task 2248 /
-            # W9-delta review fix): TaskSteward._handle_escalation publishes
-            # StewardResolved for the workflow's own L0 (steward.py:563)
-            # BEFORE it ever chains a follow-on escalation of its own — so
-            # the channel must carry [StewardResolved, StewardReescalatedL1],
-            # not just the trailing re-escalation — each tagged with the L0 it
-            # is about, as the real producer tags it.
+            # Publication order as the real producer emits it:
+            # TaskSteward._handle_escalation publishes StewardResolved for the
+            # workflow's own L0 BEFORE it ever chains a follow-on escalation.
             if self._outcome_channel is not None:
                 for esc in pending:
                     self._outcome_channel.put_nowait(PublishedStewardOutcome(
@@ -2913,13 +2914,15 @@ class TestMarkBlockedFalseDoneGuard:
         THAT one with terminate=True, the workflow must still treat it
         as "agent gives up".
 
-        Task 2248 / W9-delta: the old timestamp-window dismissal guard
-        that used to catch this case is deleted; the fake steward now
-        publishes ``StewardReescalatedL1`` (mirroring the real give-up
-        choke point) and ``_mark_blocked``'s single isinstance dispatch
-        (SO-1) routes it to ESCALATED — no re-pend, no duplicate L1.  This
-        still exercises the "not just created_l0_id" case: the dismissed
-        L0 is NOT the one the workflow itself submitted.
+        The steward's ``StewardReescalatedL1`` is about the chained L0, so
+        ``_mark_blocked``'s scoped wait discards it (task 5563) and receives
+        only its own L0's ``StewardResolved``.  The ``has_open_l1``
+        source-of-truth override in ``_await_steward_completion`` turns that
+        would-be requeue into ``StewardReescalatedL1``, which
+        ``_mark_blocked``'s single isinstance dispatch (SO-1) routes to
+        ESCALATED — no re-pend, no duplicate L1.  This still exercises the
+        "not just created_l0_id" case: the dismissed L0 is NOT the one the
+        workflow itself submitted.
         """
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
