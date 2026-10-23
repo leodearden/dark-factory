@@ -20,6 +20,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.mcp_lifecycle import plan_tools_mcp_server
+from orchestrator.workflow import (
+    _ORCH_PROJECT_DIR,
+    _inject_plan_tools_mcp,
+    _meta_root_for_worktree,
+)
+
 _TASK_ROOT = Path('/.task-meta/task-3155')
 
 
@@ -29,15 +37,12 @@ class TestMetaRootForWorktree:
     never by hand-joining '.task' or '.task-meta'."""
 
     def test_derives_sibling_task_meta_path(self):
-        from orchestrator.workflow import _meta_root_for_worktree  # noqa: PLC0415
-
         assert _meta_root_for_worktree(Path('/base/wt')) == Path('/base/.task-meta/wt')
 
     def test_result_is_sibling_not_child_of_worktree(self):
         """The derived path must NOT live under the worktree itself — that's
         the entire point of the relocation (git add -A/clean/checkout in the
         worktree cannot reach a sibling path)."""
-        from orchestrator.workflow import _meta_root_for_worktree  # noqa: PLC0415
 
         worktree = Path('/base/wt')
         meta_root = _meta_root_for_worktree(worktree)
@@ -54,12 +59,6 @@ class TestInjectPlanToolsMcp:
         """Given mcp_config=None, result has mcpServers['plan-tools'] == helper output
         with python_executable=sys.executable (no-uv hot path, task 1776) and
         meta_root=_meta_root_for_worktree(wt) (task 2258, W11-ε1)."""
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-        from orchestrator.workflow import (  # noqa: PLC0415
-            _ORCH_PROJECT_DIR,
-            _inject_plan_tools_mcp,
-            _meta_root_for_worktree,
-        )
 
         wt = Path('/wt')
         out = _inject_plan_tools_mcp(None, wt, task_root=_TASK_ROOT)
@@ -77,8 +76,6 @@ class TestInjectPlanToolsMcp:
         """args carry '--meta-root <lane root>' then '--task-root <task root>'
         — the agent-side plan-tools server must target the same two roots the
         orchestrator uses (task 3155)."""
-        from orchestrator.artifacts import TaskArtifacts  # noqa: PLC0415
-        from orchestrator.workflow import _inject_plan_tools_mcp  # noqa: PLC0415
 
         wt = Path('/base/wt')
         out = _inject_plan_tools_mcp(None, wt, task_root=_TASK_ROOT)
@@ -92,7 +89,6 @@ class TestInjectPlanToolsMcp:
 
     def test_existing_server_is_preserved(self):
         """Pre-existing servers (e.g. fused-memory) survive alongside plan-tools."""
-        from orchestrator.workflow import _inject_plan_tools_mcp  # noqa: PLC0415
 
         existing = {
             'mcpServers': {

@@ -18,6 +18,7 @@ from escalation.queue import EscalationQueue
 from shared.cli_invoke import AllAccountsCappedException
 from shared.usage_gate import AccountLease, InvokeSlot
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.steward import (
     StewardMetrics,
     TaskSteward,
@@ -2660,8 +2661,6 @@ class TestPreTriageSuggestionsPath:
     ):
         """Task 3155: verdict-tools is launched on the task root, and the
         triage verdict consumed is the one there, never a lane-root decoy."""
-        from orchestrator.artifacts import TaskArtifacts  # noqa: PLC0415
-
         artifacts = TaskArtifacts.for_task(steward.worktree, steward.task_id)
 
         def _submit_triage(**_kwargs):
