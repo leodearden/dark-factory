@@ -9,12 +9,15 @@ prints only paths: the lead never reads a brief (``SKILL.md`` §Lead context bud
 from __future__ import annotations
 
 import argparse
+import contextlib
 import enum
 import json
+import os
 import shlex
 import sys
+import tempfile
 import types
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -562,12 +565,27 @@ def _seat(args: argparse.Namespace) -> _Seat:
 
 
 def _spawned_session(seat: _Seat) -> sessions.SpawnedSession:
-    """The sessions.json entry for the spawn, refused before any write when its title is taken."""
-    sessions.refuse_taken(seat.run.home, seat.session.title)
     return sessions.SpawnedSession(
         title=seat.session.title, stream=seat.stream, pass_=seat.pass_, item=seat.item,
         spawned_after=state.now_utc(), record_dir=None,
     )
+
+
+@contextlib.contextmanager
+def _replacing(path: Path, text: str) -> Iterator[None]:
+    """*text* staged beside *path*, which it replaces when the block completes; a block that raises
+    leaves *path* as it was."""
+    path.parent.mkdir(exist_ok=True)
+    handle, staged = tempfile.mkstemp(dir=path.parent, prefix=f'.{path.name}.')
+    try:
+        with os.fdopen(handle, 'w', encoding='utf-8') as out:
+            out.write(text)
+        os.chmod(staged, 0o644)
+        yield
+        os.replace(staged, path)
+    except BaseException:
+        Path(staged).unlink(missing_ok=True)
+        raise
 
 
 def _write(args: argparse.Namespace) -> Exit:
@@ -578,13 +596,13 @@ def _write(args: argparse.Namespace) -> Exit:
     spawned = _spawned_session(seat) if seat.spawned else None
     home = seat.run.home
     path = home.brief_file(seat.stream, seat.pass_, seat.item)
-    path.parent.mkdir(exist_ok=True)
-    path.write_text(text, encoding='utf-8')
+    with _replacing(path, text):
+        if spawned is not None:
+            sessions.add(home, spawned)
     print(f'wrote {path}')
     if built.store_read is not None:
         print(f'store read {built.store_read}')
     if spawned is not None:
-        sessions.add(home, spawned)
         print(f'recorded {spawned.title} in {home.sessions_json}')
         print(_spawn_command(seat.run.program.project_root, spawned.title, path))
     return Exit.WRITTEN

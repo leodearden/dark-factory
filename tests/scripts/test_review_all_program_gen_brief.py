@@ -12,20 +12,31 @@ are only ever copied.
 from __future__ import annotations
 
 import contextlib
+import errno
+import fcntl
 import importlib.util
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
+import time
 import types
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import pytest
-from review_all_program_cli import FIXTURE_RETURNS, RUN_ID, ProgramEnv, load_program_module
+from review_all_program_cli import (
+    FIXTURE_RETURNS,
+    RUN_ID,
+    SCRIPT_TIMEOUT_SECS,
+    ProgramEnv,
+    load_program_module,
+    wait_until_blocked_on,
+)
 from review_all_program_fixture import FIXTURE_DIR, PROGRAM_DIR, REPO_ROOT, running_fake_store
 from review_all_program_seeded_run import StoreCopy
 
@@ -544,6 +555,59 @@ def test_a_taken_title_is_refused_and_nothing_changes(run: BriefRun) -> None:
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert S1_TITLE in proc.stderr
     assert ((run.home / 'sessions.json').read_bytes(), brief_path.read_bytes()) == before
+    assert [path.name for path in (run.home / 'briefs').iterdir()] == ['S1.author.md']
+
+
+def _opened_for_writing(fifo: Path, reader: subprocess.Popen[str]) -> TextIO:
+    """*fifo* open for writing, which succeeds once *reader* has opened it to read."""
+    deadline = time.monotonic() + SCRIPT_TIMEOUT_SECS
+    while True:
+        try:
+            handle = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            break
+        except OSError as unopened:
+            if unopened.errno != errno.ENXIO:
+                raise
+        if reader.poll() is not None:
+            stdout, stderr = reader.communicate()
+            raise AssertionError(f'exited {reader.returncode} before opening {fifo}: {stdout}{stderr}')
+        if time.monotonic() > deadline:
+            reader.kill()
+            raise AssertionError(f'{fifo} not opened within {SCRIPT_TIMEOUT_SECS}s')
+        time.sleep(0.02)
+    os.set_blocking(handle, True)
+    return os.fdopen(handle, 'w', encoding='utf-8')
+
+
+def test_a_title_taken_while_the_brief_is_built_is_refused_and_no_brief_is_written(
+    run: BriefRun,
+) -> None:
+    """The run record is a FIFO, so gen_brief waits on it after reading the home. The test then takes
+    the home lock, so gen_brief also waits to record its session. Only then is the title taken."""
+    record_text = run.record.read_text(encoding='utf-8')
+    run.record.unlink()
+    os.mkfifo(run.record)
+    program_json = run.home / 'program.json'
+    taken = {S1_TITLE: {
+        'stream': 'S3', 'pass': 'author', 'item': None, 'spawned_after': '2026-10-23T00:00:00Z',
+        'record_dir': None,
+    }}
+
+    spawning = run.env.start(SCRIPT, '--run', RUN_ID, 'S1', 'author', '--spawn', S1_TITLE)
+    record = _opened_for_writing(run.record, spawning)
+    with program_json.open() as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        with record:
+            record.write(record_text)
+        wait_until_blocked_on(program_json, spawning)
+        (run.home / 'sessions.json').write_text(json.dumps(taken), encoding='utf-8')
+        fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+    stdout, stderr = spawning.communicate(timeout=SCRIPT_TIMEOUT_SECS)
+
+    assert spawning.returncode == 1, stdout + stderr
+    assert S1_TITLE in stderr
+    assert sessions_json(run) == taken
+    assert list((run.home / 'briefs').iterdir()) == []
 
 
 def test_sessions_of_different_titles_are_all_kept(run: BriefRun) -> None:
@@ -555,9 +619,11 @@ def test_sessions_of_different_titles_are_all_kept(run: BriefRun) -> None:
 
 
 def test_a_title_with_a_line_break_is_refused_and_nothing_is_written(run: BriefRun) -> None:
-    proc = run.brief('S1', 'author', '--spawn', 'prd:fixture\nS1')
+    title = 'prd:fixture\nS1'
+    proc = run.brief('S1', 'author', '--spawn', title)
 
-    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert repr(title) in proc.stderr
     assert not (run.home / 'sessions.json').exists()
     assert not (run.home / 'briefs' / 'S1.author.md').exists()
 

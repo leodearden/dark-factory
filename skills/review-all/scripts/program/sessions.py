@@ -101,11 +101,6 @@ def _refuse_taken(recorded: Mapping[str, SpawnedSession], title: str) -> None:
         )
 
 
-def refuse_taken(home: state.Home, title: str) -> None:
-    """Refuse *title* when sessions.json already records it; ``add`` checks again under the lock."""
-    _refuse_taken(read(home), title)
-
-
 def _entry(session: SpawnedSession) -> dict[str, Any]:
     return {
         'stream': session.stream, 'pass': str(session.pass_), 'item': session.item,
