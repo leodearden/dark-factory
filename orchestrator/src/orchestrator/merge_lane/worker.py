@@ -81,10 +81,7 @@ from orchestrator.merge_lane.disposition import (
     SkewEvidence,
     classify_merge_failure_disposition,
 )
-from orchestrator.merge_lane.drift import (
-    _build_remote_runners,
-    _maybe_run_drift_check,
-)
+from orchestrator.merge_lane.drift import _maybe_run_drift_check
 from orchestrator.merge_lane.gates import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
@@ -226,6 +223,7 @@ from orchestrator.verify_categories import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
 )
 from orchestrator.verify_classify import reports_disk_full
+from orchestrator.verify_hosts import build_remote_runners as _build_remote_runners
 from orchestrator.verify_plan import effective_merge_module_configs
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,

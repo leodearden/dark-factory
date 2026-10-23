@@ -206,14 +206,14 @@ tasks:
       - orchestrator/src/orchestrator/merge_lane/
       expect: present
   - name: public-ru-tracker-entry
-    binding: capability→producer — δ1 adds note_runner_unavailable / note_runner_recovered
-      over the existing private _quarantine_unreachable_host, _record_runner_unavailable
-      and _record_runner_recovered (present on main), so task-path RU enters the reprobe
-      sweep (critic F1).
+    binding: capability→producer — δ1 adds note_runner_recovered over the existing
+      private _record_runner_recovered (present on main) and wires the pool's on_unavailable
+      to 6565's public bench_unavailable_runner (present on main), so task-path RU enters
+      the reprobe sweep (critic F1).
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: def note_runner_unavailable\(
+      pattern: def note_runner_recovered\(
       paths:
       - orchestrator/src/orchestrator/merge_lane/
       expect: present
