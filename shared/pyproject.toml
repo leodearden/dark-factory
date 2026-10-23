@@ -111,11 +111,10 @@ filterwarnings = [
 # load, measured 45.48s (orchestrator/tests/test_hard_v2_fixture_pool.py,
 # root-bound); times the 8x headroom factor whose rationale is
 # orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR = 363.84,
-# rounded up to a whole minute = 420, floored at
-# orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS
-# (also 420). Marked tests are excluded by design, including the slower
-# repo-wide scans in fused-memory/tests/test_check_bare_magicmock_config.py,
-# which carry their own mark. The full corpus, the run-to-run spread, the
+# rounded up to a whole minute = 420. Marked tests are excluded by design,
+# including the slower repo-wide scans in
+# fused-memory/tests/test_check_bare_magicmock_config.py, which carry their own
+# mark. The full corpus, the run-to-run spread, the
 # arithmetic and the value's history are in
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md — read that before
 # moving this number, and re-measure rather than re-judging it.

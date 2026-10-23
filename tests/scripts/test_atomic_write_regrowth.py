@@ -149,8 +149,6 @@ _ALLOWED_RENAMERS = {
         'TestStdlibOnlySelfContainment. Do not "finish" this migration.',
     ('orchestrator/src/orchestrator/session_hooks.py', '_run_install'):
         'Out of task 3223 enumerated scope; left alone deliberately.',
-    ('orchestrator/src/orchestrator/verify_cancel.py', 'write_pgid_file'):
-        'Out of task 3223 enumerated scope; left alone deliberately.',
     ('escalation/src/escalation/queue.py', 'EscalationQueue._atomic_write_path'):
         'Out of task 3223 enumerated scope. This is the helper 3223 was MODELLED '
         'on (its durable= flag became fsync=); a follow-up may migrate it.',
@@ -331,10 +329,6 @@ _ALLOWED_RENAMERS = {
         'writer of the legibility pipeline\'s canonical registry, and '
         'byte-stable given byte-stable input so a no-change night commits '
         'nothing — a migration must not perturb either property.',
-    ('scripts/legibility/trickle_state.py', 'record_run'):
-        'Out of task 3223 enumerated scope; left alone deliberately. '
-        'Same-directory mkstemp + os.replace of the trickle-state document the '
-        'function also returns; ordinary write path with no seam of its own.',
     ('scripts/migrate_transcript_archive_gunzip.py', 'gunzip_one'):
         'PRE-REPLACE SEAM, and the same one already recorded above for shared '
         'transcript_archive._archive_one — cited rather than re-argued. It '

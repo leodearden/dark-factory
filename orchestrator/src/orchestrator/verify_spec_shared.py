@@ -110,6 +110,7 @@ def apply_spec_to_host_config(
     global_verify_command: VerifyCommand | None,
     module_configs: Sequence[ModuleConfig],
     field_overrides: Mapping[str, Any],
+    verify_cold_preprovision_command: str,
 ) -> OrchestratorConfig:
     """Return a copy of the consuming host's *config* with a spec applied onto it.
 
@@ -134,6 +135,12 @@ def apply_spec_to_host_config(
       checked strictly against its declared OrchestratorConfig type first,
       because ``model_copy(update=...)`` validates nothing: an unknown name
       or a mistyped value raises TypeError rather than deciding the run.
+    - *verify_cold_preprovision_command*: non-empty replaces the host's, ''
+      keeps the host's own, under the same strict check as *field_overrides*.
+      '' is both "the dispatcher has none" and what a pre-6127 merge spec
+      decodes to, so a host-side value (leo-laptop's 2026-10-01 operational
+      fix is the live case) is never wiped.  PRD:
+      plans/remote-task-leg-verify-prd.md §4.1.
 
     Two spelling hazards, both because ``model_copy`` carries field and
     private-attribute VALUES over by reference: verify_env is a FRESH dict
@@ -142,8 +149,11 @@ def apply_spec_to_host_config(
     would shadow the PrivateAttr in ``__dict__``).  Either mistake corrupts
     the caller's config — the one cli.py loaded and may still use.
     """
+    overrides = dict(field_overrides)
+    if verify_cold_preprovision_command != '':
+        overrides['verify_cold_preprovision_command'] = verify_cold_preprovision_command
     update: dict[str, Any] = {
-        **_validated_field_overrides(field_overrides),
+        **_validated_field_overrides(overrides),
         'verify_env': {**config.effective_verify_env, **verify_env},
     }
     if global_verify_command is not None:

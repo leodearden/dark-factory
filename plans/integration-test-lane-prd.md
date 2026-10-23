@@ -1,6 +1,9 @@
 # PRD — Reusable off-hot-path integration-test lane (generalize the offline lane), + dark-factory Qdrant instance
 
 **Status:** author-complete, gates walked (2026-07-19). Decompose-ready.
+
+> **Amended 2026-10-12** by plans/offline-lane-red-path-prd.md: §3 'Confirm (flake filter)' (whole-command serial re-run) is replaced by a confirm that narrows to the named tests or intersects with the detection run. `LaneCommand` gains `outage_probe` and `outage_probe_timeout_secs` (D7).
+
 **Slug:** `integration-test-lane` · **Milestone:** verify-pipeline infra (root `plans/`).
 **Authoritative brief:** `~/.claude/spawn-briefs/integration-test-lane-prd-brief-2026-07-19.md` (verified against HEAD `c7507a4997`, 2026-07-19).
 **Closes:** `plans/cpu-load-robust-verify-prd.md` §9 (the "Qdrant compat coverage lane" open question) — the gap task **2773** creates.

@@ -17,9 +17,14 @@ dict) when any of these invariants is violated:
 3. ``task_kind='normal'`` ∧ ``before_done is not None`` — before_done is only
    valid on deterministic tasks.
 4. When ``before_done`` is present on a deterministic task: must be a dict;
-   ``script`` required string that resolves UNDER ``project_root``, exists,
-   and is executable (``os.access X_OK``); ``timeout_secs`` required positive
-   int; ``kind`` (when present) must be one of ``{'deploy', 'predicate'}``.
+   ``script`` required string that resolves UNDER ``project_root`` — or, when
+   ``script_root='factory'``, under the dark-factory root
+   (``shared.repo_paths.resolve_dark_factory_root``) — exists, and is
+   executable (``os.access X_OK``); ``timeout_secs`` required positive int;
+   ``kind`` (when present) must be one of ``{'deploy', 'predicate'}``;
+   ``script_root`` (when present) must be one of ``{'project', 'factory'}``,
+   and ``'factory'`` requires ``kind='predicate'``. An unresolvable
+   dark-factory root is a rejection.
 5. ``metadata.milestone``, when present, must match the shared ``Milestone``
    model (``mode='dated'`` with a parseable ``at``, or ``mode='delayed'``
    with a positive int ``after_secs``). Checked by presence alone — this
@@ -52,10 +57,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
+from shared.before_done_paths import ScriptRootRefused, resolve_script_base
+from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_metadata import Milestone, Recurrence, parse_metadata
 
 __all__ = [
@@ -74,6 +82,12 @@ _VALID_KINDS: frozenset[str] = frozenset({'normal', 'deterministic'})
 # all — as a less-targeted warning at the (enforce=False, warn-only) write
 # boundary.
 _VALID_BEFORE_DONE_KINDS: frozenset[str] = frozenset({'deploy', 'predicate'})
+
+# How the diagnostics name each before_done.script_root's base directory.
+_SCRIPT_BASE_NAMES: dict[str, str] = {
+    'project': 'project_root',
+    'factory': 'the dark-factory root',
+}
 
 # SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
 # value was discarded — parse_metadata could not produce any dict at all.
@@ -299,6 +313,8 @@ def deterministic_task_error(
     task_kind: str,
     metadata: str | dict[str, Any] | None,
     project_root: str,
+    *,
+    factory_root_resolver: Callable[[], Path | None] = resolve_dark_factory_root,
 ) -> dict[str, Any] | None:
     """Validate the deterministic-task-kind invariants.
 
@@ -311,6 +327,8 @@ def deterministic_task_error(
         metadata: Task metadata (dict, JSON string, or None).
         project_root: Absolute path to the project root (already normalised by
             the tools.py wrapper before this function is called).
+        factory_root_resolver: Locates the dark-factory root for a
+            ``script_root='factory'`` script; consulted only for those.
     """
     # Invariant 1: enum
     if task_kind not in _VALID_KINDS:
@@ -375,7 +393,12 @@ def deterministic_task_error(
 
     # Invariant 4: before_done structural + filesystem checks (only when present)
     if before_done is not None:
-        err = _validate_before_done(before_done, project_root, always_escalates=always_escalates)
+        err = _validate_before_done(
+            before_done,
+            project_root,
+            always_escalates=always_escalates,
+            factory_root_resolver=factory_root_resolver,
+        )
         if err is not None:
             return err
 
@@ -406,6 +429,7 @@ def _validate_before_done(
     project_root: str,
     *,
     always_escalates: bool = False,
+    factory_root_resolver: Callable[[], Path | None] = resolve_dark_factory_root,
 ) -> dict[str, Any] | None:
     """Validate the before_done payload structurally and against the filesystem.
 
@@ -417,6 +441,8 @@ def _validate_before_done(
         always_escalates: The already-computed top-level metadata.always_escalates
             value — needed here (rather than re-derived) to enforce the
             kind='predicate' prohibition on always_escalates=True below.
+        factory_root_resolver: Locates the dark-factory root for a
+            ``script_root='factory'`` script; consulted only for those.
     """
     # Must be a dict
     if not isinstance(before_done, dict):
@@ -445,33 +471,29 @@ def _validate_before_done(
             hint="Set 'script' to a relative path of an executable file under project_root.",
         )
 
-    # Resolve the script path relative to project_root
-    root = Path(project_root).resolve()
-    resolved_script = (root / script).resolve()
-
-    # Path containment: reject ../ escapes
     try:
-        resolved_script.relative_to(root)
-    except ValueError:
+        base = resolve_script_base(before_done, Path(project_root), factory_root_resolver)
+    except ScriptRootRefused as exc:
         return _validation_error(
-            f"before_done.script {script!r} resolves outside project_root — "
-            "path traversal is not allowed.",
-            hint="Use a path relative to project_root without leading '../' segments.",
+            str(exc),
+            hint=(
+                "Omit 'script_root' to resolve the script under project_root, or set "
+                "script_root='factory' together with kind='predicate'."
+            ),
         )
-
-    # File must exist and be executable
-    if not resolved_script.exists():
+    if base is None:
         return _validation_error(
-            f"before_done.script {script!r} does not exist under project_root.",
-            hint=f"Expected an executable file at: {resolved_script}",
+            "before_done.script_root='factory' but the dark-factory root could not "
+            "be resolved, so the script cannot be located.",
+            hint=(
+                f'Set {DARK_FACTORY_ROOT_ENV} for the fused-memory process to the '
+                "dark-factory checkout, or use script_root='project'."
+            ),
         )
-
-    if not os.access(resolved_script, os.X_OK):
-        return _validation_error(
-            f"before_done.script {script!r} exists but is not executable "
-            "(os.X_OK check failed).",
-            hint=f"Run: chmod +x {resolved_script}",
-        )
+    where = _SCRIPT_BASE_NAMES[before_done.get('script_root', 'project')]
+    err = _validate_script_under(script, base.resolve(), where)
+    if err is not None:
+        return err
 
     # timeout_secs: required positive int
     timeout_secs = before_done.get('timeout_secs')
@@ -506,6 +528,40 @@ def _validate_before_done(
                     "non-zero."
                 ),
             )
+
+    return None
+
+
+def _validate_script_under(script: str, base: Path, where: str) -> dict[str, Any] | None:
+    """Containment, existence and executable checks for *script* under *base*.
+
+    *where* names *base* in the diagnostics.
+    """
+    resolved_script = (base / script).resolve()
+
+    # Path containment: reject ../ escapes
+    try:
+        resolved_script.relative_to(base)
+    except ValueError:
+        return _validation_error(
+            f"before_done.script {script!r} resolves outside {where} — "
+            "path traversal is not allowed.",
+            hint=f"Use a path relative to {where} without leading '../' segments.",
+        )
+
+    # File must exist and be executable
+    if not resolved_script.exists():
+        return _validation_error(
+            f"before_done.script {script!r} does not exist under {where}.",
+            hint=f"Expected an executable file at: {resolved_script}",
+        )
+
+    if not os.access(resolved_script, os.X_OK):
+        return _validation_error(
+            f"before_done.script {script!r} exists but is not executable "
+            "(os.X_OK check failed).",
+            hint=f"Run: chmod +x {resolved_script}",
+        )
 
     return None
 

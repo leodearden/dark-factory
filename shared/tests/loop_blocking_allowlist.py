@@ -266,6 +266,40 @@ _DEAD_LETTER_APPEND_WHY = (
     'population is larger. Filed by task 5099 as TASK 6085.'
 )
 
+#: The shared justification of both ``gc_run_config_dir`` rows in harness.py.
+_RUN_CONFIG_DIR_GC_WHY = (
+    'ROOT CAUSE (one defect, 2 rows): two harness coroutines call the '
+    'sync cli_stage_runner.py::gc_run_config_dir inline. The scanner '
+    'credits only its shutil.rmtree of the per-run agent config dir -- one '
+    'unlink syscall per file, all on the loop thread. Found once task '
+    '4484\'s amendment pass added shutil.rmtree to the vocabulary. '
+    'UNDERSTATED BY THESE ROWS since task 3972: both calls now pass '
+    'archive_root=recon_archive_root(self.config), so with archival enabled '
+    'gc_run_config_dir first runs shared.transcript_archive.'
+    'archive_before_delete, which copies each stage transcript to a staging '
+    'file, os.replaces it into the archive and unlinks the source. That '
+    'I/O lives under shared/src, outside the scanner\'s fused-memory/src '
+    'scope, so it does not show up as a primitive here. Task 3972 re-keyed '
+    'these rows for the new call text. CAUTION FOR THE OFFLOAD: '
+    'gc_run_config_dir is documented as synchronous by contract, because an '
+    'await is a cancellation point and SIGTERM-driven teardown is exactly '
+    'what would then skip the archive-then-delete. An offload must keep the '
+    'teardown unskippable. OWNED BY TASK 5270: task 4484\'s ticket '
+    'tkt_0RT88VW7RRECTHNCVTJXD6M5RJ was combined into task 5072, which '
+    'was coalesced into 5270. '
+    'NOT A ROW, NOT 5270\'s: the producer half of the same archival runs '
+    'on the loop thread too, in stages/base.py::'
+    'BaseStage._archive_stage_transcripts from BaseStage.run\'s finally on '
+    'every stage exit -- shared.transcript_archive.archive_task_transcripts '
+    'stats each per-run transcript and staged-copies each changed one. The '
+    'scanner cannot see it for the same shared/src reason, and stages/base.py '
+    'is outside 5270\'s file scope. ACCEPTED, synchronous for the same '
+    'cancellation-safety reason, on task 3972\'s measurement over a copy of '
+    'the largest live recon run dir (5.0 MB, 2026-10-13, load average '
+    '56-170): a full first copy took 10 ms median / 13.5 ms max, a repeat '
+    '(mtime-equality skip) 0.5 ms.'
+)
+
 #: ``(relpath, qualname, content_hash, disposition, justification)``.
 AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
 
@@ -426,34 +460,16 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._recover_one_run',
-        '361d4c634750',
-        'to_file',
-        'ROOT CAUSE (one defect, 2 rows): two harness coroutines call the '
-        'sync cli_stage_runner.py::gc_run_config_dir inline, which '
-        'shutil.rmtree()s a run\'s per-run agent config dir -- one unlink '
-        'syscall per file, all of them on the loop thread, and a config dir '
-        'is not one file. Found only once task 4484\'s amendment pass added '
-        'shutil.rmtree to the vocabulary, which is the same gap-B shape the '
-        'guard exists to close: the primitive was never enumerated, so the '
-        'sites were invisible however the census was run. Follow-up filed by '
-        'task 4484 amendment pass.'
-        ' Ticket: tkt_0RT88VW7RRECTHNCVTJXD6M5RJ.',
+        'f05da1451b63',
+        'filed',
+        _RUN_CONFIG_DIR_GC_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._persist_stage_reports_then_gc_config_dir',
-        '361d4c634750',
-        'to_file',
-        'ROOT CAUSE (one defect, 2 rows): two harness coroutines call the '
-        'sync cli_stage_runner.py::gc_run_config_dir inline, which '
-        'shutil.rmtree()s a run\'s per-run agent config dir -- one unlink '
-        'syscall per file, all of them on the loop thread, and a config dir '
-        'is not one file. Found only once task 4484\'s amendment pass added '
-        'shutil.rmtree to the vocabulary, which is the same gap-B shape the '
-        'guard exists to close: the primitive was never enumerated, so the '
-        'sites were invisible however the census was run. Follow-up filed by '
-        'task 4484 amendment pass.'
-        ' Ticket: tkt_0RT88VW7RRECTHNCVTJXD6M5RJ.',
+        'f05da1451b63',
+        'filed',
+        _RUN_CONFIG_DIR_GC_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -1204,6 +1220,19 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
         'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+    ),
+    (
+        'fused-memory/src/fused_memory/server/tools.py',
+        'create_mcp_server.find_tasks_by_metadata',
+        '81d0d2709341',
+        'to_file',
+        'SAME ROOT CAUSE as the server/tools.py::_normalize_project_root '
+        'cluster above, added deliberately as its 23rd handler by task '
+        '6385: the cold-miss-only subprocess.run(git) in '
+        'models/scope.py::resolve_main_checkout, memoised by '
+        '_MAIN_CHECKOUT_CACHE. Offloading it here alone would diverge from '
+        'the 22 siblings that one shared fix closes together.'
         ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
 ]

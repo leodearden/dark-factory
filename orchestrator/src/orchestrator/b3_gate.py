@@ -14,6 +14,7 @@ import argparse
 import fcntl
 import json
 import logging
+import re
 import sqlite3
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from shared import safe_io
+from shared.project_layout import escalation_queue_dir, tasks_db
 from shared.safe_io import load_json_or_warn
 
 from orchestrator.stop_instruction import detect_stop_instruction
@@ -35,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-STATE_REL_PATH = 'data/escalations/b3-state.json'
+STATE_FILENAME = 'b3-state.json'
 B3_CATEGORIES: frozenset[str] = frozenset({'task_failure', 'review_issues'})
 
 FRESH = 'fresh'
@@ -76,13 +78,22 @@ DEFAULT_TAG = 'master'
 DEFAULT_CAP = 6
 _LAUNCH_RETENTION_DAYS = 30  # prune launches older than this many days (bound state-file growth)
 
+_FAILURE_REPORT_CAPTURED_HEADINGS = (
+    'Test Failures', 'Test Output', 'Lint Issues', 'Type Errors', 'Type Check Output',
+)
+_CAPTURED_OUTPUT_RE = re.compile(
+    r'^(## (?:' + '|'.join(map(re.escape, _FAILURE_REPORT_CAPTURED_HEADINGS)) + r')\n\n)'
+    r'```\n.*?^```[ \t]*$',
+    re.MULTILINE | re.DOTALL,
+)
+
 # ---------------------------------------------------------------------------
 # State path
 # ---------------------------------------------------------------------------
 
 def _state_path(project_root: str | Path) -> Path:
     """Return the canonical state-file path for a given project root."""
-    return Path(project_root) / STATE_REL_PATH
+    return escalation_queue_dir(project_root) / STATE_FILENAME
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +353,20 @@ def _age_of(
         return None, AGE_UNPARSEABLE
 
 
+def _strip_captured_output(text: str | None) -> str | None:
+    """Return *text* without the fenced output of its failure-report sections.
+
+    Only a fence opened directly under a _FAILURE_REPORT_CAPTURED_HEADINGS
+    heading starts captured output, and the first fence line after it ends
+    it.  A stray fence line inside captured output therefore only ends the
+    excerpt early: it cannot pair with a later fence and hide authored text.
+    An opening fence with no closing line excludes nothing.
+    """
+    if not text:
+        return text
+    return _CAPTURED_OUTPUT_RE.sub(r'\1', text)
+
+
 def check_proposal(
     entry: dict[str, Any] | None,
     *,
@@ -368,10 +393,19 @@ def check_proposal(
           legacy prose/status sniffs (those stay gated on `block_class is
           None`, not on validity).
       1c. EXPLICIT STOP INSTRUCTION (task 2509, reconciliation finding
-          0aac21b4): if entry['proposal_text'], entry['block_reason'], or any
-          string in extra_texts (e.g. the task description — see
-          b3_gate.run_check) contains a phrase from
+          0aac21b4): if any AUTHORED text contains a phrase from
           orchestrator.stop_instruction.STOP_INSTRUCTION_PHRASES -> abort.
+          Authored, scanned whole: entry['proposal_text'] and every string in
+          extra_texts (e.g. the task description — see b3_gate.run_check).
+          Captured, excluded: in entry['block_reason'], the fenced output
+          under each _FAILURE_REPORT_CAPTURED_HEADINGS section — tool output
+          from
+          orchestrator/src/orchestrator/verify.py::VerifyResult.failure_report,
+          not a directive (task 6933).  Authored, scanned: the rest of
+          block_reason, including any other fence, an unterminated one, and
+          whatever follows a stray fence line inside captured output.  Pinned
+          by
+          orchestrator/tests/test_b3_gate.py::TestStopScanExcludesCapturedOutput.
           Hard-aborted before risk_label/git checks, same shape as 1b, and
           takes precedence even over an otherwise-fresh low-risk entry — a
           stop instruction is the highest-authority human directive and must
@@ -470,8 +504,11 @@ def check_proposal(
     # single source of truth for the phrase set — also reused by
     # DeterministicRunner's before_done guard and the /unblock +
     # unblock-low-risk runbook prose, so it cannot drift between surfaces.
+    # The authored/captured line is stated in the docstring's item 1c.
     stop_phrase = detect_stop_instruction(
-        entry.get('proposal_text'), entry.get('block_reason'), *(extra_texts or []),
+        entry.get('proposal_text'),
+        _strip_captured_output(entry.get('block_reason')),
+        *(extra_texts or []),
     )
     if stop_phrase:
         return _result(
@@ -587,7 +624,7 @@ def _read_latest_proposal(
     try:
         owns_conn = conn is None
         if owns_conn:
-            db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+            db_path = tasks_db(project_root)
             if not db_path.exists():
                 return None
             # Open read-only via URI
@@ -657,7 +694,7 @@ def _read_task_description(
     try:
         owns_conn = conn is None
         if owns_conn:
-            db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+            db_path = tasks_db(project_root)
             if not db_path.exists():
                 return None
             uri = f'file:{db_path}?mode=ro'
@@ -755,7 +792,7 @@ def run_check(args: argparse.Namespace) -> None:
     # tasks.db twice per invocation, once per reader). Falls back to each
     # reader's own independent open (and its existing fail-closed-to-None
     # behavior) when this shared connection can't be established.
-    db_path = Path(args.project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    db_path = tasks_db(args.project_root)
     shared_conn: sqlite3.Connection | None = None
     if db_path.exists():
         try:
@@ -854,7 +891,7 @@ def _build_parser() -> argparse.ArgumentParser:
             sp_parser.add_argument('--worktree', required=True,
                                    help='path to the blocked task\'s worktree')
         sp_parser.add_argument('--project-root', required=True,
-                               help='project root dir (contains data/escalations/)')
+                               help='project root dir (holds the escalation queue)')
         sp_parser.add_argument('--config', default=None,
                                help='optional path to orchestrator config YAML')
         sp_parser.add_argument('--now', default=None,

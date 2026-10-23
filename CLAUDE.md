@@ -161,11 +161,17 @@ turns ago. An orchestrator-dispatched Claude session is launched with
 `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`
 (`orchestrator/src/orchestrator/agents/invoke.py::apply_bash_cwd_reset_env`),
 which the CLI reads as a request to put its shell back at the dispatch root,
-silently, after every call. The anchor below is correct whether or not that
-happens; use it regardless. Your own
-command text does not show where the command will run: in the transcript behind
-`plans/confusion-census-2026-09-20.md` §1.4, two adjacent Bash calls in one
-session carried different tracked cwds.
+silently, after every call.
+
+Measured 2026-10-18 on CLI 2.1.302 in a dispatched session (task 5987):
+`CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR` reached the shell as `1`, a `cd` was
+undone silently before the next call, and a relative `Grep` path and `Glob`
+pattern both resolved from the worktree root afterwards.
+
+The anchor below is correct whether or not that reset happens; use it
+regardless. Your own command text does not show where the command will run: in
+the transcript behind `plans/confusion-census-2026-09-20.md` §1.4, two adjacent
+Bash calls in one session carried different tracked cwds.
 
 So a bare or repo-relative path in an ad-hoc probe is a guess, and a wrong guess
 arrives as a bare `FileNotFoundError: [Errno 2] No such file or directory:
@@ -404,12 +410,17 @@ sweep overrunning `orchestrator_restart_lease_max_age_secs` loses the lease
 and degrades to the old collision, and the fused-memory tier has no lease at
 all — so read `--report`'s `FLEET-LEASE:` line rather than assuming.
 
-`--drain` (task 5371) is a two-stage drain: Stage A halts merge admission on
-every unit up front, Stage B restarts a unit only once no merge verify is in
-flight on any host (bounded by each verify's own timeout and
-`ORCH_DRAIN_VERIFY_MAX_WAIT_SECS`). Pre-5371 units and refused requests keep
-the old 600s merge-idle gate. The first sweep after a deploy of that code still
-meets old-code units. Detail: `OPERATIONS.md` §"Reading a drain".
+`--drain` (task 5371, per unit since task 7297) is a two-stage drain: Stage A
+halts a unit's merge admission when the sweep reaches it; Stage B restarts it
+once none of its merge verifies is in flight, bounded by each verify's own
+timeout, a per-unit `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS`, and a sweep-wide
+ceiling `ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS` counted from sweep start; past
+the ceiling every unit still gets its request and is restarted at its first
+acknowledged poll. How the ceiling fits under the lease is derived at
+`scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS`.
+Pre-5371 units and refused requests keep the old 600s merge-idle gate. The
+first sweep after a deploy of that code still meets old-code units. Detail:
+`OPERATIONS.md` §"Reading a drain".
 
 ## Working in the main checkout
 

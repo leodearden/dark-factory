@@ -58,8 +58,32 @@ def is_external_kill_rc(rc: int) -> bool:
     shell-reported ``128 + N`` status (e.g. 137 for SIGKILL) is NOT treated as
     a kill, because the predicate must not guess at shell conventions — a
     plain positive rc is a real exit status the process chose to return.
+    A caller that interposed the shell itself reads that convention with
+    ``is_shell_reported_external_kill`` instead.
     """
     return rc < 0 and -rc in _EXTERNAL_KILL_SIGNALS
+
+
+_SHELL_REPORTED_KILL_SIGNALS: frozenset[int] = _EXTERNAL_KILL_SIGNALS - {signal.SIGKILL}
+
+
+def is_shell_reported_external_kill(rc: int) -> bool:
+    """Return True when *rc* is a shell's ``128 + N`` report of an external
+    SIGTERM, SIGINT or SIGHUP.
+
+    PRECONDITION: *rc* is the exit status of a POSIX shell the CALLER
+    interposed, so ``128 + N`` means that shell's child died of signal N.
+    ``verify.classify_leg`` is the caller: every leg runs under
+    ``_run_cmd``'s ``/bin/bash`` wrapper. Calling this on any other rc is the
+    shell-convention guessing ``is_external_kill_rc`` refuses.
+
+    SIGKILL is excluded: a positive 137 is the ordinary branch-caused OOM of a
+    memory-hungry grandchild.
+
+    It decides nothing alone. The caller must also establish that the leg
+    printed no failure verdict.
+    """
+    return rc > 128 and (rc - 128) in _SHELL_REPORTED_KILL_SIGNALS
 
 # ---------------------------------------------------------------------------
 # Shared regex primitives — patterns that legitimately belong to more than
@@ -176,12 +200,23 @@ _TREE_SITTER_GENERATE_RE = re.compile(r'tree-sitter generate', re.MULTILINE)
 # does not apply here.
 # ---------------------------------------------------------------------------
 
-# ENOSPC markers reused VERBATIM from merge_queue._ENOSPC_MARKERS (single
-# grounded vocabulary shared with merge_queue's _verify_hit_enospc and
-# git_ops's disk-pressure detection) — do not invent new ENOSPC strings;
-# extend that constant instead if a new grounded sample appears. Matched
-# case-insensitively against the whole output, same as _verify_hit_enospc.
-_ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
+# The OS's own ENOSPC renderings: the strerror (Python, git, bash, ld, Node)
+# and Rust's "(os error 28)" suffix. A bare ENOSPC token is how tests, ids and
+# log lines NAME the condition, so it is not evidence (task 7032).
+_DISK_FULL_OS_ERROR_MARKERS = ('no space left on device', 'os error 28')
+
+
+def reports_disk_full(text: str) -> bool:
+    """Does *text* carry an OS error report of a full disk (ENOSPC)?
+
+    The one disk-full text predicate, shared by ``_classify_environmental``,
+    ``git_ops.py::_worktree_add_failure_is_retryable`` and
+    ``merge_lane/worker.py::_verify_hit_enospc``. Known residual: a failing
+    test whose own message quotes the full phrase still reads as disk-full.
+    """
+    folded = text.casefold()
+    return any(marker in folded for marker in _DISK_FULL_OS_ERROR_MARKERS)
+
 
 # Linker SIGBUS-on-full-disk (git_ops.py: "proceeding into an ENOSPC build
 # that SIGBUSes the linker") — a real secondary disk-full mode where the
@@ -357,33 +392,25 @@ _SLOT_ACQUIRE_DEADLINE_RE = re.compile(
 # note above (cf. `_SLOT_ACQUIRE_DEADLINE_RE`, `verify._match_clock_marker`):
 # run_all emits two leading spaces, and verify output is aggregated from
 # wrappers that routinely indent captured sub-output. It adopts the shape
-# already source-verified in `offline_lane._INFRA_RESULT_FAIL_RE`, widened to
-# PASS|FAIL|SKIP, and stops before any trailing
-# ` [flaky: passed on serial retry]` suffix (run_all.sh:1792).
+# already source-verified in `offline_lane_runs.py::INFRA_RESULT_RE`, and stops
+# before any trailing ` [flaky: passed on serial retry]` suffix (run_all.sh:1792).
 #
 # ---> SIBLING ENCODING, KEEP IN SYNC (review amendment #4). This is the
 # SECOND in-repo encoding of run_all.sh's per-suite RESULT framing; the other
-# is `offline_lane._INFRA_RESULT_FAIL_RE` (offline_lane.py:102), which parses
-# the same lines for the infra confirmation runner. They intentionally
-# DIVERGE in three ways, none of them accidental:
+# is `offline_lane_runs.py::INFRA_RESULT_RE`, which parses the same lines into
+# the offline lane's infra run records. Both match PASS|FAIL|SKIP, leave the
+# tail open and capture the name as `[^)]+`. They DIVERGE in one way, not by
+# accident:
 #
-#   * TAIL — offline_lane end-anchors (`\s*$`); this one does NOT, because the
-#     close may carry run_all's ` [flaky: ...]` suffix. Traced consequence of
-#     the open tail here: a close can only ever match EARLIER, which only ever
-#     SHRINKS a redaction window — i.e. it stays in the fail-safe direction.
-#   * SEPARATORS — offline_lane uses `\s*` between tokens; this one requires
-#     the literal single spaces run_all actually emits. Stricter, and correct
-#     per the ANCHORING CONTRACT: a looser separator is another way for quoted
-#     assertion prose to impersonate the producer.
-#   * NAME — offline_lane uses `.+?`; this one uses `[^)]+`, which cannot run
-#     past the closing paren into a ` [flaky: ...]` suffix.
+#   * SEPARATORS — offline_lane_runs uses `\s*` between tokens; this one
+#     requires the literal single spaces run_all actually emits. Stricter, and
+#     correct per the ANCHORING CONTRACT: a looser separator is another way for
+#     quoted assertion prose to impersonate the producer.
 #
 # Neither site is generated from the other, so a future run_all framing change
 # must be fixed in BOTH. This cross-reference exists so that is discoverable
 # from either end. If a THIRD consumer ever appears, lift the patterns into
-# one small shared module rather than adding a fourth copy. (The reciprocal
-# `cf. verify_classify._RUN_ALL_SUITE_CLOSE_RE` comment in offline_lane.py is
-# NOT in task 4492's lock scope and is filed as follow-up work.)
+# one small shared module rather than adding a fourth copy.
 _RUN_ALL_SUITE_OPEN_RE = re.compile(r'^--- Running: (?P<name>.+?) ---[ \t]*$')
 _RUN_ALL_SUITE_CLOSE_RE = re.compile(
     r'^[ \t]*RESULT: (?P<verdict>PASS|FAIL|SKIP) \((?P<name>[^)]+)\)'
@@ -617,17 +644,62 @@ def is_interpreter_missing_workspace_packages(output: str) -> bool:
     rather than raising — a classifier must never be the thing that fails.
     """
     unresolved = unresolved_top_level_modules(output)
-    return (
-        len(unresolved) >= _MIN_DISTINCT_UNRESOLVED_IMPORTS
-        and bool(unresolved & _BASELINE_WORKSPACE_MODULES)
+    return _has_broad_unresolved_imports(unresolved) and bool(
+        unresolved & _BASELINE_WORKSPACE_MODULES
     )
+
+
+def is_partially_provisioned_venv_type_failure(
+    type_output: str, *, test_tool: ToolKind, test_leg_passed: bool,
+) -> bool:
+    """True when a type-check failure shows pyright reading a cold ``.venv``
+    that was still being populated, corroborated by the same run's passing
+    PYTEST leg — an environment fault, not a branch defect.
+
+    Task 6127 / esc-6021-3. Measured signature: 164 reportMissingImports over
+    seven DISTINCT top-level third-party modules on a docs-only merge, while
+    every test leg passed. pytest resolved, because shared's ``uv run``
+    installed it first, so the task-3367 sentinel misses this shape; the
+    member-specific packages had not landed yet.
+
+    DISCRIMINATOR CONTRACT — all three conditions must hold:
+
+      1. *test_leg_passed*: the same venv imported those packages at runtime,
+         so pyright's view was stale rather than the dependency set wrong.
+         This corroboration replaces the 3367 sentinel;
+      2. *test_tool* is ``ToolKind.PYTEST``: only a Python test run imports
+         anything, so a passing ``true``, JS-only or wrapped test command
+         corroborates nothing. A skipped leg resolves ``ToolKind.OPAQUE``;
+      3. at least ``_MIN_DISTINCT_UNRESOLVED_IMPORTS`` DISTINCT top-level
+         modules are unresolved — the floor shared with 3367, so a branch
+         adding one or two undeclared imports still blames the branch.
+
+    Purity of reportMissingImports is deliberately NOT required: the measured
+    log carried consequential reportAttributeAccessIssue and
+    reportOptionalMemberAccess errors alongside the imports.
+
+    Residual gap: a passing pytest leg vouches only for the modules it
+    imported, so a type command covering code no test imports (a whole
+    subproject, or a new untested module) gets no real corroboration.
+
+    Pure and total: any input returns a bool rather than raising.
+    """
+    return (
+        test_leg_passed
+        and test_tool is ToolKind.PYTEST
+        and _has_broad_unresolved_imports(unresolved_top_level_modules(type_output))
+    )
+
+
+def _has_broad_unresolved_imports(unresolved: frozenset[str]) -> bool:
+    return len(unresolved) >= _MIN_DISTINCT_UNRESOLVED_IMPORTS
 
 
 def unresolved_top_level_modules(output: str) -> frozenset[str]:
     """Distinct TOP-LEVEL module names reported unresolved in *output*.
 
-    The one place ``_UNRESOLVED_IMPORT_RE`` is applied — both the predicate
-    above and verify.py's loud log (which reports the count) read the signature
+    The one place ``_UNRESOLVED_IMPORT_RE`` is applied — both predicates above
+    and verify.py's loud logs (which report the count) read the signature
     through this helper, so there is never a second copy of the regex.
     """
     return frozenset(
@@ -663,11 +735,32 @@ _VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r'^=== INTERRUPTED \(worktree removed\) ===', re.MULTILINE),
 ]
 
+# verify.py::_run_cmd's `systemd-run --user --scope` could not start the leg's
+# scope (task 7258). Grounded samples, each the leg's ENTIRE output at rc=1:
+#   'Failed to start transient scope unit: Transport endpoint is not connected'
+#     (task 7217's cockpit test/lint/type legs, 2026-10-20)
+#   'Failed to connect to bus: No such file or directory'
+#     (systemd 255.4, user bus unreachable, measured 2026-10-22)
+# Matched against the WHOLE output, never per line: systemd-run fails before
+# exec'ing the leg, so its refusal is all the leg can print, and any other
+# output means the command ran and its own verdict stands. Only systemd-run
+# prints the scope-unit line, so any reason after it means the scope never
+# started. `systemctl --user` and `busctl --user` print the bus-connect line
+# verbatim too (measured), so only its observed reasons match; a leg whose own
+# systemctl prints exactly that line still reads as infra until task 7339 tags
+# the spawn path structurally. Add a reason only on a newly observed sample
+# (the _CARGO_CLI_ERROR_RE discipline).
+_SCOPE_SPAWN_FAILURE_RE = re.compile(
+    r'Failed to start transient scope unit: [^\n]+'
+    r'|Failed to connect to bus: No such file or directory'
+)
+
 
 def _classify_environmental(output: str) -> FailureCategory | None:
     """Tool-blind host-infrastructure guard: DISK_FULL / ENV_TRANSIENT (broken
     ``_merge-verify`` worktree, incl. restart collateral; mis-resolved pyright
-    interpreter) / SEMAPHORE_TIMEOUT.
+    interpreter; a verify scope systemd-run could not start) /
+    SEMAPHORE_TIMEOUT.
 
     Checked in ``classify_failure`` immediately after the ``timed_out`` ->
     ``INFRA_TIMEOUT`` guard and before any per-tool dispatch — these
@@ -911,6 +1004,13 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     per-tool table duplication (Invariant C1 intact — C1 forbids duplicating
     the same pattern across per-tool tables, not a category being reachable
     from more than one guard).
+
+    ENV_TRANSIENT — verify scope never started (task 7258): when
+    ``verify.py::_run_cmd``'s ``systemd-run --user --scope`` cannot reach the
+    user bus it exits before exec'ing the leg, so the leg's entire output is
+    systemd-run's one-line refusal (``_SCOPE_SPAWN_FAILURE_RE``). It is matched
+    only as the WHOLE scoped output, so it cannot tie with any other arm and
+    its position among them is not load-bearing.
     """
     # task 4492 — every POSITIVE detector below reads `scoped`, the output
     # with each PASSED suite's interior blanked; the one NEGATIVE/veto
@@ -933,13 +1033,12 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     #      removed) ===` marker a test could legitimately replay. Scoping one
     #      arm would leave the class alive under a different label — the
     #      shape-N+1 treadmill (2748 -> 2821 -> 3679 -> 4212) this exists to end.
-    #   3. ORDERING IS UNCHANGED (DISK_FULL, the three ENV_TRANSIENT
-    #      branches, then SEMAPHORE_TIMEOUT last). The ORDERING note above
+    #   3. ORDERING IS UNCHANGED (DISK_FULL, the ENV_TRANSIENT branches,
+    #      then SEMAPHORE_TIMEOUT last). The ORDERING note above
     #      stays load-bearing; scoping changes WHICH TEXT each arm reads,
     #      never the order they are tried in.
     scoped = _redact_passed_suite_blocks(output)
-    lower = scoped.lower()
-    if any(marker in lower for marker in _ENOSPC_MARKERS):
+    if reports_disk_full(scoped):
         return FailureCategory.DISK_FULL
     if _LINKER_CONTEXT_RE.search(scoped) and _LINKER_SIGNAL_RE.search(scoped):
         return FailureCategory.DISK_FULL
@@ -952,6 +1051,8 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     if any(pattern.search(scoped) for pattern in _VERIFY_WORKTREE_COLLATERAL_PATTERNS):
         return FailureCategory.ENV_TRANSIENT
     if is_interpreter_missing_workspace_packages(scoped):
+        return FailureCategory.ENV_TRANSIENT
+    if _SCOPE_SPAWN_FAILURE_RE.fullmatch(scoped.rstrip('\n')):
         return FailureCategory.ENV_TRANSIENT
     # task 4212: sentinel half is gated on disposition
     # (`_has_fatal_slot_timeout_sentinel` above has the full grounding);
@@ -984,9 +1085,10 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
        see ``_EXTERNAL_KILL_SIGNALS``.
     3. ``_classify_environmental(output)`` -> ``FailureCategory.DISK_FULL``,
        ``FailureCategory.SEMAPHORE_TIMEOUT``, or ``FailureCategory.ENV_TRANSIENT``
-       (broken ``_merge-verify`` worktree; or a mis-resolved pyright
+       (broken ``_merge-verify`` worktree; a mis-resolved pyright
        interpreter holding none of the workspace's third-party packages —
-       task 3367) when grounded in *output* (wins over any per-tool output
+       task 3367; or a verify scope systemd-run could not start — task 7258)
+       when grounded in *output* (wins over any per-tool output
        pattern for the same "root cause is the environment, not the command
        output" reason as guard 2 — a host condition like a full disk, a
        lock/semaphore-slot timeout, an unreadable worktree lockfile, or an
@@ -1035,13 +1137,15 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
       ``_classify_cargo``, the text table.
     - ``ToolKind.NPX`` -> ``_classify_npx``.
     - ``ToolKind.PYRIGHT`` -> a structured ``--outputjson`` parse
-      (``_parse_pyright_json``) is attempted FIRST (Invariant C2); otherwise
-      falls back to ``_classify_opaque`` (no dedicated PYRIGHT text table —
-      preserves today's on-the-wire mapping).
+      (``_parse_pyright_json``, yielding ``TYPE_ERROR``) is attempted FIRST
+      (Invariant C2); otherwise falls back to ``_classify_opaque``. There is
+      deliberately no PYRIGHT text table, so human-text output takes the
+      OPAQUE ladder unchanged.
     - ``ToolKind.RUFF`` -> a structured ``--output-format json`` parse
-      (``_parse_ruff_json``) is attempted FIRST (Invariant C2); otherwise
-      falls back to ``_classify_opaque`` (no dedicated RUFF text table —
-      preserves today's on-the-wire mapping).
+      (``_parse_ruff_json``, yielding ``LINT_ERROR``) is attempted FIRST
+      (Invariant C2); otherwise falls back to ``_classify_opaque``. There is
+      deliberately no RUFF text table, so human-text output takes the OPAQUE
+      ladder unchanged.
     - ``ToolKind.OPAQUE`` -> ``_classify_opaque``, the FULL legacy generic
       ladder (moved verbatim from verify.py's ``_CLASSIFY_PATTERNS``) — the
       ONLY survivor of the tool-blind ladder.
@@ -1141,8 +1245,8 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 # producer, so any reasoning that relied on env_transient implying the failing
 # leg was the TEST leg must be re-derived rather than assumed. The one place
 # that reasoning was load-bearing is verify.py's env-recovery retry gate, which
-# task 3367 tightens with an explicit `attempt.test.rc != 0` check instead of
-# leaning on the retired corollary.
+# now reads the TEST leg's own classification (task 4843; task 3367 first
+# restricted it to the test leg) instead of leaning on the retired corollary.
 # ---------------------------------------------------------------------------
 
 # Shared-venv mutation signatures (task 2048): a concurrent `uv sync` from
@@ -1320,11 +1424,10 @@ def _classify_npx(output: str) -> FailureCategory:
 
 
 # ---------------------------------------------------------------------------
-# ToolKind.PYRIGHT — structured JSON only (Invariant C2); no dedicated text
-# table exists — non-JSON PYRIGHT output falls through to the OPAQUE
-# placeholder ladder (see classify_failure's docstring), preserving today's
-# on-the-wire mapping. Adding a dedicated PYRIGHT/type-check FailureCategory
-# is out of scope for this task.
+# ToolKind.PYRIGHT — structured JSON only (Invariant C2). An error
+# diagnostic is TYPE_ERROR (task 4843). There is still NO text table, so
+# non-JSON PYRIGHT output deliberately falls through to the OPAQUE ladder
+# (Invariants C1/C2; see classify_failure's docstring).
 # ---------------------------------------------------------------------------
 
 
@@ -1340,8 +1443,7 @@ def _parse_pyright_json(output: str) -> FailureCategory | None:
         ], "summary": {...}}
 
     A ``generalDiagnostics`` entry with ``severity == "error"`` maps to
-    ``UNKNOWN_TEST_FAILURE`` — the preserved on-the-wire category (no
-    dedicated PYRIGHT category exists — see module docstring). Exception-safe:
+    ``TYPE_ERROR``; warnings and information alone claim nothing. Exception-safe:
     *output* that isn't valid JSON, or isn't shaped like this schema, returns
     ``None`` rather than raising, so the caller falls back to
     ``_classify_opaque``, the text table.
@@ -1357,16 +1459,15 @@ def _parse_pyright_json(output: str) -> FailureCategory | None:
         return None
     for diagnostic in diagnostics:
         if isinstance(diagnostic, dict) and diagnostic.get('severity') == 'error':
-            return FailureCategory.UNKNOWN_TEST_FAILURE
+            return FailureCategory.TYPE_ERROR
     return None
 
 
 # ---------------------------------------------------------------------------
-# ToolKind.RUFF — structured JSON only (Invariant C2); no dedicated text
-# table exists — non-JSON RUFF output falls through to the OPAQUE placeholder
-# ladder (see classify_failure's docstring), preserving today's on-the-wire
-# mapping. Adding a dedicated RUFF/lint FailureCategory is out of scope for
-# this task.
+# ToolKind.RUFF — structured JSON only (Invariant C2). A violations array is
+# LINT_ERROR (task 4843). There is still NO text table, so non-JSON RUFF
+# output deliberately falls through to the OPAQUE ladder (Invariants C1/C2;
+# see classify_failure's docstring).
 # ---------------------------------------------------------------------------
 
 
@@ -1380,9 +1481,8 @@ def _parse_ruff_json(output: str) -> FailureCategory | None:
         [{"cell": null, "code": "F821", "filename": "...",
           "message": "...", "severity": "error", ...}]
 
-    A non-empty violations array maps to ``UNKNOWN_TEST_FAILURE`` — the
-    preserved on-the-wire category (no dedicated RUFF category exists — see
-    module docstring). Exception-safe: *output* that isn't valid JSON, or
+    A non-empty violations array maps to ``LINT_ERROR``; an empty one claims
+    nothing. Exception-safe: *output* that isn't valid JSON, or
     isn't shaped like this schema, returns ``None`` rather than raising, so
     the caller falls back to ``_classify_opaque``, the text table.
     """
@@ -1394,7 +1494,7 @@ def _parse_ruff_json(output: str) -> FailureCategory | None:
         return None
     if not any(isinstance(item, dict) for item in payload):
         return None
-    return FailureCategory.UNKNOWN_TEST_FAILURE
+    return FailureCategory.LINT_ERROR
 
 
 # ---------------------------------------------------------------------------

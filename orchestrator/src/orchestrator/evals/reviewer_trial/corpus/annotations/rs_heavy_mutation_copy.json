@@ -16,6 +16,14 @@
       "severity": "suggestion",
       "description": "create_solution_map() is defined but never called in this diff. If it's meant to replace build_solved_values(), the old function should be removed. If both are needed, they should be consolidated into one.",
       "mutation_type": "heavy_mutation_copy"
+    },
+    {
+      "id": "rs_heavy_mutation_copy_pool_01",
+      "location": "crates/reify-constraints/src/solver.rs:77",
+      "category": "missing_required_tests",
+      "severity": "blocking",
+      "description": "The task's test_strategy requires unit tests for create_solution_map (a two-parameter case with one dimensioned and one dimensionless param, an empty-slice case, and a #[should_panic] length-mismatch case); the change adds none, so the new function including its required length assertion is unexercised. Equivalent tests exist only for build_solved_values.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "context": {

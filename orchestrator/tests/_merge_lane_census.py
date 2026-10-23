@@ -21,7 +21,7 @@ destination, not a completed migration.
 """
 from __future__ import annotations
 
-from orchestrator.merge_queue import SpeculativeMergeWorker
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 #: The wire state ``snapshot()`` stamps on anything still waiting to be merged.
 #: ``ItemLifecycleState.QUEUED`` and ``LANE_BUFFERED`` share this one string

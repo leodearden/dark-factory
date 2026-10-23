@@ -196,31 +196,48 @@ extended to the other members: it was justified by forensics on the
 briefing shape specifically, and a newly-sighted injector earns one only
 on its own evidence."""
 
+TRICKLE_CODER_PROMPT_OPENER: str = 'you are the trickle coder for the dark-factory agent-confusion codebook'
+"""The lowercase opening of scripts/legibility/coder.py::build_prompt,
+restated rather than imported for the same layering reason as
+:data:`CODER_JUDGMENT_KEYS`."""
+
 HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
-    'you are the trickle coder for the dark-factory agent-confusion codebook',
+    TRICKLE_CODER_PROMPT_OPENER,
     'your previous run was interrupted by a usage limit',
     'you were interrupted by an orchestrator restart',
+    'handle this escalation, then call `resolve_issue` with a summary',
 )
-"""Harness-authored PROSE preamble literals, matched as plain
-case-insensitive substrings (unlike the line-anchored heading markers
-above): the trickle coder's system prompt
-(scripts/legibility/coder.py:174 ``build_prompt``), and the harness's two
-resume prompts -- ``shared.cli_invoke.CAP_HIT_RESUME_PROMPT`` (cap-hit)
-and ``shared.cli_invoke.CRASH_RECOVERY_RESUME_PROMPT`` (orchestrator
-restart), the canonical sources of the two literals above. Both resume
-prompts are one defect class -- harness-injected continuation boilerplate
-typed into the transcript as an ordinary isMeta=False user turn -- even
-though cli_invoke deliberately keeps the two strings separate because
-their causes differ (a usage-cap interrupt vs. an orchestrator restart).
-Each marker is deliberately its constant's stable FIRST SENTENCE, not the
-whole string: a future rewording of a later sentence must not silently
-un-cover the marker. Held in lockstep with the canonical constants by
+"""Harness-authored PROSE literals, matched as plain case-insensitive
+substrings (unlike the line-anchored heading markers above): the trickle
+coder's system prompt (scripts/legibility/coder.py:174 ``build_prompt``),
+the harness's two resume prompts --
+``shared.cli_invoke.CAP_HIT_RESUME_PROMPT`` (cap-hit) and
+``shared.cli_invoke.CRASH_RECOVERY_RESUME_PROMPT`` (orchestrator restart)
+-- and the steward's resume prompt for a new escalation,
+``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_steward_continuation_prompt``.
+All three resume prompts are one defect class -- harness-injected
+continuation boilerplate typed into the transcript as an ordinary user
+turn, the steward's with no origin stamp -- even though cli_invoke
+deliberately keeps its two strings separate because their causes differ (a
+usage-cap interrupt vs. an orchestrator restart).
+
+Each marker is deliberately a stable, interpolation-free sentence of its
+constant, not the whole string -- the FIRST sentence wherever the first one
+is stable -- so a future rewording of another sentence must not silently
+un-cover the marker. The steward's marker is its closing instruction rather
+than its first line, because its '# New Escalation for Task {id} — {title}'
+heading interpolates the task.
+
+Held in lockstep with the canonical sources by
 ``TestHarnessInjectedTurnFilter.test_resume_prompt_is_excluded_lockstep``
-in scripts/tests/test_legibility_reingestion.py, which asserts
-``is_harness_injected_turn(<constant>) is True`` for each rather than
-restating the literal -- a harness rewording turns that test red instead
-of silently regressing coverage. Extend with future harness prompt
-literals as one-line additions."""
+(the two constants) and
+``TestHarnessInjectedTurnFilter.test_steward_continuation_prompt_is_excluded_lockstep``
+(the prompt built by the real builder), both in
+scripts/tests/test_legibility_reingestion.py, which assert
+``is_harness_injected_turn(<prompt>) is True`` rather than restating the
+literal -- a harness rewording turns them red instead of silently
+regressing coverage. Extend with future harness prompt literals as
+one-line additions."""
 
 HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = (
     '_this context was recalled from the ',

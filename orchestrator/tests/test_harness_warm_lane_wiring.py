@@ -21,6 +21,7 @@ import pytest
 from _workflow_helpers import _build_harness, _init_git_repo
 from escalation.queue import EscalationQueue
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
@@ -165,6 +166,7 @@ def _make_runner(name: str) -> VerifyRunnerConfig:
         name=name,
         ssh_host=f'{name}.example.com',
         git_remote=f'remote-{name}',
+        df_checkout_path='/df',
     )
 
 
@@ -925,10 +927,13 @@ class TestMarkInProgressDoneLaneRelease:
         pool._assignments.clear()
         assert pool.assignment_for(tid) is None, 'setup: assignment map must be empty'
 
-        # Write on-disk plan.json backstop so the primitive can still find the lane
-        task_dir = lane / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+        # Seed the lane's meta root with the on-disk backstop key so the
+        # primitive can still find the lane. The lane dir itself must exist:
+        # the scan only considers dirs found under worktree_base.
+        lane.mkdir(parents=True, exist_ok=True)
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "3459"}')
 
         # ── Build Harness with real git_ops ─────────────────────────────────
         harness = _build_harness(config)
@@ -953,7 +958,7 @@ class TestMarkInProgressDoneLaneRelease:
         assert pool.assignment_for(tid) is None, (
             '_mark_in_progress_done must release the lane after mark_done '
             '(the in-memory map was lost post-restart; the primitive uses the '
-            'on-disk plan.json backstop to locate and free the lane)'
+            'on-disk metadata.json backstop to locate and free the lane)'
         )
         assert pool.state(lane) == LaneState.FREE, (
             f'Lane must be FREE after found-on-main mark_done, got {pool.state(lane)!r}'

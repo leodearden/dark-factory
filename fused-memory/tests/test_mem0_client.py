@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
+from _qdrant_responses import missing_collection_404
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
@@ -196,8 +197,8 @@ class TestMem0BackendScrollByMetadata:
         Mirrors count_by_metadata's propagate-by-default contract: a timed-out
         scroll must never be indistinguishable from a genuinely-empty result
         (no-silent-fail invariant).  Since task 5265 the read is bounded by
-        Mem0Backend._timed, whose only handling of a TimeoutError is to re-raise
-        it naming the operation and the budget.
+        backends/timeout_budget.py::await_within, whose only handling of a
+        TimeoutError is to re-raise it naming the operation and the budget.
         """
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
@@ -1096,7 +1097,7 @@ class TestMem0BackendScrollCollectionPages:
 
         with (
             patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
-            patch('fused_memory.backends.mem0_client.asyncio.wait_for', _spy),
+            patch('fused_memory.backends.timeout_budget.asyncio.wait_for', _spy),
         ):
             got = await _drain(backend.scroll_collection_pages('c', page_size=1))
 
@@ -1379,9 +1380,10 @@ class TestMem0BackendSemanticReadTimeouts:
     """One contract, one test: every mem0-instance read propagates and NAMES itself.
 
     ``search`` / ``get_all`` / ``get`` share a single implementation of this —
-    ``Mem0Backend._timed``, the sole ``asyncio.wait_for`` call site on the
-    class — so they are asserted together.  Three near-identical copies of
-    this test could drift apart without noticing; one parametrized copy cannot,
+    ``Mem0Backend._timed_read`` over ``backends/timeout_budget.py::await_within``,
+    the sole ``asyncio.wait_for`` call site — so they are asserted together.
+    Three near-identical copies of this test could drift apart without
+    noticing; one parametrized copy cannot,
     which matters because the MESSAGE is a contract and not decoration: it is
     what reaches ``MemoryService._store_failure_diagnostics['error']``, and
     ``asyncio.wait_for``'s own ``TimeoutError`` stringifies EMPTY, so a bare
@@ -1951,6 +1953,139 @@ class TestIsMissingCollectionError:
     def test_timeout_error_is_false(self):
         """A timeout must keep propagating — it is not evidence of 'no data'."""
         assert is_missing_collection_error(TimeoutError()) is False
+
+
+_ABSENT_SCOPE = Scope(project_id='solar_challenge')
+_ABSENT_FILTERS = {'kind': 'project_status_correction'}
+
+_SCOPED_METADATA_READS = ['scroll_by_metadata', 'count_by_metadata']
+
+_EMPTY_READ_RESULTS = [
+    pytest.param('scroll_by_metadata', [], id='scroll'),
+    pytest.param('count_by_metadata', 0, id='count'),
+]
+
+_PROPAGATING_FAILURES = [
+    pytest.param(
+        lambda: UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers()),
+        UnexpectedResponse,
+        id='500',
+    ),
+    pytest.param(
+        lambda: UnexpectedResponse(
+            404,
+            'Not Found',
+            b'{"status":{"error":"Not found: Point 42 does not exist"}}',
+            httpx.Headers(),
+        ),
+        UnexpectedResponse,
+        id='point-404',
+    ),
+    pytest.param(
+        lambda: UnexpectedResponse(
+            404, 'Not Found', b"Snapshot `daily` doesn't exist!", httpx.Headers(),
+        ),
+        UnexpectedResponse,
+        id='snapshot-404',
+    ),
+    pytest.param(lambda: TimeoutError('too slow'), TimeoutError, id='timeout'),
+    pytest.param(lambda: RuntimeError('qdrant down'), RuntimeError, id='generic'),
+]
+
+
+class TestMem0BackendMetadataReadsOnAbsentCollection:
+    """A never-provisioned collection holds zero memories, so both Scope-addressed
+    metadata reads answer it as empty and say so at INFO, while every other
+    failure keeps propagating (task 4858).
+    """
+
+    @staticmethod
+    async def _read_raising(backend, op: str, exc: BaseException):
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(side_effect=exc)
+        mock_client.count = AsyncMock(side_effect=exc)
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            return await getattr(backend, op)(scope=_ABSENT_SCOPE, filters=_ABSENT_FILTERS)
+
+    @staticmethod
+    def _collection(backend) -> str:
+        return _ABSENT_SCOPE.mem0_collection_name(backend.config.mem0.collection_prefix)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('op', 'empty'), _EMPTY_READ_RESULTS)
+    async def test_missing_collection_reads_as_empty(self, backend, op, empty):
+        exc = missing_collection_404(self._collection(backend))
+
+        result = await self._read_raising(backend, op, exc)
+
+        assert result == empty
+        assert type(result) is type(empty)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('op', _SCOPED_METADATA_READS)
+    async def test_missing_collection_is_disclosed_at_info(self, backend, caplog, op):
+        collection = self._collection(backend)
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.backends.mem0_client'):
+            await self._read_raising(backend, op, missing_collection_404(collection))
+
+        disclosures = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO
+            and op in r.getMessage()
+            and collection in r.getMessage()
+        ]
+        assert len(disclosures) == 1, [r.getMessage() for r in caplog.records]
+        assert getattr(disclosures[0], 'collection', None) == collection
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('op', _SCOPED_METADATA_READS)
+    @pytest.mark.parametrize(('make_failure', 'raised'), _PROPAGATING_FAILURES)
+    async def test_other_failures_still_propagate(self, backend, op, make_failure, raised):
+        with pytest.raises(raised):
+            await self._read_raising(backend, op, make_failure())
+
+
+@pytest.fixture
+def _absent_scope(worker_id) -> Scope:
+    return Scope(project_id=f'_test_absent_collection_{worker_id}')
+
+
+@pytest.fixture
+def _absent_collection(_absent_scope, mock_config):
+    """Guarantee the scope's Qdrant collection is absent before AND after the test."""
+    collection = _absent_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
+        client.delete_collection(collection)
+    yield collection
+    with contextlib.suppress(Exception):
+        client.delete_collection(collection)
+    client.close()
+
+
+class TestMem0BackendMetadataReadsOnAbsentCollectionIntegration:
+    """The live client's absent-collection 404 matches the predicate for BOTH reads.
+
+    No mem0 instance is built: ``_get_instance`` would provision the very
+    collection this test needs absent.
+    """
+
+    pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]
+
+    @pytest.mark.asyncio
+    async def test_live_absent_collection_reads_as_empty(
+        self, mock_config, _absent_scope, _absent_collection,
+    ):
+        config = mock_config.model_copy(deep=True)
+        config.mem0.qdrant_url = QDRANT_URL
+        backend = Mem0Backend(config)
+        try:
+            assert await backend.scroll_by_metadata(_absent_scope, {'kind': 'x'}) == []
+            assert await backend.count_by_metadata(_absent_scope, {'kind': 'x'}) == 0
+        finally:
+            await backend.close()
 
 
 # ---------------------------------------------------------------------------

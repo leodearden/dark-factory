@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.services.memory_service import MemoryService
 
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
+
 from fused_memory.backends.task_backend_errors import (
     DuplicateCandidateKeyError,
     LeakedEnvelopeMarkupError,
@@ -105,6 +107,7 @@ from fused_memory.reconciliation.task_filter import (
     render_retained_done_tasks,
     select_done_since_boundary,
 )
+from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.utils.async_utils import gather_collect
 
 try:
@@ -3351,6 +3354,8 @@ class TaskKnowledgeSync(BaseStage):
 
     # Active task tree — set by harness before run() (task 455)
     filtered_task_tree: FilteredTaskTree | None = None
+    # Set with filtered_task_tree: the instant that tree, and every heartbeat_at in it, was read.
+    filtered_task_tree_fetched_at: datetime | None = None
 
     # Minimum number of tasks to proactively spot-check each run
     MIN_TASK_SAMPLE: int = 5
@@ -3890,7 +3895,7 @@ class TaskKnowledgeSync(BaseStage):
                         self.filtered_task_tree.cancelled_tasks,
                     )
                 )
-            summary = await _queue_briefing_refresh_tasks(
+            summary = await queue_briefing_refresh_tasks(
                 self.taskmaster,
                 self.scope.project_root,
                 mismatches,
@@ -3926,6 +3931,29 @@ class TaskKnowledgeSync(BaseStage):
             },
         )
 
+    async def _resolve_task_tree(self) -> tuple[FilteredTaskTree, datetime]:
+        """The task tree this payload renders, paired with the instant it was read.
+
+        Uses the harness-injected tree when there is one (task 455); otherwise
+        self-fetches from taskmaster and stamps the instant after the fetch.
+        """
+        if self.filtered_task_tree is not None:
+            read_at = resolve_tree_read_instant(
+                self.filtered_task_tree_fetched_at,
+                event='reconciliation.task_tree_read_instant_missing',
+                extra={'project_id': self.project_id, 'run_id': self._current_run_id},
+            )
+            return self.filtered_task_tree, read_at
+
+        # filter_task_tree accepts `object`; either GetTasksResult or {} is fine.
+        tasks_data: object = {}
+        if self.taskmaster:
+            try:
+                tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
+            except Exception:
+                tasks_data = {}
+        return filter_task_tree(tasks_data), datetime.now(UTC)
+
     async def assemble_payload(
         self,
         events: list[ReconciliationEvent],
@@ -3952,20 +3980,7 @@ class TaskKnowledgeSync(BaseStage):
 
         stage1_report = prior_reports[0] if prior_reports else None
 
-        # Dual-path: use harness-injected tree or self-fetch (task 455)
-        if self.filtered_task_tree is not None:
-            # Harness path: tree already fetched and filtered before run()
-            filtered = self.filtered_task_tree
-        else:
-            # Fallback path: self-fetch via taskmaster
-            # filter_task_tree accepts `object`; either GetTasksResult or {} is fine.
-            tasks_data: object = {}
-            if self.taskmaster:
-                try:
-                    tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
-                except Exception:
-                    tasks_data = {}
-            filtered = filter_task_tree(tasks_data)
+        filtered, tree_read_at = await self._resolve_task_tree()
 
         # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
         self._check_filtered_tree_invariant(filtered)
@@ -4066,7 +4081,8 @@ class TaskKnowledgeSync(BaseStage):
         visible_active, active_tree_text = render_active_section(filtered)
 
         # Compute the hint-attention section: active tasks whose memory_hints
-        # need conversion from legacy list format (or are missing entirely).
+        # need conversion from legacy list format (or are missing entirely), less
+        # any task live-claimed when the tree was read (task 5093).
         # Gated on `if not self.remediation_mode:` — mirrors proactive_sample_section
         # (above) because hint conversion is a general-sync activity, not a Stage 1
         # remediation task. Rendered conditionally within that gate — omitted on the
@@ -4075,9 +4091,9 @@ class TaskKnowledgeSync(BaseStage):
         # always used for the prompt template slot regardless of remediation_mode.
         hint_conversion_section = ''
         if not self.remediation_mode:
-            tasks_needing_hint_attention = [
-                t for t in visible_active if _needs_hint_attention(t)
-            ]
+            tasks_needing_hint_attention = select_tasks_needing_hint_attention(
+                visible_active, claims_read_at=tree_read_at
+            )
             if tasks_needing_hint_attention:
                 hint_conversion_section = (
                     '\n### Tasks Needing Memory Hint Attention\n'
@@ -5174,6 +5190,24 @@ def _needs_hint_attention(task: dict) -> bool:
     return not task_hints
 
 
+def select_tasks_needing_hint_attention(
+    tasks: Iterable[dict], *, claims_read_at: datetime
+) -> list[dict]:
+    """The tasks rendered as ``### Tasks Needing Memory Hint Attention``.
+
+    A task claimed by a live orchestrator run is left out, because a Stage 2
+    hint write would race that run's own metadata writers (task 5093). Claim
+    freshness is judged at *claims_read_at*, the instant the task snapshot was
+    read, not at wall clock.
+    """
+    return [
+        t
+        for t in tasks
+        if _needs_hint_attention(t)
+        and not has_live_claimant(t, claims_read_at, DEFAULT_CLAIMANT_HEARTBEAT_TTL)
+    ]
+
+
 async def _run_briefing_known_gaps_script(project_root: ProjectRoot) -> list[dict] | None:
     """Run reify's refresh_briefing_known_gaps.py in --json mode.
 
@@ -5251,7 +5285,7 @@ async def _run_briefing_known_gaps_script(project_root: ProjectRoot) -> list[dic
         return None
 
 
-async def _queue_briefing_refresh_tasks(
+async def queue_briefing_refresh_tasks(
     taskmaster: TaskBackendProtocol,
     project_root: ProjectRoot,
     mismatches: list[dict],
@@ -5259,6 +5293,10 @@ async def _queue_briefing_refresh_tasks(
     run_id: str = '',
 ) -> dict:
     """Create 'Refresh briefing: remove task N from known_gaps' tasks for each mismatch.
+
+    Each mismatch is a dict carrying the ``task_id`` still listed in a
+    briefing's known_gaps, its ``subproject``, its ``title``, and the gap
+    text ``what``; one refresh task is filed per mismatch.
 
     Skips creation when a task with status 'pending' and the same canonical title
     already exists (exact-title de-dup, case-sensitive string equality).

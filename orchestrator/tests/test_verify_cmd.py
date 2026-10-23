@@ -27,8 +27,10 @@ from _serial_recovery_helpers import (
     xdist_option_surface,
 )
 from _verify_config_corpus import (
+    DASHBOARD_LINT_COMMAND,
     DF_CONFIG_PATH,
     FM_LINT_COMMAND,
+    MODULE_LINT_COMMANDS,
     REPO_ROOT,
     ROOT_LINT_COMMAND,
     ROOT_TEST_COMMAND,
@@ -325,6 +327,88 @@ class TestParseConfigCommandOpaque:
         assert cmd.base_flags == ()
         assert cmd.targets == ()
         assert cmd.wrappers == ()
+
+
+_LIVE_CHAINED_LINT_COMMANDS = [
+    ('root', ROOT_LINT_COMMAND),
+    ('fused-memory', FM_LINT_COMMAND),
+    ('dashboard', DASHBOARD_LINT_COMMAND),
+    *sorted(MODULE_LINT_COMMANDS.items()),
+]
+
+
+class TestParseChainRecoversLintTypeIdentity:
+    """A chain with exactly one argv-head ruff-check or pyright invocation
+    resolves to that tool, for IDENTITY only (task 4843, #4462): raw is
+    retained, so render is unchanged and no mutator applies. Zero or several
+    recognised tools stay OPAQUE, and the pytest/cargo arms keep precedence.
+    """
+
+    def test_live_module_lint_commands_are_present(self):
+        assert MODULE_LINT_COMMANDS, 'the parametrisation below must not be vacuous'
+
+    @pytest.mark.parametrize(('origin', 'raw'), _LIVE_CHAINED_LINT_COMMANDS)
+    def test_live_chained_lint_command_is_ruff(self, origin, raw):
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.RUFF, (
+            f'{origin} lint chain has exactly one argv-head `ruff check`, '
+            'so it must resolve RUFF'
+        )
+        assert cmd.raw == raw, 'identity recovery must retain raw'
+        assert render(cmd) == raw, 'identity recovery must not change rendering'
+
+    def test_live_chained_type_check_command_is_pyright(self):
+        cmd = parse_config_command(ROOT_TYPE_CHECK_COMMAND)
+        assert cmd.tool is ToolKind.PYRIGHT, (
+            'every argv-head tool in the root type-check chain is pyright, '
+            'so it must resolve PYRIGHT'
+        )
+        assert cmd.raw == ROOT_TYPE_CHECK_COMMAND, 'identity recovery must retain raw'
+        assert render(cmd) == ROOT_TYPE_CHECK_COMMAND, (
+            'identity recovery must not change rendering'
+        )
+
+    def test_chainless_scripts_lint_command_stays_structured(self):
+        cmd = parse_config_command(SCRIPTS_LINT_COMMAND)
+        assert cmd.tool is ToolKind.RUFF
+        assert cmd.raw is None, 'a single-segment command keeps its structured parse'
+
+    def test_live_test_command_stays_pytest(self):
+        assert parse_config_command(ROOT_TEST_COMMAND).tool is ToolKind.PYTEST
+
+    @pytest.mark.parametrize(
+        'raw',
+        ['ruff check src/ && pyright src/', 'pyright src/ && ruff check src/'],
+    )
+    def test_two_recognised_tools_stay_opaque(self, raw):
+        assert parse_config_command(raw).tool is ToolKind.OPAQUE, (
+            'a chain running two recognised tools has no dominant tool, and '
+            'the answer must not depend on table order'
+        )
+
+    def test_tool_named_only_in_a_script_path_stays_opaque(self):
+        raw = 'python3 scripts/check_pyright_config.py src/ && mypy src/'
+        assert parse_config_command(raw).tool is ToolKind.OPAQUE, (
+            "a tool name inside a sibling checker's path is not an invocation"
+        )
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [
+            ('uv run ruff check src/ && uv run pytest tests/', ToolKind.PYTEST),
+            ('cargo test --workspace && ruff check src/', ToolKind.CARGO_TEST),
+        ],
+    )
+    def test_pytest_and_cargo_arms_keep_precedence(self, raw, expected):
+        assert parse_config_command(raw).tool is expected, (
+            'pytest/cargo own the chain-aware mutators, so their arms must '
+            'win over identity recovery'
+        )
+
+    def test_chain_with_no_recognised_tool_stays_opaque(self):
+        assert parse_config_command('make lint && make type').tool is ToolKind.OPAQUE, (
+            'a chain invoking no recognised tool has no identity to recover'
+        )
 
 
 class TestRenderRoundTrip:
@@ -1481,7 +1565,7 @@ class TestSubshellClauseIntegrity:
 
         RED at baseline for the same reason as
         ``test_cockpit_subshell_stays_parseable`` above: at baseline
-        ``split_and_chain_segments`` still returns all 8 segments (it has no
+        ``split_and_chain_segments`` still returns all 9 segments (it has no
         reason to refuse — the chain itself is well-formed `&&`-separated
         shell, just one segment's *content* happens to be unparseable), with
         the cockpit segment individually failing ``bash -n``. So segmenting
@@ -1493,7 +1577,7 @@ class TestSubshellClauseIntegrity:
         recovered = render(serial_pytest(parse_config_command(ROOT_TEST_COMMAND)))
         segments = split_and_chain_segments(recovered)
         assert segments is not None
-        assert len(segments) == 8
+        assert len(segments) == 9
         for segment in segments:
             _assert_bash_parses(segment.command, what=f'segment {segment.label!r}')
 
@@ -2108,9 +2192,11 @@ class TestGovernCpu:
         command for role=='merge' regardless of shape; OPAQUE (arbitrary/
         unparseable shell) is exactly the case that safe bash-wrap exists
         for. Dropping merge cpu-governance for OPAQUE would silently starve
-        dark_factory's real lint_command/type_check_command chains (which
-        parse OPAQUE — see TestParseChain) of the merge-weighted cgroup
-        scope every other merge verify command gets.
+        any unrecognised command shape of the merge-weighted cgroup scope
+        every other merge verify command gets. (dark_factory's own lint/type
+        chains now resolve RUFF/PYRIGHT with raw retained — see
+        TestParseChainRecoversLintTypeIdentity — and are covered by the
+        sibling test below.)
         """
         cmd = parse_config_command('mypy src/')
         assert cmd.tool is ToolKind.OPAQUE
@@ -2124,16 +2210,16 @@ class TestGovernCpu:
 
         the real dark_factory.orchestrator.config.yaml lint_command/
         type_check_command shape: multi-clause, non-pytest/non-cargo, so
-        parse_config_command classifies it OPAQUE (_parse_chain only
-        recognises pytest/cargo chains). It must still be cpu-governed on
-        merge, matching the historical unconditional bash-wrap.
+        parse_config_command resolves it RUFF with raw retained (identity
+        only — task 4843). It must still be cpu-governed on merge, matching
+        the historical unconditional bash-wrap.
         """
         raw = (
             'uv run ruff check shared escalation && '
             'python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
         )
         cmd = parse_config_command(raw)
-        assert cmd.tool is ToolKind.OPAQUE
+        assert cmd.tool is ToolKind.RUFF
         assert cmd.raw == raw
 
         result = render(govern_cpu(cmd, self._EXEC))
@@ -2401,12 +2487,12 @@ class TestSplitChainTail:
         prefix, tail = split_chain_tail(ROOT_LINT_COMMAND, 'ruff check')
         assert prefix == (
             'uv run ruff check shared escalation fused-memory orchestrator dashboard sampler'
-            ' cockpit conftest.py df_pytest_isolation.py skills '
+            ' cockpit client-feed conftest.py df_pytest_isolation.py skills '
         )
         assert tail == (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
             ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-            ' sampler/tests cockpit/tests'
+            ' sampler/tests cockpit/tests client-feed/tests'
         )
         assert prefix + tail == ROOT_LINT_COMMAND
 
@@ -3014,7 +3100,7 @@ class TestDescribeDroppedClauses:
     ``has_unpreserved_chain_clauses`` answers "was anything dropped at all";
     this answers "WHAT was dropped, and is it the same tool again". Both are
     pure, which is what keeps this module logging-free — the caller
-    (``verify_plan.log_dropped_chain_clauses``) turns the answer into a record.
+    (``verify_plan._log_dropped_chain_clauses``) turns the answer into a record.
 
     Two properties are pinned here because the first version of that record
     got both wrong (task 3218, review findings 1 and 2):
@@ -3036,12 +3122,12 @@ class TestDescribeDroppedClauses:
     """
 
     def test_root_type_check_fan_out(self):
-        """The live root ``type_check_command``: 14 segments, 2 retained, 12 dropped.
+        """The live root ``type_check_command``: 16 segments, 2 retained, 14 dropped.
 
         The record used to say 13 — every clause in the original — because the
         keyword sits in segment 1, not segment 0.
 
-        The counts track the live config: it fans pyright out over seven
+        The counts track the live config: it fans pyright out over eight
         directories today (it was three when this case was written), so
         ``dropped`` is ``2 * (dirs - 1)`` — a ``cd`` and an ``npx pyright``
         per directory past the retained first one.
@@ -3049,13 +3135,13 @@ class TestDescribeDroppedClauses:
         dropped, fan_out = describe_dropped_clauses(
             ROOT_TYPE_CHECK_COMMAND, 'cd fused-memory && npx pyright', 'pyright',
         )
-        assert len(dropped) == 12
+        assert len(dropped) == 14
         assert fan_out is True
         assert dropped[0] == 'cd ../orchestrator'
         assert dropped[-1] == 'npx pyright'
 
     def test_root_test_command_fan_out(self):
-        """The live root ``test_command``: 16 segments, 2 retained, 14 dropped.
+        """The live root ``test_command``: 18 segments, 2 retained, 16 dropped.
 
         This is the regression case for review finding 2. Every dropped
         ``uv run pytest tests/ --timeout=300`` clause invokes pytest at an
@@ -3065,7 +3151,7 @@ class TestDescribeDroppedClauses:
         dropped, fan_out = describe_dropped_clauses(
             ROOT_TEST_COMMAND, 'cd shared && uv run pytest', 'pytest',
         )
-        assert len(dropped) == 14
+        assert len(dropped) == 16
         assert fan_out is True
 
     @pytest.mark.parametrize(
@@ -3153,15 +3239,15 @@ class TestSplitAndChainSegments:
     """
 
     def test_root_test_command_yields_one_segment_per_subproject(self):
-        """The committed fleet chain decomposes into its 8 runnable clauses.
+        """The committed fleet chain decomposes into its 9 runnable clauses.
 
-        Six `cd <subproject> && pytest` pairs, the cockpit subshell, and the
+        Seven `cd <subproject> && pytest` pairs, the cockpit subshell, and the
         `tests/scripts/` clause — the LAST one, and the one esc-3062-2 reports
         never ran because an earlier subproject's red short-circuited the shell.
         """
         segments = split_and_chain_segments(ROOT_TEST_COMMAND)
         assert segments is not None
-        assert len(segments) == 8
+        assert len(segments) == 9
         assert [s.cwd_rel for s in segments] == [
             'shared',
             'escalation',
@@ -3169,6 +3255,7 @@ class TestSplitAndChainSegments:
             'fused-memory',
             'dashboard',
             'sampler',
+            'client-feed',
             '.',
             '.',
         ]
@@ -3177,17 +3264,17 @@ class TestSplitAndChainSegments:
         """The `( ... )` group is never split on its interior `&&`."""
         segments = split_and_chain_segments(ROOT_TEST_COMMAND)
         assert segments is not None
-        assert segments[6].command == _COCKPIT_GROUP
-        assert segments[6].cwd_rel == '.'
+        assert segments[7].command == _COCKPIT_GROUP
+        assert segments[7].cwd_rel == '.'
         # A subshell's own `cd cockpit` never escapes it, so the NEXT segment
         # is still at the worktree root.
-        assert segments[7].cwd_rel == '.'
+        assert segments[8].cwd_rel == '.'
 
     def test_final_tests_scripts_segment_is_recovered_intact(self):
         """The clause esc-3062-2 is about, addressable on its own."""
         segments = split_and_chain_segments(ROOT_TEST_COMMAND)
         assert segments is not None
-        assert segments[7].command == (
+        assert segments[8].command == (
             'uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
         )
 
@@ -3232,8 +3319,9 @@ class TestSplitAndChainSegments:
             'fused-memory-4',
             'dashboard-5',
             'sampler-6',
-            'root-7',
+            'client-feed-7',
             'root-8',
+            'root-9',
         ]
         assert len(set(labels)) == len(labels)
         for label in labels:
@@ -3260,8 +3348,9 @@ class TestSplitAndChainSegments:
             'escalation',
             'sampler',
             'cockpit',
+            'client-feed',
         ]
-        assert [s.command for s in segments] == ['npx pyright'] * 7
+        assert [s.command for s in segments] == ['npx pyright'] * 8
 
     def test_chain_segment_is_a_frozen_dataclass(self):
         """Segments are inert value objects — the runner must not mutate them."""
@@ -3510,7 +3599,7 @@ class TestSplitAndChainSegmentsRefuses:
         assert split_and_chain_segments(bad) is None
         good = split_and_chain_segments(ROOT_TEST_COMMAND)
         assert good is not None
-        assert len(good) == 8
+        assert len(good) == 9
 
 
 class TestSplitAndChainSegmentsLiveConfigDrift:

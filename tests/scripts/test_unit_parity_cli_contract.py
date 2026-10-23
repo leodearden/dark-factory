@@ -747,7 +747,7 @@ GOLDENS: dict[str, tuple[int, str, str]] = {
     'orchestrator/zero-compared': (
         1,
         (
-            '[orchestrator_unit_parity] [vanished] 16 committed unit(s) not found — nothing was verified for them:\n'
+            '[orchestrator_unit_parity] [vanished] 18 committed unit(s) not found — nothing was verified for them:\n'
             '[orchestrator_unit_parity]   orchestrator-autopilot-video.service: expected committed copy at <TMP>/repo/scripts/orchestrator-autopilot-video.service\n'
             '[orchestrator_unit_parity]   orchestrator-autopilot-video.socket: expected committed copy at <TMP>/repo/scripts/orchestrator-autopilot-video.socket.template\n'
             '[orchestrator_unit_parity]   orchestrator-dark-factory.service: expected committed copy at <TMP>/repo/scripts/orchestrator-dark-factory.service\n'
@@ -762,6 +762,8 @@ GOLDENS: dict[str, tuple[int, str, str]] = {
             '[orchestrator_unit_parity]   orchestrator-reify.socket: expected committed copy at <TMP>/repo/scripts/orchestrator-reify.socket.template\n'
             '[orchestrator_unit_parity]   orchestrator-solar-challenge-platform.service: expected committed copy at <TMP>/repo/scripts/orchestrator-solar-challenge-platform.service\n'
             '[orchestrator_unit_parity]   orchestrator-solar-challenge-platform.socket: expected committed copy at <TMP>/repo/scripts/orchestrator-solar-challenge-platform.socket.template\n'
+            '[orchestrator_unit_parity]   orchestrator-stream-touch.service: expected committed copy at <TMP>/repo/scripts/orchestrator-stream-touch.service\n'
+            '[orchestrator_unit_parity]   orchestrator-stream-touch.socket: expected committed copy at <TMP>/repo/scripts/orchestrator-stream-touch.socket.template\n'
             '[orchestrator_unit_parity]   orchestrator-watchdog.service: expected committed copy at <TMP>/repo/scripts/orchestrator-watchdog.service\n'
             '[orchestrator_unit_parity]   orchestrator-watchdog.timer: expected committed copy at <TMP>/repo/scripts/orchestrator-watchdog.timer\n'
             "[orchestrator_unit_parity] [vanished] The committed unit is this checker's source of truth. Check --repo-root, and whether the unit was renamed or moved (the paths live in UNITS in this script).\n"

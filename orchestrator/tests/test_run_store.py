@@ -1039,3 +1039,52 @@ class TestBlockContextPersistence:
             store._migrate_task_results_block_context(
                 _BrokenConn(),  # type: ignore[arg-type]
             )
+
+
+class TestRunsCodeSha:
+    """Task 6565 D1: ``runs.code_sha`` records the commit the process runs."""
+
+    @staticmethod
+    def _runs_columns(db_path) -> list[str]:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return [row[1] for row in conn.execute('PRAGMA table_info(runs)')]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _code_sha(db_path, run_id: str):
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return conn.execute('SELECT code_sha FROM runs WHERE run_id = ?', (run_id,)).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_start_run_records_code_sha(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        store.start_run('run-1', 'proj', '2026-10-20T00:00:00+00:00', code_sha='d' * 40)
+        assert self._code_sha(db_path, 'run-1') == 'd' * 40
+
+    def test_code_sha_defaults_to_null(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        store.start_run('run-1', 'proj', '2026-10-20T00:00:00+00:00')
+        assert self._code_sha(db_path, 'run-1') is None
+
+    def test_pre_6565_db_gains_code_sha_last_with_null_rows(self, tmp_path):
+        """A migrated DB and a fresh one agree on column ORDER (code_sha last)."""
+        legacy = tmp_path / 'legacy.db'
+        _build_legacy_db(legacy)
+        assert 'code_sha' not in self._runs_columns(legacy)
+
+        store = RunStore(legacy)
+        RunStore(legacy)  # idempotent
+
+        fresh = tmp_path / 'fresh.db'
+        RunStore(fresh)
+        assert self._runs_columns(legacy) == self._runs_columns(fresh)
+        assert self._runs_columns(legacy)[-1] == 'code_sha'
+        assert self._code_sha(legacy, 'run-legacy') is None
+        store.start_run('run-new', 'proj-a', '2026-10-20T00:00:00+00:00', code_sha='e' * 40)
+        assert self._code_sha(legacy, 'run-new') == 'e' * 40

@@ -39,12 +39,12 @@ from _boundary_payloads import (
     ragged_b,
     ragged_day,
 )
+from _dashboard_helpers import node_path
 from _lock_chip_matrix import (
     CELL_MATRIX,
     heatmap_cell_and_chip,
     heatmap_module,
     heatmap_row,
-    node_path,
 )
 from shared.task_statuses import TaskStatus
 

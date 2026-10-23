@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
-logger = logging.getLogger('orchestrator.merge_queue_store')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +382,7 @@ def _reconstruct_module_configs(
     * ``module_prefixes == []`` (explicitly persisted empty) -> ``[]``.
       The task genuinely had no assigned modules, so the global-fallback path
       is the correct gate and
-      ``orchestrator.merge_queue::_merge_boundary_module_configs``' deliberate
+      ``orchestrator.merge_lane.worker::_merge_boundary_module_configs``' deliberate
       no-widen policy is preserved.  Deliberately NOT widened to the registry.
     * ``module_prefixes`` non-empty -> one ``ModuleConfig`` per prefix via
       ``orchestrator.config::OrchestratorConfig.for_module`` (a longest-prefix
@@ -611,7 +611,7 @@ async def recover_pending_merges(
     double-rehydrate) never dispatches two concurrent verifies of one work
     item.  Survivors are grouped by ``QueuedBranch.bare_id`` (first-seen order);
     for each group the descendant-most snapshot tip is chosen as the WINNER via
-    :func:`orchestrator.merge_queue.select_recovery_winner`, which routes the
+    :func:`orchestrator.merge_lane.worker.select_recovery_winner`, which routes the
     pairwise ancestry decision through δ's shared
     ``decide_c3_submit_action(verifying=False)`` (SAME/SUBSET keep the winner,
     SUPERSET replaces it, a DIVERGENT force-push folds through

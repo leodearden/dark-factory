@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import html.parser
 import json
+import os
 import re
+import shutil
 import sqlite3
 import threading
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
@@ -872,6 +874,30 @@ async def make_recon_db(
     async with aiosqlite.connect(str(db_path)) as conn:
         conn.row_factory = aiosqlite.Row
         yield conn
+
+
+def node_path() -> str:
+    """The node binary: a skip locally, a failure under CI (CI carries node)."""
+    path = shutil.which('node')
+    if not path:
+        if os.environ.get('CI'):
+            pytest.fail('node is required in CI but not found on PATH')
+        pytest.skip('node not available')
+    return path
+
+
+def bug_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Every captured WARNING a dashboard handler logs for its own bug, never an outage.
+
+    Matches the sentence ``dashboard/src/dashboard/api/tasks.py::_unknown_after_contract_break``,
+    ``dashboard/src/dashboard/api/tasks.py::_unknown_after_unexpected_error``
+    and the fan-out's catch-all in ``dashboard/src/dashboard/data/active_tasks.py``
+    all put in their message.
+    """
+    return [
+        record.getMessage() for record in caplog.records
+        if 'this is a BUG, not an outage' in record.getMessage()
+    ]
 
 
 # ---------------------------------------------------------------------------

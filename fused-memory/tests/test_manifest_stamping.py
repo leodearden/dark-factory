@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import yaml
+from shared.capability_manifest import load_capability_manifest
 
 from fused_memory.server.manifest_stamping import (
     stamp_capability_manifests,
@@ -395,6 +396,43 @@ async def test_stamp_preserves_sidecar_header_comment(tmp_path):
         '  - label: π  # the paired-edit task\n    task_id: 2861\n',
     )
     assert sidecar_path.read_bytes() == expected.encode('utf-8')
+
+
+@pytest.mark.asyncio
+async def test_stamp_keeps_signal_leaves_byte_for_byte(tmp_path):
+    """Boundary row 5 of plans/dashboard-prd-lanes-prd.md: ``signal_leaves`` survives the stamp."""
+    prd_key = 'plans/signal-prd.md'
+    sidecar_relpath = 'plans/signal-prd.capability-manifest.yaml'
+    original = _mechanical_sidecar_yaml('signal', ['α', 'ζ']).replace(
+        'schema_version: 1\n',
+        "schema_version: 1\nsignal_leaves:  # the PRD's integration gate\n- ζ\n",
+        1,
+    )
+    on_disk = tmp_path / sidecar_relpath
+    on_disk.parent.mkdir(parents=True)
+    on_disk.write_bytes(original.encode('utf-8'))
+
+    report, _interceptor = await _stamp_batch(
+        tmp_path,
+        [
+            ('701', {'prd_path': prd_key, 'prd_task_label': 'α'}),
+            ('702', {'prd_path': prd_key, 'prd_task_label': 'ζ'}),
+        ],
+    )
+
+    assert report == {
+        'path': sidecar_relpath,
+        'stamped': ['α', 'ζ'],
+        'missing_labels': [],
+        'errors': [],
+    }
+    expected = original.replace(
+        '  - label: α\n    task_id: null\n', '  - label: α\n    task_id: 701\n'
+    ).replace('  - label: ζ\n    task_id: null\n', '  - label: ζ\n    task_id: 702\n')
+    assert on_disk.read_bytes() == expected.encode('utf-8')
+    doc = load_capability_manifest(on_disk)
+    assert doc.signal_leaves == ['ζ']
+    assert {task.label: task.task_id for task in doc.tasks} == {'α': 701, 'ζ': 702}
 
 
 def _externally_produced(sidecar_yaml, label, external_task_id='reify:5613'):

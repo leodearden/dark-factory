@@ -30,6 +30,7 @@ import subprocess
 import sys
 import types
 import uuid
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -80,9 +81,11 @@ from fused_memory.server.write_triage_judge import (
     JUDGE_VERDICTS,
     VERDICT_KEY,
     JudgeOutputError,
+    JudgePromptElisions,
     _call_llm,
     _provider_credentials,
     build_judge_prompt,
+    judge_prompt_elisions,
     judge_write,
     parse_judge_verdict,
     resolve_judge_api_url,
@@ -751,7 +754,7 @@ class TestSelectJudgeCandidates:
         assert len(selected) <= 3
 
     def test_the_winner_is_present_even_when_hoisted(self) -> None:
-        """`_canonical_id_of` HOISTS a child winner to its parent id.
+        """`canonical_id_of` HOISTS a child winner to its parent id.
 
         So `decision.canonical_id` can name a record that is not itself in the
         result set at all. The parent is what the attach targets, so when the
@@ -910,6 +913,52 @@ class TestBuildJudgePrompt:
         assert 'e' * 10 + _ELIDED_MARKER not in prompt
         assert 'c' * 10 + _ELIDED_MARKER in prompt
         assert 'c' * 11 not in prompt
+
+
+class TestJudgePromptElisions:
+    """Which fields the prompt cuts, answered in the prompt's own terms."""
+
+    def test_a_field_is_elided_only_when_longer_than_the_width(self) -> None:
+        report = judge_prompt_elisions(
+            'e' * 10,
+            [_result('a', 0.9, content='a' * 11), _result('b', 0.8, content='b' * 3)],
+            field_chars=10,
+        )
+        assert report == JudgePromptElisions(entry=False, candidates={'a': True, 'b': False})
+
+    def test_every_candidate_given_is_reported(self) -> None:
+        """No selection, no trim, no reorder: it describes the slate it was handed."""
+        ids = ['m6', 'm2', 'm0', 'm5', 'm1', 'm4', 'm3']
+        assert len(ids) > resolve_judge_candidate_count(types.SimpleNamespace())
+        slate = [_result(id_, 0.50 + index * 0.05) for index, id_ in enumerate(ids)]
+        assert list(judge_prompt_elisions('new', slate).candidates) == ids
+
+    @pytest.mark.parametrize('entry_chars', [8, 9])
+    def test_the_report_agrees_with_the_rendered_prompt(self, entry_chars: int) -> None:
+        """A field is reported cut exactly when its full text is missing from the prompt."""
+        width = 8
+        content = 'e' * entry_chars
+        slate = [
+            _result('m1', 0.9, content='p' * width),
+            _result('m2', 0.8, content='q' * (width + 1)),
+            _result('m3', 0.7, content='r' * 3),
+            _result('m4', 0.6, content='s' * 40),
+        ]
+        prompt = build_judge_prompt(content, slate, field_chars=width)
+        report = judge_prompt_elisions(content, slate, field_chars=width)
+        assert set(report.candidates.values()) == {True, False}
+        assert report.entry == (content not in prompt)
+        assert report.candidates == {c.id: c.content not in prompt for c in slate}
+
+    def test_the_default_width_is_the_shipped_default(self) -> None:
+        default = resolve_judge_field_chars(types.SimpleNamespace())
+        assert judge_prompt_elisions('x' * default, []).entry is False
+        assert judge_prompt_elisions('x' * (default + 1), []).entry is True
+
+    def test_the_candidate_flags_are_read_only(self) -> None:
+        """A frozen value crosses the boundary: the flags offer no mutation at all."""
+        flags = judge_prompt_elisions('new', [_result('a', 0.9)]).candidates
+        assert not isinstance(flags, MutableMapping)
 
 
 class TestAttachTargetGateProbe:

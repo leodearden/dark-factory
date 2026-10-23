@@ -340,3 +340,5 @@ tasks:
     delivered_check:
       kind: manual
       reason: asserted by the orchestrator fixture and tests
+signal_leaves:
+- gamma4

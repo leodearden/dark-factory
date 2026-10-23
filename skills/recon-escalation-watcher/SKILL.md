@@ -33,9 +33,10 @@ Verify these before starting. If anything is missing, ask the user — don't gue
    `/home/leo/src/dark-factory`). The `escalation` package (watcher) lives here.
 2. **This session's `escalation` MCP must point at 8103**, and `fused-memory` at
    8002. The stock repo `.mcp.json` points `escalation` at 8102 — wrong queue.
-   Launch via the recon-watch config (see "Launching" below); confirm with
-   `mcp__escalation__get_pending_escalations()` returning recon findings
-   (ids like `esc-recon-<hex>-N`, categories `recon_*`).
+   Launch via the recon-watch config (see "Launching" below); confirm the
+   binding from the store-identity block on `get_pending_escalations` reading
+   `kind=reconciliation`, which holds even on an empty queue (how to read it:
+   the empty-result bullet in "Failure Modes" below).
 3. **The 8103 server is up** — it runs inside `fused-memory.service`. If
    `get_pending_escalations` errors, the service is down → tell the user
    (priority 1, system stability); do not try to start it yourself.
@@ -98,7 +99,8 @@ a supervised, always-on rotation rather than a single-owner actor. The lease nam
 2289 specified and that `build_lease_name('recon-watcher', '<project>')` already produces.
 
 **Do not assemble the slug (or the pid) in shell — the CLI owns both.** `--slug` is optional and
-defaults to `<--name>-$CLAUDE_PID`; `--pid` is optional and resolves the same way. Pass either only
+defaults to `<--name>-$CLAUDE_PID` (or `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID` under a
+`claude agents` host); `--pid` is optional and resolves the same way. Pass either only
 as a deliberate operator override. Both are derived rather than documented because the token is
 load-bearing on every heartbeat and on the final release, and must not depend on this document
 getting one shell token right (tasks 3994, 4248). It has to be **re-derivable**, not carried: each
@@ -111,6 +113,23 @@ call — hence the CLI re-derives it on every verb.
 the first already dead), so a slug built on it would not match your own later heartbeat. The
 long-lived `claude` process is `$CLAUDE_PID` — verify with `ps -o comm= -p "$CLAUDE_PID"`, which
 prints `claude`.
+
+**Under `claude agents`, `$CLAUDE_PID` is not yours alone.** `ps -o comm=` prints `claude` for a
+`claude agents` host too, so it cannot tell you: every session one `claude agents` process hosts
+shares that host's pid, which outlives each of them. The CLI detects a host (its argv is
+`claude agents ...`), records **pid 0** (heartbeat-only staleness, logged as DEGRADED) and derives
+the slug as `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID`; without a usable
+`$CLAUDE_CODE_SESSION_ID` the lease verbs exit 2 (pass `--slug`). So a hosted holder reads
+`holder_liveness=orphaned` / `holder_pid=0` even while alive: its fresh heartbeat still forces
+stand-down, and once its heartbeat is past the TTL the reaper reclaims it. The per-cycle
+`lease-heartbeat` is the **only** liveness signal a hosted holder has
+(`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
+
+**One-time rollout note (task 6916).** A lease a hosted session claimed *before* this change carries
+the bare `<--name>-$CLAUDE_PID` slug, so that session's re-derived heartbeat and release get
+`result=refused` (naming the holder's pid `alive`) — nothing is damaged. The lease becomes
+reclaimable once its heartbeat is past the 2h TTL; to skip the wait, release it with its original
+`--slug` (`lease-show` prints it as `holder_slug`) and claim again.
 
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** naming both,
 rather than silently drifting to a slug your own later heartbeat would fail to match; the CLI will
@@ -543,6 +562,9 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
        # dead. This is a SUCCESS, not a failure: do NOT retry (a retry just
        # re-hits the same guard) and do NOT record a task id.
        resolve_issue(..., action='close_only', resolution="Ticket <res['reason']>")   # res["reason"] already reads "refused (no task created): ..."
+   elif res["status"] == "awaiting_curation":
+       # Parked for curation: no task_id yet, NOT a failure. Do NOT re-submit.
+       resolve_issue(..., action='resume', resolution="Queued for curation (ticket <sub['ticket']>)")
    elif res["status"] == "failed":
        # Retryable (`server_restart`, `timeout`): apply
        # _shared/ticket-failure-handling.md's retry policy (retry
@@ -976,7 +998,7 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `dark_factory`/`df`/`dark-factory`, each invisible to a reap scoped to either of the others).
   - **Caveat — check your project's existing rows before trusting the declared token.** Folding
     merges spellings that differ only by case or separator; only an entry in
-    `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
+    `shared.project_id.PROJECT_ID_ALIASES` can bridge a project whose filed decisions fold to something *other*
     than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
     **solar-challenge is the known standing case**: its config declares `my_solar_challenge`, but
     its decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but
@@ -1181,8 +1203,13 @@ known so you don't re-investigate them each cycle.
 - **"Too many open files"** after many watcher restart cycles → fd pool
   exhaustion from accumulated background tasks; tell the user to start a fresh
   session.
-- **`get_pending_escalations` errors / empty when you expect items** → confirm
-  this session's `escalation` server points at **8103**, not 8102. The stock
-  repo `.mcp.json` is 8102.
+- **`get_pending_escalations` empty when you expect items** → read the
+  `THIS ENDPOINT SERVES:` block ending that tool's own description in your
+  tool listing (rendered by
+  `escalation/src/escalation/server.py::_render_store_identity_block`).
+  `kind=reconciliation` → this queue answered; nothing is pending.
+  `kind=project` (e.g. `project=dark_factory`) → wrong store, an orchestrator
+  queue: relaunch per "Launching" above. No block → the server cannot vouch
+  for its store; tell the human rather than read `[]` as absence.
 - **8103 server unreachable** → fused-memory.service is down. Priority 1: tell
   the human; do not start services yourself.

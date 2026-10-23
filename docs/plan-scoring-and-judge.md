@@ -1070,6 +1070,67 @@ unrecognised stage or cause loads as `(architect, legacy_unclassified, <raw
 string>)`, and a tainted legacy cell with no string gets `(architect,
 legacy_unclassified, '')`. A live run never produces `legacy_unclassified`.
 
+### Scoring instruments: unmeasured, never a tie or zero (task 6736)
+
+Code: `reviewer_trial/scorer.py::match_issues`, `judge.py::run_judge` and
+`::run_elo_tournament`, `compare.py::compare_models`,
+`elo.py::MAX_UNMEASURED_PER_PAIR`, and the reducers
+`reviewer_trial/campaign.py::summarize_arm` and
+`reviewer_trial/report.py::build_trial_report` (all under
+`orchestrator/src/orchestrator/evals/`).
+
+**Instruments measure or say they did not (PRD D1).** The reviewer-trial
+matcher, the pairwise judge, the comparison assessor and the synthesizer are
+instruments, like the plan judge above. Each runs through `measured_call`, so a
+refusal is `Unmeasured`. So is an answer that does not carry the measurement: a
+missing winner, a winner outside A/B/tie, a missing or non-finite confidence,
+or a `matches` that is not a list of objects. Before this task those cases came
+back as a tie (the pairwise judge and the assessor), an overall tie (the
+synthesizer) or an empty match list and F1 0.0 (the matcher). Each of those
+is a measurement nobody made. Prose fields such as reasoning, summary and
+strengths stay lenient, because rejecting on them would throw away a valid
+score. A verdict record (`JudgeVerdict`, `TaskAssessment`) has `winner` None
+exactly when `unmeasured` is set, enforced at construction by
+`measurement.py::require_answer_iff_measured`. The winner vocabulary has one
+home, `elo.PAIRWISE_RESULT`, and every schema enum derives from it.
+
+**Reducers exclude and count (PRD D2).** Every reducer above an instrument
+leaves an unmeasured record out of its figures and reports how many it left
+out: `ArmMetrics.unmeasured`, `VariantSummary.unmeasured`,
+`HeadToHead.unmeasured`, `ComparisonReport.unmeasured` and
+`TournamentTally.unmeasured`. The `corpus-sanity` command does the same, and
+it exits 1 while any cell is unmeasured, because the sanity run is incomplete.
+A group with nothing measured reports None, never 0.0. Per-group cost ratios
+are taken over measured records only, so an unmeasured record moves no mean,
+cost-per-review included. Its spend is still reported, beside the ratios
+(`unmeasured_cost_usd`) and in the trial and campaign totals, because a
+refused call still spent. The synthesizer reads the measured assessments
+only, and it is not called when none measured (`synthesis` is None).
+
+**Elo.** An unmeasured verdict never reaches `record_match`, so it moves no
+rating and adds nothing to the pair's `MAX_PER_PAIR` count. Unmeasured calls
+spend `max_rounds` like measured ones. A pair that returns
+`MAX_UNMEASURED_PER_PAIR` (2) unmeasured verdicts is retired for the rest of
+that run, so a capped account cannot spin the loop. A pair with a missing
+contender joins the same per-run skip set. That replaces the old write of a
+fabricated `pair_counts[key] = MAX_PER_PAIR`, which `is_pairwise_data_dense`
+then read as density. Nothing about the skip set is persisted in `TaskPool`,
+so a later run measures those pairs again. As a second line of defence,
+`record_match` raises on a winner outside `PAIRWISE_RESULT` rather than
+scoring it 0.5.
+
+**Cache and gates.** The reviewer-trial `campaign` command never caches an
+unmeasured score, so a rerun measures that cell again. The matcher draws on the
+campaign's existing usage gate. The pairwise judge, the assessor and the
+synthesizer get no gate, because their drivers build none (PRD §12 q1). Wiring
+one in later is a single `usage_gate=` argument to `measured_call`.
+
+**Backfill (INV-13).** Score files a campaign cached before task 6736 carry no
+`unmeasured` key, so they cannot be told apart from a refused matcher's
+fabricated zero. They are abandoned, not migrated, and they load as measured.
+A campaign that needs a trustworthy mean must rerun into a fresh
+`--results-dir`.
+
 ### Terminal outcome (`terminal_kind`, task 4760)
 
 The three counts above all describe the *quality* axis. This one describes what

@@ -58,6 +58,7 @@ from _plan_markup_fixtures import (
     on_disk,
     plan_artifacts,  # noqa: F401 — a fixture, requested by test parameter name
 )
+from shared.plan_deviation import DEVIATION_KINDS
 from shared.toolcall_markup import detect
 
 from orchestrator.artifacts import (
@@ -176,10 +177,10 @@ _COLLECTION_SCHEMA_TOOL_NAME = {
     'dropped_files': 'drop_plan_file',
 }
 
-#: The only three ``TaskArtifacts`` methods that mutate plan.json — measured,
-#: not assumed: ``write_plan`` (artifacts.py:356), ``update_step_status``
-#: (:734) and ``mark_step_committed`` (:753) each write
-#: ``self.root / 'plan.json'`` (the latter via a call to ``self.write_plan``).
+#: The ``TaskArtifacts`` plan-mutating methods that plan-tools impls call:
+#: ``artifacts.py::TaskArtifacts.write_plan``, ``::update_step_status``,
+#: ``::mark_step_committed`` and ``::append_step_deviation`` each write
+#: ``self.root / 'plan.json'``, the last two via a call to ``self.write_plan``.
 #: ``_plan_writing_tool_names()`` below keys its live-module walk on this set
 #: to derive the candidate set for "could this plan-tools entry point write a
 #: ``_REPAIRABLE_PLAN_FIELDS`` cell?".
@@ -193,6 +194,7 @@ _PLAN_MUTATING_ARTIFACT_METHODS = frozenset({
     'write_plan',
     'update_step_status',
     'mark_step_committed',
+    'append_step_deviation',
 })
 
 
@@ -201,8 +203,8 @@ def _registered_plan_tool_names() -> frozenset[str]:
     """The tool names plan-tools' server actually REGISTERS, read from the server.
 
     Derived, never restated: builds a real server over a throwaway artifacts
-    root and asks it what it registered. Measured against the live tree — 16
-    names, the 11 plan writers plus the 5 ``report_*``.
+    root and asks it what it registered: the plan writers plus the
+    ``report_*`` family.
 
     Cached because several callers ask for the registered surface, which
     cannot change within a process; without it each would pay its own server
@@ -468,6 +470,10 @@ def _alternate_writer_changed_the_cell(
             kwargs[name] = seeded_id
         elif name == 'step_type':
             kwargs[name] = 'test'
+        elif name == 'kind':
+            kwargs[name] = sorted(DEVIATION_KINDS)[0]
+        elif name == 'prose_only':
+            kwargs[name] = False
         elif name in ('sha', 'commit_sha'):
             kwargs[name] = 'a' * 40
         elif name == 'files':
@@ -481,6 +487,7 @@ def _alternate_writer_changed_the_cell(
         elif name in (
             'description', 'analysis', 'title', 'decision', 'rationale',
             'what', 'where', 'how', 'reason',
+            'observed', 'expected', 'action_taken', 'note',
         ):
             kwargs[name] = f'Probe marker for {tool_name}.{name}.'
         else:
@@ -935,10 +942,10 @@ class TestRepairableFieldTable:
         TWO HALVES, both derived:
 
         (a) Every REGISTERED tool that is not a ``report_*`` separate-artifact
-            writer. Measured, production's own claims alone (half (b)) floor
-            only 8 of the 11 — ``confirm_plan``, ``mark_step_done`` and
-            ``remove_plan_step`` are declared as no row's alternate, so all
-            three could vanish from the sweep and every test here would still
+            writer. Production's own claims alone (half (b)) do not floor
+            every plan writer — a writer such as ``confirm_plan`` or
+            ``mark_step_done`` that is declared as no row's alternate could
+            vanish from the sweep and every test here would still
             report green, which is exactly what this test's name claims to
             rule out. The ``report_*`` exclusion is not a prefix guess: the
             behaviour it stands for is pinned against the live module by
@@ -1042,8 +1049,7 @@ class TestRepairableFieldTable:
         # registered OUTSIDE that convention (written inline inside
         # `create_server`, or delegating to a differently-named helper) would
         # not fail — it would silently be no candidate at all, which is the
-        # under-reporting this whole surface exists to end. Measured: all 16
-        # registered tools follow it today.
+        # under-reporting this whole surface exists to end.
         for name in sorted(registered):
             impl = getattr(plan_tools, '_' + name, None)
             assert inspect.isfunction(impl) and impl.__module__ == plan_tools.__name__, (
@@ -2598,6 +2604,11 @@ def _plan_finalized(plan: dict) -> None:
     assert plan['_revalidated_at']
 
 
+def _deviation_recorded(plan: dict) -> None:
+    assert plan['steps'][0]['deviations'][0]['kind'] == 'other'
+    assert plan['steps'][0]['status'] == 'pending'
+
+
 #: ``(id, call, expected-response-subset, on-disk-mutation-check)`` for every
 #: plan-tools entry point that OPENS an existing plan. ``_create_plan`` is
 #: absent on purpose: it overwrites the document wholesale, so it has no read to
@@ -2646,6 +2657,14 @@ READ_PATH_CASES = [
         lambda a: plan_tools._mark_step_done(a, 'step-1', _NEW_SHA),
         {'status': 'ok', 'step_id': 'step-1', 'new_status': 'done', 'commit': _NEW_SHA},
         _step_marked_done,
+    ),
+    (
+        'record_step_deviation',
+        lambda a: plan_tools._record_step_deviation(
+            a, 'step-1', 'other', 'Observed.', 'Expected.', 'Acted.'
+        ),
+        {'status': 'ok', 'step_id': 'step-1', 'deviations': 1},
+        _deviation_recorded,
     ),
     (
         # Contract A1's DELIBERATELY divergent envelope — ``ok`` plus ``status``

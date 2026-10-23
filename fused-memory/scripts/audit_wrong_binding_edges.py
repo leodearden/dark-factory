@@ -137,8 +137,6 @@ def fact_referents(fact: str | None, graph: str) -> frozenset[Referent]:
     * a genuine project-qualified reference split across lines by HARD
       WRAPPING is missed ('dark_factory:\\n2500'), because the qualified
       pattern's '[ \\t]' padding cannot span a newline;
-    * the HYPHEN spelling 'task-1836' is missed, because the separator
-      alternation admits only whitespace, '#' and ':';
     * the BARE-HASH spelling '#4262' is missed, because a mention must carry
       the literal word 'task'.
 
@@ -146,10 +144,10 @@ def fact_referents(fact: str | None, graph: str) -> frozenset[Referent]:
     ``canonical_labels`` at its single site, and that module is on the LIVE
     memory write path — editing a pattern to suit a retrospective survey
     would change what the write-time guard does to production writes. The
-    last two blind spots are the ones that actually bite this detector (they
-    make an endpoint that IS named in the fact look unnamed), and they are
-    absorbed by :func:`bare_id_present`, which mints no referent and can only
-    SUPPRESS a flag.
+    last blind spot is the one that actually bites this detector (it makes an
+    endpoint that IS named in the fact look unnamed), and it is absorbed by
+    :func:`bare_id_present`, which mints no referent and can only SUPPRESS a
+    flag.
 
     ``ambiguous`` referents are deliberately NOT returned. A referent lands
     there only when its number was claimed BOTH by a bare mention and by a
@@ -230,10 +228,10 @@ def bare_id_present(referent: Referent, fact: str | None) -> bool:
     of, and was therefore vacuous.
 
     WHY IT IS NEEDED. ``scan_content`` is documented "precision over recall",
-    and two of its blind spots bite this detector specifically: the bare-hash
-    spelling ('#4262') and the hyphen spelling ('task-1836'). Both are cases
-    where the fact DOES name the endpoint and the shared scanner cannot see
-    it, so without this check the endpoint would be flagged as mis-bound —
+    and one of its blind spots bites this detector specifically: the bare-hash
+    spelling ('#4262'). The hyphen spelling ('task-1836') has been seen since
+    task 6059. '#4262' is a case where the fact DOES name the endpoint and the
+    shared scanner cannot see it, so without this check the endpoint would be flagged as mis-bound —
     a false positive in exactly the direction that costs a reader time. The
     fix is NOT to widen ``canonical_labels`` (that module is on the live
     memory write path; a survey's convenience must not change what the
@@ -255,8 +253,8 @@ def bare_id_present(referent: Referent, fact: str | None) -> bool:
     invisible in every count the artifact publishes. A digit run joined to
     ANOTHER digit run by one of :data:`_COMPOUND_SEPARATORS` is therefore
     part of a larger number, not a reference, and does not suppress. The
-    spellings this function exists for survive it: '#4262' and 'task-1836'
-    are each preceded by a NON-digit, so neither lookaround fires.
+    spelling this function exists for survives it: '#4262' is preceded by a
+    NON-digit, so neither lookaround fires.
 
     WHAT IT STILL CANNOT SEE, stated because the report has to publish the
     bound rather than imply it does not exist: the check is CONTEXT-FREE, by
@@ -1055,8 +1053,8 @@ CAVEATS: tuple[str, ...] = (
     'BOUND on Class A.',
     'DETECTION BOUND, SUPPRESSION: an endpoint whose bare digits appear as a '
     'standalone run in the fact is treated as NAMED and never flagged — the '
-    'backstop absorbing the shared scanner\'s "#4262" and "task-1836" blind '
-    'spots. Digit runs joined to another digit run by -:./ are excluded, so '
+    'backstop absorbing the shared scanner\'s "#4262" blind spot. Digit runs '
+    'joined to another digit run by -:./ are excluded, so '
     'an ISO timestamp ("2026-05-09T17:09") no longer suppresses an endpoint '
     '"Task 2026" or "Task 17". The check is still CONTEXT-FREE by design '
     '(requiring a preceding "task"/"#" would be a second vocabulary), so a '
