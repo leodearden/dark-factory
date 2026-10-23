@@ -859,6 +859,7 @@ class TestCancellation:
         await _cancel_mid_verify(h, transport.reached)
 
         assert transport.log == ['push', 'cancel_verify']
+        assert transport.argvs[0][-1] == f'{h.tip}:refs/merge-verify/req1'
         _assert_slot_free(h)
         assert h.sidecars() == []
         assert h.local.calls == []

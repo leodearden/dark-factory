@@ -29,7 +29,7 @@ a §4 design decision.
    edit could never have been δ1's.
 2. **Rows 9, 12 and 13 named halves produced downstream of γ.** The RU-tracker half of rows 9
    and 12 needs δ1's public tracker entry. The `SOFT_CANCELLED` workflow outcome in row 13
-   needs δ2's workflow wiring. **Resolution:** γ asserts the `on_unavailable(name, kind)`
+   needs δ2's workflow wiring. **Resolution:** γ asserts the `on_unavailable(name, exc)`
    hook call and the dispatcher-side cancel-before-unwind order. δ1 asserts the tracker half
    of row 9. ι executes all three rows end to end.
 3. **Row 3 spans two producers.** The fake-ssh `rc ≠ 0 → RunnerUnavailable(kind='transport')`

@@ -94,7 +94,7 @@ Numbered; each names the heuristic or ruling it turns on.
 
 11. **Pressure hold (phase 2, η).** The one load-shaped lever Leo allows: a binary hold for task legs only — `verify_task_remote_pressure_hold: {cpu_some_avg10: float, probe_interval_secs: float, max_age_secs: float}` (null = off). `acquire_for_task` is synchronous, and `RemoteRunner.health()` is `ssh host true` run only by the reprobe sweep, so the reading needs a producer: a `verify_hosts.py` probe loop refreshes a cached `PressureReading(value, read_at)` per remote host on the static interval (`ssh host cat /proc/pressure/cpu`). `acquire_for_task` compares the cached `some avg10` against the static threshold: above → `Refusal('pressure_hold')`; absent or older than `max_age_secs` → no hold, recorded as `pressure_hold_stale` (fail-open, INV-11). A static threshold on a static-cadence reading is the allowed binary shape; it never derives a count and never applies to merge legs. η is filed `deferred` at decompose, flipped only by ε's step 6 if the report shows overload (F11 of the critic pass: a status dependency would auto-dispatch it on ε's completion regardless of the evidence).
 
-12. **Placement (heuristics 9, 13, 14).** New files: `orchestrator/src/orchestrator/task_verify_spec.py` (spec, codec, rebuild), `verify_hosts.py` (runner construction, `HostPool`, `MergeDemand`), `task_verify_dispatch.py` (the dispatcher and `TaskVerifyPort`). Each reads in isolation: `task_verify_spec` imports downward from `verify_runner` (`VerifyCommand`, codec helpers) and `config`; `verify_hosts` imports `verify_runner` (`HostAllocator`, `RemoteRunner`, `resolve_local_df_checkout`); `task_verify_dispatch` imports both plus `verify` and `git_ops`. None imports `merge_lane.*` or `workflow`. `workflow.py` imports `task_verify_dispatch` for the `TaskVerifyPort` type only; the default port stays the module-level `run_scoped_verification` so an un-injected workflow is byte-identical and every existing `patch('orchestrator.workflow.run_scoped_verification')` keeps working.
+12. **Placement (heuristics 9, 13, 14).** New files: `orchestrator/src/orchestrator/task_verify_spec.py` (spec, codec, rebuild), `verify_hosts.py` (runner construction, `HostPool`, `MergeDemand`), `task_verify_dispatch.py` (the dispatcher and `TaskVerifyPort`). Each reads in isolation: `task_verify_spec` imports downward from `verify_runner` (`VerifyCommand`, codec helpers) and `config`; `verify_hosts` imports `verify_runner` (`HostAllocator`, `RemoteRunner`, `RunnerUnavailable`) and `deployed_sha` (`resolve_code_checkout`); `task_verify_dispatch` imports both plus `verify` and `git_ops`. None imports `merge_lane.*` or `workflow`. `workflow.py` imports `task_verify_dispatch` for the `TaskVerifyPort` type only; the default port stays the module-level `run_scoped_verification` so an un-injected workflow is byte-identical and every existing `patch('orchestrator.workflow.run_scoped_verification')` keeps working.
 
 13. **Hub-file carry chain.** α, β, γ touch no hub file and are dispatchable. δ1 (`harness.py` + `merge_lane/worker.py`) and δ2 (`config.py` + `workflow.py`) are hand-carries, chained δ1 → δ2. `worker.py` cannot grow in lines without `--authorize-raise` (merge-lane ratchet); `build_workflow` has a keyword-set tripwire (`test_workflow_factory.py::_BUILD_WORKFLOW_PARAMS`). δ2 waits for 6580 so there is exactly one task-role call site to route and the two `workflow.py` edits do not collide.
 
@@ -134,7 +134,7 @@ async def _dispatch(self, sha: str, subcommand: Literal['verify-merge', 'verify-
     # result_from_json; RunnerUnavailable on rc != 0 / unparseable / no-verdict summary; delete ref; clear inflight.
     # Raises if _inflight_request_id is already set (exclusive-use invariant).
 async def run_merge_verify(...)   # unchanged signature; main-mirror push + _dispatch('verify-merge') + merge archiving
-async def run_task_verify(self, spec: TaskVerifySpec, *, task_id: str, archive_root: Path | None) -> VerifyResult
+async def run_task_verify(self, spec: TaskVerifySpec, *, task_id: str, archive_root: Path | None, event_store=None) -> VerifyResult
     # _dispatch('verify-task') + archive: red → attempt-{spec.attempt_id}.remote-<name>.{test,lint,type}-<stamp>.log
     # + .summary-<stamp>.json; green → .pass-summary-<stamp>.json; sets result.archive_log_paths to those files.
 class RunnerUnavailable(Exception): kind: Literal['transport', 'unparseable', 'no_verdict', 'wire_shape']
@@ -153,7 +153,7 @@ Shared prologue (extracted from `verify_merge`): `load_config`, `GitOps`, pgid f
 ### 5.4 `orchestrator/src/orchestrator/verify_hosts.py`
 
 ```python
-def build_remote_runners(config, cwd, *, quarantine: set[str] | None = None) -> list[RemoteRunner]   # moved verbatim from merge_lane/drift.py
+def build_remote_runners(config, cwd, *, deployed_sha: DeployedSha, quarantine: set[str] | None = None) -> list[RemoteRunner]   # moved from merge_lane/drift.py (6565 added deployed_sha)
 MergeDemand = Callable[[], bool]
 
 @dataclass(frozen=True)
@@ -167,7 +167,7 @@ class HostPool:
     def acquire_for_task(self, task_id: str) -> HostLease | Refusal
         # remote only; records the hold under task_id; `host_parked` when the only remote is PARKED (HostAllocator.is_parked)
     async def release(self, lease) -> None
-    async def cancel_and_release(self, lease) -> bool          # delegate; drop the hold record either way
+    async def cancel_and_release(self, lease, *, unwind=None) -> bool   # delegate; unwind runs after the host-side cancel, before the slot frees; drop the hold record either way
     def mark_unavailable(self, lease, exc: RunnerUnavailable) -> None  # on_unavailable(name, exc): the merge lane's RU tracker, never a bare quarantine
     def holders(self) -> Mapping[str, str]                    # {host: 'task:<id>'}
 ```
@@ -199,7 +199,7 @@ class DispatchDecision:
     tip_sha: str | None; base_sha: str | None; remote_wall_secs: float | None; lease_held_secs: float | None
     cross_check: CrossCheck | None; red_confirmed_locally: RedConfirmation | None
 
-def eligible(policy: TaskVerifyPolicy, executed_prefixes: Iterable[str], *, force_workspace, per_module_env_present: bool) -> bool   # pure; the static leg class
+def eligible(policy: TaskVerifyPolicy, executed_prefixes: Iterable[str], *, force_workspace, per_module_overrides_present: bool) -> bool   # pure; the static leg class
 ```
 
 Ordering, as in §4.7, inside one `try/finally` that releases the lease on every exit. The dispatcher writes its own sidecar `attempt-N.dispatch-<stamp>.json` under `archive_root/<task_id>/` (nothing when policy is `local`); it never edits files other modules write. The policy is read per call, as `policy_of(config)` on that call's `config`, so a hot-reloaded policy reaches the next dispatch and never a running one.
