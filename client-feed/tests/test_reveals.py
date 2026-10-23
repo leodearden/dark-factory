@@ -450,6 +450,42 @@ def test_b17_a_changed_file_is_charged_its_lines_since_delivery_not_its_lines_at
     assert newest_tree(project).budget.spent_lines == 60
 
 
+def cursor_of(project: Project) -> Cursor:
+    return Cursor.model_validate_json((project.out_dir / CURSOR_FILENAME).read_text())
+
+
+def test_b17_the_cursor_carries_each_changed_blob_pairs_added_lines(tmp_path: Path) -> None:
+    project = _delivered_project(tmp_path, proportion=0.25)
+    repo = project.repo
+
+    project.run()
+
+    counts = cursor_of(project).added_line_counts
+    assert counts is not None
+    assert counts.by_blob_pair == {repo.rev('main~1:src/a.py'): {repo.rev('main:src/a.py'): 60}}
+
+
+def test_b17_a_later_pass_charges_a_carried_blob_pair_without_diffing_it_again(
+    tmp_path: Path,
+) -> None:
+    project = _delivered_project(tmp_path, proportion=0.25)
+    repo = project.repo
+    project.run(minutes=60)
+    cursor = cursor_of(project)
+    planted = {repo.rev('main~1:src/a.py'): {repo.rev('main:src/a.py'): 100}}
+    assert cursor.added_line_counts is not None
+    carried = cursor.added_line_counts.model_copy(update={'by_blob_pair': planted})
+    (project.out_dir / CURSOR_FILENAME).write_text(
+        cursor.model_copy(update={'added_line_counts': carried}).model_dump_json()
+    )
+    repo.write('src/b.py', numbered('b', 210) + numbered('more', 5))
+    repo.commit('c3', when=at(20))
+
+    project.run(minutes=61)
+
+    assert newest_tree(project).budget.counted_lines == 100 + 30 + 5
+
+
 FOLLOWED = ('src/a.py', 'src/b.py', 'src/c.py', 'src/f.py')
 FOLLOW_FILES: Mapping[str, str | bytes] = {
     **{path: numbered(Path(path).stem, 20) for path in FOLLOWED},

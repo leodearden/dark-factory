@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from _git_repo import Repo, make_repo
 
-from client_feed.budget import Granted, counted_set, judge, lines_since
+from client_feed.budget import AddedLineCounts, Granted, counted_set, judge, lines_since
 from client_feed.contract import FileKind, RefusalReason, RevealBudget, TreeFile
 from client_feed.policy import Policy
 from client_feed.sources.git import EntryKind, TreeEntry
@@ -153,7 +153,7 @@ def test_b17_only_lines_added_or_changed_since_delivery_are_counted(
     repo, policy, c1, c2 = delivered_repo
     files = visible_tree(repo.root, policy, c2, previous=None, line_counts=None).files
 
-    since = lines_since(repo.root, policy, files, delivered=c1, head=c2)
+    since = lines_since(repo.root, policy, files, delivered=c1, head=c2, cached=None).by_path
     counted = counted_set(policy, files, since=since)
 
     assert since['src/long.py'] == 3
@@ -166,6 +166,51 @@ def test_b17_only_lines_added_or_changed_since_delivery_are_counted(
     for outside in ('src/same.py', 'src/blank.py', 'src/moved.py', 'tests/test_new.py'):
         assert counted.cost(outside) == 0
     assert counted.cost('src/long.py') == 50
+
+
+def _long_pair(repo: Repo, c1: str, c2: str) -> tuple[str, str]:
+    return repo.rev(f'{c1}:src/long.py'), repo.rev(f'{c2}:src/long.py')
+
+
+def test_lines_since_carries_the_count_of_each_blob_pair_it_diffed(
+    delivered_repo: tuple[Repo, Policy, str, str],
+) -> None:
+    repo, policy, c1, c2 = delivered_repo
+    files = visible_tree(repo.root, policy, c2, previous=None, line_counts=None).files
+    old, new = _long_pair(repo, c1, c2)
+
+    counts = lines_since(repo.root, policy, files, delivered=c1, head=c2, cached=None).counts
+
+    assert counts.max_line_bytes == 40
+    assert counts.by_blob_pair[old] == {new: 3}
+
+
+def test_a_blob_pair_counted_under_the_same_max_line_bytes_is_not_diffed_again(
+    delivered_repo: tuple[Repo, Policy, str, str],
+) -> None:
+    repo, policy, c1, c2 = delivered_repo
+    files = visible_tree(repo.root, policy, c2, previous=None, line_counts=None).files
+    old, new = _long_pair(repo, c1, c2)
+    cached = AddedLineCounts(max_line_bytes=40, by_blob_pair={old: {new: 99}, 'f' * 40: {'e' * 40: 5}})
+
+    since = lines_since(repo.root, policy, files, delivered=c1, head=c2, cached=cached)
+
+    assert since.by_path['src/long.py'] == 99
+    assert since.counts.by_blob_pair[old] == {new: 99}
+    assert 'f' * 40 not in since.counts.by_blob_pair
+
+
+def test_a_blob_pair_counted_under_another_max_line_bytes_is_counted_again(
+    delivered_repo: tuple[Repo, Policy, str, str],
+) -> None:
+    repo, policy, c1, c2 = delivered_repo
+    files = visible_tree(repo.root, policy, c2, previous=None, line_counts=None).files
+    old, new = _long_pair(repo, c1, c2)
+    cached = AddedLineCounts(max_line_bytes=400, by_blob_pair={old: {new: 99}})
+
+    since = lines_since(repo.root, policy, files, delivered=c1, head=c2, cached=cached)
+
+    assert since.by_path['src/long.py'] == 3
 
 
 JUDGE_POLICY = policy_of(never_reveal_globs=['src/secret/**'])

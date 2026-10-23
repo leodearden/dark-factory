@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from client_feed.budget import CountedSet, Granted, counted_set, judge, lines_since
+from client_feed.budget import AddedLineCounts, CountedSet, Granted, counted_set, judge, lines_since
 from client_feed.contract import (
     FEED_VERSION,
     EngagementProjection,
@@ -59,12 +59,13 @@ def answered_in(lines: Iterable[FeedLine]) -> Counter[AnswerIdentity]:
 
 @dataclass(frozen=True)
 class RevealOutput:
-    """One pass's reveal events, the budget after them, and the positions they answered through."""
+    """One pass's reveal events, the budget after them, the positions they answered through, and the added-line counts to carry."""
 
     events: tuple[Answer, ...]
     budget: RevealBudget
     inbox_offset: int
     reveals_head: str
+    added_line_counts: AddedLineCounts | None
 
 
 @dataclass(frozen=True)
@@ -216,14 +217,20 @@ def _answer(request: RevealRequested, at_head: _Head, revealed: set[str]) -> _Un
 
 
 def _counted(
-    root: Path, policy: Policy, files: Sequence[TreeFile], engagement: EngagementProjection, head: str
-) -> CountedSet:
+    root: Path,
+    policy: Policy,
+    files: Sequence[TreeFile],
+    engagement: EngagementProjection,
+    *,
+    head: str,
+    cached: AddedLineCounts | None,
+) -> tuple[CountedSet, AddedLineCounts | None]:
+    """The counted set at head, and with a delivered commit the added-line counts it was charged by."""
     delivered = engagement.delivered_commit
     if delivered is None:
-        return counted_set(policy, files)
-    return counted_set(
-        policy, files, since=lines_since(root, policy, files, delivered=delivered, head=head)
-    )
+        return counted_set(policy, files), None
+    since = lines_since(root, policy, files, delivered=delivered, head=head, cached=cached)
+    return counted_set(policy, files, since=since.by_path), since.counts
 
 
 def _unanswered(
@@ -259,14 +266,18 @@ def reveal_events(
     requests: Sequence[RevealRequested],
     inbox_offset: int,
     answered: Counter[AnswerIdentity],
+    added_line_counts: AddedLineCounts | None,
     stamp: Stamp,
     now: datetime,
 ) -> RevealOutput:
     """Every revealed file followed from `since` to head, then each request answered in inbox order; the budget is what is spent after them.
 
-    An answer already in `answered`, the uncommitted tail, is consumed there instead of emitted again.
+    An answer already in `answered`, the uncommitted tail, is consumed there instead of emitted again. A blob
+    pair `added_line_counts` already counted is not diffed again.
     """
-    counted = _counted(root, policy, files, engagement, head)
+    counted, counts = _counted(
+        root, policy, files, engagement, head=head, cached=added_line_counts
+    )
     revealed = {file.path for file in state.revealed}
     tracks = _tracks(root, state.revealed, since=since, head=head)
     with blob_reader(root) as read:
@@ -284,4 +295,5 @@ def reveal_events(
         budget=counted.budget(revealed),
         inbox_offset=inbox_offset,
         reveals_head=head,
+        added_line_counts=counts,
     )

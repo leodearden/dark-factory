@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final
 
-from client_feed.contract import FileKind, RefusalReason, RevealBudget, TreeFile
-from client_feed.policy import Policy, matches_any
+from pydantic import BaseModel, ConfigDict
+
+from client_feed.contract import FileKind, NonNegativeInt, RefusalReason, RevealBudget, TreeFile
+from client_feed.policy import Policy, PositiveInt, matches_any
 from client_feed.sources.git import EntryKind, PathChange, TreeEntry, added_lines, tree_changes
 
 _LINKED_KINDS: Final = frozenset({EntryKind.SYMLINK, EntryKind.SUBMODULE})
@@ -33,11 +35,11 @@ class CountedSet:
             floor_lines=policy.reveal_floor_lines,
         )
 
-    @property
+    @functools.cached_property
     def counted_lines(self) -> int:
         return sum(self.lines.values())
 
-    @property
+    @functools.cached_property
     def budget_lines(self) -> int:
         return math.floor(self.proportion * self.counted_lines)
 
@@ -63,38 +65,100 @@ class CountedSet:
         )
 
 
+def _countable(policy: Policy, files: Sequence[TreeFile]) -> Iterator[TreeFile]:
+    """The production files outside the free and never-reveal globs."""
+    uncounted = (*policy.free_globs, *policy.never_reveal_globs)
+    return (
+        file
+        for file in files
+        if file.kind is FileKind.PRODUCTION and not matches_any(uncounted, file.path)
+    )
+
+
 def counted_set(
     policy: Policy, files: Sequence[TreeFile], *, since: Mapping[str, int] | None = None
 ) -> CountedSet:
     """Production files outside the free and never-reveal globs, charged their lines, or with `since` their lines since delivery."""
-    uncounted = (*policy.free_globs, *policy.never_reveal_globs)
     chargeable = {
         file.path: file.lines if since is None else since.get(file.path, 0)
-        for file in files
-        if file.kind is FileKind.PRODUCTION and not matches_any(uncounted, file.path)
+        for file in _countable(policy, files)
     }
     return CountedSet.of(policy, {path: lines for path, lines in chargeable.items() if lines > 0})
 
 
-def _lines_changed(root: Path, policy: Policy, change: PathChange, file: TreeFile) -> int:
+class AddedLineCounts(BaseModel):
+    """Counted lines a new blob adds or changes against an old one, by old then new blob sha.
+
+    Valid only under the max_line_bytes they were counted with.
+    """
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    max_line_bytes: PositiveInt
+    by_blob_pair: dict[str, dict[str, NonNegativeInt]]
+
+    def lines_of(self, old: str, new: str) -> int:
+        return self.by_blob_pair[old][new]
+
+
+@dataclass(frozen=True)
+class LinesSince:
+    """Each counted file changed since delivery with the lines it added or changed, and the counts to carry to the next pass."""
+
+    by_path: Mapping[str, int]
+    counts: AddedLineCounts
+
+
+def _diffed_pair(change: PathChange) -> tuple[str, str] | None:
+    """The old and new blob a changed file is charged by; None when the path held no file before, so every line is new."""
     if change.old_kind is not EntryKind.FILE or change.old_blob is None or change.new_blob is None:
-        return file.lines
-    if change.old_blob == change.new_blob:
-        return 0
-    return policy.counted_lines(added_lines(root, change.old_blob, change.new_blob))
+        return None
+    return change.old_blob, change.new_blob
+
+
+def _added_line_counts(
+    root: Path, policy: Policy, pairs: Collection[tuple[str, str]], cached: AddedLineCounts | None
+) -> AddedLineCounts:
+    """Each pair's counted added lines: from `cached` when it was counted under this max_line_bytes, else diffed now."""
+    known = {} if cached is None or cached.max_line_bytes != policy.max_line_bytes else cached.by_blob_pair
+    by_blob_pair: dict[str, dict[str, int]] = {}
+    for old, new in sorted(pairs):
+        lines = known.get(old, {}).get(new)
+        if lines is None:
+            lines = 0 if old == new else policy.counted_lines(added_lines(root, old, new))
+        by_blob_pair.setdefault(old, {})[new] = lines
+    return AddedLineCounts(max_line_bytes=policy.max_line_bytes, by_blob_pair=by_blob_pair)
 
 
 def lines_since(
-    root: Path, policy: Policy, files: Sequence[TreeFile], *, delivered: str, head: str
-) -> dict[str, int]:
-    """Each file of `files` that changed since `delivered`, with the counted lines it added or changed; a pure rename adds none."""
-    by_path = {file.path: file for file in files}
-    since: dict[str, int] = {}
+    root: Path,
+    policy: Policy,
+    files: Sequence[TreeFile],
+    *,
+    delivered: str,
+    head: str,
+    cached: AddedLineCounts | None,
+) -> LinesSince:
+    """Each countable file of `files` changed since `delivered`, with the counted lines it added or changed.
+
+    A file added since is charged all its lines and a pure rename none; a blob pair `cached` already counted is not diffed again.
+    """
+    by_path = {file.path: file for file in _countable(policy, files)}
+    changed: list[tuple[TreeFile, tuple[str, str] | None]] = []
     for change in tree_changes(root, delivered, head):
         file = None if change.new_path is None else by_path.get(change.new_path)
         if file is not None:
-            since[file.path] = _lines_changed(root, policy, change, file)
-    return since
+            changed.append((file, _diffed_pair(change)))
+    counts = _added_line_counts(
+        root, policy, {pair for _, pair in changed if pair is not None}, cached
+    )
+    return LinesSince(
+        by_path={
+            file.path: file.lines if pair is None else counts.lines_of(*pair)
+            for file, pair in changed
+        },
+        counts=counts,
+    )
 
 
 @dataclass(frozen=True)

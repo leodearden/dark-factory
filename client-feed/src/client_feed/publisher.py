@@ -336,6 +336,7 @@ def _reveal_unit(
             requests=() if inbox is None else inbox.requests,
             inbox_offset=cursor.inbox_offset if inbox is None else inbox.offset,
             answered=answered,
+            added_line_counts=cursor.added_line_counts,
             stamp=stamp,
             now=now,
         ),
@@ -372,7 +373,8 @@ def _advanced(
 ) -> Cursor:
     """Each source position past what this pass read, where its unit succeeded; head and line counts move with the tree.
 
-    The inbox offset and reveals_head move with a reveal unit that ran; an inbox read holding no request moves its offset alone.
+    The inbox offset, reveals_head and added-line counts move with a reveal unit that ran; an inbox read holding no
+    request moves its offset alone.
     """
     update: dict[str, object] = {}
     if events_id is not None:
@@ -382,7 +384,11 @@ def _advanced(
     if tree is not None:
         update |= {'head': tree.commit, 'line_counts': tree.line_counts}
     if reveals is not None:
-        update |= {'inbox_offset': reveals.inbox_offset, 'reveals_head': reveals.reveals_head}
+        update |= {
+            'inbox_offset': reveals.inbox_offset,
+            'reveals_head': reveals.reveals_head,
+            'added_line_counts': reveals.added_line_counts,
+        }
     elif inbox is not None and not inbox.requests:
         update['inbox_offset'] = inbox.offset
     return cursor.model_copy(update=update)
