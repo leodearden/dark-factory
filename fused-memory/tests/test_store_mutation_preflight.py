@@ -24,10 +24,12 @@ seam is patched instead).
 from __future__ import annotations
 
 import errno
+import logging
 import os
 from pathlib import Path
 
 import pytest
+from _store_mutation_preflight_contract import fail_closed_records
 
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
@@ -164,6 +166,128 @@ class TestAssertStoreMutationAllowed:
 
         assert str(missing) in str(excinfo.value)
         assert isinstance(excinfo.value.__cause__, OSError)
+
+
+_CALLER_LOGGER = 'store_mutation_preflight_caller_probe'
+
+
+def _caller_logger() -> logging.Logger:
+    return logging.getLogger(_CALLER_LOGGER)
+
+
+def _refuse(**kwargs) -> StoreMutationUnavailable:
+    """Run the guard against a denied probe and return what it raised."""
+    with pytest.raises(StoreMutationUnavailable) as excinfo:
+        assert_store_mutation_allowed(**kwargs)
+    return excinfo.value
+
+
+class TestRefusalRecord:
+    """Given the CALLER's logger, a refusal also emits the operator-facing record.
+
+    The guarded scripts used to wrap the guard in a hand-copied
+    ``except StoreMutationUnavailable: logger.error(...)`` arm, and the copies
+    drifted. The guard now composes that record once, through the logger the
+    caller passes, so the record can name what only the guard knows: the
+    directory it probed and the error the probe hit.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _hermetic_history_dir(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv('MEM0_DIR', str(tmp_path))
+        caplog.set_level(logging.DEBUG)
+
+    @pytest.fixture
+    def denied(self, monkeypatch):
+        monkeypatch.setattr(_CREATE_SEAM, _deny_creation)
+
+    @pytest.mark.usefixtures('denied')
+    def test_without_a_logger_a_refusal_raises_and_logs_nothing(self, caplog):
+        _refuse(operation='unit-test')
+
+        assert caplog.records == []
+
+    @pytest.mark.usefixtures('denied')
+    def test_with_a_logger_a_refusal_emits_one_record_through_the_callers_logger(
+        self, caplog
+    ):
+        _refuse(operation='unit-test', logger=_caller_logger())
+
+        assert len(fail_closed_records(caplog, _CALLER_LOGGER)) == 1
+        assert [rec.name for rec in caplog.records] == [_CALLER_LOGGER]
+
+    @pytest.mark.usefixtures('denied')
+    def test_the_record_names_the_operation_the_directory_and_the_cause(
+        self, tmp_path, caplog
+    ):
+        _refuse(operation='sweep_toolcall_xml_leak --apply', logger=_caller_logger())
+
+        (record,) = fail_closed_records(caplog, _CALLER_LOGGER)
+        message = record.getMessage()
+        assert 'sweep_toolcall_xml_leak --apply' in message
+        assert str(tmp_path) in message
+        assert 'Permission denied' in message
+
+    @pytest.mark.usefixtures('denied')
+    def test_extra_detail_is_carried_verbatim(self, caplog):
+        detail = 'the frobnicator would split in half, and nothing was frobbed'
+
+        _refuse(operation='unit-test', logger=_caller_logger(), extra_detail=detail)
+
+        (record,) = fail_closed_records(caplog, _CALLER_LOGGER)
+        assert detail in record.getMessage()
+
+    @pytest.mark.usefixtures('denied')
+    def test_an_omitted_extra_detail_leaks_no_placeholder(self, caplog):
+        _refuse(operation='unit-test', logger=_caller_logger(), extra_detail=None)
+
+        (record,) = fail_closed_records(caplog, _CALLER_LOGGER)
+        assert 'None' not in record.getMessage()
+
+    @pytest.mark.usefixtures('denied')
+    def test_the_raised_exception_is_unchanged_by_a_logger(self, tmp_path):
+        """Reporting never softens or rewrites the refusal itself."""
+        unlogged = _refuse(operation='sweep_toolcall_xml_leak --apply')
+        logged = _refuse(
+            operation='sweep_toolcall_xml_leak --apply',
+            logger=_caller_logger(),
+            extra_detail='nothing was swept',
+        )
+
+        assert type(logged) is type(unlogged)
+        assert str(logged) == str(unlogged)
+        message = str(logged)
+        assert str(tmp_path) in message
+        assert 'sweep_toolcall_xml_leak --apply' in message
+        assert 'Permission denied' in message
+        assert isinstance(logged.__cause__, PermissionError)
+
+    def test_a_permitted_probe_logs_nothing_even_with_a_logger(self, caplog):
+        result = assert_store_mutation_allowed(
+            operation='unit-test', logger=_caller_logger(), extra_detail='x'
+        )
+
+        assert result is None
+        assert caplog.records == []
+
+    def test_extra_detail_without_a_logger_is_refused_before_the_probe(
+        self, monkeypatch
+    ):
+        """Eager, not lazy: a lazy check on the refusal path would raise the
+        same ValueError here, because this probe is denied too -- only the
+        untouched recorder tells the two apart."""
+        probed: list[Path] = []
+
+        def _record_then_deny(path: Path) -> None:
+            probed.append(path)
+            _deny_creation()
+
+        monkeypatch.setattr(_CREATE_SEAM, _record_then_deny)
+
+        with pytest.raises(ValueError, match='extra_detail'):
+            assert_store_mutation_allowed(operation='unit-test', extra_detail='x')
+
+        assert probed == []
 
 
 class TestFailClosedPrecedent:
