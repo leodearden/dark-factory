@@ -2214,8 +2214,7 @@ were prose.
   "Deferring a task") exactly as stored, present if stored and absent if
   not; a stored blob that is corrupt or not a JSON object counts as
   storing none of them. Otherwise the call is refused and nothing is
-  written. Send those
-  keys back exactly as you read them
+  written. Send those keys back exactly as you read them
   (`sqlite_task_backend.py::_assert_passthrough_only_keys`,
   `sqlite_task_backend.py::_assert_deferral_unchanged`).
 - `title`, `description` and `priority` are replace-only. Combining any of
