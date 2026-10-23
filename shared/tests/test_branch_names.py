@@ -1,4 +1,4 @@
-"""Tests for shared.branch_names — canonical_queued_branch_name primitive.
+"""Tests for shared.branch_names — canonical_queued_branch_name and bare_queued_branch_id.
 
 Locks the "prepend branch_prefix unless branch already starts with it"
 shape-normalization rule shared by orchestrator's ``recover_pending_merges``
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.branch_names import canonical_queued_branch_name
+from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 
 
 class TestCanonicalQueuedBranchName:
@@ -36,3 +36,28 @@ class TestCanonicalQueuedBranchName:
     ) -> None:
         """canonical_queued_branch_name prepends branch_prefix unless already present."""
         assert canonical_queued_branch_name(branch, branch_prefix) == expected
+
+
+class TestBareQueuedBranchId:
+    @pytest.mark.parametrize(
+        'branch, branch_prefix, expected',
+        [
+            ('task/123', 'task/', '123'),
+            ('123', 'task/', '123'),
+            ('feature/x', 'task/', 'feature/x'),
+            ('task/x', '', 'task/x'),
+        ],
+    )
+    def test_bare_shape(
+        self, branch: str, branch_prefix: str, expected: str
+    ) -> None:
+        """bare_queued_branch_id strips branch_prefix when present and leaves any other name as is."""
+        assert bare_queued_branch_id(branch, branch_prefix) == expected
+
+    @pytest.mark.parametrize('branch', ['123', 'task/123', 'feature/x'])
+    def test_round_trips_through_the_canonical_name(self, branch: str) -> None:
+        """The bare id and the full ref name the same queued branch."""
+        prefix = 'task/'
+        assert canonical_queued_branch_name(
+            bare_queued_branch_id(branch, prefix), prefix
+        ) == canonical_queued_branch_name(branch, prefix)
