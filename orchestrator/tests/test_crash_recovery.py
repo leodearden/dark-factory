@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2650,6 +2650,10 @@ def _stale_lock(root: Path) -> Path:
     return lock_path
 
 
+def _cleanup_worktree_mock(harness: Harness) -> AsyncMock:
+    return cast(AsyncMock, harness.git_ops.cleanup_worktree)
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 2376: heavy class
 class TestRecoveryReadsTheTaskRoot:
@@ -2667,7 +2671,7 @@ class TestRecoveryReadsTheTaskRoot:
         assert len(harness._recovered_plans['35']['steps']) == 5
         assert not lock_path.exists()
         assert wt.exists()
-        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        _cleanup_worktree_mock(harness).assert_not_called()
 
     async def test_cold_worktree_stamped_zero_completed_task_root_plan_is_preserved(
         self, harness: Harness,
@@ -2684,7 +2688,7 @@ class TestRecoveryReadsTheTaskRoot:
         assert '38' in harness._preserved_worktrees
         assert '38' not in harness._recovered_plans
         assert not lock_path.exists()
-        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        _cleanup_worktree_mock(harness).assert_not_called()
 
     async def test_recordless_lane_takes_its_task_id_from_lane_metadata(
         self, harness: Harness,
@@ -2699,7 +2703,7 @@ class TestRecoveryReadsTheTaskRoot:
 
         assert '42' in harness._recovered_plans
         assert '_lane-0' not in harness._recovered_plans
-        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        _cleanup_worktree_mock(harness).assert_not_called()
 
     async def test_record_adopted_lane_reads_its_plan_from_the_task_root(
         self, harness: Harness,
@@ -2734,7 +2738,7 @@ class TestRecoveryReadsTheTaskRoot:
         await harness._recover_crashed_tasks()
 
         assert harness._recovered_plans == {}
-        harness.git_ops.cleanup_worktree.assert_called_once_with(lane, '_lane-0')  # type: ignore[attr-defined]
+        _cleanup_worktree_mock(harness).assert_called_once_with(lane, '_lane-0')
 
 
 class TestSessionResumeReasons:
