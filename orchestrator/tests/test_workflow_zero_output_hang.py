@@ -628,8 +628,8 @@ class TestCaptureEvidenceLoopWiring:
         )
         _stub_iteration_helpers(wf, _zero_output_agent_result())
         # Wire up a real TaskConfigDir so _capture_zero_output_evidence can write
-        from shared.config_dir import TaskConfigDir as _TCD
-        wf._config_dir = _TCD(wf.task_id, base_dir=wf.artifacts.lane_root)  # type: ignore[attr-defined]
+        assert wf.artifacts is not None
+        wf._config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
 
         outcome = await wf._execute_iterations()
 
