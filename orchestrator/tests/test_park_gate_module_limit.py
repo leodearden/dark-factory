@@ -1,11 +1,17 @@
 """The park gate honours the module limit (task 7313).
 
 A park on a key takes one of that key's ``_limit_for`` slots instead of
-reserving it exclusively.  A rank-blocking park refuses a request only once
-the occupants — the foreign holders plus the blocking park owners, each task
-counted once — fill ``min(limit of the requested key, limit of the parked
-key)``.  Wherever a limit of 1 appears that minimum is 1, so a limit-1 park
-stays exclusive, hierarchical cases included.
+reserving it exclusively.  A rank-blocking park (owner o, key K) refuses a
+request on M when either term fires:
+
+- the hold term: counting the park owners as holders, M is at its limit —
+  ``|foreign holders conflicting with M ∪ blocking park owners| >=
+  _limit_for(M)``;
+- the owner's-slot term: granting the request would leave o no slot on K —
+  ``|foreign holders conflicting with K ∪ {o}| >= _limit_for(K)``.
+
+A limit of 1 on either key still makes the park exclusive, hierarchical cases
+included.
 
 Every assertion goes through the lock table's public seams.
 """
@@ -165,6 +171,52 @@ def test_the_rule_follows_max_per_module_without_any_override():
     assert table.try_acquire('C', ['pkg/m.py'])
     assert table.park_owners_blocking('D', ['pkg/m.py']) == ['P']
     assert not table.try_acquire('D', ['pkg/m.py'])
+
+
+def _two_slot_table() -> ModuleLockTable:
+    """lock_depth 3, no overrides: every key has 2 slots."""
+    return ModuleLockTable(OrchestratorConfig(
+        max_per_module=2, lock_depth=3, module_overrides={},
+    ))
+
+
+class TestAWidenedAncestorPark:
+    def test_a_sibling_holder_leaves_the_parent_park_its_last_slot(self):
+        table = _two_slot_table()
+        table.install_parks('P', ['pkg'], 'medium')
+        _acquire_all(table, ['H1'], 'pkg/a.py')
+
+        assert table.park_owners_blocking('C', ['pkg/b.py']) == ['P']
+        assert _parked_owners(table, 'C', 'pkg/b.py') == {'P'}
+        assert not table.try_acquire('C', ['pkg/b.py'])
+        assert table.try_acquire('P', ['pkg']), 'the park kept its slot'
+
+    def test_without_the_sibling_holder_the_child_and_the_owner_both_fit(self):
+        table = _two_slot_table()
+        table.install_parks('P', ['pkg'], 'medium')
+
+        assert table.try_acquire('C', ['pkg/b.py'])
+        assert table.try_acquire('P', ['pkg'])
+
+    def test_admission_borrows_through_the_named_ancestor_park(self):
+        table = _two_slot_table()
+        table.install_parks('P', ['pkg'], 'medium')
+        _acquire_all(table, ['H1'], 'pkg/a.py')
+
+        admitted = frozenset(table.park_owners_blocking('C', ['pkg/b.py']))
+        assert table.try_acquire('C', ['pkg/b.py'], admitted_parks=admitted)
+
+
+def test_a_child_park_does_not_refuse_a_parent_that_has_room():
+    table = ModuleLockTable(OrchestratorConfig(
+        max_per_module=1, lock_depth=3,
+        module_overrides={'pkg': 3, 'pkg/a.py': 2, 'pkg/b.py': 2},
+    ))
+    table.install_parks('P', ['pkg/a.py'], 'medium')
+    _acquire_all(table, ['H1'], 'pkg/b.py')
+
+    assert table.try_acquire('C', ['pkg'])
+    assert table.try_acquire('P', ['pkg/a.py'])
 
 
 def _scheduler(module_overrides: dict[str, int]) -> tuple[Scheduler, _RecordingEventStore]:
