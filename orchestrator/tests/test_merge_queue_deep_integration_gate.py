@@ -175,8 +175,6 @@ elsewhere, or original to this file:
   _make_worker                   | a gate variant defaulting to the production
                                  |   ``VerifyPort`` (task 5028); deep_landing's
                                  |   builds a fake-verified lane by design.
-  _fail_verify_result,           | gate-only since deep_landing dropped its
-  _spy_post_merge_verify         |   copies (task 5033).
   _finalized_rows                | the original sqlite reader; deep_landing's
                                  |   delegates to its own ``_event_rows``.
   -------------------------------+-------------------------------------------
@@ -296,6 +294,7 @@ from _merge_deep_scene import (
     _drain_residue,
     _ephemeral_merge_wt,
     _events_for_task,
+    _fail_verify_result,
     _local_lease,
     _make_config,
     _make_git_ops,
@@ -308,6 +307,7 @@ from _merge_deep_scene import (
     _shared_txt_with,
     _spy_advance_main,
     _spy_chain_lane_release,
+    _StubRemoteAllocator,
     git_repo,  # noqa: F401 — pytest fixture used by name, resolved from the shared deep scene
 )
 from _merge_lane_census import lanes_by_task, queued_in_lane
@@ -415,16 +415,6 @@ def _conflicting_branch_content(
 # ── verify verdicts ──────────────────────────────────────────────────────────
 
 
-def _fail_verify_result():
-    """A failing :class:`VerifyResult` — a RED tip verdict."""
-    from orchestrator.verify import VerifyResult
-
-    return VerifyResult(
-        passed=False, test_output='tip is red', lint_output='', type_output='',
-        summary='fail', category='',
-    )
-
-
 def _timed_out_verify_result():
     """A :class:`VerifyResult` that TIMED OUT — a red that names no culprit.
 
@@ -523,44 +513,6 @@ def _verdict_from_tree(bad_file: str):
 
 
 # ── dispatch-scene spies ─────────────────────────────────────────────────────
-
-
-def _spy_post_merge_verify(
-    monkeypatch, outcome=None, *, raises=None,
-    park: set[str] | None = None,
-    parked: asyncio.Event | None = None,
-) -> list[dict]:
-    """Replace ``_run_post_merge_verify`` with a recorder returning *outcome*.
-
-    ``outcome=None`` is a PASS in this function's vocabulary; a
-    :class:`VerifyResult` is a FAIL.  *raises* makes the verify blow up
-    instead, which is the third exit — the one that stays NON-adopting.
-
-    *park* names task ids whose verify NEVER RETURNS — the shape a live head
-    has while the speculative slot verifies the chain tip.  *parked*, when
-    given, is set the moment such a call is entered, so a test can wait for the
-    swap to have happened rather than sleeping for it.  The park is ONE-SHOT
-    per task id, deliberately.
-    """
-    calls: list[dict] = []
-    parked_once: set[str] = set()
-
-    async def _recording(git_ops, req, merge_wt, **kwargs):
-        calls.append({'task_id': req.task_id, 'merge_wt': merge_wt, **kwargs})
-        if park is not None and req.task_id in park and req.task_id not in parked_once:
-            parked_once.add(req.task_id)
-            if parked is not None:
-                parked.set()
-            # Never completes on its own: δ's teardown is what ends it.
-            await asyncio.Event().wait()
-        if raises is not None:
-            raise raises
-        return outcome
-
-    monkeypatch.setattr(
-        'orchestrator.merge_lane.worker._run_post_merge_verify', _recording,
-    )
-    return calls
 
 
 def _capture_verify_timeouts(monkeypatch) -> list[float]:
@@ -1468,59 +1420,6 @@ def _gate_followers(n: int, *, start: int = 102) -> tuple[str, ...]:
     construction, so a short chain can only ever be the code's doing.
     """
     return tuple(str(start + i) for i in range(n))
-
-
-class _StubRemoteAllocator:
-    """Minimal HostAllocator stand-in handing out ONE remote lease at a time.
-
-    REMOTE deliberately (cloned from test_merge_queue_deep_dispatch.py): a
-    remote lease makes ``_run_post_merge_verify`` build its pool from the
-    injected runner instead of a real ``LocalRunner``, so
-    ``VerifyRunnerPool.dispatch`` — the single ``merge_verify`` emission site —
-    genuinely runs and genuinely emits.  Stubbing ``_run_post_merge_verify``
-    wholesale (what ``remote=False`` does) emits no event at all and would make
-    every ``chain_items`` telemetry assertion vacuous.
-    """
-
-    def __init__(self, lease) -> None:
-        self._lease = lease
-        self._held = False
-
-    def free_host_count(self) -> int:
-        return 0 if self._held else 1
-
-    async def acquire(self, _local_factory, *, policy):
-        if self._held:
-            return None
-        self._held = True
-        return self._lease
-
-    async def release(self, _lease) -> None:
-        self._held = False
-
-    async def cancel_and_release(self, _lease) -> bool:
-        self._held = False
-        return True
-
-    # -- the read side `snapshot()` goes through --------------------------------
-    # Minimal, but not optional: `SpeculativeMergeWorker.snapshot()` reads
-    # `host_names` UNCONDITIONALLY for `occupancy.hosts_total`
-    # (merge_queue.py::SpeculativeMergeWorker.snapshot), so a stub without it
-    # makes the worker's own public observation surface unreadable on a remote
-    # scene -- an AttributeError from inside snapshot(), not a failed claim.
-    #
-    # `host_states()` is deliberately NOT provided: the `hosts` block is built
-    # by `_host_states_block`, whose first statement is
-    # `if not isinstance(self._host_allocator, HostAllocator): return []`.
-    # That gate is a TYPE check by design (its docstring: the doubles "answer
-    # every attribute, so hasattr/duck-typing would let them crash or inject
-    # garbage"), so for THIS duck-typed stub the block is `[]` whatever the
-    # stub offers -- and an assertion written against `hosts` here would be
-    # permanently vacuous.
-
-    @property
-    def host_names(self) -> list[str]:
-        return [self._lease.name]
 
 
 def _verify_rows(db_path: Path) -> list[dict]:

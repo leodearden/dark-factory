@@ -1074,7 +1074,7 @@
   },
   "tests": {
     "orchestrator/tests/_fill_drive_harness.py": {"patch_targets": [], "private_reads": 4},
-    "orchestrator/tests/_merge_deep_scene.py": {"patch_targets": ["worker.release_chain_build_lane"], "private_reads": 4},
+    "orchestrator/tests/_merge_deep_scene.py": {"patch_targets": ["worker._run_post_merge_verify", "worker.release_chain_build_lane"], "private_reads": 4},
     "orchestrator/tests/_merge_lane_census.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/_merge_lane_fakes.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/_merge_queue_doubles.py": {"patch_targets": [], "private_reads": 0},
