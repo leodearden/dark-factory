@@ -348,3 +348,73 @@ class TestResolverProbeFailuresNameTheTask:
             f'task_id={TASK} entry=docs/invented.md'
             in _record(caplog, 'history-probe git error')
         )
+
+
+@pytest.mark.asyncio
+class TestPlanFilesGateArms:
+    """Each classification arm of the plan-files gate settles its entry and moves on to the next."""
+
+    async def test_existing_directory_with_nothing_touched_beneath_is_flagged(
+        self, git_repo: Path, git_ops: GitOps,
+    ):
+        base = _commit(
+            git_repo,
+            {'pkg/mod/a.py': _module('a'), 'other/b.py': _module('b')},
+            'add two directories',
+        )
+        head = _commit(git_repo, {'other/b.py': _module('b edited')}, 'edit other')
+
+        result = await _check_plan_files_touched_in_branch(
+            ['pkg/mod', 'other'], base, head, git_ops, task_id=TASK,
+        )
+
+        assert result.not_touched == ['pkg/mod']
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {}
+
+    async def test_every_classified_entry_lets_later_entries_be_checked(
+        self, git_repo: Path, git_ops: GitOps, tmp_path: Path,
+        caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _commit(
+            git_repo,
+            {
+                'pkg/done.py': _module('done'),
+                'pkg/dir/inner.py': _module('inner'),
+                'pkg/broken.py': _module('broken'),
+                'pkg/idle.py': _module('idle'),
+                'pkg/stale_old.py': _module('stale'),
+                'pkg/zz_sentinel.py': _module('sentinel'),
+            },
+            'add one file per arm',
+        )
+        base = _mv(git_repo, 'pkg/stale_old.py', 'pkg/stale_new.py', 'rename stale')
+        head = _commit(
+            git_repo,
+            {
+                'pkg/done.py': _module('done edited'),
+                'pkg/dir/inner.py': _module('inner edited'),
+                'pkg/stale_new.py': _module('stale edited'),
+            },
+            'edit three',
+        )
+        _fail_git_argv(monkeypatch, tmp_path / 'bin', 'ls-tree * -- pkg/broken.py')
+
+        with caplog.at_level(logging.WARNING, logger=LANE_LOGGER):
+            result = await _check_plan_files_touched_in_branch(
+                [
+                    '',
+                    'pkg/done.py',
+                    'pkg/broken.py',
+                    'pkg/dir',
+                    'pkg/idle.py',
+                    'pkg/stale_old.py',
+                    'pkg/zz_sentinel.py',
+                ],
+                base, head, git_ops, task_id=TASK,
+            )
+
+        assert result.not_touched == ['pkg/broken.py', 'pkg/idle.py', 'pkg/zz_sentinel.py']
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {'pkg/stale_old.py': 'pkg/stale_new.py'}
+        assert 'entry=pkg/broken.py' in _record(caplog, 'ls-tree probe failed')
