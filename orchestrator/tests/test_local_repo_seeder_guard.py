@@ -47,7 +47,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_merge_item_union.py',
     'test_merge_lane_package.py',
     'test_merge_queue_bounce.py',
-    'test_merge_queue_build_chain.py',
     'test_merge_queue_c3_submit_identity.py',
     'test_merge_queue_chain_intact.py',
     'test_merge_queue_coalesce.py',
