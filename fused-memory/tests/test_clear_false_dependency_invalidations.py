@@ -181,9 +181,8 @@ class TestRunApplyStoreMutationPreflight:
         memory.update_edge.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment repairs exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         memory = self._memory()
 
         report = await _mod.repair(memory, project_id='know_live', apply=True)
@@ -229,7 +228,8 @@ class TestRunApplyStoreMutationPreflight:
 
         # The logger is ``clear_false_dep_invalidations``, NOT the module name --
         # filtering on the module name would match nothing and be vacuous.
-        assert fail_closed_records(caplog, 'clear_false_dep_invalidations'), (
+        (record,) = fail_closed_records(caplog, 'clear_false_dep_invalidations')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

@@ -6898,7 +6898,6 @@ class TestApplyStoreMutationPreflight:
         self, monkeypatch, tmp_path,
     ):
         """Happy path: a writable environment deletes exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         _install_run_doubles(monkeypatch, self._raw())
         args = _build_parser().parse_args([
             '--project-id', 'p', '--apply', '--threshold', '0.75',
@@ -7008,7 +7007,8 @@ class TestApplyStoreMutationPreflightThroughMain:
         ):
             _mod.main()
 
-        assert fail_closed_records(caplog, 'audit_duplicate_memories'), (
+        (record,) = fail_closed_records(caplog, 'audit_duplicate_memories')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

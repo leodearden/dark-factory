@@ -3088,7 +3088,6 @@ class TestRunApplyStoreMutationPreflight:
     async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
         """Happy path: a writable environment consolidates exactly as before,
         driving all four phases."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         mocks = _patch_merge_primitives(monkeypatch)
         memory_service, _, qdrant_client = self._scenario()
 
@@ -3139,7 +3138,8 @@ class TestRunApplyStoreMutationPreflight:
         ):
             await _mod.run(_run_args(apply=True), memory_service, limit=1000)
 
-        assert fail_closed_records(caplog, 'consolidate_namespace_families'), (
+        (record,) = fail_closed_records(caplog, 'consolidate_namespace_families')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

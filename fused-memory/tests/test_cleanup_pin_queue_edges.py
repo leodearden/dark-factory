@@ -343,7 +343,8 @@ class TestRunApplyStoreMutationPreflight:
                 self._args(tmp_path, apply=True), memory=self._memory(), graph=self._graph()
             )
 
-        assert fail_closed_records(caplog, 'cleanup_pin_queue_edges')
+        (record,) = fail_closed_records(caplog, 'cleanup_pin_queue_edges')
+        assert SENTINEL in record.getMessage()
 
     @pytest.mark.asyncio
     async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch, tmp_path):
@@ -363,8 +364,7 @@ class TestRunApplyStoreMutationPreflight:
         self._assert_no_mutation(memory)
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, tmp_path):
         memory = self._memory()
 
         report = await _mod.run(

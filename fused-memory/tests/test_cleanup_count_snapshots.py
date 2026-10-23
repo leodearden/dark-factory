@@ -1405,9 +1405,8 @@ class TestRunApplyStoreMutationPreflight:
         memory.update_edge.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment cleans up exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         memory = self._make_memory()
 
         report = await _mod.run(
@@ -1475,7 +1474,8 @@ class TestRunApplyStoreMutationPreflight:
         ):
             _mod.main()
 
-        assert fail_closed_records(caplog, 'cleanup_count_snapshots'), (
+        (record,) = fail_closed_records(caplog, 'cleanup_count_snapshots')
+        assert SENTINEL in record.getMessage(), (
             "main has no handler, so the traceback is all an operator gets "
             'unless the guard site logs the fail-closed diagnosis itself; '
             f'got: {[rec.getMessage() for rec in caplog.records]}'

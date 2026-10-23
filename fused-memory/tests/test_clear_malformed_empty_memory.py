@@ -571,9 +571,8 @@ class TestRunApplyStoreMutationPreflight:
         assert _mod.resolve_exit_code(report) == 0
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment deletes exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         payload = {'data': '', 'category': None, 'agent_id': None}
         client = _make_qdrant_mock([_make_record(payload)])
         args = types.SimpleNamespace(memory_id='id1', apply=True)
@@ -641,7 +640,8 @@ class TestRunApplyStoreMutationPreflight:
         assert exit_code == 2
         # ``main``'s own generic "fatal error during cleanup" ERROR shares this
         # logger AND this level, so only the markers can tell the two apart.
-        assert fail_closed_records(caplog, 'clear_malformed_empty_memory'), (
+        (record,) = fail_closed_records(caplog, 'clear_malformed_empty_memory')
+        assert SENTINEL in record.getMessage(), (
             "main's blanket handler only says 'fatal error during cleanup', so "
             'the guard site must log the fail-closed diagnosis itself; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'
