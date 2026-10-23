@@ -14,7 +14,7 @@ from collections.abc import Callable
 import pytest
 
 from orchestrator.verify_hosts import HostPool, Refusal
-from orchestrator.verify_runner import HostAllocator, HostLease
+from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
 
 class _FakeRemote:
@@ -48,7 +48,7 @@ class _Hooks:
     def __init__(self, *, demand: list[bool] | None = None) -> None:
         self.demand_answers = list(demand or [False])
         self.demand_calls = 0
-        self.unavailable: list[tuple[str, str]] = []
+        self.unavailable: list[tuple[str, RunnerUnavailable]] = []
         self.recovered: list[str] = []
 
     def merge_demand(self) -> bool:
@@ -56,8 +56,8 @@ class _Hooks:
         self.demand_calls += 1
         return answer
 
-    def on_unavailable(self, name: str, reason: str) -> None:
-        self.unavailable.append((name, reason))
+    def on_unavailable(self, name: str, exc: RunnerUnavailable) -> None:
+        self.unavailable.append((name, exc))
 
     def on_recovered(self, name: str) -> None:
         self.recovered.append(name)
@@ -242,9 +242,11 @@ class TestReleaseAndCancel:
         pool, allocator = _pool([_FakeRemote('laptop')], hooks)
         lease = _lease(pool.acquire_for_task('42'))
 
-        pool.mark_unavailable(lease, 'transport')
+        unreachable = RunnerUnavailable('ssh exited 255', kind='transport')
 
-        assert hooks.unavailable == [('laptop', 'transport')]
+        pool.mark_unavailable(lease, unreachable)
+
+        assert hooks.unavailable == [('laptop', unreachable)]
         assert allocator.is_quarantined('laptop') is False
         assert allocator.is_busy('laptop') is True
         await pool.release(lease)

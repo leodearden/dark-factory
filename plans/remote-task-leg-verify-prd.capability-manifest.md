@@ -78,7 +78,7 @@ slot. Up to `max_concurrent_tasks` workflows share one dispatcher (heuristic 7).
 | Capability | Evidence | Verdict | Check |
 |---|---|---|---|
 | `merge_lane_wants_host()` | producer δ1 over worker `_redispatch`, `_verifier_queue`, `_pending_verifier_get`, `_merge_ahead_ledger` (present) | PASS | grep `def merge_lane_wants_host\(` |
-| public RU tracker entry | producer δ1 over `_quarantine_unreachable_host`, `_record_runner_unavailable`, `_record_runner_recovered` (present) | PASS | grep `def note_runner_unavailable\(` |
+| public RU tracker entry | producer δ1 over `_record_runner_recovered` (present); the unavailable side is 6565's public `bench_unavailable_runner` (present) | PASS | grep `def note_runner_recovered\(` |
 | harness owns the pool | producer δ1 in `Harness.__init__`, injected via `Harness._start_merge_worker` (present); `HostPool` from γ upstream | PASS | grep `HostPool\(` in `harness.py` |
 
 ### δ2 — workflow, config, dispatcher wiring (hub carry, stage 2)

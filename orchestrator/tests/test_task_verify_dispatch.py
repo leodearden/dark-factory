@@ -2,8 +2,10 @@
 
 The value layer (policy, eligibility, the decision record) is pure.  The
 dispatcher is driven over a real committed repo, a real HostAllocator/HostPool
-and a real RemoteRunner whose public transport seams (``run=``, ``ssh_run=``,
-``id_factory=``) are scripted by :class:`_Transport`.
+and a real RemoteRunner built by ``_gate_fixtures.gated_remote_runner``, which
+answers the gate's publish and ensure calls; every other call through its public
+transport seams (``run=``, ``ssh_run=``, ``id_factory=``) is scripted by
+:class:`_Transport`.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _gate_fixtures import TEST_DEPLOYED_SHA, gated_remote_runner
 from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import wait_responsive
 
@@ -37,7 +40,7 @@ from orchestrator.task_verify_dispatch import (
 from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_from_json
 from orchestrator.verify import VerifyInfraError, VerifyResult
 from orchestrator.verify_hosts import HostPool
-from orchestrator.verify_runner import HostAllocator, RemoteRunner, result_to_json
+from orchestrator.verify_runner import HostAllocator, RunnerUnavailable, result_to_json
 
 _SIDECAR_KEYS = {
     'decision', 'runner', 'reason', 'tip_sha', 'base_sha',
@@ -251,10 +254,6 @@ class _Transport:
     verify: VerifyAnswer = _never_called
     cancel_rc: int = 0
     pgrep_rc: int = 1
-    local_df_head: str = 'a' * 40
-    remote_df_head: str = 'a' * 40
-    upstream_rc: int = 1
-    pull_rc: int = 0
     log: list[str] = field(default_factory=list)
     argvs: list[list[str]] = field(default_factory=list)
     on_delete_ref: Callable[[], object] | None = None
@@ -284,10 +283,6 @@ class _Transport:
     def answer(self, argv: list[str]) -> tuple[str, Answer]:
         if argv[:2] == ['git', 'push']:
             return ('delete_ref' if '--delete' in argv else 'push'), (0, '', '')
-        if argv == ['git', 'rev-parse', 'HEAD']:
-            return 'local_df_head', (0, self.local_df_head, '')
-        if argv == ['git', 'rev-parse', '@{upstream}']:
-            return 'upstream', (self.upstream_rc, '', '')
         if argv[0] == 'ssh':
             return self.ssh_answer(argv[-1])
         return 'unscripted', (127, '', 'unscripted')
@@ -297,10 +292,6 @@ class _Transport:
             return 'cancel_verify', (self.cancel_rc, '', '')
         if remote_cmd.startswith('pgrep'):
             return 'pgrep', (self.pgrep_rc, '', '')
-        if 'pull --ff-only' in remote_cmd:
-            return 'pull', (self.pull_rc, '', 'pull refused')
-        if 'rev-parse HEAD' in remote_cmd:
-            return 'remote_df_head', (0, self.remote_df_head, '')
         return 'unscripted', (127, '', 'unscripted')
 
 
@@ -308,15 +299,18 @@ class _Hooks:
     def __init__(self, *, demand: bool = False) -> None:
         self.demand = demand
         self.demand_calls = 0
-        self.unavailable: list[tuple[str, str]] = []
+        self.unavailable: list[tuple[str, RunnerUnavailable]] = []
         self.recovered: list[str] = []
 
     def merge_demand(self) -> bool:
         self.demand_calls += 1
         return self.demand
 
-    def on_unavailable(self, name: str, reason: str) -> None:
-        self.unavailable.append((name, reason))
+    def on_unavailable(self, name: str, exc: RunnerUnavailable) -> None:
+        self.unavailable.append((name, exc))
+
+    def unavailable_kinds(self) -> list[tuple[str, str]]:
+        return [(name, exc.kind) for name, exc in self.unavailable]
 
     def on_recovered(self, name: str) -> None:
         self.recovered.append(name)
@@ -402,8 +396,8 @@ def _harness(
     tip = _commit_on_task_branch(repo, touch, 'CHANGED = 2\n')
     transport = transport if transport is not None else _Transport()
     runners = [
-        RemoteRunner(
-            name, ssh_host=f'{name}.local', git_remote=f'{name}-remote', cwd=repo,
+        gated_remote_runner(
+            name, f'{name}.local', f'{name}-remote', repo,
             run=transport.run, ssh_run=transport.ssh_run, id_factory=lambda: 'req1',
             **(runner_kwargs or {}),
         )
@@ -684,29 +678,46 @@ class TestRemoteLeg:
         assert 'push' not in h.transport.log
         _assert_slot_free(h)
 
-    async def test_a_stale_runner_that_cannot_sync_runs_locally(self, tmp_path: Path) -> None:
-        df_local = tmp_path / 'df-local'
-        df_local.mkdir()
-        transport = _Transport(
-            verify=_answers(_result(True)), local_df_head='a' * 40, remote_df_head='b' * 40,
-            upstream_rc=1, pull_rc=1,
-        )
+    async def test_a_gate_answering_another_deploy_runs_locally_before_any_verify(
+        self, tmp_path: Path,
+    ) -> None:
+        other_deploy = dataclasses.replace(TEST_DEPLOYED_SHA, sha='e' * 40)
         h = _harness(
-            tmp_path, _ORCH_ONLY, transport=transport,
-            runner_kwargs={'df_remote_checkout': '/remote/df', 'df_local_checkout': df_local},
+            tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(_result(True))),
+            runner_kwargs={'deployed_sha': other_deploy},
+        )
+
+        result = await h.call()
+
+        assert result is h.local.result
+        assert h.local.calls == [h.expected_call()]
+        assert h.only_sidecar()['reason'] == 'runner_unavailable'
+        [(name, skew)] = h.hooks.unavailable
+        assert (name, skew.kind) == ('laptop', 'wire_shape')
+        assert skew.identity is not None
+        assert skew.identity.local.code_sha == other_deploy.sha
+        assert skew.identity.remote.code_sha == TEST_DEPLOYED_SHA.sha
+        assert h.hooks.recovered == []
+        assert h.allocator.is_quarantined('laptop') is False
+        assert h.transport.log == []
+        _assert_slot_free(h)
+
+    async def test_a_gate_built_for_the_dispatch_is_announced_to_its_event_store(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _harness(
+            tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(_result(True))),
+            runner_kwargs={'gate_built': True},
         )
         events = _Events()
 
         result = await h.call(event_store=events)
 
-        assert result is h.local.result
-        assert h.local.calls == [h.expected_call(event_store=events)]
-        assert h.only_sidecar()['reason'] == 'sync_stale'
-        assert h.hooks.unavailable == [('laptop', 'sync_stale')]
-        assert h.allocator.is_quarantined('laptop') is False
-        assert [e[0] for e in events.emitted] == [EventType.runner_stale]
-        assert 'verify_task' not in h.transport.log
-        _assert_slot_free(h)
+        assert result.passed is True
+        assert [(event, task) for event, task, _ in events.emitted] == [
+            (EventType.runner_stale, '7'), (EventType.runner_synced, '7'),
+        ]
+        assert h.only_sidecar()['reason'] == 'remote'
 
     async def test_an_unreachable_runner_runs_locally(self, tmp_path: Path) -> None:
         h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_exits(255)))
@@ -716,7 +727,7 @@ class TestRemoteLeg:
         assert result is h.local.result
         assert h.local.calls == [h.expected_call()]
         assert h.only_sidecar()['reason'] == 'runner_unavailable'
-        assert h.hooks.unavailable == [('laptop', 'transport')]
+        assert h.hooks.unavailable_kinds() == [('laptop', 'transport')]
         assert h.hooks.recovered == []
         _assert_slot_free(h)
 
@@ -841,19 +852,13 @@ class TestCancellation:
         assert result is h.local.result
         assert h.only_sidecar(attempt_id=2)['reason'] == 'host_parked'
 
-    async def test_a_cancel_while_the_runner_syncs_frees_the_slot(self, tmp_path: Path) -> None:
-        df_local = tmp_path / 'df-local'
-        df_local.mkdir()
-        transport = _Transport(hang_on='remote_df_head')
-        h = _harness(
-            tmp_path, _ORCH_ONLY, transport=transport,
-            runner_kwargs={'df_remote_checkout': '/remote/df', 'df_local_checkout': df_local},
-        )
+    async def test_a_cancel_while_the_tip_is_pushed_frees_the_slot(self, tmp_path: Path) -> None:
+        transport = _Transport(hang_on='push')
+        h = _harness(tmp_path, _ORCH_ONLY, transport=transport)
 
         await _cancel_mid_verify(h, transport.reached)
 
-        assert 'verify_task' not in transport.log
-        assert 'cancel_verify' not in transport.log
+        assert transport.log == ['push', 'cancel_verify']
         _assert_slot_free(h)
         assert h.sidecars() == []
         assert h.local.calls == []

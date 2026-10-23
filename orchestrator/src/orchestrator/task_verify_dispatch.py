@@ -132,7 +132,7 @@ class RedConfirmation:
 
 DispatchReason = Literal[
     'remote', 'not_eligible', 'no_host', 'host_parked', 'merge_demand', 'pressure_hold',
-    'dirty_tree', 'sync_stale', 'runner_unavailable', 'infra_transient', 'cross_check',
+    'dirty_tree', 'runner_unavailable', 'infra_transient', 'cross_check',
     'red_confirm', 'dispatcher_error',
 ]
 
@@ -386,12 +386,6 @@ class TaskVerifyDispatcher:
         try:
             if await self._git_ops.has_uncommitted_work(call.worktree):
                 return 'dirty_tree'
-            sync = await lease.runner.sync_if_stale(
-                event_store=call.event_store, task_id=call.task_id,
-            )
-            if not sync.ok:
-                self._pool.mark_unavailable(lease, 'sync_stale')
-                return 'sync_stale'
             spec = build_task_verify_spec(
                 call.config, call.module_configs, scope.task_files,
                 force_workspace=False, attempt_id=call.attempt_id,
@@ -399,6 +393,7 @@ class TaskVerifyDispatcher:
             )
             remote = verifying = asyncio.ensure_future(lease.runner.run_task_verify(
                 spec, task_id=call.task_id, archive_root=call.archive_root,
+                event_store=call.event_store,
             ))
             return await self._remote_verdict(verifying, lease, draft)
         finally:
@@ -412,7 +407,7 @@ class TaskVerifyDispatcher:
         try:
             result = await asyncio.shield(remote)
         except RunnerUnavailable as exc:
-            self._pool.mark_unavailable(lease, exc.kind)
+            self._pool.mark_unavailable(lease, exc)
             return 'runner_unavailable'
         finally:
             draft.remote_wall_secs = time.monotonic() - started

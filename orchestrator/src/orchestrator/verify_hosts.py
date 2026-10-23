@@ -19,6 +19,8 @@ from orchestrator.verify_runner import (
     HostAllocator,
     HostLease,
     RemoteRunner,
+    RunnerUnavailable,
+    RunnerUnavailableSink,
 )
 
 if TYPE_CHECKING:
@@ -138,7 +140,7 @@ class HostPool:
         allocator: HostAllocator,
         *,
         merge_demand: MergeDemand,
-        on_unavailable: Callable[[str, str], None],
+        on_unavailable: RunnerUnavailableSink,
         on_recovered: Callable[[str], None],
         probe_sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
@@ -198,8 +200,8 @@ class HostPool:
         finally:
             await once()
 
-    def mark_unavailable(self, lease: HostLease, reason: str) -> None:
-        self._on_unavailable(lease.name, reason)
+    def mark_unavailable(self, lease: HostLease, exc: RunnerUnavailable) -> None:
+        self._on_unavailable(lease.name, exc)
 
     def mark_recovered(self, lease: HostLease) -> None:
         self._on_recovered(lease.name)
