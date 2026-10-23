@@ -140,6 +140,7 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_reported_landing,
 )
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.recut_ruling import ruling_to_enforce
 from orchestrator.review_inputs import gather_review_subject, review_fork_point
 from orchestrator.review_outcome import review_completed_payload
@@ -16940,8 +16941,14 @@ class TaskWorkflow:
         :func:`orchestrator.task_status.is_infra_held`) see it.  The internal
         ``WorkflowState.BLOCKED`` transition and escalation filing below are
         unaffected by this choice.
-        *skip_escalation* suppresses escalation creation when a level-1
-        escalation already exists (e.g. steward re-escalated to human).
+        *skip_escalation* states that the caller has ALREADY filed the task's
+        human-facing level>=1 record (e.g. the steward's re-escalation, a
+        halt-owning L1, the L1s promoted from the architect's L0s).  So this
+        method files no L0, starts no steward and files no fall-through L1.
+        Pending L0s are dismissed on the way out only while an open handoff
+        covers them (:meth:`_dismiss_l0s_covered_by_handoff`).  It cannot be
+        combined with *escalate_to_human*, which would be silently ignored;
+        that pair raises ``ValueError``.
         *merge_phase* suppresses the ENTRY task-status transition
         (blocked/pending) so the caller can retry the merge in-place rather
         than requeueing through the scheduler.  It does NOT suppress the park
@@ -16986,6 +16993,14 @@ class TaskWorkflow:
         human-judgement/infra cases and must NOT receive a proposal — leave
         their callers with spawn_dry_run=False (the default).
         """
+        if escalate_to_human and skip_escalation:
+            raise ValueError(
+                '_mark_blocked: escalate_to_human=True cannot be combined with '
+                'skip_escalation=True. skip_escalation means the caller already '
+                'filed the human-facing level>=1 record, so escalate_to_human '
+                'would be silently ignored. File the L1 first, then pass '
+                'skip_escalation alone.'
+            )
         if self.machine.is_terminal():
             logger.warning(
                 'Task %s: already %s, ignoring late blocked transition: %s',
@@ -17101,27 +17116,6 @@ class TaskWorkflow:
                 block_class=(disposition.block_class if disposition is not None else None),
             )
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
-
-        if self.escalation_queue and skip_escalation:
-            # Defensive cleanup: L0 should already be cleared by
-            # _wait_for_resolution, but dismiss any stragglers (race
-            # between the L0-empty check and the L1 check).
-            remaining_l0 = self.escalation_queue.get_by_task(
-                self.task_id, status='pending', level=0,
-            )
-            if remaining_l0:
-                logger.warning(
-                    'Task %s: %d L0 escalation(s) still pending at '
-                    'mark_blocked(skip_escalation=True) — dismissing',
-                    self.task_id, len(remaining_l0),
-                )
-                for esc in remaining_l0:
-                    self.escalation_queue.resolve(
-                        esc.id,
-                        'Auto-dismissed: task blocked after steward re-escalation',
-                        dismiss=True,
-                        resolved_by='auto-dismissed',
-                    )
 
         if self.escalation_queue and not skip_escalation:
             # Fix C short-circuit: the caller determined this failure is not
@@ -17421,7 +17415,8 @@ class TaskWorkflow:
         # skip_escalation guard (task 2757): a skip_escalation=True caller has
         # ALREADY filed its own signature-specific L1 (train halt → wip_conflict/
         # unmerged_state; main-health auto-heal → preexisting_main_break; architect
-        # no-plan → the promoted L0; steward re-escalation → the steward's L1).
+        # no-plan → the L1s promoted from its L0s; steward re-escalation → the
+        # steward's L1).
         # Before the terminal gate became signature-aware, the bare
         # has_open_l1(task_id) dedup masked this fall-through for those callers
         # (any open L1 suppressed it).  Now that _ensure_l1_escalation_for_blocked
@@ -17436,39 +17431,56 @@ class TaskWorkflow:
                 reason, detail or reason, category=category,
             )
 
-        # Fix #2 — dismiss any still-pending L0 now that we are exiting BLOCKED.
-        # The steward has finished (or never ran) and this workflow slot is
-        # about to exit, so the L0's only consumer is dead.  Leaving it pending
-        # strands an orphan that the orphan-L0 reaper later promotes into a
-        # DUPLICATE L1 (esc-3576-234 in the 2026-05-29 incident) — pure churn,
-        # since _ensure_l1_escalation_for_blocked above already filed the human-
-        # facing L1.  Mirrors the defensive dismissal block at the
-        # skip_escalation path above.  Guarded on escalation_queue because the
-        # fall-through is also reached when no queue is wired.
+        # Fix #2 — this slot is exiting BLOCKED, so a pending L0's only
+        # consumer is dead; left pending, the orphan-L0 reaper later promotes
+        # it into a DUPLICATE of the L1 already open (esc-3576-234).  The
+        # dismissal is gated on that L1 actually covering it: see
+        # _dismiss_l0s_covered_by_handoff.
         if self.escalation_queue:
-            orphan_l0 = self.escalation_queue.get_by_task(
-                self.task_id, status='pending', level=0,
-            )
-            for esc in orphan_l0:
-                self.escalation_queue.resolve(
-                    esc.id,
-                    'Auto-dismissed: workflow exiting BLOCKED, steward done '
-                    '(L1 filed for human handoff)',
-                    dismiss=True,
-                    resolved_by='auto-dismissed',
-                )
-            if orphan_l0:
-                logger.info(
-                    'Task %s: dismissed %d orphan L0(s) on BLOCKED fall-through '
-                    '(steward consumer dead; L1 already filed)',
-                    self.task_id, len(orphan_l0),
-                )
+            self._dismiss_l0s_covered_by_handoff()
         observed = await self._park_merge_phase_row(
             merge_phase, block_status,
             why=f'BLOCKED fall-through: {reason[:80]}',
         )
         return _record(
             observed if observed is not None else WorkflowOutcome.BLOCKED,
+        )
+
+    def _dismiss_l0s_covered_by_handoff(self) -> None:
+        """Dismiss pending L0s only while open level>=1 records pin the block.
+
+        Coverage is the stranded-blocked sweep's own veto, so a dismissal can
+        never leave a blocked row unpinned.  An uncovered L0 stays pending,
+        named in a WARNING, for the orphan-L0 reaper to promote.
+        """
+        assert self.escalation_queue is not None
+        pending = self.escalation_queue.get_by_task(self.task_id, status='pending')
+        l0s = [e for e in pending if e.level == 0]
+        if not l0s:
+            return
+        handoffs = [e for e in pending if e.level >= 1]
+        if not records_pin_blocked_recovery(
+            self.task_id, handoffs, live_claimant=False,
+        ):
+            for esc in l0s:
+                logger.warning(
+                    'Task %s: leaving L0 %s (agent_role=%s, category=%s) '
+                    'pending on BLOCKED exit: no open level>=1 handoff covers '
+                    'it, so the orphan-L0 reaper will promote it',
+                    self.task_id, esc.id, esc.agent_role, esc.category,
+                )
+            return
+        covering = ', '.join(e.id for e in handoffs)
+        for esc in l0s:
+            self.escalation_queue.resolve(
+                esc.id,
+                f'Auto-dismissed: workflow exiting BLOCKED; covered by open {covering}',
+                dismiss=True,
+                resolved_by='auto-dismissed',
+            )
+        logger.info(
+            'Task %s: dismissed %d L0(s) on BLOCKED exit, covered by open %s',
+            self.task_id, len(l0s), covering,
         )
 
     async def _park_merge_phase_row(
