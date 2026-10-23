@@ -18,7 +18,7 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.lane_lifecycle import LaneState
+from orchestrator.lane_lifecycle import LaneLifecycle, LaneState
 from orchestrator.task_runtime import (
     _derive_phase,
     _map_lane_state,
@@ -264,7 +264,7 @@ class TestEachArtifactFromItsOwnRoot:
     def test_pooled_lane_record_reads_its_tasks_root(self, git_repo: Path):
         git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
         worktree_base = git_ops.worktree_base
-        git_ops._lane_lifecycle.note_assigned('_lane-0', task_id='7')
+        LaneLifecycle(worktree_base).note_assigned('_lane-0', task_id='7')
         _seed_lane_metadata(worktree_base, '_lane-0', '7')
         _seed_task_scoped(TaskArtifacts.task_root_for(worktree_base, '7'))
 

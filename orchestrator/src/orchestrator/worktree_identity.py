@@ -22,7 +22,6 @@ produce false-positive quarantines.
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
@@ -65,34 +64,21 @@ def identities_match(stored: str | None, live: str | None) -> bool:
 
 
 def read_worktree_title(worktree: Path) -> str | None:
-    """Read the worktree's stored task title — new-root-then-legacy-root.
+    """The worktree's stored task title: its lane root, then the legacy one.
 
-    Resolves the sibling ``.task-meta/<name>`` root first (via the single
-    derivation owner :meth:`TaskArtifacts.meta_root_for`, W11 epsilon1),
-    falling back to the legacy in-worktree ``<worktree>/.task`` sidecar for
-    the compat window. Within EACH root, prefers ``metadata.json`` ``title``,
-    falling back to ``plan.json`` ``title`` — mirroring the new-then-old
-    idiom of ``TaskArtifacts._read_path``. Task 3154 left this title
-    resolution unchanged: only the disk backstop's lane->task MATCH key
-    moved to ``metadata.json``.
+    Reads the lane ``.task-meta/<name>`` root (:meth:`TaskArtifacts.meta_root_for`),
+    then the compat-window ``<worktree>/.task``; within each,
+    :meth:`TaskArtifacts.read_title` prefers ``metadata.json`` over ``plan.json``.
 
-    Returns ``None`` if no root/file is readable or carries a non-blank
-    title — callers treat ``None`` as "unprovable", which
-    :func:`identities_match` fails open on.
+    Returns ``None`` if no root carries a non-blank title — callers treat
+    ``None`` as "unprovable", which :func:`identities_match` fails open on.
     """
-    roots = (
-        TaskArtifacts.meta_root_for(worktree.parent, worktree.name),
-        worktree / '.task',
+    views = (
+        TaskArtifacts(worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name)),
+        TaskArtifacts(worktree),
     )
-    for root in roots:
-        for rel in ('metadata.json', 'plan.json'):
-            path = root / rel
-            try:
-                data = json.loads(path.read_text())
-            except (OSError, ValueError):
-                continue
-            if isinstance(data, dict):
-                title = data.get('title')
-                if isinstance(title, str) and title.strip():
-                    return title
+    for view in views:
+        title = view.read_title()
+        if title is not None:
+            return title
     return None
