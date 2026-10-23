@@ -9,10 +9,12 @@ test drives ``_finalize_advanced_merge`` over a real repository, a real
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shlex
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -241,3 +243,221 @@ async def test_the_triage_hint_names_the_merged_tip_and_the_landing(
         f'Triage with `git diff {scene.branch_tip[:12]} {scene.landed[:12]} -- <path>`'
         in _blocked_reason(outcome)
     )
+
+
+BASE = ''.join(f'line{i}\n' for i in range(1, 41))
+BRANCH_EDITED = BASE.replace('line2\n', 'line2\nBRANCH_EDIT\n')
+
+
+class Relocation(NamedTuple):
+    """A top-level ``a.py`` the branch moved to ``b.py``, landed on main.
+
+    *fork* is where the branch left main, *main_tip* is main just before the
+    landing (finalize's base), and *landed* is the landing itself.
+    """
+
+    worktree: Path
+    fork: str
+    main_tip: str
+    branch_tip: str
+    landed: str
+
+
+def _relocate_on_branch(repo: Path, tmp_path: Path, *, edit: bool) -> tuple[Path, str, str]:
+    """Main adds ``a.py``; the branch moves it to ``b.py``, optionally editing it near the top.
+
+    The paths are top level on purpose: with no directory part, the relocated
+    file's parent is the scratch directory the proof stages it in.
+    """
+    base = _commit(repo, {'a.py': BASE}, 'add a.py')
+    worktree = _task_worktree(repo, tmp_path)
+    _git(worktree, 'mv', 'a.py', 'b.py')
+    branch_tip = _commit(
+        worktree, {'b.py': BRANCH_EDITED} if edit else {}, f'impl({TASK_ID}): relocate a.py',
+    )
+    return worktree, base, branch_tip
+
+
+def _main_edits_the_source(repo: Path, main_edit: bytes) -> str:
+    """Main edits ``a.py`` near the bottom, far from the branch's hunk."""
+    edited = BASE.encode().replace(b'line37\n', b'line37\n' + main_edit + b'\n')
+    return _commit(repo, {'a.py': edited}, 'main edits a.py')
+
+
+def _land(repo: Path) -> str:
+    """A clean ``--no-ff`` landing: ``b.py`` carries both the branch's and main's edits."""
+    _git(repo, 'merge', '--no-ff', '-m', f'Merge {TASK_BRANCH} into main', TASK_BRANCH)
+    return _git(repo, 'rev-parse', 'HEAD')
+
+
+def _land_dropping_the_relocation(repo: Path) -> str:
+    """A ``--no-ff`` landing whose resolution deletes the relocated ``b.py`` outright."""
+    _git(repo, 'merge', '--no-ff', '--no-commit', TASK_BRANCH)
+    _git(repo, 'rm', '-q', '-f', 'b.py')
+    _git(repo, 'commit', '-m', f'Merge {TASK_BRANCH} into main (resolution dropped b.py)')
+    return _git(repo, 'rev-parse', 'HEAD')
+
+
+def _relocation(
+    repo: Path,
+    tmp_path: Path,
+    *,
+    edit: bool = True,
+    main_edit: bytes = b'MAIN_EDIT',
+    land: Callable[[Path], str] = _land,
+) -> Relocation:
+    worktree, fork, branch_tip = _relocate_on_branch(repo, tmp_path, edit=edit)
+    main_tip = _main_edits_the_source(repo, main_edit)
+    landed = land(repo)
+    return Relocation(
+        worktree=worktree, fork=fork, main_tip=main_tip, branch_tip=branch_tip, landed=landed,
+    )
+
+
+async def _finalize_relocation(
+    git_ops: GitOps, config: OrchestratorConfig, scene: Relocation,
+) -> MergeOutcome:
+    return await _finalize(
+        git_ops, _request(config, scene.worktree), landed=scene.landed, base=scene.main_tip,
+    )
+
+
+def _messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.levelno == level]
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return _messages(caplog, logging.WARNING)
+
+
+def _infos(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return _messages(caplog, logging.INFO)
+
+
+@pytest.mark.asyncio
+async def test_a_faithful_top_level_relocation_lands(
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A relocation whose edit re-applies against the merged blob is not reported as diverging.
+
+    Main edited the source too, so the proof must stage the merged blob and
+    reverse-apply the branch's patch; at the top level that staging happens
+    directly in the scratch directory.
+    """
+    scene = _relocation(repo, tmp_path)
+
+    with caplog.at_level(logging.INFO, logger=GATES_LOGGER):
+        outcome = await _finalize_relocation(git_ops, lane_config, scene)
+
+    assert (outcome.status, outcome.merge_sha) == ('done', scene.landed)
+
+
+@pytest.mark.asyncio
+async def test_the_verified_relocation_is_logged_against_the_task(
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The suppressed rename pair is logged once, naming the task it belongs to."""
+    scene = _relocation(repo, tmp_path)
+
+    with caplog.at_level(logging.INFO, logger=GATES_LOGGER):
+        await _finalize_relocation(git_ops, lane_config, scene)
+
+    verified = (
+        "post-merge-equiv: content verified at the new name, not comparing "
+        f"[('b.py', 'a.py')] (target, source). task_id={TASK_ID}"
+    )
+    assert _infos(caplog).count(verified) == 1, _infos(caplog)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_branch_delta_keeps_the_relocation_flagged(
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the branch's own delta cannot be read, the relocated path is compared and flagged."""
+    scene = _relocation(repo, tmp_path)
+    _fail_one_git_call(
+        monkeypatch, tmp_path / 'bin', f'diff {scene.fork}:a.py {scene.branch_tip}:b.py',
+    )
+
+    with caplog.at_level(logging.INFO, logger=GATES_LOGGER):
+        outcome = await _finalize_relocation(git_ops, lane_config, scene)
+
+    assert 'b.py' in _blocked_reason(outcome)
+    assert any(
+        message.startswith(
+            f'post-merge-equiv: branch-delta diff {scene.fork}:a.py..{scene.branch_tip}:b.py '
+            'failed (rc=128'
+        )
+        and message.endswith(f'task_id={TASK_ID}')
+        for message in _warnings(caplog)
+    ), _warnings(caplog)
+
+
+@pytest.mark.asyncio
+async def test_an_undecodable_merged_blob_keeps_the_relocation_flagged(
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A merged blob that is not UTF-8 cannot be patch-verified, so the relocation stays flagged.
+
+    Main's latin-1 edit sits far from the branch's hunk, so the branch's patch
+    itself stays ASCII and only the merged blob is undecodable.
+    """
+    scene = _relocation(repo, tmp_path, main_edit=b'MAIN_\xe9DIT')
+
+    with caplog.at_level(logging.INFO, logger=GATES_LOGGER):
+        outcome = await _finalize_relocation(git_ops, lane_config, scene)
+
+    assert 'b.py' in _blocked_reason(outcome)
+    assert (
+        f'post-merge-equiv: merged blob {scene.landed}:b.py is not valid UTF-8 and cannot be '
+        f'patch-verified; not suppressing. task_id={TASK_ID}'
+    ) in _warnings(caplog)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_merged_blob_keeps_the_relocation_flagged(
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the merged blob cannot be read, the relocated path is compared and flagged."""
+    scene = _relocation(repo, tmp_path)
+    _fail_one_git_call(monkeypatch, tmp_path / 'bin', f'show {scene.landed}:b.py')
+
+    with caplog.at_level(logging.INFO, logger=GATES_LOGGER):
+        outcome = await _finalize_relocation(git_ops, lane_config, scene)
+
+    assert 'b.py' in _blocked_reason(outcome)
+    assert any(
+        message.startswith(f'post-merge-equiv: merged blob {scene.landed}:b.py unreadable (rc=128')
+        for message in _warnings(caplog)
+    ), _warnings(caplog)
+
+
+@pytest.mark.asyncio
+async def test_a_working_tree_file_cannot_stand_in_for_a_dropped_relocation(
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pure relocation the resolution deleted is flagged, even beside a file named like its blob.
+
+    The branch's delta is empty, so only the merged path's existence separates
+    "relocated" from "dropped".  An untracked file literally named
+    ``<landing>:b.py`` in the main checkout must not pass for that blob.
+    """
+    scene = _relocation(repo, tmp_path, edit=False, land=_land_dropping_the_relocation)
+    (repo / f'{scene.landed}:b.py').write_text('not a blob\n')
+
+    with caplog.at_level(logging.INFO, logger=GATES_LOGGER):
+        outcome = await _finalize_relocation(git_ops, lane_config, scene)
+
+    assert 'b.py' in _blocked_reason(outcome)
+    assert any(
+        message.startswith(
+            f'post-merge-equiv: merged path {scene.landed}:b.py resolves to no blob (rc=128'
+        )
+        for message in _warnings(caplog)
+    ), _warnings(caplog)
