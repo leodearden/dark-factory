@@ -19,6 +19,7 @@ Every assertion goes through the lock table's public seams.
 
 from __future__ import annotations
 
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -26,6 +27,7 @@ from _park_test_helpers import event_payloads, make_task, make_withheld_task
 from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventStore
 from orchestrator.pin_reservation import BlockerKind
 from orchestrator.scheduler import ModuleLockTable, Scheduler
 
@@ -247,7 +249,7 @@ def _scheduler(module_overrides: dict[str, int]) -> tuple[Scheduler, _RecordingE
         max_per_module=1, lock_depth=2, module_overrides=module_overrides,
     )
     store = _RecordingEventStore()
-    scheduler = Scheduler(config, event_store=store)  # type: ignore[arg-type]
+    scheduler = Scheduler(config, event_store=cast(EventStore, store))
     scheduler.finish_startup()
     scheduler.lock_table.install_parks('F', ['wide.json'], 'high')
     scheduler.get_tasks = AsyncMock(return_value=[
