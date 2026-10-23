@@ -431,6 +431,21 @@ class TestSubmitResponseEchoesTheResolvedLane:
         assert result.get('lane') == 'normal', result
         assert result.get('lane_source') == 'default', result
 
+    async def test_failed_metadata_read_reports_unavailable_not_default(
+        self, tmp_path: Path
+    ):
+        """A degraded task store must not read as "nothing asked at all".
+
+        The lane still fails open to ``'normal'``; only the provenance differs
+        from ``test_neither_source_reports_the_default``.
+        """
+        result = await _submit_nonblocking(
+            tmp_path, _make_harness(scheduler_raises=True)
+        )
+        assert result.get('status') == 'queued', result
+        assert result.get('lane') == 'normal', result
+        assert result.get('lane_source') == 'unavailable', result
+
     async def test_queued_response_reports_the_lane_as_applied(self, tmp_path: Path):
         """On the dispatched arm the echo IS the effective lane."""
         result = await _submit_nonblocking(

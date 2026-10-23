@@ -364,6 +364,17 @@ but never fail a submission. The rule itself lives in a new pure module,
 `escalation/src/escalation/merge_lane_resolution.py`, so it is testable without building a
 server, a queue, a registry and a fake worker.
 
+**`lane_source` has a fourth value, `'unavailable'` (task 5564).** `lane_source` is one of
+`'argument'`, `'task_metadata'`, `'default'` (the task was read and asked for nothing) or
+`'unavailable'` (the task-store read failed or timed out, so what the task carries is
+unknown). Previously a failed read's `{}` was reported as `'default'`, so a main-health
+hotfix relying on `metadata.merge_lane='high'` that was silently downgraded on a degraded
+store looked identical to a healthy no-op submission. The lane itself is unchanged —
+still `'normal'`, fail-open — only the reported provenance is more honest. The spelling
+mirrors `TaskMetadataResult.unavailable`, and the value alone carries the "lane is
+`'normal'` BECAUSE the read failed" fact, so no extra response key was added.
+`resolve_merge_lane` takes the flag as `metadata_unavailable` and stays pure.
+
 **`merge_lane` is now a Tier-A blessed metadata key**, so `parse_metadata` no longer emits
 `code=unknown_key` on every carrier, and `docs/task-authoring.md` §8 states what the key
 means and why `'high'` stays reserved. Blessed rather than promoted to a typed
