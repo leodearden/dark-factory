@@ -36,7 +36,7 @@ from fused_memory.mcp_tools.scheduler_state import (
     clear_lock_depth_cache,
     effective_lock_depth,
 )
-from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.candidate_key import compute_candidate_key, normalize_title
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.curator_types import (
@@ -68,7 +68,6 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     _trim_pool,
     flatten_task_tree,
-    normalize_title,
 )
 
 # ----------------------------------------------------------------------
@@ -5811,6 +5810,13 @@ class TestNormalizeTitle:
     def test_empty_input_returns_empty_string(self):
         """(e) empty string → empty string."""
         assert normalize_title('') == ''
+
+    def test_candidate_key_and_normalize_title_agree_on_sameness(self):
+        """(f) the store's dedup key treats a title exactly as normalize_title does."""
+        title, files = '  Fix   The\tParser  ', ['b.py', 'a.py']
+        assert compute_candidate_key(title, files) == compute_candidate_key(
+            normalize_title(title), files,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────
