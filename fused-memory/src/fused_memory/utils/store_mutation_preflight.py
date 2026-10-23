@@ -236,6 +236,7 @@ network, no ``MemoryService``.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -315,7 +316,35 @@ def _create_probe_file(path: Path) -> None:
     os.close(fd)
 
 
-def assert_store_mutation_allowed(*, operation: str) -> None:
+def _refusal_record_message(
+    *, operation: str, history_dir: Path, extra_detail: str | None, cause: OSError
+) -> str:
+    """Compose the operator-facing ERROR record for a refused *operation*.
+
+    Every guarded script used to hand-copy this prose into its own
+    ``except StoreMutationUnavailable`` arm, and the copies drifted. Only the
+    marker, the diagnosis, the remedy and the ``--apply`` tail are shared; the
+    one script-specific part is *extra_detail*, spliced in after "so".
+    """
+    diagnosis = (
+        f'{operation}: NOT started (fail-closed) -- this process cannot write '
+        f"mem0's history directory {str(history_dir)!r}"
+    )
+    diagnosis += f', so {extra_detail}' if extra_detail else '.'
+    return (
+        f'{diagnosis} Route this operation through the fused-memory MCP server '
+        f'(the unsandboxed owner of the store), or re-run from an unsandboxed '
+        f"operator shell. To obtain this run's report safely from anywhere, "
+        f're-run without --apply. ({cause!r})'
+    )
+
+
+def assert_store_mutation_allowed(
+    *,
+    operation: str,
+    logger: logging.Logger | None = None,
+    extra_detail: str | None = None,
+) -> None:
     """Refuse *operation* unless this process can actually write mem0's history dir.
 
     Probes real capability by creating a uniquely-named file in the resolved
@@ -333,16 +362,49 @@ def assert_store_mutation_allowed(*, operation: str) -> None:
         operation: Human-readable name of the mutation being gated (e.g.
             ``'sweep_toolcall_xml_leak --apply'``). Echoed into the refusal
             message so an operator can tell WHICH operation was refused.
+        logger: The CALLER's own logger. When given, a refusal emits exactly
+            one ERROR record through it -- naming the operation, the probed
+            directory and the probe's error -- before raising. It is the
+            caller's rather than this module's because, in most guarded
+            scripts, that record is the only diagnosis an operator sees.
+            Omitted, nothing is logged.
+        extra_detail: This script's own part of that record: the mechanism by
+            which its mutation would split in half, plus its "nothing was X'd"
+            clause, read as a continuation after "so". CALLER CONTRACT: never
+            restate the shared remedy or the ``--apply`` tail, which the
+            record already carries. Only the record reads it, so it requires
+            *logger*.
 
     Raises:
         StoreMutationUnavailable: When the probe cannot be created. The caller
-            MUST NOT begin the mutation.
+            MUST NOT begin the mutation. Raised the same whether or not a
+            *logger* was given.
+        ValueError: When *extra_detail* is given without *logger*. Checked
+            before the probe, so a miswired call site fails on every run rather
+            than only on the rare refused one.
     """
+    if extra_detail is not None and logger is None:
+        raise ValueError(
+            f'assert_store_mutation_allowed(operation={operation!r}) was given '
+            f'extra_detail without a logger; only the record emitted through '
+            f"the caller's logger reads extra_detail, so it would be silently "
+            f"discarded. Pass the calling module's logger, or drop extra_detail."
+        )
+
     history_dir = resolve_history_dir()
     probe = history_dir / f'.store-mutation-probe-{uuid.uuid4().hex}'
     try:
         _create_probe_file(probe)
     except OSError as exc:
+        if logger is not None:
+            logger.error(
+                _refusal_record_message(
+                    operation=operation,
+                    history_dir=history_dir,
+                    extra_detail=extra_detail,
+                    cause=exc,
+                )
+            )
         raise StoreMutationUnavailable(
             f'Refusing to begin {operation!r}: this process cannot create files in '
             f"mem0's history directory {str(history_dir)!r} ({exc!r}). "
