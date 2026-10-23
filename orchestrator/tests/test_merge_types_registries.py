@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Iterator
 
 import pytest
@@ -15,6 +16,24 @@ def event_loop_for_futures() -> Iterator[asyncio.AbstractEventLoop]:
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
+
+
+class ManualClock:
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, secs: float) -> None:
+        self.now += secs
+
+
+@pytest.fixture
+def frozen_monotonic(monkeypatch: pytest.MonkeyPatch) -> ManualClock:
+    clock = ManualClock(1000.0)
+    monkeypatch.setattr(time, 'monotonic', clock)
+    return clock
 
 
 class TestAcquireSeedsTheEntry:
@@ -46,6 +65,45 @@ class TestAcquireSeedsTheEntry:
         assert entry is not None
         assert entry.request_id is None
         assert [w.request_id for w in entry.waiters] == ['']
+
+
+def _dispatch_591(loop: asyncio.AbstractEventLoop) -> tuple[InFlightMergeRegistry, int]:
+    registry = InFlightMergeRegistry()
+    registry.acquire('591', 'T-591', loop.create_future(), request_id='mr-1')
+    at_dispatch = registry.eta_seconds('591')
+    assert at_dispatch is not None and at_dispatch > 1
+    return registry, at_dispatch
+
+
+class TestEtaSeconds:
+    def test_eta_counts_down_one_second_per_elapsed_second(
+        self, event_loop_for_futures: asyncio.AbstractEventLoop, frozen_monotonic: ManualClock,
+    ) -> None:
+        registry, at_dispatch = _dispatch_591(event_loop_for_futures)
+
+        frozen_monotonic.advance(1)
+
+        assert registry.eta_seconds('591') == at_dispatch - 1
+
+    def test_eta_still_reports_the_last_whole_second(
+        self, event_loop_for_futures: asyncio.AbstractEventLoop, frozen_monotonic: ManualClock,
+    ) -> None:
+        registry, at_dispatch = _dispatch_591(event_loop_for_futures)
+
+        frozen_monotonic.advance(at_dispatch - 1)
+
+        assert registry.eta_seconds('591') == 1
+
+    def test_eta_is_none_once_the_estimate_is_used_up(
+        self, event_loop_for_futures: asyncio.AbstractEventLoop, frozen_monotonic: ManualClock,
+    ) -> None:
+        registry, at_dispatch = _dispatch_591(event_loop_for_futures)
+
+        frozen_monotonic.advance(at_dispatch)
+        assert registry.eta_seconds('591') is None
+
+        frozen_monotonic.advance(1)
+        assert registry.eta_seconds('591') is None
 
 
 class TestMergeBounceRegistryClear:
