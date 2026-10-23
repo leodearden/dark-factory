@@ -1854,6 +1854,34 @@ class TestMetaRootDerivation:
         )
 
 
+class TestTaskRootFor:
+    """`task_root_for` owns the task-lifetime `.task-meta/task-<id>` shape
+    (PRD plans/task-meta-task-keying-prd.md §Path-derivation contract), and
+    refuses an id that could leave `.task-meta/` or name a non-dir.
+    """
+
+    BASE = Path('/pool/.worktrees')
+
+    @pytest.mark.parametrize('task_id', ['3155', 'df_task_12', 'a.b-c_9'])
+    def test_accepted_id_derives_task_prefixed_dir(self, task_id: str):
+        assert TaskArtifacts.task_root_for(self.BASE, task_id) == (
+            self.BASE / '.task-meta' / f'task-{task_id}'
+        )
+
+    @pytest.mark.parametrize('task_id', ['', '../x', 'a/b', 'a b', '3155\n', 3155])
+    def test_rejected_id_raises_naming_value_and_pattern(self, task_id):
+        with pytest.raises(ValueError) as excinfo:
+            TaskArtifacts.task_root_for(self.BASE, task_id)
+        message = str(excinfo.value)
+        assert repr(task_id) in message
+        assert '^[A-Za-z0-9._-]+$' in message
+
+    def test_meta_root_for_lane_shape_is_unchanged(self):
+        assert TaskArtifacts.meta_root_for(self.BASE, '_lane-3') == (
+            self.BASE / '.task-meta' / '_lane-3'
+        )
+
+
 class TestReadLaneTaskId:
     """`read_lane_task_id` resolves lane -> task off `metadata.json` ONLY, and
     a missing, undecodable, corrupt or malformed file is a miss, never a raise.
