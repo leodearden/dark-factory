@@ -8,8 +8,10 @@ child's process group if the await is cancelled.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import shutil
 from pathlib import Path
 
 from shared.git_async import run_git
@@ -35,9 +37,9 @@ async def remove_tree(path: Path, *, ignore_errors: bool = False) -> None:
     """Ensure *path* is absent, never following symlinks inside it.
 
     An absent *path* is already removed. A refused removal raises
-    :class:`TreeRemovalError`, and an ``rm`` that cannot be spawned raises its
-    ``OSError``; with *ignore_errors* either one logs a WARNING instead, as
-    ``shutil.rmtree(ignore_errors=True)`` never raises.
+    :class:`TreeRemovalError`; with *ignore_errors* it logs a WARNING instead,
+    as ``shutil.rmtree(ignore_errors=True)`` never raises. When ``rm`` cannot
+    be spawned, ``shutil.rmtree`` does the delete on a worker thread.
     """
     if not os.path.lexists(path):
         return
@@ -45,10 +47,8 @@ async def remove_tree(path: Path, *, ignore_errors: bool = False) -> None:
         # bounded=False: a multi-minute rm must not hold one of the short-probe
         # spawn slots (shared/src/shared/git_async.py, "who should opt out").
         result = await run_git(['rm', '-rf', '--', str(path)], None, bounded=False)
-    except OSError as err:
-        if not ignore_errors:
-            raise
-        _warn_left_in_place(path, err)
+    except OSError as spawn_err:
+        await _remove_on_a_worker_thread(path, spawn_err, ignore_errors=ignore_errors)
         return
     if result.ok:
         return
@@ -58,5 +58,25 @@ async def remove_tree(path: Path, *, ignore_errors: bool = False) -> None:
     _warn_left_in_place(path, failure)
 
 
-def _warn_left_in_place(path: Path, err: OSError) -> None:
+async def _remove_on_a_worker_thread(
+    path: Path, spawn_err: OSError, *, ignore_errors: bool,
+) -> None:
+    """Delete *path* in-process because ``rm`` could not be spawned.
+
+    A spawn fails under process, memory or fd exhaustion (EAGAIN, ENOMEM,
+    EMFILE), which is when the crash-safe cleanups need to work, and
+    ``shutil.rmtree`` needs no new process. The path is rare enough to justify
+    holding a thread-pool worker.
+    """
+    await asyncio.to_thread(shutil.rmtree, path, ignore_errors=ignore_errors)
+    if os.path.lexists(path):
+        _warn_left_in_place(path, f'rm could not be spawned ({spawn_err}) and shutil.rmtree left it')
+    else:
+        logger.warning(
+            'remove_tree: rm could not be spawned (%s); removed %s with shutil.rmtree',
+            spawn_err, path,
+        )
+
+
+def _warn_left_in_place(path: Path, err: OSError | str) -> None:
     logger.warning('remove_tree: leaving %s in place: %s', path, err)

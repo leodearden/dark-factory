@@ -94,9 +94,11 @@ async def test_the_loop_keeps_running_while_a_tree_is_removed(tmp_path: Path) ->
     await asyncio.gather(removal, ticker())
 
     assert not root.exists()
-    assert True in sightings, (
-        'no loop tick observed the tree before remove_tree finished: the '
-        'deletion ran inline on the event loop thread'
+    # An inline delete behind one yield (`await asyncio.sleep(0)` then
+    # shutil.rmtree) lets exactly one tick see the tree.
+    assert sightings.count(True) > 2, (
+        f'only {sightings.count(True)} loop tick(s) observed the tree before '
+        'remove_tree finished: the deletion held the event loop thread'
     )
 
 
@@ -139,36 +141,66 @@ async def test_a_refused_removal_with_ignore_errors_warns_instead(
     assert str(root) in warnings[0].getMessage()
 
 
-@pytest.mark.asyncio
-async def test_a_removal_that_cannot_spawn_with_ignore_errors_warns_instead(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
-) -> None:
-    root = tmp_path / 'tree'
-    _build_nested_tree(root)
+def _hide_rm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make spawning ``rm`` fail, as it does when the host is out of processes."""
     empty_bin = tmp_path / 'empty-bin'
     empty_bin.mkdir()
     monkeypatch.setenv('PATH', str(empty_bin))
-    caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
 
-    await remove_tree(root, ignore_errors=True)
 
-    warnings = [
+def _warnings_naming(caplog: pytest.LogCaptureFixture, path: Path) -> list[logging.LogRecord]:
+    return [
         r for r in caplog.records
         if r.name == _LOGGER_NAME and r.levelno == logging.WARNING
+        and str(path) in r.getMessage()
     ]
-    assert len(warnings) == 1
-    assert str(root) in warnings[0].getMessage()
 
 
 @pytest.mark.asyncio
-async def test_a_removal_that_cannot_spawn_raises_os_error(
+@pytest.mark.parametrize('ignore_errors', [False, True])
+async def test_a_removal_that_cannot_spawn_rm_still_removes_the_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ignore_errors: bool,
+) -> None:
+    root = tmp_path / 'tree'
+    _build_nested_tree(root)
+    _hide_rm(tmp_path, monkeypatch)
+    caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
+
+    await remove_tree(root, ignore_errors=ignore_errors)
+
+    assert not os.path.lexists(root)
+    assert len(_warnings_naming(caplog, root)) == 1
+
+
+@pytest.mark.asyncio
+@_skip_as_root
+async def test_a_refused_removal_without_rm_raises_os_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / 'tree'
-    _build_nested_tree(root)
-    empty_bin = tmp_path / 'empty-bin'
-    empty_bin.mkdir()
-    monkeypatch.setenv('PATH', str(empty_bin))
+    locked = _make_undeletable(root)
+    _hide_rm(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(OSError):
+            await remove_tree(root)
+    finally:
+        locked.chmod(0o700)
 
-    with pytest.raises(OSError):
-        await remove_tree(root)
+
+@pytest.mark.asyncio
+@_skip_as_root
+async def test_a_refused_removal_without_rm_with_ignore_errors_warns_instead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    root = tmp_path / 'tree'
+    locked = _make_undeletable(root)
+    _hide_rm(tmp_path, monkeypatch)
+    caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
+    try:
+        await remove_tree(root, ignore_errors=True)
+        assert os.path.lexists(locked)
+    finally:
+        locked.chmod(0o700)
+
+    assert len(_warnings_naming(caplog, root)) == 1
