@@ -13,14 +13,30 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import os
+import types
 import weakref
 from collections import deque
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMockMixin
 
 _log = logging.getLogger(__name__)
 
 
-_created_mock_call_coroutines: deque[weakref.ref] = deque()
+class OrphanedAsyncMockCall(NamedTuple):
+    """An AsyncMock call that was never awaited, and where it was made.
+
+    ``created_during`` is pytest's ``PYTEST_CURRENT_TEST`` label when the call
+    was made, such as ``'tests/test_x.py::test_y (call)'``, or None outside any
+    test phase (collection).  pytest gives that label no stable format, so it is
+    displayed, never parsed.
+    """
+
+    mock_name: str
+    created_during: str | None
+
+
+_created_mock_call_coroutines: deque[tuple[weakref.ref, str | None]] = deque()
 
 
 def track_async_mock_coroutines() -> None:
@@ -49,7 +65,9 @@ def track_async_mock_coroutines() -> None:
     @functools.wraps(create_coroutine)
     def create_tracked_coroutine(self, /, *args, **kwargs):
         coroutine = create_coroutine(self, *args, **kwargs)
-        _created_mock_call_coroutines.append(weakref.ref(coroutine))
+        _created_mock_call_coroutines.append(
+            (weakref.ref(coroutine), os.environ.get('PYTEST_CURRENT_TEST'))
+        )
         return coroutine
 
     # pyright reads this package as Python 3.11; markcoroutinefunction arrived in 3.12.
@@ -58,7 +76,7 @@ def track_async_mock_coroutines() -> None:
     )
 
 
-def drain_async_mock_coroutines() -> int:
+def drain_async_mock_coroutines() -> tuple[OrphanedAsyncMockCall, ...]:
     """Close every AsyncMock call coroutine created since the last drain and never awaited.
 
     Task 1714 / esc-1702-13.  Calling an AsyncMock without awaiting the result
@@ -77,19 +95,40 @@ def drain_async_mock_coroutines() -> int:
     Its predecessor searched ``gc.get_objects()`` instead, which with the whole
     suite collected was 88% of a full run's CPU (task 5668).
 
-    Returns the number of coroutines closed.
+    Returns the orphans it closed, each naming the mock that produced it and
+    the test phase it was created in.
     """
-    closed = 0
+    orphans: list[OrphanedAsyncMockCall] = []
     for _ in range(len(_created_mock_call_coroutines)):
-        coroutine = _created_mock_call_coroutines.popleft()()
-        if coroutine is not None and inspect.getcoroutinestate(coroutine) == inspect.CORO_CREATED:
-            coroutine.close()
-            closed += 1
-    if closed:
+        coroutine_ref, created_during = _created_mock_call_coroutines.popleft()
+        coroutine = coroutine_ref()
+        if coroutine is None or inspect.getcoroutinestate(coroutine) != inspect.CORO_CREATED:
+            continue
+        mock_name = _calling_mock_name(coroutine)
+        coroutine.close()
+        if mock_name is not None:
+            orphans.append(OrphanedAsyncMockCall(mock_name, created_during))
+    if orphans:
         _log.debug(
             'drain_async_mock_coroutines: closed %d orphaned AsyncMock '
             '_execute_mock_call coroutine(s) — consider auditing un-awaited '
             'AsyncMock calls in the preceding test',
-            closed,
+            len(orphans),
         )
-    return closed
+    return tuple(orphans)
+
+
+def _calling_mock_name(coroutine: types.CoroutineType[Any, Any, Any]) -> str | None:
+    """Name the mock whose call created *coroutine*: ``_execute_mock_call``'s ``self``.
+
+    None when another thread finished the coroutine since its state was read,
+    which leaves no frame to read ``self`` from.  The frame must be read before
+    ``close()``, which discards it.
+    """
+    frame = coroutine.cr_frame
+    if frame is None:
+        return None
+    mock = frame.f_locals.get('self')
+    if mock is None:
+        return None
+    return mock._extract_mock_name()
