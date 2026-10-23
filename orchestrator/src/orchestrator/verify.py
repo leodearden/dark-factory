@@ -9655,7 +9655,7 @@ async def verify_failure_is_preexisting_on_main(
 
     The task worktree is NEVER mutated — all git ops target *config.project_root*
     (for worktree-level commands) and the detached probe path (for probe verify).
-    Cleanup (worktree remove --force + shutil.rmtree of the probe dir) always
+    Cleanup (worktree remove --force + remove_tree of the probe dir) always
     runs in a ``finally`` block.  No broad ``git worktree prune`` is issued so
     concurrently-active sibling probes are not disturbed.
 
@@ -9961,7 +9961,7 @@ async def run_main_tip_sweep(
     - Retry hits pytest INTERNALERROR or env_transient → return ``None``
       (infra, retry next tick).
 
-    Cleanup: scoped ``git worktree remove --force <tmp_path>`` + ``shutil.rmtree``
+    Cleanup: scoped ``git worktree remove --force <tmp_path>`` + ``remove_tree``
     always runs in a ``finally`` block.  NO broad ``git worktree prune`` (DD5
     guarantee: a broad prune would deregister concurrently-active sibling
     probe/merge worktrees).
