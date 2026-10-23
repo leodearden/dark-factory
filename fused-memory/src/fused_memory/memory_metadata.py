@@ -61,6 +61,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
+
 from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
 
 # Re-exported, NOT redefined (task 3198, leaf ε).  These are bound to the
@@ -98,6 +100,7 @@ __all__ = [
     'ParentHasChildrenError',
     'RESERVED_VOCABULARY_KEYS',
     'SERVER_STAMPED_KEYS',
+    'SUPERSEDED_BY_METADATA_KEY',
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
     'TRIAGE_CONTESTED_METADATA_KEY',
@@ -124,6 +127,9 @@ EXPERIMENTAL_KEY_PREFIX = 'x_'
 #: discards any value a caller supplies. Read by
 #: ``plans/write-triage-link-healing-prd.md`` H1 row 2.
 TRIAGE_CONTESTED_METADATA_KEY = f'{EXPERIMENTAL_KEY_PREFIX}contested_by_triage'
+
+# ``SUPERSEDED_BY_METADATA_KEY`` (imported above from ``shared.memory_supersession``)
+# is the server-stamped supersession mark.
 
 
 def normalize_supersedes(value: Any) -> list[Any]:
