@@ -514,9 +514,9 @@ def _incident_report() -> dict:
 
 
 def _conftest_rise(report: dict) -> None:
-    """The 52d98220ad shape, conftest.py 1172 -> 1187 lines and 752 -> 770 prose.
+    """The 52d98220ad size shape, conftest.py 1172 -> 1187 lines and 752 -> 770 prose.
 
-    Plus function_local_imports 7 -> 8.
+    Plus function_local_imports 7 -> 8, because size alone no longer raises.
     """
     report['files'][_CONFTEST].update(lines=1187, prose_lines=770, function_local_imports=8)
 
@@ -534,9 +534,10 @@ class TestRestoreCarveOut:
     a0fb5cc8e0fb1e9ce363c81538a350dbfc12c191. The measured shape is one step
     back: a0fb5cc8e0 was the value at b79315a31c, 5f577b9613 replaced it with
     0a42c2ee7d, and 3e7d55ce47 put a0fb5cc8e0 straight back --
-    `compare_baseline_files(0a42c2ee7d, a0fb5cc8e0)` measures 4 raises, so the
-    carve-out really does fire for it. Without it, undoing a revert would demand
-    a fresh authorization for a raise nobody re-introduced.
+    `compare_baseline_files(0a42c2ee7d, a0fb5cc8e0)` measured 4 raises while size
+    was still ratcheted, so the carve-out really did fire for it. Without it,
+    undoing a revert would demand a fresh authorization for a raise nobody
+    re-introduced.
 
     NOT "a blob this path ever carried", and not "already reviewed". Both were
     wrong and this class once said both. The images that motivated this task
@@ -1439,10 +1440,10 @@ class TestTheCarveOutIsOneStepBack:
         Measured on this repo's own history: `git rev-list --full-history` over
         the baseline shows blob a0fb5cc8e0 at b79315a31c, then 0a42c2ee7d
         introduced by 5f577b9613 (task 5668), then a0fb5cc8e0 restored by
-        3e7d55ce47. `compare_baseline_files(0a42c2ee7d, a0fb5cc8e0)` measures 4
-        raises -- conftest.py lines 1172->1187, prose_lines 752->770, and both
-        derived totals -- so the carve-out really does fire for it, and
-        narrowing the rule must not take that away.
+        3e7d55ce47. `compare_baseline_files(0a42c2ee7d, a0fb5cc8e0)` measured 4
+        raises while size was still ratcheted -- conftest.py lines 1172->1187,
+        prose_lines 752->770, and both derived totals -- so the carve-out really
+        did fire for it, and narrowing the rule must not take that away.
         """
         # PREVIOUS IS THE HIGHER IMAGE, matching the real revert: 5f577b9613
         # LOWERED the baseline and 3e7d55ce47 put the higher one back, so the

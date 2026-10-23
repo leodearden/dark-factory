@@ -9,8 +9,10 @@ guard it supersedes (``test_merge_queue_reachback_patch_guard.py`` carries its
 Ratchet contract
 ----------------
 ``orchestrator/tests/merge_lane_ratchet_baseline.json`` freezes every measure at
-its value on the commit that introduced it. The gate FAILS on any measure that
-rises above its baseline (ratchet semantics). Equality is permitted -- this is a
+its value on the commit that introduced it, except the two size measures
+(``metrics.REPORTED_ONLY_MEASURES``), which are reported but never ratcheted.
+The gate FAILS on any other measure that rises above its baseline (ratchet
+semantics). Equality is permitted -- this is a
 ratchet, not a day-one gate, and on the introducing commit 62 lane functions
 already exceed cognitive 15 and ``merge_queue.py`` is 21,550 lines. The two
 CEILINGS (1,500 lines per file, cognitive 15 per function) therefore apply only

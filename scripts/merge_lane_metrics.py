@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Measure the merge-lane cluster, and ratchet every measure against a committed baseline.
+"""Measure the merge-lane cluster, and ratchet its structure against a committed baseline.
 
 PRD ``plans/merge-lane-quality-prd.md`` task alpha. The measures are the ones
 the PRD's Background table quotes -- file lines and prose lines, per-function
 cognitive complexity, function-local (reach-back) imports, re-export shim names,
 distinct test patch targets into lane internals, and private-attribute reads
-from tests. The committed baseline lives at
-``orchestrator/tests/merge_lane_ratchet_baseline.json`` and the gate that
-enforces it is ``orchestrator/tests/test_merge_lane_ratchet.py``.
+from tests. The two size measures are measured and reported but never
+ratcheted (``REPORTED_ONLY_MEASURES``); every other one is. The committed
+baseline lives at ``orchestrator/tests/merge_lane_ratchet_baseline.json`` and
+the gate that enforces it is ``orchestrator/tests/test_merge_lane_ratchet.py``.
 
 Ratchet contract, and it has two sides. An UNAUTHORIZED raise is refused: by
 ``--check``, and decisively by ``--write-baseline`` itself, so a raise cannot be
@@ -145,7 +146,7 @@ CLUSTER_PATHS: tuple[str, ...] = (
 #: PRD decision 9: ``git_ops.py`` is the git engine for warm lanes, the
 #: scheduler and recovery -- not only the merge lane -- and its split is a
 #: follow-up PRD. The exemption is scoped to the CEILING alone: git_ops.py's
-#: 14,721 lines are still frozen by the ratchet, so they cannot grow unwatched.
+#: structural measures are still ratcheted, so they cannot grow unwatched.
 SIZE_CEILING_EXEMPT: frozenset[str] = frozenset(
     {'orchestrator/src/orchestrator/git_ops.py'}
 )
@@ -502,6 +503,16 @@ _SUMMED_FILE_MEASURES = (
     'reexport_names',
 )
 
+#: Measured, stored and printed by --report, never ratcheted: raw size steers
+#: toward deleting prose instead of rehoming it (docs/code-quality.md "Do not
+#: steer by"; PRD plans/review-all-s25-scripts-instruments-prd.md D10). `lines`
+#: stays stored because the new-file ceiling reads it.
+REPORTED_ONLY_MEASURES: frozenset[str] = frozenset({'lines', 'prose_lines'})
+
+_RATCHETED_FILE_MEASURES = tuple(
+    measure for measure in _SUMMED_FILE_MEASURES if measure not in REPORTED_ONLY_MEASURES
+)
+
 
 def derive_totals(report: dict) -> dict[str, int]:
     """Cluster-wide totals, DERIVED by summing *report*'s per-path maps.
@@ -510,10 +521,10 @@ def derive_totals(report: dict) -> dict[str, int]:
 
     Deriving rather than storing is what makes the ten parallel gamma branches
     rebase cleanly, AND it preserves the anti-rename-gaming property exactly. A
-    total computed by summing stored per-path baselines is unchanged when 500
-    lines move from ``merge_queue.py`` to a brand-new path, so the ratchet still
-    catches the move -- which a per-path-only comparison would not, since the
-    new path is simply absent from the baseline.
+    total computed by summing stored per-path baselines is unchanged when code
+    carrying 500 cognitive moves from ``merge_queue.py`` to a brand-new path, so
+    the ratchet still catches the move -- which a per-path-only comparison would
+    not, since the new path is simply absent from the baseline.
 
     ``patch_targets`` is the size of the UNION across files, matching the PRD's
     "distinct names" measure rather than a sum of per-file counts.
@@ -619,12 +630,13 @@ RAISE_REMEDY = (
 #: is about to "fix" rather than only in a docstring they will not open.
 BASELINE_README = (
     'This is a committed RATCHET BASELINE for the merge-lane cluster '
-    '(PRD plans/merge-lane-quality-prd.md, task alpha). Every measure here is '
-    'frozen at its value on the commit that recorded it: the gate '
-    'orchestrator/tests/test_merge_lane_ratchet.py FAILS on any measure that '
-    'RISES above these numbers. Equality is fine, lowering is the point. The '
-    'enumeration block below is the CLUSTER half only: the instrument also '
-    'sweeps every .py under '
+    '(PRD plans/merge-lane-quality-prd.md, task alpha). Every measure here '
+    f'except {" and ".join(sorted(REPORTED_ONLY_MEASURES))}, which are reported '
+    'but never ratcheted, is frozen at its value on the commit that recorded it: '
+    'the gate orchestrator/tests/test_merge_lane_ratchet.py FAILS on any such '
+    'measure that RISES above these numbers. Equality is fine, lowering is the '
+    'point. The enumeration block below is the CLUSTER half only: the '
+    'instrument also sweeps every .py under '
     'orchestrator/tests for the measures in the tests section, and that sweep '
     'is sized by --report rather than ratcheted here, so an unrelated test file '
     'arriving never touches these bytes.\n'
@@ -1433,7 +1445,7 @@ def _check_files(current: dict, baseline: dict) -> list[Violation]:
             # Not a per-path violation -- lowering is the point -- and the
             # derived totals are what catch a move that only relocated the mass.
             continue
-        for measure in _SUMMED_FILE_MEASURES:
+        for measure in _RATCHETED_FILE_MEASURES:
             was, now = int(base_entry.get(measure, 0)), int(entry.get(measure, 0))
             if now > was:
                 violations.append(Violation.rose(measure, path, was, now))
@@ -1477,7 +1489,7 @@ def _check_totals(current: dict, baseline: dict) -> list[Violation]:
     return [
         _total_violation(measure, was, current_totals[measure])
         for measure, was in sorted(baseline_totals.items())
-        if current_totals.get(measure, 0) > was
+        if measure not in REPORTED_ONLY_MEASURES and current_totals.get(measure, 0) > was
     ]
 
 
@@ -1758,8 +1770,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             'Measure the merge-lane cluster (PRD plans/merge-lane-quality-prd.md '
-            'task alpha) and ratchet every measure against the committed '
-            'baseline. READ-ONLY except under --write-baseline.'
+            'task alpha) and ratchet its structural measures against the '
+            'committed baseline. READ-ONLY except under --write-baseline.'
         ),
         epilog=(
             'Exit codes: 0 clean; 1 ratchet violations (a measure rose above '
