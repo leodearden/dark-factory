@@ -230,3 +230,55 @@ class TestRenameProbeReadsTheDeclaredPathsPair:
         )
 
         assert result.resolved_renames == {'pkg/before.py': 'pkg/after.py'}
+
+
+_BASE_MODULE = ''.join(f'line{i}\n' for i in range(1, 41))
+
+
+@pytest.mark.asyncio
+class TestRenameCycleThroughMergeHistory:
+    """A rename chain that revisits a path (reachable only across a merge) stops at the revisit."""
+
+    async def test_cycle_stops_at_the_revisited_path_and_falls_back_to_the_hop_basename(
+        self, git_repo: Path, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        _commit(git_repo, {'pkg/x.py': _BASE_MODULE}, 'add x')
+        r1 = _mv(git_repo, 'pkg/x.py', 'pkg/a.py', 'x -> a')
+        _git(git_repo, 'checkout', '-q', '-b', 'cyc-p', r1)
+        p1 = _mv(git_repo, 'pkg/a.py', 'pkg/b.py', 'p: a -> b')
+        _git(git_repo, 'checkout', '-q', '-b', 'cyc-q', r1)
+        _mv(git_repo, 'pkg/a.py', 'pkg/b.py', 'q: a -> b')
+        q2 = _mv(git_repo, 'pkg/b.py', 'pkg/a.py', 'q: b -> a')
+        _git(git_repo, 'checkout', '-q', 'cyc-p')
+        _git(git_repo, 'merge', '--no-ff', '--no-commit', 'cyc-q')
+        _git(git_repo, 'rm', '-q', '-f', '--ignore-unmatch', 'pkg/a.py', 'pkg/b.py')
+        merge = _commit(
+            git_repo, {'moved/b.py': _BASE_MODULE}, 'merge: drop both, keep moved/b.py',
+        )
+        head = _commit(
+            git_repo, {'moved/b.py': _BASE_MODULE + 'edited\n'}, 'edit moved/b.py',
+        )
+
+        def deleting_commit(path: str) -> str:
+            return _git(git_repo, 'log', '--diff-filter=D', '-1', '--format=%H', head, '--', path)
+
+        assert _git(git_repo, 'rev-parse', f'{merge}^1', f'{merge}^2').split() == [p1, q2]
+        assert deleting_commit('pkg/x.py') == r1
+        assert deleting_commit('pkg/a.py') == p1
+        assert deleting_commit('pkg/b.py') == q2
+        assert _git(
+            git_repo, 'show', '--name-status', '-M', '--format=', q2,
+        ) == 'R100\tpkg/b.py\tpkg/a.py'
+
+        with caplog.at_level(logging.WARNING, logger=LANE_LOGGER):
+            result = await _check_plan_files_touched_in_branch(
+                ['pkg/x.py'], merge, head, git_ops, task_id=TASK,
+            )
+
+        assert result.not_touched == []
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {'pkg/x.py': 'moved/b.py'}
+        assert (
+            'via unique basename match on pkg/b.py (after 2-hop rename chain);'
+            in _record(caplog, 'resolved to')
+        )
