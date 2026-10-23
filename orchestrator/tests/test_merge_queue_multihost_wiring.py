@@ -17,22 +17,23 @@ Covers:
 import asyncio
 import contextlib
 import logging
-from typing import TypeGuard, cast
+from pathlib import Path
+from typing import Any, TypeGuard, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _gate_fixtures import TEST_DEPLOYED_SHA, gated_remote_runner
-from _merge_lane_fakes import FakeVerifier, hangs_until, raises
+from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until, raises
 from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.deployed_sha import DeployedSha
 from orchestrator.event_store import EventStore
 from orchestrator.merge_lane.types import QueuedBranch
-from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
+from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER, SpeculativeMergeWorker
 from orchestrator.remote_gate import RunnerUnavailableKind
 from orchestrator.verify import VerifyResult
-from orchestrator.verify_runner import HostAllocator, RemoteRunner
+from orchestrator.verify_runner import HostAllocator, HostLease, RemoteRunner, RunnerUnavailable
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1873,148 +1874,8 @@ class TestRunInflightVerifyThreadsEscalationQueue:
 
 
 # ---------------------------------------------------------------------------
-# 1795/step-5 RED: per-host unavailability tracker on the worker
-# ---------------------------------------------------------------------------
-
-
-class TestRunnerUnavailableTracker:
-    """Per-host streak tracker _record_runner_unavailable / _record_runner_recovered.
-
-    RED until step-6 GREEN adds _HostUnavailability, _runner_unavailable dict,
-    and the two methods to SpeculativeMergeWorker.
-    """
-
-    def _make_worker(self, *, escalate_after_n=2):
-        import asyncio
-        from unittest.mock import MagicMock
-
-        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
-
-        git_ops = MagicMock()
-        git_ops.project_root = None
-        q: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
-        # Override threshold to a small value (test-overridable attr)
-        worker._unreachable_escalate_after_n = escalate_after_n
-        return worker
-
-    def test_first_call_sets_streak_one_and_returns_false_below_threshold(self):
-        """First _record_runner_unavailable call: streak=1, returns False when N=2."""
-        import time
-        worker = self._make_worker(escalate_after_n=2)
-        now = time.time()
-        # RED: AttributeError until the method is added
-        result = worker._record_runner_unavailable('host1', 'ssh timeout', now)
-        assert result is False  # streak=1 < N=2
-
-    def test_first_call_stores_first_unavailable_at(self):
-        """first_unavailable_at is set to `now` on the first call."""
-        import time
-        worker = self._make_worker(escalate_after_n=3)
-        now = time.time()
-        worker._record_runner_unavailable('host1', 'ssh error', now)
-        entry = worker._runner_unavailable['host1']
-        assert entry.first_unavailable_at == now
-
-    def test_first_call_stores_reason(self):
-        """reason is stored in the tracker entry on first call."""
-        import time
-        worker = self._make_worker(escalate_after_n=3)
-        now = time.time()
-        worker._record_runner_unavailable('host1', 'Connection refused', now)
-        entry = worker._runner_unavailable['host1']
-        assert entry.reason == 'Connection refused'
-
-    def test_repeated_calls_increment_streak_keep_first_at_fixed(self):
-        """Repeated calls increment streak; first_unavailable_at is NOT updated."""
-        import time
-        worker = self._make_worker(escalate_after_n=5)
-        t0 = time.time()
-        worker._record_runner_unavailable('host1', 'err', t0)
-        t1 = t0 + 30.0
-        worker._record_runner_unavailable('host1', 'err2', t1)
-        t2 = t0 + 60.0
-        worker._record_runner_unavailable('host1', 'err3', t2)
-        entry = worker._runner_unavailable['host1']
-        assert entry.streak == 3
-        assert entry.first_unavailable_at == t0  # unchanged
-
-    def test_returns_true_exactly_when_streak_reaches_n(self):
-        """Returns True (should-escalate) on the call that reaches streak==N."""
-        import time
-        worker = self._make_worker(escalate_after_n=3)
-        t = time.time()
-        r1 = worker._record_runner_unavailable('host1', 'e', t)
-        r2 = worker._record_runner_unavailable('host1', 'e', t + 1)
-        r3 = worker._record_runner_unavailable('host1', 'e', t + 2)  # streak=3 == N
-        assert r1 is False
-        assert r2 is False
-        assert r3 is True
-
-    def test_returns_true_again_beyond_n(self):
-        """Returns True for every call once streak >= N (persistent alarm condition)."""
-        import time
-        worker = self._make_worker(escalate_after_n=2)
-        t = time.time()
-        worker._record_runner_unavailable('host1', 'e', t)      # streak=1 False
-        r2 = worker._record_runner_unavailable('host1', 'e', t + 1)  # streak=2 True
-        r3 = worker._record_runner_unavailable('host1', 'e', t + 2)  # streak=3 True
-        assert r2 is True
-        assert r3 is True
-
-    def test_recovered_clears_tracker_state(self):
-        """_record_runner_recovered removes the host entry; next call starts fresh."""
-        import time
-        worker = self._make_worker(escalate_after_n=3)
-        t = time.time()
-        worker._record_runner_unavailable('host1', 'err', t)
-        worker._record_runner_unavailable('host1', 'err', t + 1)
-
-        worker._record_runner_recovered('host1')
-
-        assert 'host1' not in worker._runner_unavailable
-
-    def test_recovered_idempotent_on_absent_host(self):
-        """_record_runner_recovered on a host that was never tracked is a no-op."""
-        worker = self._make_worker()
-        # Should not raise
-        worker._record_runner_recovered('ghost-host')
-
-    def test_recovered_allows_fresh_episode(self):
-        """After recovery, a new failure starts a fresh streak (first_unavailable_at resets)."""
-        import time
-        worker = self._make_worker(escalate_after_n=3)
-        t0 = time.time()
-        worker._record_runner_unavailable('host1', 'err', t0)
-        worker._record_runner_unavailable('host1', 'err', t0 + 1)
-
-        worker._record_runner_recovered('host1')
-
-        t1 = t0 + 100.0
-        r = worker._record_runner_unavailable('host1', 'new err', t1)
-        assert r is False  # streak=1 < N=3
-        entry = worker._runner_unavailable['host1']
-        assert entry.streak == 1
-        assert entry.first_unavailable_at == t1  # fresh episode
-
-    def test_independent_hosts_tracked_separately(self):
-        """Two different hosts maintain independent streak counters."""
-        import time
-        worker = self._make_worker(escalate_after_n=3)
-        t = time.time()
-        worker._record_runner_unavailable('host1', 'e', t)
-        worker._record_runner_unavailable('host1', 'e', t + 1)  # host1 streak=2
-        worker._record_runner_unavailable('host2', 'e', t)      # host2 streak=1
-
-        worker._record_runner_recovered('host1')
-
-        assert 'host1' not in worker._runner_unavailable
-        assert 'host2' in worker._runner_unavailable
-        assert worker._runner_unavailable['host2'].streak == 1
-
-
-# ---------------------------------------------------------------------------
-# 1795/step-7 RED: _alarm_verify_host_unreachable module-level helper
+# Escalation-queue doubles, and the host-bench scene the bench/reprobe
+# classes drive the worker through (task 5453)
 # ---------------------------------------------------------------------------
 
 
@@ -2048,6 +1909,178 @@ class _FakeEscalationQueue:
     def open_it(self):
         """Simulate a prior open L1 (for dedup tests)."""
         self._open_l1 = True
+
+
+class _FakeEscalationQueueWithResolution(_FakeEscalationQueue):
+    """Extends _FakeEscalationQueue to support get_by_task / resolve for recovery tests."""
+
+    def __init__(self, *, open_l1: bool = False):
+        super().__init__(open_l1=open_l1)
+        # Map from task_id → list of fake pending escalation SimpleNamespace objects
+        self._by_task: dict = {}
+        self.resolved: list = []  # list of (escalation_id, resolution) pairs
+
+    def seed_pending_l1(self, task_id: str, esc_id: str = 'esc-1001') -> None:
+        """Pre-seed a pending L1 escalation for the given task_id."""
+        from types import SimpleNamespace
+        esc = SimpleNamespace(id=esc_id, task_id=task_id, status='pending', level=1)
+        self._by_task.setdefault(task_id, []).append(esc)
+        # Mark the queue as having an open L1 so has_open_l1 returns True
+        self._open_l1 = True
+
+    def get_by_task(self, task_id: str, status: str | None = None) -> list:
+        escs = list(self._by_task.get(task_id, []))
+        if status is not None:
+            escs = [e for e in escs if e.status == status]
+        return escs
+
+    def resolve(self, escalation_id: str, resolution: str, **kwargs) -> None:
+        self.resolved.append((escalation_id, resolution))
+        # Update the in-memory status so subsequent get_by_task(status='pending') sees 0
+        for escs in self._by_task.values():
+            for e in escs:
+                if e.id == escalation_id:
+                    e.status = 'resolved'
+        # Once resolved, has_open_l1 should return False
+        self._open_l1 = False
+
+
+class _DedupingEscalationQueue(_FakeEscalationQueue):
+    """has_open_l1 reflects what was actually submitted (real-queue dedup shape).
+
+    The plain _FakeEscalationQueue returns a STATIC bool, which cannot express
+    "one alarm per downtime episode"; this variant answers from ``submitted``
+    so a repeat call past the threshold is deduped exactly as the live queue
+    would dedup it.
+    """
+
+    def has_open_l1(self, task_id: str) -> bool:
+        return self._open_l1 or any(e.task_id == task_id for e in self.submitted)
+
+
+class _DefaultEscalationQueue:
+    """Sentinel for ``escalation_queue=`` on ``_make_ru_worker`` and
+    ``_HostBenchScene``: build the caller's fresh default queue.  Distinct from
+    ``None``, which is a meaningful choice (the worker gets no sink at all)."""
+
+
+_DEFAULT_EQ = _DefaultEscalationQueue()
+
+
+async def _noop_sleep(_delay):
+    """Injected sleep so the real probe loop runs synchronously."""
+    return None
+
+
+class _HostBenchScene:
+    """A bare merge worker that benches, re-probes and re-admits remotes for real.
+
+    The remotes go in through ``remote_runners=`` and the worker builds its own
+    HostAllocator from them, on its own quarantine set; the clock, the event
+    store and the escalation queue go in as constructor keywords too.  A test
+    drives the worker through ``bench_unavailable_runner`` and ``readmit_host``
+    and reads it back through ``snapshot()['hosts']``, the escalation queue,
+    the event store and the log.
+
+    The worker publishes neither its lazy allocator build nor a single reprobe
+    sweep, so ``build`` and ``sweep`` are the only places those two private
+    names are touched; ``place`` puts an allocator double in the worker, for
+    the tests that pin its fallbacks for non-HostAllocator doubles.  Same shape
+    as test_verify_host_skew_bench.py::_Scene.
+    """
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        remotes: tuple[str, ...] = ('leo-laptop',),
+        escalation_queue: Any = _DEFAULT_EQ,
+        escalate_after_n: int = 3,
+        escalate_after_secs: float = 600.0,
+        build: bool = True,
+    ) -> None:
+        self.clock = FakeClock()
+        self.runners = {name: _runner_double(name, is_local=False) for name in remotes}
+        self.events = _RecordingEventStore()
+        self.eq = (
+            _FakeEscalationQueueWithResolution()
+            if isinstance(escalation_queue, _DefaultEscalationQueue)
+            else escalation_queue
+        )
+        git_ops = _make_git_ops_mock()
+        git_ops.project_root = tmp_path
+        self.config = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_host_unreachable_escalate_after_n=escalate_after_n,
+            verify_host_unreachable_escalate_after_secs=escalate_after_secs,
+            verify_host_reprobe_interval_s=120.0,
+        )
+        self.worker = SpeculativeMergeWorker(
+            git_ops=git_ops, queue=asyncio.Queue(), event_store=self.events,
+            escalation_queue=self.eq, clock=self.clock,
+            remote_runners=list(self.runners.values()),
+        )
+        self._allocator: HostAllocator | None = self.build() if build else None
+
+    @property
+    def allocator(self) -> HostAllocator:
+        assert self._allocator is not None, 'scene made with build=False: call build() first'
+        return self._allocator
+
+    def build(self) -> HostAllocator:
+        """Build the worker's allocator, as its first verify dispatch would."""
+        self._allocator = self.worker._ensure_host_allocator(self.config)
+        return self._allocator
+
+    def place(self, alloc: HostAllocator) -> None:
+        """Put *alloc* in the worker, in place of the one it would build."""
+        self.worker._host_allocator = alloc
+
+    def bench(
+        self, host: str, reason: str = 'ssh: connect refused', *,
+        kind: RunnerUnavailableKind = 'transport',
+    ) -> None:
+        self.worker.bench_unavailable_runner(host, RunnerUnavailable(reason, kind=kind))
+
+    async def sweep(self, *, advance: float = 0.0) -> None:
+        """One reprobe sweep, *advance* seconds on: what ``_reprobe_loop`` runs."""
+        self.clock.time += advance
+        await self.worker._reprobe_quarantined_hosts(self.clock.now())
+
+    def host(self, name: str) -> dict[str, Any]:
+        """*name*'s ``snapshot()['hosts']`` entry, aged on the scene clock."""
+        [entry] = [h for h in self.worker.snapshot()['hosts'] if h['name'] == name]
+        return entry
+
+    def tracked(self, name: str) -> bool:
+        return self.host(name)['streak'] is not None
+
+    async def park(self, name: str) -> None:
+        """Leave remote *name*'s slot PARKED, as a cancel that fails against it does.
+
+        Park before benching: a quarantined host cannot be acquired.
+        """
+        lease = self._take(name)
+        runner = self.runners[name]
+        runner.cancel_verify = AsyncMock(return_value=1)
+        runner.probe_clean = AsyncMock(return_value=False)
+        await self.allocator.cancel_and_release(lease, sleep=_noop_sleep, max_attempts=1)
+
+    async def diverge(self, name: str) -> None:
+        """Quarantine remote *name* with no bench, as a verdict divergence does."""
+        await self.allocator.quarantine_and_release(self._take(name))
+
+    def _take(self, name: str) -> HostLease:
+        lease = self.allocator.acquire_remote()
+        assert lease is not None and lease.name == name, (
+            f'{name!r} is not the first free remote: got {lease}'
+        )
+        return lease
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-7 RED: _alarm_verify_host_unreachable module-level helper
+# ---------------------------------------------------------------------------
 
 
 class _FakeEventStore:
@@ -2291,15 +2324,6 @@ class TestAlarmVerifyWorktreeContention:
 # keyword args on ``_make_ru_entry`` (``merge_wt`` so a caller can supply a REAL
 # directory — MagicMock has no mtime for os.utime / no Path.resolve() — and
 # ``spec_warm`` so the warm ``_spec-``-lane RU case can be constructed).
-
-
-class _DefaultEscalationQueue:
-    """Sentinel for ``_make_ru_worker(escalation_queue=...)``: build a fresh
-    ``_FakeEscalationQueue``.  Distinct from ``None``, which is a meaningful
-    choice (the worker gets no sink at all)."""
-
-
-_DEFAULT_EQ = _DefaultEscalationQueue()
 
 
 def _make_ru_worker(*, escalate_after_n=2, escalation_queue=_DEFAULT_EQ):
@@ -2840,40 +2864,6 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
 # ---------------------------------------------------------------------------
 # 1795/step-11 RED: _clear_verify_host_unreachable module-level helper
 # ---------------------------------------------------------------------------
-
-
-class _FakeEscalationQueueWithResolution(_FakeEscalationQueue):
-    """Extends _FakeEscalationQueue to support get_by_task / resolve for recovery tests."""
-
-    def __init__(self, *, open_l1: bool = False):
-        super().__init__(open_l1=open_l1)
-        # Map from task_id → list of fake pending escalation SimpleNamespace objects
-        self._by_task: dict = {}
-        self.resolved: list = []  # list of (escalation_id, resolution) pairs
-
-    def seed_pending_l1(self, task_id: str, esc_id: str = 'esc-1001') -> None:
-        """Pre-seed a pending L1 escalation for the given task_id."""
-        from types import SimpleNamespace
-        esc = SimpleNamespace(id=esc_id, task_id=task_id, status='pending', level=1)
-        self._by_task.setdefault(task_id, []).append(esc)
-        # Mark the queue as having an open L1 so has_open_l1 returns True
-        self._open_l1 = True
-
-    def get_by_task(self, task_id: str, status: str | None = None) -> list:
-        escs = list(self._by_task.get(task_id, []))
-        if status is not None:
-            escs = [e for e in escs if e.status == status]
-        return escs
-
-    def resolve(self, escalation_id: str, resolution: str, **kwargs) -> None:
-        self.resolved.append((escalation_id, resolution))
-        # Update the in-memory status so subsequent get_by_task(status='pending') sees 0
-        for escs in self._by_task.values():
-            for e in escs:
-                if e.id == escalation_id:
-                    e.status = 'resolved'
-        # Once resolved, has_open_l1 should return False
-        self._open_l1 = False
 
 
 class TestClearVerifyHostUnreachable:
@@ -4239,9 +4229,8 @@ class TestReprobeCompatAndErrorPaths:
         )
 
 
-@pytest.mark.asyncio
 class TestLocalQuarantineIsLoud:
-    """`_quarantine_unreachable_host` never quarantines local — but never silently.
+    """The RU chokepoint never quarantines local — but never silently.
 
     Task 3043 amend (reviewer robustness finding).  The pre-3043
     ``_finalize_inflight`` RUNNER_UNAVAILABLE path called
@@ -4249,26 +4238,16 @@ class TestLocalQuarantineIsLoud:
     Routing through the chokepoint made a local RU produce no tracker entry, no
     alarm and no log line at all — the trust anchor reporting itself unavailable
     would simply vanish, which the repo's loud-over-silent norm and the
-    no-silent-fail-soft design invariant rule out.
+    no-silent-fail-soft design invariant rule out.  That local stays out of
+    quarantine and the tracker is pinned by
+    TestQuarantineUnreachableHostChokepoint::test_local_host_is_a_noop.
     """
 
-
-    async def test_local_host_is_still_a_state_noop(self, caplog):
-        """The never-quarantine-local rule is unchanged."""
-        worker, _eq = make_reprobe_worker()
+    def test_local_host_emits_one_warning(self, tmp_path, caplog):
+        scene = _HostBenchScene(tmp_path)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
-            worker._quarantine_unreachable_host('local', 'boom', 1000.0)
-
-        assert worker._runner_quarantine == set()
-        assert worker._runner_unavailable == {}
-
-    async def test_local_host_emits_one_warning(self, caplog):
-        """…but the event is greppable instead of vanishing."""
-        worker, _eq = make_reprobe_worker()
-
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
-            worker._quarantine_unreachable_host('local', 'ssh: connect refused', 1000.0)
+            scene.bench('local', 'ssh: connect refused')
 
         warns = [
             r for r in caplog.records
@@ -4280,25 +4259,20 @@ class TestLocalQuarantineIsLoud:
         assert 'local' in warns[0].args
         assert 'ssh: connect refused' in warns[0].args
 
-    async def test_a_custom_local_name_is_also_recognised(self, caplog):
+    def test_a_custom_local_name_is_also_recognised(self, tmp_path, caplog):
         """The guard reads the allocator's local_name, not a hard-coded 'local'."""
-        from orchestrator.verify_runner import HostAllocator
-
-        worker, _eq = make_reprobe_worker()
-        worker._host_allocator = HostAllocator(
-            [], quarantine=worker._runner_quarantine, local_name='anchor-01',
-        )
+        scene = _HostBenchScene(tmp_path, build=False)
+        scene.place(HostAllocator([], local_name='anchor-01'))
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
-            worker._quarantine_unreachable_host('anchor-01', 'boom', 1000.0)
+            scene.bench('anchor-01', 'boom')
 
-        assert worker._runner_quarantine == set()
-        assert worker._runner_unavailable == {}
+        host = scene.host('anchor-01')
+        assert (host['is_local'], host['streak']) == (True, None)
         assert [
             r for r in caplog.records
             if r.name == 'orchestrator.merge_lane' and r.levelno >= logging.WARNING
         ]
-
 
 
 # ---------------------------------------------------------------------------
@@ -4388,184 +4362,209 @@ class TestRunPostMergeVerifyRemoteStderrWiring:
 # ---------------------------------------------------------------------------
 
 
-class _DedupingEscalationQueue(_FakeEscalationQueue):
-    """has_open_l1 reflects what was actually submitted (real-queue dedup shape).
-
-    The plain _FakeEscalationQueue returns a STATIC bool, which cannot express
-    "one alarm per downtime episode"; this variant answers from ``submitted``
-    so a repeat call past the threshold is deduped exactly as the live queue
-    would dedup it.
-    """
-
-    def has_open_l1(self, task_id: str) -> bool:
-        return self._open_l1 or any(e.task_id == task_id for e in self.submitted)
-
-
 class TestQuarantineUnreachableHostChokepoint:
-    """_quarantine_unreachable_host: one place that quarantines AND records (task 3043).
+    """bench_unavailable_runner: one place that quarantines AND records (tasks 1795, 3043).
 
     INV-A — a host is never removed from the acquirable pool for an
     unreachability reason without a ``_runner_unavailable`` entry, because
     ``_reprobe_quarantined_hosts`` can only re-adopt hosts it can see in the
-    tracker.  Today three paths violate that (an orphaned verify task's
+    tracker.  Three paths used to violate that (an orphaned verify task's
     escaping RunnerUnavailable, a cancel_and_release that PARKs the slot, and
     any future quarantine site that forgets to record), each stranding a host
     out of the verify pool until an orchestrator restart.
 
-    RED until 3043/step-6 adds the method (AttributeError before that).
+    The tracker entry is read back as the host's ``snapshot()['hosts']`` fields
+    (``streak``, ``unavailable_since``, ``reason``), and its should-escalate
+    answer as an L1 on the injected queue.
     """
-
-    def _real_allocator_worker(self, *, escalate_after_n=2, remotes=('leo-laptop',)):
-        """_make_ru_worker but with a REAL HostAllocator sharing the worker's set.
-
-        Needed for the _host_states_block cross-check, which is gated on
-        ``isinstance(self._host_allocator, HostAllocator)`` (task 3275).
-        """
-        worker, eq, _fake = _make_ru_worker(escalate_after_n=escalate_after_n)
-        runners = [MagicMock(name=n, is_local=False) for n in remotes]
-        for r, n in zip(runners, remotes, strict=True):
-            r.name = n
-        worker._host_allocator = HostAllocator(
-            runners, quarantine=worker._runner_quarantine,
-        )
-        return worker, eq
 
     # -- (a) quarantines ------------------------------------------------------
 
-    def test_adds_host_to_runner_quarantine(self):
-        """The host lands in the set shared by reference with the allocator."""
-        worker, _eq, _alloc = _make_ru_worker()
-        worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', 1000.0)
-        assert 'leo-laptop' in worker._runner_quarantine
+    def test_adds_host_to_runner_quarantine(self, tmp_path):
+        scene = _HostBenchScene(tmp_path)
+        scene.bench('leo-laptop', 'ssh timeout')
+        assert scene.host('leo-laptop')['quarantined'] is True
 
-    def test_quarantine_takes_effect_on_acquire_remote_without_restart(self):
+    def test_quarantine_takes_effect_on_acquire_remote_without_restart(self, tmp_path):
         """Because the set is shared by reference, acquire_remote skips it at once."""
-        worker, _eq = self._real_allocator_worker(remotes=('leo-laptop', 'spare'))
-        worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', 1000.0)
-        assert worker._host_allocator is not None
-        lease = worker._host_allocator.acquire_remote()
+        scene = _HostBenchScene(tmp_path, remotes=('leo-laptop', 'spare'))
+        scene.bench('leo-laptop', 'ssh timeout')
+        lease = scene.allocator.acquire_remote()
         assert lease is not None and lease.name == 'spare'
 
-    # -- (b) records, delegating to the shared streak tracker ------------------
+    # -- (b) records, in the streak tracker the RU finalize path shares --------
 
-    def test_creates_tracker_entry_with_streak_one(self):
-        """First call creates a _HostUnavailability with streak=1 and the reason."""
-        worker, _eq, _alloc = _make_ru_worker()
-        worker._quarantine_unreachable_host('leo-laptop', 'ssh: connect timed out', 1000.0)
+    def test_creates_tracker_entry_with_streak_one(self, tmp_path):
+        scene = _HostBenchScene(tmp_path)
+        scene.clock.time = 1000.0
+        scene.bench('leo-laptop', 'ssh: connect timed out')
 
-        entry = worker._runner_unavailable.get('leo-laptop')
-        assert entry is not None
-        assert entry.streak == 1
-        assert entry.first_unavailable_at == 1000.0
-        assert entry.reason == 'ssh: connect timed out'
+        host = scene.host('leo-laptop')
+        assert host['streak'] == 1
+        assert host['unavailable_since'] == 1000.0
+        assert host['reason'] == 'ssh: connect timed out'
 
-    def test_second_call_increments_streak_and_pins_first_seen(self):
-        """Streak semantics are SHARED with the existing RU path (delegation)."""
-        worker, _eq, _alloc = _make_ru_worker()
-        worker._quarantine_unreachable_host('leo-laptop', 'first', 1000.0)
-        worker._quarantine_unreachable_host('leo-laptop', 'second', 1500.0)
+    def test_second_call_increments_streak_and_pins_first_seen(self, tmp_path):
+        scene = _HostBenchScene(tmp_path)
+        scene.clock.time = 1000.0
+        scene.bench('leo-laptop', 'first')
+        scene.clock.time = 1500.0
+        scene.bench('leo-laptop', 'second')
 
-        entry = worker._runner_unavailable['leo-laptop']
-        assert entry.streak == 2
-        assert entry.first_unavailable_at == 1000.0   # fixed at the episode start
-        assert entry.reason == 'second'               # refreshed to the latest
+        host = scene.host('leo-laptop')
+        assert host['streak'] == 2
+        assert host['unavailable_since'] == 1000.0   # fixed at the episode start
+        assert host['reason'] == 'second'            # refreshed to the latest
+
+    def test_two_hosts_are_tracked_independently(self, tmp_path):
+        scene = _HostBenchScene(tmp_path, remotes=('host1', 'host2'))
+        scene.bench('host1')
+        scene.bench('host1')
+        scene.bench('host2')
+
+        scene.worker.readmit_host('host1', now=scene.clock.now())
+
+        assert scene.tracked('host1') is False
+        assert scene.host('host2')['streak'] == 1
+
+    # -- a readmit ends the episode --------------------------------------------
+
+    def test_a_readmit_drops_the_entry_and_returns_the_host(self, tmp_path):
+        scene = _HostBenchScene(tmp_path)
+        scene.bench('leo-laptop')
+        scene.bench('leo-laptop')
+
+        assert scene.worker.readmit_host('leo-laptop', now=scene.clock.now()) is True
+
+        host = scene.host('leo-laptop')
+        assert (host['streak'], host['quarantined']) == (None, False)
+
+    def test_readmitting_a_never_benched_host_is_a_safe_noop(self, tmp_path):
+        scene = _HostBenchScene(tmp_path)
+
+        scene.worker.readmit_host('ghost-host', now=scene.clock.now())
+
+        assert [h['name'] for h in scene.worker.snapshot()['hosts']] == ['local', 'leo-laptop']
+        assert scene.eq.submitted == []
+
+    def test_a_bench_after_a_readmit_opens_a_fresh_episode(self, tmp_path):
+        scene = _HostBenchScene(tmp_path)
+        scene.clock.time = 1000.0
+        scene.bench('leo-laptop')
+        scene.bench('leo-laptop')
+        scene.worker.readmit_host('leo-laptop', now=scene.clock.now())
+
+        scene.clock.time = 1100.0
+        scene.bench('leo-laptop', 'new err')
+
+        host = scene.host('leo-laptop')
+        assert (host['streak'], host['unavailable_since']) == (1, 1100.0)
+        assert scene.eq.submitted == []
 
     # -- (c) exactly one dedup'd L1 at the threshold ---------------------------
 
-    def test_no_escalation_below_threshold(self):
-        """Below escalate_after_n nothing is submitted."""
-        worker, eq, _alloc = _make_ru_worker(escalate_after_n=2)
-        worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', 1000.0)
-        assert eq.submitted == []
+    def test_no_escalation_below_threshold(self, tmp_path):
+        scene = _HostBenchScene(tmp_path, escalate_after_n=2)
+        scene.bench('leo-laptop', 'ssh timeout')
+        assert scene.eq.submitted == []
 
-    def test_one_escalation_at_threshold(self):
-        """Reaching the streak threshold submits exactly one L1."""
-        worker, eq, _alloc = _make_ru_worker(escalate_after_n=2)
-        worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', 1000.0)
-        worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', 1060.0)
+    def test_one_escalation_at_threshold(self, tmp_path):
+        scene = _HostBenchScene(tmp_path, escalate_after_n=2)
+        scene.clock.time = 1000.0
+        scene.bench('leo-laptop', 'ssh timeout')
+        scene.clock.time = 1060.0
+        scene.bench('leo-laptop', 'ssh timeout')
 
-        assert len(eq.submitted) == 1
-        esc = eq.submitted[0]
+        assert len(scene.eq.submitted) == 1
+        esc = scene.eq.submitted[0]
         assert esc.category == 'verify_host_unreachable'
         assert esc.level == 1
         assert 'leo-laptop' in esc.summary
 
-    def test_no_second_escalation_while_one_is_open(self):
+    def test_every_bench_from_the_nth_on_asks_for_the_alarm(self, tmp_path):
+        """The tracker asks to alarm whenever streak >= N; dedup is the queue's job.
+
+        A queue whose has_open_l1 is a static False takes every request.
+        """
+        eq = _FakeEscalationQueue(open_l1=False)
+        scene = _HostBenchScene(tmp_path, escalation_queue=eq, escalate_after_n=3)
+
+        filed = []
+        for _ in range(4):
+            scene.bench('leo-laptop')
+            filed.append(len(eq.submitted))
+
+        assert filed == [0, 0, 1, 2]
+
+    def test_no_second_escalation_while_one_is_open(self, tmp_path):
         """Dedup via has_open_l1 — one alarm per downtime episode."""
         eq = _DedupingEscalationQueue(open_l1=False)
-        worker, _eq, _alloc = _make_ru_worker(escalate_after_n=2, escalation_queue=eq)
+        scene = _HostBenchScene(tmp_path, escalation_queue=eq, escalate_after_n=2)
 
         for t in (1000.0, 1060.0, 1120.0, 1180.0):
-            worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', t)
+            scene.clock.time = t
+            scene.bench('leo-laptop', 'ssh timeout')
 
         assert len(eq.submitted) == 1
-        assert worker._runner_unavailable['leo-laptop'].streak == 4
+        assert scene.host('leo-laptop')['streak'] == 4
 
-    def test_escalation_duration_measured_from_first_failure(self):
+    def test_escalation_duration_measured_from_first_failure(self, tmp_path):
         """duration_s is now - first_unavailable_at, not a fresh clock read."""
-        worker, eq, _alloc = _make_ru_worker(escalate_after_n=2)
-        worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', 1000.0)
-        worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', 1000.0 + 7200.0)
+        scene = _HostBenchScene(tmp_path, escalate_after_n=2)
+        scene.clock.time = 1000.0
+        scene.bench('leo-laptop', 'ssh timeout')
+        scene.clock.time = 1000.0 + 7200.0
+        scene.bench('leo-laptop', 'ssh timeout')
 
-        assert len(eq.submitted) == 1
+        assert len(scene.eq.submitted) == 1
         # 7200 s == 2.0 h — the alarm helper renders >= 1 h in hours.
-        assert '2.0 h' in eq.submitted[0].summary
+        assert '2.0 h' in scene.eq.submitted[0].summary
 
     # -- (d) local is never quarantined ----------------------------------------
 
-    def test_local_host_is_a_noop(self):
-        """Local is the trust anchor: never quarantined, never tracked."""
-        worker, eq, _alloc = _make_ru_worker()
-        worker._quarantine_unreachable_host('local', 'ssh timeout', 1000.0)
+    def test_local_host_is_a_noop(self, tmp_path):
+        """Local is the trust anchor: never quarantined, tracked or alarmed for."""
+        scene = _HostBenchScene(tmp_path, escalate_after_n=1)
+        scene.bench('local', 'ssh timeout')
 
-        assert worker._runner_quarantine == set()
-        assert worker._runner_unavailable == {}
-        assert eq.submitted == []
-
-    def test_local_host_is_a_noop_with_real_allocator(self):
-        """The local name is resolved from the allocator when one is present."""
-        worker, eq = self._real_allocator_worker()
-        worker._quarantine_unreachable_host('local', 'ssh timeout', 1000.0)
-
-        assert worker._runner_quarantine == set()
-        assert worker._runner_unavailable == {}
-        assert eq.submitted == []
+        host = scene.host('local')
+        assert (host['quarantined'], host['streak']) == (False, None)
+        assert scene.eq.submitted == []
 
     # -- (e) None-safety --------------------------------------------------------
 
-    def test_no_allocator_still_records_so_recovery_stays_possible(self):
-        """_host_allocator is None → no raise, and the tracker entry IS written."""
-        worker, _eq, _alloc = _make_ru_worker()
-        worker._host_allocator = None
+    def test_no_allocator_still_records_so_recovery_stays_possible(self, tmp_path):
+        """A bench before any allocator exists is there once one is built."""
+        scene = _HostBenchScene(tmp_path, build=False)
+        scene.bench('leo-laptop', 'ssh timeout')
 
-        worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', 1000.0)
+        scene.build()
 
-        assert 'leo-laptop' in worker._runner_unavailable
-        assert 'leo-laptop' in worker._runner_quarantine
+        host = scene.host('leo-laptop')
+        assert (host['quarantined'], host['streak']) == (True, 1)
 
-    def test_no_escalation_queue_does_not_raise(self):
-        """_escalation_queue is None → no raise, state still recorded."""
-        worker, _eq, _alloc = _make_ru_worker(escalate_after_n=1, escalation_queue=None)
+    def test_no_escalation_queue_does_not_raise(self, tmp_path):
+        scene = _HostBenchScene(tmp_path, escalation_queue=None, escalate_after_n=1)
+        scene.bench('leo-laptop', 'ssh timeout')
 
-        worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', 1000.0)
-
-        assert 'leo-laptop' in worker._runner_unavailable
-        assert 'leo-laptop' in worker._runner_quarantine
+        host = scene.host('leo-laptop')
+        assert (host['quarantined'], host['streak']) == (True, 1)
 
     # -- cross-check against task 3275's observable ----------------------------
 
-    def test_chokepoint_state_is_classified_ru_by_host_states_block(self):
+    def test_chokepoint_state_is_classified_ru_in_the_snapshot(self, tmp_path):
         """A chokepoint-quarantined host is, by construction, a reprobe candidate.
 
         Task 3275 derives quarantine_class from the SAME predicate reprobe uses
         (``name in self._runner_unavailable``), so 'ru' means exactly "the
         tracker owns this host's recovery" — which is what INV-A guarantees.
         """
-        worker, _eq = self._real_allocator_worker()
-        worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', 1000.0)
+        scene = _HostBenchScene(tmp_path)
+        scene.clock.time = 1000.0
+        scene.bench('leo-laptop', 'ssh timeout')
+        scene.clock.time = 1300.0
 
-        block = {h['name']: h for h in worker._host_states_block(1300.0)}
-        entry = block['leo-laptop']
+        entry = scene.host('leo-laptop')
         assert entry['quarantined'] is True
         assert entry['quarantine_class'] == 'ru'
         assert entry['streak'] == 1
@@ -5162,11 +5161,6 @@ class TestOrphanGuardPreservesCancellation:
 # 3043/step-9 RED: a cancel_and_release that PARKs a remote slot must be
 # RECORDED, not silently stranded (the repro-#1 mechanism)
 # ---------------------------------------------------------------------------
-
-
-async def _noop_sleep(_delay):
-    """Injected sleep so the real probe loop runs synchronously."""
-    return None
 
 
 class _UnreachableRemoteRunner:
