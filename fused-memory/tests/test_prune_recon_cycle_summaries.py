@@ -21,6 +21,8 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'prune_recon_cycle_summaries.py'
 
 
@@ -1003,7 +1005,7 @@ class TestRunApplyStoreMutationPreflight:
         memory = self._make_memory(self._records())
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True), memory=memory,
@@ -1021,7 +1023,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 self._args(apply=True, project_id=None), memory=memory,
                 known_projects_map={'dark_factory': '/a', 'reify': '/b', 'knowlive': '/c'},
@@ -1097,7 +1099,7 @@ class TestRunApplyStoreMutationPreflight:
         memory = self._make_memory([])
         memory.mem0.count_by_metadata = AsyncMock(return_value=7)
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 self._args(apply=True), memory=memory,
                 known_projects_map=self._known_map(),
@@ -1120,7 +1122,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 self._args(apply=True, limit_per_project=0), memory=memory,
                 known_projects_map=self._known_map(),
@@ -1161,7 +1163,7 @@ class TestRunApplyStoreMutationPreflight:
         monkeypatch.setattr(_mod.asyncio, 'run', _drive)
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 

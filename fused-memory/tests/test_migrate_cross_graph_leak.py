@@ -31,6 +31,7 @@ from fused_memory.maintenance.cross_graph_move import (
     CreateResult,
     SubgraphEdgeResult,
 )
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'migrate_cross_graph_leak.py'
 
@@ -2246,7 +2247,7 @@ class TestRunApplyStoreMutationPreflight:
         manifest_path = self._manifest_path(tmp_path)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 _args(apply=True, manifest=str(manifest_path)), memory_service,
@@ -2271,7 +2272,7 @@ class TestRunApplyStoreMutationPreflight:
         load_mock = MagicMock(side_effect=AssertionError('manifest was loaded'))
         monkeypatch.setattr(_mod, 'load_reviewed_manifest', load_mock)
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 _args(apply=True, manifest=str(manifest_path)), memory_service,
             )
@@ -2386,7 +2387,7 @@ class TestRunApplyStoreMutationPreflight:
 
         with (
             caplog.at_level(logging.ERROR),
-            pytest.raises(_mod.StoreMutationUnavailable),
+            pytest.raises(StoreMutationUnavailable),
         ):
             await _mod.run(
                 _args(apply=True, manifest=str(manifest_path)), memory_service,

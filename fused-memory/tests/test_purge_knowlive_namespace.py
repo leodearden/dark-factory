@@ -21,6 +21,8 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'purge_knowlive_namespace.py'
 
 
@@ -916,7 +918,7 @@ class TestRunApplyStoreMutationPreflight:
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True), memory_service,
@@ -940,7 +942,7 @@ class TestRunApplyStoreMutationPreflight:
         )
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 self._args(apply=True), memory_service,
                 invalidation_time=invalidation_time,
@@ -1062,7 +1064,7 @@ class TestRunApplyStoreMutationPreflight:
         monkeypatch.setattr(_mod.asyncio, 'run', _drive)
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 

@@ -102,10 +102,7 @@ from fused_memory.topic_slug import (
     derive_topic_slug,
     is_valid_topic_slug,
 )
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 from fused_memory.utils.validation import is_full_uuid
 
 # This script reports through ``print``; stdout carries its machine-read
@@ -1520,23 +1517,17 @@ async def run(
     # ``print``, to keep it off the stdout this script reserves for its
     # machine-read artifact.
     if apply:
-        try:
-            assert_store_mutation_allowed(operation='retro_stamp_topics --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'retro_stamp_topics: --apply NOT started (fail-closed) -- this '
-                "process cannot write mem0's history directory, so each stamp "
-                'would patch a record and then fail to record the change, '
-                'leaving the corpus half-stamped: some claims filed under the '
-                'new topic slug and some under the legacy one, which is worse '
-                'for an exact-match topic query than either uniform state. '
-                'Nothing was scrolled and no record was stamped. Route the '
-                'stamping through the fused-memory MCP server (the unsandboxed '
-                'owner of the store), or re-run from an unsandboxed operator '
-                'shell. To obtain the sweep report safely from anywhere, '
-                're-run without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='retro_stamp_topics --apply',
+            logger=logger,
+            extra_detail=(
+                'each stamp would patch a record and then fail to record the '
+                'change, leaving the corpus half-stamped: some claims filed under '
+                'the new topic slug and some under the legacy one, which is worse '
+                'for an exact-match topic query than either uniform state. Nothing '
+                'was scrolled and no record was stamped.'
+            ),
+        )
 
     if calibration_rows is None:
         calibration_rows = load_calibration_rows(CALIBRATION_FIXTURE_PATH)

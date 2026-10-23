@@ -25,6 +25,7 @@ from _store_mutation_preflight_contract import (
 )
 
 from fused_memory.reconciliation.mem0_tombstone import PROTECTED_AUDIT_KINDS
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_orphan_flag_markers.py'
 
@@ -4255,7 +4256,7 @@ class TestRunApplyStoreMutationPreflight:
         memory_service = self._service()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
@@ -4273,7 +4274,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         memory_service = self._service()
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
                 terminal_task_ids=set(),
