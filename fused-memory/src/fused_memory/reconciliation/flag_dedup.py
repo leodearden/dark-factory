@@ -3039,24 +3039,15 @@ async def filter_terminal_metadata_flags(
 # Stale-bulk-get_statuses guard helpers (task-3007)
 # --------------------------------------------------------------------------- #
 
-#: Flag types asserting the SQLite backend's bulk ``get_statuses`` returned a
+#: The finding that the SQLite backend's bulk ``get_statuses`` returned a
 #: census that is stale relative to a live/scoped read.  The canonical spelling
 #: the Stage-1/Stage-3 harness emits is ``stale_bulk_get_statuses_recurrence``;
-#: the recurrence-less ``stale_bulk_get_statuses`` is included to be robust
-#: against LLM naming drift.  Case / separator / word-order variants of either
-#: spelling are ALSO matched at filter time via
-#: :func:`canonical_flag_type_family`, so only genuinely-distinct token multisets
-#: need to be listed here.
-STALE_BULK_GET_STATUSES_FLAG_TYPES: frozenset[str] = frozenset({
-    'stale_bulk_get_statuses_recurrence',
-    'stale_bulk_get_statuses',
-})
-
-#: Precomputed canonical-family keys for :data:`STALE_BULK_GET_STATUSES_FLAG_TYPES`
-#: so a reworded / reordered LLM spelling of the flag_type still matches (mirrors
-#: the family matching used by ``filter_suppressed`` / ``write_suppression_record``).
-_STALE_BULK_GET_STATUSES_FAMILIES: frozenset[str] = frozenset(
-    canonical_flag_type_family(ft) for ft in STALE_BULK_GET_STATUSES_FLAG_TYPES
+#: the recurrence-less ``stale_bulk_get_statuses`` is a genuinely-distinct
+#: token multiset, so it is listed too.
+STALE_BULK_GET_STATUSES_FAMILY = FlagTypeFamily(
+    name='stale_bulk_get_statuses',
+    spellings=frozenset({'stale_bulk_get_statuses_recurrence', 'stale_bulk_get_statuses'}),
+    drift_tokens=frozenset({'statuses'}),
 )
 
 
@@ -3080,14 +3071,13 @@ async def filter_stale_bulk_get_statuses_flags(
     disagree (verified: tasks 2455/2651/2694 already hardened the connection
     layer, and existing tests prove bulk+scoped reads observe committed writes).
 
-    For each flag whose ``flag_type`` FAMILY (:func:`canonical_flag_type_family`)
-    is in :data:`STALE_BULK_GET_STATUSES_FLAG_TYPES` and that carries a
-    ``task_id``, this filter re-runs the flag's OWN A/B claim LIVE — a fresh
-    unscoped ``taskmaster.get_statuses(project_root)`` and a fresh scoped
-    ``taskmaster.get_statuses(project_root, ids=[tid])`` — and DROPS the flag iff
-    the two now AGREE on the cited task (both report the same non-None status),
-    proving the alleged divergence was a benign capture-time artifact that does
-    not reproduce.
+    For each flag whose ``flag_type`` :data:`STALE_BULK_GET_STATUSES_FAMILY`
+    matches and that carries a ``task_id``, this filter re-runs the flag's OWN
+    A/B claim LIVE — a fresh unscoped ``taskmaster.get_statuses(project_root)``
+    and a fresh scoped ``taskmaster.get_statuses(project_root, ids=[tid])`` —
+    and DROPS the flag iff the two now AGREE on the cited task (both report the
+    same non-None status), proving the alleged divergence was a benign
+    capture-time artifact that does not reproduce.
 
     **Fail-safe direction is KEEP**: this filter drops ONLY on positively-confirmed
     live agreement.  A live-reproduced divergence, a cited status absent/None on
@@ -3114,38 +3104,17 @@ async def filter_stale_bulk_get_statuses_flags(
     if not taskmaster or not project_root:
         return list(flags)
 
-    # Positions whose flag_type FAMILY matches STALE_BULK_GET_STATUSES_FLAG_TYPES
-    # and that carry a task_id — only these are re-verified.
     check_positions: list[int] = []
     for i, flag in enumerate(flags):
-        flag_type = flag.get('flag_type')
         if (
-            isinstance(flag_type, str)
-            and canonical_flag_type_family(flag_type) in _STALE_BULK_GET_STATUSES_FAMILIES
+            STALE_BULK_GET_STATUSES_FAMILY.matches(flag.get('flag_type'))
             and flag.get('task_id') is not None
         ):
             check_positions.append(i)
 
-    # Detect potential LLM naming drift: flag_type strings that mention 'statuses'
-    # but whose family is not in STALE_BULK_GET_STATUSES_FLAG_TYPES.  When the
-    # model emits an unrecognised spelling the filter silently becomes a no-op;
-    # this log makes that observable (mirrors filter_terminal_metadata_flags).
-    drift_candidates = [
-        ft
-        for flag in flags
-        if (ft := flag.get('flag_type')) is not None
-        and isinstance(ft, str)
-        and 'statuses' in ft.lower()
-        and canonical_flag_type_family(ft) not in _STALE_BULK_GET_STATUSES_FAMILIES
-    ]
-    if drift_candidates:
-        logger.info(
-            'reconciliation.stale_bulk_get_statuses_filter_possible_drift '
-            'unmatched_flag_types=%s known_types=%s '
-            '— update STALE_BULK_GET_STATUSES_FLAG_TYPES if drift confirmed',
-            drift_candidates,
-            sorted(STALE_BULK_GET_STATUSES_FLAG_TYPES),
-        )
+    STALE_BULK_GET_STATUSES_FAMILY.log_drift(
+        flags, log_event='reconciliation.stale_bulk_get_statuses_filter_possible_drift',
+    )
 
     if not check_positions:
         return list(flags)
