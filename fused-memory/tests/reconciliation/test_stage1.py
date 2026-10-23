@@ -5854,15 +5854,6 @@ class TestStage1LiveStateFreshnessSection:
 
         assert STAGE1_SYSTEM_PROMPT.count(LIVE_STATE_FRESHNESS_HEADING) == 1
 
-    def test_every_documented_deleter_is_rendered_in_the_section(self):
-        from fused_memory.reconciliation.recon_self_model import MEM0_TOMBSTONE_DELETERS
-
-        section = self._section()
-        missing = [d for d in MEM0_TOMBSTONE_DELETERS if d not in section]
-        assert not missing, (
-            f'the section must name every documented sweep deleter; missing {missing!r}'
-        )
-
     def test_section_renders_the_shared_deleter_list(self):
         from fused_memory.reconciliation.recon_self_model import format_mem0_tombstone_deleters
 
