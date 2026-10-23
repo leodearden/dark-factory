@@ -8,6 +8,8 @@ import os
 import re
 import shutil
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,12 +17,16 @@ from pathlib import Path
 from shared import safe_io
 from shared.plan_deviation import DeviationRecord
 
+from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
 
 logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
 PLAN_TASK_TEXT_FP_KEY = '_task_text_fp'
+
+# Must exceed the longest legitimate critical section: plan_tools._mark_step_done's two timeout=10 git probes.
+PLAN_MUTEX_TIMEOUT_SECS = 60.0
 
 
 class ArtifactWriteError(OSError):
@@ -40,6 +46,13 @@ class ArtifactWriteError(OSError):
     Subclasses ``OSError`` so existing ``except OSError`` handlers keep
     working, and is a DISTINCT type so ``_write_json``'s vanished-root
     ``except FileNotFoundError`` tolerance cannot accidentally swallow it.
+    """
+
+
+class PlanMutexNotHeld(RuntimeError):
+    """A plan.json read-modify-write reached its write without holding ``plan_mutex()``.
+
+    Raised before anything is written: the alternative is a silently lost update.
     """
 
 
@@ -428,9 +441,56 @@ class TaskArtifacts:
         metadata['base_commit'] = new_base
         self._write_json(self.root / 'metadata.json', metadata)
 
-    def write_plan(self, plan: dict) -> None:
-        """Write .task/plan.json — the structured plan."""
+    @contextmanager
+    def plan_mutex(self) -> Iterator[None]:
+        """The cross-writer lock every plan.json read-modify-write holds.
+
+        Reentrant per thread and honoured across processes
+        (``orchestrator.file_mutex``). Keyed on the RESOLVED plan path, so the
+        lane symlink view and the meta-root view share one lock. Distinct from
+        the ownership lock ``lock_plan`` (plan.lock). A vanished root takes no
+        lock: it holds no plan to lose an update of, and must not be
+        re-materialized by locking.
+
+        A WAIT BLOCKS THE CALLING THREAD, for up to PLAN_MUTEX_TIMEOUT_SECS. The
+        orchestrator calls its plan methods synchronously on its event-loop
+        thread, so while a plan-tools process holds the mutex, every task
+        workflow in the orchestrator stalls. Keep critical sections short, and
+        never hold one across a subprocess the plan does not depend on.
+        """
+        lock_path = self._plan_mutex_path()
+        if lock_path is None:
+            yield
+            return
+        with file_mutex.exclusive(lock_path, timeout=PLAN_MUTEX_TIMEOUT_SECS):
+            yield
+
+    def _plan_mutex_path(self) -> Path | None:
+        lock_path = Path(os.path.realpath(self.root / 'plan.json')).with_name('plan.json.mutex')
+        return lock_path if lock_path.parent.is_dir() else None
+
+    def write_plan(self, plan: dict, *, mutex_held: bool = False) -> None:
+        """Write .task/plan.json — the structured plan.
+
+        A bare overwrite holds ``plan_mutex()`` for the write alone. The write
+        that ends a read-modify-write passes ``mutex_held=True``, a claim that
+        is VERIFIED: if the calling thread does not hold the mutex it raises
+        :class:`PlanMutexNotHeld` and writes nothing.
+        """
         plan['_schema_version'] = PLAN_SCHEMA_VERSION
+        if mutex_held:
+            self._write_held_plan(plan)
+            return
+        with self.plan_mutex():
+            self._write_held_plan(plan)
+
+    def _write_held_plan(self, plan: dict) -> None:
+        lock_path = self._plan_mutex_path()
+        if lock_path is not None and not file_mutex.held(lock_path):
+            raise PlanMutexNotHeld(
+                f'{self.root / "plan.json"} reached its write without {lock_path} held: '
+                'run the whole read-modify-write inside plan_mutex()'
+            )
         self._write_json(self.root / 'plan.json', plan)
 
     def ensure_lane_plan_symlink(self) -> None:
@@ -805,18 +865,24 @@ class TaskArtifacts:
 
     def read_plan(self) -> dict:
         """Read current plan state, auto-normalizing malformed shapes."""
+        plan, modified = self._read_normalized_plan()
+        if not modified:
+            return plan
+        with self.plan_mutex():
+            plan, modified = self._read_normalized_plan()
+            if modified:
+                logger.warning(
+                    'Plan normalization applied — writing corrected plan to %s',
+                    self.root / 'plan.json',
+                )
+                self._write_held_plan(plan)
+        return plan
+
+    def _read_normalized_plan(self) -> tuple[dict, bool]:
         plan_path = self._read_path('plan.json')
         if not plan_path.exists():
-            return {}
-        plan = json.loads(plan_path.read_text())
-        plan, modified = _normalize_plan(plan)
-        if modified:
-            logger.warning(
-                'Plan normalization applied — writing corrected plan to %s',
-                self.root / 'plan.json',
-            )
-            self._write_json(self.root / 'plan.json', plan)
-        return plan
+            return {}, False
+        return _normalize_plan(json.loads(plan_path.read_text()))
 
     def update_step_status(
         self, step_id: str, status: str, commit: str | None = None
@@ -828,18 +894,19 @@ class TaskArtifacts:
         ``::_replace_plan_step``), and only on steps that are not done.
         Per-step deviation records go through :meth:`append_step_deviation`.
         """
-        plan = self.read_plan()
+        with self.plan_mutex():
+            plan = self.read_plan()
 
-        for collection in ('prerequisites', 'steps'):
-            for item in plan.get(collection, []):
-                if not isinstance(item, dict):
-                    continue
-                if item.get('id') == step_id:
-                    item['status'] = status
-                    if commit is not None:
-                        item['commit'] = commit
-                    self._write_json(self.root / 'plan.json', plan)
-                    return
+            for collection in ('prerequisites', 'steps'):
+                for item in plan.get(collection, []):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get('id') == step_id:
+                        item['status'] = status
+                        if commit is not None:
+                            item['commit'] = commit
+                        self._write_held_plan(plan)
+                        return
 
         logger.warning(f'Step {step_id} not found in plan')
 
@@ -858,20 +925,21 @@ class TaskArtifacts:
 
         Markup-repair limits: ``plans/plan-deviation-recording-prd.md`` D4.
         """
-        plan = self.read_plan()
+        with self.plan_mutex():
+            plan = self.read_plan()
 
-        for collection in ('prerequisites', 'steps'):
-            for item in plan.get(collection, []):
-                if not isinstance(item, dict):
-                    continue
-                if item.get('id') == step_id:
-                    existing = item.get('deviations')
-                    item['deviations'] = [
-                        *(existing if isinstance(existing, list) else []),
-                        record.to_dict(),
-                    ]
-                    self.write_plan(plan)
-                    return len(item['deviations'])
+            for collection in ('prerequisites', 'steps'):
+                for item in plan.get(collection, []):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get('id') == step_id:
+                        existing = item.get('deviations')
+                        item['deviations'] = [
+                            *(existing if isinstance(existing, list) else []),
+                            record.to_dict(),
+                        ]
+                        self.write_plan(plan, mutex_held=True)
+                        return len(item['deviations'])
 
         logger.warning(f'Step {step_id} not found in plan')
         return None
@@ -897,24 +965,25 @@ class TaskArtifacts:
         lives in ``plan_tools._sha_exists_on_branch``; this method does NOT
         prove the step's semantics (VERIFY remains the gate).
         """
-        plan = self.read_plan()
         tag = f'[COMMITTED {sha[:12]}]'
+        with self.plan_mutex():
+            plan = self.read_plan()
 
-        for collection in ('prerequisites', 'steps'):
-            for item in plan.get(collection, []):
-                if not isinstance(item, dict):
-                    continue
-                if item.get('id') == step_id:
-                    item['status'] = 'done'
-                    item['commit'] = sha
-                    # Strip any existing leading [COMMITTED <sha>] tag(s) before
-                    # prepending the current one: idempotent for a repeat of the
-                    # same sha, and a clean replace (no stacking) for a re-mark
-                    # with a different sha.
-                    description = _COMMITTED_TAG_RE.sub('', item.get('description') or '')
-                    item['description'] = f'{tag} {description}'
-                    self.write_plan(plan)
-                    return True
+            for collection in ('prerequisites', 'steps'):
+                for item in plan.get(collection, []):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get('id') == step_id:
+                        item['status'] = 'done'
+                        item['commit'] = sha
+                        # Strip any existing leading [COMMITTED <sha>] tag(s) before
+                        # prepending the current one: idempotent for a repeat of the
+                        # same sha, and a clean replace (no stacking) for a re-mark
+                        # with a different sha.
+                        description = _COMMITTED_TAG_RE.sub('', item.get('description') or '')
+                        item['description'] = f'{tag} {description}'
+                        self.write_plan(plan, mutex_held=True)
+                        return True
 
         logger.warning(f'Step {step_id} not found in plan')
         return False
@@ -1096,15 +1165,16 @@ class TaskArtifacts:
             ValueError: if plan.json is missing or has no ``steps`` —
                 callers should never invoke this on an empty plan.
         """
-        plan = self.read_plan()
-        if not plan.get('steps'):
-            raise ValueError(
-                'bump_revalidation_stamp called before plan.json contains a '
-                'valid plan (missing or empty steps).'
-            )
-        plan['_revalidated_at'] = datetime.now(UTC).isoformat()
-        plan['_revalidated_by_session'] = session_id
-        self._write_json(self.root / 'plan.json', plan)
+        with self.plan_mutex():
+            plan = self.read_plan()
+            if not plan.get('steps'):
+                raise ValueError(
+                    'bump_revalidation_stamp called before plan.json contains a '
+                    'valid plan (missing or empty steps).'
+                )
+            plan['_revalidated_at'] = datetime.now(UTC).isoformat()
+            plan['_revalidated_by_session'] = session_id
+            self._write_held_plan(plan)
         if base_commit is not None:
             self.update_base_commit(base_commit)
 
@@ -1122,24 +1192,25 @@ class TaskArtifacts:
                 This prevents silently creating a provenance-only stub that passes
                 bool() checks but has no actual plan content.
         """
-        plan = self.read_plan()
-        if not plan.get('steps'):
-            raise ValueError(
-                'stamp_plan_provenance called before plan.json contains a valid plan '
-                '(missing or empty steps). '
-                'Ensure the architect has written a complete plan before stamping provenance.'
-            )
-        plan['_session_id'] = session_id
-        plan['_created_at'] = datetime.now(UTC).isoformat()
-        # Invariant: a provenance-stamped plan is a complete plan, so it must
-        # carry the completeness marker.  The architect's confirm_plan normally
-        # sets this already (idempotent setdefault); paths that inject a
-        # ready-made plan (eval initial_plan, SIMPLE_TASK) rely on this so the
-        # plan is not mistaken for an interrupted partial on a later requeue.
-        plan.setdefault('_finalized_at', plan['_created_at'])
-        if task_text_fp is not None:
-            plan[PLAN_TASK_TEXT_FP_KEY] = task_text_fp
-        self._write_json(self.root / 'plan.json', plan)
+        with self.plan_mutex():
+            plan = self.read_plan()
+            if not plan.get('steps'):
+                raise ValueError(
+                    'stamp_plan_provenance called before plan.json contains a valid plan '
+                    '(missing or empty steps). '
+                    'Ensure the architect has written a complete plan before stamping provenance.'
+                )
+            plan['_session_id'] = session_id
+            plan['_created_at'] = datetime.now(UTC).isoformat()
+            # Invariant: a provenance-stamped plan is a complete plan, so it must
+            # carry the completeness marker.  The architect's confirm_plan normally
+            # sets this already (idempotent setdefault); paths that inject a
+            # ready-made plan (eval initial_plan, SIMPLE_TASK) rely on this so the
+            # plan is not mistaken for an interrupted partial on a later requeue.
+            plan.setdefault('_finalized_at', plan['_created_at'])
+            if task_text_fp is not None:
+                plan[PLAN_TASK_TEXT_FP_KEY] = task_text_fp
+            self._write_held_plan(plan)
 
     def validate_plan_owner(self, session_id: str) -> bool:
         """Return True if *session_id* owns plan.json.
@@ -1186,16 +1257,17 @@ class TaskArtifacts:
         left untouched: the original planner's ``_session_id`` is preserved
         for audit rather than being promoted.
         """
-        plan = self.read_plan()
-        plan['files'] = files
-        already_owner = (
-            plan.get('_session_id') == session_id
-            or plan.get('_revalidated_by_session') == session_id
-        )
-        if not already_owner:
-            plan['_session_id'] = session_id
-            plan.setdefault('_created_at', datetime.now(UTC).isoformat())
-        self._write_json(self.root / 'plan.json', plan)
+        with self.plan_mutex():
+            plan = self.read_plan()
+            plan['files'] = files
+            already_owner = (
+                plan.get('_session_id') == session_id
+                or plan.get('_revalidated_by_session') == session_id
+            )
+            if not already_owner:
+                plan['_session_id'] = session_id
+                plan.setdefault('_created_at', datetime.now(UTC).isoformat())
+            self._write_held_plan(plan)
 
     # ──────────────────────────────────────────────────────────────────
     # Agent-session sidecar — marker for "an agent subprocess is in flight".

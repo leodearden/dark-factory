@@ -80,6 +80,7 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import functools
 import inspect
 import json
 import logging
@@ -90,7 +91,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, NamedTuple
+from typing import Any, Concatenate, NamedTuple, ParamSpec, TypeVar
 
 from fastmcp import FastMCP
 from shared.mcp_markup_middleware import (
@@ -984,6 +985,25 @@ def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, 
     return repaired, reportable
 
 
+_P = ParamSpec('_P')
+_R = TypeVar('_R')
+
+
+def _plan_mutation(
+    fn: Callable[Concatenate[TaskArtifacts, _P], _R],
+) -> Callable[Concatenate[TaskArtifacts, _P], _R]:
+    """The whole mutator, including the repair write-back in ``_read_plan_repaired``
+    and any nested TaskArtifacts write, is ONE critical section against every
+    other plan.json writer."""
+
+    @functools.wraps(fn)
+    def mutation(artifacts: TaskArtifacts, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with artifacts.plan_mutex():
+            return fn(artifacts, *args, **kwargs)
+
+    return mutation
+
+
 def _with_markup_repairs(
     response: dict[str, Any], facts: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -1029,6 +1049,7 @@ def _step_type_refusal(step_type: str) -> dict[str, Any] | None:
     }
 
 
+@_plan_mutation
 def _create_plan(
     artifacts: TaskArtifacts,
     task_id: str,
@@ -1120,10 +1141,11 @@ def _create_plan(
             'markup stamp: could not carry the rejection counter into the new '
             'plan for %s; the plan itself is unaffected', task_id,
         )
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return {'status': 'ok', 'task_id': task_id}
 
 
+@_plan_mutation
 def _add_plan_step(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1158,13 +1180,14 @@ def _add_plan_step(
         'status': 'pending',
         'commit': None,
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'step_id': step_id, 'total_steps': len(plan['steps'])},
         markup_facts,
     )
 
 
+@_plan_mutation
 def _add_prerequisite(
     artifacts: TaskArtifacts,
     prereq_id: str,
@@ -1193,10 +1216,11 @@ def _add_prerequisite(
         'commit': None,
         'tests': [],
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs({'status': 'ok', 'prereq_id': prereq_id}, markup_facts)
 
 
+@_plan_mutation
 def _add_design_decision(
     artifacts: TaskArtifacts,
     decision: str,
@@ -1210,13 +1234,14 @@ def _add_design_decision(
         'decision': decision,
         'rationale': rationale,
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'total_decisions': len(plan['design_decisions'])},
         markup_facts,
     )
 
 
+@_plan_mutation
 def _add_reuse_item(
     artifacts: TaskArtifacts,
     what: str,
@@ -1232,12 +1257,13 @@ def _add_reuse_item(
         'where': where,
         'how': how,
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'total_reuse': len(plan['reuse'])}, markup_facts
     )
 
 
+@_plan_mutation
 def _drop_plan_file(
     artifacts: TaskArtifacts,
     path: str,
@@ -1324,7 +1350,7 @@ def _drop_plan_file(
         'path': path,
         'reason': reason,
     })
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {
             'status': 'ok',
@@ -1342,6 +1368,7 @@ def _drop_plan_file(
 _REPAIRABLE_PLAN_FIELDS = _build_repairable_plan_fields()
 
 
+@_plan_mutation
 def _mark_step_done(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1421,6 +1448,7 @@ def _session_identity_in_hand(artifacts: TaskArtifacts, plan: dict) -> str | Non
     return None
 
 
+@_plan_mutation
 def _record_step_deviation(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1473,6 +1501,7 @@ def _record_step_deviation(
 # ---------------------------------------------------------------------------
 
 
+@_plan_mutation
 def _update_plan_metadata(
     artifacts: TaskArtifacts,
     files: list[str] | str | None = None,
@@ -1487,7 +1516,7 @@ def _update_plan_metadata(
         _forget_redeclared_drops(plan)
     if analysis is not None:
         plan['analysis'] = analysis
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _with_markup_repairs(
         {
             'status': 'ok',
@@ -1510,6 +1539,7 @@ def _forget_redeclared_drops(plan: dict) -> None:
     ]
 
 
+@_plan_mutation
 def _remove_plan_step(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1533,7 +1563,7 @@ def _remove_plan_step(
                         markup_facts,
                     )
                 items.pop(i)
-                artifacts.write_plan(plan)
+                artifacts.write_plan(plan, mutex_held=True)
                 return _with_markup_repairs(
                     {'status': 'ok', 'removed': step_id, 'collection': collection},
                     markup_facts,
@@ -1545,6 +1575,7 @@ def _remove_plan_step(
     )
 
 
+@_plan_mutation
 def _replace_plan_step(
     artifacts: TaskArtifacts,
     step_id: str,
@@ -1574,7 +1605,7 @@ def _replace_plan_step(
                     )
                 item['type'] = step_type
                 item['description'] = description
-                artifacts.write_plan(plan)
+                artifacts.write_plan(plan, mutex_held=True)
                 return _with_markup_repairs(
                     {'status': 'ok', 'replaced': step_id}, markup_facts
                 )
@@ -1585,6 +1616,7 @@ def _replace_plan_step(
     )
 
 
+@_plan_mutation
 def _confirm_plan(
     artifacts: TaskArtifacts,
 ) -> dict[str, Any]:
@@ -1666,7 +1698,7 @@ def _confirm_plan(
     # moment the plan was first frozen.
     plan['_finalized_at'] = now
     plan['_revalidated_at'] = now
-    artifacts.write_plan(plan)
+    artifacts.write_plan(plan, mutex_held=True)
     return _respond({
         'status': 'ok',
         'finalized': True,
@@ -1899,7 +1931,9 @@ def _mark_step_committed(
 
     Guards on a real on-branch reachability check for *sha* (corroborate-before-
     acting) before delegating the status/commit/description-tag mutation to
-    :meth:`TaskArtifacts.mark_step_committed`. Returns the Contract A1 shapes:
+    :meth:`TaskArtifacts.mark_step_committed`. The probe reads no plan, so it
+    runs BEFORE ``plan_mutex()``: no plan writer waits on its git subprocess.
+    Returns the Contract A1 shapes:
     ``{'ok': True, 'step_id', 'status': 'done'}`` on success (``status`` is the
     step's NEW status), and ``{'ok': False, 'status': 'error', 'message': ...}``
     on a non-resolving sha or an unknown ``step_id``.
@@ -1928,8 +1962,10 @@ def _mark_step_committed(
     # ``artifacts.mark_step_committed`` reaches disk on its own. Repairing here
     # first means the write-back has already landed when the delegate re-reads,
     # so its mutation applies to the repaired document rather than racing it.
-    _, markup_facts = _read_plan_repaired(artifacts)
-    if not artifacts.mark_step_committed(step_id, sha):
+    with artifacts.plan_mutex():
+        _, markup_facts = _read_plan_repaired(artifacts)
+        committed = artifacts.mark_step_committed(step_id, sha)
+    if not committed:
         return _with_markup_repairs(
             {
                 'ok': False,
