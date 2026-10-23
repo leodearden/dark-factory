@@ -14,15 +14,15 @@ Subcommands, run from ``fused-memory/``:
   primary and a second shard set over every pair, attach-time pairs in their
   own shards, plus ``key.json``, ``texts.json`` and ``rater_prompt.md`` into
   ``--scratch``. A re-run shards only what is not yet keyed.
-- ``reask``: write a shard per rater holding the lines whose quotes or spans
-  are not in the texts that rater saw. The rater's answer in the later round
-  supersedes the earlier line.
+- ``reask``: write a shard per rater holding the lines that break the
+  rubric's row contract or whose quotes or spans are not in the texts that
+  rater saw. The rater's answer in the later round supersedes the earlier line.
 - ``third``: write a shard holding exactly the pairs a decisive tie or an open
   follow-up blocks, for a new third rater each round.
 - ``assemble``: map the effective ratings back through the key and write the
   committed corpus:
   ``write_triage_v2_soak_{items.jsonl,verdicts.jsonl,strata.json,derivation.json}``.
-  ``third`` and ``assemble`` refuse while any evidence is unfound or any pair
+  ``third`` and ``assemble`` refuse while any line awaits a re-ask or any pair
   lacks a primary or second answer.
 
 Rater output lives in ``<scratch>/ratings/<shard>.jsonl``, one line per item.
@@ -461,6 +461,28 @@ def _found(quote: object, text: str) -> bool:
     return isinstance(quote, str) and _rubric.quote_found(quote, text)
 
 
+def rating_problems(row: Mapping[str, Any], child_text: str, parent_text: str) -> list[str]:
+    """Why an effective rater line must be asked again; [] when it need not.
+
+    A line breaking the rubric's row contract is named for that alone, since
+    :func:`validate_rating` presumes a line that keeps it; any other line gets
+    :func:`validate_rating`'s evidence problems.
+    """
+    violation = _contract_violation(row)
+    if violation is not None:
+        return [violation]
+    return validate_rating(row, child_text, parent_text)
+
+
+def _contract_violation(row: Mapping[str, Any]) -> str | None:
+    """The violation the rubric's ``resolve_judgements`` refuses *row* alone for; None if none."""
+    try:
+        _rubric.resolve_judgements([row])
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
 def effective_ratings(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Each rater's highest-``round`` line on each pair and basis, without its ``round``.
 
@@ -783,7 +805,7 @@ class _Scratch:
 
     def ratings(self, key: Mapping[str, Any], entries: Mapping[tuple[str, str, str], ShardEntry],
                 ) -> _Rated:
-        """Every rater's effective lines, checked against the texts each rater saw."""
+        """Every rater's effective lines, each checked by :func:`rating_problems`."""
         lines: list[dict[str, Any]] = []
         for name, spec in sorted(key['shards'].items()):
             lines += self._shard_ratings(name, spec, key['items'])
@@ -792,13 +814,13 @@ class _Scratch:
             (name, *_keyed_order(key['items'][item_id])): item_id
             for name, spec in key['shards'].items() for item_id in spec['items']
         }
-        unfound = []
+        reask = []
         for row in rows:
             entry = entries[_keyed_order(row)]
-            if problems := validate_rating(row, entry.child_text, entry.parent_text):
+            if problems := rating_problems(row, entry.child_text, entry.parent_text):
                 item_id = item_ids[row['batch'], *_keyed_order(row)]
-                unfound.append(_Unfound(row, item_id, tuple(problems)))
-        return _Rated(rows=rows, reasked=len(lines) - len(rows), unfound=unfound)
+                reask.append(_Reask(row, item_id, tuple(problems)))
+        return _Rated(rows=rows, reasked=len(lines) - len(rows), reask=reask)
 
     def _shard_ratings(
         self, name: str, spec: Mapping[str, Any], items: Mapping[str, Mapping[str, str]],
@@ -817,10 +839,6 @@ class _Scratch:
             seen[item_id] += 1
             row = {**items[item_id], 'rater': spec['rater'], 'role': spec['role'], 'batch': name,
                    **answer}
-            try:
-                _rubric.resolve_judgements([row])
-            except ValueError as exc:
-                raise ValueError(f'{path}:{number}: {exc}') from exc
             rows.append({**row, 'round': spec['round']})
         wrong = sorted(item for item in spec['items'] if seen[item] != 1)
         if wrong:
@@ -829,8 +847,8 @@ class _Scratch:
 
 
 @dataclass(frozen=True)
-class _Unfound:
-    """An effective rater line whose evidence is not in the texts its rater saw."""
+class _Reask:
+    """An effective rater line to ask again, and why."""
 
     row: Mapping[str, Any]
     item_id: str
@@ -842,11 +860,11 @@ class _Unfound:
 
 @dataclass(frozen=True)
 class _Rated:
-    """The effective rater lines, how many earlier-round lines they superseded, and the unfound ones."""
+    """The effective rater lines, how many earlier-round lines they superseded, and those to ask again."""
 
     rows: list[dict[str, Any]]
     reasked: int
-    unfound: list[_Unfound]
+    reask: list[_Reask]
 
 
 def _shards_command(args: argparse.Namespace) -> dict[str, Any]:
@@ -890,16 +908,16 @@ class _Corpus:
 
 
 def _corpus(args: argparse.Namespace) -> _Corpus:
-    """The assembled corpus, refused while any evidence is unfound or any pair lacks a rater."""
+    """The assembled corpus, refused while any line awaits a re-ask or any pair lacks a rater."""
     bundle = _SoakBundle.read(args.bundle)
     scratch = _Scratch(args.scratch)
     key = scratch.load_key()
     soak = bundle.keyed_items(key)
     entries = scratch.entries(soak)
     rated = scratch.ratings(key, entries)
-    if rated.unfound:
-        raise ValueError('rater evidence not found in the texts shown; run reask:\n'
-                         + '\n'.join(map(str, rated.unfound)))
+    if rated.reask:
+        raise ValueError('rater lines break the row contract or quote evidence not in the texts'
+                         ' shown; run reask:\n' + '\n'.join(map(str, rated.reask)))
     rated_roles = {(*_keyed_order(row), row['role']) for row in rated.rows}
     lacking = sorted(
         (*keyed, role) for keyed in entries for role in _DOUBLE_RATED
@@ -918,20 +936,20 @@ def _reask_command(args: argparse.Namespace) -> dict[str, Any]:
     scratch = _Scratch(args.scratch)
     key = scratch.load_key()
     entries = scratch.entries(_SoakBundle.read(args.bundle).keyed_items(key))
-    unfound_by_rater: defaultdict[str, list[_Unfound]] = defaultdict(list)
-    for unfound in scratch.ratings(key, entries).unfound:
-        unfound_by_rater[unfound.row['rater']].append(unfound)
+    reask_by_rater: defaultdict[str, list[_Reask]] = defaultdict(list)
+    for reask in scratch.ratings(key, entries).reask:
+        reask_by_rater[reask.row['rater']].append(reask)
     last_round = max(spec['round'] for spec in key['shards'].values())
     written = {}
-    for round_, (rater, unfound) in enumerate(sorted(unfound_by_rater.items()), start=last_round + 1):
-        role = unfound[0].row['role']
+    for round_, (rater, lines) in enumerate(sorted(reask_by_rater.items()), start=last_round + 1):
+        role = lines[0].row['role']
         name = f'reask_{round_:02d}_{role}'
-        scratch.write_shard(key, name, [entries[_keyed_order(line.row)] for line in unfound],
+        scratch.write_shard(key, name, [entries[_keyed_order(line.row)] for line in lines],
                             role=role, rater=rater, round=round_)
-        written[name] = len(unfound)
+        written[name] = len(lines)
     if written:
         scratch.save_key(key)
-    return {'unfound': sum(written.values()), 'shards': written}
+    return {'lines': sum(written.values()), 'shards': written}
 
 
 def _third_command(args: argparse.Namespace) -> dict[str, Any]:
@@ -1035,8 +1053,9 @@ def _rater_prompt() -> str:
         ' `loss_spans` when, and only when, `loss` is YES.',
         '- Give `unclear_reason` with any UNCLEAR answer.',
         '- Copy `conflict_quote.parent` verbatim from PARENT, and `conflict_quote.child` and'
-        ' every `loss_spans` entry verbatim from CHILD. A quote or span not found in the text'
-        ' shown is sent back to you to answer again.',
+        ' every `loss_spans` entry verbatim from CHILD. A line that breaks these rules, or'
+        ' whose quote or span is not found in the text shown, is sent back to you to answer'
+        ' again.',
         '',
         'Append to the file after every batch of about 10 items, so partial progress'
         ' survives. Every item in the shard gets exactly one line. When done, reply with'
