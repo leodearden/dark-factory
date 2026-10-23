@@ -2811,15 +2811,13 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
 
 def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
-    """Parse ``--worktree``/``--meta-root`` and return the corresponding
-    ``TaskArtifacts``.
+    """Parse ``--worktree``/``--meta-root``/``--task-root`` and return the
+    corresponding ``TaskArtifacts``.
 
-    Mirrors workflow.py's orchestrator-side construction
-    (``TaskArtifacts(worktree, _meta_root_for_worktree(worktree))``) so both
-    sides resolve the IDENTICAL meta_root for a given worktree
-    (worktree-lane-lifecycle PRD task ε1). When ``--meta-root`` is omitted,
-    behaviour is byte-identical to before this argument existed: the root
-    dir checked for existence is the legacy ``<worktree>/.task``.
+    Mirrors workflow.py's orchestrator-side construction so both sides
+    resolve the IDENTICAL roots for a given dispatch (worktree-lane-lifecycle
+    PRD task ε1; the task root, task 3155). Each root must already exist;
+    omitting both flags leaves the legacy ``<worktree>/.task`` single root.
     """
     parser = argparse.ArgumentParser(description='Plan-tools MCP server (stdio)')
     parser.add_argument(
@@ -2834,20 +2832,29 @@ def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
             '<worktree>/.task location.'
         ),
     )
+    parser.add_argument(
+        '--task-root', type=Path, default=None,
+        help=(
+            'Optional task-lifetime `.task-meta/task-<id>` root. When '
+            'omitted, every artifact resolves against the lane root.'
+        ),
+    )
     args = parser.parse_args(argv)
 
-    worktree = args.worktree.resolve()
-    meta_root = args.meta_root.resolve() if args.meta_root is not None else None
-    root_to_check = meta_root if meta_root is not None else worktree / '.task'
-    if not root_to_check.is_dir():
-        print(f'Error: {root_to_check} does not exist', file=sys.stderr)
-        sys.exit(1)
-
-    return TaskArtifacts(worktree, meta_root)
+    artifacts = TaskArtifacts(
+        args.worktree.resolve(),
+        args.meta_root.resolve() if args.meta_root is not None else None,
+        args.task_root.resolve() if args.task_root is not None else None,
+    )
+    for root in (artifacts.lane_root, artifacts.task_root):
+        if not root.is_dir():
+            print(f'Error: {root} does not exist', file=sys.stderr)
+            sys.exit(1)
+    return artifacts
 
 
 def main() -> None:
-    """Parse --worktree/--meta-root and run the stdio MCP server."""
+    """Parse the worktree and artifact roots and run the stdio MCP server."""
     artifacts = _artifacts_from_args()
     server = create_server(artifacts)
     # show_banner=False suppresses FastMCP's decorative startup banner and its
