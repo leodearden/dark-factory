@@ -468,6 +468,15 @@ class ReconciliationJournal:
             applied = cursor.rowcount == 1
         return applied
 
+    async def is_run_completed(self, run_id: str) -> bool:
+        """The one definition of 'durably completed', consulted by both the
+        drained-event restore policy and ``run_full_cycle``'s failure arms:
+        durable completion is final."""
+        row = await self._require_access().read_one(
+            'SELECT status FROM runs WHERE id = ?', (run_id,)
+        )
+        return row is not None and row['status'] == RunStatus.completed.value
+
     async def update_run_stage_reports(
         self, run_id: str, stage_reports: dict[str, StageReport | dict]
     ) -> None:

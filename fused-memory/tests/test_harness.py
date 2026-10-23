@@ -539,7 +539,7 @@ def _make_s3_findings():
     ]
 
 
-def _make_test_harness(journal, event_buffer, mock_memory_service):
+def _make_test_harness(journal, event_buffer, mock_memory_service, **harness_kwargs):
     """Build a ReconciliationHarness wired to test fixtures with minimal config.
 
     Callers must mock individual stage.run methods as needed.
@@ -566,6 +566,7 @@ def _make_test_harness(journal, event_buffer, mock_memory_service):
         journal=journal,
         event_buffer=event_buffer,
         config=config,
+        **harness_kwargs,
     )
     # task 1143: inject known projects so run_full_cycle pre-flight does not raise
     # for the project_ids used across the existing test suite.  Set BEFORE building
@@ -6447,11 +6448,15 @@ def _pending_recon_failures(esc_queue) -> list:
     return [e for e in esc_queue.get_pending() if e.category == 'recon_failure']
 
 
-def _make_completing_harness(journal, event_buffer, mock_memory_service, tmp_path):
+def _make_completing_harness(
+    journal, event_buffer, mock_memory_service, tmp_path, **harness_kwargs,
+):
     """A harness whose three stages all complete, with a real escalation queue."""
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service, **harness_kwargs,
+    )
     esc_queue = EscalationQueue(tmp_path / 'esc')
     harness._escalation_queue = esc_queue
     for stage in harness.stages:
@@ -6536,6 +6541,114 @@ async def test_run_full_cycle_post_completion_cancellation_keeps_run_completed(
     restore_spy.assert_not_awaited()
     assert len(await event_buffer.get_drained_events('test-project', row.id)) == 1
     assert _pending_recon_failures(esc_queue) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('resume_after_restart', [False, True])
+async def test_run_full_cycle_cancellation_after_the_completion_commit_keeps_run_completed(
+    journal, event_buffer, mock_memory_service, tmp_path, resume_after_restart,
+):
+    """A cancellation reaching run_full_cycle after complete_run(run_id,
+    'completed') has committed (aiosqlite lands a commit whose awaiter was
+    cancelled) still propagates, but never relabels the durably completed run
+    nor restores its drained events."""
+    harness, esc_queue = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    harness.config.resume_after_restart = resume_after_restart
+    await event_buffer.push(_make_event())
+
+    entered = asyncio.Event()
+    original_complete_run = journal.complete_run
+
+    async def complete_run_then_stall(run_id, status):
+        if status != 'completed':
+            return await original_complete_run(run_id, status)
+        await original_complete_run(run_id, status)
+        entered.set()
+        await asyncio.sleep(999)
+
+    journal.complete_run = complete_run_then_stall
+    restore_spy = AsyncMock(side_effect=event_buffer.restore_drained)
+    event_buffer.restore_drained = restore_spy
+
+    outer = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    await _cancel_once_entered(outer, entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.status == 'completed'
+    assert '_error' not in row.stage_reports
+    assert row.id not in {r.id for r in await journal.get_interrupted_runs()}
+    restore_spy.assert_not_awaited()
+    assert len(await event_buffer.get_drained_events('test-project', row.id)) == 1
+    assert (await journal.get_watermark('test-project')).last_full_run_id == row.id
+    assert _pending_recon_failures(esc_queue) == []
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_exception_after_the_completion_commit_keeps_run_completed(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """An Exception raised by complete_run(run_id, 'completed') after its commit
+    landed still propagates, but the failure arm leaves the durably completed
+    run completed, in the stage_reports it persists as in its status, and never
+    restores its drained events."""
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    await event_buffer.push(_make_event())
+    original_complete_run = journal.complete_run
+
+    async def complete_run_then_raise(run_id, status):
+        await original_complete_run(run_id, status)
+        if status == 'completed':
+            raise _sqlite_busy_error()
+
+    journal.complete_run = complete_run_then_raise
+    restore_spy = AsyncMock(side_effect=event_buffer.restore_drained)
+    event_buffer.restore_drained = restore_spy
+
+    with pytest.raises(sqlite3.OperationalError):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.status == 'completed'
+    assert '_error' not in row.stage_reports
+    restore_spy.assert_not_awaited()
+    assert len(await event_buffer.get_drained_events('test-project', row.id)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('resume_after_restart', 'row_status', 'buffered_after'),
+    [(False, 'failed', 1), (True, 'interrupted', 0)],
+)
+async def test_run_full_cycle_cancellation_relabels_when_the_completion_read_fails(
+    journal, event_buffer, mock_memory_service, tmp_path,
+    resume_after_restart, row_status, buffered_after,
+):
+    """The cancelled arm's read of whether the journal already records the run
+    completed is best-effort: when it fails, a run cancelled before completion
+    is relabelled exactly as it would be without that read."""
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    harness.config.resume_after_restart = resume_after_restart
+    await event_buffer.push(_make_event())
+    _fail_first_call(journal, 'is_run_completed', _sqlite_busy_error)
+    entered = asyncio.Event()
+    harness.stages[0].run = _stalling_stage_run(entered)
+
+    outer = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    await _cancel_once_entered(outer, entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.status == row_status
+    assert await event_buffer.count_buffered('test-project') == buffered_after
 
 
 def _lock_restore_drained(event_buffer) -> None:
@@ -11745,6 +11858,24 @@ async def _drive_one_project_loop_cycle(harness):
         await _drive_until(harness._project_loop('test-project'), completed)
 
 
+class _ManualDeadline:
+    """A ``full_cycle_deadline`` that never expires on the clock, so a test
+    lands the cycle timeout at a chosen point instead of racing the host clock."""
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+        self._armed: asyncio.Timeout | None = None
+
+    def arm(self, delay: float) -> asyncio.Timeout:
+        self.delays.append(delay)
+        self._armed = asyncio.timeout(None)
+        return self._armed
+
+    def expire(self) -> None:
+        assert self._armed is not None, 'expire() called before the deadline was armed'
+        self._armed.reschedule(asyncio.get_running_loop().time())
+
+
 @pytest.mark.asyncio
 async def test_project_loop_logs_iterate_timeout_without_restoring(
     journal, event_buffer, mock_memory_service, caplog
@@ -13636,16 +13767,19 @@ async def test_project_loop_timeout_in_post_completion_tail_keeps_events_drained
     journal, event_buffer, mock_memory_service, tmp_path, caplog,
 ):
     """Task 6453: a cycle timeout landing after the run durably completed
-    leaves that run's consumed events drained."""
+    leaves that run's consumed events drained; the deadline expires once the
+    tail is entered, never on the host clock."""
+    deadline = _ManualDeadline()
     harness, _ = _make_completing_harness(
         journal, event_buffer, mock_memory_service, tmp_path,
+        full_cycle_deadline=deadline.arm,
     )
     assert harness.judge is not None
-    harness.config.cycle_timeout_seconds = 1
     await event_buffer.push(_make_event())
     await event_buffer.push(_make_event())
 
     async def stalled_mark_judge_pending(run_id, project_id):
+        deadline.expire()
         await asyncio.sleep(999)
 
     journal.mark_judge_pending = stalled_mark_judge_pending
@@ -13660,6 +13794,44 @@ async def test_project_loop_timeout_in_post_completion_tail_keeps_events_drained
     assert [
         r for r in caplog.records if r.getMessage() == 'reconciliation.full_cycle_timed_out'
     ]
+    assert deadline.delays == [harness.config.cycle_timeout_seconds]
+
+
+@pytest.mark.asyncio
+async def test_project_loop_timeout_landing_after_the_completion_commit_keeps_events_drained(
+    journal, event_buffer, mock_memory_service, tmp_path, caplog,
+):
+    """A cycle timeout whose cancellation reaches run_full_cycle after
+    complete_run(run_id, 'completed') has committed leaves the run completed
+    and its consumed events drained."""
+    deadline = _ManualDeadline()
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+        full_cycle_deadline=deadline.arm,
+    )
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+    original_complete_run = journal.complete_run
+
+    async def complete_run_then_expire(run_id, status):
+        if status != 'completed':
+            return await original_complete_run(run_id, status)
+        await original_complete_run(run_id, status)
+        deadline.expire()
+        await asyncio.sleep(999)
+
+    journal.complete_run = complete_run_then_expire
+
+    with caplog.at_level(logging.ERROR, logger='fused_memory.reconciliation.harness'):
+        await _drive_one_project_loop_cycle(harness)
+
+    [run] = await journal.get_recent_runs('test-project')
+    assert run.status == 'completed'
+    assert await event_buffer.count_buffered('test-project') == 0
+    assert len(await event_buffer.get_drained_events('test-project', run.id)) == 2
+    assert len([
+        r for r in caplog.records if r.getMessage() == 'reconciliation.full_cycle_timed_out'
+    ]) == 1
 
 
 @pytest.mark.asyncio
