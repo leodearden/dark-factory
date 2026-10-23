@@ -85,12 +85,16 @@ left out.
   every basis. Both get the brief verbatim and are blind to outcome, system
   and key files. Raters answer HOME and CONFLICT, plus the follow-ups the brief
   conditions on them; DIGEST is computed, never asked.
-- Every `conflict_quote` side and every loss span is checked before scoring:
-  it must be a whitespace-normalised substring of the text its rater saw
-  (`fused-memory/scripts/write_triage_reader_rubric.py::quote_found`). A rater
-  whose quote or span is not found is asked the item again (the `reask`
-  subcommand of `fused-memory/scripts/build_write_triage_v2_soak_baseline.py`),
-  and the later round's line supersedes the earlier one.
+- Every rater line is checked before scoring. It must keep the rubric's row
+  contract (`fused-memory/scripts/write_triage_reader_rubric.py::resolve_judgements`):
+  the answer words, the follow-ups its own answers ask, and the evidence an
+  answer needs. Every `conflict_quote` side and every loss span must be found:
+  a whitespace-normalised substring of the text its rater saw (`::quote_found`).
+  A rater whose line breaks the contract, or whose quote or span is not found,
+  is asked the item again (the `reask` subcommand of
+  `fused-memory/scripts/build_write_triage_v2_soak_baseline.py`, via
+  `::rating_problems`), and the later round's line supersedes the earlier one.
+  `third` and `assemble` refuse while any such line is left.
 - Agreement is Cohen's kappa per binary between the primary and the second
   rater, over consumed answers only. An answer is consumed when both raters
   gave it on a (record, binary) the derivation read
@@ -107,17 +111,27 @@ left out.
 - SCOPE below the floor on its own is recorded and reported with
   `escalate_info`, and does not block scoring. Leo ratified this reading of
   R5 on 2026-10-21 (task 7174, metadata `x_ruling_ratified`).
-- A third rater, also Opus, is asked only about decisive disagreements: a
-  binary that is tied and that the derivation needs. The scorer names them,
-  refusing with `fused-memory/scripts/score_write_triage_reader.py::IncompleteJudgementError`
+- A third rater, also Opus, is asked only about decisive gaps that the
+  derivation needs: a tied binary, or an OPEN follow-up. A follow-up is OPEN
+  when the raters' answers resolve every one of its preconditions, though no
+  rater's own answers met them all, so no rater gave it
+  (`fused-memory/scripts/write_triage_reader_rubric.py::Resolved`, OPEN). For
+  example, a primary answering HOME YES / CONFLICT UNCLEAR beside a second
+  answering HOME UNCLEAR / CONFLICT NO resolves HOME YES and CONFLICT NO with
+  no LOSS. A third rater answers the whole item blind: one whose own HOME is
+  YES and CONFLICT NO must give LOSS, and any other answer moves the
+  preconditions, so the rounds go on. No rater is ever asked LOSS
+  conditionally. The scorer names every gap, refusing with
+  `fused-memory/scripts/score_write_triage_reader.py::IncompleteJudgementError`
   until each is resolved. Third raters come in rounds, each round a new rater
   id, because a resolved CONFLICT can open a tied LOSS. A tie on a binary the
   derivation never asks for is left as it is.
 - UNCLEAR only where a truncation falls at the deciding point, with the point
   named, or where no rater reached a follow-up because a held v1 row fixed an
   answer it is conditioned on (`fused-memory/scripts/write_triage_reader_rubric.py::Judgement`,
-  its `unreached_follow_ups`). An item whose deciding binary is UNCLEAR is
-  left out of every rate and counted.
+  its `unreached_follow_ups`). A follow-up the raters' own answers leave open
+  is not UNCLEAR: it goes to a third round. An item whose deciding binary is
+  UNCLEAR is left out of every rate and counted.
 
 ## 5. Reconstructing write-time state
 
@@ -198,9 +212,9 @@ record marked). The window opens when the last of them is live, runs at least
 3. Build shards as `fused-memory/scripts/build_write_triage_v2_soak_baseline.py`
    does: the brief verbatim, texts capped at 4,000 characters, no digest,
    opaque item ids, a separate key, and a record of the texts each rater saw.
-4. Rate per §4: two blind Opus raters on every item. Validate every quote and
-   span, and re-ask each rater whose evidence is not found until none is
-   left. Then check kappa over consumed answers.
+4. Rate per §4: two blind Opus raters on every item. Validate every line, and
+   re-ask each rater whose line breaks the row contract or whose evidence is
+   not found until none is left. Then check kappa over consumed answers.
 5. Score with `score_write_triage_reader.py --strata`. For the gaps a refusal
    names, run a third round with a new rater, and repeat until the scorer
    accepts the corpus.
