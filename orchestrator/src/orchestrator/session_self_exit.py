@@ -95,20 +95,19 @@ class SelfExit:
 
     def enact(
         self,
-        evaluation: SelfExitEvaluation | None,
+        evaluation: SelfExitEvaluation,
         record: session_registry.SessionRecord,
         root: Path | str | None,
     ) -> None:
-        """Signal the owner of an ATTEMPTED evaluation, then delete its marker; anything else is a no-op.
+        """Signal the owner of an ATTEMPTED evaluation, then delete its marker; a refusal is a no-op.
 
         A failed signal is stamped ``kill_failed`` in a second, fail-soft
         write and the marker stays, so the next Stop retries.
         """
-        if evaluation is None:
-            return
         request = evaluation.request
-        if request.state is not session_registry.ExitRequestState.ATTEMPTED or request.pid is None:
+        if request.state is not session_registry.ExitRequestState.ATTEMPTED:
             return
+        assert request.pid is not None, 'an unresolved owner pid is refused, never attempted'
         try:
             self.kill(request.pid, signal.SIGINT)
         except (OSError, OverflowError) as exc:

@@ -965,7 +965,7 @@ def _run_status_refresh_and_retitle(
     # Unconditional: the heartbeat is owed on every event, a withheld one too.
     session_registry.write_record(record, root=root)
     _stamp_session_pointer(record, probes, root)
-    if self_exit is not None:
+    if self_exit is not None and evaluation is not None:
         self_exit.enact(evaluation, record, root)
     identity_env = _own_identity_env(env, resolution)
     identity = resolve_hook_identity(hook_input, identity_env)
