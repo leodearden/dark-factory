@@ -10,7 +10,7 @@ Three kinds of coverage:
     WATCHER_REARM_PYTHON=sys.executable + PYTHONPATH -- the watcher reads
     the queue directly via inotify, never through the MCP server, so this
     is the faithful hermetic "live" end-to-end path.
-  - Default-path tests (see _default_env) leave WATCHER_REARM_PYTHON unset,
+  - Default-path tests (see fake_root) leave WATCHER_REARM_PYTHON unset,
     so the wrapper runs its default interpreter -- the root venv's
     $DARK_FACTORY_ROOT/.venv/bin/python -- against a fake root, with a
     recording fake `uv` first on PATH (see _uv_shim).
@@ -124,6 +124,27 @@ def _stub_venv_python(venv):
     stub = bin_dir / 'python'
     stub.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
     stub.chmod(0o755)
+
+
+class _FakeRoot(NamedTuple):
+    """A fake DARK_FACTORY_ROOT holding no .venv yet, an empty queue dir, the
+    env that drives the wrapper's default interpreter against them, and the
+    uv shim's invocation marker (see _uv_shim)."""
+
+    root: Path
+    queue_dir: Path
+    env: dict[str, str]
+    uv_marker: Path
+
+
+@pytest.fixture
+def fake_root(tmp_path):
+    root = tmp_path / 'root'
+    root.mkdir()
+    queue_dir = tmp_path / 'queue'
+    queue_dir.mkdir()
+    shim_path, uv_marker = _uv_shim(tmp_path)
+    return _FakeRoot(root, queue_dir, _default_env(root, shim_path), uv_marker)
 
 
 def _write_pending(queue_dir, esc_id, task_id='1', level=2):
@@ -344,7 +365,7 @@ def test_exclude_file_ownership_suppresses(tmp_path, mode):
     )
 
 
-def test_default_path_never_invokes_uv(tmp_path):
+def test_default_path_never_invokes_uv(fake_root):
     """With WATCHER_REARM_PYTHON unset, the wrapper runs the shared root
     venv's interpreter ($DARK_FACTORY_ROOT/.venv/bin/python) directly: the
     real watcher fires through it, and `uv` is never invoked.
@@ -357,16 +378,13 @@ def test_default_path_never_invokes_uv(tmp_path):
     CREATED a missing venv, and REMOVED and RECREATED a venv whose
     interpreter link dangled. This wrapper must never sync, recreate or prune
     the main checkout's venv, so it does not call uv."""
-    root = tmp_path / 'root'
-    _stub_venv_python(root / '.venv')
-    queue_dir = tmp_path / 'queue'
-    queue_dir.mkdir()
-    esc = _write_pending(queue_dir, 'esc-60-1', task_id='60', level=2)
-    shim_path, uv_marker = _uv_shim(tmp_path)
+    _stub_venv_python(fake_root.root / '.venv')
+    esc = _write_pending(fake_root.queue_dir, 'esc-60-1', task_id='60', level=2)
+    uv_marker = fake_root.uv_marker
 
     result = _run(
-        '--queue-dir', str(queue_dir), '--level', '2', '--timeout', '5',
-        env=_default_env(root, shim_path),
+        '--queue-dir', str(fake_root.queue_dir), '--level', '2', '--timeout', '5',
+        env=fake_root.env,
     )
 
     assert result.returncode == 0, (
@@ -409,15 +427,18 @@ def _venv_snapshot(venv_dir):
     return sorted(entries)
 
 
+_NOT_EXECUTABLE = 'not an executable interpreter'
+
+
 def _missing_venv(venv_dir):
-    return str(venv_dir / 'bin' / 'python')
+    return _NOT_EXECUTABLE
 
 
 def _dangling_interpreter(venv_dir):
     interpreter = venv_dir / 'bin' / 'python'
     interpreter.parent.mkdir(parents=True)
     interpreter.symlink_to(venv_dir / 'gone' / 'python3.13')
-    return str(interpreter)
+    return _NOT_EXECUTABLE
 
 
 def _empty_venv(venv_dir):
@@ -425,36 +446,44 @@ def _empty_venv(venv_dir):
     real interpreter with nothing installed, so `import escalation.watcher`
     fails (on inotify_simple) even with the source tree on PYTHONPATH."""
     EnvBuilder(with_pip=False, symlinks=True).create(str(venv_dir))
-    return 'escalation.watcher'
+    return 'cannot import escalation.watcher (ModuleNotFoundError'
+
+
+def _silently_failing_interpreter(venv_dir):
+    """An interpreter that dies without a word, as one killed by a signal
+    would: the diagnostic falls back to its exit status."""
+    interpreter = venv_dir / 'bin' / 'python'
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text('#!/bin/sh\nexit 3\n')
+    interpreter.chmod(0o755)
+    return 'cannot import escalation.watcher (exit 3, no output)'
 
 
 # Each builder makes one broken shape of the root .venv and returns a token
-# the refusal diagnostic must contain.
+# naming its problem, which the refusal diagnostic must contain.
 _BROKEN_VENVS = [
     pytest.param(_missing_venv, id='missing'),
     pytest.param(_dangling_interpreter, id='dangling-interpreter'),
     pytest.param(_empty_venv, id='empty-venv'),
+    pytest.param(_silently_failing_interpreter, id='silent-interpreter'),
 ]
 
 
 @pytest.mark.parametrize('build', _BROKEN_VENVS)
-def test_default_path_refuses_broken_venv(tmp_path, build):
+def test_default_path_refuses_broken_venv(fake_root, build):
     """A root venv that cannot run the watcher makes the default path refuse
     with exit 2 and a diagnostic naming the venv and the problem, BEFORE any
     side effect: no exclude-file is created, uv is never invoked, and the
     venv is left exactly as it was found."""
-    root = tmp_path / 'root'
-    root.mkdir()
-    root_venv = root / '.venv'
+    root_venv = fake_root.root / '.venv'
     token = build(root_venv)
     before = _venv_snapshot(root_venv)
-    queue_dir = tmp_path / 'queue'
-    queue_dir.mkdir()
-    shim_path, uv_marker = _uv_shim(tmp_path)
+    queue_dir = fake_root.queue_dir
+    uv_marker = fake_root.uv_marker
 
     result = _run(
         '--queue-dir', str(queue_dir), '--level', '2', '--timeout', '5',
-        env=_default_env(root, shim_path),
+        env=fake_root.env,
     )
 
     assert result.returncode == 2, (
@@ -486,25 +515,19 @@ def test_default_path_refuses_broken_venv(tmp_path, build):
     )
 
 
-def test_check_refuses_missing_venv(tmp_path):
+def test_check_refuses_missing_venv(fake_root):
     """The --check dry-run reports a run that would refuse as a refusal,
     not as a would-watch line."""
-    root = tmp_path / 'root'
-    root.mkdir()
-    queue_dir = tmp_path / 'queue'
-    queue_dir.mkdir()
-    shim_path, _ = _uv_shim(tmp_path)
-
     result = _run(
-        '--check', '--queue-dir', str(queue_dir), '--level', '2',
-        env=_default_env(root, shim_path),
+        '--check', '--queue-dir', str(fake_root.queue_dir), '--level', '2',
+        env=fake_root.env,
     )
 
     assert result.returncode == 2, (
         f'Expected exit 2 from --check with no root venv; got '
         f'{result.returncode}\nstdout={result.stdout!r} stderr={result.stderr!r}'
     )
-    assert str(root / '.venv') in result.stderr, (
+    assert str(fake_root.root / '.venv') in result.stderr, (
         f'Expected the diagnostic to name the venv; got {result.stderr!r}'
     )
     assert 'would watch' not in result.stdout, (
@@ -513,20 +536,15 @@ def test_check_refuses_missing_venv(tmp_path):
     )
 
 
-def test_override_needs_no_root_venv(tmp_path):
+def test_override_needs_no_root_venv(fake_root):
     """WATCHER_REARM_PYTHON keeps working unchanged: with the override set,
     the wrapper neither needs nor checks the root venv."""
-    root = tmp_path / 'root'
-    root.mkdir()
-    queue_dir = tmp_path / 'queue'
-    queue_dir.mkdir()
-    esc = _write_pending(queue_dir, 'esc-61-1', task_id='61', level=2)
-    shim_path, uv_marker = _uv_shim(tmp_path)
-    env = _default_env(root, shim_path)
-    env['WATCHER_REARM_PYTHON'] = sys.executable
+    esc = _write_pending(fake_root.queue_dir, 'esc-61-1', task_id='61', level=2)
+    env = {**fake_root.env, 'WATCHER_REARM_PYTHON': sys.executable}
+    uv_marker = fake_root.uv_marker
 
     result = _run(
-        '--queue-dir', str(queue_dir), '--level', '2', '--timeout', '5',
+        '--queue-dir', str(fake_root.queue_dir), '--level', '2', '--timeout', '5',
         env=env,
     )
 

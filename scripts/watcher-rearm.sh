@@ -177,35 +177,33 @@ else
     EXCLUDE_FILE="$QUEUE_DIR/.watcher-rearm-exclude"
 fi
 
-# Interpreter prefix: by default the one shared root .venv every workspace
-# member resolves to, run without uv so nothing on this path can sync,
-# recreate or prune it (why not `uv run --no-sync`:
+# Default interpreter: the shared root .venv, run without uv (why:
 # escalation/tests/test_watcher_rearm.py::test_default_path_never_invokes_uv).
-# WATCHER_REARM_PYTHON overrides it (tests inject sys.executable). Built as
-# an array so the default branch keeps the interpreter path as a single argv
-# token -- space-safe even if DARK_FACTORY_ROOT contains spaces. Only an
-# explicit WATCHER_REARM_PYTHON override is word-split, on the assumption
-# that a caller supplying a multi-word interpreter command (e.g.
-# "python3 -I") wants each word as a separate argv entry.
 ROOT_VENV="$DARK_FACTORY_ROOT/.venv"
 ROOT_VENV_PYTHON="$ROOT_VENV/bin/python"
 
-# The import probe inherits exactly the env the real run will, so the two
-# cannot disagree.
-require_runnable_root_venv() {
-    local repair="this script never creates, syncs or repairs that venv; repair it with scripts/sync-orchestrator-env.sh"
-    local problem err
-    if [ ! -x "$ROOT_VENV_PYTHON" ]; then
-        problem="$ROOT_VENV_PYTHON is not an executable interpreter (missing venv, missing bin/python, or a dangling link)"
-    elif ! err=$("$ROOT_VENV_PYTHON" -c 'import escalation.watcher' 2>&1 >/dev/null); then
-        problem="$ROOT_VENV_PYTHON cannot import escalation.watcher (${err##*$'\n'})"
-    else
-        return 0
-    fi
-    echo "watcher-rearm.sh: shared root venv $ROOT_VENV cannot run the watcher: $problem -- $repair" >&2
+refuse_root_venv() {
+    echo "watcher-rearm.sh: shared root venv $ROOT_VENV cannot run the watcher: $1 -- this script never creates, syncs or repairs that venv; repair it with scripts/sync-orchestrator-env.sh" >&2
     exit 2
 }
 
+require_runnable_root_venv() {
+    local err rc last_line
+    [ -x "$ROOT_VENV_PYTHON" ] \
+        || refuse_root_venv "$ROOT_VENV_PYTHON is not an executable interpreter (missing venv, missing bin/python, or a dangling link)"
+    err=$("$ROOT_VENV_PYTHON" -c 'import escalation.watcher' 2>&1 >/dev/null)
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    last_line=${err##*$'\n'}
+    refuse_root_venv "$ROOT_VENV_PYTHON cannot import escalation.watcher (${last_line:-exit $rc, no output})"
+}
+
+# WATCHER_REARM_PYTHON overrides the default (tests inject sys.executable).
+# Built as an array so the default branch keeps the interpreter path as a
+# single argv token -- space-safe even if DARK_FACTORY_ROOT contains spaces.
+# Only an explicit override is word-split, on the assumption that a caller
+# supplying a multi-word interpreter command (e.g. "python3 -I") wants each
+# word as a separate argv entry.
 if [ -n "${WATCHER_REARM_PYTHON:-}" ]; then
     # shellcheck disable=SC2206
     WATCHER_CMD=($WATCHER_REARM_PYTHON)
