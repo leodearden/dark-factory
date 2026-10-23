@@ -10,10 +10,14 @@ retro-critic ruling R1; reify's reference reader is
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import tempfile
 import time
+import uuid
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -132,3 +136,69 @@ def read_verify_event_channel(path: Path, *, verify_id: str) -> VerifyEventChann
         logger.warning('verify event channel %s unreadable; treating it as absent: %s', path, exc)
         return VerifyEventChannel()
     return parse_verify_event_channel(data, verify_id=verify_id)
+
+
+@dataclass(frozen=True)
+class VerifyEventLog:
+    """One allocated channel file; ``path`` None means allocation failed (no channel)."""
+
+    path: Path | None
+    verify_id: str
+
+    def export_into(self, env: Mapping[str, str]) -> dict[str, str]:
+        exported = {key: value for key, value in env.items() if key != VERIFY_EVENT_LOG_ENV}
+        if self.path is not None:
+            exported[VERIFY_EVENT_LOG_ENV] = str(self.path)
+        return exported
+
+    def read(self) -> VerifyEventChannel:
+        if self.path is None:
+            return VerifyEventChannel()
+        channel = read_verify_event_channel(self.path, verify_id=self.verify_id)
+        if not channel.present:
+            logger.warning(
+                'verify event channel %s lost its channel_open header; '
+                'classifying this leg from its text alone', self.path,
+            )
+        return channel
+
+
+def _create_with_header(*, role: str, verify_id: str, directory: Path | None) -> Path:
+    fd, name = tempfile.mkstemp(prefix='df-verify-events-', suffix='.jsonl', dir=directory)
+    try:
+        os.write(fd, encode_channel_open(role=role, verify_id=verify_id))
+    except OSError:
+        Path(name).unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(fd)
+    return Path(name)
+
+
+def _remove(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning('could not remove verify event channel %s: %s', path, exc)
+
+
+@contextlib.contextmanager
+def allocate_verify_event_log(
+    *, role: str, directory: Path | None = None,
+) -> Iterator[VerifyEventLog]:
+    """A fresh channel file headed by DF's ``channel_open``, removed on exit.
+
+    Allocation failure is logged and yields a log with no path, so the verify runs
+    with no channel (C3 rule 2) rather than failing.
+    """
+    verify_id = uuid.uuid4().hex
+    try:
+        path = _create_with_header(role=role, verify_id=verify_id, directory=directory)
+    except OSError as exc:
+        logger.warning('could not allocate a verify event channel; running without one: %s', exc)
+        yield VerifyEventLog(None, verify_id)
+        return
+    try:
+        yield VerifyEventLog(path, verify_id)
+    finally:
+        _remove(path)

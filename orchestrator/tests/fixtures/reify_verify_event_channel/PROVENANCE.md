@@ -176,3 +176,31 @@ slot_timeout_fatal=0
 slot_timeout_soft=1
 skipped_lines=0
 ```
+
+## DF's header is a well-formed C2 v1 record to reify's reader
+
+Checked 2026-10-23 (task 6856, step-4) against the same reify main. A scratch
+file outside the worktree held one DF header from
+`orchestrator.verify_event_channel.encode_channel_open(role="merge",
+verify_id="0123456789abcdef0123456789abcdef")` followed by the bytes of
+`run_all-pool.events.jsonl`:
+
+```
+$ head -1 df-header-plus-pool.jsonl
+{"v":1,"ts_ns":1792763394852374376,"pid":3878890,"event":"channel_open","role":"merge","verify_id":"0123456789abcdef0123456789abcdef"}
+$ python3 -I /home/leo/src/reify/tests/infra/verify_events.py summary df-header-plus-pool.jsonl
+channel=present
+runs=1
+discovered=3
+failures=1
+failed=test_fail.sh
+flaky=
+skipped=
+interrupted=false
+slot_timeout_fatal=0
+slot_timeout_soft=0
+skipped_lines=0
+```
+
+`skipped_lines=0`: reify's reader parses the header as a v1 record and ignores
+its event, as ruling R1 expects.

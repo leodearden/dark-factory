@@ -317,13 +317,14 @@ def test_allocated_log_holds_only_this_verifys_header_and_is_removed_after(
 
 
 def test_allocated_log_is_removed_when_the_block_raises(tmp_path: Path) -> None:
-    with pytest.raises(RuntimeError, match='boom'):
-        with allocate_verify_event_log(role='task', directory=tmp_path) as log:
-            assert log.path is not None
-            path = log.path
-            raise RuntimeError('boom')
+    with (
+        pytest.raises(RuntimeError, match='boom'),
+        allocate_verify_event_log(role='task', directory=tmp_path) as log,
+    ):
+        assert log.path is not None and log.path.is_file()
+        raise RuntimeError('boom')
 
-    assert not path.exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_producer_deleting_the_log_is_tolerated(tmp_path: Path) -> None:
@@ -342,10 +343,12 @@ def test_export_overrides_an_operator_supplied_channel(tmp_path: Path) -> None:
 
 
 def test_nested_allocations_are_distinct(tmp_path: Path) -> None:
-    with allocate_verify_event_log(role='task', directory=tmp_path) as outer:
-        with allocate_verify_event_log(role='task', directory=tmp_path) as inner:
-            assert outer.path != inner.path
-            assert outer.verify_id != inner.verify_id
+    with (
+        allocate_verify_event_log(role='task', directory=tmp_path) as outer,
+        allocate_verify_event_log(role='task', directory=tmp_path) as inner,
+    ):
+        assert outer.path != inner.path
+        assert outer.verify_id != inner.verify_id
 
 
 def test_producer_bytes_appended_to_the_log_are_read(tmp_path: Path) -> None:
