@@ -76,7 +76,7 @@ def _service(score: float, *, enabled: bool = True) -> AsyncMock:
 
 async def _call(mock_service: AsyncMock, metadata: dict | None) -> dict:
     server = create_mcp_server(mock_service)
-    args = {
+    args: dict[str, object] = {
         'content': _CONTENT,
         'category': 'procedural_knowledge',
         'agent_id': _AGENT_ID,
