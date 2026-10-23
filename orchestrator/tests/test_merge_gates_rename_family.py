@@ -22,10 +22,14 @@ from pathlib import Path
 
 import pytest
 from _git_fixtures import seed_repo
+from _resolution_merges import resolution_merge
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_lane.gates import _check_plan_files_touched_in_branch
+from orchestrator.merge_lane.gates import (
+    _check_plan_files_touched_in_branch,
+    _check_plan_targets_in_tree,
+)
 
 TASK = 'task-6412'
 LANE_LOGGER = 'orchestrator.merge_lane'
@@ -418,3 +422,123 @@ class TestPlanFilesGateArms:
         assert result.missing_from_tree == []
         assert result.resolved_renames == {'pkg/stale_old.py': 'pkg/stale_new.py'}
         assert 'entry=pkg/broken.py' in _record(caplog, 'ls-tree probe failed')
+
+
+_BRANCH_EDIT = _BASE_MODULE.replace('line2\n', 'line2\nBRANCH_EDIT\n')
+_MAIN_EDIT = _BASE_MODULE.replace('line37\n', 'line37\nMAIN_EDIT\n')
+_BASE_BLOB = b'\x89PNG\r\n\x1a\n' + bytes(range(256)) * 4
+
+
+def _on_branch(repo: Path, branch: str, files: Mapping[str, str | bytes], msg: str) -> str:
+    _git(repo, 'checkout', '-q', '-b', branch)
+    sha = _commit(repo, files, msg)
+    _git(repo, 'checkout', '-q', 'main')
+    return sha
+
+
+def _merge_no_ff(repo: Path, branch: str) -> str:
+    _git(repo, 'merge', '-q', '--no-ff', '--no-edit', branch)
+    return _git(repo, 'rev-parse', 'HEAD')
+
+
+def _main_relocates_what_the_branch_edited(repo: Path) -> tuple[str, str]:
+    """Clean merge of a branch that edited pkg/a.py while main moved it to pkg/b.py; returns (merge, main_sha)."""
+    _commit(repo, {'pkg/a.py': _BASE_MODULE}, 'add pkg/a.py')
+    _on_branch(repo, 'task/drop', {'pkg/a.py': _BRANCH_EDIT}, 'branch: edit top')
+    _git(repo, 'mv', 'pkg/a.py', 'pkg/b.py')
+    main_sha = _commit(repo, {'pkg/b.py': _MAIN_EDIT}, 'main: move and edit bottom')
+    return _merge_no_ff(repo, 'task/drop'), main_sha
+
+
+@pytest.mark.asyncio
+class TestDropGuardAuditTrail:
+    """What the plan-target drop-guard logs, and how it reads the merge's rename map."""
+
+    async def test_verified_relocation_logs_the_suppressed_pair(
+        self, git_repo: Path, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        merge, main_sha = _main_relocates_what_the_branch_edited(git_repo)
+
+        with caplog.at_level(logging.INFO, logger=LANE_LOGGER):
+            result = await _check_plan_targets_in_tree(
+                merge, git_ops, main_sha, task_id=TASK,
+            )
+
+        assert result.dropped == []
+        record = _record(caplog, 'drop-guard: content verified at the new name')
+        assert "[('pkg/a.py', 'pkg/b.py')]" in record
+        assert f'task_id={TASK} ' in record
+
+    async def test_unverifiable_binary_relocation_logs_the_gate_and_the_task(
+        self, git_repo: Path, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        _commit(git_repo, {'pkg/a.bin': _BASE_BLOB}, 'add pkg/a.bin')
+        task_head = _on_branch(
+            git_repo, 'task/bin', {'pkg/a.bin': _BASE_BLOB + b'\x00branch-payload\xff'},
+            'branch: append payload',
+        )
+        _git(git_repo, 'mv', 'pkg/a.bin', 'pkg/b.bin')
+        main_sha = _commit(
+            git_repo, {'pkg/b.bin': _BASE_BLOB + b'\x00main-payload\xfe'},
+            'main: move and rewrite',
+        )
+        merge = await resolution_merge(
+            git_repo, main_sha=main_sha, branch_tip=task_head, kept_tree_of=main_sha,
+        )
+
+        renames = _git(git_repo, 'diff', '-M', '--name-status', task_head, merge)
+        assert [
+            ln for ln in renames.splitlines()
+            if ln.startswith('R') and 'pkg/a.bin' in ln and 'pkg/b.bin' in ln
+        ]
+
+        with caplog.at_level(logging.WARNING, logger=LANE_LOGGER):
+            result = await _check_plan_targets_in_tree(
+                merge, git_ops, main_sha, task_id=TASK,
+            )
+
+        assert result.dropped == ['pkg/a.bin']
+        record = _record(caplog, 'is not valid UTF-8')
+        assert record.startswith('drop-guard: merged blob ')
+        assert record.endswith(f'task_id={TASK}')
+
+    async def test_unreadable_rename_map_logs_the_gate_and_the_task(
+        self, git_repo: Path, git_ops: GitOps, tmp_path: Path,
+        caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    ):
+        merge, main_sha = _main_relocates_what_the_branch_edited(git_repo)
+        _fail_git_argv(monkeypatch, tmp_path / 'bin', 'diff -M --name-status *')
+
+        with caplog.at_level(logging.WARNING, logger=LANE_LOGGER):
+            result = await _check_plan_targets_in_tree(
+                merge, git_ops, main_sha, task_id=TASK,
+            )
+
+        assert result.dropped == []
+        record = _record(caplog, 'rename-pair diff')
+        assert record.startswith('drop-guard: rename-pair diff ')
+        assert record.endswith(f'task_id={TASK}')
+
+    async def test_relocation_of_a_path_containing_spaces_is_not_a_drop(
+        self, git_repo: Path, git_ops: GitOps,
+    ):
+        _commit(git_repo, {'pkg/my mod.py': _BASE_MODULE}, 'add spaced module')
+        task_head = _on_branch(
+            git_repo, 'task/spaced', {'pkg/my mod.py': _BRANCH_EDIT}, 'branch: edit top',
+        )
+        _git(git_repo, 'mv', 'pkg/my mod.py', 'pkg/your mod.py')
+        _git(git_repo, 'commit', '-q', '-m', 'main: pure move')
+        main_sha = _git(git_repo, 'rev-parse', 'HEAD')
+        merge = _merge_no_ff(git_repo, 'task/spaced')
+
+        raw_drops = _git(
+            git_repo, 'diff', '--name-only', '--no-renames', '--diff-filter=D',
+            task_head, merge,
+        )
+        assert 'pkg/my mod.py' in raw_drops
+
+        result = await _check_plan_targets_in_tree(
+            merge, git_ops, main_sha, task_id=TASK,
+        )
+
+        assert result.dropped == []
