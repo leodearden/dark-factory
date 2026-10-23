@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -402,6 +403,45 @@ class TestParseCodexFailedTurnReportsOnlyCodexErrors:
 
         assert _CODEX_MODEL_METADATA_WARNING in agent_result.output
         assert _CODEX_CONTEXT_WINDOW_ERROR in agent_result.output
+
+    def test_timed_out_run_quoting_a_cap_is_a_plain_failure(self) -> None:
+        stream = replace(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-timeout-1'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': _PROSE_QUOTING_CAP_TEXT}},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': _CODEX_USAGE_LIMIT_MESSAGE}},
+        ), returncode=-9, timed_out=True)
+
+        agent_result = _parse_codex_output(stream, 'gpt-6-astra')
+
+        assert agent_result.success is False
+        assert agent_result.timed_out is True
+        assert _PROSE_QUOTING_CAP_TEXT not in agent_result.output
+        assert _CODEX_USAGE_LIMIT_MESSAGE not in agent_result.output
+        assert 'timed out' in agent_result.output
+        outcome = classify_invocation(agent_result, strict_confirm=True, backend='codex')
+        assert isinstance(outcome, Failure)
+
+    def test_nonzero_exit_without_error_event_reports_codex_exit_and_warnings(self) -> None:
+        stream = replace(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-rc-1'},
+            {'type': 'item.completed', 'item': {'type': 'error', 'message': _CODEX_MODEL_METADATA_WARNING}},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': _CODEX_USAGE_LIMIT_MESSAGE}},
+        ), returncode=2)
+
+        agent_result = _parse_codex_output(stream, 'gpt-6-astra')
+
+        assert agent_result.success is False
+        assert agent_result.output == f'codex exited rc=2\n{_CODEX_MODEL_METADATA_WARNING}'
+        outcome = classify_invocation(agent_result, strict_confirm=True, backend='codex')
+        assert isinstance(outcome, Failure)
+
+    def test_nonzero_exit_with_unparseable_stdout_drops_the_raw_text(self) -> None:
+        agent_result = _parse_codex_output(_make_subprocess_result(
+            stdout=f'not json: {_CODEX_USAGE_LIMIT_MESSAGE}', returncode=1,
+        ), 'gpt-6-astra')
+
+        assert agent_result.success is False
+        assert agent_result.output == 'codex exited rc=1'
 
     def test_completed_turn_still_reports_agent_text(self) -> None:
         agent_result = _parse_codex_output(_codex_stream(
