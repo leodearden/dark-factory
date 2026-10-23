@@ -6708,7 +6708,7 @@ class TestBlocklistLazyLoadRunsOffEventLoop:
             raise RuntimeError("boom")
 
         with patch(
-            "fused_memory.middleware.cancelled_premise_blocklist.load_blocklist",
+            "fused_memory.middleware.task_curator.load_blocklist",
             side_effect=counting_raise,
         ), caplog.at_level(logging.WARNING):
             decision1 = await curator._maybe_blocklist_drop(
@@ -7659,7 +7659,7 @@ class TestPremiseGuardRunsOffEventLoop:
             return True
 
         with patch(
-            "fused_memory.middleware.recon_code_fix_premise_guard.verify_premise_refuted",
+            "fused_memory.middleware.task_curator.verify_premise_refuted",
             side_effect=recording_verify,
         ):
             decision = await curator._maybe_premise_refuted_drop(
@@ -7712,7 +7712,7 @@ class TestPremiseGuardRunsOffEventLoop:
         )
 
         with patch(
-            "fused_memory.middleware.recon_code_fix_premise_guard.verify_premise_refuted",
+            "fused_memory.middleware.task_curator.verify_premise_refuted",
             side_effect=RuntimeError("boom"),
         ), caplog.at_level(logging.WARNING):
             decision = await curator._maybe_premise_refuted_drop(
@@ -7794,7 +7794,7 @@ class TestPremiseGuardRunsOffEventLoop:
             return real_load_premise_registry(path)
 
         with patch(
-            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            "fused_memory.middleware.task_curator.load_premise_registry",
             side_effect=recording_load,
         ):
             decision1 = await curator._maybe_premise_refuted_drop(
@@ -7869,7 +7869,7 @@ class TestPremiseGuardRunsOffEventLoop:
             return real_load_premise_registry(path)
 
         with patch(
-            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            "fused_memory.middleware.task_curator.load_premise_registry",
             side_effect=slow_load,
         ):
             d1, d2 = await asyncio.gather(
@@ -7945,7 +7945,7 @@ class TestPremiseGuardRunsOffEventLoop:
             raise RuntimeError("registry load exploded")
 
         with patch(
-            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            "fused_memory.middleware.task_curator.load_premise_registry",
             side_effect=raising_load,
         ), caplog.at_level(logging.WARNING):
             decision1 = await curator._maybe_premise_refuted_drop(
@@ -8023,7 +8023,7 @@ class TestPremiseGuardRunsOffEventLoop:
             return real_load_premise_registry(path)
 
         with patch(
-            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            "fused_memory.middleware.task_curator.load_premise_registry",
             side_effect=first_call_cancelled,
         ):
             with pytest.raises(asyncio.CancelledError):
@@ -8732,7 +8732,7 @@ class TestOperationalRegistryLazyLoadRunsOffEventLoop:
             raise RuntimeError("boom")
 
         with patch(
-            "fused_memory.middleware.operational_ask_registry.load_operational_registry",
+            "fused_memory.middleware.task_curator.load_operational_registry",
             side_effect=counting_raise,
         ), caplog.at_level(logging.WARNING):
             decision1 = await curator._maybe_route_deterministic(

@@ -271,7 +271,7 @@ class TestMaybeFlagUnverifiedClaims:
         candidate = CandidateTask(title="T", description=_INCIDENT_DESCRIPTION)
 
         with patch(
-            "fused_memory.middleware.recon_claim_verification_guard."
+            "fused_memory.middleware.task_curator."
             "make_source_and_history_probe",
             side_effect=recording_make_probe,
         ):
@@ -352,7 +352,7 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
 
         with (
             patch(
-                "fused_memory.middleware.recon_claim_verification_guard."
+                "fused_memory.middleware.task_curator."
                 "make_source_and_history_probe",
                 side_effect=fake_make_probe,
             ),
@@ -475,7 +475,7 @@ class TestClaimExtractionSkipsUnneededProbeWork:
         candidate = CandidateTask(title="T", description="plain description, no claims")
 
         with patch(
-            "fused_memory.middleware.recon_claim_verification_guard."
+            "fused_memory.middleware.task_curator."
             "make_source_and_history_probe",
         ) as mock_make_probe:
             result = await curator._maybe_flag_unverified_claims(candidate)
@@ -525,7 +525,7 @@ class TestClaimExtractionSkipsUnneededProbeWork:
 
         with (
             patch(
-                "fused_memory.middleware.recon_claim_verification_guard."
+                "fused_memory.middleware.task_curator."
                 "make_source_and_history_probe",
             ) as mock_make_probe,
             patch.object(curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch),
@@ -570,7 +570,7 @@ class TestClaimVerificationGuardFailsOpen:
 
         with (
             patch(
-                "fused_memory.middleware.recon_claim_verification_guard."
+                "fused_memory.middleware.task_curator."
                 "make_source_and_history_probe",
                 side_effect=RuntimeError("boom"),
             ),
