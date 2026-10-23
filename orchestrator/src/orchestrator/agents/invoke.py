@@ -567,6 +567,9 @@ def _parse_codex_output(
     codex-authored text — its error events, or a synthetic exit line when it
     died without one (timeout, crash) — so a reply that discusses caps is
     never read as one by classify_invocation.
+
+    codex's input_tokens INCLUDES its cached_input_tokens; the result's
+    input_tokens excludes them, the AgentResult convention every backend shares.
     """
     if not result.stdout.strip():
         return AgentResult(
@@ -671,16 +674,16 @@ def _parse_codex_output(
         output_parts = agent_parts + error_parts
         output_text = '\n'.join(output_parts) if output_parts else result.stdout[:2000]
 
-    priced_input_tokens = total_input_tokens
-    if total_cached_input_tokens > total_input_tokens:
+    uncached_input_tokens = total_input_tokens - total_cached_input_tokens
+    if uncached_input_tokens < 0:
         logger.warning(
             'codex reported cached_input_tokens=%d above input_tokens=%d, which should '
-            'include them; pricing the non-cached input count as 0',
+            'include them; counting the non-cached input as 0',
             total_cached_input_tokens, total_input_tokens,
         )
-        priced_input_tokens = total_cached_input_tokens
+        uncached_input_tokens = 0
     cost = _estimate_cost(
-        model, priced_input_tokens, total_output_tokens, prices,
+        model, uncached_input_tokens + total_cached_input_tokens, total_output_tokens, prices,
         cached_input_tokens=total_cached_input_tokens,
     )
 
@@ -694,7 +697,7 @@ def _parse_codex_output(
         subtype='success' if result.returncode == 0 and not is_error else 'error',
         stderr=result.stderr,
         timed_out=result.timed_out,
-        input_tokens=total_input_tokens,
+        input_tokens=uncached_input_tokens,
         output_tokens=total_output_tokens,
         cache_read_tokens=total_cached_input_tokens,
         cache_create_tokens=total_cache_write_tokens,
