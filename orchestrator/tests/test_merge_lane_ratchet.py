@@ -1384,15 +1384,15 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     ) -> None:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] += 103  # the real task-5342 shape
+        current['files'][_MQ]['cognitive'] += 15
 
         with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
             metrics.write_baseline(target, current)
 
         message = str(excinfo.value)
-        assert 'lines' in message
+        assert 'cognitive' in message
         assert _MQ in message
-        assert '21550' in message and '21653' in message
+        assert '2133' in message and '2148' in message
         # The refusal must name the sanctioned path, not merely forbid the move.
         assert '--authorize-raise' in message
 
@@ -1401,7 +1401,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     ) -> None:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] += 103
+        current['files'][_MQ]['cognitive'] += 15
 
         with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
             metrics.write_baseline(target, current)
@@ -1420,7 +1420,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         before = target.read_text(encoding='utf-8')
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] += 103
+        current['files'][_MQ]['cognitive'] += 15
 
         with pytest.raises(metrics.UnauthorizedRaise):
             metrics.write_baseline(target, current)
@@ -1484,7 +1484,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # Lowering is the POINT. It must cost nothing extra.
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] -= 4000
+        current['files'][_MQ]['cognitive'] -= 400
 
         written = metrics.write_baseline(target, current)
         assert written.path == target
@@ -1501,7 +1501,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         ledger = tmp_path / 'raises'
         first = copy.deepcopy(_ratchet_baseline())
-        first['files'][_MQ]['lines'] += 103
+        first['files'][_MQ]['cognitive'] += 15
         metrics.write_baseline(
             target, first, authorization=self._AUTHORIZATION, ledger=ledger
         )
@@ -1509,7 +1509,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         assert metrics.load_ledger(ledger)
 
         further = copy.deepcopy(first)
-        further['files'][_MQ]['lines'] += 50
+        further['files'][_MQ]['cognitive'] += 5
         with pytest.raises(metrics.UnauthorizedRaise):
             metrics.write_baseline(target, further, ledger=ledger)
 
@@ -1526,7 +1526,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         ledger = _corrupt_ledger(tmp_path)
         lowered = copy.deepcopy(_ratchet_baseline())
-        lowered['files'][_MQ]['lines'] -= 4000
+        lowered['files'][_MQ]['cognitive'] -= 400
 
         assert metrics.write_baseline(target, lowered, ledger=ledger).record is None
         assert _ledger_files(ledger) == {'corrupt.json': '{ not json at all'}
@@ -1674,9 +1674,9 @@ class TestAuthorizedRaise:
 
     @staticmethod
     def _raised() -> dict:
-        """The real task-5342 shape: several measures up across two sections."""
+        """Several measures up across two sections, as task 5342's raise was."""
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] += 103
+        current['files'][_MQ]['function_local_imports'] += 2
         current['files'][_MQ]['cognitive'] += 15
         current['functions'][_VERIFIER_LOOP] += 7
         return current
@@ -1755,7 +1755,7 @@ class TestAuthorizedRaise:
         measures = metrics.load_ledger(ledger)[0]['measures']
         totals = [row for row in measures if row['measure'].startswith('total:')]
         assert {row['measure'] for row in totals} == {
-            'total:lines', 'total:cognitive'
+            'total:cognitive', 'total:function_local_imports'
         }
         assert all(row['key'] == metrics.CLUSTER_TOTAL_KEY for row in totals)
         assert {row['key'] for row in measures} >= {_MQ, _VERIFIER_LOOP}
@@ -1810,7 +1810,7 @@ class TestAuthorizedRaise:
         # the real ones harder to read.
         target, ledger = self._seeded(tmp_path)
         lowered = copy.deepcopy(_ratchet_baseline())
-        lowered['files'][_MQ]['lines'] -= 4000
+        lowered['files'][_MQ]['cognitive'] -= 400
 
         written = metrics.write_baseline(
             target, lowered, authorization=self._authorization(), ledger=ledger
@@ -2241,15 +2241,15 @@ class TestCeilingsApplyOnlyToNewKeys:
         ]
 
     def test_the_exemption_is_scoped_to_the_ceiling_not_to_the_ratchet(self) -> None:
-        # git_ops.py's 14,721 lines are exempt from the CEILING and still frozen
-        # by the RATCHET, so they cannot grow unwatched.
+        # git_ops.py is exempt from the CEILING, and its structural measures
+        # are still frozen by the RATCHET, so they cannot grow unwatched.
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_GIT_OPS]['lines'] += 1
+        current['files'][_GIT_OPS]['cognitive'] += 1
         assert [
             v
             for v in metrics.check_against_baseline(current, baseline)
-            if v.measure == 'lines' and v.key == _GIT_OPS
+            if v.measure == 'cognitive' and v.key == _GIT_OPS
         ]
 
     def test_a_new_function_over_the_cognitive_ceiling_is_a_violation(self) -> None:
@@ -2322,7 +2322,7 @@ class TestComparatorPreconditions:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         current['enumeration']['complete'] = False
-        current['files'][_MQ]['lines'] += 5000
+        current['files'][_MQ]['cognitive'] += 5000
         with pytest.raises(metrics.RatchetError):
             metrics.check_against_baseline(current, baseline)
 
@@ -2331,7 +2331,7 @@ class TestViolationShape:
     def test_a_violation_carries_both_numbers_and_a_stable_order(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_MQ]['lines'] += 1
+        current['files'][_MQ]['function_local_imports'] += 1
         current['files'][_GIT_OPS]['cognitive'] += 1
         violations = metrics.check_against_baseline(current, baseline)
         per_path = [v for v in violations if v.key in (_MQ, _GIT_OPS)]
@@ -2346,7 +2346,7 @@ class TestViolationShape:
     def test_the_comparator_mutates_neither_input(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_MQ]['lines'] += 1
+        current['files'][_MQ]['cognitive'] += 1
         before = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
         metrics.check_against_baseline(current, baseline)
         after = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
@@ -2488,13 +2488,13 @@ class TestCheckCli:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         doctored = copy.deepcopy(stub_measurement)
-        doctored['files'][_MQ]['lines'] -= 10
+        doctored['files'][_MQ]['cognitive'] -= 10
         baseline = tmp_path / 'baseline.json'
         metrics.write_baseline(baseline, doctored)
         assert metrics.main(['--check', '--baseline', str(baseline)]) == 1
         err = capsys.readouterr().err
         assert _MQ in err
-        assert 'lines' in err
+        assert 'cognitive' in err
 
     def test_check_resolves_its_defaults_and_exits_clean(
         self, stub_measurement: dict, no_private_tree_scan: None,
@@ -2579,7 +2579,7 @@ class TestAuthorizeRaiseCli:
         target = tmp_path / 'b.json'
         metrics.write_baseline(target, stub)
         raised = copy.deepcopy(stub)
-        raised['files'][_MQ]['lines'] += 103
+        raised['files'][_MQ]['cognitive'] += 15
         return target, tmp_path / 'raises', raised
 
     def test_an_authorized_raise_is_written_and_recorded(
@@ -2719,7 +2719,7 @@ class TestAuthorizeRaiseCli:
         ledger = tmp_path / 'raises'
         metrics.write_baseline(target, stub_measurement)
         lowered = copy.deepcopy(stub_measurement)
-        lowered['files'][_MQ]['lines'] -= 10
+        lowered['files'][_MQ]['cognitive'] -= 10
         monkeypatch.setattr(metrics, 'build_report', lambda root: copy.deepcopy(lowered))
 
         assert metrics.main([
@@ -2847,7 +2847,7 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         doctored = copy.deepcopy(stub_measurement)
-        doctored['files'][_MQ]['lines'] -= 10
+        doctored['files'][_MQ]['cognitive'] -= 10
         baseline = tmp_path / 'baseline.json'
         metrics.write_baseline(baseline, doctored)
 
