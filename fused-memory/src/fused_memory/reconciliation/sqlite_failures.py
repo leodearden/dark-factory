@@ -53,4 +53,4 @@ async def await_best_effort(
             level, '%s failed: %r (%s)',
             what, err, sqlite_log_fields(run_id, sqlite_classification(err)),
         )
-        return None
+    return None
