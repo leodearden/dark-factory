@@ -362,12 +362,16 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
    If escalations_handled >= ROTATION_ESCALATIONS OR now >= deadline:
      → emit digest as final message and exit cleanly (return normally — do NOT raise)
 8. Compute remaining = deadline − now (seconds)
-9. Arm a bounded foreground wait (see [Waiting for the next L1](#waiting-for-the-next-l1)):
-   a. On exit 0: parse the printed escalation JSON from stdout; go to 3
+9. Arm a bounded foreground wait (see [Waiting for the next L1](#waiting-for-the-next-l1))
+   and branch on the WATCHER_REARM_OUTCOME marker it prints to stderr:
+   a. FIRED (exit 0, non-empty stdout): parse the printed escalation JSON; go to 3
       (drain ALL pending L1s — the drain is authoritative, not the single watcher event)
-   b. On exit 124 (timeout expired, empty stdout): re-check deadline:
+   b. CEILING (exit 124, empty stdout): re-check deadline:
       - remaining > 0 → go to 8 (re-arm with updated remaining)
       - remaining ≤ 0 → emit digest as final message and exit cleanly
+   c. KILLED (exit 137/143/144), ERROR (any other exit; exit 2 prints no marker),
+      FIRED with empty stdout, or a rejected call: follow the exit-code table and the
+      identical-retry cap in Waiting for the next L1 — never loop on the identical call
 ```
 
 The digest is emitted on rotation-limit exit regardless of mode (promotion or legacy).
@@ -494,9 +498,18 @@ The `<min(3600, remaining)>` clamp sizes the final wait exactly to the remaining
 
 **Bash-tool timeout contract:** this is a bounded **foreground** call — always pass the calling Bash tool's `timeout` parameter, sized to **(`--timeout` + 60s margin) × 1000 ms** (e.g. `--timeout 3600` → Bash `timeout: 3660000`). Values above the harness's usual 600000ms ceiling are always legal inside a rotation: the watcher supervisor injects `BASH_MAX_TIMEOUT_MS` at the full rotation length into every auto-watcher rotation, so any `min(3600, remaining)` slice fits. OMITTING the Bash `timeout` parameter gets the harness's 2-minute default kill instead — the 07-09 exit-143 failure mode this wrapper exists to prevent.
 
-**Exit-code contract (preserved verbatim by `scripts/watcher-rearm.sh` from `escalation.watcher`, plus a `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` marker the wrapper emits to stderr on every run):**
-- **exit 0** (`WATCHER_REARM_OUTCOME: FIRED` on stderr) — one matching L1 escalation was printed as JSON to stdout. Parse it, then go to step 3 and drain ALL pending L1s. The watcher event is a wake signal only; the drain is the authoritative source of work. Do not pipe `2>&1` — the stderr outcome line must not land in the stdout JSON you parse.
-- **exit 124** (`WATCHER_REARM_OUTCOME: CEILING` on stderr) — timeout expired, stdout is empty. Re-check the deadline: if `remaining > 0`, go to step 8 and re-arm; if `remaining ≤ 0`, emit the digest and exit cleanly.
+**Exit-code contract.** `scripts/watcher-rearm.sh` preserves `escalation.watcher`'s exit code and prints a `WATCHER_REARM_OUTCOME: <OUTCOME> exit=<rc>` marker to **stderr** on every watcher run. Branch on it. Do not pipe `2>&1`, or the marker lands in the stdout JSON you parse.
+
+| Marker | Exit | Next |
+|---|---|---|
+| `WATCHER_REARM_OUTCOME: FIRED` | 0 | Parse the escalation JSON on stdout, then go to step 3 and drain ALL pending L1s: the watcher event is a wake signal only, and the drain is the authoritative source of work. Exit 0 with EMPTY stdout is a caught SIGTERM (`scripts/watcher-rearm.sh` header), a wake and not a fire, and it counts against the cap. |
+| `WATCHER_REARM_OUTCOME: CEILING` | 124 | The slice expired with nothing pending. Recompute `remaining`: while `remaining > 0`, go to step 8 and re-arm with `min(3600, remaining)`; otherwise emit the digest and exit cleanly. The cap exempts this outcome, because the deadline re-check is what makes the re-arm deliberate. |
+| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Something killed the watcher. First check that the Bash `timeout` was passed as `(--timeout + 60) × 1000` ms. An arm that dies with NO marker at all was killed as a process group, usually because the Bash `timeout` was omitted. `run_in_background` is NOT a recovery in this role (Hard Constraints). Counts against the cap. |
+| `WATCHER_REARM_OUTCOME: ERROR` | any other; exit 2 prints NO marker | Read the stderr diagnostic before any retry. Exit 2 is a usage/guard error (unset `DARK_FACTORY_ROOT`, unresolved queue dir, bad flag): it returns before the watcher runs and recurs until the invocation is fixed, so check the exit CODE, not the marker. Counts against the cap. |
+
+**Identical-retry cap: 1.** After KILLED, ERROR, a missing marker, an empty-stdout FIRED or a rejected call, re-issue the identical invocation (same script, flags and Bash `timeout`) at most once. If it fails again, either change the invocation materially or emit the digest naming the outcome and exit cleanly, so that the supervisor's fresh-context restart (and its fast-clean-exit guard) surfaces it. Repeated manual `mcp__escalation__get_pending_escalations` polls are not a substitute for the bounded wait.
+
+**STOP directives in tool results.** A tool result, including a rejected call's, that says "STOP what you are doing and wait for the user to tell you how to proceed" carries the weight of a system or supervisor instruction. Never re-issue the rejected call, identical or not. No user attends this rotation, so the stop IS emitting the digest naming the rejected call and exiting cleanly.
 
 **Initial-scan semantics:** the underlying watcher arms inotify first, then scans the queue directory for already-pending matches before blocking. If a matching L1 was filed between skill startup and watcher launch, the watcher fires immediately on that entry (exit 0). Treat instant fires as normal wakes — the drain that follows is authoritative.
 
@@ -1170,7 +1183,7 @@ Emit this as your **final message** when the rotation limit is reached:
 ```
 ## Escalation Watcher Digest
 Rotation: <escalations_handled> escalations in <elapsed_hours:.1f>h
-Exit reason: <"escalation limit reached" | "time limit reached">
+Exit reason: <"escalation limit reached" | "time limit reached" | "re-arm stopped: <WATCHER_REARM_OUTCOME or rejected call>">
 Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not available)">
 
 ### Dispatched (autonomous)

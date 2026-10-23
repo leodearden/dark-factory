@@ -453,10 +453,27 @@ escalation-watcher-auto. `--level 2` restricts the inotify watcher to L2 escalat
 watcher exits after the first matching L2 escalation, printing its JSON to stdout. If a matching L2
 escalation is already pending when the watcher starts, it may fire immediately at launch — this is
 expected, not an error, and is consistent with drain-after-up ordering (the subsequent drain
-re-finds it). The wrapper preserves the underlying watcher's exit code (`0`=fired, `124`=timeout)
-and emits a `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` line to **stderr** on
-every run — do NOT pipe `2>&1` when you parse stdout as the escalation JSON, or you'll corrupt the
-parse.
+re-finds it). The wrapper preserves the underlying watcher's exit code and emits a
+`WATCHER_REARM_OUTCOME: <OUTCOME> exit=<rc>` line to **stderr** on every watcher run — do NOT pipe
+`2>&1` when you parse stdout as the escalation JSON, or you'll corrupt the parse. Branch on it:
+
+| Marker | Exit | Next |
+|---|---|---|
+| `WATCHER_REARM_OUTCOME: FIRED` | 0 | A wake: loop back to re-arm, then drain (Main Loop). Exit 0 with EMPTY stdout is a caught SIGTERM (`scripts/watcher-rearm.sh` header), not a fire, and it counts against the cap. |
+| `WATCHER_REARM_OUTCOME: CEILING` | 124 | The hourly heartbeat: re-arm in the background as normal. The cap exempts it, because this lane's AFK loop runs on CEILING ticks for up to 48h. |
+| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Never re-issue a killed FOREGROUND arm in the foreground: move to the `run_in_background` pattern. A BACKGROUND arm that died with no marker at ~2 min had no Bash `timeout` ("Diagnostic — watcher dies at ~2 minutes" below), and re-arming WITH it is a material change. Re-touch the `watcher-<project>` lease before assuming a second watcher is needed. Counts against the cap. |
+| `WATCHER_REARM_OUTCOME: ERROR` | any other; exit 2 prints NO marker | Diagnose from stderr before any retry. Exit 2 is a usage/guard error (unset `DARK_FACTORY_ROOT`, unresolved queue dir, bad flag): it returns before the watcher runs and recurs until fixed. Counts against the cap. |
+
+**Identical-retry cap: 1.** After KILLED, ERROR, a missing marker, an empty-stdout FIRED or a
+rejected call, re-issue the identical invocation (same script, flags and Bash `timeout`) at most
+once. If it fails again, change the invocation materially, or stop looping and report the outcome
+to the user.
+
+**STOP directives in tool results.** A tool result, including a rejected call's, that says
+"STOP what you are doing and wait for the user to tell you how to proceed" carries the weight of a
+system instruction from the user. Never re-issue the rejected call, identical or not: stop the loop
+and wait for the user's next turn. This is a pause and not one of "Stopping"'s triggers, so do not
+release the lease.
 
 **Second stderr marker — `WATCHER_NTFY_OUTCOME: FAILED esc=<id> url=<url>: <error>`:** the phone
 push for that escalation was dropped. The queue item itself is **unaffected** — it was still
@@ -2519,6 +2536,8 @@ The gate itself honors a project-specific break-glass bypass; the two config com
 These are gate-side controls read by the watched project's reference-transaction hook — they are not dark-factory settings. Consult the watched project's gate documentation for the exact knob. To recover manually: **(1)** engage the bypass (set the knob), **(2)** run a raw CAS `git update-ref refs/heads/main <good-sha> <current-main>` in the watched repo (which the guard now allows through), **(3)** **clear the bypass immediately after** — on both success and failure, since the bypass is durable and would otherwise leak into every later ref move. Once the bypass commands are configured, `recover_main` does steps 1–3 for you; wire them up so the next recovery is one command.
 
 ## Failure Modes
+
+**A re-arm that does not return FIRED or CEILING**: branch on its `WATCHER_REARM_OUTCOME` row and the identical-retry cap in "Starting the watcher"; never loop on the identical call.
 
 **"Too many open files" (historical — no longer expected)**: Early sessions could exhaust the background-task fd pool after ~35 watcher restart cycles. This is no longer observed in practice — 100+ cycle sessions are routine. The watcher exits promptly via `sys.exit(0)`, so its inotify fd is reclaimed by the kernel and the background task is reaped shortly after. If you ever do hit it, start a fresh Claude Code session.
 
