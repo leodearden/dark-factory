@@ -379,15 +379,15 @@ class TestUnreachedFollowUps:
         with pytest.raises(ValueError, match="row 1.*e1.*t1.*lacks loss.*home 'YES'.*conflict 'NO'"):
             _mod().resolve_judgements(rows)
 
-    def test_a_rater_row_with_home_and_conflict_on_separate_rows_leaves_loss_unrated(self) -> None:
+    def test_a_rater_row_with_home_and_conflict_on_separate_rows_leaves_loss_open(self) -> None:
         rubric = _mod()
         judgement = self._judgement([_row(home='YES'), _row(rater='r2', role='second', conflict='NO')])
-        assert judgement.answer(rubric.Binary.LOSS) is None
+        assert judgement.answer(rubric.Binary.LOSS) == rubric.Resolved.OPEN
         assert judgement.unreached_follow_ups == frozenset()
         result = rubric.derive('restated', {'t1': judgement})
         assert isinstance(result, rubric.Incomplete), result
         assert [(gap.target_id, gap.binary, gap.kind) for gap in result.missing] == [
-            ('t1', 'loss', 'unrated'),
+            ('t1', 'loss', 'open'),
         ]
 
     def test_a_derived_row_meeting_the_preconditions_needs_no_loss(self) -> None:
@@ -430,6 +430,67 @@ class TestUnreachedFollowUps:
         assert judgement.unreached_follow_ups == frozenset()
         result = _decided(rubric.derive('restated', {'t1': judgement}))
         assert result.triage_cells == {'hidden_detail'}
+
+
+class TestOpenFollowUps:
+    """A decisive follow-up whose preconditions rater votes alone resolve, though no rater
+    row met them all, goes to a third round (F3, task 7412)."""
+
+    def _judgement(self, rows: list[dict[str, Any]]) -> Any:
+        rubric = _mod()
+        return rubric.resolve_judgements(rows)[rubric.PairKey('e1', 't1', rubric.Basis.CURRENT)]
+
+    def _split(self) -> list[dict[str, Any]]:
+        """A primary deciding HOME beside a second deciding CONFLICT, each abstaining on the other."""
+        return [
+            _row(home='YES', conflict='UNCLEAR', unclear_reason='cut where the claims meet'),
+            _row(rater='r2', role='second', home='UNCLEAR', conflict='NO',
+                 unclear_reason='cut at the subject'),
+        ]
+
+    def test_loss_resolves_open_when_the_votes_meet_its_preconditions_but_no_row_does(self) -> None:
+        rubric = _mod()
+        judgement = self._judgement(self._split())
+        assert judgement.answer(rubric.Binary.HOME) == rubric.Resolved.YES
+        assert judgement.answer(rubric.Binary.CONFLICT) == rubric.Resolved.NO
+        assert judgement.answer(rubric.Binary.LOSS) == rubric.Resolved.OPEN
+        assert judgement.unreached_follow_ups == frozenset()
+
+    @pytest.mark.parametrize('outcome', ['restated', 'amended', 'contested'])
+    def test_an_item_reading_the_open_loss_is_incomplete(self, outcome: str) -> None:
+        rubric = _mod()
+        result = rubric.derive(outcome, {'t1': self._judgement(self._split())})
+        assert isinstance(result, rubric.Incomplete), result
+        assert [(gap.target_id, gap.binary, gap.kind) for gap in result.missing] == [
+            ('t1', 'loss', 'open'),
+        ]
+
+    def test_a_third_rater_reaching_loss_closes_the_gap(self) -> None:
+        rubric = _mod()
+        judgement = self._judgement([
+            *self._split(),
+            _row(rater='r3', role='third', home='YES', conflict='NO', loss='NO'),
+        ])
+        assert judgement.answer(rubric.Binary.LOSS) == rubric.Resolved.NO
+        result = _decided(rubric.derive('restated', {'t1': judgement}))
+        assert result.status_quo_cells == {'duplicate_clutter'}
+
+    def test_a_split_that_is_not_an_abstention_opens_loss_too(self) -> None:
+        rubric = _mod()
+        judgement = self._judgement([
+            _row(home='YES', conflict='YES'),
+            _row(rater='r2', role='second', home='YES', conflict='UNCLEAR',
+                 unclear_reason='cut where the claims meet'),
+            _row(rater='r3', role='third', home='NO', conflict='NO'),
+            _row(rater='r4', role='third', home='UNCLEAR', conflict='NO',
+                 unclear_reason='cut at the subject'),
+        ])
+        assert judgement.answer(rubric.Binary.HOME) == rubric.Resolved.YES
+        assert judgement.answer(rubric.Binary.CONFLICT) == rubric.Resolved.NO
+        assert judgement.answer(rubric.Binary.LOSS) == rubric.Resolved.OPEN
+
+    def test_a_gap_is_unrated_tied_or_open(self) -> None:
+        assert {kind.value for kind in _mod().GapKind} == {'unrated', 'tied', 'open'}
 
 
 def _judged(target: str, *votes: dict[str, str]) -> Any:
@@ -553,8 +614,8 @@ class TestDecisiveness:
         return [(gap.target_id, gap.binary, gap.kind) for gap in result.missing]
 
     def test_a_decisive_unrated_binary_is_incomplete(self) -> None:
-        assert self._gaps(_derive('restated', {'home': 'YES'}, {'conflict': 'NO'})) == [
-            ('p', 'loss', 'unrated'),
+        assert self._gaps(_derive('restated', {'home': 'YES'})) == [
+            ('p', 'conflict', 'unrated'),
         ]
 
     def test_a_decisive_tie_is_incomplete(self) -> None:
@@ -566,7 +627,7 @@ class TestDecisiveness:
 
     def test_the_status_quo_regime_can_be_the_decisive_one(self) -> None:
         assert self._gaps(_derive('amended', {'home': 'YES'}, {'conflict': 'NO'})) == [
-            ('p', 'loss', 'unrated'),
+            ('p', 'loss', 'open'),
         ]
 
     def test_a_decisive_unclear_binary_makes_the_item_unclear(self) -> None:

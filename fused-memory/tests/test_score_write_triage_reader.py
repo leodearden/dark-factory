@@ -490,7 +490,7 @@ class TestKappa:
 
 
 class TestRefusal:
-    def test_a_decisive_unrated_binary_refuses_naming_every_gap(self) -> None:
+    def test_a_decisive_gap_refuses_naming_every_gap(self) -> None:
         items = [
             _item('X2', 'restated', 'P2', band='restated'),
             _item('X1', 'restated', 'P1', band='restated'),
@@ -500,11 +500,12 @@ class TestRefusal:
         with pytest.raises(_mod().IncompleteJudgementError) as refusal:
             _mod().score_reader(items, verdicts)
         assert refusal.value.gaps == (
-            ('X1', 'P1', 'conflict', 'unrated'), ('X2', 'P2', 'loss', 'unrated'),
+            ('X1', 'P1', 'conflict', 'unrated'), ('X2', 'P2', 'loss', 'open'),
         )
         lines = str(refusal.value).splitlines()
         assert len(lines) == 3
         assert 'X1' in lines[1] and 'conflict' in lines[1] and 'unrated' in lines[1]
+        assert 'open' in lines[2] and 'loss' in lines[2]
 
     def test_a_decisive_tie_refuses(self) -> None:
         verdicts = [_vote('X', 'P', conflict='YES'),
