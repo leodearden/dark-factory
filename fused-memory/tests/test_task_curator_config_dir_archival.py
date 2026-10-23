@@ -189,3 +189,54 @@ class TestDeadPidSweepArchivesFirst:
 
         assert not planted.exists()
         assert not would_be_root.exists()
+
+
+_LIVE_ENC = '-tmp-fm-neutral-classifier-cwd-y'
+_LIVE_TRANSCRIPT = b'{"type":"assistant","from":"this process"}\n'
+
+
+def _plant_live_transcript(invoke_kwargs: dict[str, Any]) -> Path:
+    """Write the transcript where the CLI would have for this gated call."""
+    transcript = (
+        invoke_kwargs['config_dir'].path / 'projects' / _LIVE_ENC
+        / f'{invoke_kwargs["session_id"]}.jsonl'
+    )
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_bytes(_LIVE_TRANSCRIPT)
+    return transcript
+
+
+@pytest.mark.usefixtures('_fresh_curator_sweep')
+class TestCloseArchivesThisProcessesDir:
+    """Clean shutdown archives this process's own config dir, then removes it."""
+
+    @pytest.mark.asyncio
+    async def test_close_archives_this_process_transcripts_and_removes_its_dir(self, tmp_path):
+        config = make_config()
+        curator = _gated_curator(tmp_path / 'tmp', config)
+        kwargs = await _curate_and_sweep(curator)
+        _plant_live_transcript(kwargs)
+
+        await curator.close()
+
+        archived = (
+            _archive_root(config) / f'fm-curator-{os.getpid()}' / _LIVE_ENC
+            / f'{kwargs["session_id"]}.jsonl'
+        )
+        assert archived.read_bytes() == _LIVE_TRANSCRIPT
+        assert not kwargs['config_dir'].path.exists()
+
+    @pytest.mark.asyncio
+    async def test_close_with_archival_switched_off_leaves_the_dir_for_the_sweep(self, tmp_path):
+        config = make_config()
+        curator = _gated_curator(tmp_path / 'tmp', config)
+        kwargs = await _curate_and_sweep(curator)
+        transcript = _plant_live_transcript(kwargs)
+        would_be_root = _archive_root(config)
+        object.__setattr__(config.reconciliation, 'transcript_archive_enabled', False)
+
+        await curator.close()
+
+        assert kwargs['config_dir'].path.is_dir()
+        assert transcript.read_bytes() == _LIVE_TRANSCRIPT
+        assert not would_be_root.exists()
