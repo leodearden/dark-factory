@@ -12212,7 +12212,7 @@ class TestFlagTypeFamily:
     _FAMILY = flag_dedup.FlagTypeFamily(
         name='widget_anomaly',
         spellings=frozenset({'widget_anomaly_detected'}),
-        drift_token='widget',
+        drift_tokens=frozenset({'widget'}),
     )
 
     def test_without_unseen_tokens_only_canonical_variants_match(self):
@@ -12245,6 +12245,40 @@ class TestFlagTypeFamily:
             )
 
         assert caplog.records == []
+
+    def test_log_drift_logs_a_flag_type_carrying_any_drift_token(self, caplog):
+        family = flag_dedup.FlagTypeFamily(
+            name='authorship_like',
+            spellings=frozenset({'possible_injection'}),
+            drift_tokens=frozenset({'inject', 'fabricat'}),
+        )
+        flags = [
+            {'flag_type': 'injection_risk'},
+            {'flag_type': 'Fabrication_Suspected'},
+            {'flag_type': 'Possible-Injection'},
+            {'flag_type': 'stale_metadata'},
+        ]
+
+        with caplog.at_level(logging.INFO):
+            family.log_drift(flags, log_event='reconciliation.x_filter_possible_drift')
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 1, messages
+        assert messages[0].startswith('reconciliation.x_filter_possible_drift ')
+        assert "unmatched_flag_types=['injection_risk', 'Fabrication_Suspected']" in messages[0]
+
+    @pytest.mark.parametrize(
+        'drift_tokens',
+        [frozenset(), frozenset({''}), frozenset({'Widget'})],
+        ids=['empty_set', 'empty_token', 'not_casefolded'],
+    )
+    def test_construction_rejects_drift_tokens_that_could_never_fire_or_always_fire(
+        self, drift_tokens,
+    ):
+        with pytest.raises(ValueError, match='drift_tokens'):
+            flag_dedup.FlagTypeFamily(
+                name='w', spellings=frozenset({'w_x'}), drift_tokens=drift_tokens,
+            )
 
 
 # ---------------------------------------------------------------------------
