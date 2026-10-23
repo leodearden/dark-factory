@@ -9,43 +9,20 @@ These are the regression guards for the defect the promotions exist to close --
 divergent copies of one harness -- so they assert object IDENTITY, not
 equivalent behaviour. A new promotion group puts its guard here.
 
-WHY THEY LIVE IN THEIR OWN MODULE, apart from the smoke tests they pair with.
-``scripts/merge_lane_metrics.py`` enrols a test file into the merge-lane ratchet
-sweep on exactly one condition -- the file statically imports a lane module --
-and then counts every single-underscore attribute access in it as a
-``private_reads`` reach into lane internals. That measure is deliberately
-receiver-agnostic and deliberately over-counts (see its header comment), and the
-ratchet permits a measure to fall or hold, never to rise.
-
-These assertions are ``<consumer module>._<promoted helper>`` reads: coupling to
-the names of TEST-module helpers, which has nothing to do with the lane seam the
-measure is about. Colocated in the enrolled ``test_workflow_helpers.py`` they
-were counted as lane-internal reads (Groups A-D: 12 of its 16; Group E alone
-would have pushed that path 16 -> 35 and breached the ratchet).
-``test_harness_reconcile_landed_outbox_none_guard.py`` resolves the same
-collision the same way, and states the rule in its own docstring: keep the file
-out of the lane-importing set so the sweep does not enrol coverage that has
-nothing to do with the lane. So this module imports NO ``orchestrator.*`` lane
-module -- only ``_workflow_helpers`` and the consumer suites, all by bare test
-name. Adding one here is not a style nit: it re-enrols the file and re-breaches
-the ratchet.
-
-The smoke tests cannot make the same move -- some anchor the promoted paths to
-production via ``orchestrator.git_ops`` and ``orchestrator.config``, which is
-precisely a lane import -- but they make no ``<consumer module>._<helper>``
-reads, so they cost the enrolled file little and stay in
-``test_workflow_helpers.py``.
+Import NO ``orchestrator.*`` lane module here -- only ``_workflow_helpers`` and
+the consumer suites, by bare test name. A lane import (any module in
+``scripts/merge_lane_metrics.py::CLUSTER_PATHS``) enrols this file in the
+merge-lane ratchet sweep, which would count every ``<consumer>._<helper>``
+assertion below as a private read of lane internals.
 """
 
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# Group A: merge-provenance factories (_Fixture, _make, _bind_landed_row)
-# Group B: warm-lane workflow factory (_make_warmlane_workflow)
-# Group C: harness factories (_build_harness, _init_git_repo)
-# Group D: e2e factories (PLAN, _make_review, AgentStub, _build_workflow,
-#          _build_workflow_with_escalation, _init_repo,
-#          _derive_meta_root_like_production)
+# Group A: merge-provenance factories
+# Group B: warm-lane workflow factory
+# Group C: harness factories
+# Group D: e2e factories
 # ---------------------------------------------------------------------------
 
 
@@ -106,9 +83,7 @@ def test_e2e_factories_identity() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Group E: transcript-archival harness (task 4384): ENC, _config, _make_git_ops,
-# _make_transcript_workflow, _config_dir, _write_transcript, _archive_root,
-# _archived, _init_transcript_repo
+# Group E: transcript-archival harness (task 4384)
 # ---------------------------------------------------------------------------
 
 

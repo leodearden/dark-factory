@@ -91,7 +91,7 @@ async def test_fake_briefing_smoke() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Group A: merge-provenance factories (_Fixture, _make, _bind_landed_row)
+# Group A: merge-provenance factories
 # ---------------------------------------------------------------------------
 
 
@@ -125,7 +125,7 @@ def test_merge_provenance_factories_smoke(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Group B: warm-lane workflow factory (_make_warmlane_workflow)
+# Group B: warm-lane workflow factory
 # ---------------------------------------------------------------------------
 
 
@@ -141,7 +141,7 @@ def test_warmlane_workflow_factory_smoke(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Group C: harness factories (_build_harness, _init_git_repo)
+# Group C: harness factories
 # ---------------------------------------------------------------------------
 
 
@@ -156,8 +156,7 @@ async def test_init_git_repo_factory_smoke(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Group D: e2e factories (PLAN, _make_review, AgentStub, _build_workflow,
-# _build_workflow_with_escalation, _init_repo, _derive_meta_root_like_production)
+# Group D: e2e factories
 # ---------------------------------------------------------------------------
 
 
@@ -181,11 +180,7 @@ async def test_e2e_factories_smoke(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Group E: transcript-archival harness (task 4384): ENC, _config,
-# _make_git_ops, _make_transcript_workflow, _config_dir, _write_transcript,
-# _archive_root, _archived —
-# promoted out of three divergent copies (test_transcript_archive_producer_hook.py,
-# test_transcript_archive_backstop.py, test_transcript_archival_boundary_gate.py).
+# Group E: transcript-archival harness (task 4384)
 # ---------------------------------------------------------------------------
 
 
