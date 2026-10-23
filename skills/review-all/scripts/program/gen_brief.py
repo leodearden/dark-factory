@@ -31,29 +31,11 @@ import return_contract
 import run_cli
 import sessions
 import state
+from brief_sections import Section
 
 sys.path.insert(0, str(state.CHECKOUT_ROOT / 'orchestrator' / 'src'))
 
 from orchestrator import session_registry
-
-
-class Section(enum.StrEnum):
-    """The brief's ``## `` headings."""
-
-    DECOMPOSE = 'Decompose'
-    STREAM = 'Stream'
-    RULINGS = 'Rulings binding the stream'
-    UPSTREAM = 'Upstream program tasks'
-    GATE = 'Gate'
-    RELEASE_DUTIES = 'Release duties'
-    INVESTIGATE = 'Investigate'
-    ITEM = 'Item'
-    FINDINGS = 'Findings'
-    FILINGS = 'Phase 5 filings'
-    XREFS = 'Cross-references to the stream'
-    SITTING = 'Design questions go to the sitting'
-    RETURN = 'Return'
-    SPAWN = 'Spawn'
 
 
 class Exit(enum.IntEnum):

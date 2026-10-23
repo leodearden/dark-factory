@@ -6,7 +6,7 @@ the run record there (the fixture record plus one filings row for an S1 key),
 builds history with the real ``apply_return.py`` and ``record.py rule``, and
 serves a writable copy of the fixture store that the fake store re-reads per
 request. Every script runs as an ``-I -S`` subprocess from a temp cwd. A brief
-is read by its ``## `` headings, named by ``gen_brief.Section``. Fixture files
+is read by its ``## `` headings, named by ``brief_sections.Section``. Fixture files
 are only ever copied.
 """
 from __future__ import annotations
@@ -50,8 +50,8 @@ S1_FILING = {
 
 
 def _section_heading(name: str) -> Any:
-    """``gen_brief.Section.<name>``, loaded when a test reads a brief."""
-    return getattr(load_program_module('gen_brief').Section, name)
+    """``brief_sections.Section.<name>``, loaded when a test reads a brief."""
+    return getattr(load_program_module('brief_sections').Section, name)
 
 
 @dataclass(frozen=True)
