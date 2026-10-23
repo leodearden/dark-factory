@@ -18,6 +18,7 @@ import ast
 import dataclasses
 import enum
 import math
+import operator
 from collections.abc import Callable, Mapping
 
 from _orch_helpers import (
@@ -44,13 +45,19 @@ _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
 }
 
 
+def _as_number(value: object) -> float | None:
+    """*value* as a float, or None when it is not a plain number (a bool is
+    not a number here)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
 def _as_seconds(value: object) -> float | None:
     """*value* as a duration in seconds, or None when it is not a plain
-    number (a bool is not a duration). A negative number lasts no time, so
-    0.0."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return max(float(value), 0.0)
-    return None
+    number. A negative number lasts no time, so 0.0."""
+    number = _as_number(value)
+    return None if number is None else max(number, 0.0)
 
 
 def _bound_names(fn: ast.AST) -> set[str]:
@@ -83,7 +90,7 @@ def _bound_names(fn: ast.AST) -> set[str]:
 def _visible_wait_constants(
     fn: ast.AST, module_constants: Mapping[str, object] | None
 ) -> dict[str, float]:
-    """The resolvable value of every name *fn* reads and never binds: the
+    """The exact numeric value of every name *fn* reads and never binds: the
     scanned module's namespace value when it is a number, else the
     ``_KNOWN_WAIT_CONSTANTS`` value. The namespace wins because it is what
     the module's code actually sees."""
@@ -93,33 +100,61 @@ def _visible_wait_constants(
     for node in ast.walk(fn):
         if not isinstance(node, ast.Name) or node.id in bound or node.id in visible:
             continue
-        seconds = _as_seconds(namespace.get(node.id))
-        if seconds is None:
-            seconds = _KNOWN_WAIT_CONSTANTS.get(node.id)
-        if seconds is not None:
-            visible[node.id] = seconds
+        value = _as_number(namespace.get(node.id))
+        if value is None:
+            value = _KNOWN_WAIT_CONSTANTS.get(node.id)
+        if value is not None:
+            visible[node.id] = value
     return visible
+
+
+_ARITHMETIC: dict[type[ast.operator], Callable[[float, float], float]] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _exact_value(node: ast.expr, visible: Mapping[str, float]) -> float | None:
+    """The number *node* evaluates to, or None when the scan cannot read it.
+
+    Readable: a numeric literal, a name in *visible*, and ``+ - * /`` over
+    two readable operands. Division by zero and a NaN result are not.
+    """
+    if isinstance(node, ast.Constant):
+        return _as_number(node.value)
+    if isinstance(node, ast.Name):
+        return visible.get(node.id)
+    if not isinstance(node, ast.BinOp) or type(node.op) not in _ARITHMETIC:
+        return None
+    left = _exact_value(node.left, visible)
+    right = _exact_value(node.right, visible)
+    if left is None or right is None:
+        return None
+    try:
+        value = _ARITHMETIC[type(node.op)](left, right)
+    except ZeroDivisionError:
+        return None
+    return None if math.isnan(value) else value
 
 
 def _resolve_wait_value(node: ast.expr | None, visible: Mapping[str, float]) -> float:
     """Resolve a wait-value expression to the most wall clock it can allow.
 
-    Never guesses. In order: a numeric literal resolves to itself (a
-    negative one waits no time, so 0.0); a name resolves through *visible*
-    (``_visible_wait_constants``): the scanned module's numeric value for
-    it, else ``_KNOWN_WAIT_CONSTANTS``, and never when the method binds the
-    name itself. Anything else -- a shadowed or unknown name, an attribute
-    access, arithmetic, the literal None, a missing value -- resolves to
-    ``math.inf``: the scan cannot read it, so it may allow any wall clock,
-    and no timeout mark clears an unbounded bill. Failing closed is what
-    keeps every recognised shape's bill an upper bound.
+    Never guesses. A readable expression (``_exact_value``) resolves to its
+    exact value, and a negative one waits no time, so 0.0. Names resolve
+    through *visible* (``_visible_wait_constants``): the scanned module's
+    numeric value, else ``_KNOWN_WAIT_CONSTANTS``, and never when the method
+    binds the name itself. Anything else -- a shadowed or unknown name, an
+    attribute access, a call, arithmetic with an unreadable operand, the
+    literal None, a missing value -- resolves to ``math.inf``: the scan
+    cannot read it, so it may allow any wall clock, and no timeout mark
+    clears an unbounded bill. Failing closed is what keeps every recognised
+    shape's bill an upper bound.
     """
-    if isinstance(node, ast.Constant):
-        seconds = _as_seconds(node.value)
-        return math.inf if seconds is None else seconds
-    if isinstance(node, ast.Name) and node.id in visible:
-        return visible[node.id]
-    return math.inf
+    value = None if node is None else _exact_value(node, visible)
+    return math.inf if value is None else max(value, 0.0)
 
 
 def _keyword(call: ast.Call, name: str) -> ast.expr | None:

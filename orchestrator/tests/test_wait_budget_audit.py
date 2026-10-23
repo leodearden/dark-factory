@@ -387,6 +387,59 @@ class TestNamespaceWins:
             f'got {budgets!r}.'
         )
 
+    @pytest.mark.parametrize(
+        ('timeout', 'bill'),
+        [
+            pytest.param('2 * _SETTLE', 10.0, id='mult'),
+            pytest.param('_SETTLE + 1.5', 6.5, id='add'),
+            pytest.param('(_SETTLE - 1) / 2', 2.0, id='sub-div'),
+            pytest.param('_SETTLE - _NEGATIVE', 8.0, id='exact-operands'),
+            pytest.param('_NEGATIVE * 2', 0.0, id='negative-result'),
+        ],
+    )
+    def test_arithmetic_over_readable_operands_bills_its_value(
+        self, timeout: str, bill: float
+    ) -> None:
+        """`+ - * /` over readable operands is exact, so it bills its value:
+        operands keep their sign and only the result is clamped at 0.0.
+        """
+        source = f'''
+class TestArithmetic:
+    async def test_it(self):
+        await asyncio.wait_for(x, {timeout})
+'''
+        budgets = item_wait_budgets(
+            source, module_constants={'_SETTLE': 5.0, '_NEGATIVE': -3}
+        )
+
+        assert budgets == {'TestArithmetic::test_it': bill}, (
+            f'Expected timeout={timeout} to bill {bill}, got {budgets!r}.'
+        )
+
+    @pytest.mark.parametrize(
+        'timeout',
+        [
+            pytest.param('2 * some_var', id='unknown-operand'),
+            pytest.param('_SETTLE / 0', id='division-by-zero'),
+            pytest.param('_SETTLE // 2', id='unsupported-operator'),
+            pytest.param('-_SETTLE', id='unary'),
+        ],
+    )
+    def test_arithmetic_the_scan_cannot_read_is_unbounded(self, timeout: str) -> None:
+        """Arithmetic with an unreadable operand or outside `+ - * /` bills
+        `math.inf`, like any other value the scan cannot read.
+        """
+        source = f'''
+class TestUnreadableArithmetic:
+    async def test_it(self):
+        await asyncio.wait_for(x, {timeout})
+'''
+        budgets = item_wait_budgets(source, module_constants={'_SETTLE': 5.0})
+
+        assert budgets == {'TestUnreadableArithmetic::test_it': math.inf}, (
+            f'Expected timeout={timeout} to bill math.inf, got {budgets!r}.'
+        )
+
     def test_wait_responsive_bare_bills_the_stretched_hidden_default(self) -> None:
         """A `wait_responsive(...)` with no `timeout=` bills its hidden
         MERGE_RESULT_TIMEOUT default stretched by RESPONSIVE_WAIT_STRETCH
