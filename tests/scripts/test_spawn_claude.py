@@ -2612,23 +2612,25 @@ def _write_fake_claude_obeying_exit_marker(
     p.chmod(0o755)
 
 
+def _trailer_header_fields(prompt: str) -> dict[str, str]:
+    fenced_blocks = re.split(r"^---$", prompt, flags=re.MULTILINE)
+    headers = [block.strip() for block in fenced_blocks if block.lstrip("\n").startswith("outcome: ")]
+    assert len(headers) == 1, fenced_blocks
+    return dict(line.split(": ", 1) for line in headers[0].splitlines())
+
+
 def test_trailer_outcome_line_mirrors_result_outcomes(tmp_path: pathlib.Path) -> None:
     captured = _spawn_capturing_prompt(tmp_path)
 
-    outcome_lines = [line for line in captured.splitlines() if line.startswith("outcome: ")]
-    assert len(outcome_lines) == 1, outcome_lines
-    spelled = tuple(outcome_lines[0].removeprefix("outcome: ").split("|"))
+    spelled = tuple(_trailer_header_fields(captured)["outcome"].split("|"))
     assert spelled == session_registry.RESULT_OUTCOMES
 
 
 def test_trailer_asks_for_a_checkpoint_outcome_and_reflect(tmp_path: pathlib.Path) -> None:
     captured = _spawn_capturing_prompt(tmp_path)
 
-    after_exit_clause = captured[captured.index("must never block your normal exit"):]
-    assert any(
-        "outcome: in-progress" in line and not line.startswith("outcome: ")
-        for line in after_exit_clause.splitlines()
-    ), after_exit_clause
+    after_exit_clause = " ".join(captured[captured.index("must never block your normal exit"):].split())
+    assert "outcome: in-progress" in after_exit_clause
     assert "/reflect" in after_exit_clause
 
 
