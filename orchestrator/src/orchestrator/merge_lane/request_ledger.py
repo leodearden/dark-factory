@@ -65,6 +65,8 @@ logger = logging.getLogger('orchestrator.merge_lane')
 
 # One alarm when a dequeue first passes the stuck threshold, ONE final re-alarm past 3x
 # (13.5h at the 16200s default), then silence until the request resolves or is re-dequeued.
+# A sweep raises at most one alarm per episode, so an episode first swept already past 3x
+# (a heartbeat stalled for hours) raises both alarms on consecutive heartbeats.
 STUCK_ALARM_THRESHOLD_MULTIPLES: tuple[float, ...] = (1.0, 3.0)
 
 
@@ -273,9 +275,14 @@ def report_stuck_requests(
     request is a new episode with a fresh ladder.
 
     *pipeline_phases* maps request_id to its pipeline state; it is called at
-    most once per sweep, and only when an alarm is due. An alarm is counted
-    only after it was filed (or suppressed by an already-open L1), so a
-    raising submit retries on the next sweep.
+    most once per sweep, and only when an alarm is due.
+
+    An alarm counts as raised once its WARNING is logged, whether or not its
+    L1 filing succeeds. A filing that raises is logged with its traceback, and
+    the sweep goes on to the next due entry. The failed filing is not retried:
+    the episode's next tier, if any, is its next chance. Retrying on every
+    heartbeat would repeat the WARNING on every heartbeat, which is the
+    repetition this ladder bounds.
 
     OBSERVATION + ESCALATION only — never resolves a Future, mutates
     pipeline state, or halts the pipeline (PRD design decision 4).
@@ -288,15 +295,51 @@ def report_stuck_requests(
         return
     phases = pipeline_phases()
     for stuck in due:
-        stuck = replace(stuck, phase=phases.get(stuck.request_id, 'unowned'))
-        logger.warning(
-            'merge request stuck: request_id=%s task=%s branch=%s age=%.0fs '
-            'phase=%s alarm %d/%d — dequeued but never resolved (silent-hang failure mode)',
-            stuck.request_id, stuck.task_id, stuck.branch, stuck.age_secs, stuck.phase,
-            stuck.alarms_raised + 1, len(STUCK_ALARM_THRESHOLD_MULTIPLES),
+        _raise_stuck_alarm(
+            ledger,
+            replace(stuck, phase=phases.get(stuck.request_id, 'unowned')),
+            escalation_queue=escalation_queue,
+            event_store=event_store,
         )
+
+
+def _raise_stuck_alarm(
+    ledger: RequestLedger,
+    stuck: StuckRequest,
+    *,
+    escalation_queue: Any,
+    event_store: Any,
+) -> None:
+    """WARN, count, then file one alarm; a failed filing is logged, never raised."""
+    alarm_number = _ladder_alarm_number(stuck)
+    logger.warning(
+        'merge request stuck: request_id=%s task=%s branch=%s age=%.0fs '
+        'phase=%s alarm %d/%d — dequeued but never resolved (silent-hang failure mode)',
+        stuck.request_id, stuck.task_id, stuck.branch, stuck.age_secs, stuck.phase,
+        alarm_number, len(STUCK_ALARM_THRESHOLD_MULTIPLES),
+    )
+    ledger.mark_alarmed(stuck.request_id)
+    try:
         _alarm_merge_request_stuck(escalation_queue, stuck, event_store=event_store)
-        ledger.mark_alarmed(stuck.request_id)
+    except Exception:
+        logger.exception(
+            'merge request stuck: filing alarm %d for request_id=%s failed; it still '
+            'counts, so this dequeue files again only at its next ladder tier',
+            alarm_number, stuck.request_id,
+        )
+
+
+def _ladder_alarm_number(stuck: StuckRequest) -> int:
+    """Number *stuck*'s next alarm, refusing any number that is not a tier of the ladder."""
+    alarm_number = stuck.alarms_raised + 1
+    ladder_size = len(STUCK_ALARM_THRESHOLD_MULTIPLES)
+    if not 1 <= alarm_number <= ladder_size:
+        raise ValueError(
+            f'stuck alarm {alarm_number} for request {stuck.request_id!r} is outside the '
+            f'{ladder_size}-alarm ladder STUCK_ALARM_THRESHOLD_MULTIPLES '
+            f'(alarms_raised={stuck.alarms_raised})'
+        )
+    return alarm_number
 
 
 _MERGE_REQUEST_STUCK_SENTINEL_PREFIX = '__merge_request_stuck__'
@@ -374,7 +417,13 @@ def _alarm_merge_request_stuck(
         stuck: The :class:`StuckRequest` snapshot to alarm on.
         event_store: Optional event store; when provided an
             ``EventType.escalation_created`` event is emitted.
+
+    Raises:
+        ValueError: ``stuck.alarms_raised + 1`` is not an alarm of the
+            :data:`STUCK_ALARM_THRESHOLD_MULTIPLES` ladder, even when
+            *escalation_queue* is None.
     """
+    alarm_number = _ladder_alarm_number(stuck)
     if escalation_queue is None:
         return
 
@@ -385,7 +434,6 @@ def _alarm_merge_request_stuck(
         return
 
     age_int = int(stuck.age_secs)
-    alarm_number = stuck.alarms_raised + 1
     detail = (
         f'request_id: {stuck.request_id}\n'
         f'task_id: {stuck.task_id}\n'

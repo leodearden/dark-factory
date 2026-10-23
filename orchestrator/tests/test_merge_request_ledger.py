@@ -321,6 +321,19 @@ class _FakeEscalationQueue:
         self._open_l1 = False
 
 
+class _FilingFailsForEscalationQueue(_FakeEscalationQueue):
+    """A queue whose submit raises for one request's alarms, as a broken store would."""
+
+    def __init__(self, failing_request_id: str):
+        super().__init__(open_l1=False)
+        self.failing_request_id = failing_request_id
+
+    def submit(self, esc) -> None:
+        if esc.task_id.endswith(self.failing_request_id):
+            raise OSError('escalation store unavailable')
+        super().submit(esc)
+
+
 class _FakeEventStore:
     """Minimal fake event store (copied from test_merge_queue_multihost_wiring.py)."""
 
@@ -337,12 +350,13 @@ def _make_stuck(
     branch: str = 'task/stuck-task',
     age_secs: float = 16201.0,
     phase: str = 'unowned',
+    alarms_raised: int = 0,
 ):
     from orchestrator.merge_lane.request_ledger import StuckRequest
 
     return StuckRequest(
         request_id=request_id, task_id=task_id, branch=branch,
-        age_secs=age_secs, phase=phase,
+        age_secs=age_secs, phase=phase, alarms_raised=alarms_raised,
     )
 
 
@@ -439,6 +453,20 @@ class TestAlarmMergeRequestStuck:
         assert EventType.escalation_created in types
         events = [e for e in es.emitted if e['event_type'] == EventType.escalation_created]
         assert any('mr-evented' in str(e['data']) for e in events)
+
+    @pytest.mark.parametrize('past_the_ladder', ['spent', 'negative'])
+    def test_an_alarm_number_outside_the_ladder_is_refused_by_name(self, past_the_ladder):
+        from orchestrator.merge_lane.request_ledger import STUCK_ALARM_THRESHOLD_MULTIPLES
+
+        ladder_size = len(STUCK_ALARM_THRESHOLD_MULTIPLES)
+        alarms_raised = ladder_size if past_the_ladder == 'spent' else -1
+        eq = _FakeEscalationQueue(open_l1=False)
+
+        with pytest.raises(
+            ValueError, match=rf'stuck alarm {alarms_raised + 1} .*{ladder_size}-alarm ladder',
+        ):
+            self._call(eq, _make_stuck(alarms_raised=alarms_raised))
+        assert eq.submitted == []
 
 
 
@@ -672,3 +700,40 @@ class TestReportStuckRequests:
         self._sweep(ledger, t2 + 1500, escalation_queue=eq, event_store=es)
 
         assert [d['alarm_number'] for d in _escalation_created_data(es)] == [1, 2, 1]
+
+    async def test_a_failed_filing_counts_its_alarm_and_spares_the_other_due_entries(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator.merge_lane.request_ledger import RequestLedger
+
+        ledger = RequestLedger()
+        failing = _make_request('rs11a', 'task/rs11a')
+        healthy = _make_request('rs11b', 'task/rs11b')
+        ledger.on_dequeue(failing, now=_T0)
+        ledger.on_dequeue(healthy, now=_T0)
+        eq = _FilingFailsForEscalationQueue(failing.request_id)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            self._sweep(ledger, _T0 + 1500, escalation_queue=eq)
+            self._sweep(ledger, _T0 + 2000, escalation_queue=eq)
+
+        assert [e.task_id for e in eq.submitted] == [
+            f'__merge_request_stuck__{healthy.request_id}',
+        ]
+        assert len(_stuck_warnings(caplog)) == 2, caplog.text
+        failures = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(failures) == 1, caplog.text
+        assert failing.request_id in failures[0].getMessage()
+        assert failures[0].exc_info is not None
+
+    async def test_an_episode_first_swept_past_every_tier_raises_one_alarm_per_sweep(
+        self,
+    ) -> None:
+        ledger, _req = self._armed('rs12')
+        eq = _FakeEscalationQueue(open_l1=False)
+        es = _FakeEventStore()
+
+        for at in (_T0 + 5000, _T0 + 5030, _T0 + 5060):
+            self._sweep(ledger, at, escalation_queue=eq, event_store=es)
+
+        assert [d['alarm_number'] for d in _escalation_created_data(es)] == [1, 2]
