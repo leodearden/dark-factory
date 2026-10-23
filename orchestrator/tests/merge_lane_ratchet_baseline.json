@@ -1128,6 +1128,7 @@
     "orchestrator/tests/test_merge_gates_drop_guard_rename.py": {"patch_targets": ["gates._run"], "private_reads": 0},
     "orchestrator/tests/test_merge_gates_equivalence_rename.py": {"patch_targets": ["gates._run"], "private_reads": 0},
     "orchestrator/tests/test_merge_gates_plan_files_rename.py": {"patch_targets": ["gates._run"], "private_reads": 0},
+    "orchestrator/tests/test_merge_gates_typecheck.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_guard_pipeline.py": {"patch_targets": ["worker._check_plan_targets_in_tree"], "private_reads": 2},
     "orchestrator/tests/test_merge_history_leg_runner.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_item_union.py": {"patch_targets": [], "private_reads": 7},
