@@ -5439,14 +5439,17 @@ class TaskWorkflow:
         # a plan.  Its new L0s are promoted verbatim to L1 and the task blocks
         # behind them, skipping the steward and the no-plan loop.  An
         # info-only filing is not an escalation in lieu of a plan; it falls
-        # through to the no-plan handler.
+        # through to the no-plan handler, as does a filing none of whose
+        # blocking L0s could be promoted.
         if not self.plan and self.escalation_queue:
             post_l0 = self.escalation_queue.get_by_task(
                 self.task_id, status='pending', level=0,
             )
             new_l0 = [e for e in post_l0 if e.id not in pre_l0_ids]
             if any(is_queue_handoff(e) for e in new_l0):
-                return await self._block_on_architect_escalations(new_l0)
+                blocked = await self._block_on_architect_escalations(new_l0)
+                if blocked is not None:
+                    return blocked
 
         if not self.plan:
             cls = classify_agent_failure(result)
@@ -6367,22 +6370,18 @@ class TaskWorkflow:
 
     async def _block_on_architect_escalations(
         self, filed: list[Escalation],
-    ) -> WorkflowOutcome:
-        """Promote every L0 the architect *filed* to L1, then block behind them."""
-        assert self.escalation_queue is not None
+    ) -> WorkflowOutcome | None:
+        """Promote every L0 the architect *filed* to L1, then block behind them.
+
+        The task blocks only once a promoted L1 is a queue handoff; otherwise
+        this returns ``None`` and the caller runs its no-plan handler.
+        """
         promoted = [
-            promote_l0_to_l1(
-                self.escalation_queue, l0,
-                agent_role='orchestrator-workflow',
-                why='architect filed it in lieu of a plan',
-                detail_suffix=self._durable_ref_suffix(),
-                filing_claimant_run_id=self._filing_claimant_run_id,
-                resolved_by='orchestrator-workflow',
-            )
-            for l0 in filed
+            (l0, l1) for l0 in filed
+            if (l1 := self._promote_architect_l0(l0)) is not None
         ]
         if self.event_store:
-            for l1 in promoted:
+            for _, l1 in promoted:
                 self.event_store.emit(
                     EventType.escalation_created,
                     task_id=self.task_id, phase=self.state.value,
@@ -6392,17 +6391,45 @@ class TaskWorkflow:
                         'summary': l1.summary[:200],
                     },
                 )
-        lead = next(e for e in filed if is_queue_handoff(e))
+        lead = next((l0 for l0, l1 in promoted if is_queue_handoff(l1)), None)
+        if lead is None:
+            logger.warning(
+                'Task %s: none of the architect L0s %s was promoted to a '
+                'blocking L1; falling through to the no-plan handler',
+                self.task_id, ', '.join(e.id for e in filed),
+            )
+            return None
         logger.warning(
             'Task %s: architect filed L0 without plan (%s) — promoted to %s '
             'to break no-plan loop',
-            self.task_id, lead.summary[:120], ', '.join(e.id for e in promoted),
+            self.task_id, lead.summary[:120],
+            ', '.join(l1.id for _, l1 in promoted),
         )
         return await self._mark_blocked(
             f'Architect filed L0 without plan: {lead.summary}',
             detail=lead.detail,
             skip_escalation=True,
         )
+
+    def _promote_architect_l0(self, l0: Escalation) -> Escalation | None:
+        """Promote one architect L0, or leave it pending if its L1 cannot be filed."""
+        assert self.escalation_queue is not None
+        try:
+            return promote_l0_to_l1(
+                self.escalation_queue, l0,
+                agent_role='orchestrator-workflow',
+                why='architect filed it in lieu of a plan',
+                detail_suffix=self._durable_ref_suffix(),
+                filing_claimant_run_id=self._filing_claimant_run_id,
+                resolved_by='orchestrator-workflow',
+            )
+        except (OSError, ValueError):
+            logger.warning(
+                'Task %s: could not promote architect L0 %s (%s) to L1; '
+                'leaving it pending',
+                self.task_id, l0.id, l0.summary[:120], exc_info=True,
+            )
+            return None
 
     async def _check_infra_resume_thrash(self) -> WorkflowOutcome | None:
         """Fix 2 — detect & escalate repeated infra-issue resume thrash.

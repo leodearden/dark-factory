@@ -11,6 +11,11 @@ An architect that filed only ``escalate_info`` has not escalated in lieu of
 a plan: the no-plan handler (with its cycle counters) runs instead, as it
 does when the architect filed nothing new.
 
+Each promotion stands alone. An L0 whose L1 cannot be written stays pending,
+named in a WARNING, and does not stop the others. The task blocks behind
+whichever blocking L0s did promote, and falls through to the no-plan handler
+when none did.
+
 These tests drive ``_plan()`` against a real ``EscalationQueue`` and the
 real ``_mark_blocked`` / ``_handle_no_plan_failure``. The architect
 subprocess (``_invoke``) is the stub, and it files its L0s the way
@@ -19,6 +24,7 @@ escalate_blocker / escalate_info would.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +38,7 @@ from shared.cli_invoke import AgentResult
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -42,6 +49,7 @@ BLOCKING_DETAIL = (
     'Lowering the cap trades throughput for nothing measurable.\n'
     'Hypothesis: the latency is merge-lane bound, not slot bound.'
 )
+SECOND_BLOCKING_SUMMARY = 'Leo decision needed: docs-only merges skip the full gate'
 INFO_SUMMARY = 'Noted: helpers.foo is duplicated in two modules'
 
 
@@ -69,10 +77,11 @@ def _architect_l0(
     )
 
 
-def _blocking_l0(queue: EscalationQueue) -> Escalation:
+def _blocking_l0(
+    queue: EscalationQueue, summary: str = BLOCKING_SUMMARY,
+) -> Escalation:
     return _architect_l0(
-        queue, severity='blocking',
-        summary=BLOCKING_SUMMARY, detail=BLOCKING_DETAIL,
+        queue, severity='blocking', summary=summary, detail=BLOCKING_DETAIL,
     )
 
 
@@ -83,7 +92,25 @@ def _info_l0(queue: EscalationQueue) -> Escalation:
     )
 
 
-def _make(tmp_path: Path) -> _Fixture:
+class _QueueRefusingL1(EscalationQueue):
+    """A real queue whose disk refuses the L1 promoted from one summary."""
+
+    def __init__(self, queue_dir: Path, refused_summary: str):
+        super().__init__(queue_dir)
+        self.refused_summary = refused_summary
+
+    def submit(self, escalation: Escalation) -> str:
+        if escalation.level == 1 and escalation.summary == self.refused_summary:
+            raise OSError(f'disk refused {escalation.id}')
+        return super().submit(escalation)
+
+
+def _make(
+    tmp_path: Path,
+    *,
+    queue: EscalationQueue | None = None,
+    event_store: EventStore | None = None,
+) -> _Fixture:
     """A TaskWorkflow ready for ``_plan()``, backed by a real escalation queue."""
     assignment = MagicMock()
     assignment.task_id = TASK_ID
@@ -112,7 +139,7 @@ def _make(tmp_path: Path) -> _Fixture:
     git_ops = MagicMock()
     git_ops.get_main_sha = AsyncMock(return_value='currentmain')
 
-    queue = EscalationQueue(tmp_path / 'escalations')
+    queue = queue or EscalationQueue(tmp_path / 'escalations')
     wf = TaskWorkflow(
         assignment=assignment,
         config=config,
@@ -121,6 +148,7 @@ def _make(tmp_path: Path) -> _Fixture:
         briefing=MagicMock(),
         mcp=MagicMock(),
         escalation_queue=queue,
+        event_store=event_store,
     )
 
     worktree = tmp_path / 'wt'
@@ -173,14 +201,23 @@ def _sweep_would_leave_it_blocked(queue: EscalationQueue) -> bool:
     )
 
 
+def _no_plan_handler_filed(queue: EscalationQueue) -> bool:
+    return any('no plan.json produced' in e.summary for e in _open_handoffs(queue))
+
+
 def _assert_blocked_through_no_plan_handler(
     f: _Fixture, *, not_promoted: str | None = None,
 ) -> None:
     handoffs = _open_handoffs(f.queue)
     assert not_promoted not in [e.summary for e in handoffs]
-    assert any('no plan.json produced' in e.summary for e in handoffs), [
-        e.summary for e in handoffs
-    ]
+    assert _no_plan_handler_filed(f.queue), [e.summary for e in handoffs]
+
+
+def _warned_about(caplog: pytest.LogCaptureFixture, esc_id: str) -> bool:
+    return any(
+        r.levelno == logging.WARNING and esc_id in r.getMessage()
+        for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -223,6 +260,23 @@ async def test_every_new_l0_is_promoted_keeping_its_severity(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_each_promoted_l1_is_announced_once(tmp_path: Path):
+    store = EventStore(tmp_path / 'runs.db', run_id='run-rc2')
+    f = _make(tmp_path, event_store=store)
+    _architect_files(f, _blocking_l0(f.queue), _info_l0(f.queue))
+
+    await f.wf._plan()
+
+    handoffs = _open_handoffs(f.queue)
+    assert len(handoffs) == 2, [(e.id, e.summary) for e in handoffs]
+    announced = sorted(
+        (row['data']['escalation_id'], row['data']['level'])
+        for row in store.fetch_events_by_type(EventType.escalation_created)
+    )
+    assert announced == sorted((e.id, 1) for e in handoffs)
+
+
+@pytest.mark.asyncio
 async def test_info_only_filing_goes_through_the_no_plan_handler(tmp_path: Path):
     f = _make(tmp_path)
     _architect_files(f, _info_l0(f.queue))
@@ -252,3 +306,39 @@ async def test_no_l0_goes_through_the_no_plan_handler(tmp_path: Path):
 
     assert outcome == WorkflowOutcome.BLOCKED
     _assert_blocked_through_no_plan_handler(f)
+
+
+@pytest.mark.asyncio
+async def test_an_l0_that_fails_to_promote_does_not_stop_the_others(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    queue = _QueueRefusingL1(tmp_path / 'escalations', BLOCKING_SUMMARY)
+    f = _make(tmp_path, queue=queue)
+    refused = _blocking_l0(queue)
+    _architect_files(f, refused, _blocking_l0(queue, SECOND_BLOCKING_SUMMARY))
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    handoffs = _open_handoffs(queue)
+    assert [e.summary for e in handoffs] == [SECOND_BLOCKING_SUMMARY]
+    assert not _no_plan_handler_filed(queue)
+    assert _warned_about(caplog, refused.id)
+    assert _sweep_would_leave_it_blocked(queue)
+
+
+@pytest.mark.asyncio
+async def test_no_blocking_l0_promoted_falls_through_to_the_no_plan_handler(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    queue = _QueueRefusingL1(tmp_path / 'escalations', BLOCKING_SUMMARY)
+    f = _make(tmp_path, queue=queue)
+    refused = _blocking_l0(queue)
+    _architect_files(f, refused, _info_l0(queue))
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    _assert_blocked_through_no_plan_handler(f, not_promoted=BLOCKING_SUMMARY)
+    assert _warned_about(caplog, refused.id)
+    assert _sweep_would_leave_it_blocked(queue)
