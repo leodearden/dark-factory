@@ -193,6 +193,19 @@ EMPTY_STATE: dict[str, Any] = {
     'recent': [],
 }
 
+RESTATED: dict[str, Any] = {'kind': 'restated', 'observed': 'o', 'expected': 'e', 'steps': ['s']}
+QUARANTINED: dict[str, Any] = {'kind': 'quarantined', 'reasons': ['suspected_injection']}
+DEFECT_REPORTED: dict[str, Any] = {
+    'seq': 2,
+    'at': AT,
+    'type': 'defect_reported',
+    'block': 2,
+    'report': 1,
+    'criterion_id': 'C-12',
+    'restater': {'prompt_version': 'restate-v1'},
+    'outcome': RESTATED,
+}
+
 
 def event_dict(wire_type: str, seq: int = 1, **overrides: Any) -> dict[str, Any]:
     return {
@@ -229,6 +242,10 @@ NESTED_SAMPLES: list[tuple[str, dict[str, Any]]] = [
     ('InFlightTask', {'task_id': 7, 'phase': 'plan', 'since': AT}),
     ('RevealedFile', {'path': 'src/ledger.py', 'commit': SHA, 'lines': 30}),
     ('RevealRequested', {'seq': 1, 'at': AT, 'type': 'reveal_requested', 'path': 'src/a.py'}),
+    ('Restated', RESTATED),
+    ('Quarantined', QUARANTINED),
+    ('Restater', {'prompt_version': 'restate-v1'}),
+    ('DefectReported', DEFECT_REPORTED),
     (
         'EngagementProjection',
         {
@@ -414,6 +431,120 @@ def test_a_criterion_refuses_a_bad_field(override: dict[str, Any]) -> None:
         contract.Criterion.model_validate({**PAYLOADS['criteria_declared']['criteria'][0], **override})
 
 
+TOKEN_TYPES = ['CriterionId', 'Token']
+
+
+@pytest.mark.parametrize('type_name', TOKEN_TYPES)
+@pytest.mark.parametrize('text', ['C-12', 'a', '0', 'A.b_c-1', 'x' * 64])
+def test_token_types_accept_an_ascii_token(type_name: str, text: str) -> None:
+    assert TypeAdapter(getattr(contract, type_name)).validate_python(text) == text
+
+
+@pytest.mark.parametrize('type_name', TOKEN_TYPES)
+@pytest.mark.parametrize(
+    'text', ['', 'C:12', '-a', '.a', '_a', 'x' * 65, 'a b', 'a/b', 'C-12\n', 'é']
+)
+def test_token_types_reject_anything_else(type_name: str, text: str) -> None:
+    with pytest.raises(ValidationError):
+        TypeAdapter(getattr(contract, type_name)).validate_python(text)
+
+
+@pytest.mark.parametrize(
+    'override',
+    [
+        {'observed': 'x' * 2000, 'expected': 'x' * 2000},
+        {'steps': []},
+        {'steps': ['x' * 500] * 20},
+    ],
+    ids=['longest-observed-and-expected', 'no-steps', 'most-and-longest-steps'],
+)
+def test_restated_accepts_text_at_its_bounds(override: dict[str, Any]) -> None:
+    restated = contract.Restated.model_validate({**RESTATED, **override})
+    assert restated.model_dump(mode='json', include=set(override)) == override
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('observed', ''),
+        ('observed', 'x' * 2001),
+        ('expected', ''),
+        ('expected', 'x' * 2001),
+        ('steps', ['s'] * 21),
+        ('steps', ['']),
+        ('steps', ['x' * 501]),
+    ],
+    ids=[
+        'empty-observed',
+        'long-observed',
+        'empty-expected',
+        'long-expected',
+        'too-many-steps',
+        'empty-step',
+        'long-step',
+    ],
+)
+def test_restated_refuses_text_out_of_bounds(field: str, value: object) -> None:
+    with pytest.raises(ValidationError, match=field):
+        contract.Restated.model_validate({**RESTATED, field: value})
+
+
+@pytest.mark.parametrize('reasons', [[], ['bogus']], ids=['no-reason', 'unknown-reason'])
+def test_quarantined_refuses_no_reason_and_an_unknown_reason(reasons: list[str]) -> None:
+    with pytest.raises(ValidationError, match='reasons'):
+        contract.Quarantined.model_validate({**QUARANTINED, 'reasons': reasons})
+
+
+def test_quarantined_refuses_a_repeated_reason() -> None:
+    with pytest.raises(ValidationError) as caught:
+        contract.Quarantined.model_validate(
+            {**QUARANTINED, 'reasons': ['not_restatable', 'not_restatable']}
+        )
+    message = first_error_message(caught.value)
+    assert 'not_restatable' in message
+    assert 'unique' in message
+
+
+def defect_reported(**overrides: Any) -> 'contract.DefectReported':
+    return contract.DefectReported.model_validate({**DEFECT_REPORTED, **overrides})
+
+
+@pytest.mark.parametrize('field', ['block', 'report'])
+@pytest.mark.parametrize('value', [0, -1, True, 1.0, '1'])
+def test_defect_reported_block_and_report_are_strict_positive_ints(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValidationError, match=field):
+        defect_reported(**{field: value})
+
+
+@pytest.mark.parametrize('prompt_version', ['', 'a b'])
+def test_defect_reported_restater_prompt_version_is_a_token(prompt_version: str) -> None:
+    with pytest.raises(ValidationError, match='prompt_version'):
+        defect_reported(restater={'prompt_version': prompt_version})
+
+
+@pytest.mark.parametrize(
+    'outcome',
+    [
+        {field: value for field, value in RESTATED.items() if field != 'kind'},
+        {**RESTATED, 'reasons': ['not_restatable']},
+        {**QUARANTINED, 'observed': 'o'},
+    ],
+    ids=['no-kind', 'restated-with-reasons', 'quarantined-with-observed'],
+)
+def test_defect_reported_outcome_is_exactly_one_kind(outcome: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError, match='outcome'):
+        defect_reported(outcome=outcome)
+
+
+def test_defect_reported_outcome_is_the_model_its_kind_names() -> None:
+    quarantined = defect_reported(outcome=QUARANTINED)
+    assert isinstance(quarantined.outcome, contract.Quarantined)
+    assert quarantined.outcome.reasons == (contract.QuarantineReason.SUSPECTED_INJECTION,)
+    assert isinstance(defect_reported(outcome=RESTATED).outcome, contract.Restated)
+
+
 @pytest.mark.parametrize(('wire_type', 'field'), [('verify_run', 'legs'), ('merge_landed', 'review')])
 def test_not_recorded_is_the_one_accepted_string(wire_type: str, field: str) -> None:
     event = build(wire_type, **{field: 'not_recorded'})
@@ -466,6 +597,10 @@ def test_task_status_vocabulary_matches_the_factory() -> None:
         ('RunKind', {'verify', 'staging'}),
         ('CriterionOutcome', {'passed', 'failed', 'not_run'}),
         ('CriterionKind', {'success', 'failure'}),
+        (
+            'QuarantineReason',
+            {'suspected_injection', 'not_restatable', 'restater_declined', 'restater_failed'},
+        ),
     ],
 )
 def test_feed_owned_vocabularies(enum_name: str, values: set[str]) -> None:
