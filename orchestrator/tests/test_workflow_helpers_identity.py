@@ -39,7 +39,6 @@ reads, so they cost the enrolled file little and stay in
 
 from __future__ import annotations
 
-
 # ---------------------------------------------------------------------------
 # Group A: merge-provenance factories (_Fixture, _make, _bind_landed_row)
 # Group B: warm-lane workflow factory (_make_warmlane_workflow)
