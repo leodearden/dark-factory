@@ -109,7 +109,9 @@ class EventType(StrEnum):
     merge_attempt = 'merge_attempt'
     # The merge worker's POST-rebase verify verdict (task_id-keyed).  data:
     # {runner, merge_sha, passed, duration_ms, attempt, depth, speculative}
-    # (depth/speculative always-present, None when absent — task 2340), PLUS
+    # (depth/speculative always-present, None when absent — task 2340;
+    # duration_ms, the dispatch wall time in ms, rides in data ONLY: the
+    # events.duration_ms column stays NULL for this type), PLUS
     # two always-present retry-scope keys (task 2837, PRD verify-retry-
     # failed-only D5) derived from spec.verify_env — the D2 failed-only retry
     # contract the orchestrator ITSELF built and shipped to reify, NOT a reify
@@ -154,7 +156,13 @@ class EventType(StrEnum):
     #                verified (see ProbePlacement's known-limitation note), so
     #                probe-era `depth` values are excluded from calibration.
     #                `chain_items` is derived from the tree that actually ran
-    #                and carries no such caveat.
+    #                and carries no such caveat.  PRD OQ#4 (task 3188 ε):
+    #                `depth` keeps being emitted alongside `chain_items` for
+    #                one release and task 4767 retires it; where both are
+    #                present `chain_items` is authoritative, and a `depth`-only
+    #                row is counted by
+    #                orchestrator/src/orchestrator/chain_telemetry.py::_is_legacy_deep_label,
+    #                never bucketed.
     # PLUS its always-present-but-NULLABLE companion (task 3185 amend,
     # reviewer_comprehensive performance):
     #   chain_build_ms  int | None.  Wall-clock milliseconds the deep chain
@@ -195,6 +203,12 @@ class EventType(StrEnum):
     # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::
     # NoProgressAbort.event_data.
     merge_verify_progress_abort = 'merge_verify_progress_abort'
+    # One decision of the post-rebase re-verify gate, skip and fire alike,
+    # written before any re-verify runs. task_id-keyed, phase='merge'; data is
+    # defined by orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py::
+    # ReverifyGateDecision.event_data. A fire's verdict is the merge_verify row
+    # with the same task_id and merge_sha.
+    merge_reverify_gate = 'merge_reverify_gate'
     # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
     # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from
     # merge_verify, which is the merge worker's POST-rebase verify (branch
@@ -207,6 +221,10 @@ class EventType(StrEnum):
     # /unblock, /do) submit branches without emitting it -> classifier
     # degrades to INDETERMINATE by design.
     workflow_verify = 'workflow_verify'
+    # Client-feed θ (plans/client-feed-prd.md §4 decision 16). Producer:
+    # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._emit_review_completed; data:
+    # orchestrator/src/orchestrator/review_outcome.py::review_completed_payload.
+    review_completed = 'review_completed'
     # Local-vs-remote verdict AGREEMENT.  THREE producers emit this member with
     # deliberately DIFFERENT data shapes — read the producer before the payload:
     #   - verify_runner.DriftDetector.check (the off-lane drift detective) emits
@@ -222,6 +240,11 @@ class EventType(StrEnum):
     #   - merge_shadow's warm/cold compare emits a wholly different
     #     {merge_commit, shadow_compare, warm_test_count, cold_test_count}.
     verdict_parity_ok = 'verdict_parity_ok'
+    # A due drift check could not acquire both host slots within its settle
+    # window, so it ran nothing and re-arms for the next landing.  Producer:
+    # merge_lane/drift.py::_run_drift_check.  Payload {merge_sha,
+    # consecutive_deferrals, hosts}, hosts being HostAllocator.host_states().
+    drift_check_deferred = 'drift_check_deferred'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence
     # and local-infra-inconclusive outcomes their own auditable types.
@@ -233,6 +256,24 @@ class EventType(StrEnum):
     # is recorded.
     verify_cross_check_mismatch = 'verify_cross_check_mismatch'
     verify_cross_check_inconclusive = 'verify_cross_check_inconclusive'
+    # Host-ENVIRONMENT parity at the drift-check cadence (task 4537, Lever C).
+    # Sibling of verdict_parity_ok above, and deliberately NOT folded into it:
+    # verdict_parity_ok says the two hosts reached the same verdict, which two
+    # hosts running different tool versions do on almost every commit — right
+    # up until the one where they don't.  These two say whether the hosts are
+    # running the same TOOLS in the first place.
+    #   verify_env_parity_ok: every compared probe matched.  Payload
+    #     {local_runner, remote_runner, probe_keys: [str], dimensions: [str]}.
+    #   verify_env_divergence: at least one probe differs.  Payload
+    #     {local_runner, remote_runner, drift_dimensions: [str],
+    #      diverging_probes: {key: {'local': str, 'remote': str}}} — both
+    #     values are carried so an operator can read the skew straight off the
+    #     event without re-probing either host.
+    # Env divergence is a DETECTIVE control only: it alarms (one deduped L1)
+    # and never quarantines, so a cosmetic probe difference cannot bench a
+    # verify host.  Absent when verify_env_probes is [] (the shipped default).
+    verify_env_parity_ok = 'verify_env_parity_ok'
+    verify_env_divergence = 'verify_env_divergence'
     # data.queue_depth = depth-at-enqueue INCLUDING the newly-queued item
     # (CAS-retry: qsize()+len(urgent)+1; plain enqueue: qsize() after put)
     merge_queued = 'merge_queued'
@@ -247,8 +288,15 @@ class EventType(StrEnum):
     # crossing the streak or time threshold).  Payload: {host, reason}.
     verify_host_unreachable = 'verify_host_unreachable'
     # Emitted when a previously-unreachable remote verify host passes health()
-    # and is cleared back into the live pool.  Payload: {host, downtime_s}.
+    # and is cleared back into the live pool.  Payload: {host, downtime_s}; a
+    # host re-admitted from a skew bench adds quarantine_class='skew'.
     verify_host_recovered = 'verify_host_recovered'
+    # Task 6565 (design D6): a remote verify host was benched in the 'skew'
+    # class — reached, but it could not run the dispatcher's gate or gave no
+    # usable verdict.  Emitted by the merge worker on every such bench.
+    # Payload: {host, kind, reason, sticky, code_sha, identity} where identity
+    # is GateIdentityPair.to_wire() or null.
+    verify_host_skew = 'verify_host_skew'
     # Emitted from enqueue_merge_request's terminal done-callback when a
     # MergeRequest future reaches its final state (resolved, cancelled, or
     # exception).  Payload shape: {request_id, branch, state, snapshot_tip,
@@ -296,28 +344,31 @@ class EventType(StrEnum):
     # in-worktree path is None-safe (correctness fix still applies; only the
     # event is dispatch-local, mirroring merge_flake_suppressed).
     trivial_pass_escalated = 'trivial_pass_escalated'
-    # Contract-currency (INV-2, plans/merge-verdict-integrity-prd.md §1, §3.1,
-    # §3.7) telemetry for the RemoteRunner auto-sync-at-dispatch gate.  A
-    # RemoteRunner's adoptable post-merge verdict is trustworthy only if the
-    # runner executed CURRENT gate logic; incident bb834dd42a is the laptop's
-    # Dark-Factory *code* checkout frozen ~5 weeks, rubber-stamping trivial
-    # PASSes (966f23a6).  Both are queue/runner-scoped (task_id optional; the
-    # sync happens before/around dispatch, not necessarily bound to one task).
+    # Contract-currency (INV-2, plans/merge-verdict-integrity-prd.md §1, §3.1)
+    # telemetry: a RemoteRunner's verdict is adoptable only if the remote ran
+    # the dispatcher's own gate code.  Since task 6565 every remote verify runs
+    # in an immutable gate checkout of the dispatcher's deployed sha
+    # (RemoteRunner.ensure_gate).  Both are runner-scoped (task_id optional).
     #
-    # runner_stale: emitted by RemoteRunner.sync_if_stale when the remote
-    # DF-code checkout HEAD differs from the dispatcher's local DF HEAD
-    # (staleness detected, BEFORE any sync/pull is attempted).  data carries
-    # {runner, local_head, remote_head}.
+    # runner_stale: emitted by RemoteRunner.ensure_gate when the remote had no
+    # ready gate of the deployed sha and ensure-gate.sh had to build one.  data
+    # carries {runner, local_head: the deployed sha, remote_head: the sha this
+    # runner's previous successful ensure used, or null}.
     #
-    # runner_synced: emitted when the remote git state was brought current with
-    # the dispatcher — either the DF-code checkout (git pull --ff-only + uv
-    # sync, kind='df_checkout') or the project checkout's main ref (mirror
-    # force-push after a non-fast-forward, kind='project_main_mirror').  data
-    # carries {runner, kind, from_head, to_head, forced}; kind ∈ {'df_checkout',
-    # 'project_main_mirror'}; forced is True only on the project-main mirror
-    # force-push arm.
+    # runner_synced: emitted when the remote was brought current with the
+    # dispatcher — a gate checkout built for the deployed sha (right after
+    # runner_stale, kind='gate_checkout'), or the project checkout's main ref
+    # mirror-forced after a non-fast-forward (kind='project_main_mirror').  data
+    # carries {runner, kind, from_head, to_head, forced}; forced is True only on
+    # the project-main mirror arm.
     runner_stale = 'runner_stale'
     runner_synced = 'runner_synced'
+    # Task 6565 (design D1): the process's deployed sha is flagged — HEAD moved
+    # while the wire path was being imported (indeterminate), or a tracked
+    # wire-path file was dirty.  Emitted once at startup by
+    # Harness._announce_deployed_sha; data is DeployedSha.to_wire():
+    # {sha, indeterminate, dirty_wire_path}.  The remote gate stays in use.
+    deployed_sha_indeterminate = 'deployed_sha_indeterminate'
     # INV-3 chain-intact enforcement (PRD plans/merge-verdict-integrity-prd.md
     # §3.7 new vocab).  Emitted whenever a verdict (PASS or FAIL) is VOIDED
     # because its verified tree no longer chains onto a still-live prefix — the
@@ -674,6 +725,10 @@ class EventType(StrEnum):
 
     # Plan revalidation
     plan_revalidated = 'plan_revalidated'
+    # Task 4031 — the revalidation branch found the plan's _task_text_fp absent or unequal to the
+    #   task's current text; the Lever-B skip is declined and the architect told.
+    #   data: {drift, plan_text_fp, task_text_fp, plan_session_id}
+    plan_text_drift = 'plan_text_drift'
 
     # Config hot-reload (plans/config-hot-reload-prd.md, task beta) — emitted
     # by Harness.reload_config() on every call, success or failure. Data
@@ -802,13 +857,16 @@ class EventType(StrEnum):
     # candidates are exempt (DA-D4) and never produce this event.  Emitted at
     # most once per ``acquire_next`` tick — on the FIRST heavy candidate
     # skipped, across both the pinned and scored dispatch loops.
-    # data keys: {metric, value, in_flight, floor}
-    #   metric:    the PSI field name that tripped saturation, chosen in
-    #              ranked order cpu_some_avg10 > mem_some_avg10 >
-    #              mem_full_avg10 > io_some_avg10 (DA-D1)
-    #   value:     that metric's sampled avg10 value (float)
+    # data keys: {metric, in_flight, floor, sample}
+    #   metric:    the tripping PsiAdmissionConfig threshold field name, ranked
+    #              by shared/src/shared/psi.py::PsiSample.tripping_metric (rank
+    #              owned by plans/load-throttle-harmonisation-prd.md D10)
     #   in_flight: len(Scheduler._dispatched) at decision time (int)
     #   floor:     config.psi_admission.min_inflight_floor (int)
+    #   sample:    dataclasses.asdict(PsiSample) — every reading, every
+    #              per-component read_ok, and own_cgroup
+    # Rows written before task 3590 carry `value` (the metric's reading)
+    # instead of `sample`.
     dispatch_deferred = 'dispatch_deferred'
 
     # Per-tick latency breakdown for Scheduler.acquire_next, emitted once at
@@ -964,6 +1022,20 @@ class EventType(StrEnum):
     # task_id is ALSO a first-class column.  Task mu's soak counts
     # verdict='violation' rows with mode='log' before flipping enforce on.
     workflow_exit_contract = 'workflow_exit_contract'
+
+    # A wedged terminal cleanup (task 6660).
+    # workflow_cleanup_abandoned — run()'s CancellationScope cut off on_terminal
+    #   entries that were still running past their grace after a hard-cancel;
+    #   the slot was still released.  Payload {entries}: the entry names, in
+    #   order.
+    # workflow_slot_force_released — the terminal-status watcher released the
+    #   slot and module locks of a workflow that never ended after its
+    #   hard-cancel (the row was already done/cancelled).  Payload
+    #   {status, polls, modules}: the terminal status, the watcher's poll count
+    #   and the modules held at release.  A workflow_slot_wedged L1 goes with it.
+    # task_id is ALSO a first-class column on both.
+    workflow_cleanup_abandoned = 'workflow_cleanup_abandoned'
+    workflow_slot_force_released = 'workflow_slot_force_released'
 
     # Task-verify admission gate (task 5628; plans/verify-admission-fifo-prd.md).
     # Every payload carries `order`, so before/after a policy flip is read from

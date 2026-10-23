@@ -7,7 +7,9 @@ files nothing: every escape it would raise is recorded as ``would_escape``.
 Its verdicts come from the hand-link corpus (:func:`run_plan`) or from the
 link adjudicator (:func:`run_adjudicator_plan`), which is asked only about the
 links no deterministic row decides and that it has not judged at their
-current texts; its verdicts are ledgered as adjudications.
+current texts; its verdicts are ledgered as adjudications. A deterministic
+plan is :func:`run_plan` with no verdicts at all: only the deterministic rows
+plan a heal, and every other link is reported unexamined.
 
 An apply run drains the pending heals oldest first. Each heal re-reads its
 record live, and is skipped when the record no longer shows what it was
@@ -62,6 +64,7 @@ from fused_memory.maintenance.link_heal import (
     apply_change,
     build_plan,
     corroboration_mismatch,
+    corroboration_reads_parent,
     journal_reason,
     needs_verdict,
     plan_links,
@@ -670,10 +673,15 @@ def _read_failure(phase: str, failure: StoreReadFailed) -> dict[str, Any]:
 
 
 async def _corroborate(store: LinkHealStore, heal: PlannedAction) -> StaleField | None:
-    """Re-read the child, its parent and (for a completion) its children, live."""
+    """Re-read the child, its parent when the heal rests on it, and (for a
+    completion) its children, live."""
     child = await store.read(heal.project_id, heal.child_id)
     parent_id = heal.pre_image.parent_id
-    parent = None if parent_id is None else await store.read(heal.project_id, parent_id)
+    parent = (
+        await store.read(heal.project_id, parent_id)
+        if parent_id is not None and corroboration_reads_parent(heal)
+        else None
+    )
     child_count = (
         await store.count_children(heal.project_id, heal.child_id)
         if heal.action in COMPLETION_ACTIONS

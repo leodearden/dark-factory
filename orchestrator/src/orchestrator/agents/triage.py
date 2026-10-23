@@ -12,6 +12,8 @@ import json
 import logging
 import re
 
+from shared.task_complexity import is_simple_complexity
+
 from orchestrator.agents.roles import AgentRole
 
 logger = logging.getLogger(__name__)
@@ -64,7 +66,7 @@ def is_declared_simple_task(task: dict) -> bool:
     are checked at the workflow gate, not here.
     """
     metadata = task.get('metadata') or {}
-    if str(metadata.get('complexity') or '').strip().lower() != 'simple':
+    if not is_simple_complexity(metadata.get('complexity')):
         return False
     description = str(task.get('description') or '')
     return not has_simple_task_blocker(description)

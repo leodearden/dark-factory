@@ -414,17 +414,24 @@ async def test_rebase_after_a_lost_cas_is_gated_against_the_verified_base_not_th
 
 
 @pytest.mark.parametrize(
-    ('mover', 'breadth', 'expected_verifies'),
+    ('mover', 'breadth', 'expected_verifies', 'expected_reason'),
     [
-        pytest.param(_queue_landed(_disjoint_drift), 'scoped', 1, id='C-disjoint-queue-landed'),
-        pytest.param(_queue_landed(_disjoint_drift), 'full', 2, id='D-disjoint-whole-tree-gate'),
         pytest.param(
-            _queue_landed(_shared_drift), 'scoped', 2, id='E-drift-on-a-non-tip-members-file',
+            _queue_landed(_disjoint_drift), 'scoped', 1, 'disjoint',
+            id='C-disjoint-queue-landed',
+        ),
+        pytest.param(
+            _queue_landed(_disjoint_drift), 'full', 2, 'disjoint_untrusted',
+            id='D-disjoint-whole-tree-gate',
+        ),
+        pytest.param(
+            _queue_landed(_shared_drift), 'scoped', 2, 'overlap',
+            id='E-drift-on-a-non-tip-members-file',
         ),
     ],
 )
 async def test_moved_main_costs_a_reverify_only_when_disjointness_cannot_be_trusted(
-    tmp_path: Path, mover: Mover, breadth: str, expected_verifies: int,
+    tmp_path: Path, mover: Mover, breadth: str, expected_verifies: int, expected_reason: str,
 ) -> None:
     scene = await _stacked_train_scene(tmp_path, merge_verify_breadth=breadth)
     train = _train(scene)
@@ -436,6 +443,13 @@ async def test_moved_main_costs_a_reverify_only_when_disjointness_cannot_be_trus
     assert outcome.status == 'done', outcome
     assert not _events(store, 'train_derailed')
     assert len(verify.calls) == expected_verifies
+    [gate] = _events(store, 'merge_reverify_gate')
+    assert (gate['reason'], gate['reverify']) == (expected_reason, expected_verifies == 2)
+    assert gate['overlap'] == (['shared.txt'] if expected_reason == 'overlap' else [])
+    gate_verifies = [
+        row for row in _events(store, 'merge_verify') if row['merge_sha'] == gate['merge_sha']
+    ]
+    assert len(gate_verifies) == expected_verifies - 1
     [drift] = verify.drifts
     assert {'a.txt', 'b.txt', 'c.txt'} <= _files_at(scene.repo, 'main')
     landed_shared = _shared_lines_at(scene.repo, 'main')

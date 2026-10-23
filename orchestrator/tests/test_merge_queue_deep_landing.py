@@ -1439,6 +1439,68 @@ class TestStaleCasAbortLeavesTheRestAlone:
             'the halt must not also render a per-link blocked outcome'
         )
 
+    async def test_an_operator_cancelled_link_stops_the_walk_unlanded(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Task 5248: a link an operator cancelled while the head verified.
+
+        It is still lane-buffered, so ``cancel_request`` accepts it; the walk
+        must stop AT it, because its own tree and every later link's contain it.
+        """
+        from orchestrator.merge_lane import OperatorMergeCancel
+
+        s = await _prefix_scene_upto_finalize(
+            git_repo, tmp_path, monkeypatch, db_name='delta-cancel.db',
+        )
+        worker, reqs = s['worker'], s['reqs']
+        cancelled = reqs['103']
+        assert worker.cancel_request(cancelled.request_id).cancelled
+
+        assert await worker._finalize_inflight(s['entry']) is True
+        await asyncio.sleep(0)
+
+        assert [c[0] for c in s['adv']] == [s['head_mc'], s['chain'].links[0][1]]
+        for tid in ('101', '102'):
+            assert reqs[tid].result.result().status == 'done', f'task {tid} must land'
+        for _tid, link_sha in s['chain'].links[1:]:
+            rc, _, _ = await _run(
+                ['git', 'merge-base', '--is-ancestor', link_sha, 'main'], cwd=git_repo,
+            )
+            assert rc != 0, f'{link_sha[:8]} landed past the cancelled link'
+        with pytest.raises(asyncio.CancelledError) as error:
+            cancelled.result.result()
+        assert OperatorMergeCancel.carried_by(error.value) == (
+            OperatorMergeCancel(cancelled.request_id)
+        )
+        assert not reqs['104'].result.done(), 'a link past the cancel stays queued'
+        assert _state_of(worker, reqs['104'].request_id) == 'queued'
+
+    async def test_a_link_already_landing_refuses_an_operator_cancel(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Task 5248: link 102 is mid-CAS while the registry still reads it
+        LANE_BUFFERED; the walk's own window is what refuses the cancel."""
+        from orchestrator.merge_lane import MergeCancelRefusal
+
+        scene: dict = {}
+        verdicts: list = []
+
+        async def _cancel_link_102_mid_landing(n: int):
+            if n == 2:
+                verdicts.append(scene['worker'].cancel_request(scene['reqs']['102'].request_id))
+            return None
+
+        scene.update(await _prefix_scene_upto_finalize(
+            git_repo, tmp_path, monkeypatch, db_name='delta-landing-cancel.db',
+            advance_hook=_cancel_link_102_mid_landing,
+        ))
+
+        assert await scene['worker']._finalize_inflight(scene['entry']) is True
+        await asyncio.sleep(0)
+
+        assert [v.refusal for v in verdicts] == [MergeCancelRefusal.FINALIZE_WINDOW]
+        assert scene['reqs']['102'].result.result().status == 'done'
+
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(DEEP_LANDING_SCENE_TEST_TIMEOUT)

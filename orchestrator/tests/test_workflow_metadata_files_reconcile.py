@@ -190,11 +190,15 @@ async def test_reconcile_ignores_stale_base_commit_uses_merge_first_parent(
 
 
 @pytest.mark.asyncio
-async def test_clears_when_merge_sha_missing(tmp_path: Path):
-    """No merge_sha (already-on-main shortcuts) → write empty list.
+async def test_writes_empty_when_merge_sha_missing_and_nothing_to_preserve(
+    tmp_path: Path,
+):
+    """No merge_sha and no recorded scope → ``[]`` is written.
 
-    The gate-skip-when-verified-provenance branch in fused-memory's
-    task_interceptor.py handles the missing-files case.
+    ``[]`` is persisted here only because nothing exists to preserve: a
+    missing merge diff means "cannot compute", so the reconcile keeps
+    whatever the backend already holds, and for a file-less task that is
+    already empty.
     """
     wf, update_task, get_merge_diff_files, get_merge_commit_diff_files = (
         _make_workflow(project_root=tmp_path)
@@ -208,6 +212,60 @@ async def test_clears_when_merge_sha_missing(tmp_path: Path):
     get_merge_commit_diff_files.assert_not_awaited()
     get_merge_diff_files.assert_not_awaited()
     update_task.assert_awaited_once_with('101', {'files': []})
+
+
+_PRIOR_SCOPE = ['src/prior_a.py', 'src/prior_b.py', 'pkg/mod/prior_c.py']
+_HINTS = {'entities': ['E3'], 'queries': ['q3']}
+
+
+@pytest.mark.asyncio
+async def test_preserves_existing_files_when_merge_sha_missing(tmp_path: Path):
+    """No merge_sha → the declared scope survives instead of being blanked.
+
+    Task 3113 (reify 5367/5602): a sha-less finalize used to persist
+    ``files=[]``, wiping the task's lock scope so the MERGE-entry tripwire
+    fired on the next dispatch.  An uncomputable merge diff is not evidence
+    that the task touched nothing.
+    """
+    wf, update_task, get_merge_diff_files, get_merge_commit_diff_files = (
+        _make_workflow(
+            project_root=tmp_path,
+            backend_metadata={'files': list(_PRIOR_SCOPE), 'memory_hints': _HINTS},
+        )
+    )
+    wf._merge_sha = None
+    wf.plan = {'files': ['anything.py']}
+
+    await wf._reconcile_metadata_files_for_done()
+
+    payload = _persisted_payload(update_task)
+    assert payload.get('files') == _PRIOR_SCOPE
+    assert payload.get('memory_hints') == _HINTS
+    assert wf.task['metadata']['files'] == _PRIOR_SCOPE
+    get_merge_commit_diff_files.assert_not_awaited()
+    get_merge_diff_files.assert_not_awaited()
+    get_task = wf.scheduler.get_task
+    assert isinstance(get_task, AsyncMock)
+    assert get_task.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_override_still_blanks_when_merge_sha_missing(
+    tmp_path: Path,
+):
+    """An explicit ``override_files=[]`` is authoritative and wins over the preserve."""
+    wf, update_task, _, _ = _make_workflow(
+        project_root=tmp_path,
+        backend_metadata={'files': list(_PRIOR_SCOPE), 'memory_hints': _HINTS},
+    )
+    wf._merge_sha = None
+    wf.plan = {'files': ['anything.py']}
+
+    await wf._reconcile_metadata_files_for_done(override_files=[])
+
+    payload = _persisted_payload(update_task)
+    assert payload.get('files') == []
+    assert payload.get('memory_hints') == _HINTS
 
 
 @pytest.mark.asyncio
@@ -315,16 +373,18 @@ async def test_reconcile_explicit_files_override_backend_files(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_reconcile_writes_empty_files_on_git_error_fail_open(tmp_path: Path):
-    """When get_merge_commit_diff_files returns ([], error), files=[] is written (fail-open).
+async def test_reconcile_preserves_existing_files_on_git_error(tmp_path: Path):
+    """When get_merge_commit_diff_files errors, the prior files persist.
 
-    Sibling keys from the backend are still preserved — the read-modify-write
-    structure is unchanged even on the error path.
+    Fail-open still never blocks the DONE, but a failed diff means "cannot
+    compute", not "touched nothing" (task 3113).  Sibling keys from the
+    backend are still preserved by the read-modify-write.
     """
     wf, update_task, get_merge_diff_files, get_merge_commit_diff_files = (
         _make_workflow(
             project_root=tmp_path,
             backend_metadata={
+                'files': ['src/prior_a.py', 'src/prior_b.py'],
                 'memory_hints': {'entities': ['E2'], 'queries': ['q2']},
             },
         )
@@ -336,12 +396,31 @@ async def test_reconcile_writes_empty_files_on_git_error_fail_open(tmp_path: Pat
     await wf._reconcile_metadata_files_for_done()
 
     payload = _persisted_payload(update_task)
-    assert payload.get('files') == [], (
-        f'files must be [] (fail-open) on git error; got {payload.get("files")!r}'
+    assert payload.get('files') == ['src/prior_a.py', 'src/prior_b.py'], (
+        f'prior files must survive a git error; got {payload.get("files")!r}'
     )
     assert payload.get('memory_hints') == {'entities': ['E2'], 'queries': ['q2']}, (
         f'memory_hints must survive even on git error path; got {payload!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_writes_empty_on_git_error_when_nothing_to_preserve(
+    tmp_path: Path,
+):
+    """A git error with no recorded scope writes ``[]``: the error path must not fabricate scope."""
+    wf, update_task, _, get_merge_commit_diff_files = _make_workflow(
+        project_root=tmp_path,
+        backend_metadata={'memory_hints': {'entities': ['E2'], 'queries': ['q2']}},
+    )
+    wf._merge_sha = 'b' * 40
+    get_merge_commit_diff_files.return_value = ([], OSError('diff failed'))
+
+    await wf._reconcile_metadata_files_for_done()
+
+    payload = _persisted_payload(update_task)
+    assert payload.get('files') == []
+    assert payload.get('memory_hints') == {'entities': ['E2'], 'queries': ['q2']}
 
 
 @pytest.mark.asyncio

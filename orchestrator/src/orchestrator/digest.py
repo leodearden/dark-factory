@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 
+from orchestrator.chain_telemetry import ChainTelemetry, summarize_chain_telemetry
 from orchestrator.event_store import EventType
 from orchestrator.workflow import WorkflowOutcome
 
@@ -265,9 +266,8 @@ def aggregate_escalations(
 
 
 # ---------------------------------------------------------------------------
-# Shared read-only-events-DB scaffold (used by count_done_in_window and
-# merge_disposition_counts below — factored out so the fail-open contract
-# lives in exactly one place instead of being stamped out per query).
+# Shared read-only-events-DB scaffold: every events.db reader in this module
+# goes through it, so the fail-open contract lives in exactly one place.
 # ---------------------------------------------------------------------------
 
 
@@ -391,6 +391,55 @@ def merge_disposition_counts(
         return {disp: int(count) for disp, count in rows}
 
     return _query_events_ro(events_db, 'merge_disposition_counts', {}, _query)
+
+
+# ---------------------------------------------------------------------------
+# Deep merge-ahead chain telemetry (task 3188, PRD ε of
+# plans/deep-merge-ahead-prd.md).  This module owns the window;
+# orchestrator/src/orchestrator/chain_telemetry.py owns the arithmetic.
+# ---------------------------------------------------------------------------
+
+
+def _parse_payload(raw: str | None) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def chain_telemetry_in_window(
+    events_db: Path,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> ChainTelemetry:
+    """Summarise merge_verify and merge_finalized events inside the window.
+
+    Both event types are windowed over the same run-agnostic
+    ``timestamp BETWEEN`` bounds, so the items-landed numerator and the
+    deep-verify denominator cover the same span across fleet redeploys.
+    A row whose ``data`` is not a JSON object is skipped.
+
+    Uses sqlite3 directly (read-only).  Fail-open: any exception returns
+    ``ChainTelemetry()``.
+    """
+    def _payloads(conn: sqlite3.Connection, event_type: EventType) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            'SELECT data FROM events '
+            'WHERE event_type = ? AND timestamp BETWEEN ? AND ? ORDER BY id',
+            (event_type.value, window_start_iso, window_end_iso),
+        ).fetchall()
+        return [_parse_payload(raw) for (raw,) in rows]
+
+    def _query(conn: sqlite3.Connection) -> ChainTelemetry:
+        return summarize_chain_telemetry(
+            _payloads(conn, EventType.merge_verify),
+            _payloads(conn, EventType.merge_finalized),
+        )
+
+    return _query_events_ro(
+        events_db, 'chain_telemetry_in_window', ChainTelemetry(), _query,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +829,8 @@ class DigestInputs:
     lifecycle_events_in_step: int = 0
     # Task 5311 — the '## Paused, waiting' section; defaulted and appended last.
     pause_visibility: PauseVisibility = field(default_factory=PauseVisibility)
+    # Task 3188 ε — the '## Deep merge-ahead chains' section; defaulted and appended last.
+    chain_telemetry: ChainTelemetry = field(default_factory=ChainTelemetry)
 
 
 def render_digest_markdown(inputs: DigestInputs) -> str:
@@ -914,6 +965,8 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
         lines.append('_none_')
     lines.append('')
 
+    lines.extend(_render_chain_telemetry_section(inputs.chain_telemetry))
+
     # Stale lane assignments (leaf γ, task 2891) — non-terminal warm-lane
     # records idle past lane_stale_report_days; surfaced for operator attention,
     # never auto-reclaimed (WIP-preserving invariant).
@@ -926,6 +979,33 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
     lines.append('')
 
     return '\n'.join(lines)
+
+
+def _render_chain_telemetry_section(telemetry: ChainTelemetry) -> list[str]:
+    lines = ['## Deep merge-ahead chains']
+    if telemetry.chain_items_histogram:
+        lines.append('| chain items | verifies | passed | pass rate |')
+        lines.append('|-------------|----------|--------|-----------|')
+        for chain_items, bucket in sorted(telemetry.chain_items_histogram.items()):
+            rate = bucket.rate
+            rate_str = f'{rate * 100:.1f}%' if rate is not None else 'n/a'
+            lines.append(f'| {chain_items} | {bucket.total} | {bucket.passed} | {rate_str} |')
+    else:
+        lines.append('_none_')
+    per_verify = telemetry.items_landed_per_deep_verify
+    lines.append(
+        f'- Items landed per deep verify: {per_verify:.2f}'
+        if per_verify is not None else '- Items landed per deep verify: n/a'
+    )
+    fail_rate = telemetry.deep_fail_rate
+    lines.append(
+        f'- Deep-fail rate: {fail_rate * 100:.1f}% '
+        f'({telemetry.deep_failures}/{telemetry.deep_verifies})'
+        if fail_rate is not None else '- Deep-fail rate: n/a'
+    )
+    lines.append(f'- Excluded legacy depth>=2 events: {telemetry.excluded_legacy_depth}')
+    lines.append('')
+    return lines
 
 
 # ---------------------------------------------------------------------------

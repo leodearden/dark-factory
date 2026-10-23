@@ -18,11 +18,13 @@ from pathlib import Path
 import config_dir_archival_allowlist
 import loop_blocking_allowlist
 import pytest
+import shared_timeout_marker_grandfathered
 import silent_fallthrough_allowlist
 
 from shared.governed_exceptions import (
     Debt,
     MalformedDeclaration,
+    Policy,
     TaskRef,
     TicketRef,
     governed_exceptions,
@@ -130,21 +132,26 @@ SILENT_FALLTHROUGH_ALLOWLIST = governed_exceptions(
     'A pre-existing site that swallows an error into an empty value or a discarded '
     'error slot, tolerated by the silent-fallthrough gate until it is fixed.',
     _occurrence_keys(entry[:3] for entry in silent_fallthrough_allowlist.ALLOWLIST_ENTRIES),
-    default=Debt(TaskRef(5603)),
+    default=Debt(TaskRef(7139)),
     default_covers=12,
+)
+
+_UNARCHIVED_CONFIG_DIR_SITES = tuple(
+    site
+    for site in config_dir_archival_allowlist.AUDITED_SITES
+    if site['disposition'] != config_dir_archival_allowlist.ARCHIVED
 )
 
 CONFIG_DIR_ARCHIVAL_EXCEPTIONS = governed_exceptions(
     'shared.tests.config_dir_archival_allowlist.AUDITED_SITES',
     'A TaskConfigDir construction site whose dir is destroyed without its transcripts '
     'being archived first, either by design or as a recorded gap.',
-    _occurrence_keys(
-        (site['path'], site['qualname'])
-        for site in config_dir_archival_allowlist.AUDITED_SITES
-        if site['disposition'] != config_dir_archival_allowlist.ARCHIVED
-    ),
-    default=Debt(TaskRef(5603)),
-    default_covers=6,
+    _occurrence_keys((site['path'], site['qualname']) for site in _UNARCHIVED_CONFIG_DIR_SITES),
+    default=Policy('inv12-config-dir-unarchived-by-design'),
+    default_covers=3,
+    dispositions={
+        'fused-memory/src/fused_memory/middleware/task_curator.py::TaskCurator._transcript_config_dir': Debt(TaskRef(6008)),
+    },
 )
 
 BLESSED_TASK_METADATA_KEYS = governed_exceptions(
@@ -152,8 +159,8 @@ BLESSED_TASK_METADATA_KEYS = governed_exceptions(
     'A task-metadata key outside the typed TaskMetadata schema that the metadata census '
     'accepts without an unknown-key warning.',
     sorted(_BLESSED_METADATA_KEYS),
-    default=Debt(TaskRef(5603)),
-    default_covers=52,
+    default=Policy('inv12-task-metadata-blessed-keys'),
+    default_covers=56,
 )
 
 LEGACY_RETRY_LEDGER_COUNTER_KEYS = governed_exceptions(
@@ -161,7 +168,7 @@ LEGACY_RETRY_LEDGER_COUNTER_KEYS = governed_exceptions(
     'A RetryLedger counter that legacy metadata blobs still carry as a top-level key '
     'instead of nested under retry_ledger, tolerated rather than reported.',
     list(_LEGACY_RETRY_LEDGER_COUNTER_KEYS),
-    default=Debt(TaskRef(5603)),
+    default=Debt(TaskRef(7135)),
     default_covers=2,
 )
 
@@ -170,8 +177,20 @@ RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
     'A ruff rule turned off in a workspace pyproject.toml, globally or for a file glob, '
     'instead of being fixed at its sites or disposed inline.',
     ruff_suppression_keys(REPO_ROOT),
-    default=Debt(TaskRef(5603)),
-    default_covers=2,
+    dispositions={
+        'tool.ruff.lint.ignore::E501': Policy('inv12-ruff-e501-line-length'),
+        'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::tests/**/*.py::F811': Debt(TaskRef(7137)),
+    },
+)
+
+
+SHARED_TIMEOUT_MARKER_GRANDFATHERED = governed_exceptions(
+    'shared.tests.shared_timeout_marker_grandfathered.INVERSION_BAND_GRANDFATHERED',
+    'An in-band timeout-marker site in shared/tests that predates the timeout-marker '
+    'inversion guard, exempt from it until migrated; entries may only be removed.',
+    sorted('::'.join(site) for site in shared_timeout_marker_grandfathered.INVERSION_BAND_GRANDFATHERED),
+    default=Debt(TaskRef(6337)),
+    default_covers=1,
 )
 
 
@@ -181,7 +200,7 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
     'event loop thread, tolerated by the INV-8 loop-blocking gate with a recorded '
     'justification until it is offloaded.',
     _occurrence_keys(row[:3] for row in loop_blocking_allowlist.AUDITED_SITES),
-    default=Debt(TaskRef(5603)),
+    default=Debt(TaskRef(5270)),
     default_covers=28,
     dispositions={
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py::BacklogPolicy.on_judge_unhalt::8f53c74a5d76': Debt(TaskRef(5270)),
@@ -193,8 +212,8 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
         'fused-memory/src/fused_memory/reconciliation/event_queue.py::EventQueue.close::c8191bbaf10a': Debt(TaskRef(6085)),
         'fused-memory/src/fused_memory/reconciliation/event_queue.py::EventQueue._commit_with_retry::93d589ee10dd': Debt(TaskRef(6085)),
         'fused-memory/src/fused_memory/reconciliation/event_queue.py::EventQueue._enqueue_on_loop::f46e02910e17': Debt(TaskRef(6085)),
-        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_one_run::361d4c634750': Debt(TicketRef('tkt_0RT88VW7RRECTHNCVTJXD6M5RJ')),
-        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._persist_stage_reports_then_gc_config_dir::361d4c634750': Debt(TicketRef('tkt_0RT88VW7RRECTHNCVTJXD6M5RJ')),
+        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_one_run::f05da1451b63': Debt(TaskRef(5270)),
+        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._persist_stage_reports_then_gc_config_dir::f05da1451b63': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_stale_runs::0787c60051a4': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_stale_runs::cc7999e2d4b6': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._resume_interrupted_runs::bc3672ec502c': Debt(TaskRef(5270)),
@@ -258,6 +277,22 @@ def _loop_blocking_mismatch(row: tuple[str, str, str, str, str], key: str) -> st
     if _override_follows_row(_OWNER_TYPE_BY_LEDGER_DISPOSITION[disposition], override, justification):
         return None
     return f'{key}: ledger disposition {disposition!r}, override found {override!r}'
+
+
+_OVERRIDE_TYPE_BY_ARCHIVAL_DISPOSITION = {
+    config_dir_archival_allowlist.UNARCHIVED_BY_DESIGN: None,
+    config_dir_archival_allowlist.UNARCHIVED_GAP: Debt,
+}
+
+
+def _config_dir_mismatch(disposition: str, key: str) -> str | None:
+    override = CONFIG_DIR_ARCHIVAL_EXCEPTIONS.overrides.get(key)
+    override_type = _OVERRIDE_TYPE_BY_ARCHIVAL_DISPOSITION[disposition]
+    if override_type is None and override is None:
+        return None
+    if override_type is not None and isinstance(override, override_type):
+        return None
+    return f'{key}: allowlist disposition {disposition!r}, override found {override!r}'
 
 
 def test_repeated_sites_keep_distinct_keys() -> None:
@@ -355,4 +390,26 @@ def test_loop_blocking_overrides_follow_the_ledger_vocabulary() -> None:
         'Debt(TaskRef(<task>)) for filed, Debt(TicketRef(<ticket>)) for to_file, and the '
         "owner id must appear in the row's justification. Correct the override in this "
         'module, or the ledger row in loop_blocking_allowlist.py:\n  ' + '\n  '.join(mismatches)
+    )
+
+
+def test_config_dir_overrides_follow_the_allowlist_vocabulary() -> None:
+    unarchived = config_dir_archival_allowlist.DISPOSITIONS - {config_dir_archival_allowlist.ARCHIVED}
+    assert set(_OVERRIDE_TYPE_BY_ARCHIVAL_DISPOSITION) == unarchived, (
+        'config_dir_archival_allowlist.DISPOSITIONS changed: decide which INV-12 disposition '
+        'each unarchived disposition maps to in _OVERRIDE_TYPE_BY_ARCHIVAL_DISPOSITION.'
+    )
+    assert isinstance(CONFIG_DIR_ARCHIVAL_EXCEPTIONS.default, Policy), (
+        'The UNARCHIVED_BY_DESIGN sites are ratified, so CONFIG_DIR_ARCHIVAL_EXCEPTIONS '
+        f'must borrow a Policy default, not {CONFIG_DIR_ARCHIVAL_EXCEPTIONS.default!r}.'
+    )
+    pairs = zip(_UNARCHIVED_CONFIG_DIR_SITES, CONFIG_DIR_ARCHIVAL_EXCEPTIONS.keys, strict=True)
+    mismatches = [
+        mismatch for site, key in pairs if (mismatch := _config_dir_mismatch(site['disposition'], key))
+    ]
+    assert not mismatches, (
+        'Each config-dir override must match its allowlist row: none for UNARCHIVED_BY_DESIGN, '
+        'which borrows the Policy default, and a Debt for UNARCHIVED_GAP. Correct the override '
+        'in this module, or the row in config_dir_archival_allowlist.py:\n  '
+        + '\n  '.join(mismatches)
     )

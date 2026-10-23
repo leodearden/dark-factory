@@ -111,6 +111,7 @@ def _make_tracker(
     lane_buffers=None,
     frozen_prefix=None,
     frozen_prefix_tip=None,
+    retire_item=None,
 ) -> SuffixConflictTracker:
     """Build a bare SuffixConflictTracker with trivial default callables.
 
@@ -134,11 +135,16 @@ def _make_tracker(
         def _default_frozen_prefix_tip(main_sha):
             return main_sha
         frozen_prefix_tip = _default_frozen_prefix_tip
+    if retire_item is None:
+        def _default_retire_item(rid):
+            return None
+        retire_item = _default_retire_item
     return SuffixConflictTracker(
         git_ops=lambda: git_ops,
         lane_buffers=lane_buffers,
         frozen_prefix=frozen_prefix,
         frozen_prefix_tip=frozen_prefix_tip,
+        retire_item=retire_item,
     )
 
 

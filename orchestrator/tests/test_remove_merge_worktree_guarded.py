@@ -87,7 +87,7 @@ def git_ops(git_repo: Path) -> GitOps:
 
 async def _make_ephemeral_worktree(git_ops: GitOps) -> Path:
     """Build a real ephemeral ``_merge-<uuid>`` worktree at the repo's HEAD."""
-    return await git_ops.create_throwaway_verify_worktree(await _head_sha(git_ops.project_root))
+    return await git_ops.create_ephemeral_verify_worktree(await _head_sha(git_ops.project_root))
 
 
 def _raise_enospc(*_a, **_k):

@@ -29,6 +29,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, TypeVar
 
+from shared.asyncio_tasks import cancel_bounded
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import (
     ActorClass,
@@ -187,7 +188,7 @@ class BlockDisposition:
     catch sites (workflow.py/steward.py/review_checkpoint.py/
     dry_run_unblock.py) now consult instead of hand-writing their own.
 
-    ``category`` is the ``verify_classify.classify_failure`` 12-value
+    ``category`` is the ``verify_classify.classify_failure``
     output domain (:class:`FailureCategory`) — a DISTINCT concept from the
     escalation-taxonomy string (``'infra_issue'``/``'wip_conflict'``/
     ``'task_failure'``) ``_mark_blocked`` separately accepts as its
@@ -288,6 +289,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         WorktreeConflictError,
         WorktreeMissing,
     )
+    from orchestrator.recut_ruling import RecutRulingUnreadable, RecutRulingViolation
     from orchestrator.verify import VerifyInfraError
 
     _disposition_table_cache = {
@@ -565,6 +567,25 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Branch reset: rebase wiped committed task work',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Re-cut rulings (task 3154): a human ruled "re-cut fresh off main",
+        # so a refused or unreadable ruling goes back to a human, never to a
+        # quiet default block.
+        RecutRulingViolation: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Re-cut ruling refused provisioning',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        RecutRulingUnreadable: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Re-cut ruling unreadable',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── BD-2 completeness rows: exported by the 4 covered modules, but
@@ -998,6 +1019,10 @@ class WorkflowCancelled(Exception):
 # `kind` is None for a normal (non-cancelled) exit.
 OnTerminalEntry = tuple[str, Callable[[Literal['hard', 'soft'] | None], Awaitable[None]]]
 
+# Cleanup entries that outlived ``cancel_bounded``'s two cancels. The event loop
+# holds tasks only weakly, so this keeps each one referenced until it ends.
+_UNDRAINED_CLEANUP_ENTRIES: set[asyncio.Task[None]] = set()
+
 
 class CancellationScope:
     """Supervises a workflow body coroutine and turns either a hard
@@ -1014,15 +1039,32 @@ class CancellationScope:
     Hard-cancel is the outer ``await`` (this coroutine's own await point)
     being cancelled, or the body itself spontaneously raising
     ``CancelledError`` (a shutdown-race teardown) — both typed ``'hard'``.
+
+    Terminal cleanup survives any number of outer cancels, but not for ever
+    (task 6660): from the first outer cancel on, each cleanup entry may run at
+    most *cancel_grace_secs* before it is cancelled under
+    ``shared.asyncio_tasks.cancel_bounded`` and named in
+    :attr:`abandoned_entries`. The remaining entries still run.
     """
 
     def __init__(
         self,
         cancel_event: asyncio.Event,
         on_terminal: Sequence[OnTerminalEntry],
+        *,
+        cancel_grace_secs: float,
     ) -> None:
         self._cancel_event = cancel_event
         self._on_terminal = on_terminal
+        self._cancel_grace_secs = cancel_grace_secs
+        self._outer_cancel_seen = False
+        self._task_name_prefix = 'cancellation-scope'
+        self._abandoned: list[str] = []
+
+    @property
+    def abandoned_entries(self) -> tuple[str, ...]:
+        """Names of the ``on_terminal`` entries cut off after their grace, in order."""
+        return tuple(self._abandoned)
 
     async def supervise(self, body_coro: Awaitable[_T]) -> _T:
         """Run *body_coro* under supervision; return its result, or raise
@@ -1032,7 +1074,12 @@ class CancellationScope:
         always passed to every ``on_terminal`` entry, in order, exactly
         once — via the ``finally`` below, so it runs on every exit path.
         """
+        current = asyncio.current_task()
+        if current is not None:
+            self._task_name_prefix = current.get_name()
         body = asyncio.ensure_future(body_coro)
+        if isinstance(body, asyncio.Task):
+            body.set_name(self._child_task_name('body'))
         waiter = asyncio.create_task(self._cancel_event.wait())
         kind: Literal['hard', 'soft'] | None = None
         try:
@@ -1047,6 +1094,7 @@ class CancellationScope:
                 # (it never cancels its member futures on our behalf), so
                 # both are handled uniformly by the finally below.
                 kind = 'hard'
+                self._outer_cancel_seen = True
                 raise WorkflowCancelled('hard') from None
             if body in done:
                 if body.cancelled():
@@ -1107,13 +1155,16 @@ class CancellationScope:
     async def _run_on_terminal(self, kind: Literal['hard', 'soft'] | None) -> None:
         """Run every ``on_terminal`` entry, in order, passing *kind*.
 
-        Runs the whole ordered list as a background task shielded behind a
-        retry loop, so it survives being cancelled REPEATEDLY (the harness's
-        ``hard_cancel_workflow`` polls, calling ``task.cancel()`` more than
-        once on the same slot task): each ``asyncio.shield`` only ever
-        detaches OUR await from the background task, never cancels the
-        background task itself, so a second (or third) cancel here can
-        never truncate an in-flight cleanup entry.
+        Each entry runs as its own task, awaited through ``asyncio.wait``,
+        which never cancels what it waits on: an outer cancel (the harness's
+        ``hard_cancel_workflow`` polls call ``task.cancel()`` more than once on
+        the same slot task) is absorbed with ``uncancel()`` and can never
+        truncate an in-flight entry. The first such cancel bounds the cleanup
+        instead: from then on an entry still running *cancel_grace_secs* after
+        the later of its start and that cancel is abandoned (see
+        :meth:`_abandon`) and the next entry starts. Without the bound a single
+        cancel-proof await in one entry held the slot and its module locks
+        until restart (task 6660). With no outer cancel nothing is bounded.
 
         Each entry is also individually try/except-``Exception``-and-logged,
         so a failure in one cleanup step can never skip the REMAINING
@@ -1124,30 +1175,82 @@ class CancellationScope:
         the harness report BLOCKED instead of CANCELLED). This generalizes
         ``_stop_claimant_heartbeat``'s own bespoke catch-and-log into one
         uniform per-entry policy, keyed on the entry name — a genuine
-        ``CancelledError`` is deliberately NOT caught here so the
-        done/cancelled bookkeeping below still sees it.
+        ``CancelledError`` raised by an entry itself is deliberately NOT
+        caught: it stops the remaining entries and propagates.
         """
-        async def _run_all() -> None:
-            for name, fn in self._on_terminal:
-                try:
-                    await fn(kind)
-                except Exception:
-                    logger.exception(
-                        f'CancellationScope on_terminal entry {name!r} '
-                        f'failed (non-fatal — continuing remaining '
-                        f'terminal cleanup)'
-                    )
+        for name, fn in self._on_terminal:
+            entry = asyncio.create_task(self._run_entry(name, fn, kind), name=self._child_task_name(name))
+            if not await self._await_entry(name, entry):
+                continue
+            if entry.cancelled():
+                raise asyncio.CancelledError()
+            exc = entry.exception()
+            if exc is not None:
+                raise exc
 
-        task = asyncio.ensure_future(_run_all())
-        while not task.done():
+    @staticmethod
+    async def _run_entry(
+        name: str,
+        fn: Callable[[Literal['hard', 'soft'] | None], Awaitable[None]],
+        kind: Literal['hard', 'soft'] | None,
+    ) -> None:
+        try:
+            await fn(kind)
+        except Exception:
+            logger.exception(
+                f'CancellationScope on_terminal entry {name!r} '
+                f'failed (non-fatal — continuing remaining '
+                f'terminal cleanup)'
+            )
+
+    async def _await_entry(self, name: str, entry: asyncio.Task[None]) -> bool:
+        """Wait for *entry*, absorbing outer cancels; False iff it was abandoned."""
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + self._cancel_grace_secs if self._outer_cancel_seen else None
+        while not entry.done():
+            remaining = None if deadline is None else deadline - loop.time()
+            if remaining is not None and remaining <= 0:
+                await self._abandon(name, entry, loop.time() - started)
+                return False
             try:
-                await asyncio.shield(task)
+                await asyncio.wait({entry}, timeout=remaining)
             except asyncio.CancelledError:
-                current = asyncio.current_task()
-                if current is not None:
-                    current.uncancel()
-        if task.cancelled():
-            raise asyncio.CancelledError()
-        exc = task.exception()
-        if exc is not None:
-            raise exc
+                self._absorb_outer_cancel()
+                if deadline is None:
+                    deadline = loop.time() + self._cancel_grace_secs
+        return True
+
+    async def _abandon(self, name: str, entry: asyncio.Task[None], elapsed: float) -> None:
+        """Cancel *entry* under a bound and record it in :attr:`abandoned_entries`."""
+        drain = asyncio.create_task(
+            cancel_bounded(entry, _UNDRAINED_CLEANUP_ENTRIES, grace_secs=self._cancel_grace_secs),
+        )
+        while not drain.done():
+            try:
+                await asyncio.wait({drain})
+            except asyncio.CancelledError:
+                self._absorb_outer_cancel()
+        self._abandoned.append(name)
+        current = asyncio.current_task()
+        logger.error(
+            'CancellationScope abandoned on_terminal entry %r of %s after %.1fs '
+            'past a hard-cancel (grace %.1fs); it %s; continuing with the '
+            'remaining terminal cleanup',
+            name,
+            current.get_name() if current is not None else 'an unnamed task',
+            elapsed,
+            self._cancel_grace_secs,
+            'ended once cancelled' if drain.result() else 'outlived two bounded cancels',
+        )
+
+    def _child_task_name(self, role: str) -> str:
+        """``<supervising task>/<role>``: a wedged slot's report finds its children by this
+        prefix (``orchestrator/src/orchestrator/slot_lease.py::suspended_slot_tasks``)."""
+        return f'{self._task_name_prefix}/{role}'
+
+    def _absorb_outer_cancel(self) -> None:
+        current = asyncio.current_task()
+        if current is not None:
+            current.uncancel()
+        self._outer_cancel_seen = True

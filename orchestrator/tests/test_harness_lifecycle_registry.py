@@ -29,6 +29,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _escalation_server_capture import create_server_kwargs
 from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
 
 from orchestrator.background_service import BackgroundService
 from orchestrator.config import OrchestratorConfig
@@ -354,8 +355,7 @@ class TestFlakeDebtDrainPass:
         ]
         await drain.pass_fn()
 
-        queue_dir = Path(config.escalation.queue_dir)
-        fresh = EscalationQueue(queue_dir if queue_dir.is_absolute() else tmp_path / queue_dir)
+        fresh = EscalationQueue(escalation_queue_dir(tmp_path))
         [record] = fresh.get_by_task(STALE_DUE_ESCALATION_SENTINEL, status='pending')
         assert record.level == 1
         assert record.category == 'infra_issue'

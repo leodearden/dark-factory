@@ -28,7 +28,10 @@ dark-factory-shared = { workspace = true }
 escalation = { workspace = true }
 
 [tool.pytest.ini_options]
-markers = ["integration: live tests requiring real external services/credentials (e.g. OpenAI API / network egress); deselect: -m 'not integration'"]
+markers = [
+    "integration: live tests requiring real external services/credentials (e.g. OpenAI API / network egress); deselect: -m 'not integration'",
+    "reads_git_history: the test reads the checkout's git history (log, merge-base, rev-list, describe), so a byte-identical tree under a new parent can verify differently; re-run alone on the merge gate's same-tree path by merge_gate_history_test_command. Not deselected by default.",
+]
 pythonpath = ["src", "../orchestrator/src"]
 asyncio_mode = "strict"
 # --max-worker-restart=0 (task 5114) is required of every thread-method config

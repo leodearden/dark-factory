@@ -14,6 +14,7 @@ verdict.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import types
 from pathlib import Path
@@ -27,6 +28,19 @@ from orchestrator.config import (
     OrchestratorConfig,
 )
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane import (
+    GroupMergeRequest,
+    InFlightMergeRegistry,
+    MergeCancelRefusal,
+    MergeCancelVerdict,
+    MergeLane,
+    MergeRequest,
+    OperatorMergeCancel,
+    QueuedBranch,
+    WaiterRecord,
+    enqueue_merge_request,
+)
 from orchestrator.merge_lane.queue_store import (
     MergeQueueStore,
 )
@@ -521,21 +535,24 @@ class TestMergeCancelDurableResolution:
 
         assert response['state'] is MergeState.unknown
 
-    async def test_a_live_waiterless_request_reports_its_live_state(
+    async def test_a_live_request_the_lane_refuses_reports_its_live_state(
         self, tmp_path: Path
     ) -> None:
         _, current = _event_stores(tmp_path)
+        worker = _live_worker(_live_entry('mr-live', state='finalizing'))
+        worker.cancel_request = lambda request_id: MergeCancelVerdict(
+            request_id, MergeCancelRefusal.FINALIZE_WINDOW,
+        )
         server = _server(
-            tmp_path,
-            current,
-            worker=_live_worker(_live_entry('mr-live', state='verifying')),
+            tmp_path, current, worker=worker,
             journal=_journal(tmp_path, _journal_entry('mr-live')),
         )
 
         response = await self._cancel(server, 'mr-live')
 
         assert response['state'] is not MergeState.journaled
-        assert response['state'] is MergeState.verifying
+        assert response['state'] is MergeState.finalizing
+        assert response['code'] == 'finalize_window'
 
 
 class TestLiveTier:
@@ -560,3 +577,133 @@ class TestLiveTier:
         assert cancelled['cancelled'] is False
         assert cancelled['state'] == 'abandoned'
         assert cancelled['reason'] == 'Request already finalized; cannot cancel.'
+
+
+class TestMergeCancelThroughTheLane:
+    """merge_cancel of a live request no caller is blocked on (task 5248).
+
+    The request reaches a real lane the way a workflow's does, through
+    ``enqueue_merge_request``, so this server holds no waiter for it.  Every
+    operator cancel ends with someone owning it: the TaskWorkflow that awaits
+    the request, or else an L1 this server files.
+    """
+
+    async def _lane_holding(
+        self, tmp_path: Path, current: Any, request: MergeRequest,
+        registry: InFlightMergeRegistry | None = None,
+    ) -> Any:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        lane = MergeLane(GitOps(_config(tmp_path).git, tmp_path), queue)
+        await enqueue_merge_request(queue, request, current)
+        git_ops = _git_ops_spies()
+        git_ops.find_inflight_merge_worktree = AsyncMock(return_value=None)
+        return create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            orch_config=_config(tmp_path),
+            event_store=current,
+            harness=types.SimpleNamespace(
+                _merge_worker=lane, _merge_store=_journal(tmp_path), git_ops=git_ops,
+            ),
+            merge_inflight_registry=registry,
+        )
+
+    def _request(
+        self, tmp_path: Path, *, train: dict[str, Any] | None = None, **flags: Any,
+    ) -> MergeRequest:
+        fields: dict[str, Any] = dict(
+            task_id=_TASK,
+            branch=QueuedBranch.parse(_BRANCH, 'task/'),
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=_config(tmp_path),
+            result=asyncio.get_running_loop().create_future(),
+            **flags,
+        )
+        if train is None:
+            return MergeRequest(**fields)
+        return GroupMergeRequest(**fields, **train)
+
+    def _escalations(self, tmp_path: Path) -> list[Any]:
+        return EscalationQueue(tmp_path / 'esc').get_by_task(_TASK)
+
+    async def test_a_queued_request_is_cancelled_and_then_polls_abandoned(
+        self, tmp_path: Path,
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        request = self._request(tmp_path, awaited_by_workflow=True)
+        server = await self._lane_holding(tmp_path, current, request)
+        queued = await _poll(server, request_id=request.request_id)
+
+        response = await call_merge_cancel(server, request_id=request.request_id)
+
+        assert queued['state'] is MergeState.queued
+        assert response == {'cancelled': True, 'state': MergeState.abandoned, 'reason': None}
+        assert (await _poll(server, request_id=request.request_id))['state'] is (
+            MergeState.abandoned
+        )
+        assert self._escalations(tmp_path) == [], 'the awaiting workflow owns the cancel'
+
+    async def test_a_workflowless_request_is_cancelled_and_escalated_here(
+        self, tmp_path: Path,
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        request = self._request(tmp_path)
+        server = await self._lane_holding(tmp_path, current, request)
+
+        response = await call_merge_cancel(server, request_id=request.request_id)
+
+        assert response['cancelled'] is True
+        [escalation] = self._escalations(tmp_path)
+        assert escalation.category == 'merge_cancelled_by_operator'
+        assert escalation.level == 1
+        assert request.request_id in escalation.summary
+        assert _TASK in escalation.summary
+
+    async def test_an_attached_workflow_peer_receives_the_operator_cancel(
+        self, tmp_path: Path,
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        request = self._request(tmp_path)
+        registry = InFlightMergeRegistry()
+        registry.acquire(
+            request.branch.bare_id, _TASK, request.result, request_id=request.request_id,
+        )
+        peer = asyncio.get_running_loop().create_future()
+        registry.attach(request.branch.bare_id, WaiterRecord(
+            request_id='mr-peer', future=peer, source='workflow',
+        ))
+        server = await self._lane_holding(tmp_path, current, request, registry)
+
+        response = await call_merge_cancel(server, request_id=request.request_id)
+
+        assert response['cancelled'] is True
+        assert peer.cancelled()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            peer.result()
+        assert OperatorMergeCancel.carried_by(cancelled.value) == (
+            OperatorMergeCancel(request.request_id)
+        )
+        assert self._escalations(tmp_path) == [], 'the attached workflow owns the cancel'
+
+    async def test_a_train_is_refused_with_its_code(self, tmp_path: Path) -> None:
+        _, current = _event_stores(tmp_path)
+        train = self._request(tmp_path, train=dict(
+            train_id='train-1',
+            member_task_ids=['41', _TASK],
+            tip_branch=QueuedBranch.parse(_BRANCH, 'task/'),
+            tip_task_id=_TASK,
+            status_check=AsyncMock(return_value={}),
+            mark_member_done=AsyncMock(),
+        ))
+        server = await self._lane_holding(tmp_path, current, train)
+
+        response = await call_merge_cancel(server, request_id=train.request_id)
+
+        assert response['cancelled'] is False
+        assert response['state'] is MergeState.queued
+        assert response['code'] == 'train_cancel_unsupported'
+        assert 'Block the member' in response['reason']
+        assert not train.result.done()
+        assert self._escalations(tmp_path) == []

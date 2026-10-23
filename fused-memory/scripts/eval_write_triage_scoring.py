@@ -538,7 +538,7 @@ def _spend(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 def _attachable_id(record: Mapping[str, Any]) -> str:
     """The id an attach against *record* would name — its canonical, hoisted.
 
-    Live rows carry the `_canonical_id_of` hoist the retrieval edge computed;
+    Live rows carry the `canonical_id_of` hoist the retrieval edge computed;
     a fixture record is its own attach target.
     """
     return str(record.get('canonical_id') or record['memory_id'])

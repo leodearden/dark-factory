@@ -696,7 +696,7 @@ def _parser() -> argparse.ArgumentParser:
     stores.add_argument('--sessions-root', type=Path, help='default: session_registry.sessions_dir()')
     stores.add_argument('--handover', type=Path, help='default: ownership.resolve_handover_path(<this checkout>)')
     stores.add_argument('--preparation', type=Path, default=DEFAULT_PREPARATION)
-    stores.add_argument('--project', help='keep only this project, folded through normalize_project_token')
+    stores.add_argument('--project', help='keep only this project, folded through shared.project_id.fold_project_token')
 
     brief_cmd = commands.add_parser('brief', parents=[stores], help='print the sitting brief')
     brief_cmd.add_argument('--ledger', type=Path, help='session ledger: stable numbers, written back')

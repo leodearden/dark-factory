@@ -11,11 +11,11 @@ import re
 import time
 import uuid
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, TypedDict, TypeVar, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
@@ -59,6 +59,7 @@ from fused_memory.backends.llm_token_usage import (
     measure_llm_tokens,
 )
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
+from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.models.scope import build_known_projects_map, known_project_roots_from_env
@@ -67,6 +68,8 @@ from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
 from fused_memory.utils.validation import canonicalize_project_id
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar('_T')
 
 
 _MIN_OPENAI_VERSION: tuple[int, ...] = (1, 91, 0)
@@ -1564,6 +1567,13 @@ class GraphitiBackend:
     FalkorDB is multi-tenant: each project's data lives in its own graph
     (named after the project_id / group_id).  The driver is cloned per-request
     so every operation targets the correct graph.
+
+    TIMEOUT POSTURE.  Every budgeted read and write goes through
+    :meth:`_timed_read` / :meth:`_timed_write`, so it follows the rule stated
+    in ``backends/timeout_budget.py``.  The one exception is index
+    provisioning (``_ensure_indices``, ``provision_registered_graphs``): it
+    runs on its own ``_index_provision_timeout`` budget and never raises, per
+    docs/prds/falkordb-index-provisioning.md D4-D6.
     """
 
     def __init__(
@@ -1614,6 +1624,18 @@ class GraphitiBackend:
         or ``reset()``.
         """
         return measure_llm_tokens(self._llm_client)
+
+    async def _timed_read(self, awaitable: Awaitable[_T], op: str) -> _T:
+        """``await_within`` under this backend's READ budget."""
+        return await await_within(
+            awaitable, store='Graphiti', op=op, budget_s=self._read_timeout,
+        )
+
+    async def _timed_write(self, awaitable: Awaitable[_T], op: str) -> _T:
+        """``await_within`` under this backend's WRITE budget."""
+        return await await_within(
+            awaitable, store='Graphiti', op=op, budget_s=self._write_timeout,
+        )
 
     # --- Per-request driver routing ---
 
@@ -1975,7 +1997,7 @@ class GraphitiBackend:
         if unverified_claim:
             source_description = f'[unverified_claim] {source_description}'
         try:
-            return await asyncio.wait_for(
+            return await self._timed_write(
                 client.add_episode(
                     name=name,
                     episode_body=content,
@@ -1986,7 +2008,7 @@ class GraphitiBackend:
                     entity_types=entity_types,
                     uuid=uuid,
                 ),
-                timeout=self._write_timeout,
+                'add_episode',
             )
         except GraphitiCoreNodeNotFoundError as exc:
             # Translate only a not-found provably about the caller's own uuid —
@@ -2024,20 +2046,16 @@ class GraphitiBackend:
         client = self._require_client()
         gids = group_ids or []
         driver = self._driver_for(gids[0]) if gids else None
-        try:
-            return await asyncio.wait_for(
-                client.search(
-                    query=query,
-                    group_ids=gids,
-                    num_results=num_results,
-                    center_node_uuid=center_node_uuid,
-                    driver=driver,
-                ),
-                timeout=self._read_timeout,
-            )
-        except TimeoutError:
-            logger.warning(f'Graphiti search timed out after {self._read_timeout}s')
-            return []
+        return await self._timed_read(
+            client.search(
+                query=query,
+                group_ids=gids,
+                num_results=num_results,
+                center_node_uuid=center_node_uuid,
+                driver=driver,
+            ),
+            'search',
+        )
 
     @_canonicalize_group_args
     async def search_nodes(
@@ -2052,20 +2070,16 @@ class GraphitiBackend:
 
         gids = group_ids or []
         driver = self._driver_for(gids[0]) if gids else None
-        try:
-            results = await asyncio.wait_for(
-                client.search_(
-                    query=query,
-                    config=NODE_HYBRID_SEARCH_RRF,
-                    group_ids=gids,
-                    driver=driver,
-                ),
-                timeout=self._read_timeout,
-            )
-            return (results.nodes or [])[:max_nodes]
-        except TimeoutError:
-            logger.warning(f'Graphiti search_nodes timed out after {self._read_timeout}s')
-            return []
+        results = await self._timed_read(
+            client.search_(
+                query=query,
+                config=NODE_HYBRID_SEARCH_RRF,
+                group_ids=gids,
+                driver=driver,
+            ),
+            'search_nodes',
+        )
+        return (results.nodes or [])[:max_nodes]
 
     @_canonicalize_group_args
     async def retrieve_episodes(
@@ -2083,60 +2097,57 @@ class GraphitiBackend:
 
         Raises:
             IncompleteEnumerationError: The keyset read ran out of page budget.
+            TimeoutError: The read overran its budget (class TIMEOUT POSTURE).
+                MemoryConsolidator then marks 'episodes' a degraded fetch
+                source, and get_episodes answers an error, not an empty list.
         """
         driver = self._driver_for(group_ids[0]) if group_ids else self._require_driver()
-        try:
-            # The full set is still read, now in keyset pages, because the
-            # created_at sort must see every episode: a cap-truncated set would
-            # silently select the wrong episodes, not merely fewer of them. The
-            # cheaper bounded read (ORDER BY created_at ... LIMIT last_n) was
-            # declined; its cost and reasons are in
-            # plans/falkordb-resultset-cap-audit.md.
-            episodes = await asyncio.wait_for(
-                _read_all_group_episodes(driver, group_ids),
-                timeout=self._read_timeout,
-            )
-            episodes = sorted(
-                episodes or [],
-                # Secondary key (uuid) makes this a total order: get_by_group_ids
-                # truncates via ORDER BY uuid DESC, so without a tie-breaker,
-                # episodes sharing created_at (batch/rapid co-ingestion, or
-                # reduced-precision storage) fall back to that upstream order,
-                # which is not guaranteed reproducible across executions and can
-                # read as non-monotonic to a strict-descending observer.
-                key=lambda ep: (
-                    _as_sortable_utc(getattr(ep, 'created_at', None)),
-                    getattr(ep, 'uuid', None) or '',
-                ),
-                reverse=True,
-            )
-            return episodes[:last_n]
-        except TimeoutError:
-            logger.warning(f'Graphiti retrieve_episodes timed out after {self._read_timeout}s')
-            return []
+        # The full set is still read, now in keyset pages, because the
+        # created_at sort must see every episode: a cap-truncated set would
+        # silently select the wrong episodes, not merely fewer of them. The
+        # cheaper bounded read (ORDER BY created_at ... LIMIT last_n) was
+        # declined; its cost and reasons are in
+        # plans/falkordb-resultset-cap-audit.md.
+        episodes = await self._timed_read(
+            _read_all_group_episodes(driver, group_ids), 'retrieve_episodes',
+        )
+        episodes = sorted(
+            episodes or [],
+            # Secondary key (uuid) makes this a total order: get_by_group_ids
+            # truncates via ORDER BY uuid DESC, so without a tie-breaker,
+            # episodes sharing created_at (batch/rapid co-ingestion, or
+            # reduced-precision storage) fall back to that upstream order,
+            # which is not guaranteed reproducible across executions and can
+            # read as non-monotonic to a strict-descending observer.
+            key=lambda ep: (
+                _as_sortable_utc(getattr(ep, 'created_at', None)),
+                getattr(ep, 'uuid', None) or '',
+            ),
+            reverse=True,
+        )
+        return episodes[:last_n]
 
     @_canonicalize_group_args
     async def get_episode_by_uuid(self, episode_uuid: str, *, group_id: str) -> EpisodicNode | None:
-        """Fetch an episode node by UUID.
+        """Fetch an episode node by UUID, or None when it does not exist.
 
         Mirrors remove_episode's driver-selection + EpisodicNode.get_by_uuid
-        call, but is fail-safe rather than propagating: a missing episode
-        (graphiti_core's NodeNotFoundError) or a timeout (matching
-        retrieve_episodes' timeout handling) both return None instead of
-        raising, since callers (e.g. the reconciliation promotion-time
-        batch-plan gate, task 2033) treat "can't determine content" as a
-        graceful fallback rather than a hard failure.
+        call.  Only a genuine miss (graphiti_core's NodeNotFoundError) returns
+        None.
+
+        Raises:
+            TimeoutError: The read overran its budget (class TIMEOUT POSTURE),
+                so a timeout is never mistaken for a missing episode.  The
+                promotion-time batch-plan gate
+                (``reconciliation/targeted.py::_should_withhold_batch_promotion``,
+                task 2033) fails open on it, as it does on None.
         """
         driver = self._driver_for(group_id)
         try:
-            return await asyncio.wait_for(
-                EpisodicNode.get_by_uuid(driver, episode_uuid),
-                timeout=self._read_timeout,
+            return await self._timed_read(
+                EpisodicNode.get_by_uuid(driver, episode_uuid), 'get_episode_by_uuid',
             )
         except GraphitiCoreNodeNotFoundError:
-            return None
-        except TimeoutError:
-            logger.warning(f'Graphiti get_episode_by_uuid timed out after {self._read_timeout}s')
             return None
 
     @_canonicalize_group_args
@@ -2144,10 +2155,7 @@ class GraphitiBackend:
         """Delete an episode by UUID."""
         driver = self._driver_for(group_id)
         node = await EpisodicNode.get_by_uuid(driver, episode_uuid)
-        await asyncio.wait_for(
-            node.delete(driver),
-            timeout=self._write_timeout,
-        )
+        await self._timed_write(node.delete(driver), 'remove_episode')
 
     @_canonicalize_group_args
     async def redact_episode_content(
@@ -2219,13 +2227,13 @@ class GraphitiBackend:
             )
 
         graph = self._graph_for(group_id)
-        result = await asyncio.wait_for(
+        result = await self._timed_read(
             graph.ro_query(
                 'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
                 'RETURN e.content',
                 {'uuid': episode_uuid, 'group_id': group_id},
             ),
-            timeout=self._read_timeout,
+            'redact_episode_content.read',
         )
         if not result.result_set:
             raise NodeNotFoundError(
@@ -2233,13 +2241,13 @@ class GraphitiBackend:
             )
         old_content = result.result_set[0][0] or ''
 
-        await asyncio.wait_for(
+        await self._timed_write(
             graph.query(
                 'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
                 'SET e.content = $content',
                 {'uuid': episode_uuid, 'group_id': group_id, 'content': new_content},
             ),
-            timeout=self._write_timeout,
+            'redact_episode_content.write',
         )
         logger.info(
             'redact_episode_content: episode=%s group=%s old_len=%d new_len=%d',
@@ -2261,10 +2269,7 @@ class GraphitiBackend:
         except EdgeNotFoundError:
             logger.info(f'Edge {edge_uuid} not found (already deleted or episode-cascaded)')
             return
-        await asyncio.wait_for(
-            edge.delete(driver),
-            timeout=self._write_timeout,
-        )
+        await self._timed_write(edge.delete(driver), 'remove_edge')
 
     @_canonicalize_group_args
     async def update_edge(
@@ -2306,19 +2311,19 @@ class GraphitiBackend:
             edge.invalid_at = invalid_at
         if clear_invalid_at:
             edge.invalid_at = None
-        await asyncio.wait_for(edge.save(driver), timeout=self._write_timeout)
+        await self._timed_write(edge.save(driver), 'update_edge.save')
 
         if clear_invalid_at:
             # edge.save()'s map-based SET does not reliably clear a
             # null-valued property on FalkorDB — force it deterministically.
             graph = self._graph_for(group_id)
-            await asyncio.wait_for(
+            await self._timed_write(
                 graph.query(
                     'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
                     'SET e.invalid_at = NULL',
                     {'uuid': edge_uuid},
                 ),
-                timeout=self._write_timeout,
+                'update_edge.clear_invalid_at',
             )
 
         # Deterministically refresh both endpoint entity summaries so they
@@ -2566,17 +2571,17 @@ class GraphitiBackend:
         """
         client = self._require_client()
         if not group_ids:
-            await asyncio.wait_for(
+            await self._timed_write(
                 client.build_communities(group_ids=group_ids, driver=None),
-                timeout=self._write_timeout,
+                'build_communities',
             )
             return
         for group_id in group_ids:
-            await asyncio.wait_for(
+            await self._timed_write(
                 client.build_communities(
                     group_ids=[group_id], driver=self._driver_for(group_id)
                 ),
-                timeout=self._write_timeout,
+                'build_communities',
             )
 
     @_canonicalize_group_args

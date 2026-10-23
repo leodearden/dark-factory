@@ -37,12 +37,9 @@ from typing import Any
 
 from shared.eval_lane import eval_lane_provenance
 from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING
+from shared.project_layout import escalation_queue_dir
 
 logger = logging.getLogger(__name__)
-
-#: Where the queue lives under project_root — the same relative path
-#: ``markup_tripwire._QUEUE_DIRNAME`` uses, so every guard files into ONE queue.
-MARKUP_QUEUE_DIRNAME = 'data/escalations'
 
 #: Rendered as the subject when there is no plan to read it from and the
 #: worktree has no name either. Never a guess — an explicit "nobody knows".
@@ -284,7 +281,7 @@ def open_escalation_channel(project_root: Path) -> tuple[Any, Any] | None:
         )
         return None
     try:
-        return Escalation, EscalationQueue(project_root / MARKUP_QUEUE_DIRNAME)
+        return Escalation, EscalationQueue(escalation_queue_dir(project_root))
     except Exception:
         logger.exception(
             'markup guard: failed to open the escalation queue under %s', project_root,

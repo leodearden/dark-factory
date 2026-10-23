@@ -95,7 +95,7 @@ tasks:
       kind: grep
       pattern: MERGE_REMEDIABLE_ESC_CATEGORIES \|
       paths:
-      - orchestrator/src/orchestrator/harness.py
+      - orchestrator/src/orchestrator/recovery_pins.py
       expect: present
   - name: preexisting-main-break-is-a-live-category-with-real-producers
     binding: 'capability→producer (wired) - filed at workflow.py:10740/:10783/:10798
@@ -108,7 +108,7 @@ tasks:
       kind: grep
       pattern: preexisting_main_break
       paths:
-      - orchestrator/src/orchestrator/harness.py
+      - orchestrator/src/orchestrator/recovery_pins.py
       expect: present
   - name: escalation-ref-carries-a-populated-category
     binding: 'field-population - EscalationRef.category: str = '''' (task_ground_truth.py:226)
@@ -1008,7 +1008,7 @@ tasks:
       kind: grep
       pattern: preexisting_main_break
       paths:
-      - orchestrator/src/orchestrator/harness.py
+      - orchestrator/src/orchestrator/recovery_pins.py
       expect: present
   - name: b9-needs-gammas-parked-vs-pruned-label
     binding: 'capability→producer - producer:task-γ upstream. B9 asserts BOTH halves:

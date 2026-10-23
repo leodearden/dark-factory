@@ -71,7 +71,7 @@ def _load_watchdog() -> types.ModuleType:
 def _neutralize_fleet_clock_gates(
     wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Stub ALL THREE of staleness_pass's fleet coordination gates to "not blocking".
+    """Stub ALL FOUR of staleness_pass's fleet coordination gates to "not blocking".
 
     For the many staleness_pass tests that are about something else entirely
     (enumeration, per-unit probes, delegation, exception isolation) and just
@@ -86,13 +86,15 @@ def _neutralize_fleet_clock_gates(
     is a hollow pass or a machine-state-dependent flake rather than a hard
     error) nothing flags it. Each gate added to the pass has so far meant
     another sweep across every such test — task 2396 added the min-interval
-    stub, task 4754 the head-start stub, task 4755 the in-flight lease stub —
-    so the list lives in ONE place and the next gate is a one-line edit here.
+    stub, task 4754 the head-start stub, task 4755 the in-flight lease stub,
+    task 7198 the module-removal waiver stub — so the list lives in ONE place
+    and the next gate is a one-line edit here.
 
-    Scoped to staleness_pass's OWN gate prefix, which is what "all three" means
+    Scoped to staleness_pass's OWN gate prefix, which is what "all four" means
     here: _count_head_start_skip_lines and _head_start_skip_line_emitted_at
     hold the head-start gate OPEN, so the pass returns before ever reaching the
-    lease read and neither needs this helper's third line.
+    lease read and neither needs this helper's third line (they stub the
+    waiver themselves, since a held gate is exactly when it is probed).
 
     Deliberately NOT used by the acceptance tests that must exercise the real
     file reads — test_staleness_head_start_anchored_on_fleet_min_interval_
@@ -114,6 +116,10 @@ def _neutralize_fleet_clock_gates(
     # once again immediately before delegating, to close the read-then-act
     # window), so an unstubbed test reads live machine state twice.
     monkeypatch.setattr(wdog, "_live_fleet_lease", lambda: None)
+    # task 7198: the module-removal waiver probes live systemd unit start times
+    # and runs git against the hardcoded REPO_DIR, on any tick where a clock
+    # gate holds.
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
 
 
 def _neutralize_fm_clock_gates(
@@ -1772,10 +1778,10 @@ def test_staleness_grace_secs_malformed_env_falls_back(monkeypatch: pytest.Monke
 
 
 def test_orch_restart_min_interval_secs_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ORCH_RESTART_MIN_INTERVAL_SECS defaults to 28800 (8h) with no env override."""
+    """ORCH_RESTART_MIN_INTERVAL_SECS defaults to 259200 (72h) with no env override."""
     monkeypatch.delenv("ORCH_RESTART_MIN_INTERVAL_SECS", raising=False)
     wdog = _load_watchdog()
-    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 28800
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 259200
 
 
 def test_orch_restart_min_interval_secs_matches_config_default(
@@ -1786,20 +1792,29 @@ def test_orch_restart_min_interval_secs_matches_config_default(
     The watchdog is a stdlib-only systemd oneshot that cannot import the
     orchestrator package at runtime, so ORCH_RESTART_MIN_INTERVAL_SECS's
     default is a hardcoded mirror of
-    OrchestratorConfig.orchestrator_restart_min_interval_secs (28800.0, task
-    2371). This drift test — mirroring
-    tests/scripts/test_orchestrator_restart_config_drift.py — pins the two
-    together so a future config.py change doesn't silently diverge from the
-    watchdog's copy (Open-Q1).
+    OrchestratorConfig.orchestrator_restart_min_interval_secs (259200.0 since
+    Leo's 2026-10-19 72h ruling; task 2371 introduced it). This drift test —
+    mirroring tests/scripts/test_orchestrator_restart_config_drift.py — pins
+    the two together so a future config.py change doesn't silently diverge
+    from the watchdog's copy (Open-Q1).
+
+    Two readings, both pinned: the field's CODE default, which the mirror
+    claims to copy, and the value this repo's committed
+    dark-factory-orchestrator.yaml resolves to, which is what the
+    merge-landed coordinator sharing the watchdog's fleet clock actually runs
+    with. The yaml sets the key explicitly, so the second reading alone no
+    longer sees the code default.
     """
     from orchestrator.config import OrchestratorConfig
 
+    field_default = OrchestratorConfig.model_fields["orchestrator_restart_min_interval_secs"].default
     monkeypatch.delenv("ORCH_RESTART_MIN_INTERVAL_SECS", raising=False)
     # Anchor ORCH_CONFIG_PATH to this worktree's own committed config so the
     # comparison is deterministic regardless of the ambient shell env (which
     # may point ORCH_CONFIG_PATH at a different checkout).
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     wdog = _load_watchdog()
+    assert pytest.approx(field_default) == wdog.ORCH_RESTART_MIN_INTERVAL_SECS
     assert pytest.approx(
         OrchestratorConfig().orchestrator_restart_min_interval_secs
     ) == wdog.ORCH_RESTART_MIN_INTERVAL_SECS
@@ -2045,14 +2060,14 @@ def test_restart_orchestrator_unit_default_matches_across_tiers() -> None:
 def test_orch_restart_min_interval_secs_malformed_env_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A malformed ORCH_RESTART_MIN_INTERVAL_SECS env value falls back to 28800.
+    """A malformed ORCH_RESTART_MIN_INTERVAL_SECS env value falls back to 259200.
 
     A typo'd env var must not crash the oneshot watchdog — fall-safe ethos,
     mirroring STALENESS_GRACE_SECS's malformed-env test above.
     """
     monkeypatch.setenv("ORCH_RESTART_MIN_INTERVAL_SECS", "not-an-int")
     wdog = _load_watchdog()
-    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 28800
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 259200
 
 
 def test_read_last_fleet_deploy_epoch_happy_path(
@@ -2782,6 +2797,7 @@ def test_staleness_pass_skips_when_within_fleet_deploy_min_interval(
     log_messages: list[str] = []
 
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     monkeypatch.setattr(wdog.time, "time", lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0)
     monkeypatch.setattr(
         wdog,
@@ -2824,6 +2840,7 @@ def test_staleness_pass_suppresses_skip_log_outside_log_bucket(
     log_messages: list[str] = []
 
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     # Halfway into the bucket — well outside the logging slot near its start.
     monkeypatch.setattr(
         wdog.time,
@@ -2870,6 +2887,7 @@ def test_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket(
 
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     # Halfway into the bucket — well outside the logging slot near its start.
     monkeypatch.setattr(
         wdog.time,
@@ -2928,6 +2946,7 @@ def _count_head_start_skip_lines(
     tier = "fm" if pass_fn_name.startswith("fused_memory") else "fleet"
     monkeypatch.setattr(wdog, f"_within_{tier}_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, f"_within_{tier}_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
 
     now = {"t": window_start + tick_phase}
@@ -2950,6 +2969,7 @@ def _head_start_skip_line_emitted_at(
     log_messages: list[str] = []
     monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
     monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
     monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
     monkeypatch.setattr(wdog.time, "time", lambda: when)
     wdog.staleness_pass()
@@ -3152,6 +3172,7 @@ def test_staleness_head_start_anchored_on_fleet_min_interval_expiry_real_clock_f
             json.dumps({"ts": now - age_secs, "iso": "2026-08-26T00:00:00+00:00"})
         )
         monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+        monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
 
         recorded_calls: list[list[str]] = []
         log_messages: list[str] = []
@@ -4301,10 +4322,11 @@ def test_boundary1_staleness_inside_window_real_clock_file(
     wdog = _load_watchdog()
 
     now = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
-    clock_ts = now - 2 * 3600  # ~2h ago -- well inside the 28800s default window
+    clock_ts = now - 2 * 3600  # ~2h ago -- well inside the 259200s default window
     clock_file = tmp_path / "clock.json"
     clock_file.write_text(json.dumps({"ts": clock_ts, "iso": "2026-07-16T00:00:00+00:00"}))
     monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog, "_due_module_removals", lambda: ())
 
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace, if ever reached
     unit = "orchestrator-know-live.service"
@@ -12211,9 +12233,10 @@ def test_fleet_lease_max_age_matches_config_default(monkeypatch: pytest.MonkeyPa
 
     Modelled on test_orch_restart_min_interval_secs_matches_config_default
     above. The bound is what makes a SIGKILLed sweep cost at most one delayed
-    window, and its 14400s value is DERIVED (worst legitimate sweep ~= 13,300s),
-    not chosen — so a tier drifting off it is a silent correctness change, not
-    a cosmetic one.
+    window, and a --drain sweep is fitted under its 14400s value (at
+    scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS) —
+    so a tier drifting off it is a silent correctness change, not a cosmetic
+    one.
 
     Two statements, because there are exactly two tiers that READ the value:
     the coordinator via OrchestratorConfig and the watchdog via its own env
@@ -13124,3 +13147,67 @@ def test_print_unit_parity_degrades_to_unknown_on_an_unexpected_failure(
     assert wdog._cli(["--report"]) == 0
     assert "unknown" in _parity_row(capsys.readouterr().out)
     assert any("parity checker exploded" in line for line in logged), logged
+
+
+def test_report_code_sha_column_shows_each_units_deployed_sha_and_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """Task 6565 D1: CODE-SHA sits beside START and is read from the unit's heartbeat.
+
+    ``?`` marks an indeterminate sha and ``*`` a dirty wire path; a heartbeat
+    without the block (a pre-6565 unit) or with a null block reads ``none``,
+    and a unit with no heartbeat file reads ``none`` too.
+    """
+    wdog = _load_watchdog()
+    commit_epoch = 1_800_000_000
+    now = 2_000_000_000.0
+    clean, flagged, old, missing = (
+        synthetic_unit(n) for n in ("clean", "flagged", "old", "missing")
+    )
+    units = [clean, flagged, old, missing]
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            stdout = "".join(f"{u} loaded active running desc\n" for u in units)
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{commit_epoch + 100}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(tmp_path / "absent_clock.json"))
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    monkeypatch.setenv("ORCH_FLEET_DIR", str(fleet_dir))
+    base = {"merge_idle": True, "depth": 0, "queue_empty": True, "ts_epoch": now - 5}
+    blocks = {
+        clean: {"sha": "1" * 40, "indeterminate": False, "dirty_wire_path": False},
+        flagged: {"sha": "2" * 40, "indeterminate": True, "dirty_wire_path": True},
+    }
+    for unit in (clean, flagged):
+        (fleet_dir / f"{unit}.json").write_text(
+            json.dumps({"unit": unit, **base, "deployed_sha": blocks[unit]})
+        )
+    (fleet_dir / f"{old}.json").write_text(json.dumps({"unit": old, **base}))
+
+    wdog.report()
+
+    out = capsys.readouterr().out
+    header = next(line for line in out.splitlines() if line.startswith("UNIT"))
+    assert header.index("START") < header.index("CODE-SHA") < header.index("NEWEST")
+    rows = [line.split() for line in out.splitlines()]
+    # START renders as three tokens ("YYYY-MM-DD HH:MM:SS UTC"), so CODE-SHA is the fifth.
+    code_sha = {row[0]: row[4] for row in rows if row and row[0] in units}
+    assert code_sha == {
+        clean: "1" * 12,
+        flagged: "2" * 12 + "?*",
+        old: "none",
+        missing: "none",
+    }

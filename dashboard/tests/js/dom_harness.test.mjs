@@ -1,6 +1,6 @@
-// The jsdom render harness's own contract (dom_harness.mjs), starting with the
-// toolchain identity guard: the harness must run the exact React bytes the
-// browser runs, or it lies about what the browser renders.
+// The jsdom render harness's own contract (dom_harness.mjs). Its identity guard holds the installed
+// react and react-dom to the packages the browser loads (their copy of index.html's build must hash
+// to the tag's integrity); the harness renders with each package's development build.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -118,6 +118,26 @@ test('the window runs React at the version index.html loads', t => {
   const { window } = openWindow(t);
   assert.equal(window.React.version, cdnScriptTag('react').version);
   assert.equal(window.ReactDOM.version, cdnScriptTag('react-dom').version);
+});
+
+test("the window runs React's development build, so a broken React rule reaches consoleErrors", t => {
+  const { window, consoleErrors, mount } = openWindow(t);
+  const { React } = window;
+  const items = withKeys => ['a', 'b'].map(id => React.createElement('li', withKeys ? { key: id } : null, id));
+  const Keyed = () => React.createElement('ul', null, items(true));
+  const Keyless = () => React.createElement('ul', null, items(false));
+
+  mount(Keyed);
+  assert.deepEqual(consoleErrors, [], 'a keyed list must render silently, or the check below proves nothing');
+
+  mount(Keyless);
+  assert.ok(
+    consoleErrors.some(entry => entry.includes('unique "key" prop')),
+    'a keyless list rendered without React\'s key warning. The browser loads the production build, which is ' +
+      "silent about key, prop and hook misuse, so jsx_render.test.mjs's consoleErrors assertion is the one place " +
+      'those warnings still fail a change, and only the development build supports the synchronous act() that ' +
+      'mount() renders through.',
+  );
 });
 
 test('the load writes nothing to console.error', t => {

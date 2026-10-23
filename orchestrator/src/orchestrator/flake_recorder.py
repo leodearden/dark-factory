@@ -45,8 +45,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from escalation.categories import EscalationCategory
+
 from orchestrator.flake_ledger import (
     DueItem,
+    FlakeSuppression,
     FlakeVerdict,
     due_items_for,
     enqueue_debt,
@@ -191,7 +194,7 @@ def _bump_suppression_streak_and_maybe_escalate(
         agent_role='orchestrator-merge-flake-monitor',
         severity='critical',
         level=2,
-        category='merge_flake_suppression_storm',
+        category=EscalationCategory.MERGE_FLAKE_SUPPRESSION_STORM,
         summary=summary,
         detail=detail,
         suggested_action=(
@@ -214,7 +217,46 @@ async def record_merge_flake_suppression(
     event_store: EventStore | None = None,
     escalation_queue: Any = None,
 ) -> None:
-    """Record the flake observation *result* carries.
+    """Record the flake observation *result* carries, via :func:`record_flake_observation`.
+
+    A result with no ``flake_suppression`` records nothing (B13).  NEVER RAISES.
+    """
+    s = getattr(result, 'flake_suppression', None)
+    if s is None:
+        # B13 — new dispatcher, OLD remote: the wire payload simply has no
+        # `flake_suppression` key, so the field defaults to None.  That is a
+        # degradation (an un-upgraded runner), not an observation: recording a
+        # sentinel row for it would put fiction in the evidence trail.
+        return
+    await record_flake_observation(
+        s,
+        project_root=project_root,
+        project_id=project_id,
+        merge_sha=merge_sha,
+        task_id=task_id,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+    )
+
+
+async def record_flake_observation(
+    s: FlakeSuppression,
+    *,
+    project_root: Path,
+    project_id: str,
+    merge_sha: str,
+    task_id: str | None,
+    event_store: EventStore | None = None,
+    escalation_queue: Any = None,
+) -> None:
+    """Record one discriminator observation *s*.
+
+    Every gate records through here: the merge gate via
+    :func:`record_merge_flake_suppression`, and the main-health classifier's
+    task-mu fork through the sink ``merge_lane/worker.py::_main_probe_flake_sink``
+    builds.  The fact and the storm escalation keep the merge-gate names
+    (``merge_flake_suppressed``, "merge-verify reds") at both; the occurrence row's
+    ``call_site`` is what tells them apart.
 
     Four side-effects, on two triggers:
 
@@ -260,14 +302,6 @@ async def record_merge_flake_suppression(
     None-safe on both collaborators: the CLI and any storeless caller still contribute
     the durable rows and items.
     """
-    s = getattr(result, 'flake_suppression', None)
-    if s is None:
-        # B13 — new dispatcher, OLD remote: the wire payload simply has no
-        # `flake_suppression` key, so the field defaults to None.  That is a
-        # degradation (an un-upgraded runner), not an observation: recording a
-        # sentinel row for it would put fiction in the evidence trail.
-        return
-
     def _lost(what: str) -> None:
         """The one place a lost signal is reported."""
         logger.warning(

@@ -1140,10 +1140,11 @@ def parse_config_command(raw: str) -> VerifyCmd:
     quotes or an empty command classify OPAQUE with *raw* retained verbatim.
 
     A command containing a shell chain operator (``&&``, ``||``, ``;``, ``|``)
-    as a literal token is a multi-segment chain: recognised chains (pytest or
-    cargo test/clippy — the two chain-aware mutators, serial_pytest and
-    cargo_scope) retain *raw* under that ToolKind; anything else chained is
-    OPAQUE. A single-segment command is decomposed into a leading ``cd <dir>
+    as a literal token is a multi-segment chain, and retains *raw* under the
+    tool it runs: pytest or cargo test/clippy (the owners of the chain-aware
+    mutators, serial_pytest and cargo_scope), else a single argv-head ruff
+    check or pyright (identity only), else OPAQUE (see ``_parse_chain``). A
+    single-segment command is decomposed into a leading ``cd <dir>
     &&``, an optional ``uv run [--project X|--directory X]`` wrapper, the
     tool head, and the remaining base_flags/targets. An unrecognised head
     (single-segment) is also OPAQUE.
@@ -1157,15 +1158,48 @@ def parse_config_command(raw: str) -> VerifyCmd:
     return _parse_single_segment(raw, tokens)
 
 
-def _parse_chain(raw: str, tokens: list[str]) -> VerifyCmd:
-    """Classify a multi-segment chain by scanning for a chain-aware tool.
+_CHAIN_IDENTIFIABLE_TOOLS: tuple[tuple[str, ToolKind], ...] = (
+    ('ruff check', ToolKind.RUFF),
+    ('pyright', ToolKind.PYRIGHT),
+)
 
-    Only pytest and cargo test/clippy are chain-aware (serial_pytest and
-    cargo_scope respectively know how to rewrite *raw* in place via a
-    localised regex); any other chain shape — including a recognised-looking
-    head followed by an unrelated segment (e.g. a ruff-check chain with a
-    second, unrelated script clause) — is OPAQUE, so it runs unscoped rather
-    than risk the historical find/replace-surgery mangling.
+
+def _identify_chain_tool(raw: str) -> ToolKind | None:
+    """The one recognised tool some segment of chain *raw* invokes, if exactly one.
+
+    Matches at an argv-head position (``_segment_invokes_tool``), not by token
+    membership, because sibling checkers are named after their tool: the live
+    root lint chain runs ``check_bare_magicmock_config.py``, and
+    ``check_pyright_config.py`` is the same shape.
+
+    Exactly one, because a chain running two recognised tools has no dominant
+    tool; ``_segment_invokes_tool`` counts an undecodable segment as a match
+    for both keywords, so such a chain resolves None too.
+    """
+    segments = split_top_level_and(raw)
+    matched = {
+        kind
+        for keyword, kind in _CHAIN_IDENTIFIABLE_TOOLS
+        if any(_segment_invokes_tool(segment, keyword) for segment in segments)
+    }
+    return matched.pop() if len(matched) == 1 else None
+
+
+def _parse_chain(raw: str, tokens: list[str]) -> VerifyCmd:
+    """Classify a multi-segment chain, retaining *raw* under the tool it runs.
+
+    pytest and cargo test/clippy come first because they own the chain-aware
+    MUTATORS: serial_pytest and cargo_scope rewrite *raw* in place via a
+    localised regex.
+
+    ruff check and pyright are recognised for IDENTITY only
+    (``_identify_chain_tool``), so ``classify_failure`` can dispatch on the
+    real tool via ``verify._tool_for_cmd``. That is safe because every
+    structural mutator no-ops on ``raw is not None`` and the pytest/cargo
+    mutators are ToolKind-gated, so the command still runs exactly as written.
+
+    Any other chain is OPAQUE and runs unscoped rather than risk the
+    historical find/replace-surgery mangling.
     """
     if 'pytest' in tokens:
         return VerifyCmd(tool=ToolKind.PYTEST, raw=raw)
@@ -1176,6 +1210,9 @@ def _parse_chain(raw: str, tokens: list[str]) -> VerifyCmd:
             return VerifyCmd(tool=ToolKind.CARGO_TEST, raw=raw)
         if tokens[i + 1] == 'clippy':
             return VerifyCmd(tool=ToolKind.CARGO_CLIPPY, raw=raw)
+    identified = _identify_chain_tool(raw)
+    if identified is not None:
+        return VerifyCmd(tool=identified, raw=raw)
     return VerifyCmd(tool=ToolKind.OPAQUE, raw=raw)
 
 
@@ -1919,7 +1956,10 @@ def serial_pytest(cmd: VerifyCmd, ini_addopts: Sequence[str] = ()) -> VerifyCmd:
     invocation recovers independently. No-ops unless ``cmd.tool is
     ToolKind.PYTEST`` (covers OPAQUE and every other tool — P1). This is the
     recovery task 2045 proved for a shared-venv-mutation transient, where
-    xdist has vanished from the venv.
+    xdist has vanished from the venv. ``-p no:xdist`` also unregisters xdist's
+    fixtures (``worker_id``, ``testrun_uid``), so a test requesting one ERRORs
+    at setup; ``verify.py::reproduced_failures`` says what such an ERROR
+    confirms.
 
     *ini_addopts* is the RAW ``addopts`` of the config pytest will read for
     this command, supplied by the caller
@@ -2130,10 +2170,9 @@ def govern_cpu(cmd: VerifyCmd, exec_path: str | None) -> VerifyCmd:
     deliberate exemption from P1. The historical ``_maybe_govern_merge_cmd``
     bash-wrapped ANY non-``None`` command for ``role=='merge'`` regardless
     of shape, and OPAQUE is exactly the "arbitrary/unparseable shell" case
-    that bash-wrap exists for (e.g. dark_factory's multi-clause
-    ``lint_command``/``type_check_command`` chains, which parse OPAQUE —
-    see ``_parse_chain`` — yet must still receive merge-weighted cgroup
-    scope like every other merge verify command).
+    that bash-wrap exists for (e.g. a multi-clause chain invoking no
+    recognised tool — see ``_parse_chain`` — which must still receive
+    merge-weighted cgroup scope like every other merge verify command).
     """
     if not exec_path:
         return cmd

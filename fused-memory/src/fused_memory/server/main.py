@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.middleware.ticket_janitor import TicketJanitor
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
@@ -573,6 +574,10 @@ async def run_server():
 
     # Initialize write journal
     from fused_memory.services.write_journal import WriteJournal
+    from fused_memory.services.write_ops_retention import (
+        prune_write_ops_pass,
+        run_periodic_write_ops_prune,
+    )
 
     wj_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
     write_journal = WriteJournal(wj_data_dir)
@@ -612,18 +617,11 @@ async def run_server():
     # watchdog's 120 s startup grace (STARTUP_GRACE_SECS in
     # scripts/orchestrator-watchdog.py) while silently dropping journal rows —
     # log_write_op swallows its own errors and busy_timeout is only 5000 ms — so
-    # it would corrupt the very telemetry it is pruning. A first run against the
-    # current backlog will legitimately need many restarts to drain, which the
-    # prune discloses at WARNING rather than hiding. Fire-and-forget.
-    _wj = config.write_journal
-    _write_ops_pruned = await write_journal.prune_write_ops(
-        read_older_than_days=_wj.read_retention_days,
-        search_older_than_days=_wj.search_retention_days,
-        write_older_than_days=_wj.write_retention_days,
-        batch_size=_wj.prune_batch_size,
-        max_rows=_wj.prune_max_rows_per_run,
-        max_seconds=_wj.prune_max_seconds,
-    )
+    # it would corrupt the very telemetry it is pruning. The periodic loop
+    # started below now carries the drain, not successive restarts; this pass
+    # catches up after downtime, and every partial pass discloses its backlog at
+    # WARNING. Fire-and-forget.
+    _write_ops_pruned = await prune_write_ops_pass(write_journal, config.write_journal)
     if _write_ops_pruned:
         logger.info(
             f'write_ops retention prune at startup: {_write_ops_pruned} rows'
@@ -1071,36 +1069,16 @@ async def run_server():
     # Ticket janitor — periodic sweep that surfaces failed tickets to the
     # orchestrator as info-severity ticket_failure escalations, and the curator
     # dedup-outage signature as a blocking infra_issue. Replaces the per-call
-    # resolve_ticket wait the steward / deep_reviewer used to chain.
+    # resolve_ticket wait the steward / deep_reviewer used to chain. It is also
+    # the only retrier of tickets parked awaiting_curation.
     janitor_task: asyncio.Task[None] | None = None
-    janitor_cfg = getattr(config.curator, 'janitor', None)
-    if janitor_cfg is not None and janitor_cfg.enabled and ticket_store is not None:
-        from fused_memory.middleware.ticket_janitor import TicketJanitor
-
-        _janitor_primary_root = (
-            config.taskmaster.project_root if config.taskmaster else ''
-        ) or ''
-        if _janitor_primary_root:
-            _janitor_primary_root = str(
-                Path(_janitor_primary_root).expanduser().resolve(),
-            )
+    ticket_janitor = (
+        _build_ticket_janitor(config, ticket_store, task_interceptor, _known_projects_map)
+        if ticket_store is not None else None
+    )
+    if ticket_janitor is not None:
+        janitor_cfg = config.curator.janitor
         dedup_outage_cfg = _dedup_outage_detector_config(config)
-        ticket_janitor = TicketJanitor(
-            ticket_store,
-            cooldown_secs=janitor_cfg.cooldown_seconds,
-            batch_limit=janitor_cfg.batch_limit,
-            primary_project_root=_janitor_primary_root,
-            liveness_probe=(
-                task_interceptor.is_worker_alive
-                if task_interceptor is not None else None
-            ),
-            signal_ticket_resolved=(
-                task_interceptor._signal_ticket_event
-                if task_interceptor is not None else None
-            ),
-            known_projects=_known_projects_map,
-            dedup_outage=dedup_outage_cfg,
-        )
         janitor_task = asyncio.create_task(
             ticket_janitor.run_loop(janitor_cfg.interval_seconds),
         )
@@ -1178,6 +1156,16 @@ async def run_server():
         )
     else:
         logger.info('  Summary rebuild loop: disabled')
+
+    write_ops_prune_task = asyncio.create_task(
+        run_periodic_write_ops_prune(write_journal, config.write_journal),
+    )
+    logger.info(
+        '  Write-ops prune loop: every %.0fs, each pass bounded by %.0fs / %d rows',
+        config.write_journal.prune_interval_seconds,
+        config.write_journal.prune_max_seconds,
+        config.write_journal.prune_max_rows_per_run,
+    )
 
     remint_sweep_task: asyncio.Task[None] | None = _start_remint_sweep(
         taskmaster,
@@ -1358,6 +1346,9 @@ async def run_server():
             rebuild_summaries_task.cancel()
             with contextlib.suppress(BaseException):
                 await rebuild_summaries_task
+        write_ops_prune_task.cancel()
+        with contextlib.suppress(BaseException):
+            await write_ops_prune_task
         if remint_sweep_task is not None:
             remint_sweep_task.cancel()
             with contextlib.suppress(BaseException):
@@ -1911,6 +1902,40 @@ def _resolve_curator_escalator_state_path(config: FusedMemoryConfig) -> Path:
     if config.reconciliation:
         return Path(config.reconciliation.data_dir) / 'curator_escalator_state.json'
     return Path('./data/curator_escalator_state.json')
+
+
+def _build_ticket_janitor(
+    config: FusedMemoryConfig,
+    ticket_store: TicketStore,
+    task_interceptor: TaskInterceptor | None,
+    known_projects: dict[str, str],
+) -> TicketJanitor | None:
+    """The ticket janitor, wired to drain parked tickets through *task_interceptor*; None when disabled."""
+    from fused_memory.middleware.ticket_janitor import TicketJanitor
+
+    janitor_cfg = getattr(config.curator, 'janitor', None)
+    if janitor_cfg is None or not janitor_cfg.enabled:
+        return None
+    primary_root = (config.taskmaster.project_root if config.taskmaster else '') or ''
+    if primary_root:
+        primary_root = str(Path(primary_root).expanduser().resolve())
+    return TicketJanitor(
+        ticket_store,
+        cooldown_secs=janitor_cfg.cooldown_seconds,
+        batch_limit=janitor_cfg.batch_limit,
+        primary_project_root=primary_root,
+        liveness_probe=task_interceptor.is_worker_alive if task_interceptor is not None else None,
+        signal_ticket_resolved=(
+            task_interceptor._signal_ticket_event if task_interceptor is not None else None
+        ),
+        requeue_ticket=(
+            task_interceptor.requeue_awaiting_curation_ticket
+            if task_interceptor is not None else None
+        ),
+        known_projects=known_projects,
+        dedup_outage=_dedup_outage_detector_config(config),
+        curation_backlog_min_attempts=janitor_cfg.curation_backlog_escalation_min_attempts,
+    )
 
 
 def _dedup_outage_detector_config(

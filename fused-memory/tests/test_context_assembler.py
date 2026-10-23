@@ -1055,7 +1055,7 @@ def _hint_task(*queries: str, task_id: str = '42') -> dict:
 
 
 async def _search_rows(journal) -> list[dict]:
-    rows = await journal.get_ops_since('1970-01-01T00:00:00+00:00', limit=500, kind='read')
+    rows = await journal.get_stored_ops_since('1970-01-01T00:00:00+00:00', limit=500, kind='read')
     return [r for r in rows if r['operation'] == 'search']
 
 

@@ -11,11 +11,15 @@ curator instead.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
+
+from shared.defects import DeclareEvent, OutcomeEvent
 
 from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
+    DefectWriteResult,
     DependencyResult,
     GetTasksResult,
     MetadataLookupResult,
@@ -293,10 +297,35 @@ class TaskBackendProtocol(Protocol):
         and JSON value match the stored row exactly, and refuse a payload
         carrying the key when the stored blob does not parse.
 
+        **Implementations MUST reject a metadata payload that is not a JSON
+        object** (unparseable text, or JSON that decodes to an array, null,
+        string, number or boolean) in every ``metadata_mode``, by raising (e.g.
+        ``MetadataNotAnObjectError``), before the row lookup.  Such a payload
+        has no keys to merge; treating it as a last-write-wins replacement
+        wiped the whole stored blob, ``done_provenance`` included (task 6130).
+
         The ``status`` param is kept in the signature as a **reject-trap**: it
         preserves the ``status=None`` passthrough that ``server/tools.py`` and
         ``task_interceptor.py`` forward via ``**kwargs``, and it makes the
         reject-only contract explicit for future backend authors.
+        """
+        ...
+
+    async def apply_defect_events(
+        self,
+        task_id: str,
+        project_root: str,
+        events: Sequence[DeclareEvent | OutcomeEvent],
+        *,
+        tag: str | None = None,
+    ) -> DefectWriteResult:
+        """Fold *events* into the task's ``defects`` / ``defect_test_retirements``, all or nothing.
+
+        The one post-creation writer of both defect keys: the rules are
+        ``fused_memory/backends/defect_records.py``'s, and the read-fold-write
+        runs in one write transaction. It takes none of the interceptor's
+        locks and journals nothing; its caller supplies both, as
+        ``TaskInterceptor.apply_defect_events`` does for the MCP tools.
         """
         ...
 
