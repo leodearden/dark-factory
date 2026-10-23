@@ -5073,16 +5073,20 @@ def test_main_lease_show_on_a_corrupt_body_is_fail_soft(
     lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
     lease_path.parent.mkdir(parents=True, exist_ok=True)
     lease_path.write_text('{not valid json')
-    _set_mtime(lease_path, datetime.now(UTC), timedelta(hours=1))
+    before = datetime.now(UTC)
+    _set_mtime(lease_path, before, timedelta(hours=1))
 
     rc = sr.main(['lease-show', '--name', 'watcher-df'])
+    after = datetime.now(UTC)
 
     assert rc == 0
     fields = _parse_kv(capsys.readouterr().out)
     # Marks the body unreadable rather than asserting a fake holder -- and
     # still reports a REAL heartbeat age, the axis that decides reapability.
     assert fields['state'] == 'unreadable'
-    assert abs(int(fields['heartbeat_age_secs']) - 3600) <= 5
+    _assert_age_between_clock_reads(
+        fields['heartbeat_age_secs'], backdated_by=timedelta(hours=1), before=before, after=after
+    )
     assert lease_path.is_file()  # read-only: inspection never reaps
 
 
