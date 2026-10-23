@@ -150,6 +150,25 @@ def _quarantined_meta_dir(git_ops: GitOps) -> Path:
     return TaskArtifacts.meta_root_for(git_ops.quarantine_base, 'x').parent
 
 
+_PRIOR_PLAN = b'{"task_id": "prior", "steps": [{"id": "step-1", "status": "done"}]}'
+
+
+def _write_task_root_plan(git_ops: GitOps, task_id: str) -> Path:
+    task_root = TaskArtifacts.task_root_for(git_ops.worktree_base, task_id)
+    task_root.mkdir(parents=True, exist_ok=True)
+    (task_root / 'plan.json').write_bytes(_PRIOR_PLAN)
+    return task_root
+
+
+def _parked_task_root(git_ops: GitOps, parked, task_id: str) -> Path:
+    """The one relocated root that was *task_id*'s task root."""
+    [moved] = [
+        Path(m) for m in parked.relocated_meta_roots if Path(m).name.endswith(f'.task-{task_id}')
+    ]
+    assert moved.parent == _quarantined_meta_dir(git_ops)
+    return moved
+
+
 async def _pooled_with_task_d(git_repo: Path, pool_size: int = 2) -> tuple[GitOps, Path]:
     """Pooled GitOps with task D on a lane: one committed and one uncommitted change."""
     await _add_warm_lane_scripts(git_repo)
@@ -249,6 +268,29 @@ class TestParkPriorIncarnation:
         for moved in parked.relocated_meta_roots:
             assert Path(moved).parent == _quarantined_meta_dir(git_ops)
 
+    async def test_the_task_root_is_parked_beside_the_lane_root(self, git_repo: Path):
+        """A recut task must not inherit its prior incarnation's task-scoped plan."""
+        git_ops, lane = await _pooled_with_task_d(git_repo)
+        _write_lane_metadata(git_ops, lane.name, 'D')
+        task_root = _write_task_root_plan(git_ops, 'D')
+
+        parked = await git_ops.park_prior_incarnation('D', reason='recut')
+
+        assert parked is not None
+        assert not task_root.exists()
+        assert (_parked_task_root(git_ops, parked, 'D') / 'plan.json').read_bytes() == _PRIOR_PLAN
+        assert len(parked.relocated_meta_roots) == 2
+
+    async def test_a_surviving_task_root_alone_is_parked(self, git_repo: Path):
+        git_ops = GitOps(_config(warm_lane_pool=False), git_repo)
+        task_root = _write_task_root_plan(git_ops, '7')
+
+        parked = await git_ops.park_prior_incarnation('7', reason='recut')
+
+        assert parked is not None and parked.parked_branch is None
+        assert not task_root.exists()
+        assert (_parked_task_root(git_ops, parked, '7') / 'plan.json').read_bytes() == _PRIOR_PLAN
+
     async def test_unprovable_checkout_listing_fails_closed(
         self, git_repo: Path, monkeypatch: pytest.MonkeyPatch,
     ):
@@ -286,6 +328,14 @@ class TestPriorIncarnationEvidence:
         assert any(str(worktree) in item for item in evidence), evidence
         assert any(str(meta_root) in item for item in evidence), evidence
 
+    async def test_names_the_task_root(self, git_repo: Path):
+        git_ops = GitOps(_config(warm_lane_pool=False), git_repo)
+        task_root = _write_task_root_plan(git_ops, '7')
+
+        evidence = await git_ops.prior_incarnation_evidence('7')
+
+        assert any(str(task_root) in item for item in evidence), evidence
+
     async def test_names_lane_assignment_and_lane_meta_root(self, git_repo: Path):
         git_ops, lane = await _pooled_with_task_d(git_repo)
         meta_root = _write_lane_metadata(git_ops, lane.name, 'D')
@@ -307,6 +357,7 @@ class TestPriorIncarnationEvidence:
             task_id = '7'
             await git_ops.create_worktree(task_id)
             TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id).mkdir(parents=True)
+        _write_task_root_plan(git_ops, task_id)
 
         await git_ops.park_prior_incarnation(task_id, reason='recut')
 
