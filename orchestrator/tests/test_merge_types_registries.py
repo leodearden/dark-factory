@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import time
 from collections.abc import Iterator
 
@@ -104,6 +105,29 @@ class TestEtaSeconds:
 
         frozen_monotonic.advance(1)
         assert registry.eta_seconds('591') is None
+
+
+class TestDetachLastWaiter:
+    def test_detaching_after_the_primary_failed_leaves_its_error_reportable(
+        self, event_loop_for_futures: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Detaching every waiter from an already-failed merge must not mark its failure as handled."""
+        loop = event_loop_for_futures
+        messages: list[str] = []
+        loop.set_exception_handler(lambda _loop, context: messages.append(context['message']))
+        registry = InFlightMergeRegistry()
+        primary = loop.create_future()
+        registry.acquire('591', 'T-591', primary, request_id='mr-1')
+        primary.set_exception(RuntimeError('verify crashed'))
+
+        assert registry.detach('591', 'mr-1') == 0
+        loop.run_until_complete(asyncio.sleep(0))
+        assert not registry.is_inflight('591')
+
+        loop.close()
+        del primary
+        gc.collect()
+        assert messages == ['Future exception was never retrieved']
 
 
 class TestMergeBounceRegistryClear:
