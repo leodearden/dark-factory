@@ -1,7 +1,7 @@
 """Regression-guard tests for _inject_plan_tools_mcp() wiring in workflow.py.
 
 Verifies the two genuinely new behaviors of _inject_plan_tools_mcp():
-1. _inject_plan_tools_mcp(None, worktree) creates an mcpServers dict with a
+1. _inject_plan_tools_mcp(None, worktree, task_root=...) creates an mcpServers dict with a
    'plan-tools' entry equal to
    plan_tools_mcp_server(_ORCH_PROJECT_DIR, worktree, python_executable=sys.executable,
    meta_root=_meta_root_for_worktree(worktree), task_root=task_root)

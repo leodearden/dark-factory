@@ -224,11 +224,11 @@ _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
 
 
 def _meta_root_for_worktree(worktree: Path) -> Path:
-    """Derive the `.task-meta` root for *worktree* — the single DRY seam used
-    by both the orchestrator-side ``TaskArtifacts`` construction (``_setup``)
-    and the agent-side plan-tools MCP injection (``_inject_plan_tools_mcp``),
-    so both sides compute the IDENTICAL meta_root for a given worktree
-    (worktree-lane-lifecycle PRD task ε1).
+    """Derive the lane `.task-meta` root for *worktree* — the single DRY seam
+    used by both the orchestrator-side roots (``TaskWorkflow._artifact_roots``)
+    and the agent-side MCP injections (``_inject_plan_tools_mcp`` /
+    ``_inject_verdict_tools_mcp``), so both sides compute the IDENTICAL lane
+    root for a given worktree (worktree-lane-lifecycle PRD task ε1).
 
     Thin wrapper around ``TaskArtifacts.meta_root_for`` — the single owner of
     the `.task-meta` path shape — so callers here never hand-join ``.task``
@@ -237,7 +237,7 @@ def _meta_root_for_worktree(worktree: Path) -> Path:
     return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
 
 
-def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path) -> dict:
+def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Path) -> dict:
     """Inject the plan-tools stdio MCP server entry into *mcp_config*.
 
     Creates a minimal ``{'mcpServers': {}}`` skeleton when *mcp_config* is
@@ -259,21 +259,25 @@ def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path) -> dict:
       ``plan_tools_mcp_server`` for callers that cannot supply an interpreter.
     - Task 1776 (this): ``python_executable=sys.executable`` eliminates ``uv``
       from the hot path entirely, collapsing the proc tree to ``claude → python3``.
-    - Task 2258 (W11-ε1): ``meta_root=_meta_root_for_worktree(cwd)`` passes the
-      sibling `.task-meta` root through as ``--meta-root``, so the agent-side
-      plan-tools server writes plan.json to the same relocated artifacts root
-      the orchestrator's own ``TaskArtifacts`` instance reads from.
+    - Task 2258 (W11-ε1) and task 3155: the lane root
+      (``_meta_root_for_worktree(cwd)``) and *task_root* pass through as
+      ``--meta-root`` / ``--task-root``, so the agent-side plan-tools server
+      writes each artifact to the root the orchestrator's own
+      ``TaskArtifacts`` reads it from. *task_root* is required so a call site
+      cannot silently fall back to a single root.
     """
     if not mcp_config:
         mcp_config = {'mcpServers': {}}
     mcp_config.setdefault('mcpServers', {})['plan-tools'] = plan_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
-        meta_root=_meta_root_for_worktree(cwd),
+        meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
     )
     return mcp_config
 
 
-def _inject_verdict_tools_mcp(mcp_config: dict | None, cwd: Path, role: AgentRole) -> dict:
+def _inject_verdict_tools_mcp(
+    mcp_config: dict | None, cwd: Path, role: AgentRole, *, task_root: Path,
+) -> dict:
     """Inject the verdict-tools stdio MCP server entry into *mcp_config*.
 
     Creates a minimal ``{'mcpServers': {}}`` skeleton when *mcp_config* is
@@ -295,10 +299,10 @@ def _inject_verdict_tools_mcp(mcp_config: dict | None, cwd: Path, role: AgentRol
     ``reviews/reviewer_comprehensive.json``.
 
     Modeled on ``_inject_plan_tools_mcp``: same direct-interpreter no-uv hot
-    path (``python_executable=sys.executable``) and the same
-    ``meta_root=_meta_root_for_worktree(cwd)`` passthrough so the agent-side
-    verdict-tools server targets the identical relocated `.task-meta` root
-    the orchestrator's own ``TaskArtifacts`` instance reads from.
+    path (``python_executable=sys.executable``) and the same lane-root and
+    required *task_root* passthrough, so the agent-side verdict-tools server
+    writes ``verdicts/`` to the task root the orchestrator's own
+    ``TaskArtifacts`` reads it from.
 
     Deliberately passes no ``--session-id`` to ``verdict_tools_mcp_server``,
     even though the active session id is available here at the ``_invoke``
@@ -310,7 +314,7 @@ def _inject_verdict_tools_mcp(mcp_config: dict | None, cwd: Path, role: AgentRol
         mcp_config = {'mcpServers': {}}
     mcp_config.setdefault('mcpServers', {})['verdict-tools'] = verdict_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, role.name, python_executable=sys.executable,
-        meta_root=_meta_root_for_worktree(cwd),
+        meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
     )
     return mcp_config
 
@@ -2601,6 +2605,18 @@ class TaskWorkflow:
                 )
         self._phase_cost_at_entry = self.metrics.total_cost_usd
 
+    def _artifact_roots(self, worktree: Path) -> tuple[Path, Path]:
+        """The ``(lane root, task root)`` every dispatch into *worktree* uses.
+
+        An external (eval-mode) worktree gets its lane root twice: eval trials
+        of one task id share a parent dir, so a task-keyed root would
+        interleave their plans (task 3155 plan, design decision 4).
+        """
+        lane_root = _meta_root_for_worktree(worktree)
+        if self._worktree_external:
+            return lane_root, lane_root
+        return lane_root, TaskArtifacts.task_root_for(worktree.parent, self.task_id)
+
     async def _setup_worktree_and_artifacts(self, branch_name: str) -> None:
         """Set in-progress, create/inspect the worktree, init artifacts, scrub .task/.
 
@@ -2730,9 +2746,7 @@ class TaskWorkflow:
         if not self._worktree_external:
             await self._sync_worktree_venvs()
 
-        self.artifacts = TaskArtifacts(
-            self.worktree, _meta_root_for_worktree(self.worktree),
-        )
+        self.artifacts = TaskArtifacts(self.worktree, *self._artifact_roots(self.worktree))
         # Capture old base_commit before init() overwrites metadata.json
         # — _plan() uses it for revalidation diff.
         self._old_plan_base = self.artifacts.read_base_commit()
@@ -14230,7 +14244,9 @@ class TaskWorkflow:
         # (--no-sync, --frozen) reuse the already-synced orchestrator venv to
         # avoid cold-resolve stalls under load (reify esc-4415-240/esc-4437-123).
         if 'plan_tools' in role.mcp_families and cwd:
-            mcp_config = _inject_plan_tools_mcp(mcp_config, cwd)
+            mcp_config = _inject_plan_tools_mcp(
+                mcp_config, cwd, task_root=self._artifact_roots(cwd)[1],
+            )
 
         # Verdict-tools stdio MCP server — reviewer/judge/merger submit a
         # constrained verdict artifact (PRD task β, task 2482). Gated on
@@ -14239,7 +14255,9 @@ class TaskWorkflow:
         # config when None, so the reviewer (no 'orchestrator' family) still
         # acquires it.
         if 'verdict_tools' in role.mcp_families and cwd:
-            mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role)
+            mcp_config = _inject_verdict_tools_mcp(
+                mcp_config, cwd, role, task_root=self._artifact_roots(cwd)[1],
+            )
 
         # --strict-mcp-config stops the CLI unioning in the ambient project/user
         # .mcp.json. EVAL_PROFILE scopes every role (task 4757). A role whose

@@ -2,7 +2,7 @@
 
 Mirrors test_workflow_plan_tools_injection.py::TestInjectPlanToolsMcp. Verifies
 the two genuinely new behaviors of _inject_verdict_tools_mcp():
-1. _inject_verdict_tools_mcp(None, worktree, role) creates an mcpServers dict
+1. _inject_verdict_tools_mcp(None, worktree, role, task_root=...) creates an mcpServers dict
    with a 'verdict-tools' entry equal to
    verdict_tools_mcp_server(_ORCH_PROJECT_DIR, worktree, role.name,
    python_executable=sys.executable, meta_root=_meta_root_for_worktree(worktree),

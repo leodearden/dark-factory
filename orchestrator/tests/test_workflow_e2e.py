@@ -856,7 +856,7 @@ class TestReviewLoop:
             async def _architect(self, cwd: Path) -> AgentResult:
                 """On re-plan, add a new step to address the review feedback."""
                 nonlocal review_round
-                task_dir = TaskArtifacts(cwd).lane_root
+                task_dir = TaskArtifacts(cwd).task_root
                 plan_path = task_dir / 'plan.json'
 
                 if plan_path.exists():
@@ -1116,7 +1116,7 @@ class TestBlastRadiusExpansion:
                 plan = dict(PLAN)
                 plan['files'] = ['lib.py', 'test_lib.py']  # wider than assigned ['lib']
                 plan['_schema_version'] = 1
-                task_dir = TaskArtifacts(cwd).lane_root
+                task_dir = TaskArtifacts(cwd).task_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
                 return AgentResult(success=True, output='Plan created', cost_usd=0.50)
@@ -1148,7 +1148,7 @@ class TestBlastRadiusExpansion:
                 plan = dict(PLAN)
                 plan['files'] = ['lib.py', 'locked_module.py']
                 plan['_schema_version'] = 1
-                task_dir = TaskArtifacts(cwd).lane_root
+                task_dir = TaskArtifacts(cwd).task_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
                 return AgentResult(success=True, output='Plan created', cost_usd=0.50)
@@ -2508,7 +2508,7 @@ class StringPrereqsArchitectStub(AgentStub):
     """AgentStub subclass that writes a plan with plain-string prerequisites."""
 
     async def _architect(self, cwd: Path) -> AgentResult:
-        task_dir = TaskArtifacts(cwd).lane_root
+        task_dir = TaskArtifacts(cwd).task_root
         task_dir.mkdir(parents=True, exist_ok=True)
         bad_plan = {
             'task_id': '42',
@@ -2606,7 +2606,7 @@ class TestPlanFinalizeMarker:
 
         class CappedAfterFinalizeStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
-                task_dir = TaskArtifacts(cwd).lane_root
+                task_dir = TaskArtifacts(cwd).task_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 plan = dict(PLAN)  # PLAN carries _finalized_at
                 plan['_schema_version'] = 1
@@ -2650,7 +2650,7 @@ class TestPlanFinalizeMarker:
 
         class CappedBeforeFinalizeStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
-                task_dir = TaskArtifacts(cwd).lane_root
+                task_dir = TaskArtifacts(cwd).task_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 plan = {k: v for k, v in PLAN.items() if k != '_finalized_at'}
                 plan['_schema_version'] = 1
@@ -2693,7 +2693,7 @@ class TestPlanFinalizeMarker:
 
         class SuccessNoFinalizeStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
-                task_dir = TaskArtifacts(cwd).lane_root
+                task_dir = TaskArtifacts(cwd).task_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 plan = {k: v for k, v in PLAN.items() if k != '_finalized_at'}
                 plan['_schema_version'] = 1
@@ -5040,12 +5040,12 @@ class TestRedispatchIterationLogHygiene:
         iterations.jsonl silently survives across re-dispatch — the exact
         signature behind the task 2125/2315/2340 false-DONE recurrence.
         """
-        # 1. Pre-seed the sibling .task-meta/<task_id> root — the exact
+        # 1. Pre-seed both .task-meta roots of the task — the exact
         #    location a prior, since-abandoned dispatch would have left
         #    behind — with an OLD (fake) base_commit and a stale iteration
         #    log entry, BEFORE the workflow creates its own fresh worktree.
         worktree_path_to_be = git_ops.worktree_base / task_assignment.task_id
-        stale_artifacts = TaskArtifacts(worktree_path_to_be)
+        stale_artifacts = TaskArtifacts.for_task(worktree_path_to_be, task_assignment.task_id)
         old_base = 'f' * 40
         stale_artifacts.init(
             task_assignment.task_id, task_assignment.task['title'],
@@ -5091,12 +5091,12 @@ class TestRedispatchIterationLogHygiene:
         """
         # 1. The fresh worktree's base_commit will be the current main tip
         #    (no remote configured — _freshen_main falls back to local main).
-        #    Seed the sibling .task-meta/<task_id> root with THAT SAME sha as
+        #    Seed both .task-meta roots of the task with THAT SAME sha as
         #    the OLD base_commit, so create_worktree's fresh base matches it
         #    exactly (same-base crash-resume, not a re-dispatch).
         main_sha = await git_ops.get_main_sha()
         worktree_path_to_be = git_ops.worktree_base / task_assignment.task_id
-        stale_artifacts = TaskArtifacts(worktree_path_to_be)
+        stale_artifacts = TaskArtifacts.for_task(worktree_path_to_be, task_assignment.task_id)
         stale_artifacts.init(
             task_assignment.task_id, task_assignment.task['title'],
             task_assignment.task['description'], base_commit=main_sha,
