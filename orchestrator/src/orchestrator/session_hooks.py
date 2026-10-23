@@ -44,6 +44,7 @@ from typing import Any
 
 from orchestrator import session_registry
 from orchestrator.session_ownership_probes import EventProbes, ProcessTree
+from orchestrator.session_self_exit import SelfExit
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,8 @@ def parse_hook_input(raw: str) -> dict[str, Any]:
     """Tolerantly parse the Claude Code hook stdin JSON.
 
     Recognized keys: ``session_id``, ``cwd``, ``hook_event_name``,
-    ``message``, ``transcript_path`` — every one of them optional. Empty,
+    ``message``, ``transcript_path``, ``background_tasks``,
+    ``session_crons`` — every one of them optional. Empty,
     malformed, or non-object input all yield ``{}`` rather than raising, so a
     hook fault here can never block a session.
     """
@@ -898,6 +900,7 @@ def _run_status_refresh_and_retitle(
     *,
     question: session_registry.Question | None = None,
     process_tree: ProcessTree | None,
+    self_exit: SelfExit | None = None,
 ) -> str:
     """Shared refresh-then-retitle body for ``run_notification``/``run_stop``.
 
@@ -913,6 +916,9 @@ def _run_status_refresh_and_retitle(
     shared withhold/refresh/bind/question/write block; do not give a lane its
     own copy. The pid pointer is stamped on every event. Returns the OSC
     retitle for *status*.
+
+    *self_exit* (Stop only) is evaluated on an owner event, the event that may
+    bind; its stamp rides the one write and its action follows the pointer.
 
     See ``docs/session-hook-ownership.md`` §One read, one decision, one write
     and §The launch window.
@@ -941,15 +947,26 @@ def _run_status_refresh_and_retitle(
     record = session_registry.apply_refresh(
         slug, prior, status=None if in_launch_window else status
     )
-    # Status, question and binding land in one body. A withheld event never
-    # binds, nor does an adopted-but-unproven one (may_bind False).
-    if not in_launch_window and may_bind:
+    # Status, question, binding and the self-exit stamp land in one body. A
+    # withheld event never acts as the owner, nor does an adopted-but-unproven
+    # one (may_bind False).
+    owner_event = not in_launch_window and may_bind
+    if owner_event:
         _bind_claude_session_id(record, hook_input, probes=probes)
     if question is not None and not in_launch_window:
         record.question = question
+    evaluation = (
+        self_exit.evaluate(record, hook_input, owner_pid=probes.owning_claude_pid(), root=root)
+        if self_exit is not None and owner_event
+        else None
+    )
+    if evaluation is not None:
+        evaluation.stamp(record)
     # Unconditional: the heartbeat is owed on every event, a withheld one too.
     session_registry.write_record(record, root=root)
     _stamp_session_pointer(record, probes, root)
+    if self_exit is not None:
+        self_exit.enact(evaluation, record, root)
     identity_env = _own_identity_env(env, resolution)
     identity = resolve_hook_identity(hook_input, identity_env)
     title = hook_display_title(identity, identity_env, record)
@@ -986,16 +1003,24 @@ def run_stop(
     root: Path | str | None = None,
     *,
     process_tree: ProcessTree | None = None,
+    self_exit: SelfExit | None = None,
 ) -> str:
     """Stop hook handler: status -> IDLE, return its OSC retitle.
 
     Resolves the record through the ownership check (task 4193): a nested
     inheritor finishing its turn can no longer idle the spawning session
     mid-turn. *process_tree* is the tree this event's ownership probes
-    read; None reads the live one (see ``ProcessTree``).
+    read; None reads the live one (see ``ProcessTree``). *self_exit* is the
+    opt-in self-exit decision; None uses ``SelfExit()``, which signals with
+    the live ``os.kill``.
     """
     return _run_status_refresh_and_retitle(
-        hook_input, env, root, session_registry.Status.IDLE, process_tree=process_tree
+        hook_input,
+        env,
+        root,
+        session_registry.Status.IDLE,
+        process_tree=process_tree,
+        self_exit=SelfExit() if self_exit is None else self_exit,
     )
 
 

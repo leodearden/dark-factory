@@ -3210,7 +3210,7 @@ def _parse_session_id(env: Mapping[str, str]) -> str | None:
     return session_id if _SESSION_ID_RE.fullmatch(session_id) else None
 
 
-def _is_shared_session_host(pid: int) -> bool:
+def is_shared_session_host(pid: int) -> bool:
     """Whether *pid* is a ``claude agents`` process hosting several sessions.
 
     The one home of the rule that a pid hosting several sessions cannot vouch
@@ -3233,7 +3233,7 @@ class SessionIdentity:
     claude_pid: ``$CLAUDE_PID`` parsed, or None when unusable.
     session_id: ``$CLAUDE_CODE_SESSION_ID`` parsed, or None when unusable.
     shared_host: whether *claude_pid* is a shared ``claude agents`` host
-        (_is_shared_session_host), so that pid does not die with this session.
+        (is_shared_session_host), so that pid does not die with this session.
     """
 
     claude_pid: int | None
@@ -3267,7 +3267,7 @@ def resolve_session_identity(env: Mapping[str, str] | None = None) -> SessionIde
     return SessionIdentity(
         claude_pid=claude_pid,
         session_id=_parse_session_id(env),
-        shared_host=claude_pid is not None and _is_shared_session_host(claude_pid),
+        shared_host=claude_pid is not None and is_shared_session_host(claude_pid),
     )
 
 
@@ -3817,11 +3817,11 @@ def _read_lease_holder_state(
 def _lease_is_stale(holder: LeaseHolder | None, *, holder_alive: bool, age_secs: float) -> bool:
     """Whether a lease is reapable: heartbeat past LEASE_HEARTBEAT_TTL and no pid vouching for it.
 
-    A running shared-host pid cannot vouch for its session (see _is_shared_session_host).
+    A running shared-host pid cannot vouch for its session (see is_shared_session_host).
     """
     if age_secs <= LEASE_HEARTBEAT_TTL.total_seconds():
         return False
-    return holder is None or not holder_alive or _is_shared_session_host(holder.pid)
+    return holder is None or not holder_alive or is_shared_session_host(holder.pid)
 
 
 def claim_lease(
