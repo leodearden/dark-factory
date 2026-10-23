@@ -114,6 +114,34 @@ class TestCompareBaselineFiles:
         assert metrics.compare_baseline_files(previous, current)
         assert metrics.compare_baseline_files(current, previous) == []
 
+    @pytest.mark.parametrize(
+        'mutate',
+        [
+            pytest.param(
+                lambda report: report['files']['a.py'].__setitem__('lines', 1005),
+                id='lines',
+            ),
+            pytest.param(
+                lambda report: report['files']['a.py'].__setitem__('prose_lines', 460),
+                id='prose_lines',
+            ),
+            pytest.param(
+                lambda report: report['files'].__setitem__(
+                    'new.py', blank_file_entry(lines=1500, prose_lines=700)
+                ),
+                id='new-path-at-the-ceiling',
+            ),
+        ],
+    )
+    def test_a_size_only_move_between_images_raises_nothing(
+        self, tmp_path: Path, mutate
+    ) -> None:
+        # PRD plans/review-all-s25-scripts-instruments-prd.md D10: size is
+        # measured and stored, never ratcheted, per path or in the total.
+        previous, current = self._pair(tmp_path, mutate)
+
+        assert metrics.compare_baseline_files(previous, current) == []
+
     def test_a_new_oversized_path_breaches_the_ceiling(self, tmp_path: Path) -> None:
         # Proves ``_check_ceilings`` is reached, not just the four rise arms: a
         # path ABSENT from the previous image is held to the ceiling, so writing
@@ -345,6 +373,19 @@ class TestCompareMergedBaselineFiles:
             ours=None,
             theirs=theirs,
         )
+
+    def test_a_size_only_excess_over_the_bound_raises_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
+
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1100)),
+            base=seed,
+            ours=seed,
+            theirs=theirs,
+        ) == []
 
     def test_a_name_set_both_sides_moved_is_bounded_by_the_side_naming_more(
         self, tmp_path: Path

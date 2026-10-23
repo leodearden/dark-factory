@@ -68,6 +68,11 @@ def _lower_cognitive(report: dict) -> None:
     report['files']['a.py']['cognitive'] = 115
 
 
+def _grow_a_py_size(report: dict) -> None:
+    """a.py 1000 -> 1005 lines and 400 -> 410 prose, and nothing structural."""
+    report['files']['a.py'].update(lines=1005, prose_lines=410)
+
+
 def _with_a_py_cognitive(cognitive: int) -> dict:
     """The seed report with a.py's `cognitive` at *cognitive* (the seed holds 120)."""
     return _report_with(
@@ -570,26 +575,6 @@ class TestRestoreCarveOut:
         # gate simply failing to notice: a reviewer can go look at it.
         assert absorbed in (result.stdout + result.stderr)
 
-    def test_the_ports_incident_is_refused_naming_both_measures(
-        self, tmp_path: Path
-    ) -> None:
-        repo, _absorbed, _high = self._history_with_a_revert(tmp_path)
-        raised = _incident_report()
-        _ports_rise(raised)
-        repo.write_baseline(raised)
-        repo.stage(metrics.BASELINE_RELPATH)
-
-        result = repo.gate()
-
-        # A blob never recorded at this path, with an empty ledger: the
-        # 0b04534c7b case, which reached main unexamined.
-        assert result.returncode == 1, result.stdout + result.stderr
-        message = result.stderr
-        assert _PORTS in message
-        assert 'lines' in message and 'prose_lines' in message
-        assert '255' in message and '274' in message
-        assert '47' in message and '59' in message
-
     def test_a_blob_one_byte_off_the_historical_one_is_refused(
         self, tmp_path: Path
     ) -> None:
@@ -650,6 +635,58 @@ class TestRestoreCarveOut:
 
         assert result.returncode == 0, result.stderr
         assert result.stdout == '' and result.stderr == ''
+
+
+class TestSizeOnlyMovesPassTheGate:
+    """Size is measured and stored, never ratcheted, so it never needs authorizing.
+
+    PRD plans/review-all-s25-scripts-instruments-prd.md D10. The gate delegates
+    every comparison to the instrument, so these pin that the commit-time face
+    inherited the change rather than keeping a size rule of its own.
+    """
+
+    @staticmethod
+    def _with_a_py_lines(lines: int) -> dict:
+        return _report_with(lambda report: report['files']['a.py'].__setitem__('lines', lines))
+
+    def test_the_ports_incident_shape_is_no_longer_a_raise(self, tmp_path: Path) -> None:
+        # The 0b04534c7b shape: lines and prose up, nothing structural.
+        repo = _Repo.seeded(tmp_path, report=_incident_report())
+        raised = _incident_report()
+        _ports_rise(raised)
+        repo.write_baseline(raised)
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stderr == ''
+
+    def test_a_structural_rise_beside_a_size_rise_is_refused_naming_only_it(
+        self, tmp_path: Path
+    ) -> None:
+        def grow_and_import(report: dict) -> None:
+            _grow_a_py_size(report)
+            report['files']['a.py']['function_local_imports'] = 4
+
+        repo = _Repo.seeded(tmp_path)
+        repo.write_baseline(_report_with(grow_and_import))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'function_local_imports rose 3 -> 4' in result.stderr
+        assert 'lines rose' not in result.stderr
+
+    def test_a_size_only_excess_over_both_parents_passes(self, tmp_path: Path) -> None:
+        repo = _Repo.mid_merge(tmp_path, theirs=self._with_a_py_lines(1005))
+        repo.write_baseline(self._with_a_py_lines(1009))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stdout + result.stderr
 
 
 class TestLedgerIsAppendOnlyAtTheGate:
@@ -1185,6 +1222,18 @@ class TestTheHookActuallyRunsTheGate:
         result = repo.attempt_commit('authorize a net-additive raise')
 
         assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_a_size_only_rise_commits_on_a_task_branch(self, tmp_path: Path) -> None:
+        repo = _hook_repo(tmp_path)
+        before = repo.git('rev-parse', 'HEAD')
+        repo.write_baseline(_report_with(_grow_a_py_size))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.attempt_commit('grow a.py without growing its structure')
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert repo.git('rev-parse', 'HEAD') != before
+        assert not (repo.root / metrics.LEDGER_DIR_RELPATH).exists()
 
     def test_an_unrelated_commit_never_spawns_the_auditor(
         self, tmp_path: Path

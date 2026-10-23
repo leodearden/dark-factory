@@ -1491,6 +1491,21 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         assert written.record is None
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
 
+    def test_a_size_only_rise_is_written_without_authorization(
+        self, tmp_path: Path
+    ) -> None:
+        target = self._seeded(tmp_path)
+        ledger = tmp_path / 'raises'
+        current = copy.deepcopy(_ratchet_baseline())
+        _grow_mq_size(current)
+        current['files'][self._NEW_PATH] = blank_file_entry(lines=1400, prose_lines=600)
+
+        written = metrics.write_baseline(target, current, ledger=ledger)
+
+        assert written.record is None
+        assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
+        assert not ledger.exists()
+
     def test_a_recorded_raise_authorizes_no_later_one(self, tmp_path: Path) -> None:
         # THE BYPASS THE DESIGN EXISTS TO CLOSE: pre-write a record, then
         # regenerate. Authorization is the ACT of passing the flags, never a
@@ -1588,29 +1603,18 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         ]
         assert [v.key for v in breaches] == [f'{_MQ}::brand_new']
 
-    def test_a_new_file_exactly_at_the_line_ceiling_is_no_ceiling_breach(
+    def test_a_new_file_exactly_at_the_line_ceiling_is_written_without_authorization(
         self, tmp_path: Path
     ) -> None:
         # A ceiling is a ceiling, not a floor -- mirrors
         # TestCeilingsApplyOnlyToNewKeys::test_a_new_file_exactly_at_the_line_ceiling_is_allowed.
-        #
-        # It is asserted as "no ceiling violation" rather than "the write
-        # succeeds" because it cannot be the latter: 1,500 new lines raise
-        # total:lines by 1,500, so this write is refused by the TOTALS arm
-        # whatever the ceiling says. Contriving the fixture to net the totals to
-        # zero would only hide which arm fired.
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
         current['files'][self._NEW_PATH] = blank_file_entry(
             lines=metrics.FILE_LINE_CEILING
         )
 
-        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
-            metrics.write_baseline(target, current)
-
-        assert 'new_file_over_ceiling' not in {
-            v.measure for v in excinfo.value.violations
-        }
+        assert metrics.write_baseline(target, current).record is None
 
     def test_the_git_ops_size_exemption_holds_on_the_write_path(
         self, tmp_path: Path
@@ -1759,6 +1763,21 @@ class TestAuthorizedRaise:
         }
         assert all(row['key'] == metrics.CLUSTER_TOTAL_KEY for row in totals)
         assert {row['key'] for row in measures} >= {_MQ, _VERIFIER_LOOP}
+
+    def test_a_size_rise_riding_with_an_authorized_raise_is_not_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        target, ledger = self._seeded(tmp_path)
+        current = self._raised()
+        _grow_mq_size(current)
+
+        metrics.write_baseline(
+            target, current, authorization=self._authorization(), ledger=ledger
+        )
+
+        recorded = {row['measure'] for row in metrics.load_ledger(ledger)[0]['measures']}
+        assert not recorded & {'lines', 'prose_lines', 'total:lines', 'total:prose_lines'}
+        assert {'cognitive', 'function_local_imports'} <= recorded
 
     @pytest.mark.parametrize(
         ('task_id', 'reason', 'field'),
@@ -2045,14 +2064,18 @@ def _add_file(measure: str):
     return mutate
 
 
+def _grow_mq_size(current: dict) -> None:
+    """The real task-5342 size shape: worker.py 103 lines and 50 prose lines longer."""
+    current['files'][_MQ]['lines'] += 103
+    current['files'][_MQ]['prose_lines'] += 50
+
+
 #: (test id, mutation, expected violation measure, expected violation key).
-#: THE SEEDED-FIXTURE SELF-TEST (INV-10 tier 1): every ratcheted measure and
-#: every derived total gets its own +1, and the ratchet must EXECUTE to a named
-#: violation for it. A measure missing from this table is a measure nothing
-#: proves is actually compared.
+#: THE SEEDED-FIXTURE SELF-TEST (INV-10 tier 1): every RATCHETED measure and
+#: every derived total of one gets its own +1, and the ratchet must EXECUTE to a
+#: named violation for it. A measure missing from this table is a measure
+#: nothing proves is actually compared.
 _SEEDS = [
-    ('files.lines', _bump_file('lines'), 'lines', _MQ),
-    ('files.prose_lines', _bump_file('prose_lines'), 'prose_lines', _MQ),
     ('files.cognitive', _bump_file('cognitive'), 'cognitive', _MQ),
     (
         'files.function_local_imports',
@@ -2082,13 +2105,6 @@ _SEEDS = [
         lambda cur: cur['tests'][_TEST_FILE]['patch_targets'].append('_new_leaf'),
         'patch_targets',
         _TEST_FILE,
-    ),
-    ('total.lines', _add_file('lines'), 'total:lines', metrics.CLUSTER_TOTAL_KEY),
-    (
-        'total.prose_lines',
-        _add_file('prose_lines'),
-        'total:prose_lines',
-        metrics.CLUSTER_TOTAL_KEY,
     ),
     (
         'total.cognitive',
@@ -2128,6 +2144,17 @@ _SEEDS = [
     ),
 ]
 
+#: (test id, mutation): a rise in a SIZE measure alone, per path and in the
+#: derived total. Size is measured and reported, never ratcheted (PRD
+#: plans/review-all-s25-scripts-instruments-prd.md D10).
+_SIZE_ONLY_SEEDS = [
+    ('files.lines', _bump_file('lines')),
+    ('files.prose_lines', _bump_file('prose_lines')),
+    ('total.lines', _add_file('lines')),
+    ('total.prose_lines', _add_file('prose_lines')),
+    ('files.task_5342_shape', _grow_mq_size),
+]
+
 
 class TestCheckAgainstBaseline:
     @pytest.mark.parametrize(
@@ -2152,6 +2179,29 @@ class TestCheckAgainstBaseline:
         # is firing on a measure nobody touched.
         others = [v for v in violations if v is not matching[0]]
         assert all(v.measure == f'total:{measure}' for v in others), others
+
+    @pytest.mark.parametrize(
+        'mutate', [pytest.param(m, id=name) for name, m in _SIZE_ONLY_SEEDS]
+    )
+    def test_a_rise_in_a_size_measure_alone_is_no_violation(self, mutate) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        mutate(current)
+
+        assert metrics.check_against_baseline(current, baseline) == []
+
+    def test_a_structural_rise_beside_a_size_rise_is_reported_alone(self) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        _grow_mq_size(current)
+        current['files'][_MQ]['function_local_imports'] += 1
+
+        violations = metrics.check_against_baseline(current, baseline)
+
+        assert [(v.measure, v.key, v.baseline, v.current) for v in violations] == [
+            ('function_local_imports', _MQ, 12, 13),
+            ('total:function_local_imports', metrics.CLUSTER_TOTAL_KEY, 17, 18),
+        ]
 
     def test_an_identical_current_is_clean(self) -> None:
         baseline = _ratchet_baseline()
@@ -2409,6 +2459,23 @@ class TestReportCli:
         assert str(totals['cognitive']) in out
         assert str(totals['lines']) in out
 
+    def test_report_still_prints_both_size_columns_and_totals(
+        self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Size leaves the RATCHET, never the report: --report is where a reader
+        # still sees how big each file is.
+        assert metrics.main(['--report']) == 0
+        rows = capsys.readouterr().out.splitlines()
+        totals = metrics.derive_totals(stub_measurement)
+
+        header = next(row for row in rows if row.startswith('path ')).split()
+        assert header[1:3] == ['lines', 'prose']
+        totals_row = next(row for row in rows if row.startswith('TOTALS ')).split()
+        assert totals_row[1:3] == [str(totals['lines']), str(totals['prose_lines'])]
+        for path, entry in stub_measurement['files'].items():
+            row = next(row for row in rows if row.startswith(f'{path} ')).split()
+            assert row[1] == str(entry['lines']), path
+
     def test_report_carries_the_test_suite_measures(
         self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -2495,6 +2562,19 @@ class TestCheckCli:
         err = capsys.readouterr().err
         assert _MQ in err
         assert 'cognitive' in err
+
+    def test_check_passes_a_tree_whose_size_alone_rose(
+        self, stub_measurement: dict, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        doctored = copy.deepcopy(stub_measurement)
+        doctored['files'][_MQ]['lines'] -= 10
+        doctored['files'][_MQ]['prose_lines'] -= 10
+        baseline = tmp_path / 'baseline.json'
+        metrics.write_baseline(baseline, doctored)
+
+        assert metrics.main(['--check', '--baseline', str(baseline)]) == 0
+        assert capsys.readouterr().err == ''
 
     def test_check_resolves_its_defaults_and_exits_clean(
         self, stub_measurement: dict, no_private_tree_scan: None,
