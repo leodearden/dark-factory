@@ -615,3 +615,60 @@ class TestReportStuckRequests:
 
         self._sweep(ledger, _T0 + 2500, escalation_queue=eq, pipeline_phases=recording_phases)
         assert len(lookups) == 1, 'the episode already alarmed and the next tier is not due'
+
+    async def test_one_final_alarm_fires_past_the_last_ladder_multiple(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        ledger, req = self._armed('rs8')
+        eq = _FakeEscalationQueue(open_l1=False)  # every prior alarm already closed
+        es = _FakeEventStore()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            self._sweep(ledger, _T0 + 1500, escalation_queue=eq, event_store=es)
+            self._sweep(ledger, _T0 + 2999, escalation_queue=eq, event_store=es)
+            assert len(eq.submitted) == 1
+
+            self._sweep(ledger, _T0 + 3001, escalation_queue=eq, event_store=es)
+            assert len(eq.submitted) == 2
+            assert len(_stuck_warnings(caplog)) == 2, caplog.text
+            final = eq.submitted[1]
+            assert [d['alarm_number'] for d in _escalation_created_data(es)] == [1, 2]
+            assert '2 of 2' in final.detail
+            assert req.request_id in final.summary
+            assert req.branch.bare_id in final.summary
+
+            self._sweep(ledger, _T0 + 10_000, escalation_queue=eq, event_store=es)
+            self._sweep(ledger, _T0 + 100_000, escalation_queue=eq, event_store=es)
+
+        assert len(eq.submitted) == 2
+        assert len(_stuck_warnings(caplog)) == 2, caplog.text
+
+    async def test_an_open_l1_at_the_final_tier_consumes_it(self) -> None:
+        ledger, _req = self._armed('rs9')
+        eq = _FakeEscalationQueue(open_l1=False)
+
+        self._sweep(ledger, _T0 + 1500, escalation_queue=eq)
+        assert len(eq.submitted) == 1
+        eq.open_it()  # the human has not closed the first alarm
+
+        self._sweep(ledger, _T0 + 3001, escalation_queue=eq)
+        assert len(eq.submitted) == 1
+
+        eq.close_it()
+        self._sweep(ledger, _T0 + 5000, escalation_queue=eq)
+        assert len(eq.submitted) == 1, 'the ladder is spent; a close does not re-fire it'
+
+    async def test_a_spent_ladder_rearms_on_a_new_dequeue_generation(self) -> None:
+        ledger, req = self._armed('rs10')
+        eq = _FakeEscalationQueue(open_l1=False)
+        es = _FakeEventStore()
+
+        self._sweep(ledger, _T0 + 1500, escalation_queue=eq, event_store=es)
+        self._sweep(ledger, _T0 + 3001, escalation_queue=eq, event_store=es)
+        ledger.on_requeued(req.request_id)
+        t2 = _T0 + 10_000
+        ledger.on_dequeue(req, now=t2)
+
+        self._sweep(ledger, t2 + 1500, escalation_queue=eq, event_store=es)
+
+        assert [d['alarm_number'] for d in _escalation_created_data(es)] == [1, 2, 1]
