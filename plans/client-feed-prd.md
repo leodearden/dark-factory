@@ -568,9 +568,13 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     In one pass the ends come first, then the re-emits, then the inbox's answers in inbox order.
   - (g) The revealed set's only home is `state.revealed` (path, commit, lines), folded from
     `file_revealed` (`client-feed/src/client_feed/fold.py::_apply_file_revealed`). `cursor.json`
-    holds `reveals_head` and `inbox_offset`, and no per-path blob shas
-    (`client-feed/src/client_feed/feed_io.py::Cursor`). Both move only when the reveal unit runs and
-    succeeds; an inbox read holding no request moves its offset alone
+    holds `reveals_head`, `inbox_offset` and `added_line_counts`, and no per-path blob shas
+    (`client-feed/src/client_feed/feed_io.py::Cursor`). `added_line_counts` caches (b)'s counted
+    added lines by old then new blob sha, valid only under the `max_line_bytes` they were counted
+    with, as `line_counts` does for whole blobs. A pair already counted is not diffed again, and
+    only the pairs of the latest count are kept
+    (`client-feed/src/client_feed/budget.py::AddedLineCounts`). All three move only when the reveal
+    unit runs and succeeds; an inbox read holding no request moves its offset alone
     (`client-feed/src/client_feed/publisher.py::_advanced`). After a crash between the append and
     the cursor, an answer whose identity (what it says, without its envelope) is in the uncommitted
     tail is consumed there and not emitted again
