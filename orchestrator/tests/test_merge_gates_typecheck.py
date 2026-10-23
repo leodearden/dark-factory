@@ -158,3 +158,30 @@ async def test_a_timed_out_type_check_is_not_retried(
 
     assert (trace / 'runs').read_text().splitlines() == ['run']
     assert result.timed_out_subprojects == ['pkg']
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_subproject_does_not_hide_a_later_failure(
+    tmp_path: Path, worktree: Path,
+) -> None:
+    modules = [_module('slow', type_cmd=_HANG), _module('red', type_cmd='exit 1')]
+
+    result = await _typecheck(
+        worktree, _impatient(tmp_path), modules, block_on_timeout=False,
+    )
+
+    assert result.timed_out_subprojects == ['slow']
+    assert result.failing_subprojects == ['red']
+
+
+@pytest.mark.asyncio
+async def test_a_silent_failing_type_check_still_carries_a_detail(
+    tmp_path: Path, worktree: Path,
+) -> None:
+    result = await _typecheck(
+        worktree, _config(tmp_path), [_module('pkg', type_cmd='exit 3')],
+        block_on_timeout=True,
+    )
+
+    assert result.failing_subprojects == ['pkg']
+    assert result.detail.strip() != ''
