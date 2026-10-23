@@ -89,9 +89,11 @@ const NARROWED_POLL_URLS = Object.freeze({
 
 // Keys fetched on a USER ACTION rather than by the poll loop, each parameterised
 // by the one value its caller already holds. Two declared rows today:
-// `terminal`, through which tab_tasks.jsx fetches `?terminal=<project>`, and
-// `taskProse`, the Task Detail pane's description/details for the selected
-// task, addressed by the row's own uid (`<project>/T-<id>`).
+// `terminal`, through which tab_tasks.jsx and, via
+// task_snapshot.js::createTerminalWindowHooks, tabs.jsx::OrchTab fetch
+// `?terminal=<project>`, and `taskProse`, the Task Detail pane's
+// description/details for the selected task, addressed by the row's own uid
+// (`<project>/T-<id>`).
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
 // one at a call site — a caller holds the parameter and asks for the row, so
@@ -602,11 +604,11 @@ function publishReceipt(stateKey, receipt) {
 // runs.
 //
 // THE POLL LOOP IGNORES THIS, and that is correct — the next tick retries, so
-// there is nothing for it to decide. It exists for a USER ACTION: tab_tasks.jsx,
-// which requests a project's terminal window, has to tell "here are the rows"
-// from "the server said no" from "we did not even ask", and datumFor(key)
-// reports the same pre-request unknown Datum in all three cases, so it reads
-// onDemandDatum instead.
+// there is nothing for it to decide. It exists for a USER ACTION: tab_tasks.jsx
+// and task_snapshot.js::createTerminalWindowHooks, which request a project's
+// terminal window, have to tell "here are the rows" from "the server said no"
+// from "we did not even ask", and datumFor(key) reports the same pre-request
+// unknown Datum in all three cases, so they read onDemandDatum instead.
 const REFRESH_OUTCOMES = Object.freeze({
   applied: 'applied',
   failed: 'failed',
