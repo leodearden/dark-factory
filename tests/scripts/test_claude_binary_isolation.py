@@ -72,6 +72,7 @@ def test_without_the_binding_the_ambient_value_does_reach_a_test_body(
     result = run_nested_pytest(tmp_path / 'unbound', {'test_probe.py': _UNSCRUBBED_TEST})
 
     assert result.returncode == 0, _output(result)
+    assert '1 passed' in _output(result), _output(result)
 
 
 def test_the_scrub_is_autouse_and_function_scoped() -> None:

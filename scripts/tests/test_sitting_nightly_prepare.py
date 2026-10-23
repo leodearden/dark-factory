@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -18,7 +17,7 @@ from pathlib import Path
 
 import pytest
 from legibility import account_pool
-from shared.cli_invoke import build_claude_argv
+from shared.cli_invoke import build_claude_argv, resolve_claude_binary
 from shared.usage_gate import AccountLease
 from sitting import nightly_prepare as mod
 from sitting import prepare_sitting
@@ -204,7 +203,7 @@ def _strip_claude_from_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     empty_bin = tmp_path / 'empty-bin'
     empty_bin.mkdir()
     monkeypatch.setenv('PATH', f'{empty_bin}{os.pathsep}/usr/bin')
-    assert shutil.which('claude') is None, 'the premise: no claude on PATH'
+    assert resolve_claude_binary() is None, 'the premise: no claude is reachable'
 
 
 # ---------------------------------------------------------------------------

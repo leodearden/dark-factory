@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _usage_gate_test_helpers import spawn_fault as _spawn_fault
 
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import AgentResult, resolve_claude_binary
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import (
     CAP_HIT_PREFIXES,
@@ -705,7 +704,7 @@ def _strip_claude_from_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     empty_bin = tmp_path / 'empty-bin'
     empty_bin.mkdir()
     monkeypatch.setenv('PATH', f'{empty_bin}{os.pathsep}/usr/bin')
-    assert shutil.which('claude') is None, 'the premise: no claude on PATH'
+    assert resolve_claude_binary() is None, 'the premise: no claude is reachable'
 
 
 def _recording_fake_claude(tmp_path: Path) -> tuple[Path, Path]:
@@ -728,7 +727,7 @@ def _recording_fake_claude(tmp_path: Path) -> tuple[Path, Path]:
 
 @pytest.mark.asyncio
 class TestRunProbe:
-    """Tests for _run_probe — mock asyncio.create_subprocess_exec."""
+    """Tests for _run_probe — mostly a mocked create_subprocess_exec; the CLAUDE_BINARY tests spawn a real recording fake."""
 
     async def _make_probing_gate(self) -> tuple[UsageGate, AccountState]:
         gate = make_gate(['a'])
