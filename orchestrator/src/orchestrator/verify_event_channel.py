@@ -58,8 +58,8 @@ class VerifyEventChannel:
     skipped_lines: int = 0
 
     def failed_run_all_members(self) -> list[str] | None:
-        """C3 rule 3: None = absent (the text parse governs); [] = full suite."""
-        if not self.present:
+        """C3 rule 3: None = no run_all reported here (the text parse governs); [] = full suite."""
+        if not self.present or not (self.run_starts or self.run_finishes):
             return None
         if len(self.run_finishes) != self.run_starts:
             return []
@@ -146,10 +146,8 @@ class VerifyEventLog:
     verify_id: str
 
     def export_into(self, env: Mapping[str, str]) -> dict[str, str]:
-        exported = {key: value for key, value in env.items() if key != VERIFY_EVENT_LOG_ENV}
-        if self.path is not None:
-            exported[VERIFY_EVENT_LOG_ENV] = str(self.path)
-        return exported
+        """``env`` naming this channel; with no path, an empty value masks any ambient one."""
+        return {**env, VERIFY_EVENT_LOG_ENV: '' if self.path is None else str(self.path)}
 
     def read(self) -> VerifyEventChannel:
         if self.path is None:
@@ -157,7 +155,7 @@ class VerifyEventLog:
         channel = read_verify_event_channel(self.path, verify_id=self.verify_id)
         if not channel.present:
             logger.warning(
-                'verify event channel %s lost its channel_open header; '
+                'verify event channel %s is not present after the leg; '
                 'classifying this leg from its text alone', self.path,
             )
         return channel
@@ -192,13 +190,14 @@ def allocate_verify_event_log(
     with no channel (C3 rule 2) rather than failing.
     """
     verify_id = uuid.uuid4().hex
+    path: Path | None
     try:
         path = _create_with_header(role=role, verify_id=verify_id, directory=directory)
     except OSError as exc:
         logger.warning('could not allocate a verify event channel; running without one: %s', exc)
-        yield VerifyEventLog(None, verify_id)
-        return
+        path = None
     try:
         yield VerifyEventLog(path, verify_id)
     finally:
-        _remove(path)
+        if path is not None:
+            _remove(path)

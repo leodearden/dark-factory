@@ -4661,8 +4661,8 @@ class VerifyResult:
     # `[]` = "no failing legs" (a pass), which is likewise not a licence.
     failing_leg_categories: list[str] | None = None
     # Task 6856: the TEST leg channel's C3 rule-3 failed run_all members. None =
-    # channel absent, so the text parse governs; [] = the channel cannot vouch
-    # for a complete set, i.e. the full suite.
+    # the channel is absent or no run_all reported into it, so the text parse
+    # governs; [] = the channel cannot vouch for a complete set, i.e. the full suite.
     run_all_failed_members: list[str] | None = None
     # Task 5357: True iff the TEST leg ran and exited non-zero. `lint_output` and
     # `type_output` are blanked on a passing leg at construction but

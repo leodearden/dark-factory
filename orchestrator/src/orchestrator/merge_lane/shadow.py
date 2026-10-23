@@ -548,9 +548,9 @@ def parse_failed_run_all_members(test_output: str) -> list[str]:
 def select_failed_run_all_members(
     test_output: str, channel_members: Sequence[str] | None,
 ) -> list[str]:
-    """C3 rule 3: the verify event channel's failed set
-    (``VerifyResult.run_all_failed_members``) when the channel was present, else
-    the text marker parse (rule 2). ``[]`` means the full run_all suite.
+    """C3 rule 3: the channel's failed set (``VerifyResult.run_all_failed_members``)
+    when a run_all reported into a present channel, else the text marker parse
+    (rule 2). ``[]`` means the full run_all suite.
     """
     if channel_members is not None:
         return list(channel_members)

@@ -10,6 +10,7 @@ Every present channel is composed the way production writes it: DF's own
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -107,12 +108,12 @@ def test_header_plus_captured_run_all_channel_is_present(producer: str) -> None:
 # (c) task-role shape: the header alone makes the channel present -----------
 
 
-def test_header_alone_is_present_with_no_run() -> None:
+def test_header_alone_is_present_but_names_no_run_all_members() -> None:
     channel = parse(header('V'))
 
     assert channel.present is True
     assert channel.run_starts == 0
-    assert channel.failed_run_all_members() == []
+    assert channel.failed_run_all_members() is None
 
 
 def test_header_plus_slot_record_without_run_start_counts_the_timeout() -> None:
@@ -262,6 +263,7 @@ def test_slot_timeout_without_exact_disposition_counts_in_neither(
         pytest.param(run_start() + run_finish(failed='x.sh'), id='failed-not-a-list'),
         pytest.param(run_start() + run_finish(failed=['x.sh', 3]), id='failed-not-all-str'),
         pytest.param(run_start(), id='run-start-without-finish'),
+        pytest.param(run_finish(), id='run-finish-without-start'),
         pytest.param(run_start() + run_start() + run_finish(), id='two-starts-one-finish'),
     ],
 )
@@ -309,7 +311,7 @@ def test_allocated_log_holds_only_this_verifys_header_and_is_removed_after(
         channel = log.read()
         assert channel.present is True
         assert channel.run_starts == 0
-        assert channel.failed_run_all_members() == []
+        assert channel.failed_run_all_members() is None
 
         base = {'A': '1'}
         exported = log.export_into(base)
@@ -373,11 +375,26 @@ def test_allocated_header_carries_the_role(tmp_path: Path) -> None:
         assert json.loads(log.path.read_bytes())['role'] == 'merge'
 
 
-def test_failed_allocation_fails_open_to_no_channel(tmp_path: Path) -> None:
+def test_failed_allocation_fails_open_to_a_masked_channel(tmp_path: Path) -> None:
     with allocate_verify_event_log(role='task', directory=tmp_path / 'missing') as log:
         assert log.path is None
-        assert log.export_into({VERIFY_EVENT_LOG_ENV: '/tmp/x', 'A': '1'}) == {'A': '1'}
+        assert log.export_into({VERIFY_EVENT_LOG_ENV: '/tmp/x', 'A': '1'}) == {
+            'A': '1', VERIFY_EVENT_LOG_ENV: '',
+        }
         assert log.read().present is False
+
+
+def test_failed_allocation_runs_the_leg_with_no_exception_in_flight(tmp_path: Path) -> None:
+    with (
+        pytest.raises(RuntimeError, match='leg failed') as raised,
+        allocate_verify_event_log(role='task', directory=tmp_path / 'missing') as log,
+    ):
+        assert log.path is None
+        in_flight = sys.exc_info()
+        raise RuntimeError('leg failed')
+
+    assert in_flight == (None, None, None)
+    assert raised.value.__context__ is None
 
 
 # classify_failure: C3 rule 4 (present channel decides SEMAPHORE_TIMEOUT) and

@@ -17,7 +17,7 @@ from typing import Literal
 import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.verify import VerifyResult, _aggregate_results, run_verification
+from orchestrator.verify import VerifyResult, run_full_verification, run_verification
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import ToolKind
@@ -57,17 +57,23 @@ def side_file(worktree: Path, name: str) -> tuple[str, dict[str, object] | None]
     return lines[0], first_record
 
 
-async def verify(
-    worktree: Path, *, lint: bool = False, role: Role = 'task',
-    verify_env: dict[str, str] | None = None,
-) -> VerifyResult:
-    config = OrchestratorConfig(
+def orchestrator_config(
+    worktree: Path, verify_env: dict[str, str] | None = None,
+) -> OrchestratorConfig:
+    return OrchestratorConfig(
         project_root=worktree,
         verify_admission_enabled=False,
         verify_use_cgroup_scope=False,
         verify_cold_preprovision_command='',
         verify_env=verify_env or {},
     )
+
+
+async def verify(
+    worktree: Path, *, lint: bool = False, role: Role = 'task',
+    verify_env: dict[str, str] | None = None,
+) -> VerifyResult:
+    config = orchestrator_config(worktree, verify_env)
     module = ModuleConfig(
         prefix='__fallback__',
         test_command='bash ./test_leg.sh',
@@ -120,7 +126,6 @@ async def test_task_role_sentinel_without_a_record_is_not_a_semaphore_timeout(
     result = await verify(tmp_path)
 
     assert result.category != FailureCategory.SEMAPHORE_TIMEOUT
-    assert result.run_all_failed_members == []
 
 
 @pytest.mark.asyncio
@@ -137,6 +142,19 @@ async def test_failed_allocation_falls_back_to_the_text_arms(
 
     assert result.category == FailureCategory.SEMAPHORE_TIMEOUT
     assert result.run_all_failed_members is None
+    assert side_file(tmp_path, 'channel.txt') == ('', None)
+
+
+@pytest.mark.asyncio
+async def test_failed_allocation_masks_an_ambient_channel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(VERIFY_EVENT_LOG_ENV, str(tmp_path / 'ambient.jsonl'))
+    write_leg(tmp_path, 'test_leg.sh', record_channel('channel.txt') + 'exit 0\n')
+    monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path / 'missing'))
+
+    await verify(tmp_path)
+
     assert side_file(tmp_path, 'channel.txt') == ('', None)
 
 
@@ -223,18 +241,42 @@ def test_a_payload_without_run_all_failed_members_reads_as_absent() -> None:
     assert result_from_dict(payload).run_all_failed_members is None
 
 
+RUN_ALL_FAILS = f'cat {POOL} >> "${VERIFY_EVENT_LOG_ENV}"\nexit 1\n'
+NO_RUN_ALL_FAILS = f'echo {shlex.quote(ORDINARY_FAILURE)}\nexit 1\n'
+
+
+async def verify_modules(worktree: Path, legs: dict[str, str]) -> VerifyResult:
+    for prefix, body in legs.items():
+        (worktree / prefix).mkdir()
+        (worktree / prefix / 'orchestrator.yaml').write_text(
+            f'test_command: bash ./{prefix}_leg.sh\n',
+        )
+        write_leg(worktree, f'{prefix}_leg.sh', body)
+    return await run_full_verification(worktree, orchestrator_config(worktree))
+
+
 @pytest.mark.parametrize(
-    ('children', 'expected'),
+    ('legs', 'expected'),
     [
-        pytest.param([None, None, None], None, id='no-child-carries-one'),
-        pytest.param([['a.sh'], None, None], ['a.sh'], id='exactly-one-child'),
-        pytest.param([[], None], [], id='one-child-refusing-to-narrow'),
-        pytest.param([['a.sh'], ['b.sh']], [], id='two-channels-are-ambiguous'),
+        pytest.param(
+            {'a': RUN_ALL_FAILS, 'b': NO_RUN_ALL_FAILS}, ['test_fail.sh'],
+            id='only-one-module-ran-run_all',
+        ),
+        pytest.param(
+            {'a': NO_RUN_ALL_FAILS, 'b': NO_RUN_ALL_FAILS}, None,
+            id='no-module-ran-run_all',
+        ),
+        pytest.param(
+            {'a': RUN_ALL_FAILS, 'b': RUN_ALL_FAILS}, [],
+            id='two-run_all-channels-are-ambiguous',
+        ),
     ],
 )
-def test_aggregate_run_all_failed_members(
-    children: list[list[str] | None], expected: list[str] | None,
+@pytest.mark.asyncio
+async def test_a_multi_module_verify_takes_run_all_members_from_the_module_that_ran_it(
+    tmp_path: Path, legs: dict[str, str], expected: list[str] | None,
 ) -> None:
-    aggregate = _aggregate_results([_bare_result(members) for members in children])
+    result = await verify_modules(tmp_path, legs)
 
-    assert aggregate.run_all_failed_members == expected
+    assert not result.passed
+    assert result.run_all_failed_members == expected
