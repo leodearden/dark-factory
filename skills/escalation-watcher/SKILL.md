@@ -277,6 +277,16 @@ After `lease-claim` returns `acquired` or `proceed`, and before the first brief:
    does not mention: is it new since, or missed? Pins and HOLDs go into the sitting as `standing`
    records with their release predicates (see "Investigate before you `record`"). Traps stay in
    mind for the session and carry into your own handover while they still hold.
+
+   A **handed-off B3 merge** in the In flight section (`{task_id, escalation_id, request_id,
+   worktree}`) has no live owner: any resume-mode run polling it ended with the predecessor. If
+   `get_escalation(escalation_id)` still shows the escalation `pending`, launch
+   `unblock-low-risk` in resume mode for it once, exactly as the `handed_off` bullet of B3
+   "Completion handling" does, and track the `task_id` as in flight from then on. This launch
+   replaces a resume the stop cut off; it is not a second resume. Do not run `b3_gate check` or
+   `record-launch` first: `check` reports `already_attempted` for this task, and skipping on that
+   verdict would leave a live merge unwatched. If the escalation is no longer pending, whoever
+   took it owns the merge: launch nothing, and never `merge_cancel` it.
 4. Open the first brief, posted unprompted at launch (see "When it runs"), with the reconciliation:
    what carried forward, what the handover missed, and each correction where live state refutes
    it.
@@ -303,7 +313,10 @@ Four steps, in this order:
    Note every background sub-agent, spawned session and merge request still in flight; they go
    into the handover's in-flight section. A B3 `unblock-low-risk` sub-agent cut off by the stop is
    not relaunched by a successor: its `record-launch` marker makes `check` report
-   `already_attempted`.
+   `already_attempted`. A handed-off B3 merge whose resume has not yet returned is different:
+   record its `{task_id, escalation_id, request_id, worktree}` in the In flight section, whether
+   or not a resume-mode run was still polling at the stop. Step 3 of "Reading the predecessor's
+   handover at launch" says what the successor does with it.
 2. **Write the handover** (see "The handover file (`l2-handover.md`)"). It goes before the release,
    so a successor that claims the freed lease finds it complete.
 3. **Release the lease** with the `lease-release` verb under "Heartbeat + release" in "Claiming the
@@ -666,6 +679,10 @@ carries the brief. Check "Always ask — keyed on record content" below first: i
    lease operation that stays forbidden.
 9. Launching a retain-and-tag, zero-deletion `/curate-fused-memories` sitting for consolidation
    gates (ratified 2026-09-25).
+10. Closing a `__stale_l0_strand_sweep__` record with `close_only` once each stranded note it
+    names has been recovered from `data/escalations/archive/<date>/` and routed: appended to a
+    `pending` owner task (line 5), or filed to the owner task of its class. The resolution names
+    where each note went (Leo, 2026-10-22, on scoping_intake's esc-__stale_l0_strand_sweep__-6).
 
 #### Always ask — keyed on record content
 
@@ -853,7 +870,7 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `dark_factory`/`df`/`dark-factory`, each invisible to a reap scoped to either of the others).
   - **Caveat — check your project's existing rows before trusting the declared token.** Folding
     merges spellings that differ only by case or separator; only an entry in
-    `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
+    `shared.project_id.PROJECT_ID_ALIASES` can bridge a project whose filed decisions fold to something *other*
     than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
     **solar-challenge is the known standing case**: its config declares `my_solar_challenge`, but
     its decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but
@@ -1100,8 +1117,8 @@ switches on and off. Three behavioural shifts:
    - Hold the task, choosing by the record's **severity**:
      - **Not `info`:** `resolve_issue(..., action='park')`. The task lands `blocked`, held under
        the open L2, because a pinning escalation vetoes the stranded-blocked sweep.
-     - **`info`:** never park. An info record never pins
-       (`escalation/src/escalation/pins.py::classify_pins`; intended, Leo 2026-10-09). The sweep
+     - **`info`:** never park; `resolve_issue` refuses it (`park_on_info`). An info record never
+       pins (`escalation/src/escalation/pins.py::classify_pins`; intended, Leo 2026-10-09). The sweep
        re-pends a parked task within a tick, as with esc-5708-3, reify esc-7881-5 and
        esc-4681-3 (16 s). Leave the escalation pending and **defer** the task:
        1. `set_task_status(id, status='deferred', deferral={'kind': 'until_condition',
@@ -1262,6 +1279,8 @@ serializes concurrent and restart races. Stash `{task_id, escalation_id, backgro
 your context. The escalation stays `pending` until the background sub-agent resolves it, so the
 *next* drain WILL re-find it — before the gate check for any task, check your context: if that
 `task_id` already has an in-flight or this-cycle-completed unblock-low-risk sub-agent, skip it.
+A task whose B3 run returned `handed_off` counts as in flight while its resume-mode run is
+outstanding.
 The durable rolling-24h merge cap is enforced by `b3_gate charge` inside the unblock-low-risk
 sub-agent immediately before its merge-submit — a charge refusal causes the sub-agent to ABORT.
 The watcher consults only `check`'s `cap_remaining` to skip launches that charge would refuse.
@@ -1321,7 +1340,28 @@ launch by `task_id` / background-task-id):
   mode; it waits for the human. If the abort reason indicates drift/staleness and the one-shot has
   not been used this cycle, route through the drift path once. Also file a DecisionRecord via
   `write-decision` carrying the abort reason as `--text` (see "Filing Parked Decisions to the
-  Cockpit Registry" below).
+  Cockpit Registry" below). A **resume-mode** `aborted` (see `handed_off` below) differs in two
+  ways. It never takes the drift path: the re-gate ends in `record-launch`, which can only report
+  `already_attempted` for this task. And when its reason is that the escalation is no longer
+  pending, write only the digest line and file no DecisionRecord: whoever took the escalation
+  owns it, and the merge carries on.
+- `outcome == "handed_off"`: neither a failure nor an abort. The merge `request_id` it returns
+  was picked up by the merge worker and is still live (merging or verifying); the sub-agent did
+  not cancel it, did not change the task status, and left the escalation pending. **Never
+  `merge_cancel` it**, and never submit another merge for that `task_id`: it is an in-flight
+  merge, so record its `{task_id, escalation_id, request_id}` per "Tracking in-flight merges". Launch
+  `unblock-low-risk` again as a NON-INTERACTIVE background sub-agent in **resume mode**, exactly
+  as B3 is launched above (`Agent` tool, general-purpose, `run_in_background: true`), pointing it
+  at the "Resuming a handed-off merge (resume mode)" subsection of
+  `skills/unblock-low-risk/SKILL.md` and passing `task_id`, `escalation_id`, `project_root`,
+  `worktree` and `request_id`. Do **not** run `b3_gate check` or `record-launch` for it: the slot
+  is already charged, and `check` would report `already_attempted`. Keep the `task_id` in flight
+  until that run completes; its completion is handled by this same list. **Resume once per B3
+  launch:** if a resume-mode run itself returns `handed_off` (its 3 h backstop expired with the
+  merge still live), do not resume again — leave the escalation pending, write the digest line,
+  and file a DecisionRecord via `write-decision` whose `--text` names the `request_id` and its
+  last state. Still never cancel. A resume-mode `merged` is handled by the `merged` bullet, and a
+  resume-mode `aborted` by the `aborted` bullet, including its resume-mode exceptions.
 
 The sub-agent re-checks the gate defensively and refuses anything not unambiguously low-risk; treat
 its abort as authoritative.
@@ -1343,12 +1383,16 @@ mode; AFK shift 3 manages it):
 - **Aborted**: `B3 <task_id> — aborted: <reason>`
 - **Drift-reinvestigated, second drift**: `B3 <task_id> — drift re-investigated; re-gate: drift-again → pending`
 - **Drift-reinvestigated, relaunched**: `B3 <task_id> — drift re-investigated; re-gate: fresh → launched`
+- **Handed off**: `B3 <task_id> — handed off: <request_id> still <state> at the polling ceiling → resume launched`
+- **Resume backstop**: `B3 <task_id> — resume backstop: <request_id> still <state> → pending (not cancelled)`
 
 `afk-digest.md` is **retained** (Fleet Cockpit C8) — it is not removed in this batch, but it is
 demoted to a generated history view: `data/return-brief.md`, the 05:30 return brief, is the
 primary pull-on-return surface that supersedes it, and it reads the cockpit decision queue (C5b),
 fed by `write-decision` (see "Filing Parked Decisions to the Cockpit Registry" above), for any of
-the above that left a decision open (i.e. every outcome except "Merged").
+the above that left a decision open (i.e. every outcome except "Merged", a first "Handed off",
+whose resume is still running, and a resume-mode "Aborted" on an escalation someone else already
+took).
 
 **When a line is derived from a triage ack.** If a digest line above, or a `write-decision --text`
 registry entry (see "Filing Parked Decisions to the Cockpit Registry" above), draws on an existing
@@ -1769,8 +1813,10 @@ enter through `resolve-answers`, with `--source docket` or `--source terminal`.
    Mem0 category, because the Graphiti route keeps the conclusion and distills the reasoning away.
 
 The order is deliberate. The markers go on while the record is still pending, and `resolve_issue`
-runs before `close-decision`, so a server refusal such as `declared_pin_refused` stops the apply
-before the registry records an answer.
+runs before `close-decision`, so a server refusal such as `declared_pin_refused` or `park_on_info`
+stops the apply before the registry records an answer. On `park_on_info` the record is
+info-severity: do not retry the park; hold the task with a deferral (AFK shift 1) and report it to
+Leo.
 
 An L2 with no DecisionRecord is filed, then closed, under
 `scripts/sitting/payloads.py::sitting_decision_id`: `<project>-<esc id>`, or `<project>-recon-<esc
@@ -2065,6 +2111,11 @@ Technical debt or cleanup discovered during development.
       # Record resolve["reason"] in the escalation resolution note.
       # Do NOT retry and do NOT record a task id.
       note_refused(resolve["reason"])
+  elif resolve["status"] == "awaiting_curation":
+      # Deliberately NOT in the tuple above: the ticket is parked with no
+      # task_id yet. Do NOT re-submit. Resolve the escalation with
+      # "queued for curation (ticket <ticket>)".
+      note_parked(ticket)
   elif resolve["status"] == "failed":
       # Record reason in escalation resolution note; skip this item.
       # See skills/_shared/ticket-failure-handling.md for the retryable/terminal reason matrix.
@@ -2229,7 +2280,9 @@ low anyway, stop (see "Stopping"): the handover carries forward what the next se
   only a compact verdict + recommended action — not the raw material
 - The low-risk auto-unblock sub-agent (`unblock-low-risk`) — run it in the **background**
   (`run_in_background: true`) so its full apply→verify→submit→poll cycle stays in its own context,
-  keeping the watch loop lean and responsive; it returns only a small JSON result when it completes
+  keeping the watch loop lean and responsive; it returns only a small JSON result when it completes.
+  After a `handed_off`, that cycle includes its resume-mode poll, also in the background, so the
+  watch loop never polls a B3 merge at top level
 - ANY other merge submission (e.g. retrying the land of a done-but-unmerged task) — submit
   top-level using the bounded submit→poll protocol; see "Merge Submissions — Bounded Submit, Then Poll"
 - Creating follow-up tasks (once you've decided what to create, have a sub-agent do the MCP calls)
@@ -2265,11 +2318,14 @@ Instead, **read the session's result file** for the structured outcome:
 1. Locate the session-registry record for the spawn (the slug you launched it under, or the
    matching record under `~/.claude/fleet/sessions/` for the task/title you spawned).
 2. Read `record.result_file` — equivalently `~/.claude/fleet/sessions/<slug>/result.md` — for the
-   `outcome` (`done|blocked|abandoned|handed-off`), `changed` (commits/branches/task ids touched),
+   `outcome: done|blocked|abandoned|handed-off|in-progress`, `changed` (commits/branches/task ids touched),
    and `action_needed` fields the spawned session wrote before ending.
 3. Use that structured outcome to decide your next step (resolve the escalation, follow up, escalate
    further) — `result.md` is the authoritative outcome source, so this replaces exploring the
    task/worktree yourself to reconstruct what happened.
+4. An `in-progress` outcome on a finished spawn (the background task has completed, so the record
+   is terminal) means the session **ended at checkpoint**, before its final write. Treat it like an
+   absent file and fall back to exploring the task/escalation state.
 
 **Fail-soft:** the write is best-effort — if `result.md` is absent, empty, or unparsable (the
 spawned session ended without writing it, or the registry write itself faulted so the record never
@@ -2301,7 +2357,7 @@ its values may be passed to `resolve_issue`.
 |---|---|---|---|---|
 | `resume` (default) | `resolved` | resumes; resolution text injected (L0 live path) | `blocked` → `pending` (any task-attached level ≥ 1, incl. memberless born-at-L2) | "Here's the answer — continue." |
 | `restart` | `resolved` | killed (soft-cancel → grace → hard) | → `pending` (from `in-progress` or `blocked`) | "This run is off-course — re-run fresh." |
-| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." **Never on an `info` record:** info never pins, so the sweep re-pends the task within a tick. Defer the task instead (AFK shift 1). `resolve_issue` will refuse it once task 6578 lands. |
+| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." **Never on an `info` record:** info never pins, so the sweep re-pends the task within a tick. Defer the task instead (AFK shift 1). `resolve_issue` refuses it with code `park_on_info` and changes nothing; the response's `hint` and `task_id` give the deferral to use instead. An info park that is accepted means that orchestrator's escalation server predates task 6578: defer the task anyway. |
 | `abandon` | `dismissed` | killed | → `cancelled` | "Never run again." |
 | `close_only` | `dismissed` | untouched | none | "Record is noise/duplicate — change nothing." |
 

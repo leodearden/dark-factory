@@ -4,18 +4,29 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from shared.briefing_queries import BriefingScope
 from shared.task_text_fingerprint import TaskTextDrift
 
 from orchestrator.agents.memory_recall import MemoryRecall
+from orchestrator.agents.review_briefing import (
+    ReviewSubject,
+    amendment_scope_section,
+    render_context_complete_review,
+    review_action_section,
+)
 from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
 
 logger = logging.getLogger(__name__)
+
+DIFF_ONLY_DIFF_CAP_CHARS = 50_000
+"""Where the incumbent reviewer briefing cuts its diff; ``diff_cap_chars=0`` lifts the cut."""
 
 COMMIT_BULLET_LIMIT = 40
 """Max commit bullets rendered in one briefing section (task 3033 amendment).
@@ -265,6 +276,56 @@ def _plan_scope(plan: dict, task_id: str | None) -> BriefingScope:
     """
     scope = BriefingScope.from_plan(plan)
     return replace(scope, task_id=str(task_id)) if task_id else scope
+
+
+@dataclass(frozen=True)
+class PriorAttemptCause:
+    """Why one earlier verify attempt failed: its failure category and cause text."""
+
+    category: str
+    cause: str
+
+
+@dataclass(frozen=True)
+class VerifyAttemptContext:
+    """Where a debugger dispatch sits in its verify/debug loop.
+
+    ``attempt`` is the 1-based number of the verify attempt that just failed.
+    ``prior_causes`` holds one entry per earlier failed attempt in the same
+    loop, oldest first.
+    """
+
+    attempt: int
+    max_attempts: int
+    prior_causes: tuple[PriorAttemptCause, ...] = ()
+
+
+def _format_prior_cause(attempt: int, prior: PriorAttemptCause) -> str:
+    cause = ' '.join(prior.cause.split())
+    return f'- attempt {attempt}: {prior.category or "uncategorized"}: {cause}'
+
+
+def _format_verify_attempt(ctx: VerifyAttemptContext) -> str:
+    lines = [
+        f'Verify attempt {ctx.attempt} of {ctx.max_attempts} failed; '
+        'the failures below are from that run.',
+    ]
+    if not ctx.prior_causes:
+        lines.append('This is the first failed attempt in this verify/debug loop.')
+    else:
+        lines.append(
+            'Earlier attempts in this loop also failed, and a debugger pass '
+            'followed each one:'
+        )
+        lines.extend(
+            _format_prior_cause(i, prior) for i, prior in enumerate(ctx.prior_causes, start=1)
+        )
+        lines.append('')
+        lines.append(
+            'If the current failure matches one of these, the earlier fix did '
+            'not work — find a different root cause instead of repeating it.'
+        )
+    return '# Verify Attempt\n\n' + '\n'.join(lines) + '\n\n'
 
 
 @dataclass
@@ -597,8 +658,13 @@ to start over from nothing.
         Option (c), ``drop_plan_file``, gives an over-declared file a
         truthful exit from the "drop = falsify provenance, confirm = mislabel
         complete work" dilemma named at
-        ``orchestrator/src/orchestrator/merge_gates.py::CROSS_REPO_DELIVERABLE_REASON_PREFIX``
-        and ``::ALREADY_LANDED_REASON_PREFIX``.
+        ``orchestrator/src/orchestrator/merge_lane/gates.py::CROSS_REPO_DELIVERABLE_REASON_PREFIX``
+        and ``orchestrator/src/orchestrator/merge_lane/gates.py::ALREADY_LANDED_REASON_PREFIX``.
+        The exit reports an architect may file instead of narrowing are
+        consumed by
+        ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._consume_narrowing_exit_report``;
+        the prompt offers only the one the gate honours as a clean close
+        (``report_task_already_done``).
 
         Lenient semantics — the architect may keep some flagged entries
         (treating them as genuinely needed; the gate's re-check is then
@@ -631,7 +697,7 @@ work is genuinely incomplete.
 
 {not_touched_list}
 
-## Action — choose ONE of (a) or (b); (c) is per-entry and may be repeated
+## Action — choose ONE of (a), (b) or (d); (c) is per-entry and may be repeated
 
 a. **Drop genuinely-unneeded entries**: call
    `update_plan_metadata(files=[<narrowed list>])` with a subset of the
@@ -658,8 +724,21 @@ c. **Correctly declared, and correctly needed no change**: call
    recorded reason is what would falsify the plan — which is why (a)
    is the wrong tool for this case and `drop_plan_file` refuses a blank
    reason.
+d. **The WHOLE task is already on main, including every commit this
+   branch carries**: call `report_task_already_done(commit, evidence)`
+   instead of narrowing.  The orchestrator re-verifies that the commit is on
+   main (and attributes it to this task, and checks any declared
+   delivered_checks) and closes the task; a claim that fails that
+   verification blocks the task instead.  If this branch carries any patch
+   not yet on main, the report is discarded and the gate decides.
+   `report_unactionable_task` and `report_false_premise` are also honoured
+   here, but each files a level-1 escalation carrying your reason.
 
 ## Forbidden for this pass
+
+Do not call `report_ready_to_merge` or `report_blocking_dependency`: the
+merge is already under way, so both are discarded unread.  A delivered
+branch whose flagged file needed no edit is option (c).
 
 Do not call `create_plan`, `add_plan_step`, or `replace_plan_step`.
 This narrowing pass is scoped strictly to the `files` list; step
@@ -1063,13 +1142,20 @@ This task holds locks for the following modules:
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
+        *, attempt_context: VerifyAttemptContext | None = None,
     ) -> str:
-        """Build prompt for the debugger agent."""
+        """Build prompt for the debugger agent.
+
+        *attempt_context* adds a ``# Verify Attempt`` section naming the
+        failed attempt and the causes of earlier ones in the same loop; with
+        ``None`` the prompt is byte-identical to the attempt-less form.
+        """
         scope = _plan_scope(plan, task_id)
         if context is None:
             context = await self._get_memory_context(scope, 'debugger')
 
         identity = self._agent_identity(scope.task_id, 'debugger')
+        verify_attempt = _format_verify_attempt(attempt_context) if attempt_context else ''
 
         return f"""\
 {context}
@@ -1081,7 +1167,7 @@ This task holds locks for the following modules:
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
 
-# Failures
+{verify_attempt}# Failures
 
 ```
 {failures}
@@ -1099,6 +1185,7 @@ This task holds locks for the following modules:
         self, reviewer_type: str, diff: str, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
         task: dict | None = None,
+        diff_cap_chars: int = DIFF_ONLY_DIFF_CAP_CHARS,
     ) -> str:
         """Build prompt for a reviewer agent.
 
@@ -1117,14 +1204,20 @@ This task holds locks for the following modules:
         the returned prompt is byte-identical to the non-amendment path.  The
         advisory section is best-effort — the deterministic
         ``partition_suggestions_by_delta`` filter is the enforceable guarantee.
+
+        *diff_cap_chars* is where the diff is cut; ``0`` inlines it whole.
+        Production callers leave the default.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(task), 'reviewer')
 
-        # Truncate very large diffs to avoid blowing the context
-        if len(diff) > 50000:
-            diff = diff[:50000] + '\n\n... [diff truncated] ...'
+        if diff_cap_chars and len(diff) > diff_cap_chars:
+            diff = diff[:diff_cap_chars] + '\n\n... [diff truncated] ...'
 
+        action = review_action_section(
+            reviewer_type,
+            'Review the diff according to your specialization. Explore the codebase as needed for context.',
+        )
         prompt = f"""\
 {context}
 
@@ -1134,34 +1227,31 @@ This task holds locks for the following modules:
 {diff}
 ```
 
-# Action
-
-1. Review the diff according to your specialization. Explore the codebase as needed for context.
-2. Call `submit_review_verdict(reviewer="{reviewer_type}", verdict=..., issues=..., summary=...)` with your findings.
-
-Your verdict is read from the `submit_review_verdict` tool call, not from your prose output — you MUST call it before finishing.
-"""
+{action}"""
 
         if amendment_suggestions:
-            listed = '\n'.join(
-                f"- {s.get('location') or '(no location)'} — "
-                f"{s.get('description') or ''}"
-                for s in amendment_suggestions
-            )
-            prompt += f"""
-# Amendment Re-Review Scope
-
-This diff was just amended to address the prior review's in-scope suggestions,
-listed below. Do NOT hunt for fresh, unrelated nits across the full diff:
-first confirm the listed prior suggestions were addressed, then report ONLY
-new findings introduced within the amendment delta — the lines this amendment
-actually changed. Blocking regressions anywhere in the diff remain in scope.
-
-Prior suggestions the amendment was asked to address:
-{listed}
-"""
+            prompt += '\n' + amendment_scope_section(amendment_suggestions)
 
         return prompt
+
+    async def build_context_complete_reviewer_prompt(
+        self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
+    ) -> str:
+        """Build the context-complete (D2) reviewer prompt for *subject*.
+
+        Memory is scoped to the task exactly as :meth:`build_reviewer_prompt`
+        scopes it; the rendering lives in ``agents/review_briefing.py``.
+        """
+        if context is None:
+            context = await self._get_memory_context(BriefingScope.from_task(subject.task), 'reviewer')
+        return render_context_complete_review(
+            reviewer_type=reviewer_type,
+            subject=subject,
+            context=context,
+            task_block=self._format_task(subject.task, include_test_strategy=True),
+            amendment_suggestions=amendment_suggestions,
+        )
 
     async def build_completion_judge_prompt(
         self,
@@ -1445,7 +1535,10 @@ A prior block-time investigation concluded the following; verify against the cur
 **Investigated at:** {created_at}
 """
 
-    def _format_task(self, task: dict, *, include_files: bool = True) -> str:
+    def _format_task(
+        self, task: Mapping[str, Any], *,
+        include_files: bool = True, include_test_strategy: bool = False,
+    ) -> str:
         """Format a task dict as readable text.
 
         Args:
@@ -1456,6 +1549,10 @@ A prior block-time investigation concluded the following; verify against the cur
                 ``build_architect_prompt`` to anti-anchor the first plan
                 derivation (C-A1): the architect must derive its own file
                 footprint rather than echoing the queue-time metadata guess.
+            include_test_strategy: When True, the task's ``testStrategy`` is
+                rendered. Only the context-complete reviewer passes it, so
+                ``review.reviewer_briefing`` stays the one switch that turns
+                that briefing change on and off (task 5369).
 
         Appends the task's own ``metadata.delivered_checks`` as a capability-gate
         section via :func:`_format_delivered_checks` (task 5359) — the gate
@@ -1492,12 +1589,14 @@ A prior block-time investigation concluded the following; verify against the cur
             lines.append(f'**Description:** {task["description"]}')
         if task.get('details'):
             lines.append(f'**Details:** {task["details"]}')
+        if include_test_strategy and task.get('testStrategy'):
+            lines.append(f'**Test strategy:** {task["testStrategy"]}')
         if include_files and metadata.get('files'):
             lines.append(f'**Files:** {", ".join(metadata["files"])}')
         deps = task.get('dependencies', [])
         if deps:
             dep_ids = [str(d.get('id', d)) if isinstance(d, dict) else str(d) for d in deps]
             lines.append(f'**Dependencies:** {", ".join(dep_ids)}')
-        body = '\n'.join(lines) if lines else json.dumps(task, indent=2)
+        body = '\n'.join(lines) if lines else json.dumps(dict(task), indent=2)
         checks_block = _format_delivered_checks(metadata.get('delivered_checks'))
         return f'{body}\n\n{checks_block}' if checks_block else body

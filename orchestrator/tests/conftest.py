@@ -660,23 +660,23 @@ def forbid_live_mcp(monkeypatch):
     through to the LIVE ``mcp_call(...)`` HTTP branch, which — because the
     module-global ``mcp_lifecycle._session`` is ``None`` in unit tests —
     constructs a one-shot ``McpSession`` and calls ``initialize()`` /
-    ``_raw_call()`` against the real ``http://localhost:8002``.  Under
+    ``call()`` against the real ``http://localhost:8002``.  Under
     ``pytest -n auto`` that shared server saturates under load (observed
     ~100x latency), and these multi-call paths can exceed the suite's 60s
     per-test timeout — which (``timeout_method='thread'``) ``os._exit()``s
     the xdist worker rather than just failing the one test.
 
-    Patches the ``McpSession`` CLASS in ``orchestrator.mcp_lifecycle`` —
+    Patches the ``McpSession`` CLASS (``shared.mcp_session``) —
     NOT ``orchestrator.scheduler.mcp_call`` — because ``scheduler.py`` binds
     ``mcp_call`` via ``from ... import``, a distinct binding from the
     canonical ``orchestrator.mcp_lifecycle.mcp_call`` (and
     ``orchestrator.agents.memory_recall.mcp_call``).  Every alias, however,
     ultimately constructs/uses an ``McpSession`` and issues its first
-    network I/O through ``McpSession.initialize`` -> ``_raw_call`` (the
-    one-shot fallback path inside ``mcp_call``, since the module-global
-    ``_session`` is ``None`` in unit tests) — patching the class methods is
-    the single binding-independent network chokepoint every alias funnels
-    through.
+    network I/O through ``McpSession.initialize`` -> ``call`` (``call_tool``
+    delegates to ``call``; the one-shot fallback inside ``mcp_call`` applies,
+    as the module-global ``_session`` is ``None`` in unit tests) — patching
+    the class methods is the single binding-independent network chokepoint
+    every alias funnels through.
 
     RECORDS each attempt into the yielded list (rather than only raising)
     because the two dominant live seams here swallow exceptions:
@@ -704,7 +704,7 @@ def forbid_live_mcp(monkeypatch):
             'Scheduler under test (see _orch_helpers.HermeticMcpSession)'
         )
 
-    async def _fake_raw_call(self, method: str, params=None, timeout: float = 30) -> dict:
+    async def _fake_call(self, method: str, params=None, *, timeout: float = 30) -> dict:
         recorder.append((self.base_url, method))
         raise AssertionError(
             f'live fused-memory MCP round-trip attempted: {method!r} at '
@@ -712,8 +712,8 @@ def forbid_live_mcp(monkeypatch):
             'Scheduler under test (see _orch_helpers.HermeticMcpSession)'
         )
 
-    monkeypatch.setattr('orchestrator.mcp_lifecycle.McpSession.initialize', _fake_initialize)
-    monkeypatch.setattr('orchestrator.mcp_lifecycle.McpSession._raw_call', _fake_raw_call)
+    monkeypatch.setattr('shared.mcp_session.McpSession.initialize', _fake_initialize)
+    monkeypatch.setattr('shared.mcp_session.McpSession.call', _fake_call)
 
     yield recorder
 

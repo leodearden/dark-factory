@@ -16,9 +16,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _curator_helpers import agent_result as _agent_result
+from _curator_helpers import empty_corpus, escalator_double, zot_agent_result
 from _curator_helpers import make_config as _make_config
 from _curator_helpers import pool_with_ids as _pool_with_ids
-from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.cli_invoke import AgentResult
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import (
     ArtifactProvenance,
@@ -36,6 +37,7 @@ from fused_memory.mcp_tools.scheduler_state import (
     effective_lock_depth,
 )
 from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.task_curator import (
     _CURATOR_PROMPT_HARNESS_VERSION,
@@ -60,6 +62,7 @@ from fused_memory.middleware.task_curator import (
     _trim_pool,
     clip_for_prompt,
     embedding_text,
+    empty_pool_sizes,
     exception_summary,
     flatten_task_tree,
     is_combine_eligible_status,
@@ -770,7 +773,7 @@ class TestCurateIdempotency:
 
 class TestCurateFallbacks:
     @pytest.mark.asyncio
-    async def test_corpus_failure_degrades_to_create(self):
+    async def test_corpus_failure_defers(self):
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
 
@@ -781,11 +784,11 @@ class TestCurateFallbacks:
             result = await curator.curate(
                 CandidateTask(title='T'), project_id='p', project_root='/x',
             )
-        assert result.action == 'create'
-        assert 'corpus-failed' in result.justification
+        assert result.action == 'defer'
+        assert result.defer_reason is DeferReason.CORPUS_FAILED
 
     @pytest.mark.asyncio
-    async def test_llm_failure_degrades_to_create(self):
+    async def test_llm_failure_defers(self):
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
 
@@ -800,19 +803,12 @@ class TestCurateFallbacks:
             result = await curator.curate(
                 CandidateTask(title='T'), project_id='p', project_root='/x',
             )
-        assert result.action == 'create'
-        assert 'llm-failed' in result.justification
+        assert result.action == 'defer'
+        assert result.defer_reason is DeferReason.LLM_FAILED
 
     @pytest.mark.asyncio
-    async def test_llm_failure_without_escalator_degrades_loudly(self):
-        """R1+R2: CLI failure with no escalator → action='create' with
-        the ``llm-error-escalated`` sentinel justification.
-
-        Distinct from the old ``llm-error`` / ``llm-failed`` strings so
-        logs can be grepped to confirm R2's wiring (see plan verification
-        checklist step 2: journalctl should show zero ``llm-error``
-        entries unpaired with a ``curator_failure`` escalation).
-        """
+    async def test_llm_failure_without_escalator_defers(self):
+        """A CLI failure with no escalator wired still defers the candidate."""
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
 
@@ -828,8 +824,8 @@ class TestCurateFallbacks:
             result = await curator.curate(
                 CandidateTask(title='T'), project_id='p', project_root='/x',
             )
-        assert result.action == 'create'
-        assert result.justification == 'llm-error-escalated'
+        assert result.action == 'defer'
+        assert result.defer_reason is DeferReason.LLM_FAILED
 
     @pytest.mark.asyncio
     async def test_llm_failure_with_escalator_calls_report_failure(self):
@@ -855,8 +851,8 @@ class TestCurateFallbacks:
             result = await curator.curate(
                 CandidateTask(title='T'), project_id='p', project_root='/x',
             )
-        assert result.action == 'create'
-        assert result.justification == 'llm-error-escalated'
+        assert result.action == 'defer'
+        assert result.defer_reason is DeferReason.LLM_FAILED
         escalator.report_failure.assert_awaited_once()
         kwargs = escalator.report_failure.await_args.kwargs
         assert kwargs['project_id'] == 'p'
@@ -886,7 +882,8 @@ class TestCurateFallbacks:
             result = await curator.curate(
                 CandidateTask(title='T'), project_id='p', project_root='/x',
             )
-        assert result.action == 'create'
+        assert result.action == 'defer'
+        assert result.defer_reason is DeferReason.LLM_FAILED
         escalator.report_failure.assert_awaited_once()
         kwargs = escalator.report_failure.await_args.kwargs
         assert kwargs['schema_tool_denied'] is True
@@ -1085,8 +1082,8 @@ class TestCurateFallbacks:
             result = await curator.curate(
                 CandidateTask(title='T'), project_id='p', project_root='/x',
             )
-        assert result.action == 'create'
-        assert result.justification == 'llm-error-escalated'
+        assert result.action == 'defer'
+        assert result.defer_reason is DeferReason.LLM_FAILED
         escalator.report_failure.assert_awaited_once()
         kwargs = escalator.report_failure.await_args.kwargs
         assert kwargs['subtype'] == 'error_max_budget_usd'
@@ -1123,17 +1120,14 @@ class TestCurateFallbacks:
 
 
 class TestUnexpectedExceptionArmReports:
-    """Part A: the catch-all arm around the LLM call must REPORT, not just degrade.
+    """The catch-all arm around the LLM call must REPORT, as well as defer.
 
-    Its two named siblings (``AllAccountsCappedException``,
-    ``CuratorFailureError``) both route through ``report_failure``. This one
-    logged at WARNING and returned ``action='create'`` — a shape
-    indistinguishable downstream from a healthy create, which is how the
-    2026-08-13 to 08-18 curator outage ran for five days on a
+    Its named sibling (``CuratorFailureError``) routes through
+    ``report_failure``; the pool-unavailable arm defers with nothing to
+    report. This one once logged at WARNING and returned ``action='create'`` —
+    a shape indistinguishable downstream from a healthy create, which is how
+    the 2026-08-13 to 08-18 curator outage ran for five days on a
     ``FileNotFoundError`` for the ``claude`` binary.
-
-    The degradation is NOT the defect: fail-open is the designed behaviour and
-    is asserted here to survive. The silence is the defect.
     """
 
     @pytest.mark.asyncio
@@ -1163,8 +1157,8 @@ class TestUnexpectedExceptionArmReports:
                 CandidateTask(title='T'), project_id='p', project_root='/x',
             )
 
-        assert result.action == 'create'
-        assert 'llm-failed' in result.justification
+        assert result.action == 'defer'
+        assert result.defer_reason is DeferReason.LLM_FAILED
 
         escalator.report_failure.assert_awaited_once()
         kwargs = escalator.report_failure.await_args.kwargs
@@ -1232,14 +1226,14 @@ def _streak(curator: TaskCurator, project_id: str = 'p') -> _DegradedStreak:
 
 
 class TestConsecutiveDegradedAlarm:
-    """Part B: a run of degraded curations is itself the alarm, whatever caused it.
+    """A run of degraded curations is itself the alarm, whatever caused it.
 
-    Every degraded arm counts toward the project's one streak — capped
-    accounts, a reported LLM failure, an unexpected exception, a corpus
-    failure, an open breaker.
-    That is deliberate: a curator degrading for days is the same outage to the
-    fleet no matter which arm it came out of, and an alarm that enumerated
-    causes would have the same hole per-class instrumentation always has.
+    Every degraded curation counts toward the project's one streak — an
+    unusable response, a zero-output hang. That is deliberate: a curator
+    degrading for days is the same outage to the fleet whatever the response
+    looked like, and an alarm that enumerated causes would have the same hole
+    per-class instrumentation always has. A deferral creates nothing, so it is
+    not part of the streak (see tests/test_curator_outage_deferral.py).
 
     Every case here uses a DISTINCT candidate title. Identical titles hash to
     the same payload and the idempotency cache serves call 2..N from call 1's
@@ -1248,17 +1242,11 @@ class TestConsecutiveDegradedAlarm:
 
     @staticmethod
     def _curator_with_escalator():
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
+        escalator = escalator_double()
         curator = TaskCurator(
             config=_make_config(), taskmaster=None, escalator=escalator,
         )
         return curator, escalator
-
-    @staticmethod
-    async def _empty_corpus(*a, **k):
-        return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
     @staticmethod
     async def _curate(curator, i):
@@ -1267,32 +1255,29 @@ class TestConsecutiveDegradedAlarm:
         )
 
     @pytest.mark.asyncio
-    async def test_mixed_arms_share_one_streak_and_fire_once(self):
+    async def test_mixed_sources_share_one_streak_and_fire_once(self):
         curator, escalator = self._curator_with_escalator()
+        healthy = _agent_result({'action': 'create', 'justification': 'genuinely new'})
 
-        # Five degraded calls across THREE different arms, then a sixth to
-        # prove the latch, a success to prove the reset, then five more.
-        outcomes = [
-            AllAccountsCappedException(
-                retries=3, elapsed_secs=1.0, label='task-curator[p]',
-            ),
-            CuratorFailureError('boom'),
-            RuntimeError('llm down'),
-            FileNotFoundError(2, 'No such file or directory', 'claude'),
-            RuntimeError('llm down again'),
-            RuntimeError('sixth, already latched'),
-            CuratorDecision(action='drop', target_id='42', justification='dup'),
-            RuntimeError('e1'),
-            RuntimeError('e2'),
-            RuntimeError('e3'),
-            RuntimeError('e4'),
-            RuntimeError('e5'),
+        # Five degraded calls across unusable responses AND a zero-output
+        # hang, then a sixth to prove the latch, a success to prove the
+        # reset, then five more.
+        responses = [
+            _agent_result({'action': 'bogus'}),
+            zot_agent_result(),
+            _agent_result(None, output='not json'),
+            _agent_result({'action': 'drop', 'justification': 'dup'}),
+            _agent_result({'action': 'bogus'}),
+            _agent_result({'action': 'bogus'}),
+            healthy,
+            *[_agent_result({'action': 'bogus'})] * 5,
         ]
 
-        with patch.object(curator, '_build_corpus', side_effect=self._empty_corpus), \
-             patch.object(curator, '_call_llm', side_effect=outcomes):
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(side_effect=responses)):
             for i in range(5):
-                await self._curate(curator, i)
+                assert (await self._curate(curator, i)).degraded
             escalator.report_consecutive_degraded.assert_awaited_once()
             assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
 
@@ -1302,7 +1287,7 @@ class TestConsecutiveDegradedAlarm:
 
             # A real LLM success clears counter AND latch.
             result = await self._curate(curator, 6)
-            assert result.action == 'drop'
+            assert (result.action, result.degraded) == ('create', False)
 
             for i in range(7, 12):
                 await self._curate(curator, i)
@@ -1311,44 +1296,17 @@ class TestConsecutiveDegradedAlarm:
         assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
 
     @pytest.mark.asyncio
-    async def test_corpus_failures_alone_fire_the_alarm(self):
-        """Class-agnostic across NON-exception-arm degradations too.
-
-        These five never reach the LLM at all, so no per-exception-class
-        instrumentation on the LLM arms could ever see them — yet they are the
-        same outage shape: five candidates filed without dedupe.
-        """
-        curator, escalator = self._curator_with_escalator()
-
-        async def boom(*a, **k):
-            raise RuntimeError('qdrant down')
-
-        with patch.object(curator, '_build_corpus', side_effect=boom):
-            for i in range(5):
-                result = await self._curate(curator, i)
-                assert 'corpus-failed' in result.justification
-
-        escalator.report_consecutive_degraded.assert_awaited_once()
-        kwargs = escalator.report_consecutive_degraded.await_args.kwargs
-        assert kwargs['streak'] == 5
-        assert kwargs['threshold'] == 5
-        assert kwargs['project_id'] == 'p'
-        assert kwargs['project_root'] == '/x'
-        assert 'corpus-failed' in kwargs['last_justification']
-
-    @pytest.mark.asyncio
     async def test_streak_is_kept_per_project(self):
         """One curator serves every project. Project B's healthy curations,
         interleaved with project A's degradations, must neither reset nor mask
         A's streak, and the alarm is filed against A."""
         curator, escalator = self._curator_with_escalator()
-        healthy = CuratorDecision(action='drop', target_id='42', justification='dup')
-        outcomes = []
-        for i in range(5):
-            outcomes += [RuntimeError(f'project a down #{i}'), healthy]
+        unusable = _agent_result({'action': 'bogus'})
+        healthy = _agent_result({'action': 'create', 'justification': 'genuinely new'})
 
-        with patch.object(curator, '_build_corpus', side_effect=self._empty_corpus), \
-             patch.object(curator, '_call_llm', side_effect=outcomes):
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(side_effect=[unusable, healthy] * 5)):
             for i in range(5):
                 await curator.curate(
                     CandidateTask(title=f'A{i}'), project_id='a', project_root='/a',
@@ -1526,13 +1484,6 @@ class TestExceptionSummary:
         assert exception_summary(TimeoutError()) == 'TimeoutError'
 
 
-_EMPTY_POOL_SIZES = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
-
-
-async def _empty_corpus(*_args, **_kwargs):
-    return [], dict(_EMPTY_POOL_SIZES), PoolWithheld()
-
-
 async def _invocation_rows(db_path: Path) -> list[dict]:
     import aiosqlite
 
@@ -1563,7 +1514,7 @@ class TestCuratorInvocationLedger:
             {'action': 'create', 'justification': 'x'},
         ))
 
-        with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
             await curator.curate(CandidateTask(title='T'), 'proj-a', str(tmp_path))
 
@@ -1595,7 +1546,7 @@ class TestCuratorInvocationLedger:
             {'candidate_index': 1, 'action': 'create', 'justification': 'n1'},
         ]}))
 
-        with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
             await curator.curate_batch(
                 [CandidateTask(title='T0'), CandidateTask(title='T1')],
@@ -1618,7 +1569,7 @@ class TestCuratorInvocationLedger:
             {'action': 'create', 'justification': 'x'},
         ))
 
-        with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
             await curator.curate(CandidateTask(title='T'), 'proj-c', str(tmp_path))
 
@@ -1644,7 +1595,7 @@ class TestCuratorInvocationLedger:
                 structured_output={'action': 'create', 'justification': 'new work'},
                 duration_ms=1234, cost_usd=0.01,
             )
-            with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+            with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
                  patch('shared.cli_invoke.invoke_claude_agent',
                        new=AsyncMock(return_value=served)):
                 decision = await curator.curate(
@@ -1678,7 +1629,7 @@ class TestCuratorInvocationLedger:
                 success=False, output='', structured_output=None,
                 timed_out=True, duration_ms=180_000,
             )
-            with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+            with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
                  patch('shared.cli_invoke.invoke_claude_agent',
                        new=AsyncMock(return_value=hung)):
                 decision = await curator.curate(
@@ -1797,65 +1748,6 @@ class TestZeroOutputTimeoutSignal:
         assert exc_info.value.zero_output_timeout is False
 
 
-class TestCuratorCapHandling:
-    """Verify TaskCurator.curate() handles AllAccountsCappedException gracefully."""
-
-    @pytest.mark.asyncio
-    async def test_curate_handles_all_accounts_capped_without_escalator(self):
-        """Cap exception → action='create', justification='all-accounts-capped', no raise."""
-        config = _make_config()
-        curator = TaskCurator(config=config, taskmaster=None)
-
-        cap_exc = AllAccountsCappedException(
-            retries=3, elapsed_secs=90.0, label='task-curator[p]'
-        )
-
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(side_effect=cap_exc)):
-            result = await curator.curate(
-                CandidateTask(title='T'), project_id='p', project_root='/x',
-            )
-
-        assert result.action == 'create'
-        assert result.justification == 'all-accounts-capped'
-
-    @pytest.mark.asyncio
-    async def test_curate_handles_all_accounts_capped_with_escalator(self):
-        """Cap exception with escalator → escalator.report_failure called with cap justification."""
-        config = _make_config()
-
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-
-        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
-
-        cap_exc = AllAccountsCappedException(
-            retries=3, elapsed_secs=90.0, label='task-curator[p]'
-        )
-
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(side_effect=cap_exc)):
-            result = await curator.curate(
-                CandidateTask(title='T'), project_id='p', project_root='/x',
-            )
-
-        assert result.action == 'create'
-        assert result.justification == 'all-accounts-capped'
-        escalator.report_failure.assert_awaited_once()
-        kwargs = escalator.report_failure.await_args.kwargs
-        assert 'all-accounts-capped' in kwargs['justification']
-        assert kwargs['project_id'] == 'p'
-        assert kwargs['candidate_title'] == 'T'
-
-
 class TestZeroOutputTimeoutAcceptance:
     """Step-5 RED/ACCEPTANCE: simulated hung subprocess does not wedge curator;
     ZOT evidence is threaded into report_failure."""
@@ -1958,14 +1850,7 @@ class TestZeroOutputTimeoutAcceptance:
 
 def _prepared(candidate: CandidateTask) -> PreparedCandidate:
     return PreparedCandidate(
-        candidate=candidate, pool=[], pool_sizes=dict(_EMPTY_POOL_SIZES), prompt_tokens=0,
-    )
-
-
-def _zot_agent_result() -> AgentResult:
-    return AgentResult(
-        success=False, output='', subtype='error_empty_output',
-        timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
+        candidate=candidate, pool=[], pool_sizes=empty_pool_sizes(), prompt_tokens=0,
     )
 
 
@@ -1998,14 +1883,14 @@ class TestCuratorDecisionZotMarker:
     @pytest.mark.asyncio
     async def test_zot_curate_is_marked_with_the_escalation_id(self):
         decision = await self._curate(
-            self._curator(), CandidateTask(title='ZOT candidate'), _zot_agent_result(),
+            self._curator(), CandidateTask(title='ZOT candidate'), zot_agent_result(),
         )
         assert decision.action == 'create'
         assert decision.degraded_by_zot is True
         assert decision.zot_escalation_id == 'esc-curator-7'
 
     @pytest.mark.asyncio
-    async def test_non_zot_llm_failure_is_not_marked(self):
+    async def test_non_zot_llm_failure_defers_unmarked(self):
         max_turns = AgentResult(
             success=False, output='partial', subtype='error_max_turns',
             timed_out=False, turns=3, cost_usd=0.05, duration_ms=9_000,
@@ -2013,41 +1898,42 @@ class TestCuratorDecisionZotMarker:
         decision = await self._curate(
             self._curator(), CandidateTask(title='Max-turns candidate'), max_turns,
         )
-        assert decision.action == 'create'
-        assert decision.justification == 'llm-error-escalated'
+        assert decision.action == 'defer'
+        assert decision.defer_reason is DeferReason.LLM_FAILED
         assert decision.degraded_by_zot is False
         assert decision.zot_escalation_id is None
 
     @pytest.mark.asyncio
-    async def test_curate_breaker_short_circuit_is_marked(self):
+    async def test_curate_breaker_short_circuit_defers_unmarked(self):
         curator = self._curator(breaker_threshold=1)
-        await self._curate(curator, CandidateTask(title='Opener'), _zot_agent_result())
+        await self._curate(curator, CandidateTask(title='Opener'), zot_agent_result())
 
         decision = await self._curate(
-            curator, CandidateTask(title='Second distinct candidate'), _zot_agent_result(),
+            curator, CandidateTask(title='Second distinct candidate'), zot_agent_result(),
         )
-        assert decision.justification == 'zero-output-breaker-open'
-        assert decision.degraded_by_zot is True
+        assert decision.action == 'defer'
+        assert decision.defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
+        assert decision.degraded_by_zot is False
         assert decision.zot_escalation_id is None
 
     @pytest.mark.asyncio
-    async def test_batch_breaker_short_circuit_marks_every_decision(self):
+    async def test_batch_breaker_short_circuit_defers_every_decision_unmarked(self):
         curator = self._curator(breaker_threshold=1)
-        await self._curate(curator, CandidateTask(title='Opener'), _zot_agent_result())
+        await self._curate(curator, CandidateTask(title='Opener'), zot_agent_result())
 
         prepared = [
             _prepared(CandidateTask(title='Batch Alpha', description='alpha details')),
             _prepared(CandidateTask(title='Batch Beta', description='beta details')),
         ]
         with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(return_value=_zot_agent_result())):
+                   new=AsyncMock(return_value=zot_agent_result())):
             decisions = await curator.curate_batch_prepared(
                 prepared, project_id='p', project_root='/x',
             )
         assert len(decisions) == 2
         for decision in decisions:
-            assert decision.justification == 'zero-output-breaker-open'
-            assert decision.degraded_by_zot is True
+            assert decision.defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
+            assert decision.degraded_by_zot is False
 
     @pytest.mark.asyncio
     async def test_interactive_path_reraises_with_the_zot_marker(self, tmp_path):
@@ -2057,7 +1943,7 @@ class TestCuratorDecisionZotMarker:
         candidate = CandidateTask(title='ZOT with no orchestrator')
         with (
             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                  new=AsyncMock(return_value=_zot_agent_result())),
+                  new=AsyncMock(return_value=zot_agent_result())),
             pytest.raises(CuratorFailureError) as exc_info,
         ):
             await curator.curate(
@@ -2134,11 +2020,10 @@ class TestZeroOutputBreakerCurate:
             )
         assert r1.action == 'create'
         assert r2.action == 'create'
-        assert r3.action == 'create'
+        assert r3.action == 'defer'
+        assert r3.defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
         # LLM call count must NOT have increased on the 3rd call.
         assert mock_llm.await_count == call_count_after_two
-        # Justification signals the breaker.
-        assert 'zero-output-breaker' in r3.justification
 
     @pytest.mark.asyncio
     async def test_success_resets_counter(self):
@@ -2488,9 +2373,7 @@ class TestDegradedStreakBatchReset:
     def _curator_with_escalator():
         config = _make_config()
         config.curator.degraded_streak_threshold = 5
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
+        escalator = escalator_double()
         curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
         return curator, escalator
 
@@ -2546,9 +2429,11 @@ class TestDegradedStreakBatchReset:
                 CandidateTask(title=f'Deg{i}'), project_id='p', project_root='/x',
             )
 
+        unusable = CuratorDecision(
+            action='create', justification="invalid-action: 'bogus'", degraded=True,
+        )
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch.object(curator, '_call_llm',
-                          side_effect=RuntimeError('llm down')), \
+             patch.object(curator, '_call_llm', return_value=unusable), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
                    new=AsyncMock(return_value=healthy)):
             for i in range(4):
@@ -2739,17 +2624,11 @@ class TestPayloadFailureDegradedness:
 
     @staticmethod
     def _curator_with_escalator():
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
+        escalator = escalator_double()
         curator = TaskCurator(
             config=_make_config(), taskmaster=None, escalator=escalator,
         )
         return curator, escalator
-
-    @staticmethod
-    async def _empty_corpus(*a, **k):
-        return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
     # (marker, raw decision payload) for each payload-failure branch reachable
     # with an EMPTY pool, i.e. without a state veto intercepting first.
@@ -2797,7 +2676,7 @@ class TestPayloadFailureDegradedness:
         curator, escalator = self._curator_with_escalator()
         result = AgentResult(success=True, output='', cost_usd=0.01,
                              structured_output=payload)
-        with patch.object(curator, '_build_corpus', side_effect=self._empty_corpus), \
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
                    new=AsyncMock(return_value=result)):
             for i in range(8):
@@ -4906,8 +4785,8 @@ class TestCuratorFailureErrorSchemaToolDenied:
 
 class TestCallLlmBatchWithFallback:
     """Fix R2 — the bisecting helper retries each half on
-    :exc:`CuratorFailureError` (recognised + unknown subtypes alike) and
-    re-raises :exc:`AllAccountsCappedException` without falling back."""
+    :exc:`CuratorFailureError` (recognised + unknown subtypes alike).
+    Pool unavailability defers instead: test_curator_pool_deferral.py."""
 
     @pytest.mark.asyncio
     async def test_n1_base_case_delegates_to_curate(self):
@@ -4991,27 +4870,6 @@ class TestCallLlmBatchWithFallback:
         # Bisect to n=1 twice; each delegates to curate().
         assert decisions == [d, d]
         assert mc.await_count == 2
-
-    @pytest.mark.asyncio
-    async def test_all_accounts_capped_propagates_without_bisect(self):
-        """Cap exhaustion on the whole batch must NOT bisect; re-raise so
-        the worker can defer the whole batch instead of repeating the
-        cap-retry storm N times."""
-        config = _make_config()
-        curator = TaskCurator(config=config, taskmaster=None)
-        candidates = [CandidateTask(title=f'T{i}') for i in range(4)]
-
-        cap_exc = AllAccountsCappedException(
-            retries=3, elapsed_secs=120.0, label='task-curator-batch[p]',
-        )
-        with patch.object(curator, '_call_llm_batch', side_effect=cap_exc), \
-             patch.object(curator, 'curate', new=AsyncMock()) as mc, \
-             pytest.raises(AllAccountsCappedException):
-            await curator._call_llm_batch_with_fallback(
-                candidates, [[]] * 4, [{}] * 4, 0.0, 'p', '/x',
-            )
-        # No fallback to per-item curate.
-        assert mc.await_count == 0
 
     @pytest.mark.asyncio
     async def test_right_half_batch_target_index_remapped_to_input_local_space(self):
@@ -5462,10 +5320,10 @@ class TestSizeOneBatchReusesThePreparedCorpus:
         assert '"module": 6' in prompt
 
     @pytest.mark.asyncio
-    async def test_a_failed_bundle_is_rebuilt_rather_than_reused(self):
-        """A corpus failure degrades the bundle to an empty pool — reusing THAT
-        would trade a loud `corpus-failed` create for an LLM call over nothing,
-        and would drop the retry the rebuild gave the size-1 path."""
+    async def test_a_failed_bundle_defers_without_a_rebuild(self):
+        """A corpus failure leaves the bundle an empty pool that is not a real
+        corpus. The size-1 path defers it, as a larger batch does; the parked
+        ticket's backoff retry is what assembles the corpus again."""
         curator = TaskCurator(config=_make_config(), taskmaster=None)
         build = AsyncMock(return_value=(
             _pool_with_ids(('rebuilt-1', 'pending')),
@@ -5480,12 +5338,12 @@ class TestSizeOneBatchReusesThePreparedCorpus:
         )
         with patch.object(curator, '_build_corpus', new=build), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=llm):
-            decisions = await curator.curate_batch_prepared([prepared], 'p', '/x')
+            [decision] = await curator.curate_batch_prepared([prepared], 'p', '/x')
 
-        assert build.await_count == 1
-        assert len(decisions) == 1
-        assert llm.await_args is not None
-        assert 'rebuilt-1' in llm.await_args.kwargs['prompt']
+        assert decision.action == 'defer'
+        assert decision.defer_reason is DeferReason.CORPUS_FAILED
+        assert build.await_count == 0
+        llm.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_prepare_candidate_records_the_corpus_failure(self):
@@ -5620,46 +5478,6 @@ class TestCurateBatchWholeBatchFailure:
         # Called in order: c1 first, c2 second.
         assert mock_curate.call_args_list[0].args[0] is c1
         assert mock_curate.call_args_list[1].args[0] is c2
-
-
-# ----------------------------------------------------------------------
-# curate_batch: AllAccountsCappedException now propagates
-# ----------------------------------------------------------------------
-
-
-class TestCurateBatchAllAccountsCapped:
-    @pytest.mark.asyncio
-    async def test_cap_exception_propagates_without_per_candidate_fallback(self):
-        """``AllAccountsCappedException`` from ``_call_llm_batch`` re-raises out of
-        ``curate_batch`` instead of fanning out to N×size-1 ``curate()`` calls.
-
-        Each fallback ``curate()`` would itself burn the ~10-min cap-retry
-        loop; the worker is responsible for deferring the whole batch via
-        :meth:`UsageGate.wait_for_open` (see Fix R5 / R2).
-        """
-        config = _make_config()
-        curator = TaskCurator(config=config, taskmaster=None)
-        c1 = CandidateTask(title='Cap One')
-        c2 = CandidateTask(title='Cap Two')
-
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch.object(
-                 curator, '_call_llm_batch',
-                 new=AsyncMock(side_effect=AllAccountsCappedException(
-                     retries=3, elapsed_secs=90.0,
-                     label='task-curator-batch[p]',
-                 )),
-             ), \
-             patch.object(curator, 'curate', new=AsyncMock()) as mock_curate, \
-             pytest.raises(AllAccountsCappedException):
-            await curator.curate_batch([c1, c2], 'p', '/x')
-
-        # Cap exhaustion must NOT trigger the size-1 curate() fallback
-        # (each fallback would repeat the cap-retry storm).
-        assert mock_curate.await_count == 0
 
 
 # ----------------------------------------------------------------------
@@ -6073,29 +5891,6 @@ class TestCuratorCapWaitSanityBound:
         _, kwargs = mock.call_args
         assert kwargs['cap_wait_sanity_secs'] == _CURATOR_CAP_WAIT_SANITY_SECS
 
-    @pytest.mark.asyncio
-    async def test_regression_cap_handling_behavior_preserved(self):
-        """(d) AllAccountsCappedException from _call_llm still yields action='create'
-        from curate() — fast-fail/defer contract is preserved with the new explicit bound."""
-        config = _make_config()
-        curator = TaskCurator(config=config, taskmaster=None)
-
-        cap_exc = AllAccountsCappedException(
-            retries=3, elapsed_secs=90.0, label='task-curator[p]'
-        )
-
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(side_effect=cap_exc)):
-            result = await curator.curate(
-                CandidateTask(title='T'), project_id='p', project_root='/x',
-            )
-
-        assert result.action == 'create'
-        assert result.justification == 'all-accounts-capped'
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -7294,8 +7089,8 @@ class TestZeroOutputBreakerBatchPath:
         )
 
     async def test_breaker_open_gates_batch_llm_calls(self):
-        """With breaker OPEN, curate_batch_prepared short-circuits all LLM-bound
-        candidates to action='create' without invoking invoke_with_cap_retry."""
+        """With breaker OPEN, curate_batch_prepared defers all LLM-bound
+        candidates without invoking invoke_with_cap_retry."""
         from fused_memory.middleware.task_curator import PreparedCandidate
 
         config = _make_config()
@@ -7336,66 +7131,14 @@ class TestZeroOutputBreakerBatchPath:
                 prepared, project_id='p', project_root='/x',
             )
 
-        # (a) Every returned decision must be action='create' (short-circuit).
+        # (a) Every returned decision is a breaker deferral (short-circuit).
         assert len(decisions) == 2
         for decision in decisions:
-            assert decision.action == 'create'
-            assert 'zero-output-breaker' in decision.justification
+            assert decision.action == 'defer'
+            assert decision.defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
 
         # (b) LLM must NOT have been invoked for the batch dispatch.
         assert mock_llm.await_count == call_count_before_batch
-
-    async def test_breaker_open_batch_decisions_count_toward_degraded_streak(self):
-        """esc-4448-11: while the breaker is open the batch path files every
-        candidate without dedupe, so each short-circuited decision is degraded
-        and advances the class-agnostic streak — the same as the size-1
-        curate() breaker-open path. Otherwise a batch-dominant deployment could
-        sit behind an open breaker indefinitely with the alarm silent."""
-        from fused_memory.middleware.task_curator import PreparedCandidate
-
-        config = _make_config()
-        config.curator.zero_output_breaker_threshold = 1
-        config.curator.zero_output_breaker_cooldown_seconds = 600.0
-        config.curator.degraded_streak_threshold = 5
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
-        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
-
-        mock_llm = AsyncMock(return_value=self._zot_result())
-
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        # One ZOT opens the breaker (and is itself degraded: streak 1).
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=mock_llm):
-            await curator.curate(
-                CandidateTask(title='Opener'), project_id='p', project_root='/x',
-            )
-        escalator.report_consecutive_degraded.assert_not_awaited()
-
-        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
-        prepared = [
-            PreparedCandidate(
-                candidate=CandidateTask(title=f'Batch {i}', description=f'body {i}'),
-                pool=[], pool_sizes=empty_sizes, prompt_tokens=20,
-            )
-            for i in range(config.curator.degraded_streak_threshold)
-        ]
-        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=mock_llm):
-            decisions = await curator.curate_batch_prepared(
-                prepared, project_id='p', project_root='/x',
-            )
-
-        assert mock_llm.await_count == 1
-        assert [d.justification for d in decisions] == (
-            ['zero-output-breaker-open'] * len(prepared)
-        )
-        assert all(d.action == 'create' and d.degraded for d in decisions)
-        escalator.report_consecutive_degraded.assert_awaited_once()
 
     async def test_batch_zot_without_preopen_trips_breaker(self):
         """A curate_batch_prepared call (no pre-opened breaker) where all candidates
@@ -7445,7 +7188,7 @@ class TestZeroOutputBreakerBatchPath:
 
         llm_calls_after_first = mock_llm.await_count  # 1 (the ZOT call)
 
-        # Second batch: 3 candidates, breaker is open → all short-circuited.
+        # Second batch: 3 candidates, breaker is open → all deferred.
         prepared_second = [
             PreparedCandidate(
                 candidate=CandidateTask(title=f'Post-breaker {i}', description=f'd{i}'),
@@ -7461,8 +7204,8 @@ class TestZeroOutputBreakerBatchPath:
 
         assert len(second_decisions) == 3
         for d in second_decisions:
-            assert d.action == 'create'
-            assert 'zero-output-breaker' in d.justification
+            assert d.action == 'defer'
+            assert d.defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
 
         # No LLM calls during second batch (breaker-open gate).
         assert mock_llm.await_count == llm_calls_after_first

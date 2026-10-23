@@ -16,6 +16,30 @@
       "severity": "suggestion",
       "description": "The diagnostic for duplicate template names reports the indices but not the file/line where each template was defined. Adding span information would help users locate and fix the duplicates.",
       "mutation_type": "real_world"
+    },
+    {
+      "id": "rs_real_01_pool_01",
+      "location": "crates/reify-compiler/src/scc.rs:15",
+      "category": "idiom_and_comments",
+      "severity": "suggestion",
+      "description": "Duplicate detection uses get-then-insert (two hash lookups) with reviewer-facing comments ('Use explicit insertion so that duplicates are detected...', 'Keep the first entry (prev wins) \u2014 don't overwrite.') explaining the branch; HashMap::entry with Vacant/Occupied, already used for duplicate function signatures in lib.rs, expresses first-wins directly without the prose.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "rs_real_01_pool_02",
+      "location": "crates/reify-compiler/src/scc.rs:22",
+      "category": "redundant_unreachable_check",
+      "severity": "suggestion",
+      "description": "The only caller (compile, lib.rs:3981) receives templates already deduplicated by seen_entity_names, which emits a span-labelled 'duplicate entity definition' error and compiles only the first definition, so the new duplicate branch is unreachable from user source and duplicates an existing user-facing policy; if ever reached it would emit a second, span-less error citing internal Vec indices. The task explicitly asked for an error Diagnostic here, so the findings' debug_assert alternative contradicts the brief; the real residue is the unreachability and the uninformative message.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "rs_real_01_pool_03",
+      "location": "crates/reify-compiler/src/scc.rs:277",
+      "category": "weak_test",
+      "severity": "blocking",
+      "description": "duplicate_template_names_emits_diagnostic only checks that some diagnostic message contains 'duplicate': it does not assert error severity (which the task's test_strategy requires), that exactly one such diagnostic is emitted, or that the name index resolves to the first template (the determinism the task asks to fix and document). Both templates are empty, so reverting to last-wins collect() plus a separate warning would still pass.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "context": {

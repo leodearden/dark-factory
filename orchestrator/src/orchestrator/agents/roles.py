@@ -14,10 +14,11 @@ from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
 from orchestrator.agents.grep_pattern_guidance import GREP_PATTERN_ESCAPING_GUIDANCE
 from orchestrator.agents.partial_failure_guidance import MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
 from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
+from orchestrator.agents.pipeline_status_guidance import PIPELINE_EXIT_STATUS_GUIDANCE
 from orchestrator.agents.pkill_guidance import PKILL_SELF_MATCH_GUIDANCE
 from orchestrator.agents.premise_refutation_guidance import PREMISE_REFUTATION_GUIDANCE
 from orchestrator.agents.python_literal_guidance import PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
-from orchestrator.agents.sigpipe_guidance import SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
+from orchestrator.agents.review_briefing import ReviewBriefing
 
 # Maps each MCP-family name to the allowed_tools prefixes that "belong" to
 # it.  Used by AgentRole.__post_init__ (below) to enforce that wiring a tool
@@ -28,8 +29,7 @@ from orchestrator.agents.sigpipe_guidance import SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
 # did not exist and the Lever-C fast-path silently always fell through to the
 # architect).  jcodemunch tools intentionally have no prefix entry here — they
 # ride inside the 'orchestrator' MCP config but are not themselves a trigger
-# for requiring a family (a role may use jcodemunch alone with no family
-# declared, e.g. reviewer_comprehensive).
+# for requiring a family.
 _FAMILY_TOOL_PREFIXES: dict[str, tuple[str, ...]] = {
     'orchestrator': ('mcp__fused-memory__', 'mcp__escalation__'),
     'plan_tools': ('mcp__plan-tools__',),
@@ -68,6 +68,24 @@ class AgentRole:
     # whenever the paired CONTRACT changes materially, invalidating any stale
     # pinned artifact for the old contract). None when prompt_spec is None.
     prompt_harness_version: str | None = None
+
+    @property
+    def strict_mcp_scope(self) -> bool:
+        """Whether this role's whole MCP surface is its declared families.
+
+        True when it declares a family, none is 'orchestrator', and every
+        mcp__ grant falls under a declared family's prefix.
+        """
+        if not self.mcp_families or 'orchestrator' in self.mcp_families:
+            return False
+        declared_prefixes = tuple(
+            prefix for family in self.mcp_families for prefix in _FAMILY_TOOL_PREFIXES[family]
+        )
+        return all(
+            tool.startswith(declared_prefixes)
+            for tool in self.allowed_tools
+            if tool.startswith('mcp__')
+        )
 
     def __post_init__(self) -> None:
         """Import-time capability assertion (W9-η, reify esc-4943-54 class).
@@ -714,12 +732,11 @@ A killed run says NOTHING about the code under test: it is neither failing nor
 hanging. Never report it as a test failure or a hang. Say it was killed
 externally, and quote the raw code.
 
-Do NOT pipe a long run into `| tail`, `| head` or `| grep`. Bash here runs
-without `pipefail`, so a pipeline reports its LAST stage's status and the real
-exit code is thrown away. A kill that takes the process group also takes
-whatever was buffered in the pipe, leaving a code and no output. Redirect to a
-file and `Read` the file: a killed run then still leaves its partial output
-on disk.
+Do NOT pipe a long run into `| tail`, `| head` or `| grep`. A kill that takes
+the process group also takes whatever was buffered in the pipe, leaving a code
+and no output. Redirect to a file and `Read` the file: a killed run then still
+leaves its partial output on disk. For what a pipe does to the exit code
+itself, see the pipeline exit-status section below.
 
 To diagnose a 137, re-run it once, on ONE line:
 
@@ -762,9 +779,9 @@ BACKGROUND_WAIT_GUIDANCE = (
 # that for ~8% of the block's bytes.
 #
 # THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
-# BACKGROUND_WAIT_GUIDANCE 10022 B (= BACKGROUND_TASK_WARNING 1193 +
-# WAIT_PATTERN_GUIDANCE 6411 + EXTERNAL_KILL_GUIDANCE 2418),
-# WAIT_PATTERN_REMINDER 766 B -> 766/10022 = 7.6%.
+# BACKGROUND_WAIT_GUIDANCE 9992 B (= BACKGROUND_TASK_WARNING 1193 +
+# WAIT_PATTERN_GUIDANCE 6411 + EXTERNAL_KILL_GUIDANCE 2388),
+# WAIT_PATTERN_REMINDER 766 B -> 766/9992 = 7.7%.
 # Re-derive rather than trust these after any edit to the strings:
 #   python -c "from orchestrator.agents.roles import *; \
 #              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
@@ -1308,7 +1325,7 @@ _BASH_CAPABLE_ROLE_PREAMBLE = (
     + PATH_NOT_FOUND_GUIDANCE
     + BASH_CWD_ANCHOR_GUIDANCE
     + FILE_LOOKUP_GUIDANCE
-    + SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
+    + PIPELINE_EXIT_STATUS_GUIDANCE
     + PREMISE_REFUTATION_GUIDANCE
 )
 
@@ -1702,7 +1719,8 @@ You are a debugger. You fix test, lint, and type-check failures.
 ## Context
 
 You will be given:
-- The failure output (test errors, lint violations, type errors)
+- The failure output (test errors, lint violations, type errors). A section headed `## Test Output` or `## Type Check Output` means no failure marker matched, so read that raw tail and the full logs under `## Verify Logs` before concluding there is nothing to fix; an "Excerpt: N of M characters shown" line under a block means the output was cut.
+- Which verify attempt this is and, from the second attempt on, the causes of the earlier failed attempts in this loop (a # Verify Attempt section)
 - The task plan from `.task/plan.json` — a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets)
 - The iteration history from `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT symlinked into the lane)
 
@@ -1768,7 +1786,9 @@ still ends up staged.
 # _REVIEWER_HEURISTICS_TEMPLATE is the EDITABLE judgment guidance (the
 # blocking-vs-suggestion rules, CODE_QUALITY_GUIDANCE per PRD
 # tier1-prompt-optimization D-3, and the specialization footer) that a pinned
-# artifact may override.
+# artifact may override. It is the incumbent (ReviewBriefing.DIFF_ONLY)
+# generation; the context-complete generation (task 5369) differs from it in
+# Rule 2 alone, and both come out of _reviewer_heuristics_template.
 #
 # Both templates are per-role (interpolate {name}/{specialization}) and built
 # via build_reviewer_prompt_spec(name, specialization) rather than module-level
@@ -1824,40 +1844,86 @@ the severity rules below say:
    the brief; the implementer is told to quote the order there.
 """
 
-_REVIEWER_HEURISTICS_TEMPLATE = """\
-## Rules
-
-1. **Be specific.** Every issue must have a file location and concrete description.
-2. **Blocking means broken.** Use `blocking` ONLY for issues that will cause runtime errors,
-   data corruption, security vulnerabilities, or API contract violations **within the scope
-   of this task**. Do not block on:
+_DO_NOT_BLOCK_ON = """\
    - Design concerns that are valid but outside this task's scope
    - Edge cases that cannot occur given the task's stated constraints
    - Missing features that belong in a follow-up task
    - Formatting or layout preferences
+"""
 
+_BLOCKING_MEANS_BROKEN = """\
+2. **Blocking means broken.** Use `blocking` ONLY for issues that will cause runtime errors,
+   data corruption, security vulnerabilities, or API contract violations **within the scope
+   of this task**. Do not block on:
+""" + _DO_NOT_BLOCK_ON + """
    Naming and structure are NOT preferences: judge them under the code-quality heuristics
    below. A heuristic violation is always reportable; it is `blocking` only when it also
    meets this rule's definition of broken, and otherwise a `suggestion`.
+"""
+
+# The context-complete generation's Rule 2 (task 5369). "Broken" stays a
+# blocking ground; the second ground replaces the unanchored design/quality
+# blocking language with a cited heuristic plus the next change it taxes.
+# Worded for every project: one roles.py prompt serves them all.
+_BLOCK_ON_A_STATED_GROUND = """\
+2. **Block only on a stated ground.** Use `blocking` ONLY when you can state one of these
+   about the change, within this task's scope: it is broken (a runtime error, data
+   corruption, a security vulnerability or an API-contract violation); or it violates a
+   code-quality heuristic below that you cite by number and name, AND you name the concrete
+   next change it makes costlier or riskier — e.g. a name that lies about what the code
+   does, a new reach-back import, a status string that is really an enum, a test that
+   patches a private dotted path. Anything you cannot state either way is a `suggestion`.
+   Do not block on:
+""" + _DO_NOT_BLOCK_ON + """
+   Naming and structure are NOT preferences: judge them under the code-quality heuristics
+   below.
+"""
+
+
+def _reviewer_heuristics_template(rule_2: str) -> str:
+    """The reviewer HEURISTICS template around *rule_2*, the one part generations vary."""
+    return """\
+## Rules
+
+1. **Be specific.** Every issue must have a file location and concrete description.
+""" + rule_2 + """\
 3. **When in doubt, suggest.** If you're unsure whether something is blocking, it's a suggestion.
 4. **Read the codebase** to understand context before judging patterns or naming.
 """ + CODE_QUALITY_GUIDANCE + """
 ## Your Specialization: {specialization}
 """
 
+
+_REVIEWER_HEURISTICS_TEMPLATE = _reviewer_heuristics_template(_BLOCKING_MEANS_BROKEN)
+
+_REVIEWER_HEURISTICS_TEMPLATES: dict[ReviewBriefing, str] = {
+    ReviewBriefing.DIFF_ONLY: _REVIEWER_HEURISTICS_TEMPLATE,
+    ReviewBriefing.CONTEXT_COMPLETE: _reviewer_heuristics_template(_BLOCK_ON_A_STATED_GROUND),
+}
+
 # Bumped whenever _REVIEWER_CONTRACT_TEMPLATE changes materially, so a stale
 # per-(prompt, model, harness) pinned artifact stops resolving and falls back
 # to the (new) in-code baseline instead of pairing new heuristics with an
 # outdated contract assumption (mirrors _CURATOR_PROMPT_HARNESS_VERSION).
+# Each generation has its own, so a pinned incumbent artifact can never
+# resolve for the context-complete role, whose prompt_id is the same.
 _REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v1'
 
+_REVIEWER_PROMPT_HARNESS_VERSIONS: dict[ReviewBriefing, str] = {
+    ReviewBriefing.DIFF_ONLY: _REVIEWER_PROMPT_HARNESS_VERSION,
+    ReviewBriefing.CONTEXT_COMPLETE: 'reviewer-d2-v1',
+}
 
-def build_reviewer_prompt_spec(name: str, specialization: str) -> PromptSpec:
+
+def build_reviewer_prompt_spec(
+    name: str, specialization: str, briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY,
+) -> PromptSpec:
     """Build the per-role reviewer :class:`PromptSpec` for (name, specialization).
 
     Both templates interpolate ``{name}``/``{specialization}``, so — unlike
     the curator's single global spec — every reviewer role gets its own
-    ``PromptSpec`` (``prompt_id=f'reviewer_{name}'``).
+    ``PromptSpec`` (``prompt_id=f'reviewer_{name}'``). *briefing* picks the
+    HEURISTICS generation; the CONTRACT is the same for every generation.
     """
     return PromptSpec(
         prompt_id=f'reviewer_{name}',
@@ -1865,12 +1931,17 @@ def build_reviewer_prompt_spec(name: str, specialization: str) -> PromptSpec:
             _REVIEWER_CONTRACT_TEMPLATE.format(name=name, specialization=specialization)
             + REVIEWER_INV12_BLOCKERS
         ),
-        baseline_heuristics=_REVIEWER_HEURISTICS_TEMPLATE.format(specialization=specialization),
+        baseline_heuristics=_REVIEWER_HEURISTICS_TEMPLATES[briefing].format(
+            specialization=specialization,
+        ),
     )
 
 
-def _reviewer_role(name: str, specialization: str) -> AgentRole:
-    spec = build_reviewer_prompt_spec(name, specialization)
+def build_reviewer_role(
+    name: str, specialization: str, briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY,
+) -> AgentRole:
+    """The ``reviewer_<name>`` role of the *briefing* generation."""
+    spec = build_reviewer_prompt_spec(name, specialization, briefing)
     return AgentRole(
         name=f'reviewer_{name}',
         system_prompt=spec.in_code_constant,
@@ -1881,12 +1952,11 @@ def _reviewer_role(name: str, specialization: str) -> AgentRole:
         default_max_turns=30,
         mcp_families=frozenset({'verdict_tools'}),
         prompt_spec=spec,
-        prompt_harness_version=_REVIEWER_PROMPT_HARNESS_VERSION,
+        prompt_harness_version=_REVIEWER_PROMPT_HARNESS_VERSIONS[briefing],
     )
 
 
-REVIEWER_COMPREHENSIVE = _reviewer_role(
-    'comprehensive',
+_COMPREHENSIVE_SPECIALIZATION = (
     'Comprehensive code review covering ALL of the following areas:\n\n'
     '1. **Test coverage and quality**: Are the right behaviors tested? '
     'Meaningful assertions? Untested failure modes? Edge cases? '
@@ -1920,7 +1990,13 @@ REVIEWER_COMPREHENSIVE = _reviewer_role(
     'The discriminator is executable — if fully rewording the surrounding '
     'sentence while keeping the identifier leaves the check green, it is '
     'referential integrity, not a wording pin. See '
-    '`orchestrator/tests/test_marker_registration_drift.py`.',
+    '`orchestrator/tests/test_marker_registration_drift.py`.'
+)
+
+REVIEWER_COMPREHENSIVE = build_reviewer_role('comprehensive', _COMPREHENSIVE_SPECIALIZATION)
+
+REVIEWER_COMPREHENSIVE_CONTEXT_COMPLETE = build_reviewer_role(
+    'comprehensive', _COMPREHENSIVE_SPECIALIZATION, ReviewBriefing.CONTEXT_COMPLETE,
 )
 
 
@@ -2040,6 +2116,18 @@ Include in the escalation summary (and in the `submit_merge_disposition`
 reason): the list of dropped files and a one-line description of what each
 dropped file contributes that the kept side lacks.
 
+## A Conflict Resolved by a Script, Never by Hand
+
+In a repository carrying `scripts/split_merge_lane_ratchet_ledger.py` (dark-factory):
+a modify/delete conflict on `orchestrator/tests/merge_lane_ratchet_authorized_raises.json`
+means this branch appended a raise entry to the RETIRED single-array ledger,
+which main has split into one file per entry under
+`orchestrator/tests/merge_lane_ratchet_raises/`. Resolve it ONLY by running
+`python3 scripts/split_merge_lane_ratchet_ledger.py` from the worktree root, then
+`git add -A orchestrator/tests`: it writes each entry as its file and deletes the
+array. Never `git rm` the array (that silently drops this branch's entries) and
+never keep it.
+
 ## CRITICAL: Git Staging Rules
 
 Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
@@ -2077,9 +2165,12 @@ commits; the architect+implementer pair is skipped, but verify/review/merge
 still run). Declare "simple" only when the change is a single coherent edit
 — docs or comments, a rename, a localized behaviour-preserving refactor, a
 typo/wording fix, a one-spot bug fix — that needs no new abstraction and no
-cross-module design, and you can name the target file(s). It is fine for a
-simple task to be high priority or to touch several files/modules, as long
-as the change is mechanically simple. When unsure, omit it — the full path
+cross-module design, and you can name the target file(s). Declaring
+"simple" REQUIRES a non-empty metadata.files naming those files: a fileless
+simple submission is rejected at submit (SimpleTaskFilesRequired), and
+files=[] does not satisfy it. It is fine for a simple task to be high
+priority or to touch several files/modules, as long as the change is
+mechanically simple. When unsure, omit it — the full path
 is the safe default, and a mis-declared task simply falls back to the
 architect.\
 """
@@ -2881,6 +2972,16 @@ git add -- .
 
 
 ALL_REVIEWERS = [REVIEWER_COMPREHENSIVE]
+
+_REVIEWERS: dict[ReviewBriefing, list[AgentRole]] = {
+    ReviewBriefing.DIFF_ONLY: ALL_REVIEWERS,
+    ReviewBriefing.CONTEXT_COMPLETE: [REVIEWER_COMPREHENSIVE_CONTEXT_COMPLETE],
+}
+
+
+def reviewers_for(briefing: ReviewBriefing) -> list[AgentRole]:
+    """The reviewer roster a dispatch of the *briefing* generation runs."""
+    return _REVIEWERS[briefing]
 
 ROLES = {
     'architect': ARCHITECT,

@@ -886,6 +886,20 @@ def node_path() -> str:
     return path
 
 
+def bug_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Every captured WARNING a dashboard handler logs for its own bug, never an outage.
+
+    Matches the sentence ``dashboard/src/dashboard/api/tasks.py::_unknown_after_contract_break``,
+    ``dashboard/src/dashboard/api/tasks.py::_unknown_after_unexpected_error``
+    and the fan-out's catch-all in ``dashboard/src/dashboard/data/active_tasks.py``
+    all put in their message.
+    """
+    return [
+        record.getMessage() for record in caplog.records
+        if 'this is a BUG, not an outage' in record.getMessage()
+    ]
+
+
 # ---------------------------------------------------------------------------
 # JSX source slicing.
 #

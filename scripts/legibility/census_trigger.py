@@ -466,6 +466,16 @@ def evaluate(
 # load_census_state — §7.5 census-state.json reader (three-valued)
 # ---------------------------------------------------------------------------
 
+CENSUS_STATE_RELPATH = Path("docs") / "legibility" / "census-state.json"
+
+
+def census_state_path(project_root: str | Path) -> Path:
+    """The ONE spelling of a project's census-state.json path: the census
+    writes it, the trigger reads it, and the nightly records it for
+    ``check_census_progress.py`` to re-read."""
+    return Path(project_root) / CENSUS_STATE_RELPATH
+
+
 _STATE_TIMESTAMP_KEYS = ("last_census_at", "session_watermark")
 
 
@@ -1484,9 +1494,7 @@ def decide_for_project(
 
     config = load_census_config(project_root)
 
-    state_status, state = load_census_state(
-        project_root / "docs" / "legibility" / "census-state.json"
-    )
+    state_status, state = load_census_state(census_state_path(project_root))
     if state_status == "malformed":
         return Decision(
             fire=False,

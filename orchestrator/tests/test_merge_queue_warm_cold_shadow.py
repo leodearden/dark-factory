@@ -836,10 +836,10 @@ class TestSubmitShadowDivergenceEscalation:
 
 
 # ---------------------------------------------------------------------------
-# Step-11: create_throwaway_verify_worktree (real-git) + _run_shadow_compare
+# Step-11: create_ephemeral_verify_worktree (real-git) + _run_shadow_compare
 # ---------------------------------------------------------------------------
 
-# --- Real-git fixtures for create_throwaway_verify_worktree ---
+# --- Real-git fixtures for create_ephemeral_verify_worktree ---
 
 
 async def _setup_repo(repo: Path) -> None:
@@ -875,71 +875,70 @@ def git_ops_wcs(git_repo_wcs: Path) -> GitOps:
     return GitOps(git, git_repo_wcs)
 
 
-class TestCreateThrowawayVerifyWorktree:
-    """Tests for git_ops.create_throwaway_verify_worktree (step-11 real-git).
+class TestCreateEphemeralVerifyWorktree:
+    """Behavioural pin of the public GitOps.create_ephemeral_verify_worktree.
 
-    (1) Verifies create_throwaway_verify_worktree creates an EPHEMERAL
-    _merge-<uuid> worktree (not the warm _merge-verify path) checked out at
-    merge_commit, and that cleanup_merge_worktree removes it.
+    It creates a ``_merge-<uuid>`` worktree directly under worktree_base,
+    detached at the given sha, never the fixed warm ``_merge-verify`` path;
+    cleanup_merge_worktree removes it.
     """
 
     @pytest.mark.asyncio
-    async def test_creates_ephemeral_worktree_at_merge_commit(
+    async def test_create_ephemeral_verify_worktree_is_detached_merge_uuid_at_sha(
         self, git_ops_wcs: GitOps, git_repo_wcs: Path
     ) -> None:
-        # Resolve the current HEAD SHA (a real commit in the repo)
         _, sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo_wcs)
-        merge_commit = sha_out.strip()
+        sha = sha_out.strip()
 
-        wt = await git_ops_wcs.create_throwaway_verify_worktree(merge_commit)
+        wt = await git_ops_wcs.create_ephemeral_verify_worktree(sha)
 
         try:
-            assert wt.exists(), f'Throwaway worktree dir must exist: {wt}'
-            # Name must start with _merge- (ephemeral UUID)
+            assert wt.exists(), f'Ephemeral worktree dir must exist: {wt}'
             assert wt.name.startswith('_merge-'), (
                 f'Expected _merge-<uuid>, got {wt.name!r}'
             )
-            # Must be checked out at the requested commit
+            assert wt.resolve().parent == git_ops_wcs.worktree_base.resolve()
             _, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
-            assert head_out.strip() == merge_commit, (
-                f'Worktree HEAD {head_out.strip()!r} != merge_commit {merge_commit!r}'
+            assert head_out.strip() == sha, (
+                f'Worktree HEAD {head_out.strip()!r} != sha {sha!r}'
             )
+            symref_rc, _, _ = await _run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=wt)
+            assert symref_rc != 0, 'Ephemeral worktree HEAD must be detached'
         finally:
             await git_ops_wcs.cleanup_merge_worktree(wt)
 
     @pytest.mark.asyncio
-    async def test_path_is_not_persistent_merge_verify(
+    async def test_create_ephemeral_verify_worktree_is_never_persistent_merge_verify(
         self, git_ops_wcs: GitOps, git_repo_wcs: Path
     ) -> None:
         _, sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo_wcs)
-        merge_commit = sha_out.strip()
+        sha = sha_out.strip()
 
-        wt = await git_ops_wcs.create_throwaway_verify_worktree(merge_commit)
+        wt = await git_ops_wcs.create_ephemeral_verify_worktree(sha)
 
         try:
-            # Path must NOT be the persistent warm worktree
             persistent = git_ops_wcs.persistent_merge_worktree_path
             assert wt.resolve() != persistent.resolve(), (
-                f'Throwaway path must not be {persistent}'
+                f'Ephemeral path must not be {persistent}'
             )
             assert wt.name != '_merge-verify', (
-                f'Throwaway name must not be _merge-verify; got {wt.name!r}'
+                f'Ephemeral name must not be _merge-verify; got {wt.name!r}'
             )
         finally:
             await git_ops_wcs.cleanup_merge_worktree(wt)
 
     @pytest.mark.asyncio
-    async def test_cleanup_removes_throwaway_worktree(
+    async def test_create_ephemeral_verify_worktree_is_removed_by_cleanup(
         self, git_ops_wcs: GitOps, git_repo_wcs: Path
     ) -> None:
         _, sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo_wcs)
-        merge_commit = sha_out.strip()
+        sha = sha_out.strip()
 
-        wt = await git_ops_wcs.create_throwaway_verify_worktree(merge_commit)
+        wt = await git_ops_wcs.create_ephemeral_verify_worktree(sha)
         assert wt.exists()
 
         await git_ops_wcs.cleanup_merge_worktree(wt)
-        assert not wt.exists(), 'cleanup_merge_worktree must remove the throwaway worktree'
+        assert not wt.exists(), 'cleanup_merge_worktree must remove the ephemeral worktree'
 
 
 # --- _run_shadow_compare async tests (cold leg stubbed) ---

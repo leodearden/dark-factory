@@ -43,6 +43,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_CONSOLIDATION_OP,
     DISALLOW_CONSOLIDATION_PROPOSALS,
+    DISALLOW_ESCALATION_MERGE_LANE_CONTROL,
     DISALLOW_ESCALATION_READS,
     DISALLOW_ESCALATION_WRITES,
     DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES,
@@ -57,6 +58,9 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _extract_report,
     _normalize_report,
     run_stage_via_cli,
+)
+from fused_memory.reconciliation.consolidation_auto_executor import (
+    auto_consolidation_initial_stats,
 )
 from fused_memory.reconciliation.live_workflow_section import NO_PER_TASK_SIGNAL_TOKEN
 from fused_memory.reconciliation.prompts import (
@@ -79,12 +83,12 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _format_flagged,
     _git_show_name_only,
     _needs_hint_attention,
-    _queue_briefing_refresh_tasks,
     _render_done_provenance_section,
     _run_briefing_known_gaps_script,
     _select_proactive_sample,
     _suppress_same_run_human_operator_dups,
     _sweep_stale_mem0_flag_for_stage2_markers,
+    queue_briefing_refresh_tasks,
     retire_flag_markers_for_terminal_task,
     select_tasks_needing_hint_attention,
 )
@@ -208,7 +212,7 @@ class TestMockTypesConstant:
 #     record the caller holds and has just mutated, in the queue it is connected
 #     to — never an arbitrary per-task query, so it answers no existence
 #     question either.
-#   - merge_* / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
+#   - merge_* (except merge_relane, denied by DISALLOW_ESCALATION_MERGE_LANE_CONTROL) / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
 #     reload_config / get_task_runtime_state — orchestrator control-plane and
 #     merge-lane surface, unrelated to the escalation-record question.
 #
@@ -222,6 +226,9 @@ _REVIEWED_STAGE_SAFE = {
     # queue it can only ever answer "not found" — never a categorical [].
     'mcp__escalation__amend_escalation',
     'mcp__escalation__claim_warm_worktree',
+    # clear_verify_host_quarantine (task 6565) is merge-lane control plane: it
+    # re-admits a benched verify host and reads no per-task escalation state.
+    'mcp__escalation__clear_verify_host_quarantine',
     # declare_pin (task 4377) is stamp_triage's structural twin: a
     # restrictive-only write that marks a record as load-bearing.  Against the
     # reconciliation queue it can only ever answer "not found" — it reads no
@@ -514,6 +521,7 @@ class TestDisallowedToolLists:
             {
                 'DISALLOW_ESCALATION_READS': DISALLOW_ESCALATION_READS,
                 'DISALLOW_ESCALATION_WRITES': DISALLOW_ESCALATION_WRITES,
+                'DISALLOW_ESCALATION_MERGE_LANE_CONTROL': DISALLOW_ESCALATION_MERGE_LANE_CONTROL,
                 '_REVIEWED_STAGE_SAFE': _REVIEWED_STAGE_SAFE,
             },
             remedy=(
@@ -637,6 +645,20 @@ class TestDisallowedToolLists:
             assert set(DISALLOW_ESCALATION_WRITES).issubset(set(stage_list)), (
                 f'{name} must deny the escalation filing tools'
             )
+
+    def test_merge_relane_is_denied_in_every_stage(self):
+        """Operator merge-lane control: no reconciliation stage may re-prioritise merges."""
+        deps = _mock_stage_deps()
+        assert DISALLOW_ESCALATION_MERGE_LANE_CONTROL == ['mcp__escalation__merge_relane']
+        for stage_list in (STAGE1_DISALLOWED, STAGE2_DISALLOWED, STAGE3_DISALLOWED):
+            assert set(DISALLOW_ESCALATION_MERGE_LANE_CONTROL).issubset(set(stage_list))
+        for cls, stage_id in (
+            (MemoryConsolidator, StageId.memory_consolidator),
+            (TaskKnowledgeSync, StageId.task_knowledge_sync),
+            (IntegrityCheck, StageId.integrity_check),
+        ):
+            hook = set(cls(stage_id, **deps).get_disallowed_tools())
+            assert set(DISALLOW_ESCALATION_MERGE_LANE_CONTROL).issubset(hook)
 
     def test_escalate_blocker_stays_allowed_in_stage2_only(self):
         """Stage 2 keeps both filing tools for FIX D; Stages 1 and 3 deny escalate_blocker."""
@@ -2422,6 +2444,11 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # The auto-consolidation post-step's keys (task 5240). This bare
+            # AsyncMock memory's enabled_projects contains nothing, so the
+            # post-step stops at its project gate.
+            **auto_consolidation_initial_stats(),
+            'auto_consolidations_skipped_project': 1,
             # THIRTEEN keys from the two stale-edge sweeps, not the four this
             # task added (task 4386).  The count is what needs explaining: the
             # consolidator's per-sweep `else:` branch copies out the WHOLE key
@@ -2631,6 +2658,11 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # The auto-consolidation post-step's keys (task 5240). This bare
+            # AsyncMock memory's enabled_projects contains nothing, so the
+            # post-step stops at its project gate.
+            **auto_consolidation_initial_stats(),
+            'auto_consolidations_skipped_project': 1,
             # THIRTEEN keys from the two stale-edge sweeps, not the four this
             # task added (task 4386).  The count is what needs explaining: the
             # consolidator's per-sweep `else:` branch copies out the WHOLE key
@@ -5262,7 +5294,7 @@ class TestStage2HandoffShortfallWarning:
 
 
 class TestBriefingKnownGapsRefresh:
-    """Tests for _run_briefing_known_gaps_script and _queue_briefing_refresh_tasks helpers."""
+    """Tests for _run_briefing_known_gaps_script and queue_briefing_refresh_tasks helpers."""
 
     @pytest.fixture
     def mock_deps(self, tmp_path):
@@ -5380,7 +5412,7 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(warning_records[0], 'returncode', None) == 2
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks                                         #
+    # queue_briefing_refresh_tasks                                          #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5395,7 +5427,7 @@ class TestBriefingKnownGapsRefresh:
             {'task_id': '1820', 'title': 'Other', 'subproject': 'orchestrator', 'what': 'Other gap'},
         ]
 
-        await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+        await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert taskmaster.add_task.call_count == 2
 
@@ -5421,7 +5453,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+        result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         taskmaster.add_task.assert_not_called()
         assert '1751' in result['skipped']
@@ -5441,7 +5473,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+        result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         taskmaster.add_task.assert_called_once()
         assert '1751' not in result['skipped']
@@ -5469,7 +5501,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+        result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         # Neither near-miss deduped → add_task must be called exactly once
         taskmaster.add_task.assert_called_once()
@@ -5760,7 +5792,7 @@ class TestBriefingKnownGapsRefresh:
         assert isinstance(getattr(warning_records[0], 'error', None), str)
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks — exception path                        #
+    # queue_briefing_refresh_tasks — exception path                         #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5776,7 +5808,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger=_TKS_LOGGER,
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+            result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['failed'] == ['1751']
         assert result['created'] == []
@@ -5791,7 +5823,7 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(warning_records[0], 'task_id', None) == '1751'
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks — candidate_key dedup (task 2402)       #
+    # queue_briefing_refresh_tasks — candidate_key dedup (task 2402)        #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5820,7 +5852,7 @@ class TestBriefingKnownGapsRefresh:
             logging.INFO,
             logger=_TKS_LOGGER,
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+            result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['skipped'] == ['1751'], (
             f"expected the collision folded into skipped, got {result['skipped']!r}"
@@ -5852,7 +5884,7 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(dedup_records[0], 'existing_id', None) == 42
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks — unexpected-shape (contract-drift)     #
+    # queue_briefing_refresh_tasks — unexpected-shape (contract-drift)      #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5895,7 +5927,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger=_TKS_LOGGER,
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+            result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['created'] == [], (
             f'created should be [] when add_task returns {bogus_result!r}, got {result["created"]!r}'
@@ -5914,7 +5946,7 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(warning_records[0], 'task_id', None) == '1751'
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks — mixed success/failure in one call    #
+    # queue_briefing_refresh_tasks — mixed success/failure in one call     #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5944,7 +5976,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger=_TKS_LOGGER,
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+            result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['created'] == ['100', '300'], (
             f'expected created=[100, 300], got {result["created"]!r}'

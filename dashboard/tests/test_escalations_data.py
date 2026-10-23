@@ -167,7 +167,7 @@ class TestLoadQueueEscalations:
         """A well-formed non-``esc-*`` JSON file in the queue root is not an escalation.
 
         The queue directory has a second writer:
-        ``orchestrator/src/orchestrator/b3_gate.py::STATE_REL_PATH`` keeps
+        ``orchestrator/src/orchestrator/b3_gate.py::STATE_FILENAME`` keeps
         ``b3-state.json`` there.  Read as an escalation it becomes a row with
         no ``id``.  It is a permanent resident, not a read failure, so it is
         not reported in *skipped* either.
@@ -778,7 +778,7 @@ class TestOwnerAttribution:
 
         (row,) = _sub(_build(config, active), 'reconciliation')['escalations']
 
-        assert row['project'] == 'proj'
+        assert row['project'] == 'b/proj'
         assert row['project_root'] == str(other.resolve())
 
     def test_a_reconciliation_row_active_nowhere_has_no_owner(self, tmp_path):

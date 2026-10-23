@@ -89,6 +89,7 @@ PURE_STDLIB_LEAVES = (
     'task_statuses',
     'task_text_fingerprint',
     'task_transitions',
+    'testing_mcp_stub',
     'testing_reify_layout',
     'testing_streams',
     'testing_timeout_markers',

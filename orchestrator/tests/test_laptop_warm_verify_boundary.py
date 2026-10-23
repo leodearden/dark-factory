@@ -25,12 +25,13 @@ That single-source rule holds exactly where it decides anything, and task
 4014 added ONE deliberate, narrow exception on the other side of a
 discovery/assertion split:
 
-* ASSERTIONS -- ``subtree_and_leader_gone``, ``wait_subtree_gone`` -- and the
-  descendant set ``wait_subtree_live`` RETURNS still come only from the
-  production walkers ``collect_descendants``/``read_ppid_map``.  A kill
-  verdict on CAPTURED pids goes through ``wait_pids_exited`` (a zombie-aware
-  ``shared/src/shared/proc_group.py::read_stat_fields`` read), but the pids
-  themselves are still discovered only by those walkers.
+* ASSERTIONS -- every row's kill verdict goes through ``wait_pids_exited``
+  (a zombie-aware ``shared/src/shared/proc_group.py::read_stat_fields``
+  read), applied by ``assert_pre_kill_tree_exited`` to the pids
+  ``snapshot_pre_kill_tree`` captured while the leader was alive.  Those
+  pids, and the descendant set ``wait_subtree_live`` RETURNS, are still
+  discovered only by the production walkers
+  ``collect_descendants``/``read_ppid_map``.
 * the ARRANGE-phase discovery GATE adds a cheap Linux
   ``/proc/<pid>/task/*/children`` pre-filter (:func:`_read_direct_children`)
   that decides nothing except whether to spend a full rescan on a given poll
@@ -73,6 +74,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Callable, Mapping
+from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
@@ -492,11 +494,64 @@ class HeartbeatWriter:
 # ---------------------------------------------------------------------------
 
 
-def wait_for_pgid_file(path: Path, *, timeout: float | None = None, interval: float = 0.05) -> int:
+def describe_proc_exit(proc: subprocess.Popen, label: str) -> str:
+    """Name *proc*'s exit status -- and, once it has exited, its stderr tail.
+
+    The diagnostic a discovery wait appends on timeout: ``<label>
+    rc=<n|None>``.  *label* names *proc* in the message; pass e.g.
+    ``"dispatcher"`` when *proc* is a stand-in process rather than the leader
+    itself, so a reader doesn't apply the rc taxonomy below to the wrong
+    process.  For the LEADER specifically, that rc distinguishes a watchdog
+    self-kill (rc == 1, no ``Error:`` line), an exception exit (rc == 1 WITH
+    an ``Error:`` line), and a merely slow leader (rc is None) -- three
+    causes that were otherwise indistinguishable in every log this timeout
+    has ever produced; a non-leader *proc* follows its own exit-code
+    conventions, not this taxonomy.  ``stderr`` is read ONLY when
+    ``proc.poll()`` is not None, and even then via a ``select()``-bounded raw
+    read (2s ceiling) rather than a buffered ``.read()`` (which blocks to
+    EOF): ``poll()`` only reports *proc*'s own exit, and a short-lived helper
+    it spawned with inherited fds could still be holding the pipe's write end
+    open, which would hang this helper (and the rest of the suite) rather
+    than raise.  The tail (not head) is kept -- see :func:`stderr_tail` --
+    since the actionable line is at the END.
+    """
+    rc = proc.poll()
+    description = f'{label} rc={rc}'
+    if rc is not None and proc.stderr is not None:
+        try:
+            chunks = []
+            read_deadline = time.monotonic() + 2.0
+            fd = proc.stderr.fileno()
+            while True:
+                remaining = read_deadline - time.monotonic()
+                if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                    break
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            tail = stderr_tail(b''.join(chunks))
+        except Exception as e:  # noqa: BLE001
+            tail = f'<unreadable: {e!r}>'
+        description += f'; stderr tail:\n{tail}'
+    return description
+
+
+def wait_for_pgid_file(
+    path: Path,
+    *,
+    proc: subprocess.Popen | None = None,
+    proc_label: str = 'leader',
+    timeout: float | None = None,
+    interval: float = 0.05,
+) -> int:
     """Poll for a pgid file and return its int value.
 
     Written by ``verify-merge --request-id`` or by a :func:`sleeper_spec`
     build with *build_pgid_file*.
+
+    *proc*, when given, is the process whose exit a timeout failure reports,
+    under *proc_label* -- see :func:`describe_proc_exit`.
 
     *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
     the wait actually STARTS rather than at import, so a row beginning
@@ -509,7 +564,10 @@ def wait_for_pgid_file(path: Path, *, timeout: float | None = None, interval: fl
             with contextlib.suppress(ValueError):
                 return int(path.read_text().strip())
         time.sleep(interval)
-    raise AssertionError(f'pgid file {path} did not appear within {timeout}s')
+    message = f'pgid file {path} did not appear within {timeout}s'
+    if proc is not None:
+        message += f'; {describe_proc_exit(proc, proc_label)}'
+    raise AssertionError(message)
 
 
 def _read_direct_children(pid: int, *, _proc_root: Path = Path('/proc')) -> set[int] | None:
@@ -621,24 +679,8 @@ def wait_subtree_live(
     SEPARATE dispatcher process, that dispatcher) whose ``stdout``/``stderr``
     were opened with ``subprocess.PIPE`` -- see :func:`spawn_verify_merge`.
     It's optional so no existing call site is forced to change semantics.
-    *proc_label* names *proc* in the failure message (default ``"leader"``);
-    pass e.g. ``proc_label="dispatcher"`` when *proc* is a stand-in process
-    rather than the leader itself, so a reader doesn't apply the rc taxonomy
-    below to the wrong process.  When *proc* is given, a timeout failure
-    names its exit status (``<proc_label> rc=<n|None>``).  For the LEADER
-    specifically, that rc distinguishes a watchdog self-kill (rc == 1, no
-    ``Error:`` line), an exception exit (rc == 1 WITH an ``Error:`` line),
-    and a merely slow leader (rc is None) -- three causes that were
-    otherwise indistinguishable in every log this timeout has ever
-    produced; a non-leader *proc* follows its own exit-code conventions,
-    not this taxonomy.  ``stderr`` is read ONLY when ``proc.poll()`` is not
-    None, and even then via a ``select()``-bounded raw read (2s ceiling)
-    rather than a buffered ``.read()`` (which blocks to EOF): ``poll()``
-    only reports *proc*'s own exit, and a short-lived helper it spawned
-    with inherited fds could still be holding the pipe's write end open,
-    which would hang this helper (and the rest of the suite) rather than
-    raise.  The tail (not head) is kept -- see :func:`stderr_tail` -- since
-    the actionable line is at the END.
+    When given, a timeout failure reports its exit under *proc_label* -- see
+    :func:`describe_proc_exit`.
 
     *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
     the wait actually STARTS rather than at import, so a row beginning
@@ -671,25 +713,7 @@ def wait_subtree_live(
         time.sleep(interval)
     message = f'pgid {pgid}: no descendant appeared within {timeout}s'
     if proc is not None:
-        rc = proc.poll()
-        message += f'; {proc_label} rc={rc}'
-        if rc is not None and proc.stderr is not None:
-            try:
-                chunks = []
-                read_deadline = time.monotonic() + 2.0
-                fd = proc.stderr.fileno()
-                while True:
-                    remaining = read_deadline - time.monotonic()
-                    if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
-                        break
-                    chunk = os.read(fd, 65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                tail = stderr_tail(b''.join(chunks))
-            except Exception as e:  # noqa: BLE001
-                tail = f'<unreadable: {e!r}>'
-            message += f'; stderr tail:\n{tail}'
+        message += f'; {describe_proc_exit(proc, proc_label)}'
     raise AssertionError(message)
 
 
@@ -771,29 +795,6 @@ def wait_for_marker_stable(
     )
 
 
-def subtree_and_leader_gone(pgid: int) -> bool:
-    """True when *pgid* has no live descendants AND the pgid leader itself is gone."""
-    if collect_descendants(pgid, read_ppid_map()):
-        return False
-    try:
-        os.killpg(pgid, 0)
-        return False  # group still alive
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-
-
-def wait_subtree_gone(pgid: int, *, timeout: float, interval: float = 0.1) -> bool:
-    """Poll until subtree_and_leader_gone(pgid); return the final boolean (no raise)."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if subtree_and_leader_gone(pgid):
-            return True
-        time.sleep(interval)
-    return subtree_and_leader_gone(pgid)
-
-
 def read_proc_state(pid: int) -> StatFields | None:
     """*pid*'s stat fields, or None once it has no ``/proc`` entry.
 
@@ -804,7 +805,7 @@ def read_proc_state(pid: int) -> StatFields | None:
 
 
 def wait_pids_exited(
-    pids: set[int],
+    pids: AbstractSet[int],
     *,
     timeout: float,
     interval: float = 0.05,
@@ -832,6 +833,45 @@ def wait_pids_exited(
         if not running or _clock() >= deadline:
             return running
         time.sleep(interval)
+
+
+class PreKillTree(NamedTuple):
+    """A verify-merge leader's process tree, snapshotted while the leader was alive."""
+
+    leader: int
+    build: int
+    pids: frozenset[int]
+
+
+def snapshot_pre_kill_tree(leader: int, build: int) -> PreKillTree:
+    """Snapshot *leader*'s tree, which must contain the session-escaped *build*.
+
+    Call it only while the leader is provably alive: once the leader dies, the
+    ppid chain to the start_new_session build is severed and a walk from the
+    leader can no longer reach it.
+    """
+    pids = frozenset({leader} | collect_descendants(leader, read_ppid_map()))
+    assert build in pids, (
+        f'harness failure, not a seam defect: build pgid {build} is not in '
+        f'leader {leader}\'s subtree {sorted(pids)}'
+    )
+    return PreKillTree(leader=leader, build=build, pids=pids)
+
+
+def assert_pre_kill_tree_exited(tree: PreKillTree, *, timeout: float, after: str) -> None:
+    """Assert every pid in *tree* exits within *timeout* of the trigger named by *after*.
+
+    A zombie awaiting its subreaper counts as exited, as in :func:`wait_pids_exited`.
+    Only the snapshotted pids are judged: a process forked after the snapshot,
+    even into the leader's own group, is outside this verdict.
+    """
+    survivors = wait_pids_exited(tree.pids, timeout=timeout)
+    rendered = {pid: (s.state, s.ppid) for pid, s in sorted(survivors.items())}
+    assert not survivors, (
+        f'leader={tree.leader} build={tree.build}: {rendered} (pid: (state, ppid)) '
+        f'still running {timeout}s after {after}. S/T means SIGKILL never reached '
+        f'it; R/D means signalled but not yet run to exit'
+    )
 
 
 def _kill_pinned_holder(
@@ -1055,7 +1095,7 @@ ROW_WATCHDOG_ENV: dict[str, str] = {
     'ORCH_WATCHDOG_KILL_GRACE_SECS': str(ROW_WATCHDOG_KILL_GRACE_SECS),
 }
 
-#: Ceiling for the rows' child.wait()/wait_subtree_gone()/wait_pids_exited() polls: the full
+#: Ceiling for the rows' child.wait()/wait_pids_exited() polls: the full
 #: window plus load headroom.  A WEDGE-DETECTOR, not a speed assertion (the
 #: rows assert THAT the tree was killed, never how fast), so on the success
 #: path a wider ceiling costs zero wall-clock and is paid only when the test
@@ -1072,9 +1112,10 @@ ROW_TREE_KILL_CEILING_SECS: float = ROW_WATCHDOG_WINDOW_SECS + 15.0  # 30.0
 ROW_MARKER_CEILING_SECS: float = 20.0
 
 #: Base ceiling for the two DISCOVERY waits every row runs BEFORE the
-#: watchdog is even armed -- wait_for_pgid_file, then wait_subtree_live (Row
-#: 1: a second wait_for_pgid_file, on the build's own pgid file).  Rows
-#: 1/2/3 pass the resolved ceiling explicitly at their call sites below
+#: watchdog is even armed.  Rows 1-4 run wait_for_pgid_file twice -- once on
+#: the leader's pgid file, once on the build's own (sleeper_spec
+#: build_pgid_file); Row 5 runs wait_for_pgid_file, then wait_subtree_live.
+#: Rows 1-4 pass the resolved ceiling explicitly at their call sites below
 #: (instead of relying on the bare default) so this value and those defaults
 #: cannot silently drift apart.
 ROW_DISCOVERY_CEILING_BASE_SECS: int = 20
@@ -1225,8 +1266,8 @@ ROW_PER_TEST_TIMEOUT_SECS: int = int(
 )  # 390
 
 #: Row 5's own bounded terms.  It does not share Rows 1-4's shape -- no
-#: watchdog window, no wait_subtree_gone kill confirmation -- so it cannot
-#: share their constant, only their DERIVATION.  Named here (rather than
+#: watchdog window, no kill confirmation -- so it cannot share their
+#: constant, only their DERIVATION.  Named here (rather than
 #: passed as literals at the call sites) so the budget below and the waits it
 #: is supposed to cover move together.
 ROW5_WAITER_COMPLETION_CEILING_SECS: float = 60.0
@@ -1689,9 +1730,8 @@ def _timeout_mark_argument(func_node):
 def test_row5_per_test_timeout_covers_its_own_bounded_work():
     """Row 5's pytest timeout must cover ITS bounded worst case, and be DERIVED.
 
-    Row 5 does not share Rows 1-4's shape -- no watchdog window, no
-    ``wait_subtree_gone`` kill confirmation -- so it cannot share their
-    constant.  Its bounded terms are: two discovery waits (both on the
+    Row 5 does not share Rows 1-4's shape -- no watchdog window, no kill
+    confirmation -- so it cannot share their constant.  Its bounded terms are: two discovery waits (both on the
     load-scaled ceiling), the marker wait, the waiter subprocess's completion
     ceiling, and the ``finally`` block's TWO holder teardowns (waiter then
     holder).
@@ -2271,9 +2311,10 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 # test_read_direct_children_skips_a_sibling_thread_that_exits_mid_probe
 # below): the two timeout-diagnostic tests spawn a real `proc` because the
 # diagnostic message's CONTENT -- the leader's actual returncode and, where
-# applicable, its stderr tail -- is exactly what is under test.  The poll
-# loop each one drives still runs zero ticks (timeout=0, interval=0), so
-# timing stays zero even there.
+# applicable, its stderr tail -- is exactly what is under test.  Each test
+# covers BOTH discovery waiters (wait_subtree_live and wait_for_pgid_file),
+# since they share one exit diagnostic.  The poll loop each one drives still
+# runs zero ticks (timeout=0), so timing stays zero even there.
 # ---------------------------------------------------------------------------
 
 
@@ -2337,10 +2378,9 @@ def test_wait_subtree_live_skips_a_vanished_transient_and_returns_the_durable_se
 
     The helper must keep polling rather than hand back that empty set.  Two
     reasons: it makes the return contract "a NON-EMPTY descendant set"
-    total, and it biases what the rows observe toward the durable sleeper --
-    a transient that self-exits could otherwise let the ``wait_subtree_gone``
-    assertion each row makes next pass without the watchdog having killed
-    anything.
+    total, and it biases what a caller observes toward the durable sleeper --
+    a caller would otherwise mistake a transient ``git`` child for the
+    durable build.
     """
     probe_calls = [0]
     ppid_map_calls = [0]
@@ -2416,21 +2456,50 @@ def test_wait_subtree_live_falls_back_to_the_full_walk_when_children_unreadable(
     )
 
 
-def test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail():
+def _time_out_subtree_live(proc: subprocess.Popen, tmp_path: Path) -> None:
+    """Drive :func:`wait_subtree_live` straight into its timeout branch for *proc*."""
+    wait_subtree_live(
+        1234,
+        proc=proc,
+        proc_label='leader',
+        timeout=0,
+        interval=0,
+        _probe_children=lambda _pid: set(),
+        _ppid_map=lambda: {},
+    )
+
+
+def _time_out_build_pgid_file(proc: subprocess.Popen, tmp_path: Path) -> None:
+    """Drive :func:`wait_for_pgid_file` straight into its timeout branch for *proc*."""
+    wait_for_pgid_file(
+        tmp_path / 'never-written.pgid', proc=proc, proc_label='leader', timeout=0,
+    )
+
+
+_DISCOVERY_WAIT_TIMEOUTS = pytest.mark.parametrize(
+    'time_out',
+    [_time_out_subtree_live, _time_out_build_pgid_file],
+    ids=['wait_subtree_live', 'wait_for_pgid_file'],
+)
+
+
+@_DISCOVERY_WAIT_TIMEOUTS
+def test_discovery_wait_timeout_reports_leader_returncode_and_stderr_tail(time_out, tmp_path):
     """The timeout diagnostic names the LEADER's real rc and stderr tail (291a75a919).
 
     291a75a919 ("De-flake alpha: make wait_subtree_live's timeout path
-    self-diagnosing") added the ``proc``/``proc_label`` reporting in the
-    timeout branch above (:func:`wait_subtree_live`, ~:582-603) so a
-    watchdog self-kill (rc == 1, no ``Error:`` line), an exception exit
-    (rc == 1 WITH an ``Error:`` line), and a merely slow leader (rc is
-    None) are distinguishable from the failure message alone -- exactly the
-    signal an incident needs. It shipped with no test (task 4312).
+    self-diagnosing") added the ``proc``/``proc_label`` reporting now owned
+    by :func:`describe_proc_exit`, which both discovery waiters append on
+    timeout, so a watchdog self-kill (rc == 1, no ``Error:`` line), an
+    exception exit (rc == 1 WITH an ``Error:`` line), and a merely slow
+    leader (rc is None) are distinguishable from the failure message alone
+    -- exactly the signal an incident needs. It shipped with no test (task
+    4312).
 
-    Deterministic per the task-4014 precedent above: ``_probe_children``
-    always reports no children and ``timeout=0`` so the poll body never
-    executes a single tick -- the timeout branch fires immediately, with
-    zero real timing.  What IS real is *proc*: an actually-spawned,
+    Deterministic per the task-4014 precedent above: each waiter runs with
+    ``timeout=0`` (and :func:`wait_subtree_live` with seams that report no
+    children), so the poll body never executes a single tick -- the timeout
+    branch fires immediately, with zero real timing.  What IS real is *proc*: an actually-spawned,
     already-``wait()``-ed subprocess with a KNOWN returncode (3) and a
     KNOWN stderr payload (``SENTINEL-XYZ``), so this pins the diagnostic's
     CONTENT rather than merely the presence of the words "rc"/"stderr" --
@@ -2447,15 +2516,7 @@ def test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail():
         assert proc.returncode == 3  # sanity: the known rc actually landed
 
         with pytest.raises(AssertionError) as exc_info:
-            wait_subtree_live(
-                1234,
-                proc=proc,
-                proc_label='leader',
-                timeout=0,
-                interval=0,
-                _probe_children=lambda _pid: set(),
-                _ppid_map=lambda: {},
-            )
+            time_out(proc, tmp_path)
 
         message = str(exc_info.value)
         assert 'leader rc=3' in message, (
@@ -2472,18 +2533,21 @@ def test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail():
                 proc.stderr.close()
 
 
-def test_wait_subtree_live_timeout_reports_rc_none_and_omits_stderr_for_a_live_leader():
+@_DISCOVERY_WAIT_TIMEOUTS
+def test_discovery_wait_timeout_reports_rc_none_and_omits_stderr_for_a_live_leader(
+    time_out, tmp_path,
+):
     """The rc=None ("merely slow leader") taxonomy branch and its anti-hang guard (291a75a919).
 
     Sibling of
-    :func:`test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail`
+    :func:`test_discovery_wait_timeout_reports_leader_returncode_and_stderr_tail`
     above, covering the two properties that rc=3 case cannot reach (task 4312
     review):
 
     * the ``rc is None`` taxonomy branch itself -- a leader that is merely
       slow (still running when the poll gives up) is the case an incident is
       most likely to actually hit, and it was entirely unpinned.
-    * the load-bearing guard :func:`wait_subtree_live`'s docstring calls out:
+    * the load-bearing guard :func:`describe_proc_exit`'s docstring calls out:
       stderr is read ONLY when ``proc.poll()`` is not ``None``, precisely
       because a LIVE leader's pipe write end can still be held open by an
       inherited-fd helper it spawned, and a buffered read on that pipe would
@@ -2508,15 +2572,7 @@ def test_wait_subtree_live_timeout_reports_rc_none_and_omits_stderr_for_a_live_l
     )
     try:
         with pytest.raises(AssertionError) as exc_info:
-            wait_subtree_live(
-                1234,
-                proc=proc,
-                proc_label='leader',
-                timeout=0,
-                interval=0,
-                _probe_children=lambda _pid: set(),
-                _ppid_map=lambda: {},
-            )
+            time_out(proc, tmp_path)
 
         message = str(exc_info.value)
         assert 'leader rc=None' in message, (
@@ -2883,6 +2939,87 @@ def test_sleeper_spec_build_pgid_file_names_the_blocking_session_leader(tmp_path
     finally:
         proc.kill()
         proc.wait(timeout=5)
+
+
+def test_pre_kill_tree_verdict_sees_a_session_escaped_build_after_its_leader_is_reaped(tmp_path):
+    """A build that outlives its reaped leader fails the verdict; once killed, it passes.
+
+    The stand-in leader leads its own session, as
+    ``orchestrator/src/orchestrator/verify_cancel.py::start_own_process_group``
+    makes the real one, and reproduces verify.py::_run_cmd's escape: it starts
+    the :func:`sleeper_spec` build in another new session, then is SIGKILLed
+    and reaped while the build runs on.  That severs the ppid chain and empties
+    the leader's group, so a walk rooted at the leader and a signal-0 probe of
+    its group both read the tree as gone.  The verdict judges the pids
+    snapshotted while the leader was alive, so it must still name the
+    surviving build.
+    """
+    build_pgf = tmp_path / 'build.pgid'
+    sleep_secs = float(f'274.{os.getpid() % 1000:03d}')
+    cmd = sleeper_spec(sleep_secs, build_pgid_file=build_pgf).verify_commands[0].test_command
+    assert cmd is not None
+    cwd = tmp_path / 'build'
+    cwd.mkdir()
+    leader = subprocess.Popen(
+        [
+            sys.executable, '-c',
+            'import subprocess, sys, time\n'
+            'subprocess.Popen(["/bin/bash", "-c", sys.argv[1]], start_new_session=True, '
+            'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
+            'time.sleep(300)\n',
+            cmd,
+        ],
+        cwd=cwd,
+        start_new_session=True,
+    )
+    build = None
+    try:
+        build = wait_for_pgid_file(build_pgf, timeout=10.0)
+        tree = snapshot_pre_kill_tree(leader.pid, build)
+        assert {leader.pid, build} <= tree.pids
+        assert os.getpgid(leader.pid) == leader.pid, (
+            f'harness bug: leader pid={leader.pid} must lead its own group, or the '
+            f'signal-0 group probe below proves nothing'
+        )
+
+        leader.kill()
+        leader.wait(timeout=5)
+
+        build_state = read_proc_state(build)
+        assert build_state is not None and not build_state.terminated, (
+            f'harness bug: build pid={build} is not running ({build_state}) after '
+            f'its leader was reaped, so the verdict below would prove nothing'
+        )
+        assert build_state.ppid != leader.pid, (
+            f'harness bug: build pid={build} still names the reaped leader '
+            f'pid={leader.pid} as its parent -- it was never reparented'
+        )
+        assert build not in collect_descendants(leader.pid, read_ppid_map()), (
+            f'harness bug: the ppid walk from pid={leader.pid} still reaches build '
+            f'pid={build}, so this test does not isolate the severed-chain case'
+        )
+        with pytest.raises(ProcessLookupError):
+            os.killpg(leader.pid, 0)
+
+        with pytest.raises(AssertionError) as exc_info:
+            assert_pre_kill_tree_exited(tree, timeout=0, after='its leader was reaped')
+        message = str(exc_info.value)
+        assert f'build={build}' in message, message
+        assert f'{build}: (' in message, (
+            f'the verdict must render the surviving build pid={build}; got {message!r}'
+        )
+        assert 'its leader was reaped' in message, message
+
+        os.kill(build, signal.SIGKILL)
+        assert_pre_kill_tree_exited(tree, timeout=5.0, after='the build was SIGKILLed')
+    finally:
+        if leader.returncode is None:
+            leader.kill()
+            leader.wait(timeout=5)
+        if build is not None:
+            for pid in wait_pids_exited({build}, timeout=0):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
 
 
 # ---------------------------------------------------------------------------
@@ -4668,19 +4805,19 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
     spec (the start_new_session escape) and a LIVE :class:`HeartbeatWriter`
     driving its stdin, so :func:`verify_cancel.run_stdin_watchdog` stays armed
     for the whole test but never times out or self-fires.  Waits for the
-    sleeper subtree to appear, then cancels via ``cancel-verify
-    --request-id`` through :class:`CliRunner` (the same in-process pattern as
-    test_cli.py's ``test_verify_merge_cancel_end_to_end``).
+    build to publish its session pgid (:func:`sleeper_spec`'s
+    *build_pgid_file*), then cancels via ``cancel-verify --request-id``
+    through :class:`CliRunner` (the same in-process pattern as test_cli.py's
+    ``test_verify_merge_cancel_end_to_end``).
 
     Asserts:
 
     * cancel-verify exits 0 and removes the pgid file;
     * the verify-merge subprocess exits promptly;
-    * the FULL descendant subtree (including the start_new_session sleeper
-      escape) AND the pgid leader itself are gone (``collect_descendants``
-      empty; ``os.killpg(pgid, 0)`` raises ``ProcessLookupError``) -- the live
-      watchdog and an explicit cancel coexist harmlessly and no orphan
-      survives.
+    * every pid snapshotted from the leader's tree while it was alive -- the
+      leader and the start_new_session build -- has exited (see
+      :func:`assert_pre_kill_tree_exited`): the live watchdog and an explicit
+      cancel coexist harmlessly and no orphan survives.
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     config_obj = OrchestratorConfig(project_root=repo)
@@ -4690,14 +4827,19 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
 
     REQUEST_ID = 'row4-cancel-under-watchdog'
     pgf = pgid_file(worktree_base, REQUEST_ID)
+    build_pgf = tmp_path / 'row4-build.pgid'
 
     child = spawn_verify_merge(
-        sha=head_sha, spec=sleeper_spec(300.0), cfg_file=cfg_file, request_id=REQUEST_ID,
+        sha=head_sha,
+        spec=sleeper_spec(300.0, build_pgid_file=build_pgf),
+        cfg_file=cfg_file,
+        request_id=REQUEST_ID,
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val, proc=child)
+        leader = wait_for_pgid_file(pgf, proc=child, timeout=row_discovery_ceiling_secs())
+        build = wait_for_pgid_file(build_pgf, proc=child, timeout=row_discovery_ceiling_secs())
+        tree = snapshot_pre_kill_tree(leader, build)
 
         monkeypatch.setattr(cli_module, 'load_config', lambda _path: config_obj)
         result = CliRunner().invoke(main, [
@@ -4716,9 +4858,8 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
                 'verify-merge subprocess did not exit within 20s after cancel-verify'
             )
 
-        assert wait_subtree_gone(pgid_val, timeout=10.0), (
-            f'pgid {pgid_val}: subtree and/or leader still alive after '
-            f'cancel-verify (live-watchdog coexistence left an orphan)'
+        assert_pre_kill_tree_exited(
+            tree, timeout=10.0, after='cancel-verify (live-watchdog coexistence left an orphan)',
         )
     finally:
         heartbeat.stop_heartbeats()
@@ -4784,39 +4925,41 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
         heartbeat_interval=0.2,
         extra_env=ROW_WATCHDOG_ENV,
     )
-    tree: set[int] = set()
+    tree: PreKillTree | None = None
     try:
-        leader = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
-        try:
-            build_pgid = wait_for_pgid_file(build_pgf, timeout=row_discovery_ceiling_secs())
-        except AssertionError as exc:
-            # Row 1 owns the DISPATCHER process, not the leader, so the
-            # dispatcher's rc is the exit status this row can report.
-            pytest.fail(f'{exc}; dispatcher rc={dispatcher.poll()}')
-        tree = {leader} | collect_descendants(leader, read_ppid_map())
-        assert build_pgid in tree, (
-            f'harness failure, not a seam defect: build pgid {build_pgid} is not in '
-            f'leader {leader}\'s subtree {sorted(tree)}'
+        leader = wait_for_pgid_file(
+            pgf,
+            proc=dispatcher,
+            proc_label='dispatcher',
+            timeout=row_discovery_ceiling_secs(),
         )
+        build_pgid = wait_for_pgid_file(
+            build_pgf,
+            proc=dispatcher,
+            proc_label='dispatcher',
+            timeout=row_discovery_ceiling_secs(),
+        )
+        tree = snapshot_pre_kill_tree(leader, build_pgid)
 
         dispatcher.kill()
         dispatcher.wait(timeout=10)
 
-        survivors = wait_pids_exited(tree, timeout=ROW_TREE_KILL_CEILING_SECS)
-        rendered = {pid: (s.state, s.ppid) for pid, s in sorted(survivors.items())}
-        assert not survivors, (
-            f'leader={leader} build={build_pgid}: {rendered} (pid: (state, ppid)) '
-            f'still running {ROW_TREE_KILL_CEILING_SECS}s after the dispatcher was '
-            f'killed (EOF-triggered watchdog tree-kill did not finish). S/T means '
-            f'SIGKILL never reached it; R/D means signalled but not yet run to exit'
+        assert_pre_kill_tree_exited(
+            tree,
+            timeout=ROW_TREE_KILL_CEILING_SECS,
+            after=(
+                'the dispatcher was killed (the EOF-triggered watchdog tree-kill '
+                'did not finish)'
+            ),
         )
     finally:
         if dispatcher.poll() is None:
             dispatcher.kill()
             dispatcher.wait(timeout=5)
-        for pid in wait_pids_exited(tree, timeout=0):
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
+        if tree is not None:
+            for pid in wait_pids_exited(tree.pids, timeout=0):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
 
 
 # ---------------------------------------------------------------------------
@@ -4836,7 +4979,8 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 
     Spawns a real ``verify-merge --request-id`` with a live
     :class:`HeartbeatWriter` driving its stdin (real heartbeats flow while
-    connected), waits for the sleeper subtree to appear, then calls
+    connected), waits for the build to publish its session pgid
+    (:func:`sleeper_spec`'s *build_pgid_file*), then calls
     ``heartbeat.close_stdin()`` -- stopping heartbeats AND closing the
     child's stdin write-end -- while this test process (the dispatcher
     stand-in) keeps running.  The child sees the same fd-0 EOF signal as Row
@@ -4851,9 +4995,11 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
     ``grace_secs`` bounds it (~5s, measured ~6.7s end-to-end), NOT the ~15s a
     reader might assume from the pinned heartbeat timeout.
 
-    Asserts within a bounded T: the full descendant subtree AND the pgid
-    leader are gone, and the verify-merge process itself self-exits non-zero
-    (the watchdog's controlled ``os._exit(1)``, not an external kill signal).
+    Asserts within a bounded T that the verify-merge process itself
+    self-exits non-zero (the watchdog's controlled ``os._exit(1)``, not an
+    external kill signal), and that every pid snapshotted from the leader's
+    tree while it was alive -- the leader and the start_new_session build --
+    has exited (see :func:`assert_pre_kill_tree_exited`).
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = tmp_path / 'config.yaml'
@@ -4862,28 +5008,24 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 
     REQUEST_ID = 'row2-ssh-dropped'
     pgf = pgid_file(worktree_base, REQUEST_ID)
+    build_pgf = tmp_path / 'row2-build.pgid'
 
     child = spawn_verify_merge(
         sha=head_sha,
-        spec=sleeper_spec(300.0),
+        spec=sleeper_spec(300.0, build_pgid_file=build_pgf),
         cfg_file=cfg_file,
         request_id=REQUEST_ID,
         extra_env=ROW_WATCHDOG_ENV,
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
-        wait_subtree_live(pgid_val, proc=child, timeout=row_discovery_ceiling_secs())
+        leader = wait_for_pgid_file(pgf, proc=child, timeout=row_discovery_ceiling_secs())
+        build = wait_for_pgid_file(build_pgf, proc=child, timeout=row_discovery_ceiling_secs())
+        tree = snapshot_pre_kill_tree(leader, build)
 
         heartbeat.close_stdin()
 
-        # Reap the leader (a DIRECT child of this test process, unlike Row
-        # 1's separate-dispatcher indirection or Row 4's cancel-verify path)
-        # BEFORE polling wait_subtree_gone: os.killpg(pgid, 0) succeeds
-        # against an unreaped zombie too, so checking liveness first would
-        # spuriously see the group as "alive" until something calls
-        # child.wait() -- confirmed by a manual repro that hung the full
-        # poll window with this ordering reversed.
+        # The reap feeds the returncode assertion; the exit verdict is zombie-aware.
         try:
             child.wait(timeout=ROW_TREE_KILL_CEILING_SECS)
         except subprocess.TimeoutExpired:
@@ -4895,10 +5037,13 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
         )
 
-        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
-            f'pgid {pgid_val}: subtree and/or leader still alive after the '
-            f'ssh channel EOF (dispatcher alive) -- watchdog tree-kill did '
-            f'not fire'
+        assert_pre_kill_tree_exited(
+            tree,
+            timeout=ROW_TREE_KILL_CEILING_SECS,
+            after=(
+                'the ssh channel EOF with the dispatcher alive (the watchdog '
+                'tree-kill did not finish)'
+            ),
         )
     finally:
         heartbeat.stop_heartbeats()
@@ -4919,8 +5064,9 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     """SS9 Row 3: heartbeat starved, stdin stays OPEN -> select-timeout tree-kill.
 
     Spawns a real ``verify-merge --request-id`` with a live
-    :class:`HeartbeatWriter`, waits for the sleeper subtree to appear, then
-    calls ``heartbeat.stop_heartbeats()`` -- which stops writing WITHOUT
+    :class:`HeartbeatWriter`, waits for the build to publish its session pgid
+    (:func:`sleeper_spec`'s *build_pgid_file*), then calls
+    ``heartbeat.stop_heartbeats()`` -- which stops writing WITHOUT
     closing stdin (contrast :func:`HeartbeatWriter.close_stdin`, Row 2) --
     modeling a hard network partition where the channel is never cleanly
     closed.  ``run_stdin_watchdog``'s ``select()`` call times out (empty
@@ -4933,9 +5079,10 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     here is ~15s rather than production's ~95s; see ROW_WATCHDOG_ENV's comment
     above for the pin rationale and the honest cliff-moved caveat.
 
-    Asserts the leader self-exits non-zero and, after reaping it (same
-    zombie-avoidance ordering as Row 2 -- ``child`` is again a direct child
-    of this test process), that the full subtree and pgid leader are gone.
+    Asserts the leader self-exits non-zero, and that every pid snapshotted
+    from the leader's tree while it was alive -- the leader and the
+    start_new_session build -- has exited (see
+    :func:`assert_pre_kill_tree_exited`).
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = tmp_path / 'config.yaml'
@@ -4944,18 +5091,20 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
 
     REQUEST_ID = 'row3-heartbeat-starved'
     pgf = pgid_file(worktree_base, REQUEST_ID)
+    build_pgf = tmp_path / 'row3-build.pgid'
 
     child = spawn_verify_merge(
         sha=head_sha,
-        spec=sleeper_spec(300.0),
+        spec=sleeper_spec(300.0, build_pgid_file=build_pgf),
         cfg_file=cfg_file,
         request_id=REQUEST_ID,
         extra_env=ROW_WATCHDOG_ENV,
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
-        wait_subtree_live(pgid_val, proc=child, timeout=row_discovery_ceiling_secs())
+        leader = wait_for_pgid_file(pgf, proc=child, timeout=row_discovery_ceiling_secs())
+        build = wait_for_pgid_file(build_pgf, proc=child, timeout=row_discovery_ceiling_secs())
+        tree = snapshot_pre_kill_tree(leader, build)
 
         heartbeat.stop_heartbeats()
         assert child.stdin is not None and not child.stdin.closed, (
@@ -4975,9 +5124,13 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
         )
 
-        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
-            f'pgid {pgid_val}: subtree and/or leader still alive after '
-            f'heartbeat starvation -- watchdog tree-kill did not fire'
+        assert_pre_kill_tree_exited(
+            tree,
+            timeout=ROW_TREE_KILL_CEILING_SECS,
+            after=(
+                'heartbeat starvation (the select-timeout watchdog tree-kill did '
+                'not finish)'
+            ),
         )
     finally:
         heartbeat.stop_heartbeats()
@@ -5058,7 +5211,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     # raises before the waiter is ever spawned.
     waiter = None
     try:
-        holder_pgid_val = wait_for_pgid_file(pgf_holder)
+        holder_pgid_val = wait_for_pgid_file(pgf_holder, proc=holder)
         wait_subtree_live(holder_pgid_val, proc=holder)
 
         persistent_wt = worktree_base / '_merge-verify'

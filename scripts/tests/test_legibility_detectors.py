@@ -557,6 +557,10 @@ def _classify(*records):
     return detectors.classify_agent_class(_MAIN_DIR_PATH, list(records))
 
 
+def _coder_prompt(digest_line):
+    return coder.build_prompt(digest_text=digest_line, codebook_index='', invariant_slugs=())
+
+
 _READ_OF_MARKER_SOURCE = (
     user_record('why did the sampler restratify my session?'),
     assistant_record(tool_use_block(
@@ -571,15 +575,16 @@ _READ_OF_MARKER_SOURCE = (
 
 
 class TestAgentClassVocabulary:
-    def test_agent_classes_are_the_five_strata_plus_unknown(self):
+    def test_agent_classes_are_the_strata_plus_unknown(self):
         assert [c.value for c in AgentClass] == [
             'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
-            'unknown',
+            'legibility-instrument', 'unknown',
         ]
 
-    def test_the_sampler_strata_are_the_five_in_order(self):
+    def test_the_sampler_strata_are_every_class_but_unknown(self):
         assert sampling.STRATA == (
             'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
+            'legibility-instrument',
         )
 
 
@@ -703,10 +708,9 @@ class TestClassifyAgentClass:
         because a watcher's identity reaches its own session only as one
         (``resolved_by=orchestrator-escalation-watcher-auto``). The price
         is this case: an interactive main-checkout session that Reads a
-        module quoting the markers is restratified by the quote. Telling a
-        session's own markers from foreign material it reads is task
-        5785's, which already names a session restratified by a Read of
-        digest.py."""
+        module quoting the markers is restratified by the quote. Only an
+        instrument session's own opening prompt is told apart from foreign
+        material it carries; a Read never is."""
         assert _classify(*_READ_OF_MARKER_SOURCE) is AgentClass.ORCHESTRATED_TASK
 
     def test_records_are_read_once_in_order_from_any_iterable(self):
@@ -755,6 +759,69 @@ class TestAgentClassEvidence:
         assert after.agent_class is AgentClass.RECON
 
 
+_ORCHESTRATED_TASK_PREAMBLE = 'Task ID: 6925\nWorktree: /home/leo/src/dark-factory/.worktrees/6925'
+
+
+class TestLegibilityInstrumentSessions:
+    @pytest.mark.parametrize(
+        'digest_line',
+        [
+            _ORCHESTRATED_TASK_PREAMBLE,
+            '<command-message>recon-escalation-watcher</command-message>',
+            'You are a Memory Consolidator agent operating in sleep mode.',
+            'You are the task curator for the dark-factory orchestrator.',
+        ],
+        ids=['orchestrated_task', 'watcher', 'recon', 'curator_classifier'],
+    )
+    def test_a_trickle_coder_prompt_is_classified_by_its_opener_not_its_embedded_digest(
+        self, digest_line,
+    ):
+        assert _classify(user_record(_coder_prompt(digest_line))) is AgentClass.LEGIBILITY_INSTRUMENT
+
+    def test_later_carriers_do_not_reclassify_an_instrument_session(self):
+        records = [
+            user_record(_coder_prompt('nothing quoted')),
+            assistant_record(text_block(coder_judgment(
+                note='resolved_by=orchestrator-escalation-watcher-auto',
+            ))),
+            tool_result_record('tu-1', 'operating in sleep mode'),
+        ]
+
+        assert _classify(*records) is AgentClass.LEGIBILITY_INSTRUMENT
+
+    def test_leading_whitespace_before_the_opener_is_ignored(self):
+        assert _classify(user_record('\n  ' + TRICKLE_CODER_PREAMBLE)) is (
+            AgentClass.LEGIBILITY_INSTRUMENT
+        )
+
+    def test_the_opener_quoted_inside_a_first_turn_is_foreign(self):
+        record = user_record(f'why is this prompt restratified?\n\n{TRICKLE_CODER_PREAMBLE}')
+
+        assert _classify(record) is AgentClass.INTERACTIVE
+
+    def test_the_opener_in_a_tool_result_is_foreign(self):
+        records = [
+            user_record('please read reingestion.py'),
+            tool_result_record(
+                'tu-1', "    'you are the trickle coder for the dark-factory agent-confusion codebook',",
+            ),
+        ]
+
+        assert _classify(*records) is AgentClass.INTERACTIVE
+
+    def test_the_opener_in_a_later_user_turn_is_not_the_first_turn(self):
+        assert _classify(user_record('hello'), user_record(TRICKLE_CODER_PREAMBLE)) is (
+            AgentClass.INTERACTIVE
+        )
+
+    def test_a_worktree_encoded_dir_still_wins_over_an_instrument_opener(self):
+        path = Path(f'/root/{_WORKTREE_DIRS[0]}/s.jsonl')
+
+        assert detectors.classify_agent_class(path, [user_record(TRICKLE_CODER_PREAMBLE)]) is (
+            AgentClass.ORCHESTRATED_TASK
+        )
+
+
 _SHAPES = [
     pytest.param(_WORKTREE_DIRS[0], [user_record('please fix it')], 'orchestrated-task', id='worktree_path'),
     pytest.param(
@@ -786,6 +853,14 @@ _SHAPES = [
         id='no_marker',
     ),
     pytest.param('-home-leo-src-dark-factory', [], 'unknown', id='empty'),
+    pytest.param(
+        '-home-leo-src-dark-factory',
+        [
+            user_record(_coder_prompt(_ORCHESTRATED_TASK_PREAMBLE)),
+            assistant_record(text_block(coder_judgment())),
+        ],
+        'legibility-instrument', id='trickle_coder_session',
+    ),
 ]
 
 

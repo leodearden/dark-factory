@@ -25,6 +25,7 @@ from _dashboard_helpers import drain, never_resolving_refresh, wedge_one_bypass
 from shared.testing_virtual_clock import virtual_clock_test
 
 from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.project_labels import ProjectLabels
 
 
 def _offline_result(errors: list[str]) -> dict:
@@ -731,6 +732,12 @@ class TestPreformattedFanoutError:
 # ── (c5) per-project-root label discrimination ───────────────────────
 
 
+_BASENAME_LABELS = ProjectLabels.of_roots(())
+_TEAM_A = '/srv/team-a/app'
+_TEAM_B = '/srv/team-b/app'
+_TEAM_LABELS = ProjectLabels.of_roots([_TEAM_A, _TEAM_B])
+
+
 class TestFanoutLabel:
     """``fanout_label`` composes the throttle key's per-project-root discriminator.
 
@@ -746,14 +753,14 @@ class TestFanoutLabel:
     def test_composes_base_and_project_basename(self):
         from dashboard.data.mcp_fanout import fanout_label
 
-        assert fanout_label('fetch_tasks', '/home/leo/src/dark-factory') == (
+        assert fanout_label('fetch_tasks', '/home/leo/src/dark-factory', _BASENAME_LABELS) == (
             'fetch_tasks[dark-factory]'
         ), 'must generalize scheduler.py\'s existing base[label] shape'
 
     def test_trailing_slash_is_stripped(self):
         from dashboard.data.mcp_fanout import fanout_label
 
-        assert fanout_label('fetch_tasks', '/a/b/') == 'fetch_tasks[b]', (
+        assert fanout_label('fetch_tasks', '/a/b/', _BASENAME_LABELS) == 'fetch_tasks[b]', (
             'a configured root with a trailing slash must not yield an empty label'
         )
 
@@ -763,14 +770,14 @@ class TestFanoutLabel:
         from dashboard.data.mcp_fanout import fanout_label
 
         # Callers pass both: metrics passes a Path-derived str, scheduler a Path.
-        assert fanout_label('list_tickets', Path('/a/b')) == fanout_label(
-            'list_tickets', '/a/b'
+        assert fanout_label('list_tickets', Path('/a/b'), _BASENAME_LABELS) == fanout_label(
+            'list_tickets', '/a/b', _BASENAME_LABELS,
         ) == 'list_tickets[b]'
 
     def test_root_without_a_basename_falls_back_to_the_full_string(self):
         from dashboard.data.mcp_fanout import fanout_label
 
-        assert fanout_label('fetch_tasks', '/') == 'fetch_tasks[/]', (
+        assert fanout_label('fetch_tasks', '/', _BASENAME_LABELS) == 'fetch_tasks[/]', (
             'a basename-less root must not degrade to a content-free "[]"'
         )
 
@@ -778,74 +785,94 @@ class TestFanoutLabel:
         from dashboard.data.mcp_fanout import fanout_label
 
         # This is the property the throttle key actually depends on.
-        assert fanout_label('fetch_tasks', '/srv/proj-a') != fanout_label(
-            'fetch_tasks', '/srv/proj-b'
+        assert fanout_label('fetch_tasks', '/srv/proj-a', _BASENAME_LABELS) != fanout_label(
+            'fetch_tasks', '/srv/proj-b', _BASENAME_LABELS,
         )
 
     def test_label_is_composed_from_the_single_project_label_definition(self):
-        """``fanout_label`` must delegate the basename rule, not re-derive it.
+        """``fanout_label`` must delegate to ``ProjectLabels``, not re-derive the rule.
 
-        ``project_label`` is the one definition every dashboard module labels
-        projects with; a future edit that inlines the rule here again would
+        ``ProjectLabels`` is the one definition every dashboard module labels
+        projects with; a future edit that inlines a rule here again would
         silently re-fork it.
         """
         from pathlib import Path
 
-        from dashboard.data.mcp_fanout import fanout_label, project_label
-
-        for root in ('/home/leo/src/dark-factory', '/a/b/', '/', Path('/srv/proj-a')):
-            assert fanout_label('fetch_tasks', root) == f'fetch_tasks[{project_label(root)}]'
-
-    def test_same_basename_roots_share_a_label_by_design(self):
-        """Discrimination is by basename, so same-named roots still collapse.
-
-        Documented, inherited behaviour rather than an oversight: scheduler's
-        per-label joins and redux_api's per-project payload already key on the
-        same basename, so diverging to full paths here alone would make this one
-        log label inconsistent with every other project label the UI renders.
-        Pinned so the assumption is executable, not only prose in the docstring.
-        """
         from dashboard.data.mcp_fanout import fanout_label
 
-        assert fanout_label('fetch_tasks', '/srv/team-a/app') == fanout_label(
-            'fetch_tasks', '/srv/team-b/app'
-        ) == 'fetch_tasks[app]'
+        configured = (_TEAM_A, Path(_TEAM_B))
+        unconfigured = ('/home/leo/src/dark-factory', '/a/b/', '/', Path('/srv/proj-a'))
+        for root in (*configured, *unconfigured):
+            assert fanout_label('fetch_tasks', root, _TEAM_LABELS) == (
+                f'fetch_tasks[{_TEAM_LABELS.of(root)}]'
+            )
+
+    def test_same_basename_roots_get_distinct_labels(self):
+        from dashboard.data.mcp_fanout import fanout_label
+
+        team_a = fanout_label('fetch_tasks', _TEAM_A, _TEAM_LABELS)
+
+        assert team_a == 'fetch_tasks[team-a/app]'
+        assert team_a != fanout_label('fetch_tasks', _TEAM_B, _TEAM_LABELS)
 
     async def test_distinct_roots_keep_independent_streaks_on_one_url(self, caplog):
         """End-to-end: the discriminated labels really do decouple the streaks."""
-        from dashboard.data.mcp_fanout import fanout_label
+        warnings = await _streak_warnings(
+            caplog, failing_root='/srv/proj-a', healthy_root='/srv/proj-b', labels=_BASENAME_LABELS,
+        )
 
-        url = 'http://shared-fused-memory:8765'
-
-        async def failing(_url):
-            raise httpx.ConnectError('refused')
-
-        async def healthy(_url):
-            return 'ok'
-
-        with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
-            for _ in range(3):
-                await first_success(
-                    [url], failing,
-                    log_label=fanout_label('fetch_tasks', '/srv/proj-a'),
-                    offline_result=_offline_result,
-                )
-                await first_success(
-                    [url], healthy,
-                    log_label=fanout_label('fetch_tasks', '/srv/proj-b'),
-                    offline_result=_offline_result,
-                )
-
-        warnings = [
-            r.getMessage() for r in caplog.records
-            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
-        ]
         assert len(warnings) == 1, (
             f"root B's success must not pop root A's streak, got {warnings}"
         )
         assert 'proj-a' in warnings[0], (
             f'the operator must be able to tell which root is down, got {warnings[0]}'
         )
+
+    async def test_same_basename_roots_keep_independent_streaks_on_one_url(self, caplog):
+        """Same-basename roots are told apart by their unique labels, not collapsed."""
+        warnings = await _streak_warnings(
+            caplog, failing_root=_TEAM_A, healthy_root=_TEAM_B, labels=_TEAM_LABELS,
+        )
+
+        assert len(warnings) == 1, (
+            f"team-b's success must not pop team-a's streak, got {warnings}"
+        )
+        assert 'team-a/app' in warnings[0], (
+            f'the operator must be able to tell which root is down, got {warnings[0]}'
+        )
+
+
+async def _streak_warnings(
+    caplog, *, failing_root: str, healthy_root: str, labels: ProjectLabels,
+) -> list[str]:
+    """Three poll cycles of one failing and one healthy root on ONE shared URL."""
+    from dashboard.data.mcp_fanout import fanout_label
+
+    url = 'http://shared-fused-memory:8765'
+
+    async def failing(_url):
+        raise httpx.ConnectError('refused')
+
+    async def healthy(_url):
+        return 'ok'
+
+    with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+        for _ in range(3):
+            await first_success(
+                [url], failing,
+                log_label=fanout_label('fetch_tasks', failing_root, labels),
+                offline_result=_offline_result,
+            )
+            await first_success(
+                [url], healthy,
+                log_label=fanout_label('fetch_tasks', healthy_root, labels),
+                offline_result=_offline_result,
+            )
+
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+    ]
 
 
 # ── (d) success path: no invalidation, exactly one call ──────────────

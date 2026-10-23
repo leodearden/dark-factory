@@ -358,7 +358,9 @@ def _serve_escalation_mcp_impl():
 
     Call as ``serve_escalation_mcp(queue_dir)`` -> ``(base_url, port, queue)``.
     Builds ``EscalationQueue(queue_dir)`` + ``create_server(queue,
-    startup_sweep=False, dedupe_config=...)`` and serves its ``http_app()``
+    startup_sweep=False, dedupe_config=...)``, passing an optional
+    ``store_identity=`` through (``None``, the default, keeps today's
+    identity-less server), and serves its ``http_app()``
     through ``uvicorn.Server`` -- production's shape -- on a localhost listener
     the fixture binds and holds from allocation onward
     (``_bind_escalation_listener``), inside a daemon thread running its own
@@ -410,15 +412,20 @@ def _serve_escalation_mcp_impl():
     from escalation.dedupe import DedupeConfig
     from escalation.queue import EscalationQueue
     from escalation.server import create_server
+    from escalation.store_identity import StoreIdentity
 
     started: list[tuple] = []
 
-    def _start(queue_dir, *, dedupe_config=None, startup_sweep=False):
+    def _start(
+        queue_dir, *, dedupe_config=None, startup_sweep=False,
+        store_identity: StoreIdentity | None = None,
+    ):
         queue = EscalationQueue(queue_dir)
         if dedupe_config is None:
             dedupe_config = DedupeConfig(infra_dedupe_enabled=False)
         mcp = create_server(
             queue, startup_sweep=startup_sweep, dedupe_config=dedupe_config,
+            store_identity=store_identity,
         )
         listener = _bind_escalation_listener()
         port = listener.getsockname()[1]

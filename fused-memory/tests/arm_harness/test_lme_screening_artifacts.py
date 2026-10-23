@@ -150,6 +150,7 @@ def test_each_spec_is_the_slate_arms_candidate_spec_through_a_loopback_tap(arm_i
     assert urlsplit(spec.serving.base_url).hostname == LOOPBACK_HOST
 
 
+@pytest.mark.reads_git_history
 def test_one_preregistration_sha_that_carries_the_doc_and_is_on_this_history():
     shas = {_evidence(arm_id).spec.preregistration_sha for arm_id in SLATE_IDS}
 

@@ -10,7 +10,7 @@ and ``test_offline_lane_episodes.py``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -230,6 +230,14 @@ class StoreWrites:
             self._log.append('write')
 
 
+def _id_order(task_id: str) -> tuple[bool, int, str]:
+    return not task_id.isdigit(), int(task_id) if task_id.isdigit() else 0, task_id
+
+
+def _holds(stored: object, value: str) -> bool:
+    return stored == value or (isinstance(stored, list) and value in stored)
+
+
 class FakeLedgerClient:
     """The task seam as ``chronic_flake.py::SchedulerChronicFlakeTaskClient`` behaves: a failed
     ``commit_planning`` is only logged, so the caller learns of it from a live read."""
@@ -240,6 +248,7 @@ class FakeLedgerClient:
         self.outcomes: list[SubmitOutcome | Exception] = []
         self.submitted: list[dict[str, Any]] = []
         self.statuses_error: Exception | None = None
+        self.lookup_error: Exception | None = None
         self.unreadable: set[str] = set()
         self.commit_failures = 0
         self.observers: list[Callable[[], None]] = []
@@ -266,7 +275,7 @@ class FakeLedgerClient:
             return outcome
         self._next_id += 1
         task_id = str(self._next_id)
-        self.set_status(task_id, 'deferred')
+        self.set_status(task_id, 'deferred', **arguments.get('metadata', {}))
         return SubmittedTask(task_id, 'deferred')
 
     async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
@@ -280,6 +289,19 @@ class FakeLedgerClient:
         if task_id in self.unreadable:
             return None, ConnectionError('task store unreachable')
         return self.tasks.get(task_id), None
+
+    async def find_tasks_by_metadata(
+        self, key: str, value: str, statuses: Sequence[str],
+    ) -> tuple[list[dict], Exception | None]:
+        """The rows the tool answers with, in its task-id order, with the wire's int ids."""
+        self._called('find_tasks_by_metadata')
+        if self.lookup_error is not None:
+            return [], self.lookup_error
+        return [
+            {'task_id': int(task_id) if task_id.isdigit() else task_id, 'status': task['status']}
+            for task_id, task in sorted(self.tasks.items(), key=lambda item: _id_order(item[0]))
+            if task['status'] in statuses and _holds(task['metadata'].get(key), value)
+        ], None
 
     async def commit_planning(self, task_ids: list[str]) -> None:
         self._called('commit_planning')

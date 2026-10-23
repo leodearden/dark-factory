@@ -912,7 +912,8 @@ async def fetch_live_merge_queues(
     """Fan out get_merge_queue to every escalation URL concurrently.
 
     Returns ``{project_label: {entries, reachable, [error]}}``.  Keys match
-    the labels from ``config.escalation_urls`` (project basenames).  Failures
+    the labels from ``config.escalation_urls`` (project label —
+    ``dashboard/project_labels.py::ProjectLabels``).  Failures
     (transport errors, timeouts, or orchestrator/worker down) produce
     ``{entries: [], reachable: False, error: ...}`` — an authoritative empty
     queue produces ``{entries: [], reachable: True}``.

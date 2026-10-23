@@ -120,6 +120,10 @@ def _prompt_ids(create: AsyncMock) -> list[list[str]]:
     return [_ID_LINE.findall(call.kwargs['input']) for call in create.await_args_list]
 
 
+def _seeded_plan():
+    return _cases_mod().seeded_plan(list(_CORPUS), distractors=2)
+
+
 def _resolved(plan, index: int) -> list:
     return list(plan.candidate_records[index])
 
@@ -127,14 +131,10 @@ def _resolved(plan, index: int) -> list:
 class TestTheSeededLiveEdge:
     """`build_judge_fn`: one shipped-judge call per case, on the slate built for it."""
 
-    @staticmethod
-    def _plan():
-        return _cases_mod().seeded_plan(list(_CORPUS), distractors=2)
-
     def test_every_case_is_one_completion_naming_its_slate_in_order(
         self, tmp_path: Path,
     ) -> None:
-        plan = self._plan()
+        plan = _seeded_plan()
         client = _openai('amends')
         with patch('openai.AsyncOpenAI', return_value=client):
             _mod().run_judge_eval(
@@ -146,7 +146,7 @@ class TestTheSeededLiveEdge:
         assert _prompt_ids(create) == [case['candidates'] for case in plan.cases]
 
     def test_the_answer_is_the_parsed_verdict(self) -> None:
-        plan = self._plan()
+        plan = _seeded_plan()
         case = plan.cases[0]
         with patch('openai.AsyncOpenAI', return_value=_openai('amends')):
             answer = _live_judge().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
@@ -154,7 +154,7 @@ class TestTheSeededLiveEdge:
         assert answer.candidate_id == case['candidates'][0]
 
     def test_a_recorded_run_reports_what_the_provider_billed(self) -> None:
-        plan = self._plan()
+        plan = _seeded_plan()
         case = plan.cases[0]
         with patch('openai.AsyncOpenAI', return_value=_openai('restates')):
             answer = _live_judge().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
@@ -162,11 +162,52 @@ class TestTheSeededLiveEdge:
 
     def test_a_run_with_no_reported_usage_is_unpriced(self) -> None:
         """The artifact says 'unpriced', never zeros."""
-        plan = self._plan()
+        plan = _seeded_plan()
         case = plan.cases[0]
         with patch('openai.AsyncOpenAI', return_value=_openai('restates', billed=None)):
             answer = _live_judge().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
         assert answer.usage is None
+
+
+class TestTheRecordedElisionFollowsTheWidth:
+    """`--field-chars` reaches each case's recorded flags, and they match the prompt sent."""
+
+    @staticmethod
+    def _first_case() -> tuple[dict, list]:
+        plan = _seeded_plan()
+        return plan.cases[0], _resolved(plan, 0)
+
+    @staticmethod
+    def _ask(case: dict, slate: list, width: int) -> tuple:
+        """The recorded answer at *width*, and the user prompt the provider was sent."""
+        config = _judge_config()
+        _mod().apply_field_chars(config, width)
+        client = _openai('amends')
+        with patch('openai.AsyncOpenAI', return_value=client):
+            answer = _live_judge().build_judge_fn(config)(case, slate)
+        return answer, client.responses.create.await_args.kwargs['input']
+
+    def test_a_narrow_width_records_every_field_elided(self) -> None:
+        case, slate = self._first_case()
+        answer, _ = self._ask(case, slate, 5)
+        assert answer.entry_elided is True
+        assert answer.candidates_elided == dict.fromkeys(case['candidates'], True)
+
+    def test_zero_records_nothing_elided(self) -> None:
+        case, slate = self._first_case()
+        answer, _ = self._ask(case, slate, 0)
+        assert answer.entry_elided is False
+        assert answer.candidates_elided == dict.fromkeys(case['candidates'], False)
+
+    def test_the_recorded_flags_agree_with_the_prompt_sent(self) -> None:
+        case, slate = self._first_case()
+        width = min(len(record['content']) for record in slate)
+        answer, prompt = self._ask(case, slate, width)
+        assert set(answer.candidates_elided.values()) == {True, False}
+        assert answer.entry_elided == (case['content'] not in prompt)
+        assert answer.candidates_elided == {
+            record['memory_id']: record['content'] not in prompt for record in slate
+        }
 
 
 def _deterministic_answer(system: str, user: str) -> str:

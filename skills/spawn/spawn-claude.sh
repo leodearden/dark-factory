@@ -9,14 +9,21 @@
 #
 # Usage:
 #   spawn-claude.sh <cwd> <skip_permissions:true|false> <title|""> <prompt>
+#   spawn-claude.sh <cwd> <skip_permissions:true|false> <title|""> --prompt-file <abs path>
+#
+# --prompt-file launches a short pointer prompt naming the file instead of
+# its contents, so a brief of any size stays under tmux's command-length limit.
 #
 # Model selection:
 #   $CLAUDE_SPAWN_MODEL — pin the spawned session's model. Forwarded verbatim
 #     to `claude --model <value>`, so it takes any alias (opus/sonnet/haiku/
 #     fable) or full id (e.g. claude-fable-5). It's an env var, not a
-#     positional, so the four-arg calling contract above is unchanged; unset =
+#     positional, so the calling forms above are unchanged; unset =
 #     inherit the spawner's default model. For other/extra claude flags use
 #     $CLAUDE_SPAWN_CLAUDE_ARGS (a raw passthrough, applied after --model).
+#
+# Self-exit: $CLAUDE_SPAWN_SELF_EXIT=1 (exactly 1) stamps record.self_exit
+#   and adds the exit-requested marker instruction to the trailer.
 #
 # These, and every other CLAUDE_SPAWN_* var read below, are per-launch
 # INPUTS: consumed by this invocation and then REMOVED from the spawned
@@ -64,15 +71,30 @@ EXIT_FAILED_TO_START=144
 REPO_ROOT="$(cd "$(dirname "$(dirname "$(dirname "${BASH_SOURCE[0]}")")")" && pwd)"
 SESSION_REGISTRY_PY="$REPO_ROOT/orchestrator/src/orchestrator/session_registry.py"
 
-if [ $# -ne 4 ]; then
-  echo "usage: spawn-claude.sh <cwd> <skip_perms:true|false> <title> <prompt>" >&2
+if [ $# -eq 4 ] && [ "$4" != "--prompt-file" ]; then
+  prompt="$4"
+elif [ $# -eq 5 ] && [ "$4" = "--prompt-file" ]; then
+  prompt_file="$5"
+  case "$prompt_file" in
+    /*) ;;
+    *)
+      echo "spawn-claude.sh: --prompt-file needs an absolute path, got: $prompt_file" >&2
+      exit 2
+      ;;
+  esac
+  if ! { [ -f "$prompt_file" ] && [ -r "$prompt_file" ]; }; then
+    echo "spawn-claude.sh: --prompt-file is not a readable file: $prompt_file" >&2
+    exit 2
+  fi
+  prompt="Read $prompt_file and follow it as your brief; that file holds your whole task."
+else
+  echo "usage: spawn-claude.sh <cwd> <skip_perms:true|false> <title> <prompt> | --prompt-file <abs path>" >&2
   exit 2
 fi
 
 cwd="$1"
 skip_perms="$2"
 title="$3"
-prompt="$4"
 
 # Fleet Cockpit C7 (plans/fleet-cockpit-prd.md §6.1): spawn_mode selects
 # which identity the child inherits as its own CLAUDE_SPAWN_PARENT_ID (see
@@ -81,6 +103,8 @@ prompt="$4"
 # positional-arg parse -- 'child' (the default) preserves every existing
 # caller's behavior byte-for-byte.
 spawn_mode="${CLAUDE_SPAWN_MODE:-child}"
+self_exit=""
+[ "${CLAUDE_SPAWN_SELF_EXIT:-}" = "1" ] && self_exit=1
 
 # Started-verification watchdog (Attention Rail T4) state: a spawn-time
 # reference marker (mtime = spawn start, used by the step-4 transcript-
@@ -143,6 +167,7 @@ if command -v python3 >/dev/null 2>&1; then
     CLAUDE_SPAWN_PROMPT="$prompt" \
     CLAUDE_SPAWN_CWD="$cwd" \
     CLAUDE_SPAWN_LAUNCHER_PID="$$" \
+    CLAUDE_SPAWN_SELF_EXIT="$self_exit" \
     python3 "$SESSION_REGISTRY_PY" launching
   ) || true
 fi
@@ -235,12 +260,12 @@ fi
 #      all, so discriminator 1 does not exist yet and whichever event
 #      arrives first would capture the record. That window is WIDE --
 #      measured over the live fleet, median ~27s, p90 ~141s -- and nothing
-#      bounds it. So session_hooks._owner_ppid_verdict compares the owning
-#      claude's DIRECT PARENT against the pid this script exports from
-#      inside $inner. That is a parent-EQUALITY test on one process, not an
-#      ancestry test, and it needs no persisted state, so it works from the
-#      very first event. It also covers CLAUDE_SPAWN_MODE=sibling records,
-#      which resolve_sibling() flips to `running` at launch and which a
+#      bounds it. So session_ownership_probes.EventProbes.owner_ppid_verdict
+#      compares the owning claude's DIRECT PARENT against the pid this script
+#      exports from inside $inner. That is a parent-EQUALITY test on one
+#      process, not an ancestry test, and it needs no persisted state, so it
+#      works from the very first event. It also covers CLAUDE_SPAWN_MODE=sibling
+#      records, which resolve_sibling() flips to `running` at launch and which a
 #      status-based guard would therefore never match.
 #
 # Both probes are FAIL-SOFT in the same direction: whenever ownership can be
@@ -257,8 +282,8 @@ fi
 #     becomes reapable after that process exits -- "reapable", not "reaped":
 #     reap_stale_records' stale_pid rule ALSO requires
 #     NON_TERMINAL_HEARTBEAT_TTL of silence, and where /proc is unavailable
-#     _nested_claude_liveness_pid falls back to os.getsid(0), the terminal's
-#     session leader, which outlives the nested claude;
+#     EventProbes.nested_claude_liveness_pid falls back to os.getsid(0), the
+#     terminal's session leader, which outlives the nested claude;
 #   * the discriminator survives /clear. Claude Code re-mints session_id in
 #     place there, so the owning session's own SessionStart would look like a
 #     mismatch -- session_hooks keys off the SessionStart-only `source` field
@@ -319,8 +344,8 @@ fi
 # DELIBERATE ORDERING: the session-registry `launching` write further above
 # (CLAUDE_SPAWN_PROMPT="$prompt") already ran and persisted `prompt` BEFORE
 # this trailer is appended, so record.prompt intentionally holds the
-# caller's original prompt, not this machine-appended boilerplate --
-# record.prompt is "what the caller asked for", not "the literal argv
+# caller's prompt or the --prompt-file pointer, not this machine-appended
+# boilerplate -- record.prompt is "what the caller asked for", not "the literal argv
 # claude received". Do NOT reorder the registry call to run after this
 # block to make them match; a reader who needs the exact text claude saw
 # should reconstruct it from record.prompt plus this trailer template.
@@ -335,13 +360,25 @@ Format (markdown with a small structured header -- parent readers are
 LLMs, so keep it concise and scannable):
 
 ---
-outcome: done|blocked|abandoned|handed-off
+outcome: done|blocked|abandoned|handed-off|in-progress
 changed: (commits/branches/task ids touched, or none)
 action_needed: (what a human or parent should do next, or none)
 ---
 A few sentences of prose context.
 
-This is best-effort: writing this file must never block your normal exit."
+This is best-effort: writing this file must never block your normal exit.
+If you write it before your work is done, set outcome: in-progress and
+rewrite it with a final outcome before you end. Run /reflect before you
+end this session."
+  if [ "$self_exit" = 1 ]; then
+    self_exit_trailer='This session was spawned with self-exit on. When all work, result.md and
+/reflect are complete and no background task of yours is still running,
+run this as your final action (best-effort; skip it if it fails):
+printf '\''%s'\'' "$CLAUDE_CODE_SESSION_ID" > "$(dirname "$CLAUDE_SPAWN_RESULT_FILE")/exit-requested"'
+    prompt="${prompt}
+
+${self_exit_trailer}"
+  fi
 fi
 
 flags=""
@@ -501,7 +538,7 @@ sanitize_env='for _v in ${!CLAUDE_SPAWN_@}; do unset "$_v"; done; unset _v; '
 # list with traps and a trailing `ec=$?`), the owning claude's DIRECT PARENT is
 # always exactly this pid, on every backend branch. A nested claude started from
 # inside the session has some other parent (its agent's Bash-tool shell), so it
-# mismatches. See session_hooks._owner_ppid_verdict.
+# mismatches. See session_ownership_probes.EventProbes.owner_ppid_verdict.
 #
 # NOT launcher_pid: this script's own $$ is not even in the owning claude's
 # ancestry under a detached emulator (gnome-terminal reparents the payload to

@@ -1,0 +1,423 @@
+{
+  "rubric": "v2",
+  "cell_rules": {
+    "hidden_detail": "A restated write adds something a reader acting on its record would need (HOME, LOSS, no CONFLICT), and a sighting is only counted, never shown.",
+    "hidden_conflict": "A restated write disputes its record (CONFLICT), and the dispute sits in a sighting a reader of the record never sees.",
+    "digest_conflict": "An amended write disputes its record (CONFLICT), and a reader of the record meets the dispute only as an untagged 240-character digest.",
+    "wrong_home": "An attached write is not about its record's claim (HOME=NO); a contest whose dispute is true is never a wrong home (ruling 5b).",
+    "false_conflict": "A contested write does not dispute its record (CONFLICT=NO), so a reader is told a sound record is in doubt.",
+    "duplicate_clutter": "A standalone write restates an earlier record and adds nothing a reader needs (HOME, no LOSS, no CONFLICT).",
+    "orphaned_conflict": "A standalone write disputes an earlier record (CONFLICT) that carries no superseded-by mark for it, so a reader of that record never learns of it.",
+    "attached_supersession": "A write declaring that it supersedes its record was attached under it; a supersession is a new standalone record plus a mark, never an attach (ruling 5c)."
+  },
+  "harm_weights": {
+    "hidden_conflict": 3,
+    "digest_conflict": 2,
+    "false_conflict": 2,
+    "orphaned_conflict": 1.5,
+    "hidden_detail": 1,
+    "wrong_home": 1,
+    "attached_supersession": 1,
+    "duplicate_clutter": 0.5
+  },
+  "harm_weights_status": "provisional",
+  "bootstrap": {
+    "resamples": 10000,
+    "seed": 7157
+  },
+  "population": {
+    "n_items": 553,
+    "by_outcome": {
+      "amended": 40,
+      "contested": 473,
+      "restated": 40,
+      "stored": 0
+    },
+    "by_stratum": {
+      "amended-sample": 40,
+      "contested-census": 473,
+      "restated-sample": 40
+    },
+    "strata": {
+      "amended-sample": 1224,
+      "contested-census": 473,
+      "restated-sample": 125
+    },
+    "decided": 552,
+    "unclear": 1,
+    "unclear_entry_ids": [
+      "e7f06b8d-5bf4-4070-b085-e2db2d29d655"
+    ]
+  },
+  "kappa": {
+    "floor": 0.7,
+    "min_overlap": 60,
+    "by_binary": {
+      "home": {
+        "n_overlap": 3,
+        "kappa": 0.0,
+        "floor_met": false
+      },
+      "loss": {
+        "n_overlap": 80,
+        "kappa": 0.3962,
+        "floor_met": false
+      },
+      "conflict": {
+        "n_overlap": 74,
+        "kappa": 0.5826,
+        "floor_met": false
+      },
+      "scope": {
+        "n_overlap": 18,
+        "kappa": 0.4906,
+        "floor_met": false
+      },
+      "digest": {
+        "n_overlap": 48,
+        "kappa": -0.036,
+        "floor_met": false
+      }
+    }
+  },
+  "cells": {
+    "triage": {
+      "hidden_detail": 8,
+      "hidden_conflict": 10,
+      "digest_conflict": 5,
+      "wrong_home": 127,
+      "false_conflict": 147,
+      "duplicate_clutter": 0,
+      "orphaned_conflict": 0,
+      "attached_supersession": 12
+    },
+    "status_quo": {
+      "hidden_detail": 0,
+      "hidden_conflict": 0,
+      "digest_conflict": 0,
+      "wrong_home": 0,
+      "false_conflict": 0,
+      "duplicate_clutter": 20,
+      "orphaned_conflict": 340,
+      "attached_supersession": 0
+    }
+  },
+  "metrics": {
+    "m1": {
+      "n": 39,
+      "hits": 18,
+      "rate": 0.4615,
+      "wilson95": [
+        0.3157,
+        0.6143
+      ],
+      "unclear": 0,
+      "population_rate": 0.4697,
+      "population_interval95": [
+        0.3158,
+        0.6263
+      ],
+      "band_unknown": 4
+    },
+    "m2": {
+      "amended": {
+        "n": 40,
+        "hits": 25,
+        "rate": 0.625,
+        "wilson95": [
+          0.4703,
+          0.7578
+        ],
+        "unclear": 0,
+        "population_rate": 0.625,
+        "population_interval95": [
+          0.475,
+          0.775
+        ],
+        "by_project": {
+          "dark_factory": {
+            "n": 10,
+            "hits": 5
+          },
+          "reify": {
+            "n": 11,
+            "hits": 7
+          },
+          "solar_challenge": {
+            "n": 11,
+            "hits": 8
+          },
+          "solar_challenge_platform": {
+            "n": 8,
+            "hits": 5
+          }
+        }
+      },
+      "contested": {
+        "n": 472,
+        "hits": 315,
+        "rate": 0.6674,
+        "wilson95": [
+          0.6237,
+          0.7084
+        ],
+        "unclear": 1,
+        "population_rate": 0.6674,
+        "population_interval95": [
+          0.625,
+          0.7091
+        ],
+        "by_project": {
+          "dark_factory": {
+            "n": 125,
+            "hits": 89
+          },
+          "reify": {
+            "n": 116,
+            "hits": 88
+          },
+          "scoping_intake": {
+            "n": 2,
+            "hits": 2
+          },
+          "solar_challenge": {
+            "n": 132,
+            "hits": 71
+          },
+          "solar_challenge_platform": {
+            "n": 97,
+            "hits": 65
+          }
+        }
+      },
+      "restated": {
+        "n": 40,
+        "hits": 13,
+        "rate": 0.325,
+        "wilson95": [
+          0.2008,
+          0.4798
+        ],
+        "unclear": 0,
+        "population_rate": 0.325,
+        "population_interval95": [
+          0.175,
+          0.475
+        ],
+        "by_project": {
+          "dark_factory": {
+            "n": 6,
+            "hits": 2
+          },
+          "reify": {
+            "n": 7,
+            "hits": 2
+          },
+          "solar_challenge": {
+            "n": 22,
+            "hits": 9
+          },
+          "solar_challenge_platform": {
+            "n": 5,
+            "hits": 0
+          }
+        }
+      },
+      "stored": {
+        "n": 0,
+        "hits": 0,
+        "rate": null,
+        "wilson95": null,
+        "unclear": 0,
+        "population_rate": null,
+        "population_interval95": null,
+        "by_project": {}
+      }
+    },
+    "m3": {
+      "n": 340,
+      "hits": 15,
+      "rate": 0.0441,
+      "wilson95": [
+        0.0269,
+        0.0715
+      ],
+      "unclear": 1,
+      "population_rate": 0.3618,
+      "population_interval95": [
+        0.1728,
+        0.4986
+      ],
+      "by_ending": {
+        "restated": 10,
+        "amended": 5,
+        "stored_unlinked": 0,
+        "contested": 325,
+        "stored_linked": 0
+      }
+    },
+    "m4": {
+      "n": 552,
+      "hits": 127,
+      "rate": 0.2301,
+      "wilson95": [
+        0.1969,
+        0.267
+      ],
+      "unclear": 1,
+      "population_rate": 0.2974,
+      "population_interval95": [
+        0.204,
+        0.3979
+      ],
+      "by_route": {
+        "direct": {
+          "n": 426,
+          "hits": 57,
+          "rate": 0.1338,
+          "wilson95": [
+            0.1047,
+            0.1694
+          ],
+          "unclear": 0,
+          "population_rate": 0.1787,
+          "population_interval95": [
+            0.0907,
+            0.2831
+          ]
+        },
+        "via_sibling": {
+          "n": 122,
+          "hits": 68,
+          "rate": 0.5574,
+          "wilson95": [
+            0.4688,
+            0.6424
+          ],
+          "unclear": 1,
+          "population_rate": 0.6732,
+          "population_interval95": [
+            0.4652,
+            0.8272
+          ]
+        },
+        "unknown": {
+          "n": 4,
+          "hits": 2,
+          "rate": 0.5,
+          "wilson95": [
+            0.15,
+            0.85
+          ],
+          "unclear": 0,
+          "population_rate": 0.6735,
+          "population_interval95": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "by_category": {
+        "same": {
+          "n": 363,
+          "hits": 87,
+          "rate": 0.2397,
+          "wilson95": [
+            0.1986,
+            0.2862
+          ],
+          "unclear": 0,
+          "population_rate": 0.3467,
+          "population_interval95": [
+            0.2229,
+            0.4755
+          ]
+        },
+        "cross": {
+          "n": 189,
+          "hits": 40,
+          "rate": 0.2116,
+          "wilson95": [
+            0.1594,
+            0.2753
+          ],
+          "unclear": 1,
+          "population_rate": 0.1874,
+          "population_interval95": [
+            0.0698,
+            0.3402
+          ]
+        },
+        "unknown": {
+          "n": 0,
+          "hits": 0,
+          "rate": null,
+          "wilson95": null,
+          "unclear": 0,
+          "population_rate": null,
+          "population_interval95": null
+        }
+      }
+    },
+    "m5": {
+      "n": 472,
+      "hits": 325,
+      "rate": 0.6886,
+      "wilson95": [
+        0.6454,
+        0.7287
+      ],
+      "unclear": 1,
+      "population_rate": 0.6886,
+      "population_interval95": [
+        0.6469,
+        0.7294
+      ],
+      "by_scope": {
+        "central": 166,
+        "secondary": 156,
+        "unknown": 3
+      }
+    },
+    "m6": {
+      "parent_edited": 13,
+      "attach_time_rated": 13,
+      "drifted": 9,
+      "drifted_entry_ids": [
+        "28bd2462-f06f-4194-9cac-a13c461cf4ec",
+        "3c88f869-8247-419b-a985-30c966d68afd",
+        "51f55850-df72-4eda-8f03-77c24dc7a75b",
+        "5b5850ac-5732-4523-80a2-8304aeb3b594",
+        "6d648544-f6a7-4a5c-a68c-ec785825466a",
+        "777f6cb1-8a75-4761-8717-7465e6dfb875",
+        "8f46293e-67ad-41d1-a0a0-da9186f05b72",
+        "f57607c7-243a-41e5-9461-3c51404d540c",
+        "fa50625d-8f99-4041-85eb-3a00a559fc59"
+      ],
+      "attach_time_undecided": 0,
+      "attach_time_unrated": 0
+    }
+  },
+  "harm": {
+    "n": 552,
+    "unclear": 1,
+    "per_write": {
+      "triage": 0.8714,
+      "status_quo": 0.942
+    },
+    "delta_per_write": -0.0707,
+    "delta_interval95": [
+      -0.2228,
+      0.0824
+    ],
+    "population_per_write": {
+      "triage": 0.701,
+      "status_quo": 0.4569
+    },
+    "population_delta_per_write": 0.2441,
+    "population_delta_interval95": [
+      0.1154,
+      0.3789
+    ]
+  }
+}

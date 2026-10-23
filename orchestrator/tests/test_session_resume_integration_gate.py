@@ -50,6 +50,7 @@ import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler, fixed_prompt
 from shared.cli_invoke import transcript_exists
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
+from shared.project_id import project_id_for_root
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
@@ -2405,6 +2406,7 @@ async def test_epsilon_no_sink_leaves_the_dispatch_byte_identical(
 
         Each drive builds its OWN tmp repo and mints its OWN fresh session
         id, so a handful of values differ by construction: the two paths, the
+        project id the config derives from the repo's basename, the
         config-dir handle and the prompt builder (objects with no value
         equality) and everything derived from the session id, the spawn
         parent slug included.
@@ -2418,6 +2420,9 @@ async def test_epsilon_no_sink_leaves_the_dispatch_byte_identical(
             json.dumps(out['mcp_config']).replace(str(repo), '<repo>')
         )
         spawn = dict(out['spawn_env'])
+        spawn['CLAUDE_SPAWN_PROJECT'] = spawn['CLAUDE_SPAWN_PROJECT'].replace(
+            project_id_for_root(repo), '<project>'
+        )
         # The spawn parent id is <task_id>-<slug of the session id>; only the
         # slug is per-drive, so the task-id half stays in the comparison.
         parent = spawn['CLAUDE_SPAWN_PARENT_ID']

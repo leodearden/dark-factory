@@ -2053,7 +2053,10 @@ class TestDeriveModuleRunsWidensOnFullDeselection:
         )
 
     def test_arm_3_task_role_production_floor_is_unchanged(self):
-        """CONTROL: the task-3294 floor keeps its own reason, not the new one."""
+        """CONTROL: the task-3294 floor keeps its own reason, not the new one.
+
+        Derived with no ``list_pkg_tests``, so this pins the floor's fallback
+        leg (task 7253): no guard family to narrow to, hence the full suite."""
         plan = derive_verify_plan(
             SOURCE_ONLY_DIFF, [_mc('orchestrator')], None, _synthetic_reader, role='task',
         )
@@ -2062,7 +2065,8 @@ class TestDeriveModuleRunsWidensOnFullDeselection:
         assert run.scope_kind is ScopeKind.FULL_SUITE
         assert run.reason == (
             'pytest: source-only diff — owning-module full suite (task role); '
-            'sibling modules NOT run'
+            'sibling modules NOT run — not narrowed: '
+            'no whole-tree guard family found for orchestrator'
         )
 
 

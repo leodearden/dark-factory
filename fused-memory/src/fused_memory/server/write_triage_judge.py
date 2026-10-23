@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard, get_args
 
 from fused_memory.config.schema import JudgeReasoningEffort, WriteTriageConfig
@@ -68,7 +69,7 @@ from fused_memory.server.write_triage import (
 from fused_memory.utils.clip_disclosure import TruncationFact, clip_text
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     from fused_memory.models.memory import MemoryResult
 
@@ -354,6 +355,32 @@ def _elide(text: object, field_chars: int) -> str:
     if clip.fact is None:
         return clip.text
     return clip.text + _ELIDED_MARKER
+
+
+class JudgePromptElisions(NamedTuple):
+    """Which fields build_judge_prompt cuts at one width: the entry, and each candidate by id."""
+
+    entry: bool
+    candidates: Mapping[str, bool]
+
+
+def judge_prompt_elisions(
+    content: str,
+    candidates: Sequence[MemoryResult],
+    *,
+    field_chars: int = _DEFAULT_JUDGE_FIELD_CHARS,
+) -> JudgePromptElisions:
+    """Which fields :func:`build_judge_prompt` would cut, for every candidate given.
+
+    Answered by the same :func:`_elide` the render calls, so it cannot disagree
+    with the prompt. It selects nothing: the whole slate it is handed is reported.
+    """
+    return JudgePromptElisions(
+        entry=_elide(content, field_chars) != content,
+        candidates=MappingProxyType(
+            {c.id: _elide(c.content, field_chars) != c.content for c in candidates},
+        ),
+    )
 
 
 def select_judge_candidates(

@@ -555,19 +555,18 @@ async def test_worker_r4_escalation_idempotency_returns_existing_task(
 
 
 # ---------------------------------------------------------------------------
-# step-29: worker degrades to create on CuratorFailureError
+# step-29: worker parks the ticket on a CuratorFailureError
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_worker_curator_failure_degrades_to_create(
+async def test_worker_curator_failure_parks_the_ticket(
     interceptor_with_store, ticket_store, taskmaster,
 ):
-    """When curator.curate raises CuratorFailureError, the worker falls through
-    to the create path:
-    - tm.add_task IS called
-    - ticket resolved status='created'
-    - result_json contains a justification indicating degrade-to-create
+    """When curator.curate raises a CuratorFailureError that is not a
+    zero-output hang, the worker parks the ticket instead of creating:
+    - tm.add_task is NOT called
+    - the ticket is awaiting_curation with defer_reason 'llm-failed'
     """
     from fused_memory.middleware.task_curator import CuratorFailureError
 
@@ -586,30 +585,17 @@ async def test_worker_curator_failure_degrades_to_create(
     ):
         result = await interceptor_with_store.submit_task(
             project_root='/project',
-            title='Degrade Test',
-            description='Should fall through to create',
+            title='Park Test',
+            description='Should be parked awaiting curation',
         )
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
         ticket_id = result['ticket']
 
-        # Let the worker drain
         row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
-    # tm.add_task MUST have been called (fallback to create)
-    taskmaster.add_task.assert_called_once()
-
-    # Ticket must be terminal with status='created'
-    assert row['status'] == 'created', f'Expected created, got {row["status"]}'
-    assert row['task_id'] == '42', f'Expected task_id=42, got {row["task_id"]}'
-    assert row['resolved_at'] is not None
-
-    # result_json contains a justification indicating degrade-to-create
-    result_data = json.loads(row['result_json'])
-    assert 'id' in result_data, f'result_json should have id: {result_data}'
-    # Must indicate that this was a curator-failure fallback
-    degrade_hint = result_data.get('curator_degrade_reason', '')
-    assert degrade_hint, (
-        f'result_json should indicate curator degrade-to-create: {result_data}'
+    taskmaster.add_task.assert_not_called()
+    assert (row['status'], row['defer_reason'], row['task_id']) == (
+        'awaiting_curation', 'llm-failed', None,
     )
 
 
@@ -2054,16 +2040,19 @@ class TestProcessAddTicketsBatch:
         self, interceptor_with_store, ticket_store, taskmaster,
     ):
         """When curate_batch_prepared raises CuratorFailureError and the
-        per-item curate() fallback ALSO raises CuratorFailureError for a
-        ticket, that ticket degrades to 'created' and result_json carries
-        curator_degrade_reason (surfaced from the fallback's exception).
+        per-item curate() fallback ALSO raises a zero-output-hang
+        CuratorFailureError for a ticket, that ticket degrades to 'created'
+        and result_json carries curator_degrade_reason (surfaced from the
+        fallback's exception).
         """
         from fused_memory.middleware.task_curator import CuratorFailureError
 
         t1 = await ticket_store.submit('project', self._make_candidate_json('Task Solo'))
 
         mock_curator = MagicMock()
-        _curator_exc = CuratorFailureError('boom', timed_out=False, duration_ms=100)
+        _curator_exc = CuratorFailureError(
+            'boom', timed_out=True, duration_ms=100, zero_output_timeout=True,
+        )
         mock_curator.curate = AsyncMock(side_effect=_curator_exc)
         mock_curator.curate_batch = AsyncMock(side_effect=_curator_exc)
         _stub_prepare_candidate(mock_curator)
@@ -2231,12 +2220,14 @@ class TestCreatePathReasonPersisted:
         assert json.loads(row['result_json']) == _ADD_TASK_RESULT
 
     @pytest.mark.asyncio
-    async def test_curator_failure_records_curator_failed_reason(
+    async def test_zot_curator_failure_records_curator_failed_reason(
         self, interceptor_with_store, ticket_store, taskmaster,
     ):
         from fused_memory.middleware.task_curator import CuratorFailureError
 
-        exc = CuratorFailureError('llm down', timed_out=False, duration_ms=100)
+        exc = CuratorFailureError(
+            'llm down', timed_out=True, duration_ms=100, zero_output_timeout=True,
+        )
         curator = MagicMock()
         curator.curate = AsyncMock(side_effect=exc)
         curator.curate_batch = AsyncMock(side_effect=exc)
@@ -2253,13 +2244,15 @@ class TestCreatePathReasonPersisted:
         assert json.loads(row['result_json'])['curator_degrade_reason'] == 'llm down'
 
     @pytest.mark.asyncio
-    async def test_single_ticket_path_curator_failure_records_reason(
+    async def test_single_ticket_path_zot_curator_failure_records_reason(
         self, interceptor_with_store, ticket_store, taskmaster,
     ):
         from fused_memory.middleware.task_curator import CuratorFailureError
 
         curator = MagicMock()
-        curator.curate = AsyncMock(side_effect=CuratorFailureError('llm down'))
+        curator.curate = AsyncMock(
+            side_effect=CuratorFailureError('llm down', zero_output_timeout=True),
+        )
         curator.note_created = MagicMock()
         curator.record_task = AsyncMock()
         ticket_id = await ticket_store.submit('project', json.dumps({
@@ -3171,43 +3164,6 @@ class TestCuratorWorkerTokenBudgetAccumulator:
         assert row['status'] == 'created', (
             f'Whale ticket must still resolve even though it busts the '
             f'soft threshold; got status={row["status"]!r}'
-        )
-
-
-# ---------------------------------------------------------------------------
-# AllAccountsCappedException sentinel guard — suggestion 7
-# ---------------------------------------------------------------------------
-
-
-class TestAllAccountsCappedSentinel:
-    """Guard that the AllAccountsCappedException import in task_interceptor.py
-    resolves to the real class from shared.cli_invoke, not the fallback
-    ``Exception`` sentinel.
-
-    If this ever breaks (e.g. the import path changes and the ImportError
-    fallback silently activates), the ``except (CuratorFailureError,
-    AllAccountsCappedException)`` clause in curate_batch would widen to catch
-    bare Exception, making the cap-retry fallback path dead code.
-    """
-
-    def test_allaccountscapped_is_not_bare_exception(self):
-        """The imported symbol must NOT be the built-in ``Exception`` class."""
-        from fused_memory.middleware.task_interceptor import AllAccountsCappedException
-        assert AllAccountsCappedException is not Exception, (
-            'AllAccountsCappedException resolves to the bare Exception sentinel; '
-            'the shared.cli_invoke import must have failed silently'
-        )
-
-    def test_allaccountscapped_is_real_import(self):
-        """The imported symbol should come from shared.cli_invoke, not the fallback."""
-        import fused_memory.middleware.task_interceptor as interceptor_mod
-        # The sentinel defined in the ImportError fallback is named
-        # _UnavailableAllAccountsCapped.  The real class is NOT that name.
-        sentinel_name = '_UnavailableAllAccountsCapped'
-        cls = interceptor_mod.AllAccountsCappedException
-        assert cls.__name__ != sentinel_name, (
-            f'AllAccountsCappedException is the placeholder {sentinel_name!r}; '
-            'shared.cli_invoke import failed'
         )
 
 

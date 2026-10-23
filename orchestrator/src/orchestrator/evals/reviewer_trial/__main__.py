@@ -8,6 +8,9 @@ Commands:
     smoke          Run baseline panel on 1 diff (step 2)
     calibrate      Run scorer on 3 diffs for human inspection (step 3)
     corpus-sanity  Run baseline on all 15 diffs and score (step 4)
+    campaign       Run arms x fixtures x N trials and reduce them; ``--briefing
+                   diff-only,d2`` adds a context-complete arm per variant,
+                   ``--briefing d2`` runs only the context-complete arms
 """
 
 from __future__ import annotations
@@ -27,6 +30,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
+from shared import project_layout
+
+from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.main_checkout_defaults import cli_default
 
 if TYPE_CHECKING:
     from .corpus import CorpusManifest
@@ -559,19 +566,6 @@ def corpus_audit(min_diffs: int) -> None:
 # Mine: FN-candidate mining + frontier labeling (task 2495 / PRD D-6)
 # ---------------------------------------------------------------------------
 
-# Overridable via env var for portability across checkouts -- the mining
-# sources are offline, gitignored data that live in the MAIN repo, not a
-# task worktree (see corpus/README.md "Regenerating / extending the
-# corpus"). Defaults match this deployment's on-disk layout unchanged.
-_MINE_DEFAULT_DB = Path(os.environ.get(
-    'REVIEWER_TRIAL_RUNS_DB', '/home/leo/src/dark-factory/data/orchestrator/runs.db',
-))
-_MINE_DEFAULT_ESC_DIR = Path(os.environ.get(
-    'REVIEWER_TRIAL_ESCALATIONS_DIR', '/home/leo/src/dark-factory/data/escalations',
-))
-_MINE_DEFAULT_REPO = Path(os.environ.get(
-    'REVIEWER_TRIAL_REPO_ROOT', '/home/leo/src/dark-factory',
-))
 _MINE_SPLIT_SEED = 'reviewer_trial-2495-fn-mining'
 
 _LANG_EXTENSIONS = {
@@ -667,12 +661,15 @@ def _select_spot_check_subset(
 
 
 @cli.command('mine')
-@click.option('--runs-db', default=str(_MINE_DEFAULT_DB), type=click.Path(path_type=Path),
-              help='Path to the offline orchestrator runs.db (env: REVIEWER_TRIAL_RUNS_DB)')
-@click.option('--escalations-dir', default=str(_MINE_DEFAULT_ESC_DIR), type=click.Path(path_type=Path),
-              help='Path to the offline escalations directory (env: REVIEWER_TRIAL_ESCALATIONS_DIR)')
-@click.option('--repo-path', default=str(_MINE_DEFAULT_REPO), type=click.Path(path_type=Path),
-              help='Git repo to recover mined diffs from')
+@click.option('--runs-db', default=None, type=click.Path(path_type=Path),
+              help='Path to the offline orchestrator runs.db (env: REVIEWER_TRIAL_RUNS_DB; '
+                   "default: the main checkout's runs.db)")
+@click.option('--escalations-dir', default=None, type=click.Path(path_type=Path),
+              help='Path to the offline escalations directory (env: REVIEWER_TRIAL_ESCALATIONS_DIR; '
+                   "default: the main checkout's escalation queue)")
+@click.option('--repo-path', default=None, type=click.Path(path_type=Path),
+              help='Git repo to recover mined diffs from (env: REVIEWER_TRIAL_REPO_ROOT; '
+                   'default: the main checkout)')
 @click.option('--target-total', default=100, type=int, help='Aim for this many total diffs (existing + mined)')
 @click.option('--max-parallel', default=8, type=int, help='Max concurrent frontier-labeling calls')
 @click.option('--model', default='opus', help='Frontier model for propose_labels_frontier')
@@ -684,7 +681,7 @@ def _select_spot_check_subset(
 @click.option('--min-diffs', default=_DEFAULT_MIN_DIFFS, type=int,
               help="Minimum required diff count for the post-run audit (kept consistent with corpus-audit's --min-diffs)")
 def mine(
-    runs_db: Path, escalations_dir: Path, repo_path: Path, target_total: int,
+    runs_db: Path | None, escalations_dir: Path | None, repo_path: Path | None, target_total: int,
     max_parallel: int, model: str, max_turns: int, seed: str, oauth_token_env: str,
     limit: int | None, min_diffs: int,
 ) -> None:
@@ -696,6 +693,14 @@ def mine(
     after every successfully-labeled diff, so an interrupted run only loses
     whatever was still in flight.
     """
+    runs_db = runs_db or cli_default(
+        '--runs-db', project_layout.runs_db, env_var='REVIEWER_TRIAL_RUNS_DB',
+    )
+    escalations_dir = escalations_dir or cli_default(
+        '--escalations-dir', project_layout.escalation_queue_dir,
+        env_var='REVIEWER_TRIAL_ESCALATIONS_DIR',
+    )
+    repo_path = repo_path or cli_default('--repo-path', Path, env_var='REVIEWER_TRIAL_REPO_ROOT')
 
     async def _run() -> int:
         from .adjudication import AdjudicationLog
@@ -715,8 +720,8 @@ def mine(
             click.echo(
                 f'runs.db not found at {runs_db}\n'
                 '  This is an offline generation tool that reads the gitignored '
-                'orchestrator run history (data/orchestrator/runs.db in the MAIN repo '
-                "checkout, not a task worktree -- see corpus/README.md). Pass --runs-db, "
+                'orchestrator run history, which lives in the MAIN repo checkout, not '
+                "a task worktree (see corpus/README.md). Pass --runs-db, "
                 'or set REVIEWER_TRIAL_RUNS_DB, to point at a real runs.db -- otherwise '
                 "sqlite3 silently creates an empty one and this fails later with "
                 "'no such table: task_results'.",
@@ -1148,7 +1153,33 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
 # the same fixtures for N trials, scored, reduced by campaign.py.
 # ---------------------------------------------------------------------------
 
-_CAMPAIGN_DEFAULT_CONFIG = Path('/home/leo/src/dark-factory/dark-factory-orchestrator.yaml')
+def _parse_briefings(
+    _ctx: click.Context, _param: click.Parameter, value: str,
+) -> list[ReviewBriefing]:
+    """The generations to run, each once; diff-only, when listed, leads.
+
+    Every arm is paired against the first arm's first generation, so ``d2``
+    alone pairs every d2 arm against the first arm's d2 arm, while d2 listed
+    before diff-only would invert the gate. A repeat would collide on its
+    result paths.
+    """
+    valid = [b.value for b in ReviewBriefing]
+    names = [name.strip() for name in value.split(',') if name.strip()]
+    unknown = [name for name in names if name not in valid]
+    if unknown or not names:
+        raise click.BadParameter(
+            f'{", ".join(unknown) or "(none)"}: each must be one of {", ".join(valid)}',
+        )
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise click.BadParameter(f'each generation runs once; repeated: {", ".join(repeated)}')
+    briefings = [ReviewBriefing(name) for name in names]
+    if ReviewBriefing.DIFF_ONLY in briefings and briefings[0] is not ReviewBriefing.DIFF_ONLY:
+        raise click.BadParameter(
+            f'{ReviewBriefing.DIFF_ONLY.value} must come first when listed: it is the incumbent '
+            f'{ReviewBriefing.CONTEXT_COMPLETE.value} is paired against',
+        )
+    return briefings
 
 
 @cli.command('campaign')
@@ -1157,39 +1188,50 @@ _CAMPAIGN_DEFAULT_CONFIG = Path('/home/leo/src/dark-factory/dark-factory-orchest
 @click.option('--trials', default=3, type=int, help='Independent repeats per arm (replication by fixture)')
 @click.option('--split', default='test', help='Corpus split to run (train|selection|test|all)')
 @click.option('--arms', default=None, help='Comma-separated variant names (default: FABLE_EVIDENCE_VARIANTS)')
+@click.option('--briefing', 'briefings', default=ReviewBriefing.DIFF_ONLY.value, callback=_parse_briefings,
+              help='Comma-separated reviewer briefing generations, each run once for every arm '
+                   '(diff-only | d2; default: diff-only; diff-only first when both are listed; '
+                   "d2 alone pairs every arm against the first arm's d2 arm)")
 @click.option('--diff-cap', default=None, type=int,
               help='Diff truncation in chars (default: runner.DIFF_CAP_CHARS; 0 lifts the cap)')
 @click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
 @click.option('--pool/--no-pool', default=True,
               help='Draw on the shared OAuth account pool via a UsageGate (default) or the CLI default login')
-@click.option('--config', 'config_path', default=str(_CAMPAIGN_DEFAULT_CONFIG),
-              type=click.Path(path_type=Path), help='Orchestrator config supplying usage_cap accounts')
+@click.option('--config', 'config_path', default=None, type=click.Path(path_type=Path),
+              help="Orchestrator config supplying usage_cap accounts (default: the main checkout's)")
 def campaign(
-    results_dir: Path, trials: int, split: str, arms: str | None, diff_cap: int | None,
-    max_parallel: int, pool: bool, config_path: Path,
+    results_dir: Path, trials: int, split: str, arms: str | None,
+    briefings: list[ReviewBriefing], diff_cap: int | None,
+    max_parallel: int, pool: bool, config_path: Path | None,
 ) -> None:
     """Run the Fable evidence campaign: every arm x every fixture x N trials.
+
+    Each arm runs once per ``--briefing`` generation; the first arm's first
+    generation is the incumbent every other arm is paired against.
 
     Panel results checkpoint to ``<results-dir>/trial-<n>/`` and scores to
     ``<results-dir>/trial-<n>/scores/``, so a killed campaign resumes
     without re-spending. Re-running with the same arguments only reduces.
     """
+    from orchestrator.config import PROJECT_CONFIG_FILENAME, default_price_table, load_config
+
+    config_path = config_path or cli_default('--config', lambda root: root / PROJECT_CONFIG_FILENAME)
 
     async def _run() -> int:
-        from orchestrator.config import default_price_table, load_config
-        from orchestrator.evals.runner import campaign_usage_gate
+        from orchestrator.evals.eval_gate import campaign_usage_gate
 
         from . import campaign as reduce
         from .runner import DIFF_CAP_CHARS, run_trial
         from .scorer import score_panel_run
-        from .variants import FABLE_EVIDENCE_VARIANTS
+        from .variants import FABLE_EVIDENCE_VARIANTS, campaign_arms
 
         manifest = _load_corpus()
         corpus = manifest if split == 'all' else _select_split(manifest, split)
         by_name = {v.name: v for v in FABLE_EVIDENCE_VARIANTS}
-        variants = (
+        variants = campaign_arms(
             [by_name[a.strip()] for a in arms.split(',') if a.strip()]
-            if arms else list(FABLE_EVIDENCE_VARIANTS)
+            if arms else FABLE_EVIDENCE_VARIANTS,
+            briefings,
         )
         incumbent = variants[0].name
         cap = DIFF_CAP_CHARS if diff_cap is None else diff_cap
@@ -1208,7 +1250,8 @@ def campaign(
 
             click.echo(click.style(
                 f'Campaign: {len(variants)} arms x {len(corpus.diffs)} diffs ({split}) x {trials} trials, '
-                f'diff cap {cap or "lifted"}, pool={"on" if usage_gate else "off"}',
+                f'briefings {",".join(briefings)}, diff cap {cap or "lifted"}, '
+                f'pool={"on" if usage_gate else "off"}',
                 bold=True,
             ))
             blocking_gt = {d.diff_id: {g.id for g in d.blocking_issues()} for d in corpus.diffs}

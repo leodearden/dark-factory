@@ -74,9 +74,12 @@ logger = logging.getLogger(__name__)
 
 
 #: The call sites whose suppressions emit ``merge_flake_suppressed`` and bump the INV-4
-#: storm streak: the merge gate's alone.  The offline lane gates no merge, so a lane clear
-#: masks nothing (offline-lane PRD D6, call 1).
-_CALL_SITES_WITH_LIVE_SIGNALS: Final = frozenset({FlakeCallSite.merge_gate})
+#: storm streak: the merge gate's, and the main-health classifier's task-mu fork, whose
+#: suppression also masks a red a merge depends on (task 3788).  The offline lane gates no
+#: merge, so a lane clear masks nothing (offline-lane PRD D6, call 1).
+_CALL_SITES_WITH_LIVE_SIGNALS: Final = frozenset(
+    {FlakeCallSite.merge_gate, FlakeCallSite.main_probe},
+)
 
 
 def _emit_merge_flake_suppressed(
@@ -478,12 +481,9 @@ async def record_merge_flake_suppression(
     """Record the merge gate's flake observation *result* carries, through
     :func:`record_call_site_observations`.
 
-    It unwraps the ``VerifyResult`` carrier and supplies the merge gate's half of the
-    contract: the merge sha as the head, the task being merged as the observing task,
-    and, on a ``passes_in_isolation`` observation only, every test it names as
-    debt-eligible with no context.  A suppression is the only merge-gate observation
-    that puts a test in the ledger: a confirmed red is a bug, not a flake, and an
-    unconfirmable observation names no test to own.
+    It unwraps the ``VerifyResult`` carrier and records the observation at the merge
+    gate (see :func:`_record_suppressing_observation`).  A result with no
+    ``flake_suppression`` records nothing (B13).  NEVER RAISES.
     """
     s = getattr(result, 'flake_suppression', None)
     if s is None:
@@ -492,14 +492,70 @@ async def record_merge_flake_suppression(
         # degradation (an un-upgraded runner), not an observation: recording a
         # sentinel row for it would put fiction in the evidence trail.
         return
+    await _record_suppressing_observation(
+        s,
+        call_site=FlakeCallSite.merge_gate,
+        project_root=project_root,
+        project_id=project_id,
+        merge_sha=merge_sha,
+        task_id=task_id,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+    )
 
-    suppressed = _is_suppression(s, _Guard(FlakeCallSite.merge_gate, merge_sha, task_id))
+
+async def record_flake_observation(
+    s: FlakeSuppression,
+    *,
+    project_root: Path,
+    project_id: str,
+    merge_sha: str,
+    task_id: str | None,
+    event_store: EventStore | None = None,
+    escalation_queue: Any = None,
+) -> None:
+    """Record one discriminator observation *s* at the call site it carries.
+
+    The main-health classifier's task-mu fork records through here, via the sink
+    ``merge_lane/worker.py::_main_probe_flake_sink`` builds (task 3788); the merge gate
+    reaches the same body through :func:`record_merge_flake_suppression`.  NEVER RAISES.
+    """
+    await _record_suppressing_observation(
+        s,
+        call_site=getattr(s, 'call_site', FlakeCallSite.merge_gate),
+        project_root=project_root,
+        project_id=project_id,
+        merge_sha=merge_sha,
+        task_id=task_id,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+    )
+
+
+async def _record_suppressing_observation(
+    s: FlakeSuppression,
+    *,
+    call_site: FlakeCallSite,
+    project_root: Path,
+    project_id: str,
+    merge_sha: str,
+    task_id: str | None,
+    event_store: EventStore | None,
+    escalation_queue: Any,
+) -> None:
+    """A gate's half of the contract: the merge sha as the head, the task being merged as
+    the observing task, and, on a ``passes_in_isolation`` observation only, every test it
+    names as debt-eligible with no context.  A suppression is the only gate observation
+    that puts a test in the ledger: a confirmed red is a bug, not a flake, and an
+    unconfirmable observation names no test to own.
+    """
+    suppressed = _is_suppression(s, _Guard(call_site, merge_sha, task_id))
     debt_eligible: dict[str, DebtContext | None] = (
         {test_id: None for test_id in named_tests(s)} if suppressed else {}
     )
     await record_call_site_observations(
         (s,),
-        call_site=FlakeCallSite.merge_gate,
+        call_site=call_site,
         project_root=project_root,
         project_id=project_id,
         head_sha=merge_sha,

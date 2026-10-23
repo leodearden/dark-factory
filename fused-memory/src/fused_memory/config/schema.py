@@ -463,6 +463,8 @@ class WriteJournalConfig(BaseModel):
     #: Non-search reads (``get_task``/``get_tasks``/``get_statuses``/
     #: ``get_external_statuses``) — 97.9% of the table with no downstream
     #: consumer, so this is incident-forensics headroom and nothing more.
+    #: Since task 5405 this governs less than it did: see the ``write_journal``
+    #: block of ``fused-memory/config/config.yaml``.
     read_retention_days: float = Field(default=30.0, gt=0)
     #: ``search`` reads — 1.36% of the table and the SOLE data source for leaf
     #: eta's write-after-miss metric (task 3213) and leaf theta's retro corpus
@@ -513,14 +515,14 @@ class WriteJournalGrowthAlarmConfig(BaseModel):
     Restart-only, in the same posture as ``WriteJournalConfig``: absent from
     ``config/reload.py::RELOADABLE_FIELDS``. The measured basis of both ceilings
     lives in the ``write_journal_growth_alarm`` block of
-    ``fused-memory/config/config.yaml``. Task 5405 must re-anchor both values
-    after its rollup lands.
+    ``fused-memory/config/config.yaml``, re-anchored on the post-task-5405
+    volume.
     """
 
     #: On-disk bytes of ``write_journal.db`` plus its ``-wal`` / ``-shm`` sidecars.
-    max_file_bytes: int = Field(default=19_327_352_832, gt=0)
+    max_file_bytes: int = Field(default=6_442_450_944, gt=0)
     #: ``write_ops`` rows inserted in the trailing 24 h.
-    max_rows_inserted_per_day: int = Field(default=1_500_000, gt=0)
+    max_rows_inserted_per_day: int = Field(default=75_000, gt=0)
     #: Minimum seconds between two checks. Checks ride the checkpoint loop's tick
     #: (``server/main.py::_CHECKPOINT_INTERVAL``), so the effective interval is
     #: this value rounded UP to a whole number of ticks: below one tick, every tick.
@@ -1608,6 +1610,27 @@ class ReconciliationConfig(BaseModel):
     sandbox_recon_agents: bool = Field(default=True)
     sandbox_recon_writable_extras: list[str] = Field(default_factory=list)
 
+    transcript_archive_enabled: bool = Field(
+        default=True,
+        description=(
+            'Archive each recon stage CLI transcript before its per-run config '
+            'dir is destroyed (task 3972). The operator kill switch, and the '
+            'only remedy if the archive root breaks: fused-memory installs no '
+            'archival-failure storm consumer. Green-tier for that reason; both '
+            'archive leaves are read live per stage and per GC through '
+            'reconciliation/cli_stage_runner.py::recon_archive_root.'
+        ),
+    )
+    transcript_archive_root: str = Field(
+        default='data/orchestrator/agent-transcripts',
+        description=(
+            'Archive root, resolved against explore_codebase_root (NOT data_dir). '
+            "The default deliberately equals the orchestrator's archive root, "
+            "which docs/legibility/legibility.yaml's agent_transcript_roots "
+            'already mines.'
+        ),
+    )
+
     # Quiescence / burst detection
     conditional_trigger_ratio: float = Field(default=0.33)
     burst_window_seconds: float = Field(default=30.0)
@@ -2149,8 +2172,10 @@ class ReconciliationConfig(BaseModel):
             'Resolved-caller prefixes permitted to record a `deterministic-*` '
             'done provenance (PRD C5). The orchestrator sends no agent_id, so '
             'server/tools.py::_resolve_identity falls back to the '
-            'clientInfo.name that server/mcp_lifecycle.py::McpSession.initialize '
-            "advertises — the literal 'orchestrator', which is why that is the "
+            'clientInfo.name the orchestrator advertises '
+            '(orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY, '
+            'sent by shared/src/shared/mcp_session.py::McpSession.initialize) '
+            "— the literal 'orchestrator', which is why that is the "
             'sole default. DENY-ON-MISSING is the consumer contract: a caller '
             'matching no prefix is refused, and an EMPTY list denies every '
             'caller (the live kill switch for the provenance kind). The '
@@ -2186,6 +2211,10 @@ class TicketJanitorConfig(BaseModel):
     interval the janitor terminalises expired pending tickets, batches
     failed rows by ``(project_id, task_id, escalation_id)``, and submits one
     info-severity ``ticket_failure`` escalation per batch.
+
+    It is also the only retrier of tickets parked ``awaiting_curation``, so
+    ``enabled=False`` strands them: they are never retried, as a dead
+    worker's pending rows are never reaped.
     """
 
     enabled: bool = Field(default=True)
@@ -2193,6 +2222,7 @@ class TicketJanitorConfig(BaseModel):
     cooldown_seconds: float = Field(default=3600.0)
     batch_limit: int = Field(default=100)
     dedup_outage: DedupOutageDetectorConfig = Field(default_factory=DedupOutageDetectorConfig)
+    curation_backlog_escalation_min_attempts: int = Field(default=2, ge=1)
 
 
 class SummaryRebuildConfig(BaseModel):
@@ -2425,6 +2455,14 @@ class CuratorConfig(BaseModel):
     # which counts only hung calls and short-circuits them; this only reports.
     degraded_streak_threshold: int = Field(default=5, ge=1)
 
+    # A submission the curator could not judge (for a reason in
+    # fused-memory/src/fused_memory/middleware/curation_deferral.py::DeferReason)
+    # parks awaiting_curation and is retried on this backoff until an attempt
+    # yields a verdict; the max is the retry-interval cap, not a bound on how
+    # long a ticket stays parked.
+    deferral_backoff_base_seconds: float = Field(default=60.0, gt=0)
+    deferral_backoff_max_seconds: float = Field(default=1800.0, gt=0)
+
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
     # of a YAML file listing premises proven wrong by revert. Matching
     # candidates are dropped before any LLM call. None disables the guard.
@@ -2494,6 +2532,15 @@ class CuratorConfig(BaseModel):
             "PURE-GATE instead of the TDD architect. None disables the gate."
         ),
     )
+
+    @model_validator(mode='after')
+    def _validate_deferral_backoff_bounds(self) -> 'CuratorConfig':
+        if self.deferral_backoff_max_seconds < self.deferral_backoff_base_seconds:
+            raise ValueError(
+                f'deferral_backoff_max_seconds ({self.deferral_backoff_max_seconds}) must be '
+                f'>= deferral_backoff_base_seconds ({self.deferral_backoff_base_seconds})'
+            )
+        return self
 
 
 class PathScopeAdjudicatorConfig(BaseModel):
@@ -2608,10 +2655,12 @@ class WriteTriageConfig(BaseModel):
     Every CALIBRATED BAND field (t_high, t_low, calibration_report_path,
     t_high_by_category) defaults to None, and that is load-bearing: None means
     UNCALIBRATED, which the triage router must read as fail-open to `stored`.
-    The two OPERATOR KNOBS below (`enabled`, `candidate_k`) deliberately do
-    NOT follow that rule — they are hand-set and ship with real defaults,
-    because there is no such thing as an uncalibrated kill switch, and a
-    retrieval width of None would have no fail-open reading at all.
+    The OPERATOR KNOBS below (`enabled`, `candidate_k`, and the attach-guard
+    pair `min_parent_cosine` / `hoist_max_cosine_gap`) deliberately do NOT
+    follow that rule — they are hand-set and ship with real defaults, because
+    there is no such thing as an uncalibrated kill switch, and a retrieval
+    width of None would have no fail-open reading at all. On the guard pair
+    None means the rule is OFF, not uncalibrated.
     """
 
     enabled: bool = Field(
@@ -2652,6 +2701,36 @@ class WriteTriageConfig(BaseModel):
             'read as "no comparable candidate" on every write and route '
             'everything to `stored` with nothing logged. Green-tier '
             'hot-reloadable, read live per write.'
+        ),
+    )
+    min_parent_cosine: float | None = Field(
+        default=0.60,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Attach-guard FLOOR (task 7158): never attach a write, in any band '
+            'and under any attach outcome, to a target whose cosine to the write '
+            'is below this; the write is stored standalone instead. The target '
+            'is the record the write would be filed under, i.e. the parent after '
+            'a child hoist. None switches the rule off. Chosen in-sample on the '
+            '2026-10-11..19 soak, in the text-embedding-3-small cosine scale, so '
+            'it must be re-derived at the embedder cutover (task 6807) alongside '
+            't_high/t_low. Green-tier hot-reloadable, read live per write.'
+        ),
+    )
+    hoist_max_cosine_gap: float | None = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Attach-guard HOIST GAP (task 7158): in the judge band only, refuse '
+            'to hoist a write from the matched child to its parent when the '
+            "parent's cosine to the write is more than this below the child's; "
+            'the write is stored standalone instead, never filed under the '
+            'child. None switches the rule off. Chosen in-sample on the '
+            '2026-10-11..19 soak, in the text-embedding-3-small cosine scale, so '
+            'it must be re-derived at the embedder cutover (task 6807) alongside '
+            't_high/t_low. Green-tier hot-reloadable, read live per write.'
         ),
     )
 
@@ -3283,11 +3362,27 @@ class ConsolidationAutoConfig(BaseModel):
         default=5,
         ge=1,
         description=(
-            'How many candidate clusters the ranking considers per cycle, as a '
-            'multiple of max_auto_per_cycle. Greater than 1 so the cycle picks '
-            'the best few of a wider field rather than the first few it saw; '
-            'bounded so ranking cost stays proportional to what can actually '
-            'be executed. Green-tier hot-reloadable.'
+            'Proposals above (max_auto_per_cycle + max_gate_filings_per_cycle) '
+            'x this trip the backlog regime: the cycle executes and files '
+            'nothing and emits ONE aggregate escalation, so a flooding proposer '
+            'costs one human-visible record per cycle rather than a gate per '
+            'cluster. Applied by '
+            'reconciliation/consolidation_flood_control.py::rank_and_cap. '
+            'Green-tier hot-reloadable.'
+        ),
+    )
+    canonical_absent_bonus: float = Field(
+        default=2.0,
+        ge=1.0,
+        description=(
+            'Ranking multiplier applied by '
+            'reconciliation/consolidation_flood_control.py::rank_and_cap to a '
+            'cluster whose topic has no canonical yet, so an unconsolidated '
+            'cluster outranks a regrowth of one already consolidated. Ordering '
+            'only: it can never raise how much a cycle executes, the per-cycle '
+            'caps do that. At least 1.0, because a value below 1 would penalise '
+            'exactly the clusters it exists to favour. Green-tier '
+            'hot-reloadable.'
         ),
     )
     refusal_streak_threshold: int = Field(

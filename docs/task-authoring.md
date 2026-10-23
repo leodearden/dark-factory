@@ -152,9 +152,29 @@ marked `done` on the strength of an unverified claim.
 | `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required; `stamped_at` written server-side (see below) |
 | `deterministic-deploy` | `DeterministicRunner` cross-unit deploy completed | — |
 | `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run` | — |
-| `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | `escalation_id` **required** — cites the resolving gate escalation, recorded verbatim (no cross-service lookup) |
+| `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | `escalation_id` **required on write** — cites the resolving gate escalation, recorded verbatim (no cross-service lookup) |
 | `deterministic-milestone` | A `kind='predicate'` milestone check exited `0` | — |
 | `operational-verified` | A `normal`-task no-code operational ask closed via a resolved escalation, not a merge | `escalation_id` **and** `note` required |
+
+The per-kind contract has one home:
+`shared/src/shared/task_metadata.py::DoneProvenance`. It holds the kind
+vocabulary, the fields each kind requires, and the evidence fields a `done`
+write records for each kind; the table above summarises it. Three rules hold
+for every kind:
+
+- **Blank means absent.** A whitespace-only value counts as missing, so
+  `commit: "  "` fails a `commit` requirement. Surrounding whitespace is
+  trimmed before the value is recorded.
+- **Evidence is type-checked, not filtered.** A wrongly-typed field such as
+  `pid: "abc"` or `fire_delay_secs: "soon"` refuses the whole write with
+  `done_provenance_invalid`; it is not silently dropped. A well-typed field
+  the kind does not record (for example `pid` on `merged`) is discarded.
+- **The `deterministic-gate` `escalation_id` requirement is write-time
+  only.** New `done` writes must carry it, while stored blobs written before
+  task 5241, which lack it, still read without a schema warning.
+
+A caller that fails a caller bar below is refused on its identity before the
+payload's shape is checked.
 
 `operational-verified` is commitless like the `deterministic-*` kinds, so
 it is likewise exempt from the reopen-freshness gate (which only inspects
@@ -782,8 +802,10 @@ unblock the task.
 Set `metadata.complexity = "simple"` to route a task to the single-agent
 SIMPLE_TASK fast path (one Sonnet agent explores, plans, edits, and
 commits; the architect+implementer pair is skipped, but verify/review/merge
-still run). The only meaningful value is `"simple"` — absent or any other
-value routes to the full architect path.
+still run). The only meaningful value is `"simple"`, matched
+case-insensitively and whitespace-stripped as the router matches it (so
+`" Simple "` counts) — absent or any other value routes to the full
+architect path.
 
 **When to declare `"simple"`:** the change is a single coherent edit — docs
 or comments, a rename, a localized behaviour-preserving refactor, a
@@ -793,6 +815,14 @@ task may be high-priority and may touch several files/modules, as long as
 the *change* is mechanically simple. **When unsure, omit it** — the full
 path is the safe default, and a mis-declared task simply falls back to the
 architect.
+
+**Declared files are mandatory:** a `simple` declaration must carry a
+non-empty `metadata.files` of FILE paths. Otherwise `submit_task` rejects it
+on both creation paths with `error_type: "SimpleTaskFilesRequired"` (guard
+`simple_task_files_error`, `required_key: "files"`). `files: []` does not
+satisfy it: it defers scope to the architect, and no architect runs. The fix
+is to name the files or drop `complexity`. The match is case-insensitive,
+like the router's. `update_task` is not gated.
 
 **Hard-blocker veto:** if the task description contains a hard-blocker
 token (`migration`, `architecture`, `integration test`, `design ... new`,
@@ -1355,14 +1385,15 @@ agent_id, escalation_id, suggestion_hash, prd_path, prd_task_label,
 user_observable_signal, consumer_ref, substrate_confirmed,
 human_decomposed, grammar_confirmed, invariants, optimistic_path,
 capability_manifest, curator_action, curator_justification, combined_at,
-gate_escalated_at, before_done_ran_at, before_done_verified_at,
+dedupe_skipped, gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, files_tagged_empty,
 source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
 execution_class, merge_lane, pending_since, pending_since_backfilled,
-claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at
+claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at,
+main_health_signature
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1498,8 +1529,20 @@ asymmetry is deliberate; the reason for it is stated once, in
 `escalation/src/escalation/merge_lane_resolution.py`, under the same one-place
 rule this section applies to the carrier census below.
 
+The lane is decided once, at enqueue. Editing `metadata.merge_lane` on a task
+whose request is already queued moves nothing (task 5246). An operator moves a
+request that is still waiting for the merger with the `merge_relane` MCP tool
+(`escalation/src/escalation/server.py::merge_relane`). It also reaches a
+coalesced member by task id and moves the member's whole train. The tool
+changes the live lane at once and writes the new lane as `metadata.merge_lane`
+on every task the entry carries. That write is the durable lane: a train's live
+lane is lost when the train dissolves (for example at a restart drain), but its
+members re-enqueue at the written lane. The tool reports each write, so a
+failed one shows up and can be repeated by hand.
+
 `'high'` remains reserved for the **rare, gated hotfix / main-health class**
-(task 1689) — its three machine writers are all of that shape. Routine work
+(task 1689) — its three machine writers are all of that shape, and its fourth
+writer, the operator's `merge_relane`, is meant for the same class. Routine work
 declaring itself urgent starves the normal lane, which is the failure the
 reservation exists to prevent. The carrier census and the reason this key was
 blessed rather than typed are recorded beside the frozenset entry in
@@ -1535,6 +1578,8 @@ apart: `curator_action` / `curator_justification` / `combined_at` are
 written by the **automated task curator**'s combine flow (fused-memory
 `task_interceptor`), while the `human_curator_*` keys below belong to a
 **human content curator** adjudicating a deterministic gate.
+`dedupe_skipped` `{reason, at}` marks a create no curator verdict judged; it is
+the re-dedupe sweep key.
 
 #### The human-curator-gate contract
 
@@ -1885,9 +1930,59 @@ since `_merge_metadata` is a shallow `{**old, **new}` with no deletion
 sentinel. Until task 3777 that made a whole-blob `'replace'` impossible on
 most of the corpus. It is now admitted when the payload carries the stored
 `done_provenance` through verbatim (the contract is
-`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_assert_done_provenance_passthrough`),
+`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_assert_passthrough_only_keys`),
 which is exactly what the migration script sends. Any other shape that
 touches the key is still refused.
+
+### Defect keys: `defects` and `defect_test_retirements`
+
+Both are registered submodels with list cardinality. Their record shapes,
+enums, ref grammar and transition table live in one place,
+`shared/src/shared/defects.py`. This subsection names who writes each key
+and deliberately restates none of that. The registration validates each
+entry alone, so it passes a list that names one ref twice; every writer of
+either key must also pass the whole list through
+`shared/src/shared/defects.py::require_unique_refs`.
+
+- **`defects`**: a list of `DefectDeclaration` records, one per declared
+  defect, each keyed by its ref.
+  - *Who writes it:* at creation, `submit_task` accepts only fresh `open`
+    entries and refuses anything else synchronously with
+    `error == 'defect_creation_refused'`, whose `detail` names the allowed
+    values. After creation `declare_defect` (`Declare`, `DeclareClosure`,
+    `Sighting`) and `record_defect_outcome` (`Proof`, `Rule`) are its only
+    writers. A defect leaves `open` only through a recorded I2 transition
+    (`shared/src/shared/defects.py::apply_event`).
+  - *PRD:* `plans/defect-tests-prd.md` decisions 7, 13 and 15; Contract I1
+    and I2.
+- **`defect_test_retirements`**: a list of `Retirement` records, carried on
+  the task whose diff removes a proven defect's test, not on the defect's
+  own task.
+  - *Who writes it:* at creation, `submit_task` accepts only unruled
+    entries. After creation it is declared through `declare_defect` (a
+    `DeclareRetirement` event) and ruled through `record_defect_outcome` (a
+    `Rule` event).
+  - *PRD:* `plans/defect-tests-prd.md` decisions 13 and 14.
+
+**The write path** for both keys is
+`fused-memory/src/fused_memory/backends/defect_records.py`, which holds the
+creation floor, the per-ref event fold and the typed refusals; read the
+rules there rather than here. `record_defect_outcome` is meant for the
+orchestrator workflow and `scripts/prove_defect.py` alone. No dispatched
+role's `allowed_tools` grants it (pinned by
+`orchestrator/tests/test_role_defect_outcome_authority.py`), but that list
+is a permission allow list, not a denial, so a dispatched session that
+mounts fused-memory can still reach the tool: no role denies it through
+`disallowed_tools` yet. A `duplicate_of` or `superseded_by` ref must already
+be declared on some task, which `lookup_defect_ref` answers. `update_task`
+never writes either key: it refuses one with
+`error == 'defect_records_via_update_task'`, except under
+`metadata_mode='replace'` when the payload carries the stored value through
+verbatim, the same rule as `done_provenance` above.
+
+**Census corollary:** like `delivered_checks` above, both registrations are
+an import side effect of `shared.defects`, so a census script must import
+that module first or it will count both keys as `unknown_key`.
 
 ---
 

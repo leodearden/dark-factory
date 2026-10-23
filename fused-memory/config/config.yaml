@@ -222,8 +222,8 @@ taskmaster:
 # restarts. That covers peak accrual (1.13M/day) plus a ~7-day drain of the
 # backlog (2.02M/day). The row budget and deadline are unchanged: no pass ever
 # reached the budget, and a longer deadline would lengthen every startup, which
-# prunes before READY. Once drained, each pass removes ~20k rows (985k / 48)
-# in ~7-8 s, finishes inside the deadline and logs no WARNING.
+# prunes before READY. Once drained, each pass would have removed ~20k rows
+# (985k / 48) in ~7-8 s; task 5405, below, has since removed that accrual.
 #
 # SERVING COST, which sets prune_batch_size. The periodic pass runs while
 # serving, and every journalled tool call (~11.4/s at 985k rows/day) queues on
@@ -238,9 +238,21 @@ taskmaster:
 #
 # Each partial pass logs a WARNING naming the horizons still behind AND the
 # rows/sec it achieved. If periodic WARNINGs persist about a week after deploy,
-# re-measure from their rows/sec and lower prune_interval_seconds. Task 5405
-# (read-row rollup) changes the accrual rate and should re-size this block
-# when it lands.
+# re-measure from their rows/sec and lower prune_interval_seconds.
+#
+# SINCE TASK 5405 (re-checked against this block 2026-10-19) successful
+# non-search reads are COUNTED into read_op_counts, never stored, so
+# read_retention_days governs only failed reads and history not yet moved by
+# fused-memory/scripts/roll_up_journal_reads.py. Per-row inserts fall from
+# ~985k/day to the per-row figure in the write_journal_growth_alarm block's
+# MEASURED BASIS below, and nearly all of those are writes and searches
+# on the 730/365-day horizons, so the read horizon accrues almost nothing and
+# the capacity above is spent only on pre-5405 history. No value here changes:
+# - prune_batch_size: a counted read still takes the journal's connection lock
+#   for its read_op_counts upsert, so tool calls still queue at ~11.4/s behind
+#   the batch in flight and the serving-cost basis above stands.
+# - prune_interval_seconds: a pass with nothing expired seeks each horizon from
+#   its resume point, milliseconds, so frequent passes cost nothing once drained.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal:
   read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}
@@ -256,31 +268,44 @@ write_journal:
 # check_interval_seconds the checkpoint loop samples write_journal.db; a crossed
 # ceiling logs a WARNING naming the measured size and files an escalation. The
 # alarm DELETES NOTHING: rows are bounded by the write_journal prune above, and
-# the volume fix and reclaim are task 5405's. Task 5405 must re-anchor both
-# ceilings after it lands.
+# the reclaim is fused-memory/scripts/roll_up_journal_reads.py's (runbook:
+# fused-memory/scripts/README_roll_up_journal_reads.md). Task 7027 re-measures
+# both ceilings one week after that reclaim.
 #
-# MEASURED BASIS (2026-10-09, live journal, read-only):
-#   file      17,296,526,128 B including -wal/-shm, 366.8 MB of it on the freelist
-#   net file  +901.8 MB over ~29.5 days (~30.6 MB/day), despite the task-5247
-#             prune running throughout
-#   inserts   trailing-7d mean 931,647 rows/day; highest 24 h window 1,108,612;
-#             d-10..d-21 ran 412k-642k/day, so a ~1.9x step around 2026-09-30
+# MEASURED BASIS (2026-10-16, post-task-5405 projection; live journal read-only,
+# keep-set rebuilt on a scratch copy; figures in the README's 'Measured'):
+#   per-row   since 5405 only writes, search and failed reads insert write_ops
+#             rows: 5.4k-38.8k/day over 2026-10-08..15, RISING; highest day
+#             38,759 (2026-10-15), trailing-7d mean 19,001
+#   size      post-reclaim 2,325,856,256 B (2.17 GiB); normal growth
+#             (write_ops + backend_ops) ~35 MB/day on the 7d mean, ~66 MB/day
+#             on the peak day
+#   regress   per-read journalling would add ~1.01M rows/day, ~477 MB/day
 #
-# max_file_bytes = 18 GiB is ~2.03 GB above today's file. If the prune stopped
-# deleting, inserts (~439 MB/day = 931,647 rows x 471 B/row, the last exact
-# bytes/row measurement, 2026-09-10) would absorb the freelist and cross it in
-# ~5.5 days; at today's ~30.6 MB/day net creep it is crossed in ~66 days.
-# `auto_vacuum` is NONE, so the file never shrinks without an offline VACUUM: a
-# size breach stays breached until an operator VACUUMs or deliberately raises
-# this ceiling, recording the reason here.
+# max_file_bytes = 6 GiB is ~4.1 GB above the post-reclaim size: normal growth
+# crosses it in ~2-4 months, a per-read-journalling regression in ~8 days.
+# `auto_vacuum` is NONE, so the file never shrinks without an offline VACUUM.
+# This ceiling is BREACHED from the 5405 deploy until the operator reclaim runs
+# (task 7026). That one folded escalation is expected, and the README's reclaim
+# clears it.
 #
-# max_rows_inserted_per_day = 1.5M is 1.35x the highest 24 h window and 1.61x
-# the 7-day mean. A repeat of the late-September step would cross it within a
-# day. It clears by itself when the rate falls.
+# max_rows_inserted_per_day = 75,000 is ~1.9x the highest post-change day and
+# ~3.9x the 7-day mean. A regression to per-read journalling crosses it within
+# ~2 h of trailing window. It clears by itself when the rate falls.
+#
+# SECOND EXPECTED TRANSIENT: the insert-rate ceiling ALSO fires once, for up to
+# ~24 h after fused-memory first runs the 5405 build. The sample is a ROWID
+# difference over the trailing 24 h (WriteJournal._rows_inserted_since), so the
+# ~0.8-1.1M per-read rows the OLD build inserted inside that window count even
+# after the migration deletes them; migration does not shorten it. Do NOT
+# re-anchor the 75,000 ceiling on this transient: it ends on its own once the
+# trailing window holds only 5405-build inserts, and the alarm's suggested
+# GROUP BY over write_ops shows nothing anomalous by then. A crossing that
+# persists past ~24 h after the 5405 restart is a real regression.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal_growth_alarm:
-  max_file_bytes: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_FILE_BYTES:19327352832}
-  max_rows_inserted_per_day: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_ROWS_PER_DAY:1500000}
+  max_file_bytes: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_FILE_BYTES:6442450944}
+  max_rows_inserted_per_day: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_ROWS_PER_DAY:75000}
   check_interval_seconds: ${WRITE_JOURNAL_GROWTH_ALARM_CHECK_INTERVAL_SECONDS:3600}
 
 
@@ -367,6 +392,9 @@ reconciliation:
   # instead of resuming silently. Restart-tier (read each cycle; not hot-reloadable).
   auto_unhalt_after_cooldown: true
   explore_codebase_root: "${PROJECT_ROOT:.}"
+  # Recon CLI transcripts are archived into the orchestrator's archive root (relative to explore_codebase_root), which the legibility miner already walks.
+  transcript_archive_enabled: true
+  transcript_archive_root: "data/orchestrator/agent-transcripts"
   # Escalation
   escalation_port: ${RECON_ESCALATION_PORT:8103}
   escalation_host: "127.0.0.1"
@@ -607,7 +635,7 @@ mem0_update:
 # Deterministic auto-consolidation of Mem0 near-duplicate clusters (task 5237,
 # plans/memory-auto-consolidation-prd.md). Recon Stage 1 proposes a cluster, a
 # pure predicate rules on it, and a passing cluster is consolidated WITH NO
-# HUMAN IN THE LOOP. All thirteen leaves are green-tier hot-reloadable: they
+# HUMAN IN THE LOOP. All fourteen leaves are green-tier hot-reloadable: they
 # are registered in `config/reload.py::RELOADABLE_FIELDS`, which is the
 # authoritative list, and `mcp__escalation__reload_config` applies a change to
 # any of them to a RUNNING server with no restart.
@@ -654,10 +682,13 @@ mem0_update:
 #   # rest of the pipeline proposing and recording.
 #   max_auto_per_cycle: 3
 #   max_gate_filings_per_cycle: 3
-#   # How many candidate clusters the ranking considers per cycle, as a multiple
-#   # of max_auto_per_cycle — so the cycle picks the best few of a wider field
-#   # rather than the first few it saw.
+#   # Proposals above (max_auto_per_cycle + max_gate_filings_per_cycle) x this
+#   # trip the backlog regime: the cycle executes and files nothing and emits
+#   # ONE aggregate escalation.
 #   backlog_multiplier: 5
+#   # Ranking multiplier for a cluster whose topic has no canonical yet. Orders
+#   # the slice only; it never raises how much a cycle executes. At least 1.0.
+#   canonical_absent_bonus: 2.0
 #   # Consecutive refusals of the SAME topic before it stops being re-proposed
 #   # and goes to a human. A refusal no LLM re-emission can fix would otherwise
 #   # repeat every cycle forever, which is cost with no information.
@@ -704,6 +735,24 @@ write_triage:
   # 88.5% @50); the retired guard's limit=5 is the number this deliberately is
   # not. Counted as a TOTAL across the three Mem0-primary categories.
   candidate_k: 20
+  # ATTACH-GUARD KNOBS (task 7158) — hand-set operator knobs, green-tier; null
+  # switches a rule off. Evidence: the 2026-10-11..19 soak,
+  # data/write-triage-soak-2026-10-19/correctness-analysis-2026-10-19.md §1
+  # F2/F5 and team/A/fix_replay_out.md (gitignored, main checkout only). Both
+  # are in-sample and in the text-embedding-3-small cosine scale — re-derive
+  # them at the embedder cutover (task 6807, η).
+  #
+  # min_parent_cosine: never attach, in any band, to a target (the parent,
+  # after a hoist) whose cosine to the write is below this; store standalone.
+  # On replay the 0.60 floor removed 28 contested misfiles for 2 correct
+  # contests.
+  min_parent_cosine: 0.60
+  # hoist_max_cosine_gap: in the judge band, refuse to hoist from the matched
+  # child to its parent when the parent's cosine is more than this below the
+  # child's; store standalone. On replay the 0.05 gap removed 32 contested
+  # misfiles for 1 correct contest; with F1 (task 6956) contested misfile fell
+  # 0.32 -> 0.24.
+  hoist_max_cosine_gap: 0.05
   # JUDGE KNOBS (leaf gamma, task 3128) — also hand-set operator knobs, and
   # deliberately ABOVE the calibration fence below so --write-config preserves
   # them. Every judge knob is green-tier hot-reloadable and read live per
