@@ -47,6 +47,9 @@ _CONTENT = (
 _JUDGE_PATH = 'fused_memory.server.tools.judge_write'
 _HIGH_BAND = 0.99
 _MIDDLE_BAND = 0.80
+#: With triage off the near-duplicate reject guard is live and refuses a
+#: restatement before anything is written, so the triage-off write stays under it.
+_BELOW_REJECT_GUARD = 0.50
 
 _DECLARATION_SHAPES = {
     'scalar': OLD,
@@ -176,11 +179,15 @@ class TestAddMemoryStoresASupersessionStandalone:
 
 class TestAddMemoryMarksTheSupersededRecord:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('triage_enabled', [True, False], ids=['triage-on', 'triage-off'])
+    @pytest.mark.parametrize(
+        ('triage_enabled', 'score'),
+        [(True, _HIGH_BAND), (False, _BELOW_REJECT_GUARD)],
+        ids=['triage-on', 'triage-off'],
+    )
     async def test_the_superseded_record_is_marked_with_the_new_id(
-        self, triage_enabled: bool,
+        self, triage_enabled: bool, score: float,
     ) -> None:
-        mock_service = _service(_HIGH_BAND, enabled=triage_enabled)
+        mock_service = _service(score, enabled=triage_enabled)
 
         ack = await _call(mock_service, {'supersedes': [OLD]})
 
