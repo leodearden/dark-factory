@@ -546,6 +546,10 @@ async def _invoke_codex(
     return _parse_codex_output(result, model, prices)
 
 
+def _codex_exit_line(result: _SubprocessResult) -> str:
+    return f'codex exited rc={result.returncode}' + (' (timed out)' if result.timed_out else '')
+
+
 def _parse_codex_output(
     result: _SubprocessResult,
     model: str,
@@ -559,9 +563,10 @@ def _parse_codex_output(
     timed_out is propagated directly from result.timed_out on every return path.
     *prices*, when provided, is forwarded to _estimate_cost (see there for the
     resolution order when None). codex exits 0 on ``turn.failed``, so
-    returncode alone is not a failure signal. A failed turn reports codex's
-    own error text, so a reply that discusses caps is never read as one by
-    classify_invocation.
+    returncode alone is not a failure signal. A failed run's output is only
+    codex-authored text — its error events, or a synthetic exit line when it
+    died without one (timeout, crash) — so a reply that discusses caps is
+    never read as one by classify_invocation.
     """
     if not result.stdout.strip():
         return AgentResult(
@@ -590,7 +595,7 @@ def _parse_codex_output(
         except json.JSONDecodeError:
             return AgentResult(
                 success=result.returncode == 0,
-                output=result.stdout,
+                output=result.stdout if result.returncode == 0 else _codex_exit_line(result),
                 subtype='text_output',
                 stderr=result.stderr,
                 timed_out=result.timed_out,
@@ -653,8 +658,18 @@ def _parse_codex_output(
         if error_text is not None and error_text not in error_parts:
             error_parts.append(error_text)
 
-    output_parts = error_parts if is_error else agent_parts + error_parts
-    output_text = '\n'.join(output_parts) if output_parts else result.stdout[:2000]
+    if is_error:
+        output_text = '\n'.join(error_parts)
+    elif result.returncode != 0 or result.timed_out:
+        if agent_parts:
+            logger.info(
+                'codex %s; its partial reply is withheld from output: %.500s',
+                _codex_exit_line(result), '\n'.join(agent_parts),
+            )
+        output_text = '\n'.join([_codex_exit_line(result), *error_parts])
+    else:
+        output_parts = agent_parts + error_parts
+        output_text = '\n'.join(output_parts) if output_parts else result.stdout[:2000]
 
     priced_input_tokens = total_input_tokens
     if total_cached_input_tokens > total_input_tokens:

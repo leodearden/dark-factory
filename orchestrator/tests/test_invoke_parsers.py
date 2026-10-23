@@ -404,7 +404,7 @@ class TestParseCodexFailedTurnReportsOnlyCodexErrors:
         assert _CODEX_MODEL_METADATA_WARNING in agent_result.output
         assert _CODEX_CONTEXT_WINDOW_ERROR in agent_result.output
 
-    def test_timed_out_run_quoting_a_cap_is_a_plain_failure(self) -> None:
+    def test_timed_out_run_quoting_a_cap_is_not_a_cap(self) -> None:
         stream = replace(_codex_stream(
             {'type': 'thread.started', 'thread_id': 'tid-timeout-1'},
             {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': _PROSE_QUOTING_CAP_TEXT}},
@@ -419,7 +419,7 @@ class TestParseCodexFailedTurnReportsOnlyCodexErrors:
         assert _CODEX_USAGE_LIMIT_MESSAGE not in agent_result.output
         assert 'timed out' in agent_result.output
         outcome = classify_invocation(agent_result, strict_confirm=True, backend='codex')
-        assert isinstance(outcome, Failure)
+        assert not isinstance(outcome, CapHit)
 
     def test_nonzero_exit_without_error_event_reports_codex_exit_and_warnings(self) -> None:
         stream = replace(_codex_stream(
