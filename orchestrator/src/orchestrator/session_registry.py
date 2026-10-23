@@ -70,7 +70,8 @@ SCHEMA_VERSION = 1
 
 # 3: LeaseHolder.record_slug and DecisionRecord.record_slug (task 4237).
 # 4: SessionRecord.self_exit (task 7179).
-SCHEMA_MINOR = 4
+# 5: SessionRecord.exit_request and exit_requested_at (task 7193).
+SCHEMA_MINOR = 5
 """Additive-extension counter for this module's contract (Fleet Cockpit C1,
 plans/fleet-cockpit-prd.md §6.1). A CODE-LEVEL signal only -- never persisted
 per-record. Bump this when a new backward-compatible (optional/defaulted)
@@ -125,6 +126,34 @@ def parse_result_outcome(text: str) -> ResultOutcome | None:
             except ValueError:
                 return None
     return None
+
+
+class ExitRequestState(StrEnum):
+    """Where the Stop hook's self-exit evaluation ended (plans/review-all-program-tooling-prd.md §4 H5)."""
+
+    REFUSED = 'refused'
+    ATTEMPTED = 'attempted'
+    KILL_FAILED = 'kill_failed'
+
+
+@dataclass(frozen=True)
+class ExitRequest:
+    """One self-exit evaluation as the Stop hook stamped it; ``reason`` names a refusal or a failed signal."""
+
+    state: ExitRequestState
+    reason: str | None
+    pid: int | None
+    at: str
+    marker_session_id: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'state': ExitRequestState(self.state).value,
+            'reason': self.reason,
+            'pid': self.pid,
+            'at': self.at,
+            'marker_session_id': self.marker_session_id,
+        }
 
 
 class Status(StrEnum):
@@ -278,6 +307,25 @@ def _coerce_session_id(value: Any) -> str | None:
     return stripped or None
 
 
+def _coerce_exit_request(value: Any) -> ExitRequest | None:
+    """Read ``exit_request`` from a record body; a non-dict or an unknown state reads None. Never raises."""
+    if not isinstance(value, dict):
+        return None
+    try:
+        state = ExitRequestState(value.get('state'))
+    except ValueError:
+        return None
+    reason = value.get('reason')
+    at = value.get('at')
+    return ExitRequest(
+        state=state,
+        reason=reason if isinstance(reason, str) else None,
+        pid=_coerce_owner_pid(value.get('pid')),
+        at=at if isinstance(at, str) else '',
+        marker_session_id=_coerce_session_id(value.get('marker_session_id')),
+    )
+
+
 @dataclass
 class SessionRecord:
     """One session-registry record — ``<fleet_root>/sessions/<slug>/record.json``.
@@ -335,6 +383,11 @@ class SessionRecord:
     self_exit: true when the spawn was launched with CLAUDE_SPAWN_SELF_EXIT=1;
         stamped at ``launching`` and preserved by every later
         read-modify-write. Anything but a JSON true reads back as False.
+    exit_request: the Stop hook's last self-exit evaluation, or None; written
+        only when the ``exit-requested`` marker is present on a proven-owner
+        event. See ExitRequest and ``session_self_exit.py``.
+    exit_requested_at: when the hook last stamped an ATTEMPTED evaluation, or
+        None; read by watch_sessions for sibling-mode final detection.
     """
 
     session_slug: str
@@ -359,6 +412,8 @@ class SessionRecord:
     claude_session_id: str | None = field(default=None, kw_only=True)
     claude_owner_pid: int | None = field(default=None, kw_only=True)
     self_exit: bool = field(default=False, kw_only=True)
+    exit_request: ExitRequest | None = field(default=None, kw_only=True)
+    exit_requested_at: str | None = field(default=None, kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain, JSON-scalar-only dict (status as its wire string)."""
@@ -385,12 +440,15 @@ class SessionRecord:
             'claude_session_id': self.claude_session_id,
             'claude_owner_pid': self.claude_owner_pid,
             'self_exit': self.self_exit,
+            'exit_request': self.exit_request.to_dict() if self.exit_request is not None else None,
+            'exit_requested_at': self.exit_requested_at,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SessionRecord:
         display_data = data.get('display')
         question_data = data.get('question')
+        exit_requested_at = data.get('exit_requested_at')
         return cls(
             session_slug=data['session_slug'],
             status=Status(data['status']),
@@ -414,6 +472,8 @@ class SessionRecord:
             claude_session_id=_coerce_session_id(data.get('claude_session_id')),
             claude_owner_pid=_coerce_owner_pid(data.get('claude_owner_pid')),
             self_exit=data.get('self_exit') is True,
+            exit_request=_coerce_exit_request(data.get('exit_request')),
+            exit_requested_at=exit_requested_at if isinstance(exit_requested_at, str) else None,
         )
 
     def to_json(self) -> str:
