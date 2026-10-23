@@ -126,6 +126,11 @@ MEM0_TOMBSTONE_DELETERS = (
 )
 
 
+def format_mem0_tombstone_deleters() -> str:
+    """MEM0_TOMBSTONE_DELETERS as the backtick-wrapped, comma-separated list the recon prompts render."""
+    return ', '.join(f'`{deleter}`' for deleter in MEM0_TOMBSTONE_DELETERS)
+
+
 @dataclass(frozen=True)
 class MarkerLifecycle:
     """Who writes a record_kind, and what deletes it.
@@ -569,7 +574,6 @@ def render_cycle_summary_section() -> str:
         f"  - stage='{stage}' -> recon_pool='{pool}'"
         for stage, pool in CYCLE_SUMMARY_STAGE_TO_RECON_POOL.items()
     )
-    deleters_str = ', '.join(f'`{deleter}`' for deleter in MEM0_TOMBSTONE_DELETERS)
     return (
         '## Per-Cycle Summary\n'
         'Python writes exactly one per-cycle summary memory per stage, '
@@ -600,7 +604,7 @@ def render_cycle_summary_section() -> str:
         'The Mem0 record is a best-effort searchable copy; the AUTHORITATIVE '
         'record is the ReconLedgerStore cycle_summary row — check it with '
         '`get_cycle_summary_presence`, never by looking for the mirror.\n\n'
-        f'Deletes performed by these named sweeps — {deleters_str} — leave a '
+        f'Deletes performed by these named sweeps — {format_mem0_tombstone_deleters()} — leave a '
         "TOMBSTONE, returned by `get_memory_by_id` on its not-found branch as "
         "a `'tombstone'` key naming the sweep that deleted the record "
         '(`deleter`), the run that performed the deletion (`deleting_run_id`), '

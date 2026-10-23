@@ -5832,8 +5832,9 @@ class TestGateOwnedActionPhrasingWiring:
 
 class TestStage1LiveStateFreshnessSection:
     """The Stage-1 live-state freshness section (task 5271) renders its benign
-    deleter list from recon_self_model.MEM0_TOMBSTONE_DELETERS, the tuple the
-    code-side sweep_deletion_guard reads, so the two cannot drift apart."""
+    deleter list as the shared recon_self_model.format_mem0_tombstone_deleters()
+    list, built from the tuple the code-side sweep_deletion_guard reads, so the
+    two cannot drift apart."""
 
     def _section(self) -> str:
         from fused_memory.reconciliation.prompts.stage1 import (
@@ -5853,13 +5854,12 @@ class TestStage1LiveStateFreshnessSection:
 
         assert STAGE1_SYSTEM_PROMPT.count(LIVE_STATE_FRESHNESS_HEADING) == 1
 
-    def test_every_documented_deleter_is_rendered_in_the_section(self):
-        from fused_memory.reconciliation.recon_self_model import MEM0_TOMBSTONE_DELETERS
+    def test_section_renders_the_shared_deleter_list(self):
+        from fused_memory.reconciliation.recon_self_model import format_mem0_tombstone_deleters
 
-        section = self._section()
-        missing = [d for d in MEM0_TOMBSTONE_DELETERS if d not in section]
-        assert not missing, (
-            f'the section must name every documented sweep deleter; missing {missing!r}'
+        deleters = format_mem0_tombstone_deleters()
+        assert deleters in self._section(), (
+            f'the section must render the shared deleter list {deleters!r}'
         )
 
 
