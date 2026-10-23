@@ -249,10 +249,9 @@ _LANE = '_lane-0'
 _TIP = 'deadbeef0123456789abcdef0123456789abcdef'
 
 
-def _write_plan(worktree_base: Path, lane: str, steps: list[dict]) -> None:
-    meta_root = TaskArtifacts.meta_root_for(worktree_base, lane)
-    meta_root.mkdir(parents=True, exist_ok=True)
-    (meta_root / 'plan.json').write_text(json.dumps({'task_id': _TID, 'steps': steps}))
+def _write_plan(root: Path, steps: list[dict]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / 'plan.json').write_text(json.dumps({'task_id': _TID, 'steps': steps}))
 
 
 def _all_done_steps() -> list[dict]:
@@ -274,11 +273,12 @@ def _build_env(
     steps: list[dict] | None = None,
     empty_records: bool = False,
     raise_on_resolve: bool = False,
+    plan_at_lane_root: bool = False,
 ) -> tuple[GitOps, EventStore, Callable[[str], Path], Path]:
     """Build (git_ops, event_store, worktree_resolver, worktree) for the detector.
 
-    Defaults describe the POSITIVE verified-green shape; override one knob per
-    negative case.
+    Defaults describe the POSITIVE verified-green shape, plan.json at the
+    task root; override one knob per negative case.
     """
     worktree_base = tmp_path / 'wtbase'
     worktree_base.mkdir(parents=True, exist_ok=True)
@@ -302,7 +302,11 @@ def _build_env(
     if verified_tip is not None:
         _emit_verify(event_store, _TID, passed=True, tip_sha=verified_tip)
 
-    _write_plan(worktree_base, _LANE, steps if steps is not None else _all_done_steps())
+    plan_root = (
+        TaskArtifacts.meta_root_for(worktree_base, _LANE) if plan_at_lane_root
+        else TaskArtifacts.task_root_for(worktree_base, _TID)
+    )
+    _write_plan(plan_root, steps if steps is not None else _all_done_steps())
 
     def _resolver(tid: str) -> Path:
         return worktree
@@ -418,6 +422,15 @@ class TestDetectVerifiedGreen:
         git_ops, event_store, resolver, _ = _build_env(
             tmp_path, steps=[{'id': 's1', 'status': 'done'}, {'id': 's2', 'status': 'pending'}],
         )
+        assert await detect_verified_green(
+            _TID, git_ops=git_ops, event_store=event_store, worktree_resolver=resolver,
+        ) is None
+
+    async def test_none_when_the_done_plan_is_only_at_the_lane_root(self, tmp_path: Path) -> None:
+        """plan.json is task-scoped: a lane-root copy is not the task's plan."""
+        from orchestrator.stranded_verified_green import detect_verified_green
+
+        git_ops, event_store, resolver, _ = _build_env(tmp_path, plan_at_lane_root=True)
         assert await detect_verified_green(
             _TID, git_ops=git_ops, event_store=event_store, worktree_resolver=resolver,
         ) is None
