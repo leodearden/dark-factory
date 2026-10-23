@@ -8,7 +8,8 @@ text).
 
 Import-leaf rule
 ----------------
-This module imports **only the standard library**, and must keep doing so.
+This module imports **only the standard library**, plus the stdlib-only
+``shared.memory_supersession`` constant, and must keep doing so.
 :class:`~fused_memory.config.schema.ConsolidationAutoConfig` is referenced under
 ``TYPE_CHECKING`` only, so importing this module never loads config, pydantic,
 yaml or the mem0 SDK. That is a STRICTLY STRONGER property than its sibling leaf
@@ -43,6 +44,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
+
+from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
 
 if TYPE_CHECKING:  # pragma: no cover - a runtime import here would cost the leaf
     from fused_memory.config.schema import ConsolidationAutoConfig
@@ -197,11 +200,13 @@ UNREADABLE = _Unreadable()
 #: ``superseded_by`` 32, ``corrects_memory_id`` 17, ``corrects`` 6,
 #: ``stale_pre_fix_state`` 2.
 #:
-#: None of these is registered vocabulary today — ``memory_metadata`` censuses
-#: all of them as unknown keys — which is why they are enumerated here as
-#: observed corpus facts rather than imported from a registry that does not
-#: carry them. The arm is REFUSAL-ONLY, so widening it can only make the
-#: predicate more conservative and can never grant a pass.
+#: None of those six is registered vocabulary today — ``memory_metadata``
+#: censuses all of them as unknown keys — which is why they are enumerated here
+#: as observed corpus facts rather than imported from a registry that does not
+#: carry them. The supersession mark is the one REGISTERED key in the set,
+#: written by ``services/supersession_mark.py::mark_superseded``. The arm is
+#: REFUSAL-ONLY, so widening it can only make the predicate more conservative
+#: and can never grant a pass.
 CORRECTION_METADATA_KEYS: frozenset[str] = frozenset({
     'corrects',
     'superseded_by',
@@ -209,6 +214,7 @@ CORRECTION_METADATA_KEYS: frozenset[str] = frozenset({
     'corrects_memory_id',
     'corrected_by_run',
     'corrected_at',
+    SUPERSEDED_BY_METADATA_KEY,
 })
 
 #: Body text marking a record as corrected, superseded or retracted.
