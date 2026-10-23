@@ -2643,6 +2643,17 @@ class TaskCurator:
             return PruneResult(skipped=True, reason='error', live=len(live))
 
     async def close(self) -> None:
+        """Archive and remove this process's config dir, then release the clients.
+
+        Archival goes first, so a hanging client close cannot starve it. The
+        thread hop holds the delete as well as the archival, so a cancelled
+        await cannot skip one and keep the other, which is the hazard
+        ``archive_before_delete``'s no-``to_thread`` note guards against.
+        """
+        config_dir, self._config_dir = self._config_dir, None
+        archive_root = self._transcript_archive_root()
+        if config_dir is not None and archive_root is not None:
+            await asyncio.to_thread(_archive_curator_config_dir, config_dir.path, archive_root)
         if self._qdrant_client is not None:
             import contextlib as _ctx
 
