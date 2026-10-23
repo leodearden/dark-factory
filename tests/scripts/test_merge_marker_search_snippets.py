@@ -279,16 +279,40 @@ def _commit_file(root: Path, name: str, *messages: str) -> str:
     return _fixture_git(root, 'rev-parse', 'HEAD')
 
 
-def _merge_into_main(root: Path, subject: str) -> str:
+def _merge_into_main(root: Path, message: str) -> str:
     _fixture_git(root, 'checkout', '-q', 'main')
-    _fixture_git(root, 'merge', '--no-ff', '-m', subject, _FIXTURE_BRANCH)
+    _fixture_git(root, 'merge', '--no-ff', '-m', message, _FIXTURE_BRANCH)
     return _fixture_git(root, 'rev-parse', 'HEAD')
 
 
-@pytest.fixture(scope='module')
-def shadowed_history(tmp_path_factory: pytest.TempPathFactory) -> ShadowedHistory:
-    root = tmp_path_factory.mktemp('shadowed-history') / 'repo'
-    root.mkdir()
+def _wrapped_first_paragraph(subject: str) -> str:
+    wrapped = subject.replace(' into ', '\ninto ', 1)
+    assert wrapped != subject, f'{subject!r} has no " into " at which to wrap it onto two lines'
+    return wrapped
+
+
+_MARKER_MESSAGES = {
+    'one-line-subject': _MARKER_SUBJECT,
+    'wrapped-subject': _wrapped_first_paragraph(_MARKER_SUBJECT),
+}
+
+
+def _assert_marker_subject_premise(root: Path, marker: str, message: str) -> None:
+    subject = _fixture_git(root, 'log', '-1', '--format=%s', marker)
+    assert subject == _MARKER_SUBJECT, (
+        f'git log --format=%s printed {subject!r} for the orchestrator marker written with '
+        f'message {message!r}, not {_MARKER_SUBJECT!r}: git no longer joins a wrapped first '
+        'paragraph into one subject, which this history and GitOps._merge_markers_by_branch rely on'
+    )
+    if message != _MARKER_SUBJECT:
+        first_line = _fixture_git(root, 'log', '-1', '--format=%B', marker).split('\n', 1)[0]
+        assert first_line != _MARKER_SUBJECT, (
+            f'the orchestrator marker written with message {message!r} has the one-line first '
+            f'line {first_line!r}, so the wrapped-subject history is not wrapped'
+        )
+
+
+def _build_shadowed_history(root: Path, marker_message: str) -> ShadowedHistory:
     _fixture_git(root, 'init', '-q', '-b', 'main')
     assert (root / '.git').is_dir(), f'git init did not make {root} a repository root'
     _commit_file(root, 'README', 'initial commit')
@@ -296,7 +320,8 @@ def shadowed_history(tmp_path_factory: pytest.TempPathFactory) -> ShadowedHistor
     _commit_file(root, 'work-1', 'task work, part one')
     _fixture_git(root, 'checkout', '-q', 'main')
     _commit_file(root, 'main-1', 'main moves on')
-    orchestrator_marker = _merge_into_main(root, _MARKER_SUBJECT)
+    orchestrator_marker = _merge_into_main(root, marker_message)
+    _assert_marker_subject_premise(root, orchestrator_marker, marker_message)
     _fixture_git(root, 'checkout', '-q', _FIXTURE_BRANCH)
     _commit_file(root, 'work-2', 'task work, part two')
     hand_merge = _merge_into_main(root, _HAND_MERGE_SUBJECT)
@@ -308,6 +333,15 @@ def shadowed_history(tmp_path_factory: pytest.TempPathFactory) -> ShadowedHistor
         f'{_MARKER_SUBJECT}\n{_HAND_MERGE_SUBJECT}',
     )
     return ShadowedHistory(root, frozenset({orchestrator_marker, hand_merge}), shadow)
+
+
+@pytest.fixture(scope='module', params=list(_MARKER_MESSAGES.values()), ids=list(_MARKER_MESSAGES))
+def shadowed_history(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory,
+) -> ShadowedHistory:
+    root = tmp_path_factory.mktemp('shadowed-history') / 'repo'
+    root.mkdir()
+    return _build_shadowed_history(root, request.param)
 
 
 def _snippet_env(history: ShadowedHistory) -> dict[str, str]:
@@ -324,7 +358,7 @@ def _violated_condition(
     if returncode != 0:
         return f'the snippet exited rc={returncode} instead of running cleanly'
     if not printed:
-        return 'the snippet printed no commit sha: the genuine marker behind a newer body match was lost'
+        return 'the snippet printed no commit sha: the genuine marker was not selected'
     if history.shadow in printed:
         return (
             f'the snippet printed {history.shadow}, a non-merge commit that only '
