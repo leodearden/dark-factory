@@ -3024,7 +3024,10 @@ class TestNonPoolBackendCapWait:
 
     @pytest.mark.parametrize(
         ('backend', 'cap_text'),
-        [('codex', 'Error: rate limit'), ('gemini', 'Error: quota exceeded')],
+        [
+            ('codex', 'Quota exceeded. Check your plan and billing details.'),
+            ('gemini', 'Error: RESOURCE_EXHAUSTED'),
+        ],
     )
     async def test_unknown_reset_backs_off_without_capping(self, backend, cap_text):
         gate = self._gate()
@@ -3057,6 +3060,28 @@ class TestNonPoolBackendCapWait:
             )
 
         assert len(cli.calls) == 1
+        self._assert_pool_untouched(gate)
+
+    async def test_failed_reply_discussing_rate_limits_is_returned_without_waiting(self):
+        """A reply that talks about rate limits and then fails for another
+        reason is that failure: one dispatch, no wait, no retry."""
+        gate = self._gate()
+        failed = _backend_cap(
+            'The cap-retry loop backs off on a rate limit before it fails over.\n'
+            "Codex ran out of room in the model's context window. "
+            'Start a new thread or clear earlier history before retrying.'
+        )
+        cli = scripted_invoke(failed, make_result(output='complete'))
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep:
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='codex',
+                park_on_frozen_pool=False, prompt='hi',
+            )
+
+        assert got.success is False
+        assert got.output == failed.output
+        assert len(cli.calls) == 1
+        mock_sleep.assert_not_awaited()
         self._assert_pool_untouched(gate)
 
     async def test_pi_cap_still_caps_the_leased_account(self):

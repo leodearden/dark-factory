@@ -978,8 +978,6 @@ class TestClassifyInvocationBackends:
         ('text', 'pattern'),
         [
             ('Error: usage limit reached', 'usage limit reached'),
-            ('Error: rate limit', 'rate limit'),
-            ('Error: quota exceeded', 'quota exceeded'),
             ('Error: insufficient_quota', 'insufficient_quota'),
             ('Error: rate_limit_exceeded', 'rate_limit_exceeded'),
         ],
@@ -992,8 +990,6 @@ class TestClassifyInvocationBackends:
     @pytest.mark.parametrize(
         ('text', 'pattern'),
         [
-            ('Error: quota exceeded', 'quota exceeded'),
-            ('Error: rate limit', 'rate limit'),
             ('Error: resource exhausted', 'resource exhausted'),
             ('Error: RESOURCE_EXHAUSTED', 'RESOURCE_EXHAUSTED'),
             ('Error: quota_exceeded', 'quota_exceeded'),
@@ -1016,8 +1012,67 @@ class TestClassifyInvocationBackends:
         assert not isinstance(outcome, CapHit)
 
     def test_backend_patterns_checked_against_stderr_too(self):
-        result = AgentResult(success=False, output='', stderr='Error: quota exceeded')
+        result = AgentResult(success=False, output='', stderr='Error: insufficient_quota')
         outcome = classify_invocation(result, strict_confirm=True, backend='codex')
+        assert isinstance(outcome, CapHit)
+
+    @pytest.mark.parametrize('backend', ['codex', 'gemini'])
+    @pytest.mark.parametrize('text', ['Error: rate limit', 'Error: quota exceeded'])
+    def test_generic_phrase_without_confirm_keyword_is_not_a_cap(self, backend, text):
+        result = AgentResult(success=False, output=text)
+        outcome = classify_invocation(result, strict_confirm=True, backend=backend)
+        assert isinstance(outcome, Failure)
+
+    @pytest.mark.parametrize(
+        ('backend', 'text', 'reason'),
+        [
+            (
+                'codex',
+                'Quota exceeded. Check your plan and billing details.',
+                'Codex cap hit: quota exceeded',
+            ),
+            (
+                'codex',
+                'Rate limit reached for gpt-6-astra. Please try again in 20s.',
+                'Codex cap hit: rate limit',
+            ),
+            (
+                'gemini',
+                'Error: rate limit exceeded, please try again later.',
+                'Gemini cap hit: rate limit',
+            ),
+        ],
+    )
+    def test_generic_phrase_with_confirm_keyword_is_a_cap(self, backend, text, reason):
+        result = AgentResult(success=False, output=text)
+        outcome = classify_invocation(result, strict_confirm=True, backend=backend)
+        assert isinstance(outcome, CapHit)
+        assert outcome.reason == reason
+
+    def test_codex_quota_exceeded_billing_text_has_no_reset(self):
+        """codex-cli 0.154.0's own QuotaExceeded text names no reset time."""
+        result = AgentResult(
+            success=False, output='Quota exceeded. Check your plan and billing details.',
+        )
+        outcome = classify_invocation(result, strict_confirm=True, backend='codex')
+        assert outcome == CapHit(resets_at=None, reason='Codex cap hit: quota exceeded')
+
+    @pytest.mark.parametrize('backend', ['codex', 'gemini'])
+    def test_failed_reply_discussing_rate_limits_is_not_a_cap(self, backend):
+        """The reviewer's scenario: a reply that talks about rate limits, then
+        fails for an unrelated reason, is that unrelated failure."""
+        result = AgentResult(success=False, output=(
+            'The cap-retry loop backs off on a rate limit before it fails over.\n'
+            "Codex ran out of room in the model's context window. "
+            'Start a new thread or clear earlier history before retrying.'
+        ))
+        outcome = classify_invocation(result, strict_confirm=True, backend=backend)
+        assert isinstance(outcome, Failure)
+
+    def test_probe_regime_accepts_a_generic_phrase_alone(self):
+        """strict_confirm=False skips the confirm keyword, as it does for claude."""
+        result = AgentResult(success=False, output='Error: rate limit')
+        outcome = classify_invocation(result, strict_confirm=False, backend='codex')
         assert isinstance(outcome, CapHit)
 
     def test_codex_chatgpt_usage_window_is_a_codex_cap_with_its_reset(self):
