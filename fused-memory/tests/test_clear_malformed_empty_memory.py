@@ -20,6 +20,8 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'clear_malformed_empty_memory.py'
 
 
@@ -527,7 +529,7 @@ class TestRunApplyStoreMutationPreflight:
         args = types.SimpleNamespace(memory_id='id1', apply=True)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(args, client, 'fused_dark_factory')
 
@@ -544,7 +546,7 @@ class TestRunApplyStoreMutationPreflight:
         client = _make_qdrant_mock([_make_record(payload)])
         args = types.SimpleNamespace(memory_id='id1', apply=True)
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(args, client, 'fused_dark_factory')
 
         client.retrieve.assert_not_awaited()

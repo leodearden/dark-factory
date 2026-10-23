@@ -27,6 +27,7 @@ from fused_memory.backends.graphiti_client import (
     INCOMPLETE_SHORT_READ,
     IncompleteEnumerationError,
 )
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_count_snapshots.py'
 
@@ -1354,7 +1355,7 @@ class TestRunApplyStoreMutationPreflight:
         memory = self._make_memory()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True),
@@ -1374,7 +1375,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         memory = self._make_memory()
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 self._args(apply=True),
                 memory=memory,
@@ -1470,7 +1471,7 @@ class TestRunApplyStoreMutationPreflight:
 
         with (
             caplog.at_level(logging.ERROR),
-            pytest.raises(_mod.StoreMutationUnavailable),
+            pytest.raises(StoreMutationUnavailable),
         ):
             _mod.main()
 

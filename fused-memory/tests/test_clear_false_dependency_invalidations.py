@@ -22,6 +22,8 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'clear_false_dependency_invalidations.py'
 )
@@ -159,7 +161,7 @@ class TestRunApplyStoreMutationPreflight:
         memory = self._memory()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.repair(memory, project_id='know_live', apply=True)
 
@@ -222,7 +224,7 @@ class TestRunApplyStoreMutationPreflight:
 
         with (
             caplog.at_level(logging.ERROR),
-            pytest.raises(_mod.StoreMutationUnavailable),
+            pytest.raises(StoreMutationUnavailable),
         ):
             await _mod.repair(memory, project_id='know_live', apply=True)
 

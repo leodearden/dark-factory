@@ -24,6 +24,7 @@ from _store_mutation_preflight_contract import (
 from shared.testing_streams import StdoutWithAFailingFlush
 
 from fused_memory.config.schema import WriteTriageProjectCalibration
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 
@@ -6842,7 +6843,7 @@ class TestApplyStoreMutationPreflight:
         ])
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _run(args)
 
@@ -6872,7 +6873,7 @@ class TestApplyStoreMutationPreflight:
             '--metrics-root', str(tmp_path),
         ])
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _run(args)
 
         assert called == [], 'the scan must not run once the preflight has refused'
@@ -6957,7 +6958,7 @@ class TestApplyStoreMutationPreflight:
             '--metrics-root', str(tmp_path),
         ])
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _run(args)
 
         assert _FakeMemoryService.instances == []
@@ -7003,7 +7004,7 @@ class TestApplyStoreMutationPreflightThroughMain:
         )
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 
