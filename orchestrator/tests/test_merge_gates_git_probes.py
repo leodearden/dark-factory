@@ -35,7 +35,7 @@ from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, OutcomeKin
 
 TASK_ID = '6411'
 TASK_BRANCH = f'task/{TASK_ID}'
-GATES_LOGGER = 'orchestrator.merge_queue'
+GATES_LOGGER = 'orchestrator.merge_lane'
 
 
 class Scene(NamedTuple):
