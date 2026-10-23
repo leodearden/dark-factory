@@ -75,7 +75,7 @@ from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_arti
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.mcp_tools.scheduler_state import effective_lock_depth
-from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.candidate_key import compute_candidate_key, normalize_title
 from fused_memory.middleware.curation_deferral import (
     POOL_UNAVAILABLE_ERRORS,
     DeferReason,
@@ -447,16 +447,6 @@ CURATOR_BATCH_SPEC = PromptSpec(
 )
 
 
-def normalize_title(title: str | None) -> str:
-    """Lowercase + collapse whitespace for forgiving title comparison.
-
-    Accepts ``str | None``; a ``None`` or empty input returns ``''``.
-    Used by both the combine-guard fingerprint check (task_interceptor.py)
-    and the intra-batch dedup key helper (``TaskCurator._intra_batch_key``).
-    """
-    return ' '.join((title or '').strip().lower().split())
-
-
 def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float:
     """Compute a scaled LLM budget clamped at ``cap``.
 
@@ -806,8 +796,8 @@ class TaskCurator:
         canonical bulk-creation path now that expand_task / parse_prd are
         gone).
 
-        Normalisation delegates to the shared module-level
-        :func:`normalize_title` helper — lowercase, strip, and collapse
+        Normalisation delegates to
+        ``candidate_key.py::normalize_title`` — lowercase, strip, and collapse
         internal whitespace — making the key case- and whitespace-insensitive.
 
         Does NOT include files_to_modify because Taskmaster-generated
