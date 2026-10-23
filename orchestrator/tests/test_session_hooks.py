@@ -4261,3 +4261,39 @@ def test_fault_lane_propagates_a_persistently_corrupt_body(tmp_path: Path) -> No
         sh.run_stop(hook_input, env, root=tmp_path)
 
     assert record_path.read_text() == 'not-json{{{'
+
+
+# ---------------------------------------------------------------------------
+# Task 7193: the self-exit decision is Stop-only
+# ---------------------------------------------------------------------------
+
+
+def test_notification_takes_no_self_exit_decision(tmp_path: Path) -> None:
+    slug = 'prd-df-7193-7193250'
+    record_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            self_exit=True,
+            claude_session_id='uuid-owner',
+            claude_owner_pid=7_193_201,
+            launcher_pid=7_193_250,
+        ),
+        root=tmp_path,
+    )
+    (record_dir / sr.RESULT_FILENAME).write_text('outcome: done\n', encoding='utf-8')
+    marker = record_dir / sr.EXIT_REQUESTED_FILENAME
+    marker.write_text('uuid-owner', encoding='utf-8')
+
+    sh.run_notification(
+        {'session_id': 'uuid-owner', 'cwd': str(tmp_path), 'background_tasks': [], 'session_crons': []},
+        _owner_ppid_env(slug, 7_193_200),
+        root=tmp_path,
+        process_tree=claude_process_tree(7_193_201, 7_193_200),
+    )
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.AWAITING_INPUT
+    assert record.exit_request is None
+    assert marker.exists()
