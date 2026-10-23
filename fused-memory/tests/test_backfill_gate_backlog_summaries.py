@@ -19,12 +19,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _cli_boundary_assertions import closed_pipe_error_line
 from _fm_helpers import load_script_module
 from escalation.dedupe import compute_content_fingerprint, gate_backlog_fingerprint_key
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
-from shared.cli_boundary import EXIT_STDOUT_FAILED, run_cli
-from shared.testing_streams import closed_pipe_stdout
 
 from fused_memory.reconciliation.stage1_stall_detector import (
     _GATE_BACKLOG_ESCALATION_CATEGORY,
@@ -1058,12 +1057,6 @@ class TestExitCodes:
         assert {EXIT_OK, EXIT_BAD_QUEUE_DIR, EXIT_FINGERPRINT_DRIFT} == {0, 1, 3}
 
 
-def _error_lines(stderr: str) -> list[str]:
-    """Only the ``error:`` lines: logging may or may not reach stderr under
-    pytest's root handlers, so the whole stream is not a stable count."""
-    return [line for line in stderr.splitlines() if line.startswith('error: ')]
-
-
 @pytest.mark.parametrize('buffering', [None, 1], ids=['deferred', 'in-band'])
 class TestALateStdoutFailureNamesTheAppliedRewrites:
     """The report carries the apply counters, so it is printed AFTER --apply
@@ -1075,14 +1068,13 @@ class TestALateStdoutFailureNamesTheAppliedRewrites:
     ):
         _seeded_queue(tmp_path, _legacy_esc())
 
-        with closed_pipe_stdout(monkeypatch, buffering=buffering, quiet_close=True):
-            code = run_cli(lambda: main(['--queue-dir', str(tmp_path), '--apply']))
+        line = closed_pipe_error_line(
+            monkeypatch, capsys, lambda: main(['--queue-dir', str(tmp_path), '--apply']),
+            buffering=buffering,
+        )
         monkeypatch.undo()
 
-        assert code == EXIT_STDOUT_FAILED
-        errors = _error_lines(capsys.readouterr().err)
-        assert len(errors) == 1
-        assert errors[0].endswith('(--apply already rewrote 1 record(s))')
+        assert line.endswith('(--apply already rewrote 1 record(s))')
         after = json.loads((tmp_path / 'esc-166-1.json').read_text())
         assert after['summary'] == rebuild_summary('166', ANCHOR)
 
@@ -1091,14 +1083,13 @@ class TestALateStdoutFailureNamesTheAppliedRewrites:
     ):
         _seeded_queue(tmp_path, _legacy_esc())
 
-        with closed_pipe_stdout(monkeypatch, buffering=buffering, quiet_close=True):
-            code = run_cli(lambda: main(['--queue-dir', str(tmp_path)]))
+        line = closed_pipe_error_line(
+            monkeypatch, capsys, lambda: main(['--queue-dir', str(tmp_path)]),
+            buffering=buffering,
+        )
         monkeypatch.undo()
 
-        assert code == EXIT_STDOUT_FAILED
-        errors = _error_lines(capsys.readouterr().err)
-        assert len(errors) == 1
-        assert '(' not in errors[0]
-        assert 'rewrote' not in errors[0]
+        assert '(' not in line
+        assert 'rewrote' not in line
         after = json.loads((tmp_path / 'esc-166-1.json').read_text())
         assert after['summary'] == LEGACY_SUMMARY
