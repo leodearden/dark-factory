@@ -75,73 +75,6 @@ from .snapshots import create_eval_worktree, read_python_pin
 logger = logging.getLogger(__name__)
 
 
-# Cap-wait patience for the architect eval invoke (eval-revival φ).
-#
-# RAISED 1800 s → 48 h on 2026-08-25 (Leo, during the γ2 ruling session,
-# esc-3634-1). The original 1800 s took the house value shared by
-# `_DRY_RUN_CAP_WAIT_SANITY_SECS` and
-# `_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS`, on the rationale that "an eval
-# campaign is a bounded, queue-blocking job, so a fully-capped pool must fail
-# LOUD rather than park a campaign for two weeks". That rationale does not
-# survive contact with the gate:
-#
-#   A SHORT BOUND NEVER PREVENTED THE PARK. When every account is capped,
-#   `before_invoke` reaches `self._open.clear(); await self._open.wait()`
-#   (usage_gate.py) — unbounded, released only by a real cap reset or a
-#   successful resume probe. Freeing a campaign slot therefore buys no
-#   progress: the next cell parks in that same wait. The old bound only decided
-#   how many IN-FLIGHT cells were destroyed on the way to parking; the campaign
-#   parked either way. Worst of both.
-#
-#   AND TAINTING IS STRICTLY MORE EXPENSIVE THAN WAITING. A cap lands MID-cell,
-#   after the architect has already spent real money (γ1 mean: $8.88 banked per
-#   cap-excluded cell). `invoke_with_cap_retry` resumes the capped session via
-#   `--resume` on a freed account, preserving that work, so waiting costs ~$0
-#   extra. Tainting discards the banked spend AND pays full freight again on the
-#   prescribed re-run — strictly more total dollars and strictly more total wall
-#   clock, for the same measurement.
-#
-#   NOR IS RESTART A CHEAP ESCAPE. `run_ofat_stage` — the path campaign drivers
-#   use — has NO skip-existing guard (that is `run_eval_matrix`'s
-#   `ResultStore.exists` check, a different function). Cells persist individually
-#   via `ResultStore.save`, so a kill loses no data, but a relaunch RE-RUNS and
-#   RE-SPENDS them unless the operator hand-restricts `--tasks-dir`.
-#
-# 48 h is sized to the observed account regime, not to a round number: 1-3
-# accounts typically sit uncapped against the WEEKLY cap and are hit repeatedly
-# against their 5-HOUR caps, giving short all-capped windows regularly plus one
-# long window each week. 1800 s cannot skate a 5-hour window; 48 h skates it
-# with large margin. A weekly exhaustion outlasts even this bound — but per the
-# park analysis above, no value of this constant makes that case loud, so the
-# choice costs nothing there.
-#
-# Deliberately NO `max_cap_retries` companion (unchanged): a fixed count scales
-# the wrong way, since cooldown doubles per full cycle through the pool, so a
-# bigger, healthier pool would give up SOONER. Wall clock is the bound that
-# literally expresses the requirement. Both raise the same
-# AllAccountsCappedException from one chokepoint, so the handler below is
-# correct either way.
-#
-# WHAT THIS BOUND STILL DOES NOT COVER. `cap_wait_sanity_secs` is consulted at
-# exactly one place, `_check_cap_wait`, which runs in the cap-hit branch AFTER
-# an invocation returned and was classified as a cap. It bounds cap-RETRY
-# patience and nothing else — the unbounded `_open.wait()` above is out of its
-# reach, and raising it does not change that. That remains true, and it is why
-# the park needed a separate remedy rather than a bigger number here.
-#
-# THE PARK IS NO LONGER SILENT (task 4945). It is still unbounded — by design,
-# since no wall-clock value makes a weekly exhaustion loud without also
-# aborting the 5-hour windows this constant exists to skate — but it now
-# ANNOUNCES itself: `shared/usage_gate.py::UsageGate.before_invoke` emits a
-# throttled `all_capped_park` WARNING carrying elapsed seconds, the account
-# count and the soonest expected reopen, for as long as the pool stays frozen.
-# So a parked campaign is distinguishable from a hung one by reading the log,
-# which is the "fail loud" the original comment wanted — delivered as
-# visibility rather than as an abort, because aborting a park throws away
-# banked spend that `--resume` would otherwise recover.
-_EVAL_CAP_WAIT_SANITY_SECS = 48 * 3600
-
-
 def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
     """The ONLY MCP an eval architect may reach: plan-tools, strictly scoped.
 
@@ -1134,6 +1067,11 @@ async def run_architect_eval(
         # parameter, which forwards it into the dispatched call because a
         # custom invoke_fn is supplied.
         #
+        # It takes the shared default cap patience: waiting is ~free because
+        # `--resume` carries banked spend across the account switch, while
+        # tainting re-spends it. No `max_cap_retries` either, since a fixed
+        # count would give a bigger pool less patience.
+        #
         # The architect is scoped to plan-tools ONLY (architect_eval_mcp_scope):
         # plan-tools is wired through the SAME production seam real dispatch
         # uses (relocated meta_root + direct-interpreter launch), and the strict
@@ -1141,7 +1079,6 @@ async def run_architect_eval(
         result = await invoke_with_cap_retry(
             usage_gate,
             f'Architect eval {task_id} × {config.name}',
-            cap_wait_sanity_secs=_EVAL_CAP_WAIT_SANITY_SECS,
             invoke_fn=_timed_invoke,
             backend=config.backend,
             prompt=prompt,
@@ -1209,8 +1146,8 @@ async def run_architect_eval(
             f'no answer within {timeout_minutes}m', cost_usd=arch_cost_usd,
         )
     except AllAccountsCappedException as e:
-        # Every account in the pool was capped for longer than this eval's
-        # patience bound. Caught HERE, ahead of the generic handler, for two
+        # Every account in the pool was capped for longer than the shared
+        # cap-wait bound. Caught HERE, ahead of the generic handler, for two
         # reasons that both matter to the persisted cell:
         #
         # 1. LABELLING. The generic handler stamps
@@ -1238,7 +1175,7 @@ async def run_architect_eval(
         logger.error(
             f'Architect eval {task_id} × {config.name}: all accounts capped '
             f'after {e.retries} retries ({e.elapsed_secs:.1f}s) — giving up on '
-            f'this cell rather than stalling the campaign'
+            f'this cell after the shared cap-wait bound; recorded as cap_tainted'
         )
         outcome = 'blocked'
         arch_unmeasured = arch_unmeasured or Unmeasured(

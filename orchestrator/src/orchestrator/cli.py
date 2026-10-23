@@ -1,6 +1,9 @@
 """CLI entry point: `orchestrator run [--prd X]`."""
 
 import asyncio
+import contextlib
+import functools
+import importlib
 import json
 import logging
 import os
@@ -8,15 +11,18 @@ import signal
 import socket
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
+from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import click
 from dotenv import load_dotenv
+from shared.project_layout import tasks_db
 
-from orchestrator.config import ConfigRequiredError, load_config
+from orchestrator.config import ConfigRequiredError, OrchestratorConfig, load_config
 from orchestrator.config_census_ignore import audit_census_ignore_entries
+from orchestrator.main_checkout_defaults import cli_default
 from orchestrator.verify_cancel import (
     WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     WATCHDOG_KILL_GRACE_SECS,
@@ -31,11 +37,19 @@ from orchestrator.verify_cancel import (
     release_merge_verify_flock,
     remove_lock_holder_pgid,
     remove_pgid_file,
+    remove_worktree_path,
     start_own_process_group,
     start_stdin_watchdog,
     write_lock_holder_pgid,
     write_pgid_file,
+    write_worktree_path,
 )
+
+if TYPE_CHECKING:
+    from orchestrator.git_ops import GitOps
+    from orchestrator.task_verify_spec import TaskVerifySpec
+    from orchestrator.verify import VerifyResult
+    from orchestrator.verify_runner import MergeVerifySpec
 
 load_dotenv()  # loads .env into os.environ (e.g. CLAUDE_OAUTH_TOKEN_A/B)
 
@@ -236,6 +250,13 @@ def main(verbose: bool):
 def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | None,
         force_dirty_start: bool, retag_modules: bool, until_idle: bool):
     """Run the orchestrator against a PRD, or execute existing tasks if no PRD given."""
+    from orchestrator.deployed_sha import capture_deployed_sha, resolve_code_checkout
+
+    # Task 6565 (D1): importing the harness loads the whole verify wire path, so
+    # bracketing this one import records which commit the process runs.
+    deployed_sha = capture_deployed_sha(
+        resolve_code_checkout(), lambda: importlib.import_module('orchestrator.harness'),
+    )
     from orchestrator.harness import Harness
 
     delay_secs = _parse_duration(delay) if delay else 0
@@ -244,7 +265,15 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
     except ConfigRequiredError as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
-    harness = Harness(config)
+    if deployed_sha is None and config.enabled_verify_runners:
+        click.echo(
+            'Error: a remote verify runner is enabled but this process cannot read the '
+            'commit it runs (no readable git checkout above its code); the remote gate '
+            'needs that sha (task 6565). Run from a git checkout or disable the runner.',
+            err=True,
+        )
+        sys.exit(1)
+    harness = Harness(config, deployed_sha=deployed_sha)
     logger = logging.getLogger(__name__)
 
     async def _main():
@@ -621,7 +650,7 @@ def check_config(config_path: Path | None):
 def _hand_exit_to_fired_watchdog(
     fired: threading.Event | None, thread: threading.Thread | None,
 ) -> None:
-    """If the stdin watchdog has fired, block on it; it owns verify-merge's exit.
+    """If the stdin watchdog has fired, block on it; it owns the remote verify's exit.
 
     A fired watchdog has already tree-killed the build and is mid-way through
     its own SIGTERM -> grace_secs sleep -> SIGKILL escalation (see
@@ -635,15 +664,340 @@ def _hand_exit_to_fired_watchdog(
     Joining lets fire_watchdog_kill's own unconditional os._exit(1) be the
     authoritative exit once the full escalation has run to completion.
 
-    The watchdog's SIGTERM routinely makes _run() RAISE rather than return
-    (e.g. it kills ``git worktree add``, rc=-15), so verify_merge calls this
-    from its ``finally``: every exit path must hand off, not just a return.
+    The watchdog's SIGTERM routinely makes the body RAISE rather than return
+    (e.g. it kills ``git worktree add``, rc=-15), so the shared prologue
+    (:func:`_run_remote_verify`) calls this from its ``finally``: every exit
+    path must hand off, not just a return.
     """
     if fired is None or not fired.is_set():
         return
     if thread is not None:
         thread.join()
     sys.exit(1)
+
+
+class _RemoteVerifyContext(NamedTuple):
+    """One remote verify invocation's host state, shared by its preflight and body."""
+
+    config: OrchestratorConfig
+    git_ops: 'GitOps'
+    pgid_path: Path | None
+
+
+_SpecT = TypeVar('_SpecT')
+
+
+def _run_remote_verify(
+    config_path: Path | None,
+    spec_json: str,
+    request_id: str | None,
+    *,
+    parse_spec: Callable[[str], _SpecT],
+    body: Callable[[_RemoteVerifyContext, _SpecT], Coroutine[Any, Any, 'VerifyResult']],
+    preflight: Callable[
+        [_RemoteVerifyContext], AbstractContextManager['VerifyResult | None']
+    ] | None = None,
+) -> None:
+    """The prologue and exit contract every remote verify subcommand shares.
+
+    Loads config, parses ``--spec``, joins its own process group and writes
+    the pgid file (with ``--request-id``), enters *preflight*, starts the
+    stdin watchdog, then runs *body*.  Prints one VerifyResult JSON to stdout
+    and exits 0 whenever it has one (even ``passed=False``); exits 1 on bad
+    input or an infrastructure error.  *preflight* yields a VerifyResult to
+    emit instead of running *body*, or None to proceed; whatever it holds is
+    released first on the way out.
+    """
+    from orchestrator.git_ops import GitOps
+    from orchestrator.verify_runner import result_to_json
+
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+
+    try:
+        spec = parse_spec(spec_json)
+    except Exception as e:
+        click.echo(f'Error: invalid --spec: {e}', err=True)
+        sys.exit(1)
+
+    # Construct GitOps once; reused for both pgid-path derivation (when --request-id
+    # is set) and the body's worktree work.  GitOps.__init__ is side-effect-free so
+    # constructing it here is safe in all paths.
+    git_ops = GitOps(config.git, config.project_root)
+
+    # Cancellation support: write pgid file before starting work so that a
+    # concurrent `cancel-verify --request-id X` can locate and kill this process.
+    pgf: Path | None = None
+    if request_id is not None:
+        pgf = pgid_file(git_ops.worktree_base, request_id)
+        pgid = start_own_process_group()
+        write_pgid_file(pgf, pgid)
+    ctx = _RemoteVerifyContext(config, git_ops, pgf)
+
+    preflight_hold = contextlib.ExitStack()
+    preflight_result = (
+        preflight_hold.enter_context(preflight(ctx)) if preflight is not None else None
+    )
+    if preflight_result is not None:
+        preflight_hold.close()
+        # Always remove the pgid file so cancel-verify knows this run is done.
+        if pgf is not None:
+            remove_pgid_file(pgf)
+        # Any preflight result exits 0: stdout is the only channel to
+        # RemoteRunner, which reads a non-zero exit as RunnerUnavailable and
+        # discards the result.
+        click.echo(result_to_json(preflight_result))
+        return
+
+    # Connection-death watchdog (task 2308 γ): ties this process's lifetime to
+    # the ssh dispatch channel on fd 0. Fires on stdin EOF (channel closed) or
+    # heartbeat starvation (hard partition), killing the build subtree and
+    # self-exiting instead of surviving as a setsid orphan. Same pgid as the
+    # pgid file, so a concurrent cancel-verify still tree-kills coherently.
+    #
+    # watchdog_fired is set as the FIRST action of the fire callback --
+    # strictly before any signal is sent -- so it always happens-before the
+    # kill that unblocks _run_cmd's awaited subprocess. Without this flag,
+    # a killed build command returns a normal (if failed) VerifyResult up
+    # through the body, and the main thread can reach the click.echo/return
+    # below and exit 0 in a race against fire_watchdog_kill's own grace-period
+    # sleep + os._exit(1) -- observed as flaky exit codes on the same
+    # watchdog-fired outcome (task 2309 boundary gate).
+    watchdog_fired: threading.Event | None = None
+    watchdog_thread: threading.Thread | None = None
+    if request_id is not None:
+        heartbeat_timeout = _env_float(
+            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS', WATCHDOG_HEARTBEAT_TIMEOUT_SECS
+        )
+        grace_secs = _env_float('ORCH_WATCHDOG_KILL_GRACE_SECS', WATCHDOG_KILL_GRACE_SECS)
+        watchdog_fired = threading.Event()
+
+        def _on_watchdog_fire(trigger: WatchdogTrigger) -> None:
+            watchdog_fired.set()
+            fire_watchdog_kill(pgid, trigger=trigger, grace_secs=grace_secs)
+
+        watchdog_thread = start_stdin_watchdog(
+            pgid, heartbeat_timeout=heartbeat_timeout, fire=_on_watchdog_fire
+        )
+
+    try:
+        result = asyncio.run(body(ctx, spec))
+    except Exception as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    finally:
+        preflight_hold.close()
+        # Always remove the pgid file so cancel-verify knows this run is done.
+        if pgf is not None:
+            remove_pgid_file(pgf)
+        _hand_exit_to_fired_watchdog(watchdog_fired, watchdog_thread)
+
+    click.echo(result_to_json(result))
+
+
+@contextlib.contextmanager
+def _merge_lane_gate(ctx: _RemoteVerifyContext) -> Iterator['VerifyResult | None']:
+    """verify-merge's preflight: the laptop lane-lock contention gate.
+
+    Yields a distinguished contention VerifyResult when a lane actor holds the
+    lane (the caller emits it without touching the tree), else None while
+    holding the compat co-lock until exit.  The contention result is a
+    passed=False verdict that exits 0, so beta receives its discriminant
+    rather than a RunnerUnavailable.
+    """
+    from orchestrator.verify_runner import make_flock_contention_result
+
+    git_ops = ctx.git_ops
+    # Flock guard (task 2306 α; converged onto the shared lane lock in task 2830):
+    # serialize the verify span under a laptop-side exclusive fcntl.flock when the
+    # persistent-worktree knob is on — the per-host serial invariant that
+    # _bump_host_verify_attempt_count relies on is only supplied at WORKSTATION
+    # startup, not on the laptop.
+    #
+    # DUAL-LOCK with SPLIT lane-lock lifetime (task 2830, esc-2830-1): the PRIMARY
+    # lock is the SHARED <lane_dir>.lock (lane_lock_path(persistent_merge_worktree_path)
+    # = <worktree_base>/_merge-verify.lock) — the SAME lock GitOps.merge_verify_lease,
+    # GitOps.reset_persistent_merge_worktree, and reify's seed/thin/gc take (task
+    # 2685) — so a laptop lane actor is mutually excluded from a live laptop verify.
+    # Because reset_persistent_merge_worktree re-acquires this SAME lane lock across
+    # its own tree mutation, the CLI CANNOT hold it continuously across the body (an
+    # in-process second flock on the same inode self-conflicts — esc-2830-1). The
+    # lane lock therefore has a SPLIT lifetime, mirroring the LOCAL flow's sequential
+    # reset-hold-then-lease-hold (merge_queue.py):
+    #   (a) here, PRE-FLIGHT — a bounded-wait acquire used purely as a contention
+    #       GATE (a live lane actor -> distinguished result, NO tree touch, PRD
+    #       Invariant 5), then RELEASED before the body so reset can take it;
+    #   (b) inside _verify_merge_body, re-acquired around the BUILD only.
+    #
+    # The divergent .merge_verify.lock (merge_verify_lock_path) is RETAINED as a
+    # transitional rollout CO-lock, held across the WHOLE span: it is a DIFFERENT
+    # inode (no self-conflict with reset), so its continuous hold both (i) closes
+    # the momentary lane-release gaps between the gate, reset, and the build against
+    # a concurrent waiter, and (ii) still mutually excludes an in-flight OLD
+    # verify-merge (holding only that lock, before checkout-sync ships this code)
+    # during rollout. A post-rollout follow-up drops it, leaving the CLI on the lane
+    # lock's split lifetime alone (matching merge_verify_lease).
+    #
+    # Acquire LANE-first (the gate), then COMPAT. The shared holder-pgid is written
+    # by the body's build-scoped hold, NOT here: an in-flight OLD caller wrote that
+    # holder when it took the old lock, so a NEW waiter that loses the bounded wait
+    # must still read the CORRECT (un-clobbered) holder on the contention path below.
+    # acquire_merge_verify_flock is a bounded-wait poll (returns None on timeout,
+    # never blocks), so the two-lock acquire cannot deadlock — worst case is a
+    # timeout -> contention.
+    #
+    # Knob OFF -> lane_fd/compat_fd stay None -> byte-identical back-compat (no lock).
+    lane_fd: int | None = None
+    compat_fd: int | None = None
+    contention_result = None
+    if ctx.config.git.persistent_merge_worktree:
+        flock_wait_secs = _env_float(
+            'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS', MERGE_VERIFY_FLOCK_WAIT_SECS
+        )
+        # (1) PRIMARY: the shared <lane_dir>.lock (task 2830 — the fix).
+        lane_fd = acquire_merge_verify_flock(
+            lane_lock_path(git_ops.persistent_merge_worktree_path), flock_wait_secs
+        )
+        if lane_fd is None:
+            # Bounded wait timed out: a laptop lane actor (or another verify-merge)
+            # holds the shared lane lock. Emit the distinguished contention result
+            # WITHOUT ever touching the tree (no acquire_host_verify_worktree, no
+            # ephemeral _merge-<uuid> fallback — PRD Invariant 5).
+            #
+            # holder_pgid can legitimately be None here — a DIAGNOSTIC-only window,
+            # not a correctness gap. The shared holder is written by the body's
+            # build-scoped hold, NOT at this gate (see the DUAL-LOCK note above). So
+            # when the current holder is another NEW-code verify-merge that has
+            # passed its own gate, released the lane lock, and is mid-reset inside
+            # acquire_host_verify_worktree — reset_persistent_merge_worktree takes
+            # the lane lock but never writes the holder-pgid (git_ops.py) — this read
+            # returns None for that window. Mutual exclusion and the gate contract
+            # are intact; make_flock_contention_result tolerates holder_pgid=None
+            # (only the diagnostic's holder_pgid field is null). A follow-up could
+            # restore always-present holder visibility by also writing the shared
+            # holder at this gate, at the cost of extra cleanup on the body's
+            # fail-open (build_lane_fd is None) path.
+            holder_pgid = read_lock_holder_pgid(git_ops.worktree_base)
+            contention_result = make_flock_contention_result(
+                host=socket.gethostname(),
+                holder_pgid=holder_pgid,
+                waiter_pgid=os.getpgrp(),
+            )
+        else:
+            # (2) COMPAT rollout co-lock: the divergent .merge_verify.lock, so an
+            # in-flight OLD verify-merge (holding only that lock) still mutually
+            # excludes during rollout.
+            compat_fd = acquire_merge_verify_flock(
+                merge_verify_lock_path(git_ops.worktree_base), flock_wait_secs
+            )
+            if compat_fd is None:
+                # An in-flight OLD caller holds .merge_verify.lock. Read the holder
+                # it recorded (NOT yet clobbered — we write ours only after both
+                # locks are held), emit the distinguished result, and release the
+                # already-held lane lock before bailing so the primary lock is not
+                # leaked on this fail-closed path. holder_pgid may also be None here
+                # (a NEW-code holder mid-reset — see the lane-timeout path above).
+                holder_pgid = read_lock_holder_pgid(git_ops.worktree_base)
+                contention_result = make_flock_contention_result(
+                    host=socket.gethostname(),
+                    holder_pgid=holder_pgid,
+                    waiter_pgid=os.getpgrp(),
+                )
+                release_merge_verify_flock(lane_fd)
+                lane_fd = None
+            else:
+                # (3) Gate passed — no laptop lane actor is present. RELEASE the
+                # lane lock now: reset_persistent_merge_worktree (inside
+                # acquire_host_verify_worktree) re-acquires this SAME lane lock
+                # across its tree mutation, and an in-process second flock on the
+                # same inode would self-conflict (esc-2830-1). The body re-takes the
+                # lane lock and writes the shared holder-pgid for the build's
+                # duration only. The compat co-lock (compat_fd) stays held across
+                # the WHOLE span — a DIFFERENT inode, so no self-conflict — closing
+                # the momentary lane-release gaps against a concurrent waiter and
+                # preserving rollout back-compat exclusion.
+                release_merge_verify_flock(lane_fd)
+                lane_fd = None
+
+    try:
+        yield contention_result
+    finally:
+        # Past the contention gate the lane lock is already released (the gate
+        # holds it only pre-flight; the body's build-scoped hold manages the lane
+        # lock and the shared holder-pgid — task 2830 split lifetime, esc-2830-1).
+        # Only the compat co-lock is held across the whole span; release it.
+        if compat_fd is not None:
+            release_merge_verify_flock(compat_fd)
+
+
+@contextlib.asynccontextmanager
+async def _verify_worktree_lifetime(
+    ctx: _RemoteVerifyContext, wt: Path,
+) -> AsyncIterator[Path]:
+    """Own *wt* for one remote verify: record it beside the pgid file, always remove it.
+
+    The record lets a cancel-verify, whose SIGKILL skips this ``finally``, reap
+    *wt* instead.
+    """
+    try:
+        if ctx.pgid_path is not None:
+            write_worktree_path(ctx.pgid_path, wt)
+        yield wt
+    finally:
+        await ctx.git_ops.cleanup_merge_worktree(wt)
+        if ctx.pgid_path is not None:
+            remove_worktree_path(ctx.pgid_path)
+
+
+async def _verify_merge_body(
+    sha: str, ctx: _RemoteVerifyContext, spec: 'MergeVerifySpec',
+) -> 'VerifyResult':
+    """verify-merge's body: the host's verify worktree at *sha*, then the merge bundle."""
+    from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+    git_ops = ctx.git_ops
+    wt = await git_ops.acquire_host_verify_worktree(sha)
+    async with _verify_worktree_lifetime(ctx, wt):
+        # LANE-lock hold scoped to the BUILD only (task 2830, esc-2830-1).
+        #
+        # acquire_host_verify_worktree -> reset_persistent_merge_worktree
+        # (git_ops.py) itself acquires the SAME lane lock across its tree
+        # mutation and releases it before returning. The CLI span therefore
+        # must NOT hold the lane lock across the reset: a second in-process
+        # fcntl.flock on the same inode via an independent fd self-conflicts
+        # (flock(2): independent fds are treated independently and deny each
+        # other), so reset's bounded lane-lock wait could never succeed —
+        # 30s timeout -> RuntimeError -> verify exits without ever building.
+        #
+        # Instead mirror the LOCAL flow (merge_queue.py: reset-hold released,
+        # THEN merge_verify_lease re-acquires the same lane lock around the
+        # build): re-take the lane lock HERE, after the reset returns, for the
+        # build's duration only, and record the shared holder-pgid so a
+        # concurrent lane actor / waiter reads the correct holder. Fail-OPEN
+        # on a contended acquire (proceed unrecorded, mirroring
+        # GitOps.merge_verify_lease) — any live actor is already excluded by
+        # the pre-flight gate + the compat co-lock held across the whole span.
+        build_lane_fd: int | None = None
+        if ctx.config.git.persistent_merge_worktree:
+            build_wait = _env_float(
+                'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS', MERGE_VERIFY_FLOCK_WAIT_SECS
+            )
+            build_lane_fd = await asyncio.to_thread(
+                acquire_merge_verify_flock,
+                lane_lock_path(git_ops.persistent_merge_worktree_path),
+                build_wait,
+            )
+            if build_lane_fd is not None:
+                write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+        try:
+            return await run_merge_verify_on_worktree(wt, ctx.config, spec, merge_sha=sha)
+        finally:
+            if build_lane_fd is not None:
+                remove_lock_holder_pgid(git_ops.worktree_base)
+                release_merge_verify_flock(build_lane_fd)
 
 
 @main.command('verify-merge')
@@ -682,10 +1036,11 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     When ``--request-id`` is supplied, the subcommand also calls ``os.setsid``
     (via :func:`~orchestrator.verify_cancel.start_own_process_group`) to join a
     new process group and writes its pgid to
-    ``<worktree_base>/.merge_verify_pgids/<request-id>``.  The file is removed
-    on exit.  A concurrent ``orchestrator cancel-verify --request-id X`` reads
-    the file and kills the full descendant tree (capturing ``start_new_session``
-    build escapes via a ``/proc`` PPID walk) plus a ``killpg`` backstop.
+    ``<worktree_base>/.merge_verify_pgids/<request-id>``, recording its
+    worktree beside it.  Both are removed on exit.  A concurrent
+    ``orchestrator cancel-verify --request-id X`` reads the file, kills the
+    full descendant tree (capturing ``start_new_session`` build escapes via a
+    ``/proc`` PPID walk) plus a ``killpg`` backstop, and reaps the worktree.
 
     **pgid-file directory**: ``<worktree_base>/.merge_verify_pgids`` —
     host-side, per-project, never pruned or git-cleaned (mirrors the
@@ -696,265 +1051,132 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
 
     Consumer: RemoteRunner (δ) parses stdout as a VerifyResult.
     """
-    from orchestrator.git_ops import GitOps
-    from orchestrator.verify_runner import (
-        make_flock_contention_result,
-        result_to_json,
-        run_merge_verify_on_worktree,
-        spec_from_json,
+    from orchestrator.verify_runner import spec_from_json
+
+    _run_remote_verify(
+        config_path, spec_json, request_id,
+        parse_spec=spec_from_json,
+        body=functools.partial(_verify_merge_body, sha),
+        preflight=_merge_lane_gate,
     )
 
-    try:
-        config = load_config(config_path)
-    except ConfigRequiredError as e:
-        click.echo(f'Error: {e}', err=True)
-        sys.exit(1)
 
-    try:
-        spec = spec_from_json(spec_json)
-    except Exception as e:
-        click.echo(f'Error: invalid --spec: {e}', err=True)
-        sys.exit(1)
+def _task_spec_for_sha(sha: str, spec_json: str) -> 'TaskVerifySpec':
+    """Parse ``--spec``, refusing a spec whose tip_sha is not ``--sha`` (INV-3, receiving end)."""
+    from orchestrator.task_verify_spec import task_spec_from_json
 
-    # Construct GitOps once; reused for both pgid-path derivation (when --request-id
-    # is set) and the async worktree acquisition inside _run().  GitOps.__init__ is
-    # side-effect-free so constructing it here is safe in all paths.
-    git_ops = GitOps(config.git, config.project_root)
+    spec = task_spec_from_json(spec_json)
+    if spec.tip_sha != sha:
+        raise ValueError(f'spec tip_sha {spec.tip_sha} is not --sha {sha}')
+    return spec
 
-    # Cancellation support: write pgid file before starting work so that a
-    # concurrent `cancel-verify --request-id X` can locate and kill this process.
-    pgf: Path | None = None
-    if request_id is not None:
-        pgf = pgid_file(git_ops.worktree_base, request_id)
-        pgid = start_own_process_group()
-        write_pgid_file(pgf, pgid)
 
-    async def _run():
-        # git_ops closed over from outer scope — same instance, no redundant construction.
-        wt = await git_ops.acquire_host_verify_worktree(sha)
-        try:
-            # LANE-lock hold scoped to the BUILD only (task 2830, esc-2830-1).
-            #
-            # acquire_host_verify_worktree -> reset_persistent_merge_worktree
-            # (git_ops.py) itself acquires the SAME lane lock across its tree
-            # mutation and releases it before returning. The CLI span therefore
-            # must NOT hold the lane lock across the reset: a second in-process
-            # fcntl.flock on the same inode via an independent fd self-conflicts
-            # (flock(2): independent fds are treated independently and deny each
-            # other), so reset's bounded lane-lock wait could never succeed —
-            # 30s timeout -> RuntimeError -> verify exits without ever building.
-            #
-            # Instead mirror the LOCAL flow (merge_queue.py: reset-hold released,
-            # THEN merge_verify_lease re-acquires the same lane lock around the
-            # build): re-take the lane lock HERE, after the reset returns, for the
-            # build's duration only, and record the shared holder-pgid so a
-            # concurrent lane actor / waiter reads the correct holder. Fail-OPEN
-            # on a contended acquire (proceed unrecorded, mirroring
-            # GitOps.merge_verify_lease) — any live actor is already excluded by
-            # the pre-flight gate + the compat co-lock held across the whole span.
-            build_lane_fd: int | None = None
-            if config.git.persistent_merge_worktree:
-                build_wait = _env_float(
-                    'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS', MERGE_VERIFY_FLOCK_WAIT_SECS
-                )
-                build_lane_fd = await asyncio.to_thread(
-                    acquire_merge_verify_flock,
-                    lane_lock_path(git_ops.persistent_merge_worktree_path),
-                    build_wait,
-                )
-                if build_lane_fd is not None:
-                    write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
-            try:
-                return await run_merge_verify_on_worktree(wt, config, spec, merge_sha=sha)
-            finally:
-                if build_lane_fd is not None:
-                    remove_lock_holder_pgid(git_ops.worktree_base)
-                    release_merge_verify_flock(build_lane_fd)
-        finally:
-            await git_ops.cleanup_merge_worktree(wt)
+async def _verify_task_body(
+    sha: str, ctx: _RemoteVerifyContext, spec: 'TaskVerifySpec',
+) -> 'VerifyResult':
+    """verify-task's body: a fresh ephemeral worktree at *sha*, then the task-role verify."""
+    from orchestrator.task_verify_run import run_task_verify_on_worktree
 
-    # Flock guard (task 2306 α; converged onto the shared lane lock in task 2830):
-    # serialize the verify span under a laptop-side exclusive fcntl.flock when the
-    # persistent-worktree knob is on — the per-host serial invariant that
-    # _bump_host_verify_attempt_count relies on is only supplied at WORKSTATION
-    # startup, not on the laptop.
-    #
-    # DUAL-LOCK with SPLIT lane-lock lifetime (task 2830, esc-2830-1): the PRIMARY
-    # lock is the SHARED <lane_dir>.lock (lane_lock_path(persistent_merge_worktree_path)
-    # = <worktree_base>/_merge-verify.lock) — the SAME lock GitOps.merge_verify_lease,
-    # GitOps.reset_persistent_merge_worktree, and reify's seed/thin/gc take (task
-    # 2685) — so a laptop lane actor is mutually excluded from a live laptop verify.
-    # Because reset_persistent_merge_worktree re-acquires this SAME lane lock across
-    # its own tree mutation, the CLI CANNOT hold it continuously across _run() (an
-    # in-process second flock on the same inode self-conflicts — esc-2830-1). The
-    # lane lock therefore has a SPLIT lifetime, mirroring the LOCAL flow's sequential
-    # reset-hold-then-lease-hold (merge_queue.py):
-    #   (a) here, PRE-FLIGHT — a bounded-wait acquire used purely as a contention
-    #       GATE (a live lane actor -> distinguished result, NO tree touch, PRD
-    #       Invariant 5), then RELEASED before _run() so reset can take it;
-    #   (b) inside _run(), re-acquired around the BUILD only (see _run above).
-    #
-    # The divergent .merge_verify.lock (merge_verify_lock_path) is RETAINED as a
-    # transitional rollout CO-lock, held across the WHOLE span: it is a DIFFERENT
-    # inode (no self-conflict with reset), so its continuous hold both (i) closes
-    # the momentary lane-release gaps between the gate, reset, and the build against
-    # a concurrent waiter, and (ii) still mutually excludes an in-flight OLD
-    # verify-merge (holding only that lock, before checkout-sync ships this code)
-    # during rollout. A post-rollout follow-up drops it, leaving the CLI on the lane
-    # lock's split lifetime alone (matching merge_verify_lease).
-    #
-    # Acquire LANE-first (the gate), then COMPAT. The shared holder-pgid is written
-    # by _run()'s build-scoped hold, NOT here: an in-flight OLD caller wrote that
-    # holder when it took the old lock, so a NEW waiter that loses the bounded wait
-    # must still read the CORRECT (un-clobbered) holder on the contention path below.
-    # acquire_merge_verify_flock is a bounded-wait poll (returns None on timeout,
-    # never blocks), so the two-lock acquire cannot deadlock — worst case is a
-    # timeout -> contention.
-    #
-    # Knob OFF -> lane_fd/compat_fd stay None -> byte-identical back-compat (no lock).
-    lane_fd: int | None = None
-    compat_fd: int | None = None
-    contention_result = None
-    if config.git.persistent_merge_worktree:
-        flock_wait_secs = _env_float(
-            'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS', MERGE_VERIFY_FLOCK_WAIT_SECS
+    wt = await ctx.git_ops.create_ephemeral_verify_worktree(sha)
+    async with _verify_worktree_lifetime(ctx, wt):
+        return await run_task_verify_on_worktree(wt, ctx.config, spec)
+
+
+@main.command('verify-task')
+@click.option('--sha', required=True, help='Task tip SHA to verify (must be present in the local repo)')
+@click.option('--spec', 'spec_json', required=True,
+              help='TaskVerifySpec as a JSON string (from RemoteRunner.run_task_verify)')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project — sets project_root and '
+                   'fused_memory.project_id.')
+@click.option('--request-id', default=None,
+              help='Optional cancellation key: joins a new process group and records the '
+                   'pgid and worktree under <worktree_base>/.merge_verify_pgids/ for '
+                   '``orchestrator cancel-verify --request-id X``.')
+def verify_task(sha: str, spec_json: str, config_path: Path | None, request_id: str | None):
+    """Run a task-role verify of --sha on a fresh ephemeral worktree; print one VerifyResult JSON.
+
+    Exit 0 on any verdict; exit 1 on a config, spec or infrastructure error, or
+    when the stdin watchdog fires.  The worktree is recorded beside the pgid
+    file so ``cancel-verify`` reaps it.  Always ephemeral: no lane flock, no
+    unscoped typecheck, no flake suppression.  PRD:
+    plans/remote-task-leg-verify-prd.md §5.3.
+    """
+    _run_remote_verify(
+        config_path, spec_json, request_id,
+        parse_spec=functools.partial(_task_spec_for_sha, sha),
+        body=functools.partial(_verify_task_body, sha),
+    )
+
+
+def _recorded_merge_worktree_remover(git_ops: 'GitOps') -> Callable[[Path], None]:
+    """Return cancel-verify's remover for the worktree a killed run recorded.
+
+    It reaps only a ``_merge-`` band entry directly under ``worktree_base``,
+    through the single guarded remover: ``cleanup_merge_worktree``'s primary
+    path does not band-check, so a corrupt record must not reach it with a
+    task worktree.
+    """
+    from orchestrator.git_ops import classify_worktree_entry
+
+    def remove(worktree: Path) -> None:
+        in_merge_band = (
+            worktree.resolve().parent == git_ops.worktree_base.resolve()
+            and classify_worktree_entry(worktree.name) == 'merge'
         )
-        # (1) PRIMARY: the shared <lane_dir>.lock (task 2830 — the fix).
-        lane_fd = acquire_merge_verify_flock(
-            lane_lock_path(git_ops.persistent_merge_worktree_path), flock_wait_secs
-        )
-        if lane_fd is None:
-            # Bounded wait timed out: a laptop lane actor (or another verify-merge)
-            # holds the shared lane lock. Emit the distinguished contention result
-            # WITHOUT ever touching the tree (no acquire_host_verify_worktree, no
-            # ephemeral _merge-<uuid> fallback — PRD Invariant 5).
-            #
-            # holder_pgid can legitimately be None here — a DIAGNOSTIC-only window,
-            # not a correctness gap. The shared holder is written by _run()'s
-            # build-scoped hold, NOT at this gate (see the DUAL-LOCK note above). So
-            # when the current holder is another NEW-code verify-merge that has
-            # passed its own gate, released the lane lock, and is mid-reset inside
-            # acquire_host_verify_worktree — reset_persistent_merge_worktree takes
-            # the lane lock but never writes the holder-pgid (git_ops.py) — this read
-            # returns None for that window. Mutual exclusion and the gate contract
-            # are intact; make_flock_contention_result tolerates holder_pgid=None
-            # (only the diagnostic's holder_pgid field is null). A follow-up could
-            # restore always-present holder visibility by also writing the shared
-            # holder at this gate, at the cost of extra cleanup on _run()'s fail-open
-            # (build_lane_fd is None) path.
-            holder_pgid = read_lock_holder_pgid(git_ops.worktree_base)
-            contention_result = make_flock_contention_result(
-                host=socket.gethostname(),
-                holder_pgid=holder_pgid,
-                waiter_pgid=os.getpgrp(),
+        if not in_merge_band:
+            click.echo(
+                f'cancel-verify: not removing recorded worktree {worktree}: it is '
+                f'not a _merge- entry directly under {git_ops.worktree_base}',
+                err=True,
             )
-        else:
-            # (2) COMPAT rollout co-lock: the divergent .merge_verify.lock, so an
-            # in-flight OLD verify-merge (holding only that lock) still mutually
-            # excludes during rollout.
-            compat_fd = acquire_merge_verify_flock(
-                merge_verify_lock_path(git_ops.worktree_base), flock_wait_secs
-            )
-            if compat_fd is None:
-                # An in-flight OLD caller holds .merge_verify.lock. Read the holder
-                # it recorded (NOT yet clobbered — we write ours only after both
-                # locks are held), emit the distinguished result, and release the
-                # already-held lane lock before bailing so the primary lock is not
-                # leaked on this fail-closed path. holder_pgid may also be None here
-                # (a NEW-code holder mid-reset — see the lane-timeout path above).
-                holder_pgid = read_lock_holder_pgid(git_ops.worktree_base)
-                contention_result = make_flock_contention_result(
-                    host=socket.gethostname(),
-                    holder_pgid=holder_pgid,
-                    waiter_pgid=os.getpgrp(),
-                )
-                release_merge_verify_flock(lane_fd)
-                lane_fd = None
-            else:
-                # (3) Gate passed — no laptop lane actor is present. RELEASE the
-                # lane lock now: reset_persistent_merge_worktree (inside
-                # acquire_host_verify_worktree) re-acquires this SAME lane lock
-                # across its tree mutation, and an in-process second flock on the
-                # same inode would self-conflict (esc-2830-1). _run() re-takes the
-                # lane lock and writes the shared holder-pgid for the build's
-                # duration only. The compat co-lock (compat_fd) stays held across
-                # the WHOLE span — a DIFFERENT inode, so no self-conflict — closing
-                # the momentary lane-release gaps against a concurrent waiter and
-                # preserving rollout back-compat exclusion.
-                release_merge_verify_flock(lane_fd)
-                lane_fd = None
+            return
+        asyncio.run(git_ops.cleanup_merge_worktree(worktree))
 
-    if contention_result is not None:
-        # Always remove the pgid file so cancel-verify knows this run is done.
-        if pgf is not None:
-            remove_pgid_file(pgf)
-        # Contention must exit 0: a passed=False VerifyResult on stdout is the
-        # only delivery channel to beta — a non-zero exit makes RemoteRunner
-        # treat this as RunnerUnavailable and beta never sees the discriminant.
-        click.echo(result_to_json(contention_result))
-        return
+    return remove
 
-    # Connection-death watchdog (task 2308 γ): ties this process's lifetime to
-    # the ssh dispatch channel on fd 0. Fires on stdin EOF (channel closed) or
-    # heartbeat starvation (hard partition), killing the build subtree and
-    # self-exiting instead of surviving as a setsid orphan. Same pgid as the
-    # pgid file, so a concurrent cancel-verify still tree-kills coherently.
-    #
-    # watchdog_fired is set as the FIRST action of the fire callback --
-    # strictly before any signal is sent -- so it always happens-before the
-    # kill that unblocks _run_cmd's awaited subprocess. Without this flag,
-    # a killed build command returns a normal (if failed) VerifyResult up
-    # through _run(), and the main thread can reach the click.echo/return
-    # below and exit 0 in a race against fire_watchdog_kill's own grace-period
-    # sleep + os._exit(1) -- observed as flaky exit codes on the same
-    # watchdog-fired outcome (task 2309 boundary gate).
-    watchdog_fired: threading.Event | None = None
-    watchdog_thread: threading.Thread | None = None
-    if request_id is not None:
-        heartbeat_timeout = _env_float(
-            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS', WATCHDOG_HEARTBEAT_TIMEOUT_SECS
-        )
-        grace_secs = _env_float('ORCH_WATCHDOG_KILL_GRACE_SECS', WATCHDOG_KILL_GRACE_SECS)
-        watchdog_fired = threading.Event()
 
-        def _on_watchdog_fire(trigger: WatchdogTrigger) -> None:
-            watchdog_fired.set()
-            fire_watchdog_kill(pgid, trigger=trigger, grace_secs=grace_secs)
+@main.command('gate-identity')
+def gate_identity():
+    """Print this checkout's gate identity as one JSON line (task 6565, D3).
 
-        watchdog_thread = start_stdin_watchdog(
-            pgid, heartbeat_timeout=heartbeat_timeout, fire=_on_watchdog_fire
-        )
+    ``{"code_sha": <HEAD of the checkout holding this code>,
+    "wire_fingerprint": <remote_gate.wire_fingerprint of the wire classes>}``.
+    A remote gate answers this before any verify is dispatched to it; the
+    dispatcher proceeds only when both values equal its own.  Importing the
+    wire classes to fingerprint them also proves the gate's codec imports.
+    Exits 1 with the cause on stderr when the checkout's HEAD cannot be read.
+    """
+    import subprocess
 
-    try:
-        result = asyncio.run(_run())
-    except Exception as e:
-        click.echo(f'Error: {e}', err=True)
+    from orchestrator.deployed_sha import checkout_head, resolve_code_checkout
+    from orchestrator.remote_gate import local_gate_identity
+
+    checkout = resolve_code_checkout()
+    if checkout is None:
+        click.echo('Error: no git checkout holds this orchestrator code', err=True)
         sys.exit(1)
-    finally:
-        # Past the contention gate the lane lock is already released (the gate
-        # holds it only pre-flight; _run()'s build-scoped hold manages the lane
-        # lock and the shared holder-pgid — task 2830 split lifetime, esc-2830-1).
-        # Only the compat co-lock is held across the whole span here; release it.
-        if compat_fd is not None:
-            release_merge_verify_flock(compat_fd)
-        # Always remove the pgid file so cancel-verify knows this run is done.
-        if pgf is not None:
-            remove_pgid_file(pgf)
-        _hand_exit_to_fired_watchdog(watchdog_fired, watchdog_thread)
-
-    click.echo(result_to_json(result))
+    try:
+        code_sha = checkout_head(checkout)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        click.echo(f'Error: cannot read HEAD of {checkout}: {exc}', err=True)
+        sys.exit(1)
+    click.echo(json.dumps(local_gate_identity(code_sha).to_wire()))
 
 
 @main.command('cancel-verify')
 @click.option('--request-id', required=True,
-              help='Request ID passed to the verify-merge invocation to cancel.')
+              help='Request ID passed to the verify-merge or verify-task invocation '
+                   'to cancel; the worktree that run recorded is reaped too.')
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
               default=None,
               help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
                    'is set). Selects the target project — determines worktree_base for '
                    'the pgid-file lookup.')
 def cancel_verify(request_id: str, config_path: Path | None):
-    """Kill the verify-merge process tree identified by --request-id and exit 0.
+    """Kill the verify-merge or verify-task tree identified by --request-id and exit 0.
 
     Reads the pgid file at
     ``<worktree_base>/.merge_verify_pgids/<request-id>`` (written by
@@ -962,7 +1184,9 @@ def cancel_verify(request_id: str, config_path: Path | None):
     ``SIGKILL``\\s every descendant plus a ``killpg`` backstop.  This reaps the
     entire process tree including ``start_new_session`` build-command escapes
     (which leave ``verify-merge``'s process group but remain its descendants in
-    the ``/proc`` parent chain).
+    the ``/proc`` parent chain).  The SIGKILL skips that run's own ``finally``,
+    so the ``_merge-`` worktree it recorded beside the pgid file is reaped here
+    (:func:`_recorded_merge_worktree_remover`).
 
     **Idempotent**: exits 0 when the file is absent (already cancelled or never
     started), when the content is corrupt, or when all processes are already
@@ -993,6 +1217,7 @@ def cancel_verify(request_id: str, config_path: Path | None):
     killed_pgid: list[int] = []
     rc = cancel_request(
         pgf, failed_pids_out=failed_pids, killed_pgid_out=killed_pgid,
+        remove_worktree=_recorded_merge_worktree_remover(git_ops),
     )
     # ── task 3186 (PRD δ): CLEAR THE FIXED-KEY HOLDER RENDEZVOUS ────────────
     # `cancel_request` SIGKILLs the verify-merge tree, which skips that
@@ -1238,9 +1463,8 @@ def eval_list_fixtures_cmd(tasks_dir: Path | None, cohort: str | None, audit: bo
                    'branches or writing fixtures')
 @click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
               help='Where fixture JSONs are written (default: orchestrator/evals/tasks)')
-@click.option('--df-root', type=click.Path(path_type=Path),
-              default=Path('/home/leo/src/dark-factory'),
-              help='dark_factory checkout to discover merges in')
+@click.option('--df-root', type=click.Path(path_type=Path), default=None,
+              help='dark_factory checkout to discover merges in (default: the main checkout)')
 @click.option('--reify-root', type=click.Path(path_type=Path),
               default=Path('/home/leo/src/reify'),
               help='reify checkout to discover merges in')
@@ -1248,7 +1472,7 @@ def eval_list_fixtures_cmd(tasks_dir: Path | None, cohort: str | None, audit: bo
               help='ISO-8601 provenance timestamp (default: now, UTC)')
 def eval_sample_cmd(since: str, target_low: int, target_high: int, seed: int,
                     cohort: str, dry_run: bool, tasks_dir: Path | None,
-                    df_root: Path, reify_root: Path, sampled_at: str | None):
+                    df_root: Path | None, reify_root: Path, sampled_at: str | None):
     """Cut a stratified near-HEAD eval-fixture corpus from both repos.
 
     Discovers completed-task merges in the df + reify checkouts, samples them
@@ -1261,7 +1485,8 @@ def eval_sample_cmd(since: str, target_low: int, target_high: int, seed: int,
     asyncio.run(_run_eval_sample(
         since=since, target_low=target_low, target_high=target_high, seed=seed,
         cohort=cohort, dry_run=dry_run, tasks_dir=tasks_dir,
-        df_root=Path(df_root), reify_root=Path(reify_root), sampled_at=sampled_at,
+        df_root=df_root or cli_default('--df-root', Path), reify_root=Path(reify_root),
+        sampled_at=sampled_at,
     ))
 
 
@@ -1294,9 +1519,7 @@ async def _run_eval_sample(*, since: str, target_low: int, target_high: int,
         found = await discover_completed_tasks(
             root, since=since, project=project, project_root=str(root),
         )
-        found = enrich_candidates_from_task_db(
-            found, root / '.taskmaster' / 'tasks' / 'tasks.db',
-        )
+        found = enrich_candidates_from_task_db(found, tasks_db(root))
         click.echo(f'discovered {len(found)} completed-task merge(s) in {project}')
         candidates.extend(found)
 
@@ -1813,10 +2036,13 @@ def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
                 f'\nJudging {task_id} '
                 f'({len(result_dicts)} contenders, max {max_rounds} rounds)...'
             )
-            rounds_used = await run_elo_tournament(
+            tally = await run_elo_tournament(
                 result_dicts, task, pool, max_rounds,
             )
-            click.echo(f'  {task_id}: {rounds_used} judge calls')
+            click.echo(
+                f'  {task_id}: {tally.judged} judged, '
+                f'{tally.unmeasured} unmeasured (excluded from Elo)'
+            )
 
             # Save state after each task (crash resilience)
             save_state(state)

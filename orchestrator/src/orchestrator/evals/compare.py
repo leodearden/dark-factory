@@ -6,18 +6,31 @@ import json
 import logging
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field, replace
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from shared.cli_invoke import no_mcp_servers_config
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.artifacts import TaskArtifacts
 
-from .judge import _strip_metadata
+from .elo import PAIRWISE_RESULT
+from .judge import _strip_metadata, parse_confidence, parse_winner
+from .measurement import (
+    MeasurementStage,
+    Unmeasured,
+    json_answer,
+    measured_call,
+    require_answer_iff_measured,
+)
+from .report import format_invocation_errors
 from .results import EvalResult
 from .scoring import quality_from_review_artifact
 from .snapshots import get_diff
+
+if TYPE_CHECKING:
+    from shared.cli_invoke import AgentResult
 
 logger = logging.getLogger(__name__)
 
@@ -28,13 +41,13 @@ OUTCOME_PRIORITY = {'done': 3, 'blocked': 2, 'timeout': 1}
 # Data types
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class TaskAssessment:
-    """Per-task LLM assessment of both models."""
+    """Per-task LLM assessment of both models: a winner, or why there is none."""
 
     task_id: str
     task_name: str
-    winner: str                      # 'A' | 'B' | 'tie'
+    winner: str | None               # a PAIRWISE_RESULT key; None exactly when unmeasured
     confidence: float                # 0.0-1.0
     summary: str
     strengths_a: list[str] = field(default_factory=list)
@@ -44,30 +57,46 @@ class TaskAssessment:
     circumstances: str = ''
     metrics_a: dict[str, Any] = field(default_factory=dict)
     metrics_b: dict[str, Any] = field(default_factory=dict)
+    unmeasured: Unmeasured | None = None
+
+    def __post_init__(self) -> None:
+        require_answer_iff_measured('TaskAssessment', 'winner', self.winner, self.unmeasured)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class Synthesis:
+    """The synthesizer's cross-task reading of the measured assessments."""
+
+    overall_winner: str              # a PAIRWISE_RESULT key
+    executive_summary: str
+    circumstantial_analysis: str
+    cost_quality_tradeoff: str
+    workflow_recommendations: str
+
+
 @dataclass
 class ComparisonReport:
-    """Full head-to-head comparison report."""
+    """Full head-to-head comparison report.
+
+    ``wins_a``/``wins_b``/``ties`` count measured assessments only;
+    ``unmeasured`` counts the assessments that did not measure. ``synthesis``
+    is None when no assessment measured, so no synthesis was attempted.
+    """
 
     group_a_name: str
     group_b_name: str
     group_a_configs: list[str]
     group_b_configs: list[str]
     assessments: list[TaskAssessment]
-    # LLM synthesis
-    overall_winner: str = ''
-    executive_summary: str = ''
-    circumstantial_analysis: str = ''
-    cost_quality_tradeoff: str = ''
-    workflow_recommendations: str = ''
+    synthesis: Synthesis | Unmeasured | None = None
     # Quantitative backdrop
     wins_a: int = 0
     wins_b: int = 0
     ties: int = 0
+    unmeasured: int = 0
     no_contest: int = 0
     avg_score_a: float = 0.0
     avg_score_b: float = 0.0
@@ -308,7 +337,7 @@ def _format_review_artifacts(reviews: dict[str, Any]) -> str:
 ASSESSOR_SCHEMA = {
     'type': 'object',
     'properties': {
-        'winner': {'type': 'string', 'enum': ['A', 'B', 'tie']},
+        'winner': {'type': 'string', 'enum': list(PAIRWISE_RESULT)},
         'confidence': {'type': 'number', 'minimum': 0.0, 'maximum': 1.0},
         'summary': {'type': 'string'},
         'strengths_a': {'type': 'array', 'items': {'type': 'string'}},
@@ -415,7 +444,7 @@ differs and what the metrics reveal about each model's approach."""
 SYNTHESIZER_SCHEMA = {
     'type': 'object',
     'properties': {
-        'overall_winner': {'type': 'string', 'enum': ['A', 'B', 'tie']},
+        'overall_winner': {'type': 'string', 'enum': list(PAIRWISE_RESULT)},
         'executive_summary': {'type': 'string'},
         'circumstantial_analysis': {'type': 'string'},
         'cost_quality_tradeoff': {'type': 'string'},
@@ -554,7 +583,16 @@ async def _assess_task(
 
     logger.info('Assessing %s: %s vs %s', task_id, group_a_name, group_b_name)
 
-    result = await invoke_agent(
+    outcome = await measured_call(
+        invoke_agent,
+        partial(
+            _parse_assessment,
+            task_id=task_id, task_name=task_name,
+            metrics_a=result_a.metrics, metrics_b=result_b.metrics,
+        ),
+        stage=MeasurementStage.ASSESSOR,
+        backend='claude',
+        label=f'Assessor {task_id}: {group_a_name} vs {group_b_name}',
         prompt=prompt,
         system_prompt=(
             'You are an expert code reviewer performing qualitative model comparison. '
@@ -564,7 +602,6 @@ async def _assess_task(
         cwd=Path('/tmp'),
         model='opus',
         effort='high',
-        backend='claude',
         max_budget_usd=5.0,
         max_turns=3,
         output_schema=ASSESSOR_SCHEMA,
@@ -572,36 +609,85 @@ async def _assess_task(
         mcp_config=no_mcp_servers_config(),
         strict_mcp_config=True,
     )
+    if isinstance(outcome, Unmeasured):
+        return TaskAssessment(
+            task_id=task_id, task_name=task_name, winner=None, confidence=0.0,
+            summary='', metrics_a=result_a.metrics, metrics_b=result_b.metrics,
+            unmeasured=outcome,
+        )
+    return outcome.value
 
-    try:
-        verdict = result.structured_output or json.loads(result.output)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning('Assessor produced unparseable output for %s: %s',
-                       task_id, result.output[:200])
-        verdict = {
-            'winner': 'tie',
-            'confidence': 0.0,
-            'summary': 'Assessment failed: unparseable LLM output',
-            'strengths_a': [],
-            'weaknesses_a': [],
-            'strengths_b': [],
-            'weaknesses_b': [],
-            'circumstances': '',
-        }
 
+def _parse_assessment(
+    result: AgentResult,
+    *,
+    task_id: str,
+    task_name: str,
+    metrics_a: dict[str, Any],
+    metrics_b: dict[str, Any],
+) -> TaskAssessment:
+    """The assessor's verdict; raises when its winner or confidence is missing or invalid."""
+    payload = json_answer(result)
     return TaskAssessment(
         task_id=task_id,
         task_name=task_name,
-        winner=verdict.get('winner', 'tie'),
-        confidence=verdict.get('confidence', 0.0),
-        summary=verdict.get('summary', ''),
-        strengths_a=verdict.get('strengths_a', []),
-        weaknesses_a=verdict.get('weaknesses_a', []),
-        strengths_b=verdict.get('strengths_b', []),
-        weaknesses_b=verdict.get('weaknesses_b', []),
-        circumstances=verdict.get('circumstances', ''),
-        metrics_a=result_a.metrics,
-        metrics_b=result_b.metrics,
+        winner=parse_winner(payload),
+        confidence=parse_confidence(payload),
+        summary=payload.get('summary', ''),
+        strengths_a=payload.get('strengths_a', []),
+        weaknesses_a=payload.get('weaknesses_a', []),
+        strengths_b=payload.get('strengths_b', []),
+        weaknesses_b=payload.get('weaknesses_b', []),
+        circumstances=payload.get('circumstances', ''),
+        metrics_a=metrics_a,
+        metrics_b=metrics_b,
+    )
+
+
+async def _synthesize(
+    measured: list[TaskAssessment],
+    group_a_name: str,
+    group_b_name: str,
+    tasks: dict[str, dict],
+    avg_score_a: float,
+    avg_score_b: float,
+) -> Synthesis | Unmeasured:
+    """The cross-task synthesis of the *measured* assessments, or why there is none."""
+    logger.info('Running cross-task synthesis...')
+    outcome = await measured_call(
+        invoke_agent,
+        _parse_synthesis,
+        stage=MeasurementStage.SYNTHESIZER,
+        backend='claude',
+        label=f'Synthesizer {group_a_name} vs {group_b_name}',
+        prompt=_build_synthesizer_prompt(
+            measured, group_a_name, group_b_name, tasks, avg_score_a, avg_score_b,
+        ),
+        system_prompt=(
+            'You are a senior engineering manager synthesizing model evaluation '
+            'results into actionable recommendations. Be concrete and specific.'
+        ),
+        cwd=Path('/tmp'),
+        model='opus',
+        effort='high',
+        max_budget_usd=5.0,
+        max_turns=3,
+        output_schema=SYNTHESIZER_SCHEMA,
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
+    )
+    return outcome if isinstance(outcome, Unmeasured) else outcome.value
+
+
+def _parse_synthesis(result: AgentResult) -> Synthesis:
+    """The synthesizer's answer; raises when its overall winner is missing or invalid."""
+    payload = json_answer(result)
+    return Synthesis(
+        overall_winner=parse_winner(payload, 'overall_winner'),
+        executive_summary=str(payload.get('executive_summary', '')),
+        circumstantial_analysis=str(payload.get('circumstantial_analysis', '')),
+        cost_quality_tradeoff=str(payload.get('cost_quality_tradeoff', '')),
+        workflow_recommendations=str(payload.get('workflow_recommendations', '')),
     )
 
 
@@ -616,6 +702,8 @@ async def compare_models(
     """Run LLM-powered head-to-head comparison across all tasks.
 
     *tasks* is a dict of ``{task_id: task_dict}`` loaded from task JSON files.
+    An assessment that did not measure counts in ``unmeasured``, never as a
+    win, loss or tie, and the synthesizer sees only the measured ones.
     """
     group_a_name = group_a_name or group_a_configs[0]
     group_b_name = group_b_name or group_b_configs[0]
@@ -662,50 +750,14 @@ async def compare_models(
 
     avg_score_a = sum(scores_a) / len(scores_a) if scores_a else 0.0
     avg_score_b = sum(scores_b) / len(scores_b) if scores_b else 0.0
-    wins_a = sum(1 for a in assessments if a.winner == 'A')
-    wins_b = sum(1 for a in assessments if a.winner == 'B')
-    ties = sum(1 for a in assessments if a.winner == 'tie')
+    measured = [a for a in assessments if a.unmeasured is None]
+    wins_a = sum(1 for a in measured if a.winner == 'A')
+    wins_b = sum(1 for a in measured if a.winner == 'B')
+    ties = sum(1 for a in measured if a.winner == 'tie')
 
-    # Run synthesizer if we have assessments
-    synthesis = {
-        'overall_winner': 'tie',
-        'executive_summary': '',
-        'circumstantial_analysis': '',
-        'cost_quality_tradeoff': '',
-        'workflow_recommendations': '',
-    }
-
-    if assessments:
-        synth_prompt = _build_synthesizer_prompt(
-            assessments, group_a_name, group_b_name, tasks,
-            avg_score_a, avg_score_b,
-        )
-
-        logger.info('Running cross-task synthesis...')
-        synth_result = await invoke_agent(
-            prompt=synth_prompt,
-            system_prompt=(
-                'You are a senior engineering manager synthesizing model evaluation '
-                'results into actionable recommendations. Be concrete and specific.'
-            ),
-            cwd=Path('/tmp'),
-            model='opus',
-            effort='high',
-            backend='claude',
-            max_budget_usd=5.0,
-            max_turns=3,
-            output_schema=SYNTHESIZER_SCHEMA,
-            mcp_config=no_mcp_servers_config(),
-            strict_mcp_config=True,
-        )
-
-        try:
-            synthesis = synth_result.structured_output or json.loads(synth_result.output)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                'Synthesizer produced unparseable output: %s',
-                synth_result.output[:200],
-            )
+    synthesis = await _synthesize(
+        measured, group_a_name, group_b_name, tasks, avg_score_a, avg_score_b,
+    ) if measured else None
 
     return ComparisonReport(
         group_a_name=group_a_name,
@@ -713,14 +765,11 @@ async def compare_models(
         group_a_configs=group_a_configs,
         group_b_configs=group_b_configs,
         assessments=assessments,
-        overall_winner=synthesis.get('overall_winner', 'tie'),
-        executive_summary=synthesis.get('executive_summary', ''),
-        circumstantial_analysis=synthesis.get('circumstantial_analysis', ''),
-        cost_quality_tradeoff=synthesis.get('cost_quality_tradeoff', ''),
-        workflow_recommendations=synthesis.get('workflow_recommendations', ''),
+        synthesis=synthesis,
         wins_a=wins_a,
         wins_b=wins_b,
         ties=ties,
+        unmeasured=len(assessments) - len(measured),
         no_contest=no_contest,
         avg_score_a=round(avg_score_a, 2),
         avg_score_b=round(avg_score_b, 2),
@@ -735,6 +784,7 @@ def format_comparison_markdown(report: ComparisonReport) -> str:
     """Render the comparison report as markdown for console output."""
     a = report.group_a_name
     b = report.group_b_name
+    synthesis = report.synthesis
     lines: list[str] = []
 
     lines.append(f'# Model Comparison: {a} vs {b}')
@@ -744,12 +794,10 @@ def format_comparison_markdown(report: ComparisonReport) -> str:
     lines.append(f'  {b}: {", ".join(report.group_b_configs)}')
     lines.append('')
 
-    # Executive summary
-    if report.executive_summary:
-        lines.append('## Executive Summary')
-        lines.append('')
-        lines.append(report.executive_summary)
-        lines.append('')
+    if isinstance(synthesis, Unmeasured):
+        lines.extend(_section('Synthesis', _unmeasured_text(synthesis)))
+    elif synthesis is not None and synthesis.executive_summary:
+        lines.extend(_section('Executive Summary', synthesis.executive_summary))
 
     # Quantitative overview
     lines.append('## Quantitative Overview')
@@ -758,98 +806,97 @@ def format_comparison_markdown(report: ComparisonReport) -> str:
     lines.append(f'  {"":22s} {a:>15s} {b:>15s}')
     lines.append(f'  {"Wins":22s} {report.wins_a:>15d} {report.wins_b:>15d}')
     lines.append(f'  {"Ties":22s} {report.ties:>15d}')
+    lines.append(f'  {"Unmeasured":22s} {report.unmeasured:>15d}')
     if report.no_contest:
         lines.append(f'  {"No contest":22s} {report.no_contest:>15d}')
     lines.append(f'  {"Avg composite score":22s} {report.avg_score_a:>15.2f} {report.avg_score_b:>15.2f}')
     lines.append(f'  {"Contested tasks":22s} {contested:>15d}')
     lines.append('')
 
-    # Per-task assessments
     if report.assessments:
         lines.append('## Per-Task Assessments')
         lines.append('')
-
         for assessment in report.assessments:
-            winner_label = {
-                'A': a, 'B': b, 'tie': 'TIE',
-            }.get(assessment.winner, '?')
+            lines.extend(_assessment_lines(assessment, a, b))
 
-            lines.append(
-                f'### {assessment.task_id}: {assessment.task_name} '
-                f'— Winner: {winner_label} (confidence: {assessment.confidence:.1f})'
-            )
-            lines.append('')
-
-            # Metrics summary
-            ma = assessment.metrics_a
-            mb = assessment.metrics_b
-            # cost_source (P5 provenance) + latency accompany the cost so the
-            # comparison states WHICH source produced each figure rather than an
-            # unlabeled CLI cost. cost_source defaults to 'cli' for a pre-P5
-            # report that lacks the key (backward compat); latency is
-            # workflow_duration_ms/1000 seconds.
-            lines.append(
-                f'  {a}: {ma.get("composite_score", 0):.2f} score, '
-                f'${ma.get("cost_usd", 0):.2f} ({ma.get("cost_source", "cli")}), '
-                f'{ma.get("workflow_duration_ms", 0) / 1000:.1f}s latency, '
-                f'{ma.get("iterations", 0)} iter, '
-                f'{ma.get("debug_cycles", 0)} debug, '
-                f'{ma.get("lines_changed", 0)} lines'
-            )
-            lines.append(
-                f'  {b}: {mb.get("composite_score", 0):.2f} score, '
-                f'${mb.get("cost_usd", 0):.2f} ({mb.get("cost_source", "cli")}), '
-                f'{mb.get("workflow_duration_ms", 0) / 1000:.1f}s latency, '
-                f'{mb.get("iterations", 0)} iter, '
-                f'{mb.get("debug_cycles", 0)} debug, '
-                f'{mb.get("lines_changed", 0)} lines'
-            )
-            lines.append('')
-
-            # LLM assessment
-            lines.append(assessment.summary)
-            lines.append('')
-
-            if assessment.strengths_a:
-                lines.append(f'  {a} strengths:')
-                for s in assessment.strengths_a:
-                    lines.append(f'    - {s}')
-            if assessment.weaknesses_a:
-                lines.append(f'  {a} weaknesses:')
-                for w in assessment.weaknesses_a:
-                    lines.append(f'    - {w}')
-            if assessment.strengths_b:
-                lines.append(f'  {b} strengths:')
-                for s in assessment.strengths_b:
-                    lines.append(f'    - {s}')
-            if assessment.weaknesses_b:
-                lines.append(f'  {b} weaknesses:')
-                for w in assessment.weaknesses_b:
-                    lines.append(f'    - {w}')
-
-            if assessment.circumstances:
-                lines.append('')
-                lines.append(f'  Circumstances: {assessment.circumstances}')
-
-            lines.append('')
-
-    # Synthesis sections
-    if report.circumstantial_analysis:
-        lines.append('## Circumstantial Analysis')
-        lines.append('')
-        lines.append(report.circumstantial_analysis)
-        lines.append('')
-
-    if report.cost_quality_tradeoff:
-        lines.append('## Cost / Quality Tradeoff')
-        lines.append('')
-        lines.append(report.cost_quality_tradeoff)
-        lines.append('')
-
-    if report.workflow_recommendations:
-        lines.append('## Workflow Recommendations')
-        lines.append('')
-        lines.append(report.workflow_recommendations)
-        lines.append('')
+    if isinstance(synthesis, Synthesis):
+        for heading, text in (
+            ('Circumstantial Analysis', synthesis.circumstantial_analysis),
+            ('Cost / Quality Tradeoff', synthesis.cost_quality_tradeoff),
+            ('Workflow Recommendations', synthesis.workflow_recommendations),
+        ):
+            if text:
+                lines.extend(_section(heading, text))
 
     return '\n'.join(lines)
+
+
+def _section(heading: str, text: str) -> list[str]:
+    return [f'## {heading}', '', text, '']
+
+
+def _unmeasured_text(unmeasured: Unmeasured) -> str:
+    return f'UNMEASURED ({format_invocation_errors([unmeasured.to_record()])})'
+
+
+def _assessment_heading(assessment: TaskAssessment, a: str, b: str) -> str:
+    title = f'### {assessment.task_id}: {assessment.task_name} — '
+    if assessment.unmeasured is not None:
+        return title + _unmeasured_text(assessment.unmeasured)
+    labels: dict[str | None, str] = {'A': a, 'B': b, 'tie': 'TIE'}
+    return (
+        title + f'Winner: {labels.get(assessment.winner, "?")} '
+        f'(confidence: {assessment.confidence:.1f})'
+    )
+
+
+def _assessment_lines(assessment: TaskAssessment, a: str, b: str) -> list[str]:
+    """One task: its verdict or why there is none, both models' metrics, then the assessor's prose."""
+    lines = [_assessment_heading(assessment, a, b), '']
+
+    ma = assessment.metrics_a
+    mb = assessment.metrics_b
+    # cost_source (P5 provenance) + latency accompany the cost so the
+    # comparison states WHICH source produced each figure rather than an
+    # unlabeled CLI cost. cost_source defaults to 'cli' for a pre-P5
+    # report that lacks the key (backward compat); latency is
+    # workflow_duration_ms/1000 seconds.
+    lines.append(
+        f'  {a}: {ma.get("composite_score", 0):.2f} score, '
+        f'${ma.get("cost_usd", 0):.2f} ({ma.get("cost_source", "cli")}), '
+        f'{ma.get("workflow_duration_ms", 0) / 1000:.1f}s latency, '
+        f'{ma.get("iterations", 0)} iter, '
+        f'{ma.get("debug_cycles", 0)} debug, '
+        f'{ma.get("lines_changed", 0)} lines'
+    )
+    lines.append(
+        f'  {b}: {mb.get("composite_score", 0):.2f} score, '
+        f'${mb.get("cost_usd", 0):.2f} ({mb.get("cost_source", "cli")}), '
+        f'{mb.get("workflow_duration_ms", 0) / 1000:.1f}s latency, '
+        f'{mb.get("iterations", 0)} iter, '
+        f'{mb.get("debug_cycles", 0)} debug, '
+        f'{mb.get("lines_changed", 0)} lines'
+    )
+    lines.append('')
+    if assessment.unmeasured is not None:
+        return lines
+
+    lines.append(assessment.summary)
+    lines.append('')
+
+    for name, label, items in (
+        (a, 'strengths', assessment.strengths_a),
+        (a, 'weaknesses', assessment.weaknesses_a),
+        (b, 'strengths', assessment.strengths_b),
+        (b, 'weaknesses', assessment.weaknesses_b),
+    ):
+        if items:
+            lines.append(f'  {name} {label}:')
+            lines.extend(f'    - {item}' for item in items)
+
+    if assessment.circumstances:
+        lines.append('')
+        lines.append(f'  Circumstances: {assessment.circumstances}')
+
+    lines.append('')
+    return lines

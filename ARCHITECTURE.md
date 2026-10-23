@@ -196,10 +196,11 @@ for the whole fleet. Entry: `fused-memory/src/fused_memory/server/main.py`
   separate staleness pass *intends* at most one fleet-wide redeploy per 8
   hours (shared clock file `data/orchestrator/last_redeploy_orchestrator.json`,
   plus an in-flight lease), delegating to
-  `scripts/restart-all-orchestrators.sh --drain`, a two-stage drain that
-  halts merge admission and holds each unit's restart while a merge verify is
-  in flight, until it ends or passes its own deadline (a sweep-wide cap bounds
-  the wait; units on pre-5371 code keep the old merge-idle gate). Full
+  `scripts/restart-all-orchestrators.sh --drain`, a two-stage drain that,
+  as the sweep reaches each unit, halts its merge admission and holds its
+  restart while one of its merge verifies is in flight, until it ends or
+  passes its own deadline (a per-unit cap and a sweep-wide ceiling bound the
+  wait; units on pre-5371 code keep the old merge-idle gate). Full
   redeploy story (liveness vs. staleness vs. coordinator) in
   [OPERATIONS.md](OPERATIONS.md).
 
@@ -342,7 +343,10 @@ Tasks reach the queue through `mcp__fused-memory__submit_task`
   (`{"ticket": "tkt_..."}`) and returns immediately; an async `TaskCurator`
   (`fused-memory/src/fused_memory/middleware/task_curator.py`) dedupes,
   combines, or creates the real task row in the SQLite backend
-  (`<project_root>/.taskmaster/tasks/tasks.db`).
+  (`<project_root>/.taskmaster/tasks/tasks.db`). When the curator's account
+  pool cannot serve, the ticket parks as `awaiting_curation` and the ticket
+  janitor retries it until it is curated; every create the curator did not
+  judge is marked `metadata.dedupe_skipped`.
 - **`planning_mode=True` path.** Used by `/prd` batch decomposition: writes
   the task directly in status `deferred`, bypassing the curator, so a whole
   batch of interdependent tasks can be authored and wired together (deps,
@@ -354,16 +358,16 @@ fire-and-forget follow-up tasks via `submit_task` as they work.
 
 ### 3.3 Scheduler tick
 
-`Scheduler.acquire_next()` runs a **21-phase pipeline** every tick
+`Scheduler.acquire_next()` runs a **22-phase pipeline** every tick
 (`orchestrator/src/orchestrator/scheduler.py`, `_TICK_PHASE_ORDER`):
 
 ```
-backfill_dep_status → backfill_terminal_dep_records → drain_park_eviction →
-park_gc → stale_sweep → cooldown_gc → redispatch_stranded_blocked →
-external_dep_policy → delivered_check_gate → stamp_milestone →
-override_snapshot_gc → reserve_now → override_diff → compute_priorities →
-build_candidates → landed_outbox_gate → starvation → empty_candidate_gate →
-psi_gate → select_pins → select_scored
+backfill_dep_status → backfill_terminal_dep_records → stale_sweep →
+cooldown_gc → redispatch_stranded_blocked → external_dep_policy →
+delivered_check_gate → drain_park_eviction → park_gc → stamp_milestone →
+override_snapshot_gc → compute_priorities → reserve_now → override_diff →
+build_candidates → landed_outbox_gate → already_landed_gate → starvation →
+empty_candidate_gate → psi_gate → select_pins → select_scored
 ```
 
 The first phase that short-circuits ends the tick early; otherwise
@@ -419,9 +423,11 @@ For a normal task, `TaskWorkflow._drive()`
    `integration test`, `design ... new`, `implement ... new feature`) and
    `metadata.force_full_path` isn't set, `_run_simple_task()` runs: **one**
    Sonnet agent (role `simple_task`) explores, plans, implements, and
-   commits in a single session. Success falls through to VERIFY; a terminal
-   outcome (done/blocked) ends the workflow there; anything else discards
-   the plan and runs the full architect path instead.
+   commits in a single session. Success falls through to VERIFY; any other
+   verdict ends the dispatch there — done, blocked, or a requeue when the
+   plan's file scope needs a module lock another task holds. Only a give-up
+   (no plan, no step marked done, agent failure) discards the plan and runs
+   the full architect path instead.
 3. **PLAN.** `architect` explores the codebase, verifies its premises, and
    builds a step-by-step TDD plan (alternating test-step, implementation-
    step) via plan-tools (`create_plan`/`add_plan_step`/`confirm_plan`).
@@ -817,11 +823,32 @@ the `unblock` skill).
 The offline lane (`orchestrator/src/orchestrator/offline_lane.py`) is a
 singleton background worker that runs heavy test suites off the merge hot
 path, snapshotting `main` at run start and coalescing advances — it never
-gates a merge, and defaults to disabled (`git.offline_lane_enabled: false`).
+gates a merge, and defaults to disabled (`git.offline_lane_enabled: false`). Each pass writes a record; each failing
+test is a per-test episode that is filed as one fix task once reproduced on
+`git.offline_lane_persist_passes` spaced passes, with one bounded level-1
+escalation if the fix stays unlanded. A command that declares an outage probe
+(`outage_probe`) runs it after a red detection, and a probe that exits 75
+naming a dependency makes the pass an outage, which is escalated, not filed.
+The lane re-runs the probe alone until it passes, then closes its own
+escalation and runs the command again (`plans/offline-lane-red-path-prd.md`;
+runbook in `OPERATIONS.md`).
 Operators can inspect and pause the merge lane directly: `get_merge_queue()`
 gives a live snapshot (lane states, conflict graph, frozen prefix, metrics)
 that the event store alone can't reconstruct; `halt_merge_queue`/
-`unhalt_merge_queue`/`get_merge_halt_status` are operator-only controls.
+`unhalt_merge_queue`/`get_merge_halt_status` are operator-only controls, as is
+`merge_relane`, which moves a request still waiting for the merger (or a
+coalesced member's whole train) between the normal and high lanes.
+
+A remote verify host never runs whatever code its checkout happens to hold.
+Each dispatcher pushes its own deployed commit to the host as `refs/gate/<sha>`
+and verifies in an immutable per-sha gate checkout built from it
+(`orchestrator/src/orchestrator/remote_gate.py`, `remote_gate/ensure-gate.sh`),
+reached through the host's `orchestrator` shim via `ORCH_GATE_BIN`. Before any
+verify is spent a `gate-identity` handshake compares the gate's commit and
+verify-wire fingerprint with the dispatcher's. A host that fails it, or whose
+verify yields no usable verdict, is benched in the `skew` class (distinct from
+an unreachable `ru` bench) and re-admitted by a passing `ensure-gate`; see
+`OPERATIONS.md` §"Reading a verify-host bench".
 
 ---
 

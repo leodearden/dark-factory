@@ -68,7 +68,8 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.harness import Harness
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
     DecidedItem,
@@ -82,7 +83,6 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     SuffixConflictGraph,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.run_store import RunStore
 from orchestrator.verify_runner import HostLease
 

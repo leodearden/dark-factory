@@ -240,11 +240,7 @@ async def _clear_claimant(client: ToolClient, project_root: str, violation: Viol
 
 
 def holder_task_ids(project_root: str) -> frozenset[str]:
-    state = read_scheduler_state(Path(project_root))
-    holders = state.get('current_holders') if isinstance(state, Mapping) else None
-    if not isinstance(holders, Mapping):
-        return frozenset()
-    return frozenset(str(task_id) for task_id in holders.values())
+    return frozenset(read_scheduler_state(Path(project_root)).current_holders.values())
 
 
 def observed_delta(

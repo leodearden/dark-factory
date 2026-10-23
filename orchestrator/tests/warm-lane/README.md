@@ -74,6 +74,15 @@ above still describe the ported baseline, not the current file:
   `lib_lane_state.sh`, with `lib_live_refs.sh` deliberately PRESENT in the
   fixture so A9's guard cannot account for the result.
 
+Six ported suites carry further dark-factory-native asserts:
+
+- **Task 5940:** `test_provision_warm_lane_fs.sh` N4, `test_warm_lane_disk_guard.sh` A10,
+  `test_warm_lane_gc_sweep.sh` G6g, `test_warm_lane_gc.sh` A11m/A11n,
+  `test_warm_lane_audit.sh` A3/A4 and `test_warm_lane_degenerate_ref.sh` U8.
+  They pin the script-side change recorded in
+  [`orchestrator/scripts/warm-lane/README.md`](../../scripts/warm-lane/README.md)
+  "Delta 12".
+
 ## Why these eight
 
 The port set was confirmed against **what α actually relocated**, not against a
@@ -797,9 +806,9 @@ on the offline lane. A further bump remains the wrong answer.
 
 **What the relocation costs, stated plainly.** Coverage moves post-merge, so a
 regression no longer blocks a merge. It surfaces instead through the lane's
-existing red path — confirm re-run (the flake filter) → node-id extraction →
-`compute_failing_test_set_fingerprint` → dedup'd autofiled fix task at `high` →
-L0 INFO escalation → staged L2 promotion — within one advance. Coverage is
+red path — a narrowed confirm re-run (the flake filter) → a held episode →
+one autofiled fix task at `high` once the red is reproduced on two spaced
+passes → one escalation if it outlives its task — within two passes. Coverage is
 *moved*, not lost, but it is strictly weaker than a pre-merge gate, and two
 obligations follow:
 

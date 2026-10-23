@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
-from shared.config_dir import TaskConfigDir
 from shared.project_layout import escalation_queue_dir
+from shared.scheduler_state import SchedulerStateSnapshot
 from shared.storm_counter import StormCounter
 from shared.usage_gate import UsageGate
 
@@ -48,8 +48,10 @@ from fused_memory.models.scope import (
 from fused_memory.reconciliation.active_runs import ActiveRunRegistry
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.cli_stage_runner import (
+    announce_recon_archive_root,
     gc_run_config_dir,
-    recon_config_base_dir,
+    recon_archive_root,
+    run_config_dir_path,
 )
 from fused_memory.reconciliation.drained_event_restore import (
     restore_unless_completed_best_effort,
@@ -106,6 +108,7 @@ from fused_memory.reconciliation.task_filter import (
     diff_status_correction,
     filter_task_tree,
 )
+from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     is_pure_gate_metadata,
@@ -1339,6 +1342,7 @@ class ReconciliationHarness:
         stage: TaskKnowledgeSync,
         *,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
         remediation_mode: bool = False,
     ) -> None:
         """Apply Stage-2 attributes to TaskKnowledgeSync.
@@ -1346,10 +1350,11 @@ class ReconciliationHarness:
         Mirrors _configure_consolidator for Stage 1 — both full-cycle and
         remediation paths use this helper to keep attribute wiring symmetric
         and discoverable. Stage-2-specific attributes (filtered_task_tree,
-        remediation_mode) are set here; Stage-1 wiring is handled by
-        _configure_consolidator.
+        filtered_task_tree_fetched_at, remediation_mode) are set here; Stage-1
+        wiring is handled by _configure_consolidator.
         """
         stage.filtered_task_tree = filtered_task_tree
+        stage.filtered_task_tree_fetched_at = filtered_task_tree_fetched_at
         stage.remediation_mode = remediation_mode
 
     async def _fetch_filtered_task_tree(self, project_root: ProjectRoot) -> FilteredTaskTree:
@@ -1499,7 +1504,8 @@ class ReconciliationHarness:
 
         Uses DurableWriteQueue.get_stats(group_id=project_id) to classify the
         queue state via summarize_graphiti_queue_health.  When dead_count > 0,
-        emits a WARNING-level log — this is the observable signal for the silent
+        emits a WARNING-level log carrying per-operation attribution
+        (dead_by_operation) — this is the observable signal for the silent
         drop that add_memory's success=True at enqueue time hides.
 
         Args:
@@ -1523,6 +1529,7 @@ class ReconciliationHarness:
                         'dead_count': health['dead_count'],
                         'pending_count': health['pending_count'],
                         'oldest_pending_age_seconds': health['oldest_pending_age_seconds'],
+                        'dead_by_operation': health['dead_by_operation'],
                     },
                 )
             return health
@@ -2123,7 +2130,10 @@ class ReconciliationHarness:
         # session-resume depends on is destroyed and resume has nothing to
         # resume from.
         try:
-            gc_run_config_dir(self.journal.data_dir, run.id)
+            gc_run_config_dir(
+                self.journal.data_dir, run.id,
+                archive_root=recon_archive_root(self.config),
+            )
         except Exception as gc_err:  # noqa: BLE001
             logger.warning(
                 'gc_run_config_dir failed for recovered run %s: %r', run.id, gc_err
@@ -2413,7 +2423,9 @@ class ReconciliationHarness:
           must differ from ``run.stage_cursor`` (never re-resume the same stage).
         * **transcript-exists** — only when a session was captured
           (``run.session_id`` non-null): its transcript must still be on disk in
-          the per-run config dir.  ``record_run_session``'s snapshot is
+          the per-run config dir, whose path is derived rather than built as a
+          ``TaskConfigDir``, because a read-only probe must not create the dir
+          it probes for.  ``record_run_session``'s snapshot is
           best-effort (can go stale after an internal cap retry), so a missing
           transcript means there is nothing to ``--resume``.  A NULL session_id
           is NOT a failure — no session was captured (the interrupt landed
@@ -2448,15 +2460,12 @@ class ReconciliationHarness:
 
         # Transcript existence — only meaningful when a session was captured.
         if run.session_id:
-            config_dir = TaskConfigDir(
-                task_id=run.id,
-                base_dir=recon_config_base_dir(self.journal.data_dir),
-            )
-            transcript = read_transcript_records(config_dir.path, run.session_id)
+            config_dir_path = run_config_dir_path(self.journal.data_dir, run.id)
+            transcript = read_transcript_records(config_dir_path, run.session_id)
             if not transcript:
                 return (
                     f'session {run.session_id} has no transcript on disk '
-                    f'({config_dir.path}) — unresumable'
+                    f'({config_dir_path}) — unresumable'
                 )
 
         return None
@@ -3113,6 +3122,7 @@ class ReconciliationHarness:
         """Startup prologue: readiness wait, gate and judge init, escalation
         server, then the one-shot recovery passes."""
         logger.info('Reconciliation harness background loop started')
+        announce_recon_archive_root(self.config)
         # Reviewer finding race_condition: wait for the recon-report server to be
         # accepting connections before the first stage subprocess is launched.  This
         # encodes the ordering invariant in code rather than relying on comment-only
@@ -3744,11 +3754,11 @@ class ReconciliationHarness:
         # Task 4115: the instant every heartbeat_at in filtered_task_tree was
         # read. Stamped HERE, immediately after the fetch returns — not later,
         # e.g. at the _maybe_remediate call below — because the S1->S3 stage
-        # loop that follows is minutes of LLM work and the remediation
-        # live-workflow gate's heartbeat TTL is only 10 minutes (task 2964).
-        # Threaded through to _maybe_remediate -> _run_remediation_pass so the
-        # gate ages a cited task's heartbeat against the actual read, not a
-        # fresh clock taken well after it.
+        # loop that follows is minutes of LLM work and the claimant heartbeat
+        # TTL is only 10 minutes (task 2964). Threaded to Stage 2's
+        # hint-attention selector (task 5093) and through _maybe_remediate ->
+        # _run_remediation_pass to the live-workflow gate, so both age a task's
+        # heartbeat against the actual read, not a fresh clock taken well after it.
         filtered_task_tree_fetched_at = datetime.now(UTC)
 
         # Fetch authoritative task-count census and cross-verify against tree (task 1785)
@@ -3885,7 +3895,11 @@ class ReconciliationHarness:
 
                     # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
                     if isinstance(stage, TaskKnowledgeSync):
-                        self._configure_task_sync(stage, filtered_task_tree=filtered_task_tree)
+                        self._configure_task_sync(
+                            stage,
+                            filtered_task_tree=filtered_task_tree,
+                            filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
+                        )
 
                     # Wire harness-fetched task tree into Stage 3 for task-dump spot-check (task 1661)
                     if isinstance(stage, IntegrityCheck):
@@ -4431,7 +4445,8 @@ class ReconciliationHarness:
         cancellation still propagates
         (``tests/test_harness.py::test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation``).
         An interrupted run keeps its dir for the startup ``--resume`` pass
-        (task σ). A GC failure is logged, never raised.
+        (task σ); its stage transcripts were already copied to the archive by
+        ``stages/base.py::BaseStage.run``. A GC failure is logged, never raised.
         """
         stage_reports_write = asyncio.ensure_future(
             self.journal.update_run_stage_reports(run.id, run.stage_reports)
@@ -4444,7 +4459,10 @@ class ReconciliationHarness:
         finally:
             if run.status != RunStatus.interrupted:
                 try:
-                    gc_run_config_dir(self.journal.data_dir, run.id)
+                    gc_run_config_dir(
+                        self.journal.data_dir, run.id,
+                        archive_root=recon_archive_root(self.config),
+                    )
                 except Exception as gc_err:  # noqa: BLE001
                     logger.warning(
                         'gc_run_config_dir failed for %s run %s: %r',
@@ -5636,22 +5654,11 @@ class ReconciliationHarness:
             # Task 4115: resolve the tree and the instant it was read as ONE unit
             # (ref: task 455, task 478 for the caller-supplied-tree short-circuit
             # itself), so a caller's read instant can never be paired with a tree
-            # it does not describe. Caller-supplied tree: honour the caller's read
-            # instant when given AND timezone-aware; otherwise fall back to a
-            # fresh now() with a WARNING trace — loud rather than silent, since a
-            # caller that drops or malforms the instant regresses straight back to
-            # the pre-4115 bug this task fixes (repo loud-over-silent-degradation
-            # norm). A naive (tzinfo-less) instant is treated the same as a
-            # missing one rather than handed to corroboration_for_task as-is:
-            # has_live_claimant compares it against timezone-aware heartbeats, and
-            # the resulting TypeError is caught and swallowed several frames down
-            # (see the `except Exception as _corr_exc` below), which would
-            # otherwise leave corroborated=None and silently suppress every
-            # stranded-work escalation in the pass — the opposite of this gate's
-            # fail-safe direction. The WARNING fallback is otherwise exactly the
-            # pre-4115 behaviour, which the ~30 existing direct
-            # _run_remediation_pass callers that pass a tree without an instant
-            # depend on. Self-fetch: always stamp a fresh now() — a caller instant
+            # it does not describe. Caller-supplied tree: resolve_tree_read_instant
+            # honours the caller's instant or falls back to now() with a WARNING;
+            # the ~30 existing direct _run_remediation_pass callers that pass a
+            # tree without an instant depend on that pre-4115 fallback.
+            # Self-fetch: always stamp a fresh now() — a caller instant
             # (if one was even supplied) describes a different tree, or no tree at
             # all, and must never leak onto the tree just fetched here.
             #
@@ -5679,25 +5686,11 @@ class ReconciliationHarness:
             _tasks_snapshot_at: datetime
             if filtered_task_tree is not None:
                 remediation_tree = filtered_task_tree
-                if (
-                    filtered_task_tree_fetched_at is not None
-                    and filtered_task_tree_fetched_at.tzinfo is not None
-                ):
-                    _tasks_snapshot_at = filtered_task_tree_fetched_at
-                else:
-                    logger.warning(
-                        'reconciliation.remediation_tree_read_instant_missing',
-                        extra={
-                            'project_id': project_id,
-                            'parent_run_id': parent_run_id,
-                            'reason': (
-                                'naive_datetime'
-                                if filtered_task_tree_fetched_at is not None
-                                else 'not_supplied'
-                            ),
-                        },
-                    )
-                    _tasks_snapshot_at = datetime.now(UTC)
+                _tasks_snapshot_at = resolve_tree_read_instant(
+                    filtered_task_tree_fetched_at,
+                    event='reconciliation.remediation_tree_read_instant_missing',
+                    extra={'project_id': project_id, 'parent_run_id': parent_run_id},
+                )
             else:
                 remediation_tree = await self._fetch_filtered_task_tree(project_root)
                 _tasks_snapshot_at = datetime.now(UTC)
@@ -5854,7 +5847,12 @@ class ReconciliationHarness:
                 remediation_findings=findings,
                 filtered_task_tree=remediation_tree,
             )
-            self._configure_task_sync(stage2, filtered_task_tree=remediation_tree, remediation_mode=True)
+            self._configure_task_sync(
+                stage2,
+                filtered_task_tree=remediation_tree,
+                filtered_task_tree_fetched_at=_tasks_snapshot_at,
+                remediation_mode=True,
+            )
 
             watermark = await self.journal.get_watermark(project_id)
             reports = []
@@ -5986,11 +5984,14 @@ class ReconciliationHarness:
                 # None inputs and never raises on them), which leaves the verdict
                 # biased toward "not corroborated" — the direction that lets a
                 # stranded escalation through only when nothing at all vouches for
-                # the task. read_scheduler_state already returns an empty skeleton
-                # for an absent/invalid file; orchestrator_started_at returns None
-                # for an absent or unparseable lock.
+                # the task. read_scheduler_state already returns
+                # SchedulerStateSnapshot.empty() for an absent/invalid file;
+                # orchestrator_started_at returns None for an absent or
+                # unparseable lock.
                 try:
-                    _sched_state: dict | None = read_scheduler_state(Path(project_root))
+                    _sched_state: SchedulerStateSnapshot | None = read_scheduler_state(
+                        Path(project_root)
+                    )
                 except Exception:
                     _sched_state = None
                 try:

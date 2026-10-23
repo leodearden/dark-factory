@@ -20,7 +20,7 @@ phase encodings that predate it:
   step-6  GREEN — ``InflightEntry.phase`` field deleted; existing tests
                   reconciled to drive registry state instead
 
-This module imports orchestrator.merge_queue LOCALLY inside each test method
+This module imports orchestrator.merge_lane.worker LOCALLY inside each test method
 (not at module scope) so a not-yet-implemented symbol never breaks collection
 of the rest of the file during the RED steps — mirrors
 test_merge_queue_lifecycle_registry.py's / test_merge_queue_request_liveness.py's
@@ -118,7 +118,7 @@ def _make_request(
     request_liveness.py (per-file duplication convention — see this file's
     module docstring).
     """
-    from orchestrator.merge_types import MergeRequest, QueuedBranch
+    from orchestrator.merge_lane.types import MergeRequest, QueuedBranch
 
     return MergeRequest(
         task_id=task_id,
@@ -190,7 +190,7 @@ class TestPhaseDerivesFromRegistry:
     async def test_registry_transition_moves_reported_phase(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState, RealMergeItem
+        from orchestrator.merge_lane.worker import InflightEntry, ItemLifecycleState, RealMergeItem
 
         worker = _make_worker(git_ops)
 
@@ -241,7 +241,7 @@ class TestPhaseDerivesFromRegistry:
     async def test_finalizing_head_excluded_when_registry_is_non_qualifying(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState, RealMergeItem
+        from orchestrator.merge_lane.worker import InflightEntry, ItemLifecycleState, RealMergeItem
 
         worker = _make_worker(git_ops)
 
@@ -283,7 +283,7 @@ class TestInflightEntryHasNoPhaseField:
     """
 
     def test_phase_field_absent_from_dataclass(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_lane.worker import InflightEntry
 
         field_names = {f.name for f in dataclasses.fields(InflightEntry)}
         assert 'phase' not in field_names, (
@@ -295,7 +295,7 @@ class TestInflightEntryHasNoPhaseField:
     async def test_derivation_works_with_no_phase_field(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState, RealMergeItem
+        from orchestrator.merge_lane.worker import InflightEntry, ItemLifecycleState, RealMergeItem
 
         worker = _make_worker(git_ops)
 

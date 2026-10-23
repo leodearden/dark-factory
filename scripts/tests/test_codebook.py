@@ -2794,6 +2794,50 @@ def test_validate_rejects_a_filed_ticket_row_missing_its_step():
     assert _c1_errors_naming(codebook, "entries/0/filed_tickets/0", "step")
 
 
+def test_a_back_link_filed_before_finding_keys_existed_validates():
+    codebook = _c1_codebook(entry=_c1_entry(filed_tickets=[_c1_ticket(finding_key=None)]))
+    assert mod.validate(codebook) == []
+
+
+def test_a_malformed_finding_key_on_a_filed_ticket_row_is_still_rejected():
+    codebook = _c1_codebook(entry=_c1_entry(filed_tickets=[_c1_ticket(finding_key="fk-ZZZ")]))
+    assert _c1_errors_naming(codebook, "entries/0/filed_tickets/0", "fk-ZZZ")
+
+
+def test_a_historical_backfill_marker_validates():
+    codebook = _c1_codebook()
+    codebook[mod.HISTORICAL_BACKFILL] = {"run_id": _C1_RUN, "unmatched_task_ids": [5330]}
+    assert mod.validate(codebook) == []
+
+
+@pytest.mark.parametrize(
+    "marker, path, offending",
+    [
+        ({"run_id": "", "unmatched_task_ids": []}, "run_id", ""),
+        ({"run_id": _C1_RUN, "unmatched_task_ids": ["5330"]}, "unmatched_task_ids/0", "5330"),
+        ({"unmatched_task_ids": []}, "", "run_id"),
+    ],
+    ids=["empty-run", "string-task-id", "no-run"],
+)
+def test_validate_rejects_a_malformed_historical_backfill_marker(marker, path, offending):
+    codebook = _c1_codebook()
+    codebook[mod.HISTORICAL_BACKFILL] = marker
+    assert _c1_errors_naming(codebook, f"{mod.HISTORICAL_BACKFILL}/{path}".rstrip("/"), offending)
+
+
+def test_filed_ticket_errors_accepts_a_well_formed_row_keyed_or_not():
+    assert mod.filed_ticket_errors(_c1_ticket()) == []
+    assert mod.filed_ticket_errors(_c1_ticket(finding_key=None)) == []
+
+
+def test_filed_ticket_errors_names_the_offending_field_or_value():
+    unresolved = _c1_ticket()
+    del unresolved["resolution"]
+
+    assert any("guess" in error for error in mod.filed_ticket_errors(_c1_ticket(step="guess")))
+    assert any("resolution" in error for error in mod.filed_ticket_errors(unresolved))
+
+
 def test_validate_rejects_an_accepted_entry_without_accepted_by():
     entry = _c1_entry()
     del entry["accepted_by"]
@@ -2871,3 +2915,119 @@ def test_validate_rejects_a_partial_finding_identity(codebook, path):
 def test_validate_holds_the_identity_to_the_contract_anchor_and_tag_vocabulary(field, value):
     codebook = _c1_codebook(entry=_c1_entry(**{field: value}))
     assert _c1_errors_naming(codebook, f"entries/0/{field}", value)
+
+
+# ---------------------------------------------------------------------------
+# task 6405 (census PRD leaf L6): every attach sets attached_by. The merger
+# copies a payload's attached_by onto the sighting it lands, wherever its
+# existing routing lands it; validate() and validate_coding_record() hold the
+# one attached_by shape, and validate() the sighting's verifier_tags.
+# ---------------------------------------------------------------------------
+
+_L6_RUN = "census-dark_factory-20260714"
+_L6_TITLE_ATTACH = {"method": "title", "run_id": _L6_RUN}
+
+
+def _attached(record: dict, op: str) -> dict:
+    record[op][0]["attached_by"] = dict(_L6_TITLE_ATTACH)
+    return record
+
+
+def _recurrence_of_novel_shape() -> dict:
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+    return _attached(record, "candidates")
+
+
+def test_a_title_attach_on_a_rejected_candidate_lands_its_attached_by():
+    merge = _merge_one(_codebook_with_adjudicated_candidate("rejected"), _recurrence_of_novel_shape())
+
+    candidate = merge.codebook["candidates"][0]
+    assert _sighting_on(candidate, "sess-new")["attached_by"] == _L6_TITLE_ATTACH
+    assert mod.validate(merge.codebook) == []
+
+
+def test_a_title_attach_on_a_promoted_candidate_lands_its_attached_by_on_the_entry():
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    codebook["candidates"][0]["promoted_to"] = "entry-a"
+
+    merge = _merge_one(codebook, _recurrence_of_novel_shape())
+
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
+    assert _sighting_on(entry, "sess-new")["attached_by"] == _L6_TITLE_ATTACH
+    assert mod.validate(merge.codebook) == []
+
+
+def test_a_match_carrying_attached_by_lands_it_on_the_entry():
+    merge = _merge_one(_codebook_with_entry_a(), _attached(_match_record(), "matches"))
+
+    entry = merge.codebook["entries"][0]
+    assert _sighting_on(entry, "sess-1")["attached_by"] == _L6_TITLE_ATTACH
+    assert mod.validate(merge.codebook) == []
+
+
+def test_a_payload_without_attached_by_lands_a_sighting_without_the_key():
+    merge = _merge_one(
+        _codebook_with_adjudicated_candidate("rejected"),
+        _candidate_record(title="novel shape", session="sess-new", date="2026-07-24"),
+    )
+
+    assert "attached_by" not in _sighting_on(merge.codebook["candidates"][0], "sess-new")
+
+
+def _codebook_with_a_sighting(**fields: Any) -> dict:
+    codebook = _codebook_with_entry_a()
+    sighting = {
+        "date": "2026-07-14",
+        "project": "dark_factory",
+        "session": "sess-1",
+        "origin_phase": "implement",
+        "manifested_phase": "merge",
+    }
+    sighting.update(fields)
+    codebook["entries"][0]["sightings"] = [sighting]
+    return codebook
+
+
+def test_validate_accepts_a_sighting_carrying_attached_by_and_verifier_tags():
+    codebook = _codebook_with_a_sighting(
+        attached_by={"method": "key", "run_id": _L6_RUN},
+        verifier_tags=["h11", "kind:confusion"],
+    )
+    assert mod.validate(codebook) == []
+
+
+@pytest.mark.parametrize(
+    "fields, path, offending",
+    [
+        ({"attached_by": {"method": "vibes", "run_id": _L6_RUN}}, "attached_by/method", "vibes"),
+        ({"attached_by": {"method": "title"}}, "attached_by", "run_id"),
+        ({"verifier_tags": []}, "verifier_tags", []),
+        ({"verifier_tags": "h11"}, "verifier_tags", "h11"),
+        ({"verifier_tags": ["h11", 7]}, "verifier_tags/1", 7),
+    ],
+    ids=["unknown-method", "no-run-id", "empty-tags", "string-tags", "non-string-tag"],
+)
+def test_validate_rejects_a_malformed_sighting_attach(fields, path, offending):
+    codebook = _codebook_with_a_sighting(**fields)
+    assert _c1_errors_naming(codebook, f"entries/0/sightings/0/{path}", offending)
+
+
+@pytest.mark.parametrize("op", ["matches", "candidates"])
+@pytest.mark.parametrize(
+    "attached_by, offending",
+    [({"method": "vibes", "run_id": _L6_RUN}, "vibes"), ({"method": "title"}, "run_id")],
+    ids=["unknown-method", "no-run-id"],
+)
+def test_validate_coding_record_rejects_a_malformed_payload_attach(op, attached_by, offending):
+    record = _match_record() if op == "matches" else _candidate_record()
+    record[op][0]["attached_by"] = attached_by
+
+    errors = mod.validate_coding_record(record)
+
+    assert [error for error in errors if f"{op}/0/attached_by" in error and repr(offending) in error]
+
+
+@pytest.mark.parametrize("op", ["matches", "candidates"])
+def test_validate_coding_record_accepts_a_well_formed_payload_attach(op):
+    record = _match_record() if op == "matches" else _candidate_record()
+    assert mod.validate_coding_record(_attached(record, op)) == []

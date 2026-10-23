@@ -22,6 +22,7 @@ import json
 import logging
 import subprocess
 import sys
+from enum import StrEnum
 from pathlib import Path
 
 import codebook as codebook_mod
@@ -622,15 +623,16 @@ def test_code_digest_malformed_frontmatter_is_never_labelled_capped():
 # ---------------------------------------------------------------------------
 # task 4736: the EXIT-0 banner, and the guard that bounds where it is scanned
 #
-# The CLI does not always exit non-zero when it declines to answer -- it can
-# print the banner and exit 0, at which point the "reply" is prose that
-# parse_coder_output cannot turn into a verdict.  That is the second scan
-# site, and it is reached ONLY after the parse has already failed.
+# A banner that reaches code_digest as a reply is prose that parse_coder_output
+# cannot turn into a verdict.  A real usage cap never arrives that way (task
+# 6213: the runner's gate sees it as a failed result), so this scan only LABELS
+# a digest that is already failing.  It is reached ONLY after the parse has
+# already failed.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
 def test_code_digest_exit_zero_cap_banner_is_labelled_capped(message):
-    """A banner that arrives as a successful-looking reply is still a cap.
+    """A banner that arrives as a successful-looking reply is labelled a cap.
 
     Every corpus message is plain prose, so parse_coder_output cannot parse
     it -- the same premise the census side already pins in
@@ -727,28 +729,6 @@ def test_code_digest_a_verdict_QUOTING_cap_text_is_never_read_as_a_banner():
     )
 
 
-@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
-def test_the_trickle_stage_offers_every_real_banner_to_the_pool(message):
-    """The runner puts a successful reply to the gate's strict cap detector
-    only when the stage cannot use it, so an exit-0 banner rotates the account
-    rather than leaving it AVAILABLE for the next digest (task 5637). That
-    route holds only while every real banner is unusable: a corpus entry that
-    parsed would turn this red rather than silently lose it."""
-    assert mod.TRICKLE_CODER_STAGE.is_usable_reply(message) is False
-
-
-def test_the_trickle_stage_never_offers_a_verdict_quoting_a_banner():
-    verdict = json.dumps({
-        "matches": [{
-            "cluster_id": "usage-limit-stall",
-            "evidence_quote": REAL_CLI_CAP_HIT_MESSAGES[0],
-        }],
-        "candidates": [],
-    })
-
-    assert mod.TRICKLE_CODER_STAGE.is_usable_reply(verdict) is True
-
-
 def test_code_digest_ordinary_garbage_stays_an_unlabelled_parse_failure():
     """NEGATIVE.  Unparseable output carrying no marker keeps its existing
     disposition: a plain parse failure, capped=False."""
@@ -772,13 +752,18 @@ def _batch_digests(n):
 # ---------------------------------------------------------------------------
 # task 4736: the batch tally and the deferral predicate
 #
-# `status` stays a two-value vocabulary, {"ok","failure"}, and the cap arrives
-# as a COUNT plus one predicate.  That is not squeamishness about enums:
-# census.py computes `saturated = dup_rate >= config.dup_rate and
-# run_result.status != "failure"` and selects storm batches with
-# `s.status == "failure"`, so a third status value would silently make a
-# capped mining batch count as saturated and stop the census early.
+# `status` is the two-member CodingStatus, and the cap arrives as a COUNT plus
+# one predicate: census treats anything but CodingStatus.FAILURE as a
+# non-storm batch, so a third member would make a capped mining batch count
+# as saturated.
 # ---------------------------------------------------------------------------
+
+def test_coding_status_is_a_two_member_str_enum():
+    assert issubclass(mod.CodingStatus, StrEnum)
+    assert {member.value for member in mod.CodingStatus} == {"ok", "failure"}
+    assert mod.CodingStatus.OK == "ok"
+    assert mod.CodingStatus.FAILURE == "failure"
+
 
 def _mixed_batch_invoke(*, capped, failed):
     """Return an *invoke* for a batch whose first *capped* digests hit a cap,
@@ -825,7 +810,7 @@ def test_code_digests_tallies_capped_alongside_the_existing_counts():
 def test_code_digests_with_no_caps_reports_zero_capped():
     result = _run_mixed(capped=0, failed=1, ok=3)
     assert result.capped == 0
-    assert result.status == "ok"
+    assert result.status == mod.CodingStatus.OK
 
 
 @pytest.mark.parametrize(
@@ -860,6 +845,23 @@ def test_is_cap_deferral_truth_table(capped, failed, ok, expected, why):
     )
 
 
+@pytest.mark.parametrize(
+    "capped, failed, ok, status, deferral",
+    [
+        (8, 3, 0, "FAILURE", True),
+        (3, 8, 0, "FAILURE", False),
+        (2, 1, 17, "OK", False),
+    ],
+)
+def test_is_cap_deferral_reads_the_typed_status(capped, failed, ok, status, deferral):
+    """Only a FAILURE run whose failures are a majority of caps defers; a
+    sub-storm OK run with caps among its failures does not."""
+    result = _run_mixed(capped=capped, failed=failed, ok=ok)
+    assert isinstance(result.status, mod.CodingStatus)
+    assert result.status == mod.CodingStatus[status]
+    assert mod.is_cap_deferral(result) is deferral
+
+
 def test_code_digests_sub_storm_cap_taints_and_excludes_but_still_merges():
     """TAINT-AND-EXCLUDE, the shape evals/runner.py already uses for a capped
     cell: label it and drop it from the reported result, never score it zero
@@ -871,7 +873,7 @@ def test_code_digests_sub_storm_cap_taints_and_excludes_but_still_merges():
     """
     result = _run_mixed(capped=2, failed=0, ok=18)
 
-    assert result.status == "ok", "2 of 20 is not a storm"
+    assert result.status == mod.CodingStatus.OK, "2 of 20 is not a storm"
     assert mod.is_cap_deferral(result) is False
     assert result.capped == 2
     assert len(result.records) == 18, (
@@ -931,7 +933,8 @@ def test_code_digests_all_succeed_batch_status_ok():
         invoke=_make_batch_invoke(fail_sessions=set()), invariant_slugs=_NO_SLUGS,
     )
 
-    assert result.status == "ok"
+    assert isinstance(result.status, mod.CodingStatus)
+    assert result.status == mod.CodingStatus.OK
     assert result.total == 3
     assert result.succeeded == 3
     assert result.failed == 0
@@ -951,7 +954,8 @@ def test_code_digests_majority_failure_batch_status_failure():
         invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
     )
 
-    assert result.status == "failure"
+    assert isinstance(result.status, mod.CodingStatus)
+    assert result.status == mod.CodingStatus.FAILURE
     assert result.total == 4
     assert result.succeeded == 1
     assert result.failed == 3
@@ -973,7 +977,7 @@ def test_code_digests_exactly_half_failure_is_not_a_storm():
         invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
     )
 
-    assert result.status == "ok"
+    assert result.status == mod.CodingStatus.OK, "exactly half failed is not a storm"
     assert result.total == 4
     assert result.succeeded == 2
     assert result.failed == 2
@@ -1030,7 +1034,7 @@ def test_code_digests_logs_every_failure_in_a_sub_storm_batch(caplog):
             invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
         )
 
-    assert result.status == "ok", (
+    assert result.status == mod.CodingStatus.OK, (
         "if this ever became a storm the test would be pinning the wrong "
         "case -- the whole point is that nightly.py stays silent here"
     )
@@ -1070,7 +1074,7 @@ def test_code_digests_logs_one_record_per_failure_in_a_storm(caplog):
             invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
         )
 
-    assert result.status == "failure"
+    assert result.status == mod.CodingStatus.FAILURE
 
     warned = _coder_warnings(caplog)
     assert len(warned) == 3, (
@@ -1098,7 +1102,7 @@ def test_code_digests_logs_the_isolated_crash_path_too(caplog):
         )
 
     # The batch kept going: the other two digests still coded.
-    assert result.status == "ok"
+    assert result.status == mod.CodingStatus.OK
     assert result.total == 3
     assert result.succeeded == 2
     assert len(result.failures) == 1
@@ -1226,6 +1230,7 @@ def test_main_happy_path_writes_valid_jsonl_and_returns_0(
     assert [codebook_mod.validate_coding_record(record) for record in records] == [[], []]
     assert {record["session"] for record in records} == {"main-sess-1", "main-sess-2"}
     captured = capsys.readouterr()
+    assert "status=ok " in captured.err, "a StrEnum status renders as its value"
     assert "total=2" in captured.err
     assert "failed=0" in captured.err
     calls = pooled_main.calls()
@@ -1264,7 +1269,7 @@ def test_main_every_account_capped_defers_with_exit_zero_and_an_honest_tally(
     assert "all 2 pool accounts capped" in err, (
         f"the exhaustion reason must reach the operator; got {err!r}"
     )
-    for field in ("status=failure", "total=3", "succeeded=0", "failed=3", "capped=3"):
+    for field in ("status=failure ", "total=3", "succeeded=0", "failed=3", "capped=3"):
         assert field in err, (field, err)
 
 
@@ -1467,7 +1472,7 @@ def test_a_broken_quality_definition_fails_every_digest(
 
     assert prompts == []
     assert run.records == []
-    assert run.status == "failure"
+    assert run.status == mod.CodingStatus.FAILURE
     assert len(run.failures) == 2
     assert all("## Definition" in reason for _session, reason in run.failures)
 

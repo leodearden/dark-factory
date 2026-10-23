@@ -795,9 +795,8 @@ def _depth_distribution(
 ) -> dict[str, Any]:
     """Histogram ``data['depth']`` with a None-safe ``int()`` coercion.
 
-    Mirrors `analyze_speculation_depth.py::compute_per_depth`: an absent, None
-    or unparseable depth is SKIPPED and counted in ``n_skipped`` rather than
-    raising or landing in a 0 bucket.  Historical (pre-task-2340) `merge_verify`
+    An absent, None or unparseable depth is SKIPPED and counted in
+    ``n_skipped`` rather than raising or landing in a 0 bucket.  Historical (pre-task-2340) `merge_verify`
     rows carry no depth at all.
     """
     counts: Counter[int] = Counter()

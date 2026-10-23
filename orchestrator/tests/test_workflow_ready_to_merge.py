@@ -30,6 +30,7 @@ import pytest
 from _orch_helpers import pydantic_spec
 from shared.task_transitions import outcome_allows_status
 
+from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
@@ -128,6 +129,7 @@ def _make(
     config.project_root = tmp_path / 'proj'
     config.git.branch_prefix = 'task/'
     config.module_configs_or_empty = {}
+    config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
 
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock(side_effect=set_task_status_side_effect)
@@ -652,7 +654,7 @@ class TestOnArchitectMergeDone:
     _fire = staticmethod(_fire_merge_done)
 
     async def test_success_marks_done_via_found_on_main(self, tmp_path: Path):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = await self._fire(
             tmp_path, MergeOutcome(status='done', merge_sha=_LANDED),
@@ -669,7 +671,7 @@ class TestOnArchitectMergeDone:
     async def test_durable_failure_leaves_task_blocked(
         self, tmp_path: Path, status: str,
     ):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = await self._fire(tmp_path, MergeOutcome(status=cast(Any, status)))
 
@@ -688,7 +690,7 @@ class TestOnArchitectMergeDone:
     ):
         """A superseded/already-merged outcome is not a failure — no L2, no
         failure event; the branch and lane are preserved by omission."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = await self._fire(tmp_path, MergeOutcome(status=cast(Any, status)))
 
@@ -705,7 +707,7 @@ class TestOnArchitectMergeDone:
     ):
         """Loud over silent: a status in neither classification set must not
         silently no-op into a stranded task with no operator signal."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = await self._fire(
             tmp_path, MergeOutcome(status='brand_new_status'),  # type: ignore[arg-type]
@@ -723,7 +725,7 @@ class TestOnArchitectMergeDone:
         """found_on_main provenance needs a landed SHA — a 'done' with none is
         an unusable signal, so degrade to the reconciler backstop rather than
         writing bogus provenance."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = await self._fire(tmp_path, MergeOutcome(status='done'))
 
@@ -774,7 +776,7 @@ class TestArchitectMergeDurableFailureEscalates:
     async def test_durable_failure_files_a_born_at_l2(
         self, tmp_path: Path, status: str,
     ):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         q = _FakeEscalationQueue()
         f = await self._fire(
@@ -797,7 +799,7 @@ class TestArchitectMergeDurableFailureEscalates:
         """'Loud' for an unclassified outcome means an escalation too — the
         shared DURABLE_MERGE_FAILURE_STATUSES docstring promises exactly this
         of BOTH submit paths."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         q = _FakeEscalationQueue()
         await self._fire(
@@ -812,7 +814,7 @@ class TestArchitectMergeDurableFailureEscalates:
     async def test_success_or_transient_files_nothing(
         self, tmp_path: Path, status: str,
     ):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         q = _FakeEscalationQueue()
         await self._fire(
@@ -823,7 +825,7 @@ class TestArchitectMergeDurableFailureEscalates:
         assert q.submitted == []
 
     async def test_second_durable_failure_is_deduped(self, tmp_path: Path):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         q = _FakeEscalationQueue()
         f = _make(tmp_path=tmp_path)
@@ -838,7 +840,7 @@ class TestArchitectMergeDurableFailureEscalates:
     async def test_missing_queue_does_not_raise(self, tmp_path: Path):
         """Fail-safe: a done-callback must never propagate a bookkeeping error.
         The structured failure event is still emitted."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = await self._fire(tmp_path, MergeOutcome(status='error'))
 
@@ -848,7 +850,7 @@ class TestArchitectMergeDurableFailureEscalates:
         assert (rows[0].get('data') or {})['decision'] == 'merge_failed'
 
     async def test_submit_failure_is_swallowed(self, tmp_path: Path):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         q = _FakeEscalationQueue()
         q.submit = MagicMock(side_effect=RuntimeError('disk full'))  # type: ignore[method-assign]
@@ -960,7 +962,7 @@ class TestHandlerNeverAdvancesMain:
     ):
         """The submitted request's future is wired to the terminal callback —
         without this the FAST done flip would never fire."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = _make(tmp_path=tmp_path)
         f.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
@@ -993,7 +995,7 @@ class TestReadyToMergeDispatch:
 
     async def _drive(
         self, tmp_path: Path, *, site: str, with_already_done: bool,
-    ) -> tuple[AsyncMock, AsyncMock, WorkflowOutcome]:
+    ) -> tuple[AsyncMock, AsyncMock, WorkflowOutcome | None]:
         """Drive the REAL dispatch site with exit artifacts a stub agent wrote.
 
         Both handlers are stubbed, so what is observed is purely which branch
@@ -1150,7 +1152,7 @@ class TestOnArchitectMergeDoneDeliveredChecksGuard:
     _fire = staticmethod(_fire_merge_done_armed)
 
     def _done(self) -> Any:
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         return MergeOutcome(status='done', merge_sha=_LANDED)
 
@@ -1255,7 +1257,7 @@ class TestOnArchitectMergeDoneDeliveredChecksGuard:
     async def test_success_without_a_sha_never_reaches_the_guard(
         self, tmp_path: Path,
     ):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         guard = AsyncMock(return_value=None)
 
@@ -1269,7 +1271,7 @@ class TestOnArchitectMergeDoneDeliveredChecksGuard:
     async def test_transient_statuses_never_reach_the_guard(
         self, tmp_path: Path, status: str,
     ):
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         guard = AsyncMock(return_value=None)
 
@@ -1286,7 +1288,7 @@ class TestOnArchitectMergeDoneDeliveredChecksGuard:
         """The durable-failure and UNCLASSIFIED arms must keep their existing
         structured failure event and born-at-L2 path exactly as today — this
         pins that the guard did not perturb the load-bearing L2."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         guard = AsyncMock(return_value=None)
 
@@ -1304,7 +1306,7 @@ class TestOnArchitectMergeDoneDeliveredChecksGuard:
     ):
         """With the guard passing and ``mark_done`` raising, the existing
         WARNING-and-degrade behaviour is unchanged."""
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         f = _make(tmp_path=tmp_path, metadata={'delivered_checks': [_MD_DC_CHECK]})
         from orchestrator.config import DeliveredChecksConfig

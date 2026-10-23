@@ -20,6 +20,7 @@ import pytest
 from _usage_gate_test_helpers import make_gate as _shared_make_gate
 
 import shared.cli_invoke as cli_invoke_module
+from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
     _MAX_CAP_COOLDOWN_SECS,
@@ -84,6 +85,15 @@ def make_result(
         cost_usd=cost_usd,
         **kw,
     )
+
+
+def make_cap_result(
+    output: str = REAL_CLI_CAP_HIT_MESSAGES[0],
+    session_id: str = '',
+    **kw,
+) -> AgentResult:
+    """A genuine cap: the CLI reports it as a failed turn carrying the banner."""
+    return make_result(success=False, output=output, session_id=session_id, **kw)
 
 
 def _mock_gate(**overrides) -> MagicMock:
@@ -350,7 +360,7 @@ class TestCapRetryFailover:
         )
         result = make_result()
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[make_cap_result(), result]) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
         ):
             got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
@@ -369,7 +379,7 @@ class TestCapRetryFailover:
         config_dir.path = '/tmp/test-config'
         result = make_result()
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[make_cap_result(), result]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
         ):
             await invoke_with_cap_retry(gate, 'lbl', config_dir=config_dir, prompt='hi')
@@ -390,7 +400,7 @@ class TestCapRetryFailover:
         )
         result = make_result()
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[make_cap_result(), result]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
         ):
             got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
@@ -406,7 +416,7 @@ class TestCapRetryFailover:
         )
         result = make_result()
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[make_cap_result(), make_cap_result(), make_cap_result(), result]) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
         ):
             got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
@@ -422,8 +432,8 @@ class TestCapRetryFailover:
             detect_cap_hit=MagicMock(side_effect=[True, False]),
             active_account_name='acct-b',
         )
-        r1 = make_result(stderr='err1', output='out1')
-        r2 = make_result(stderr='err2', output='out2')
+        r1 = make_cap_result(stderr='err1', output='out1')
+        r2 = make_result(success=False, stderr='err2', output='out2')
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[r1, r2]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
@@ -451,7 +461,7 @@ class TestCapRetryResume:
             detect_cap_hit=MagicMock(side_effect=[True, False]),
             active_account_name='acct-b',
         )
-        capped = make_result(session_id='sess-42')
+        capped = make_cap_result(session_id='sess-42')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
@@ -470,7 +480,7 @@ class TestCapRetryResume:
             detect_cap_hit=MagicMock(side_effect=[True, False]),
             active_account_name='acct-b',
         )
-        capped = make_result(session_id='')
+        capped = make_cap_result(session_id='')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
@@ -489,7 +499,7 @@ class TestCapRetryResume:
             detect_cap_hit=MagicMock(side_effect=[True, False, False]),
             active_account_name='acct-a',
         )
-        capped = make_result(session_id='sess-1')
+        capped = make_cap_result(session_id='sess-1')
         resume_fail = make_result(success=False, output='resume broke')
         ok = make_result()
         with (
@@ -514,7 +524,7 @@ class TestCapRetryResume:
             detect_cap_hit=MagicMock(side_effect=[True, False]),
             active_account_name='acct-b',
         )
-        capped = make_result(session_id='sess-x')
+        capped = make_cap_result(session_id='sess-x')
         ok = make_result(output='resumed ok')
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]),
@@ -531,8 +541,8 @@ class TestCapRetryResume:
             detect_cap_hit=MagicMock(side_effect=[True, True, False]),
             active_account_name='acct-c',
         )
-        r1 = make_result(session_id='sess-A')
-        r2 = make_result(session_id='sess-B')  # resume on B produces updated session
+        r1 = make_cap_result(session_id='sess-A')
+        r2 = make_cap_result(session_id='sess-B')  # resume on B produces updated session
         r3 = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[r1, r2, r3]) as mock_inv,
@@ -552,10 +562,10 @@ class TestCapRetryResume:
             detect_cap_hit=MagicMock(side_effect=[True, False, True, False]),
             active_account_name='acct-b',
         )
-        capped1 = make_result(session_id='sess-1')
+        capped1 = make_cap_result(session_id='sess-1')
         resume_fail = make_result(success=False)
         # Second cycle: cap hit again, this time without session_id
-        capped2 = make_result(session_id='')
+        capped2 = make_cap_result(session_id='')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped1, resume_fail, capped2, ok]) as mock_inv,
@@ -598,7 +608,7 @@ class TestCapRetryResume:
             active_account_name='acct-b',
             soonest_resets_at=MagicMock(),  # truthy + non-serializable
         )
-        capped = make_result(session_id='')
+        capped = make_cap_result(session_id='')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
@@ -773,7 +783,7 @@ class TestCapRetryTranscriptReachability:
         # Deliberately write NO transcript: projects/ stays absent.
         assert not (config_dir.path / 'projects').exists()
 
-        capped = make_result(session_id='sess-42')
+        capped = make_cap_result(session_id='sess-42')
         ok = make_result()
         rebuild = AsyncMock(return_value='FRESH REBUILT PROMPT')
         with (
@@ -803,7 +813,7 @@ class TestCapRetryTranscriptReachability:
             active_account_name='acct-b',
         )
         config_dir = TaskConfigDir('3454-reach-missing-norebuild', base_dir=tmp_path)
-        capped = make_result(session_id='sess-42')
+        capped = make_cap_result(session_id='sess-42')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
@@ -832,7 +842,7 @@ class TestCapRetryTranscriptReachability:
         config_dir = TaskConfigDir('3454-reach-present', base_dir=tmp_path)
         _write_transcript(config_dir.path, 'sess-42')
 
-        capped = make_result(session_id='sess-42')
+        capped = make_cap_result(session_id='sess-42')
         ok = make_result()
         rebuild = AsyncMock(return_value='DISCARDED BY THE RESUME')
         with (
@@ -861,7 +871,7 @@ class TestCapRetryTranscriptReachability:
         _write_transcript(config_dir.path, 'sess-42')
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock,
-                  side_effect=[make_result(session_id='sess-42'), make_result()]),
+                  side_effect=[make_cap_result(session_id='sess-42'), make_result()]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
         ):
@@ -883,7 +893,7 @@ class TestCapRetryTranscriptReachability:
         )
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock,
-                  side_effect=[make_result(session_id=''), make_result()]),
+                  side_effect=[make_cap_result(session_id=''), make_result()]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
         ):
@@ -907,7 +917,7 @@ class TestCapRetryTranscriptReachability:
         config_dir = TaskConfigDir('3454-reason-unreachable', base_dir=tmp_path)
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock,
-                  side_effect=[make_result(session_id='sess-42'), make_result()]),
+                  side_effect=[make_cap_result(session_id='sess-42'), make_result()]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
         ):
@@ -933,7 +943,7 @@ class TestCapRetryTranscriptReachability:
             detect_cap_hit=MagicMock(side_effect=[True, False]),
             active_account_name='acct-b',
         )
-        capped = make_result(session_id='sess-42')
+        capped = make_cap_result(session_id='sess-42')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
@@ -1012,7 +1022,7 @@ class TestCapRetryResumableProgress:
         config_dir = TaskConfigDir('4274-noprogress', base_dir=tmp_path)
         _write_transcript(config_dir.path, 'sess-42', records=_text_only_session_records())
 
-        capped = make_result(session_id='sess-42')
+        capped = make_cap_result(session_id='sess-42')
         ok = make_result()
         rebuild = AsyncMock(return_value='FRESH REBUILT PROMPT')
         with (
@@ -1050,7 +1060,7 @@ class TestCapRetryResumableProgress:
 
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock,
-                  side_effect=[make_result(session_id='sess-42'), make_result()]) as mock_inv,
+                  side_effect=[make_cap_result(session_id='sess-42'), make_result()]) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
         ):
             await invoke_with_cap_retry(
@@ -1079,7 +1089,7 @@ class TestCapRetryResumableProgress:
         # Default fixture content = a progressed session (user + assistant tool_use).
         _write_transcript(config_dir.path, 'sess-42')
 
-        capped = make_result(session_id='sess-42')
+        capped = make_cap_result(session_id='sess-42')
         ok = make_result()
         rebuild = AsyncMock(return_value='DISCARDED BY THE RESUME')
         with (
@@ -1114,7 +1124,7 @@ class TestCapRetryResumableProgress:
         rebuild = AsyncMock(return_value='DISCARDED BY THE RESUME')
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock,
-                  side_effect=[make_result(session_id='sess-42'), make_result()]) as mock_inv,
+                  side_effect=[make_cap_result(session_id='sess-42'), make_result()]) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
         ):
             await invoke_with_cap_retry(
@@ -1143,7 +1153,7 @@ class TestCapRetryResumableProgress:
         _write_transcript(config_dir.path, 'sess-42', records=_text_only_session_records())
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock,
-                  side_effect=[make_result(session_id='sess-42'), make_result()]),
+                  side_effect=[make_cap_result(session_id='sess-42'), make_result()]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
         ):
@@ -1367,7 +1377,7 @@ class TestCapRetryCooldown:
         )
         result = make_result()
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[make_cap_result(), result]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep,
         ):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
@@ -1389,7 +1399,7 @@ class TestCapRetryCooldown:
         )
         result = make_result()
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[make_cap_result()] * 3 + [result]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep,
         ):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
@@ -1409,7 +1419,7 @@ class TestCapRetryCooldown:
         )
         result = make_result()
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[make_cap_result()] * 5 + [result]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep,
         ):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
@@ -1426,7 +1436,7 @@ class TestCapRetryCooldown:
         )
         result = make_result()
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[make_cap_result()] * 19 + [result]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep,
         ):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
@@ -1445,7 +1455,7 @@ class TestCapRetryCooldown:
         )
         result = make_result()
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[make_cap_result()] * 5 + [result]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep,
         ):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
@@ -1514,7 +1524,7 @@ class TestCapRetryBudget:
             side_effect=['tok-a', SessionBudgetExhausted(5.0)],
         )
         gate.detect_cap_hit = MagicMock(side_effect=[True])
-        capped = make_result(cost_usd=0.1)
+        capped = make_cap_result(cost_usd=0.1)
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=capped),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
@@ -1605,12 +1615,12 @@ class TestCapRetryEdgeCases:
     """Edge cases and boundary conditions."""
 
     async def test_empty_stderr_and_output_no_cap_hit(self):
-        """Empty stderr and output -> no cap hit detected."""
+        """A successful result is never offered to the cap detector."""
         gate = _mock_gate()
         result = make_result(stderr='', output='')
         with patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result):
             got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
-        gate.detect_cap_hit.assert_called_once()
+        gate.detect_cap_hit.assert_not_called()
         assert got.success is True
 
     async def test_cap_hit_on_very_first_invocation(self):
@@ -1623,7 +1633,7 @@ class TestCapRetryEdgeCases:
         )
         result = make_result()
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[make_cap_result(), result]) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
         ):
             got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
@@ -1639,12 +1649,13 @@ class TestCapRetryEdgeCases:
             active_account_name='acct',
         )
         # Result has multiple cap patterns, but detect_cap_hit is only called once per loop
-        result = make_result(
+        capped = make_cap_result(
             stderr="You've hit your limit. You've used all.",
             output='usage limit reset',
         )
+        other_failure = make_result(success=False, output='unrelated failure')
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, other_failure]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
         ):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
@@ -1678,7 +1689,7 @@ class TestCapRetryEdgeCases:
             detect_cap_hit=MagicMock(side_effect=[True, False, False]),
             active_account_name='acct',
         )
-        capped = make_result(session_id='sess-1')
+        capped = make_cap_result(session_id='sess-1')
         resume_fail = make_result(success=False)
         ok = make_result()
         with (
@@ -1707,9 +1718,9 @@ class TestCapRetryEdgeCases:
         )
         # Cycle 1: cap with session -> resume fails -> fresh
         # Cycle 2: cap without session -> fresh succeeds
-        r1 = make_result(session_id='s1')
+        r1 = make_cap_result(session_id='s1')
         r2 = make_result(success=False)  # resume fail
-        r3 = make_result(session_id='')  # cap hit, no session
+        r3 = make_cap_result(session_id='')  # cap hit, no session
         r4 = make_result()  # success
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[r1, r2, r3, r4]) as mock_inv,
@@ -1829,7 +1840,7 @@ class TestCapRetryTimingAndSequence:
             side_effect=lambda *a, **kw: (call_order.append('detect'), [True, False][len([x for x in call_order if x == 'detect']) - 1])[1],
         )
 
-        r1 = make_result()
+        r1 = make_cap_result()
         r2 = make_result()
 
         async def invoke_side_effect(**kwargs):
@@ -1845,7 +1856,7 @@ class TestCapRetryTimingAndSequence:
         ):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
 
-        assert call_order == ['invoke', 'detect', 'sleep', 'invoke', 'detect']
+        assert call_order == ['invoke', 'detect', 'sleep', 'invoke']
 
     async def test_no_sleep_on_success(self):
         """No sleep when invocation succeeds on first try."""
@@ -1882,7 +1893,7 @@ class TestCapRetryWithRealGate:
         """Real gate: first account caps, second account succeeds."""
         gate = make_gate(['alpha', 'beta'])
         capped = make_result(
-            success=True,
+            success=False,
             stderr="You've hit your usage limit. resets in 1h",
             output='partial',
         )
@@ -1974,7 +1985,7 @@ class TestCapRetrySanityBound:
             detect_cap_hit=MagicMock(return_value=True),
             active_account_name='acct',
         )
-        result = make_result()
+        result = make_cap_result()
         # First call → 0.0 (retry_start), all subsequent → 4000.0
         # elapsed = 4000.0 > cap_wait_sanity_secs=3600.0 → raise
         monotonic_values = itertools.chain([0.0], itertools.repeat(4000.0))
@@ -2003,7 +2014,7 @@ class TestCapRetrySanityBound:
             detect_cap_hit=MagicMock(return_value=True),
             active_account_name='acct',
         )
-        result = make_result()
+        result = make_cap_result()
         # First call → 0.0 (retry_start), all subsequent → 15.0
         # elapsed = 15.0 > cap_wait_sanity_secs=10.0 after first hit
         monotonic_values = itertools.chain([0.0], itertools.repeat(15.0))
@@ -2064,7 +2075,7 @@ class TestCapWaitSanitySecs:
             detect_cap_hit=MagicMock(return_value=True),
             active_account_name='acct',
         )
-        result = make_result()
+        result = make_cap_result()
         # First call → 0.0 (retry_start), all subsequent → 15.0
         # → elapsed = 15.0 > cap_wait_sanity_secs=10.0 after first cap hit
         monotonic_values = itertools.chain([0.0], itertools.repeat(15.0))
@@ -2216,7 +2227,7 @@ class TestCapRetrySanityGuardLogging:
             detect_cap_hit=MagicMock(return_value=True),
             active_account_name='acct',
         )
-        result = make_result()
+        result = make_cap_result()
         # First call → 0.0 (retry_start), all subsequent → 4000.0
         # → elapsed = 4000.0 > cap_wait_sanity_secs=3600.0 after just 1 cap hit
         monotonic_values = itertools.chain([0.0], itertools.repeat(4000.0))
@@ -2254,7 +2265,7 @@ class TestCapRetrySanityGuardLogging:
             detect_cap_hit=MagicMock(return_value=True),
             active_account_name='acct',
         )
-        result = make_result()
+        result = make_cap_result()
         # First call → 0.0, all subsequent → 4000.0 → elapsed = 4000.0s
         monotonic_values = itertools.chain([0.0], itertools.repeat(4000.0))
         with (
@@ -2923,7 +2934,7 @@ class TestInvokeFnParameter:
         gate.detect_cap_hit = spy  # type: ignore[assignment]
 
         result = make_result(
-            success=True, cost_usd=0.1, duration_ms=6000, turns=2,
+            success=False, cost_usd=0.1, duration_ms=6000, turns=2,
         )
         with patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result):
             await invoke_with_cap_retry(
@@ -3282,7 +3293,7 @@ class TestCapRetryMaxCapRetries:
             detect_cap_hit=MagicMock(side_effect=[True, True, True, False]),
             active_account_name='acct',
         )
-        capped = make_result(session_id='')
+        capped = make_cap_result(session_id='')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, capped, capped, ok]) as mock_inv,
@@ -3383,7 +3394,7 @@ class TestCapRetryRebuildPrompt:
             detect_cap_hit=MagicMock(side_effect=[True, False]),
             active_account_name='acct',
         )
-        capped = make_result(session_id='')  # unresumable
+        capped = make_cap_result(session_id='')  # unresumable
         ok = make_result()
         rebuild = AsyncMock(return_value='FRESH ESCALATIONS PROMPT')
         with (
@@ -3406,7 +3417,7 @@ class TestCapRetryRebuildPrompt:
             detect_cap_hit=MagicMock(side_effect=[True, False]),
             active_account_name='acct',
         )
-        capped = make_result(session_id='sess-1')  # resumable
+        capped = make_cap_result(session_id='sess-1')  # resumable
         ok = make_result()
         rebuild = AsyncMock(return_value='FRESH ESCALATIONS PROMPT')
         with (
@@ -3472,7 +3483,7 @@ class TestCapRetryRebuildPrompt:
             detect_cap_hit=MagicMock(side_effect=[True, False]),
             active_account_name='acct',
         )
-        capped = make_result(session_id='')  # unresumable
+        capped = make_cap_result(session_id='')  # unresumable
         ok = make_result()
         rebuild = AsyncMock(side_effect=RuntimeError('transient MCP failure'))
         with (

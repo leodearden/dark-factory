@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from shared import safe_io
+from shared.plan_deviation import DeviationRecord
 
 from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
@@ -22,6 +23,7 @@ from orchestrator.config import TASK_META_DIRNAME
 logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
+PLAN_TASK_TEXT_FP_KEY = '_task_text_fp'
 
 # Must exceed the longest legitimate critical section: plan_tools._mark_step_done's two timeout=10 git probes.
 PLAN_MUTEX_TIMEOUT_SECS = 60.0
@@ -357,6 +359,32 @@ class TaskArtifacts:
         lane acquisition. See ``plans/worktree-lane-lifecycle-prd.md``.
         """
         return worktree_base / TASK_META_DIRNAME / worktree_name
+
+    @staticmethod
+    def read_lane_task_id(meta_root: Path) -> str | None:
+        """The task id ``<meta_root>/metadata.json`` was dispatched for, else None.
+
+        The lane->task key of ``GitOps``'s disk backstop. One root, no
+        ``plan.json`` and no legacy fallback: PRD
+        ``plans/task-meta-task-keying-prd.md`` decision 7. Never raises.
+        """
+        meta_path = meta_root / 'metadata.json'
+        if not meta_path.exists():
+            return None
+        try:
+            metadata = json.loads(meta_path.read_text())
+        except (ValueError, OSError) as exc:
+            logger.warning('Unreadable metadata.json at %s: %s', meta_path, exc)
+            return None
+        if not isinstance(metadata, dict):
+            logger.warning('Malformed metadata.json at %s: not an object', meta_path)
+            return None
+        task_id = metadata.get('task_id')
+        if isinstance(task_id, str):
+            return task_id or None
+        if isinstance(task_id, int) and not isinstance(task_id, bool):
+            return str(task_id)
+        return None
 
     def init(
         self,
@@ -859,7 +887,13 @@ class TaskArtifacts:
     def update_step_status(
         self, step_id: str, status: str, commit: str | None = None
     ) -> None:
-        """Update ONLY status and commit fields in plan.json. Structure is immutable."""
+        """Update ONLY the status and commit fields of one step in plan.json.
+
+        Plan structure changes only through the architect-role revalidation
+        tools (``orchestrator/mcp/plan_tools.py::_remove_plan_step`` /
+        ``::_replace_plan_step``), and only on steps that are not done.
+        Per-step deviation records go through :meth:`append_step_deviation`.
+        """
         with self.plan_mutex():
             plan = self.read_plan()
 
@@ -875,6 +909,40 @@ class TaskArtifacts:
                         return
 
         logger.warning(f'Step {step_id} not found in plan')
+
+    def append_step_deviation(
+        self, step_id: str, record: DeviationRecord
+    ) -> int | None:
+        """Append *record* to the matching step's ``deviations`` list.
+
+        Returns the list's new length, or ``None`` (with a warning, and no
+        write) when no step or prerequisite has ``id == step_id``. Any step
+        status is accepted, including ``done``.
+
+        Append-only: this class never edits or removes a record. ``status``,
+        ``commit``, ``type`` and ``description`` are never touched, so
+        :meth:`update_step_status` stays "status and commit only".
+
+        Markup-repair limits: ``plans/plan-deviation-recording-prd.md`` D4.
+        """
+        with self.plan_mutex():
+            plan = self.read_plan()
+
+            for collection in ('prerequisites', 'steps'):
+                for item in plan.get(collection, []):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get('id') == step_id:
+                        existing = item.get('deviations')
+                        item['deviations'] = [
+                            *(existing if isinstance(existing, list) else []),
+                            record.to_dict(),
+                        ]
+                        self.write_plan(plan, mutex_held=True)
+                        return len(item['deviations'])
+
+        logger.warning(f'Step {step_id} not found in plan')
+        return None
 
     def mark_step_committed(self, step_id: str, sha: str) -> bool:
         """Pre-satisfy a plan step/prerequisite at AUTHORING time.
@@ -1110,10 +1178,14 @@ class TaskArtifacts:
         if base_commit is not None:
             self.update_base_commit(base_commit)
 
-    def stamp_plan_provenance(self, session_id: str) -> None:
+    def stamp_plan_provenance(
+        self, session_id: str, *, task_text_fp: str | None = None,
+    ) -> None:
         """Stamp _session_id and _created_at into plan.json.
 
         Reads current plan.json, adds provenance fields, writes back.
+        ``task_text_fp=None`` leaves an existing fingerprint untouched (the
+        per-iteration and recovered-plan stamps rely on this).
 
         Raises:
             ValueError: if plan.json is missing or does not contain a 'steps' list.
@@ -1136,6 +1208,8 @@ class TaskArtifacts:
             # ready-made plan (eval initial_plan, SIMPLE_TASK) rely on this so the
             # plan is not mistaken for an interrupted partial on a later requeue.
             plan.setdefault('_finalized_at', plan['_created_at'])
+            if task_text_fp is not None:
+                plan[PLAN_TASK_TEXT_FP_KEY] = task_text_fp
             self._write_held_plan(plan)
 
     def validate_plan_owner(self, session_id: str) -> bool:

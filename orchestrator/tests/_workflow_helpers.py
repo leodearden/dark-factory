@@ -31,11 +31,11 @@ from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 from shared.locking import normalize_lock
 
 from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.mcp.verdict_tools import (
     _envelope as _verdict_envelope,
 )
@@ -43,6 +43,7 @@ from orchestrator.mcp.verdict_tools import (
     _submit_review_verdict,
 )
 from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.scheduler import (
     BlastRadiusResult,
@@ -478,6 +479,7 @@ class FakeBriefing:
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
+        *, attempt_context=None,
     ) -> str:
         return f'Fix: {failures[:100]}'
 
@@ -491,6 +493,13 @@ class FakeBriefing:
         # drift neither ruff nor pyright reports — only a call through this
         # fake would have caught it.
         return f'Review ({reviewer_type}): {diff[:100]}'
+
+    async def build_context_complete_reviewer_prompt(
+        self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
+    ) -> str:
+        first_path = subject.change.files[0].path if subject.change.files else ''
+        return f'Review-d2 ({reviewer_type}): {first_path}'
 
     async def build_completion_judge_prompt(
         self,
@@ -523,7 +532,7 @@ class FakeBriefing:
 
     async def build_revalidation_prompt(
         self, task: dict, existing_plan: dict, changed_files: list,
-        worktree=None, context: str | None = None,
+        worktree=None, context: str | None = None, *, text_drift=None,
     ) -> str:
         return f'Revalidate: {task.get("title", "")}'
 
@@ -671,6 +680,7 @@ def _make(
     config.steward_completion_timeout = 300.0
     config.project_root = project_root
     config.git.branch_prefix = 'task/'
+    config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
 
     set_task_status = AsyncMock()
     scheduler = MagicMock()

@@ -13,6 +13,7 @@ from _recording_event_store import _RecordingEventStore
 from shared.locking import directory_locks
 from shared.task_metadata_wire import coerce_task_metadata
 
+from orchestrator.already_landed_tick_view import AlreadyLandedTickView
 from orchestrator.config import (
     TIER_BASE,
     TIER_WIDTH,
@@ -29,6 +30,7 @@ from orchestrator.scheduler import (
     ExternalResolverError,
     ModuleLockTable,
     Scheduler,
+    SchedulerCallbacks,
     TickContext,
     files_to_modules,
     normalize_lock,
@@ -8319,32 +8321,32 @@ class TestSchedulerPause:
         """
         # Fresh scheduler — not paused.
         snap = scheduler.get_state_snapshot()
-        assert snap['is_paused'] is False, (
-            f"Expected is_paused=False on fresh scheduler; got {snap['is_paused']!r}"
+        assert snap.is_paused is False, (
+            f"Expected is_paused=False on fresh scheduler; got {snap.is_paused!r}"
         )
-        assert snap['pause_reason'] is None, (
-            f"Expected pause_reason=None on fresh scheduler; got {snap['pause_reason']!r}"
+        assert snap.pause_reason is None, (
+            f"Expected pause_reason=None on fresh scheduler; got {snap.pause_reason!r}"
         )
 
         # After pause — snapshot must reflect the paused state.
         reason = 'park-stop: 3 tasks parked in 1h'
         scheduler.pause(reason)
         snap_paused = scheduler.get_state_snapshot()
-        assert snap_paused['is_paused'] is True, (
-            f"Expected is_paused=True after pause; got {snap_paused['is_paused']!r}"
+        assert snap_paused.is_paused is True, (
+            f"Expected is_paused=True after pause; got {snap_paused.is_paused!r}"
         )
-        assert snap_paused['pause_reason'] == reason, (
-            f"Expected pause_reason={reason!r}; got {snap_paused['pause_reason']!r}"
+        assert snap_paused.pause_reason == reason, (
+            f"Expected pause_reason={reason!r}; got {snap_paused.pause_reason!r}"
         )
 
         # After resume — snapshot must return to unpaused state.
         scheduler.resume()
         snap_resumed = scheduler.get_state_snapshot()
-        assert snap_resumed['is_paused'] is False, (
-            f"Expected is_paused=False after resume; got {snap_resumed['is_paused']!r}"
+        assert snap_resumed.is_paused is False, (
+            f"Expected is_paused=False after resume; got {snap_resumed.is_paused!r}"
         )
-        assert snap_resumed['pause_reason'] is None, (
-            f"Expected pause_reason=None after resume; got {snap_resumed['pause_reason']!r}"
+        assert snap_resumed.pause_reason is None, (
+            f"Expected pause_reason=None after resume; got {snap_resumed.pause_reason!r}"
         )
 
 
@@ -9736,83 +9738,6 @@ class TestGetExternalStatusesPartialResult:
             f'Empty deps should not trigger partial-result guard; got err={err!r}'
         )
         assert statuses == {}
-
-
-# ---------------------------------------------------------------------------
-# TestTaskExternalDeps (task 2167 — W3-δ: shared TaskMetadata seam, SEAM A)
-# ---------------------------------------------------------------------------
-
-class TestTaskExternalDeps:
-    """Unit tests for the ``_task_external_deps`` helper (SEAM A).
-
-    ``_task_external_deps`` is the single seam every scheduler
-    ``metadata.external_deps`` read routes through:
-    ``parse_metadata(task.get('metadata'), direction='read')[0].external_deps``.
-    ``direction='read'`` is best-effort (never raises) so a corrupt
-    historical metadata row cannot break a scheduler dispatch tick — matching
-    the scheduler's existing fail-safe philosophy.  The return value stays
-    the canonical "project_id:task_id" wire STRING form (PRD Open Question
-    #4) — it is never converted to ``list[ExternalDep]``.
-
-    Plain dict task fixtures only — no Scheduler construction needed.
-    """
-
-    def test_no_metadata_key_returns_empty_list(self):
-        """A task dict with no 'metadata' key at all -> []."""
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '1'}
-        assert _task_external_deps(task) == []
-
-    def test_metadata_none_returns_empty_list(self):
-        """metadata=None -> [] (benign-absent, same as a missing key)."""
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '2', 'metadata': None}
-        assert _task_external_deps(task) == []
-
-    def test_dict_metadata_returns_external_deps(self):
-        """dict metadata {'external_deps': [...]} -> the list, unchanged."""
-        from orchestrator.scheduler import _task_external_deps
-        task = {
-            'id': '3',
-            'metadata': {'external_deps': ['dark_factory:42', 'p:9']},
-        }
-        assert _task_external_deps(task) == ['dark_factory:42', 'p:9']
-
-    def test_json_string_metadata_is_parsed(self):
-        """metadata as a JSON *string* is parsed through the shared parser.
-
-        The old inline idiom ``(task.get('metadata') or {}).get(...)`` would
-        ``AttributeError`` on a str (``str`` has no ``.get``) — the shared
-        parser handles a JSON string natively.
-        """
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '4', 'metadata': '{"external_deps": ["a:1"]}'}
-        assert _task_external_deps(task) == ['a:1']
-
-    def test_corrupt_metadata_string_returns_empty_list_no_raise(self):
-        """Unparseable metadata string -> [] with no exception raised.
-
-        ``direction='read'`` is best-effort: a corrupt historical metadata
-        row must not break a scheduler dispatch tick.
-        """
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '5', 'metadata': 'not json{'}
-        assert _task_external_deps(task) == []
-
-    def test_returned_elements_stay_string_wire_form(self):
-        """Every returned element is a str — NOT converted to ExternalDep.
-
-        Resolves PRD Open Question #4 for task W3-δ: the scheduler keeps
-        consuming the canonical "project_id:task_id" STRING wire form fed to
-        ``get_external_statuses`` / the external-status cache.
-        """
-        from orchestrator.scheduler import _task_external_deps
-        task = {
-            'id': '6',
-            'metadata': {'external_deps': ['dark_factory:42', 'p:9']},
-        }
-        result = _task_external_deps(task)
-        assert all(isinstance(dep, str) for dep in result)
 
 
 # ---------------------------------------------------------------------------
@@ -12046,7 +11971,11 @@ class TestDrainParkEvictionRequests:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # T's parks gone.
         assert not scheduler.lock_table.has_parks('T')
@@ -12081,7 +12010,11 @@ class TestDrainParkEvictionRequests:
         status_map = {}
         tasks_by_id = {}
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # No eviction event.
         evicted_events = [
@@ -12133,7 +12066,11 @@ class TestDrainParkEvictionGuard:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # T's park must be INTACT.
         assert scheduler.lock_table.has_parks('T'), (
@@ -12175,7 +12112,11 @@ class TestDrainParkEvictionGuard:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # T's park must be gone — unsatisfied deps → not live-dispatchable → evict.
         assert not scheduler.lock_table.has_parks('T'), (
@@ -12321,8 +12262,8 @@ class TestDrainFiresWithNoActiveTasks:
 class TestAcquireNextFmReadFailureFailSafe:
     """acquire_next() must NOT drain park-evictions when get_tasks signals a
     read FAILURE (get_tasks(distinguish_failure=True) returns None) — draining
-    with empty status_map/tasks_by_id would make _owner_is_live_dispatchable
-    return False for every id, bypassing the D4 live-owner guard and
+    with empty status_map/tasks_by_id would make _park_hold_refusal name a
+    refusal ('missing') for every id, bypassing the D4 live-owner guard and
     force-evicting still-live owners during an fm outage/restart.
 
     A genuine empty result ([]) is NOT a failure and still drains exactly as
@@ -12603,7 +12544,11 @@ class TestDrainBuriedOwnerRestoredEvents:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # B's park on m2 is gone.
         assert not scheduler.lock_table.has_parks('B')
@@ -13572,6 +13517,83 @@ class TestConsultAlreadyLanded:
             'a raising gate hook should be logged, not silently swallowed'
         )
 
+    async def test_tick_view_is_read_once_and_threaded_with_each_candidate(self):
+        view = AlreadyLandedTickView(local_branches=frozenset())
+        reader = AsyncMock(return_value=view)
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+        candidates = [_pending_task(tid) for tid in ('A', 'B', 'C')]
+
+        await scheduler._consult_already_landed(candidates)
+
+        reader.assert_awaited_once()
+        assert gate.await_count == len(candidates)
+        for call, candidate in zip(gate.await_args_list, candidates, strict=True):
+            assert call.args == (candidate['id'],)
+            assert call.kwargs['task'] is candidate
+            assert call.kwargs['tick_view'] is view
+
+    async def test_without_a_reader_the_gate_gets_no_tick_view(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+        candidate = _pending_task('Z')
+
+        await scheduler._consult_already_landed([candidate])
+
+        (call,) = gate.await_args_list
+        assert call.kwargs['task'] is candidate
+        assert call.kwargs['tick_view'] is None
+
+    async def test_a_raising_reader_fails_open_to_per_candidate_reads(self, caplog):
+        caplog.set_level('WARNING')
+        reader = AsyncMock(side_effect=RuntimeError('for-each-ref hiccup'))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
+        scheduler._already_landed_gate = gate
+
+        result = await scheduler._consult_already_landed(
+            [_pending_task('Z'), _pending_task('Y')]
+        )
+
+        assert result == {'Z'}
+        assert {call.args[0] for call in gate.await_args_list} == {'Z', 'Y'}
+        assert all(call.kwargs['tick_view'] is None for call in gate.await_args_list)
+        assert any(record.levelname == 'WARNING' for record in caplog.records)
+
+    async def test_without_a_gate_the_tick_view_is_not_read(self):
+        reader = AsyncMock(return_value=AlreadyLandedTickView(local_branches=frozenset()))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+
+        assert await scheduler._consult_already_landed([_pending_task('Z')]) == set()
+        reader.assert_not_awaited()
+
+    async def test_with_no_candidates_the_tick_view_is_not_read(self):
+        reader = AsyncMock(return_value=AlreadyLandedTickView(local_branches=frozenset()))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+        scheduler._already_landed_gate = AsyncMock(return_value=False)
+
+        assert await scheduler._consult_already_landed([]) == set()
+        reader.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # acquire_next() honors the already-landed gate (task 2313).
@@ -13593,27 +13615,33 @@ class TestAcquireNextAlreadyLandedGate:
         scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
-        scheduler._already_landed_gate = AsyncMock(return_value=True)
+        gate = AsyncMock(return_value=True)
+        scheduler._already_landed_gate = gate
 
         result = await scheduler.acquire_next()
 
         assert result is None, 'a gated task must not be dispatched this tick'
         assert 'Z' not in scheduler._dispatched
-        scheduler._already_landed_gate.assert_awaited_once_with('Z')
+        (call,) = gate.await_args_list
+        assert call.args == ('Z',)
+        assert call.kwargs['task']['id'] == 'Z'
 
     async def test_gate_false_dispatches_normally(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
-        scheduler._already_landed_gate = AsyncMock(return_value=False)
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
 
         result = await scheduler.acquire_next()
 
         assert result is not None
         assert result.task_id == 'Z'
         assert 'Z' in scheduler._dispatched
-        scheduler._already_landed_gate.assert_awaited_once_with('Z')
+        (call,) = gate.await_args_list
+        assert call.args == ('Z',)
+        assert call.kwargs['task']['id'] == 'Z'
 
     async def test_gated_pinned_candidate_is_not_dispatched(self, tmp_path):
         """Pin-loop parity: a gated PINNED candidate must also be skipped."""
@@ -13626,7 +13654,7 @@ class TestAcquireNextAlreadyLandedGate:
         scheduler = Scheduler(config, override_store=store)
         scheduler.finish_startup()
         scheduler._project_root = '/proj'
-        scheduler._already_landed_gate = AsyncMock(side_effect=lambda task_id: task_id == 'Z')
+        scheduler._already_landed_gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
 
         task_z = _pending_task('Z', files=['z/src'])
         task_y = _pending_task('Y', files=['y/src'])

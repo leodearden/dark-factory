@@ -268,37 +268,20 @@ WHOLE_TREE_SCAN_TEST_TIMEOUT = 1200
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 UNDER_LOAD_HEADROOM_FACTOR = 8
 
-# task 5147: the per-test budget VERIFY actually passes -- the `--timeout=300`
-# token in `orchestrator/orchestrator.yaml`'s `test_command`, mirrored by every
-# pytest segment of the fleet chain in dark-factory-orchestrator.yaml.  It is
-# the upper edge of the inversion band, whose rationale lives in
-# shared/src/shared/testing_timeout_markers.py, and a slow test here loosens
-# safely by spelling it: `@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)`.
-# ENFORCED by tests/test_timeout_marker_inversion_guard.py.
+# task 5147: the per-test budget VERIFY passes -- the `--timeout` token in
+# orchestrator/orchestrator.yaml's `test_command`.  A slow test loosens safely
+# by spelling `@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)`; the band it
+# clears, and why, live in shared/src/shared/testing_timeout_markers.py.
 #
-# THE CLI BUDGET AND THE INI DEFAULT NO LONGER COINCIDE.  Both were 300 until
-# 2026-09-17, when task 5442's measurement raised the ini default to 540 and
-# deliberately left the verify `--timeout=300` alone (that knob lives in yaml,
-# outside a task scoped to "every module pyproject.toml").  So verify now runs
-# TIGHTER than a bare local `pytest`, and this constant -- which names the
-# VERIFY budget, never the ini default -- is the edge that matters for a
-# merge-gating run.  That is exactly why it is a literal rather than derived
-# from PYPROJECT_DEFAULT_TIMEOUT: a mirror would have followed the ini default
-# up to 540 and silently widened the band past what verify actually passes.
+# It names the VERIFY budget, never the ini default.  The two differ -- verify
+# runs tighter than a bare local `pytest` -- and a slow test's marker must
+# clear the one that gates its merge.
 #
-# A LITERAL, NOT AN EXPRESSION, and deliberately NOT `5 *
-# PYPROJECT_DEFAULT_TIMEOUT` despite equalling it today.  What is being named
-# here is the VERIFY CLI BUDGET, whose only real-world source is that
-# `--timeout=300` token; the ini default is the OTHER edge of the band, not a
-# scale factor.  Deriving one edge from the other would let a tightened ini
-# default drag this constant DOWN in silence -- `timeout = 20` would shrink it
-# to 100 while a ratio assertion stayed green as an identity -- collapsing the
-# band toward nothing without a single test going red.  Same hazard, and same
-# resolution, as WHOLE_TREE_SCAN_TEST_TIMEOUT deliberately not borrowing
-# HEAVY_BARRIER_TEST_TIMEOUT.  The literal is instead kept honest by an
-# EXECUTABLE link: test_timeout_marker_inversion_guard.py::
-# TestVerifyCliBudgetConstant re-reads orchestrator/orchestrator.yaml at
-# runtime and fails if the two disagree.  Never-narrow.
+# A LITERAL: marks read it at import, and the guard's _SANCTIONED_TIMEOUT_NAMES
+# and TestSanctionedNameMirrors resolve it only through literal arithmetic.
+# Held to the yaml by
+# test_timeout_marker_inversion_guard.py::TestVerifyCliBudgetConstant, whose
+# docstring records why that pin is deliberately loud on a retune.
 VERIFY_CLI_PER_TEST_TIMEOUT = 300
 
 
@@ -1096,7 +1079,7 @@ _BASEMODEL_PROPS: frozenset[str] = frozenset(
 _BASEMODEL_ATTRS: frozenset[str] = frozenset(dir(BaseModel))
 
 
-def idle_psi_sample() -> PsiSample:
+def idle_psi_sample(*, project_id: str | None = None) -> PsiSample:
     """Return the hermetic default PSI reading: idle and read_ok.
 
     Task 2418 — fix for the scheduler-test xdist flake where the dispatch-
@@ -1123,6 +1106,10 @@ def idle_psi_sample() -> PsiSample:
     scheduler.py) exactly — tests that need a specific (e.g. saturated)
     reading still reassign ``scheduler._read_psi_sample`` post-construction,
     which overrides this default same as before.
+
+    ``project_id`` is accepted and ignored: ``Scheduler.__init__`` binds the
+    module-level reader with its project_id (task 3590), and conftest
+    substitutes this function for that reader BEFORE construction.
     """
     return PsiSample(
         cpu_some10=0.0,
@@ -1131,6 +1118,32 @@ def idle_psi_sample() -> PsiSample:
         io_some10=0.0,
         read_ok=True,
     )
+
+
+class HostDiskUsage(NamedTuple):
+    """The ``(total, used, free)`` shape ``shutil.disk_usage`` returns."""
+
+    total: int
+    used: int
+    free: int
+
+
+_AMPLE_FREE_BYTES = 1024**4
+
+
+def ample_disk_usage(path: str | os.PathLike[str]) -> HostDiskUsage:
+    """Return the hermetic default disk reading: 1 TiB free on any volume.
+
+    Far above every free-space floor a test can reach, starting with the
+    merge-lane pre-verify guard's 10 GiB default
+    (``OrchestratorConfig.merge_verify_min_free_disk_bytes``), so the guards
+    take their healthy-host path whatever disk the host has. It still stats
+    *path*, so a missing path raises ``OSError`` as the real call does.
+    Installed as ``shutil.disk_usage`` by conftest's autouse
+    ``_hermetic_disk_usage``.
+    """
+    os.stat(path)
+    return HostDiskUsage(total=2 * _AMPLE_FREE_BYTES, used=_AMPLE_FREE_BYTES, free=_AMPLE_FREE_BYTES)
 
 
 class HermeticMcpSession:
@@ -2369,8 +2382,8 @@ def mcp_tool_envelope(payload: object) -> dict:
     """The JSON-RPC body ``Scheduler.dispatch_tool`` ACTUALLY returns for a
     successful ``tools/call``, wrapping *payload* — the tool's own return value.
 
-    ``dispatch_tool`` hands back ``McpSession._raw_call``'s parsed response
-    verbatim (``mcp_lifecycle.py::McpSession.call_tool`` returns it unmodified),
+    ``dispatch_tool`` hands back ``shared.mcp_session.McpSession.call``'s parsed response
+    verbatim (``shared/src/shared/mcp_session.py::McpSession.call_tool`` returns it unmodified),
     so a fake that answers with a bare ``{'statuses': …}`` is speaking a shape the
     transport never emits.  That substitution is not a harmless simplification: it
     is what let a one-level envelope unwrapper in

@@ -562,6 +562,9 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
        # dead. This is a SUCCESS, not a failure: do NOT retry (a retry just
        # re-hits the same guard) and do NOT record a task id.
        resolve_issue(..., action='close_only', resolution="Ticket <res['reason']>")   # res["reason"] already reads "refused (no task created): ..."
+   elif res["status"] == "awaiting_curation":
+       # Parked for curation: no task_id yet, NOT a failure. Do NOT re-submit.
+       resolve_issue(..., action='resume', resolution="Queued for curation (ticket <sub['ticket']>)")
    elif res["status"] == "failed":
        # Retryable (`server_restart`, `timeout`): apply
        # _shared/ticket-failure-handling.md's retry policy (retry
@@ -995,7 +998,7 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `dark_factory`/`df`/`dark-factory`, each invisible to a reap scoped to either of the others).
   - **Caveat — check your project's existing rows before trusting the declared token.** Folding
     merges spellings that differ only by case or separator; only an entry in
-    `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
+    `shared.project_id.PROJECT_ID_ALIASES` can bridge a project whose filed decisions fold to something *other*
     than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
     **solar-challenge is the known standing case**: its config declares `my_solar_challenge`, but
     its decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but

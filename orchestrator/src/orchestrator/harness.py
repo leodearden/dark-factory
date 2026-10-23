@@ -21,9 +21,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
+from escalation.categories import EscalationCategory
 from escalation.classify import is_done_step_commit_orphan
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
+from shared.asyncio_tasks import abandon_task
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -33,6 +35,11 @@ from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.eval_lane import eval_lane_provenance
 from shared.mcp_envelope import resolver_failed
+from shared.project_layout import escalation_queue_dir, orchestrator_data_dir, runs_db
+from shared.repo_paths import (
+    rejected_dark_factory_root_override,
+    resolve_dark_factory_root,
+)
 from shared.storm_counter import StormCounter
 from shared.systemd_listeners import take_systemd_listeners
 from shared.task_claimant import (
@@ -50,10 +57,15 @@ from shared.transcript_archive import (
 )
 
 from orchestrator import digest as digest_mod
-from orchestrator import recovery_pins
+from orchestrator import recovery_pins, recut_ruling
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.already_landed_tick_view import (
+    AlreadyLandedTickView,
+    branch_absent_and_unmarked,
+    read_already_landed_tick_view,
+)
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.background_service import (
     DEFAULT_BACKOFF_SECS,
@@ -62,6 +74,8 @@ from orchestrator.background_service import (
     LifecycleRegistry,
     ManagedService,
 )
+from orchestrator.chain_telemetry import ChainTelemetry
+from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
 from orchestrator.config import (
     OrchestratorConfig,
     apply_reload,
@@ -73,36 +87,39 @@ from orchestrator.delivered_checks import (
     gate_mark_done_on_delivered_checks,
 )
 from orchestrator.deploy_state import DeployPhase, DeployState
+from orchestrator.deployed_sha import DeployedSha
 from orchestrator.deterministic_runner import (
     DETERMINISTIC_AGENT_ROLE,
     DeterministicRunner,
     build_milestone_gate_escalation_fields,
 )
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.flake_debt_drain import DRAIN_INTERVAL_SECS, run_drain_pass
+from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps, classify_worktree_entry
-from orchestrator.landed_outbox import MergeProvenance
-from orchestrator.landing_evidence import (
+from orchestrator.lane_lifecycle import LaneRecord
+from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
+from orchestrator.mcp_lifecycle import McpLifecycle
+from orchestrator.merge_deferred_recovery import AbandonedMemberSweep
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
     branch_is_degenerate,
     file_unattributed_landing_escalation,
     is_valid_sha_40,
     validate_landing_evidence,
 )
-from orchestrator.lane_lifecycle import LaneRecord
-from orchestrator.lane_lifecycle import LaneState as DurableLaneState
-from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
-from orchestrator.mcp_lifecycle import McpLifecycle
-from orchestrator.merge_deferred_recovery import AbandonedMemberSweep
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.queue_store import MergeQueueStore, recover_pending_merges
+from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
+from orchestrator.merge_lane.worker import (
     enqueue_merge_request,
     reconcile_landed_outbox,
     reconcile_landed_task,
     select_recovery_winner,
 )
-from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
-from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.module_tagger_prompt import (
     TAGGER_SCHEMA,
@@ -110,6 +127,7 @@ from orchestrator.module_tagger_prompt import (
     build_tagger_prompt,
 )
 from orchestrator.offline_lane import OfflineLaneWorker
+from orchestrator.offline_lane_pass import lane_pass_outcome_hooks
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.proc_supervision import EscalationSpec
@@ -133,10 +151,6 @@ from orchestrator.recovery_emission import (
     veto_signature,
 )
 from orchestrator.recovery_pins import records_pin_recovery
-from orchestrator.repo_paths import (
-    rejected_dark_factory_root_override,
-    resolve_dark_factory_root,
-)
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
@@ -154,6 +168,13 @@ from orchestrator.service_restart import (
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
+from orchestrator.slot_lease import (
+    SlotLease,
+    SuspendedTask,
+    culprit,
+    suspended_slot_tasks,
+    wedged_slot_escalation,
+)
 from orchestrator.strand_conversion import record_strand_conversion
 from orchestrator.stranded_verified_green import (
     DURABLE_MERGE_FAILURE_STATUSES,
@@ -169,12 +190,14 @@ from orchestrator.systemd_inspect import (
     inspect_systemd_unit,
 )
 from orchestrator.task_ground_truth import (
+    ON_MAIN_BRANCH_KINDS,
     BranchStateKind,
     ClaimantSource,
     RecoveryAction,
     TaskGroundTruth,
     leave_reason,
     recovery_shape_str,
+    report_blocked_arm_would_move,
     report_pins_blocked_done_flip,
     report_pins_blocked_recovery,
     report_pins_recovery,
@@ -205,7 +228,7 @@ from orchestrator.zero_progress_requeue import (
 if TYPE_CHECKING:
     from escalation.models import Escalation
 
-    from orchestrator.merge_queue import (
+    from orchestrator.merge_lane.worker import (
         BreakerTrip,
         SpeculativeMergeWorker,
         TrainCallbackFactory,
@@ -227,6 +250,9 @@ except ImportError:
     HAS_STEWARD = False
 
 logger = logging.getLogger(__name__)
+
+# Force-release claimant clears that outlived their bound, kept referenced until they unwind.
+_UNDRAINED_CLAIMANT_CLEARS: set[asyncio.Task] = set()
 
 # Maximum number of same-signature blocked→pending re-pends allowed before the
 # 4th flip is withheld and a born-at-L2 human escalation is filed.  A module
@@ -395,6 +421,10 @@ _WATCHER_TIMEOUT_GRACE_SECS: float = 300.0
 
 # Maximum backoff between unclean watcher exits (seconds).
 _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
+
+# Cap-retry bound for one rotation; past it the supervisor's fresh relaunch and
+# crashloop guard own recovery (mirrors steward.py::_MAX_CAP_RETRIES).
+_WATCHER_MAX_CAP_RETRIES: int = 16
 
 # Fixed quiescent gap after a failed background-loop pass (seconds). Shared by
 # the main-tip sweep and no-landings breaker loops. Guarantees neither loop can
@@ -576,6 +606,8 @@ _WATCHER_DISALLOWED_TOOLS: list[str] = [
     'Bash(git clean:*)',
     'Bash(git merge:*)',
     'Bash(git rebase:*)',
+    # Unscoped on purpose: removes the tool from the CLI registry, so no skill loads; SKILL.md invokes none.
+    'Skill',
 ]
 
 
@@ -1025,7 +1057,7 @@ def _acquire_project_lock(project_root: Path) -> IO:
     (closing or GC releases the lock).  Raises ``SystemExit(1)`` if
     another orchestrator instance already holds the lock.
     """
-    lock_path = project_root / 'data' / 'orchestrator' / 'orchestrator.lock'
+    lock_path = orchestrator_data_dir(project_root) / 'orchestrator.lock'
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     lock_file = open(lock_path, 'w')  # noqa: SIM115
@@ -1551,62 +1583,6 @@ def build_train_callback_factory(
 _TRAIN_MEMBER_READY_STATUS: str = 'merge-deferred'
 
 
-class _OfflineLaneTaskClient:
-    """Concrete ``offline_lane.OfflineLaneTaskClient`` adapter over the scheduler.
-
-    Structurally satisfies the ``OfflineLaneTaskClient`` Protocol
-    (``offline_lane.py``) so ``OfflineLaneWorker`` never talks to the
-    fused-memory MCP directly (task 2016, closing Bug #1) — mirrors that
-    module's ``SuiteRunner``/cross-project scope boundary. Delegates
-    entirely to existing, tested ``Scheduler`` helpers; no new MCP plumbing.
-    Module-level (not nested in ``Harness``) so it stays trivially
-    constructible in isolation, e.g. ``_OfflineLaneTaskClient(scheduler)``.
-    """
-
-    def __init__(self, scheduler: Scheduler) -> None:
-        self._scheduler = scheduler
-
-    async def submit_fix_task(self, arguments: dict) -> str:
-        """Submit a new fix task and return its id.
-
-        Reuses ``Harness._extract_task_id`` to normalise the task_id out of
-        the MCP ``tools/call`` response envelope, whatever shape it arrives
-        in (``{'task_id': ...}``, ``structuredContent``, or a ``content``
-        text block).
-        """
-        result = await self._scheduler.dispatch_tool('submit_task', arguments, timeout=30)
-        return Harness._extract_task_id(result) or ''
-
-    async def append_suspect_range(self, task_id: str, suspect_range: str) -> None:
-        """Append a suspect commit range to an already-open fix task.
-
-        Uses ``metadata_mode='additive'`` — a recursive list-union performed
-        server-side — so the range is appended (and dedup'd) atomically with
-        no read-modify-write round-trip.
-        """
-        await self._scheduler.update_task(
-            task_id, {'suspect_ranges': [suspect_range]}, metadata_mode='additive',
-        )
-
-    async def get_status(self, task_id: str) -> str:
-        """Return a previously filed fix task's current status.
-
-        Logs (rather than silently swallows) a non-``None`` error half from
-        ``get_statuses`` — e.g. a transient MCP outage — so it stays
-        observable; the caller (``_maybe_promote_blocker``) still degrades
-        to treating the empty status as "not done, not terminal" either way
-        (task 2016 amendment).
-        """
-        statuses, err = await self._scheduler.get_statuses([task_id])
-        if err is not None:
-            logger.warning(
-                'offline-lane: get_statuses failed for task %s: %s — '
-                'treating status as unknown this check',
-                task_id, err,
-            )
-        return statuses.get(task_id, '')
-
-
 def _extract_tagger_entries(payload: Any) -> list:
     """Peel known StructuredOutput wrapper keys and return the entries list.
 
@@ -1678,8 +1654,13 @@ def _repend_while_paused_note(task_id: str, pause_reason: str) -> str:
 class Harness:
     """Top-level orchestration loop."""
 
-    def __init__(self, config: OrchestratorConfig):
+    def __init__(
+        self, config: OrchestratorConfig, *, deployed_sha: DeployedSha | None = None,
+    ):
         self.config = config
+        # Task 6565: the commit this process's wire path was imported from,
+        # captured by cli.py::run around the import of this module.
+        self._deployed_sha = deployed_sha
         from orchestrator.agents.sandbox_dispatch import set_backend
         set_backend(config.sandbox.backend)
         self.mcp = McpLifecycle(config)
@@ -1733,6 +1714,9 @@ class Harness:
         #     bound method is late-bound — valid to reference here even though
         #     the Counter itself is created AFTER this Scheduler build, because
         #     it resolves the Counter at CALL time, not at reference time.
+        #   - read_already_landed_tick_view (task 4900): one local-branch
+        #     snapshot per already-landed consult, read through the bound
+        #     method so a test-replaced self.git_ops is honoured.
         self.scheduler = Scheduler(
             config,
             callbacks=SchedulerCallbacks(
@@ -1746,6 +1730,7 @@ class Harness:
                 on_warm_base_promote_l2=self._promote_warm_base_hard_down_l2,
                 on_warm_base_resolve=self._resolve_warm_base_hard_down,
                 suppress_blocked_write=self._is_action_teardown_task,
+                read_already_landed_tick_view=self._read_already_landed_tick_view,
             ),
             override_store=OverrideStore.from_config(config),
             park_eviction_store=ParkEvictionRequestStore.from_config(config),
@@ -2019,6 +2004,13 @@ class Harness:
         # See task 1491, ITEM 2 (hard-cancel fallback).
         self._workflow_slot_tasks: dict[str, asyncio.Task] = {}
 
+        # Per-task SlotLease (task 6660): the live slot's one-shot release of its
+        # module locks and semaphore permit.  Registered at _run_slot start and
+        # dropped at its exit, or by _force_release_wedged_slot.  Which slot
+        # owns a task id's registrations is decided by this entry's identity.
+        self._slot_leases: dict[str, SlotLease] = {}
+        self._force_released_slots: set[asyncio.Task] = set()
+
         # Per-task cancel CAUSE, stamped by hard_cancel_workflow immediately
         # before task.cancel() and consumed once by _run_slot's
         # `except asyncio.CancelledError` handler (task 3172).  This is the
@@ -2122,7 +2114,9 @@ class Harness:
         # Pure detection logic lives in merge_queue.NoLandingsCircuitBreaker;
         # I/O wiring (disk-stat, halt/resume, escalation file/resolve) lives
         # here, in a periodic loop mirroring the main-tip-sweep lifecycle.
-        from orchestrator.merge_queue import NoLandingsCircuitBreaker as _NLCB  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
+            NoLandingsCircuitBreaker as _NLCB,
+        )
         self._no_landings_breaker: _NLCB = _NLCB(
             window_samples=config.no_landings_breaker_window_samples,
             disk_free_floor_bytes=config.no_landings_breaker_disk_free_floor_bytes,
@@ -2147,7 +2141,7 @@ class Harness:
         self._merge_queue: asyncio.Queue = asyncio.Queue()
         # Single shared registry injected into both the escalation server and
         # every TaskWorkflow so the MCP coalesce gate sees workflow-path merges.
-        from orchestrator.merge_queue import InFlightMergeRegistry
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry
         self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
@@ -2164,10 +2158,10 @@ class Harness:
             emit=self._emit_fleet_drain,
         )
         # Durable journal for in-flight merge requests (task 1772).
-        # Persisted at data/orchestrator/merge_queue.json; recovered on restart
-        # by _recover_pending_merges (called from run() after _rehydrate_merge_halt).
+        # Recovered on restart by _recover_pending_merges (called from run()
+        # after _rehydrate_merge_halt).
         self._merge_store: MergeQueueStore = MergeQueueStore(
-            config.project_root / 'data' / 'orchestrator' / 'merge_queue.json'
+            orchestrator_data_dir(config.project_root) / 'merge_queue.json'
         )
 
         # Post-merge staleness hook — restart services when a landed diff
@@ -2346,15 +2340,15 @@ class Harness:
         terminal-status-watcher, watcher-supervisor, stranded-reconcile,
         main-tip-sweep, no-landings-breaker, deterministic-recon-sweep,
         warm-lane-gc, stale-service-restart, merge-heartbeat,
-        verify-admission-watch.
+        verify-admission-watch, flake-debt-drain.
         escalation-server and merge-worker start first so the recovery block
         (which runs immediately after ``start_all()`` returns) can depend on
         both being live. The seven sweeps are conditionally registered on
         their own ``config.X_enabled`` gate — ``BackgroundService`` itself has
         no ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
-        absent from the registry. The last three always run: they must keep
+        absent from the registry. The last four always run: they must keep
         their cadence whatever the dispatch loop is doing (task 5344; the
-        verify-admission watch, task 5628).
+        verify-admission watch, task 5628; the flake-debt drain, task 6934).
         """
         if self._lifecycle is not None:
             return
@@ -2472,7 +2466,35 @@ class Harness:
             stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
             max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
         ))
+        drain_client = SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root)
+        registry.register(BackgroundService(
+            name='flake-debt-drain',
+            pass_fn=functools.partial(self._run_flake_debt_drain_pass, drain_client),
+            interval_secs=DRAIN_INTERVAL_SECS,
+            backoff=sweep_backoff,
+            stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+            max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+        ))
         self._lifecycle = registry
+
+    async def _run_flake_debt_drain_pass(
+        self, task_client: SchedulerChronicFlakeTaskClient,
+    ) -> None:
+        """One pass of the flake-debt drain (task 6934).
+
+        ``self._escalation_queue`` and ``self.git_ops`` are read when the pass
+        RUNS, not when the registry is built: the registry is built before
+        ``_start_escalation_server`` creates the queue, so a queue captured at
+        registration would stay ``None`` for the drain's whole life.
+        """
+        await run_drain_pass(
+            ledger_db_path(Path(self.config.project_root)),
+            self.config.fused_memory.project_id,
+            task_client=task_client,
+            git=self.git_ops,
+            escalation_queue=self._escalation_queue,
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
 
     async def _run_verify_admission_watch_pass(self) -> None:
         """One tick of the task-verify admission watch on this process's gate.
@@ -2530,6 +2552,7 @@ class Harness:
         try:
             await self._abandoned_member_sweep.run_pass(
                 lane=self._merge_worker,
+                requests=self._merge_inflight_registry,
                 tasks=self.scheduler,
                 escalations=self._escalation_queue,
                 claimant_ttl=timedelta(seconds=self.config.claimant_liveness_ttl_secs),
@@ -2611,12 +2634,13 @@ class Harness:
 
         run_id = f'run-{uuid.uuid4().hex[:12]}'
         self._run_id = run_id
-        db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
+        db_path = runs_db(self.config.project_root)
         try:
             self.event_store = EventStore(db_path, run_id)
             self.scheduler.event_store = self.event_store
         except Exception:
             logger.warning('Failed to create event store', exc_info=True)
+        self._announce_deployed_sha()
 
         # 0a. Create run store and register this run immediately so
         # task_results can be written incrementally as tasks complete.
@@ -2627,6 +2651,7 @@ class Harness:
                 self.config.fused_memory.project_id,
                 self.report.started_at,
                 str(prd_path) if prd_path else '',
+                code_sha=None if self._deployed_sha is None else self._deployed_sha.sha,
             )
         except Exception:
             # Non-fatal, but loud: swallowing this at warning level understated
@@ -3069,36 +3094,7 @@ class Harness:
                     continue
 
                 await sem.acquire()
-                self._task_modules[assignment.task_id] = list(assignment.modules)
-                # Register escalation wake-event BEFORE create_task so Fix #1a
-                # (_on_escalation_resolved orphan-flip gate) sees task_id in
-                # _escalation_events immediately — closing the sub-second race
-                # where a resolving escalation would mis-classify a just-
-                # dispatched task as an orphan and double-flip it.
-                self._register_escalation_event(assignment.task_id)
-                task = asyncio.create_task(
-                    self._run_slot(assignment, sem),
-                    name=f'workflow-{assignment.task_id}',
-                )
-                self._live_tasks.add(task)
-                task.add_done_callback(
-                    functools.partial(self._collect_slot_report, task_reports)
-                )
-                # Guard against the narrow resource-leak window where the slot
-                # task is cancelled before _run_slot's body begins executing
-                # (e.g. hard_cancel_workflow or shutdown sweeping pending tasks
-                # before the event loop schedules the coroutine's first step).
-                # In that case _run_slot's finally block never runs and
-                # _escalation_events[task_id] would leak — permanently
-                # satisfying the active-workflow gate and suppressing both the
-                # stranded_blocked re-file and Fix #1a orphan-flip for that
-                # task forever.  The done_callback fires unconditionally when
-                # the Task reaches any terminal state; pop() is idempotent (a
-                # no-op if _run_slot's finally already removed the entry).
-                _tid = assignment.task_id
-                task.add_done_callback(
-                    lambda _t, tid=_tid: self._escalation_events.pop(tid, None)
-                )
+                self._launch_slot(assignment, sem, task_reports)
 
             self._compute_tallies(task_reports)
 
@@ -3484,9 +3480,8 @@ class Harness:
         name`` (the new ``.task-meta`` sibling location, W11 beta), falling
         back to the legacy ``entry / '.task' / name`` when the new path is
         absent.  Mirrors ``TaskArtifacts._read_path``'s new-then-old
-        contract and ``GitOps._find_lane_by_plan_task_id``'s plan.json scan,
-        for the ``_recover_crashed_tasks`` reads that don't go through a
-        ``TaskArtifacts`` instance.
+        contract, for the ``_recover_crashed_tasks`` reads that don't go
+        through a ``TaskArtifacts`` instance.
         """
         new_path = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, entry.name) / name
         if new_path.exists():
@@ -5874,7 +5869,7 @@ class Harness:
             )
             return True
 
-        from orchestrator.merge_types import QueuedBranch  # noqa: PLC0415
+        from orchestrator.merge_lane.types import QueuedBranch
 
         # Build + enqueue + stamp the durable race-guard marker (PRD leaf α §7)
         # via the shared submit primitive — the architect-desync exit (task
@@ -6030,7 +6025,7 @@ class Harness:
         propagated (mirrors ``enqueue_merge_request._on_finalized``).
         """
         try:
-            from orchestrator.merge_types import MergeOutcome  # noqa: PLC0415
+            from orchestrator.merge_lane.types import MergeOutcome
 
             if fut.cancelled():
                 return  # abandoned/superseded — transient, no-op
@@ -6167,7 +6162,7 @@ class Harness:
         infra-held guard, which share this same degeneracy signal.
 
         The predicate itself now lives in
-        :func:`orchestrator.landing_evidence.branch_is_degenerate` (task 3103)
+        :func:`orchestrator.merge_lane.landing_evidence.branch_is_degenerate` (task 3103)
         so the escalation server's merge_status Tier-3.5 and merge_request
         fast-path guard this class with the SAME implementation rather than a
         divergent copy.  See that function for the full fail-open contract
@@ -6286,18 +6281,22 @@ class Harness:
         # question and share `report_pins_blocked_recovery` /
         # `records_pin_blocked_recovery`.
         #
-        # The two predicates carry the SAME merge-remediable relaxation and
-        # differ on exactly one input class — a dead-filer L0.  Recovery may
-        # proceed past one: its handoff has no consumer left, and conversion or
-        # a re-file is recoverable.  A DONE-FLIP may not: it is terminal, so
-        # completing a task past an unconsumed handoff is the phantom-done D4
-        # had just closed at the dispatch gate, and PRD D3 / spec §6 demand 3
-        # say so directly ("any non-info open record still vetoes MARK_DONE").
-        # The dead L0 is not stranded forever either — part 4 of this task, the
-        # orphan-L0 reaper, promotes it to L1 and gives it an owner.
+        # The two predicates differ on exactly two input classes.  A dead-filer
+        # L0: recovery may proceed past one — its handoff has no consumer left,
+        # and conversion or a re-file is recoverable — but a DONE-FLIP may not.
+        # It is terminal, so completing a task past an unconsumed handoff is the
+        # phantom-done D4 had just closed at the dispatch gate, and PRD D3 /
+        # spec §6 demand 3 say so directly ("any non-info open record still
+        # vetoes MARK_DONE").  The dead L0 is not stranded forever either — part
+        # 4 of this task, the orphan-L0 reaper, promotes it to L1 and gives it
+        # an owner.  And a `preexisting_main_break` pin (task 4645): this clause
+        # ALONE relaxes the wider `recovery_pins.ON_MAIN_REMEDIABLE_ESC_CATEGORIES`,
+        # because it only fires with the branch ON MAIN, where that escalation's
+        # ask (a fixed main so the branch can merge) is already satisfied.  The
+        # off-main clause below keeps the shared set — there the ask is unmet.
         #
-        # The relaxation itself is unchanged and is why this clause exists at
-        # all (PRD leaf δ): a task whose branch landed while it was still
+        # The relaxation itself is why this clause exists at all (PRD leaf δ):
+        # a task whose branch landed while it was still
         # blocked is usually held by the reaper's OWN stranded_blocked — the
         # record that ASKED for this landing — and letting it veto the
         # self-heal pins the task blocked forever after its work is on main.
@@ -6308,9 +6307,7 @@ class Harness:
             and status == 'blocked'
             and report.live_claimant is None
             and not report_pins_blocked_done_flip(report)
-            and report.branch_state.kind in (
-                BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER,
-            )
+            and report.branch_state.kind in ON_MAIN_BRANCH_KINDS
         ):
             action = RecoveryAction.MARK_DONE_WITH_PROVENANCE
 
@@ -6397,8 +6394,13 @@ class Harness:
         # exist to avoid, arrived at by a route no one reviewed.
         #
         # This clause therefore asks the blocked arm's OWN question — "would
-        # those clauses move this row next sweep?" — by calling the SAME
-        # predicate they call (task 3541).  Before eta it asked with
+        # those clauses move this row next sweep?" — through
+        # `report_blocked_arm_would_move`, which composes the SAME two
+        # predicates the clauses call (task 3541) and so follows them when they
+        # diverge: the ON_MAIN clause relaxes `preexisting_main_break` (task
+        # 4645) while the recovery predicate still pins it, and an in-progress
+        # on-main row pinned only by that record is held here rather than
+        # converted and then auto-done next sweep.  Before eta it asked with
         # `_only_merge_remediable`, which WAS that predicate at the time;
         # keeping the old spelling once the arm moved on would let the two
         # drift, which is precisely how this hazard reopens.
@@ -6421,7 +6423,7 @@ class Harness:
         # holds is not in it.
         if (
             action == RecoveryAction.CONVERT_TO_BLOCKED
-            and not report_pins_blocked_recovery(report)
+            and report_blocked_arm_would_move(report)
         ):
             # Says what the clause ACTUALLY asked.  It used to name the records
             # "merge-remediable", which was exact while the question WAS
@@ -7388,21 +7390,6 @@ class Harness:
     # task for this condition, matched via get_by_task + this exact role.
     _CASCADE_REJECTION_ROLE: str = 'harness-cascade'
 
-    # Category for the same records.  A NAMED CONSTANT rather than a literal at
-    # the filing site because escalation categories are prose, not a checked
-    # contract: nothing rejects a typo'd category at submit time, and every
-    # categorized reader (auto-watcher triage, category-filtered queue scans)
-    # depends on filer and reader spelling it identically — so the one spelling
-    # this file owns lives in exactly one place.
-    #
-    # escalation/src/escalation/models.py carries a standing REFACTOR TRIGGER
-    # (task 3709) saying the NEXT category addition promotes that prose
-    # vocabulary to an enum or a submit-time lint.  This IS that addition, but
-    # models.py is outside task 3538's locked module scope, so the promotion is
-    # filed as follow-up work instead of done here; this constant is the
-    # interim single source of truth for the spelling.
-    _CASCADE_REJECTION_CATEGORY: str = 'cascade_status_rejection'
-
     def _escalate_cascade_status_rejection(
         self,
         task_id: str,
@@ -7479,7 +7466,7 @@ class Harness:
                 agent_role=self._CASCADE_REJECTION_ROLE,
                 severity='blocking',
                 level=1,
-                category=self._CASCADE_REJECTION_CATEGORY,
+                category=EscalationCategory.CASCADE_STATUS_REJECTION,
                 summary=(
                     f'Cascade resume failed to set task {task_id} to '
                     f'{target_status!r}'
@@ -7536,7 +7523,7 @@ class Harness:
     # so the orphan-L0 reaper (L0-only), _on_escalation (no registered event),
     # and reconcile (no such task) all leave it alone.
     _SCHEDULER_PAUSE_SENTINEL: str = '__scheduler__'
-    _SCHEDULER_PAUSE_CATEGORY: str = 'scheduler_paused'
+    _SCHEDULER_PAUSE_CATEGORY: str = EscalationCategory.SCHEDULER_PAUSED
 
     # Synthetic task_id for the no-landings circuit-breaker INFO escalation.
     # Deduped to one open at a time (via get_by_task + agent_role filter).
@@ -9455,6 +9442,103 @@ class Harness:
             task_id,
         )
 
+    async def _run_recut_ruling_gate(self, assignment) -> recut_ruling.RecutGateResult:
+        """Execute or refuse a task's re-cut ruling before dispatch (task 3154).
+
+        Fails closed: an exception is a refusal. A refusal blocks the task and
+        files one design_concern L1.
+        """
+        task_id = assignment.task_id
+        try:
+            result = await recut_ruling.enforce_recut_ruling(
+                assignment.task,
+                ops=self.git_ops,
+                persist=functools.partial(self.scheduler.update_task, task_id),
+                now=datetime.now(UTC),
+            )
+        except Exception as exc:
+            logger.warning(
+                'recut_ruling: gate raised for task %s: %s', task_id, exc, exc_info=True,
+            )
+            result = recut_ruling.RecutGateResult(
+                recut_ruling.GateVerdict.REFUSED, reason=f'the re-cut gate raised: {exc}',
+            )
+        logger.info(
+            'recut_ruling: task %s verdict=%s reason=%r',
+            task_id, result.verdict.value, result.reason,
+        )
+        if result.executed:
+            self._log_recut_executed(task_id, result)
+        elif result.refused:
+            ruling_id = result.ruling.ruling_id if result.ruling else 'unreadable'
+            await self._block_and_file_dispatch_gate_l1(
+                task_id,
+                category='design_concern',
+                summary=f'RECUT_RULING_REFUSED: task {task_id} ruling {ruling_id} cannot be honoured',
+                detail=(
+                    f'{result.reason}\n'
+                    'Remedy: if metadata.recut_ruling is malformed, correct it to '
+                    '{"ruling_id": <str>, "ruled_at": <ISO-8601>}; otherwise resolve the '
+                    'cause above and unblock the task. A re-dispatch is safe: nothing '
+                    'fresh is cut until the execution record is durable.'
+                ),
+            )
+        return result
+
+    @staticmethod
+    def _log_recut_executed(task_id: str, result: recut_ruling.RecutGateResult) -> None:
+        parked = result.parked
+        logger.warning(
+            'RECUT: task %s ruling %s executed — parked %s @ %s; dispatching fresh off main',
+            task_id,
+            result.ruling.ruling_id if result.ruling else '?',
+            parked.parked_branch if parked and parked.parked_branch else 'nothing',
+            parked.parked_tip if parked and parked.parked_tip else '-',
+        )
+
+    async def _block_and_file_dispatch_gate_l1(
+        self, task_id: str, *, category: str, summary: str, detail: str,
+    ) -> None:
+        """Block *task_id* and file one category-scoped L1 for a dispatch gate."""
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+        except Exception:
+            logger.warning(
+                'Dispatch-gate block for task %s — set_task_status raised; '
+                'will still attempt to file escalation',
+                task_id, exc_info=True,
+            )
+        if not self._escalation_queue:
+            logger.warning(
+                'Dispatch-gate block for task %s — no escalation queue, skipping L1 file',
+                task_id,
+            )
+            return
+        if self._escalation_queue.has_open_l1(task_id, category=category):
+            logger.warning(
+                'Dispatch-gate block for task %s — open %s L1 already exists, '
+                'suppressing duplicate',
+                task_id, category,
+            )
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-scheduler',
+            severity='blocking',
+            category=category,
+            summary=summary[:200],
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
+        self._escalation_queue.submit(esc)
+        logger.warning('Filed L1 %s escalation %s for task %s', category, esc.id, task_id)
+
     async def _run_cross_repo_gate(self, assignment) -> bool:
         """Run the dispatch-time cross-repo admission gate (task 3121).
 
@@ -10001,6 +10085,8 @@ class Harness:
         # preventing the rapid re-block loop where reconciliation immediately
         # re-dispatches the task before it can make progress.
         arm_requeue_cooldown = False
+        lease = SlotLease(assignment.task_id, self.scheduler, sem)
+        self._slot_lease_registry()[assignment.task_id] = lease
         try:
             logger.info(
                 f'Starting workflow for task {assignment.task_id}: '
@@ -10052,6 +10138,22 @@ class Harness:
             )
             # Drop any preserved-worktree marker once the slot picks the task up.
             self._preserved_worktrees.discard(assignment.task_id)
+
+            # ── Re-cut ruling gate (task 3154) ───────────────────────────────
+            # Runs before the session-resume guard so a pre-ruling plan or
+            # session is never resumed. See orchestrator/recut_ruling.py.
+            if recut_ruling.carries_recut_ruling(assignment.task):
+                recut = await self._run_recut_ruling_gate(assignment)
+                if recut.refused:
+                    arm_requeue_cooldown = True
+                    return TaskReport(
+                        task_id=assignment.task_id,
+                        title=assignment.task.get('title', ''),
+                        outcome=WorkflowOutcome.BLOCKED,
+                        block_reason='recut_ruling_refused',
+                    )
+                if recut.executed:
+                    recovered_plan = recovered_session = recovered_config_dir = None
 
             # ── γ session-resume eligibility guard (task 2774) ────────────────
             # A recovered session is injected as --resume below ONLY when it is
@@ -10643,7 +10745,14 @@ class Harness:
                 # Ladder: stamped cause → drain → honest residue.  Never a
                 # guess that an unattributed cancel "must have been" a drain.
                 block_reason=(
-                    self._cancel_causes().pop(assignment.task_id, None)
+                    (
+                        self._cancel_causes().pop(assignment.task_id, None)
+                        if self._owns_slot(assignment.task_id, lease)
+                        # Force-released (task 6660): only the watcher's
+                        # hard-cancel leads there, and the cause registry may
+                        # hold a re-dispatch's entry by now.
+                        else 'terminal_status_cancel'
+                    )
                     or ('shutdown_drain' if getattr(self, '_draining', False)
                         else 'cancelled_unattributed')
                 ),
@@ -10704,31 +10813,13 @@ class Harness:
                 outcome=WorkflowOutcome.BLOCKED,
             )
         finally:
-            self._escalation_events.pop(assignment.task_id, None)
-            self._workflow_cancel_events.pop(assignment.task_id, None)
-            # NB: deliberately do NOT pop _workflow_cancel_at here.  Popping it
-            # in the finally defeated the R3 reconcile grace window — it only
-            # ever overlapped the period the live slot already protected (via
-            # dispatch-table membership), leaving the brief post-exit window
-            # uncovered.  The stamp is instead cleared at (re)dispatch (top of
-            # _run_slot) and lazily pruned by the sweep's grace-check reader.
-            self._workflow_slot_tasks.pop(assignment.task_id, None)
-            # Defensive merge-phase grace clear (task 2753): mirrors the
-            # inline clear at the durable-enqueue boundary in
-            # _submit_to_merge_queue, covering abnormal slot exits (e.g.
-            # WorkflowCancelled raised before that inline clear). Unlike
-            # _workflow_cancel_at above, clearing here is CORRECT: once the
-            # slot exits there is no more pre-enqueue verify to protect — the
-            # workflow either enqueued (and cleared inline) or died — so
-            # releasing the grace immediately is exactly right (the monotonic
-            # stamp would auto-expire regardless; this just does it promptly).
-            self.scheduler.clear_merge_phase(assignment.task_id)
-            self._terminal_cancel_counts.pop(assignment.task_id, None)
-            # Belt-and-braces (task 3172): the ladder above consumes the cause
-            # on the cancel path; this covers every OTHER slot exit so a
-            # stamped-but-unconsumed entry can never leak into a later
-            # re-dispatch of the same task.
-            self._cancel_causes().pop(assignment.task_id, None)
+            # Task 6660: a slot the terminal-status watcher force-released has
+            # already lost its registrations, its claimant and its locks, and a
+            # fresh dispatch of the same id may own all of them now.  Only the
+            # slot whose lease is still the registered one acts on the task.
+            owns_slot = self._owns_slot(assignment.task_id, lease)
+            if owns_slot:
+                self._unregister_slot(assignment.task_id)
             # W9-θ: the former B2 belt-and-suspenders release (any DONE/CANCELLED
             # that missed B1, e.g. authoritative-cancel returning normally from
             # workflow.run()) is retired.  The workflow's own kind-aware
@@ -10740,7 +10831,7 @@ class Harness:
             # above) never ran on_terminal either; that is intentional — see the
             # comment there — the periodic terminal-lane reconciler reclaims it.
             requeued = report is not None and report.outcome == WorkflowOutcome.REQUEUED
-            if report is not None:
+            if report is not None and owns_slot:
                 requeued = await self._apply_retry_cap(
                     assignment.task_id, report, requeued,
                 )
@@ -10776,15 +10867,15 @@ class Harness:
             # tool/param, absent column, or transient error here can never
             # block scheduler.release/sem.release below. plan.lock forensics
             # are left untouched.
-            with contextlib.suppress(Exception):
-                await self.scheduler.set_task_claimant(
-                    assignment.task_id, claimant_run_id=None, heartbeat_at=None,
-                )
+            if owns_slot:
+                with contextlib.suppress(Exception):
+                    await self.scheduler.set_task_claimant(
+                        assignment.task_id, claimant_run_id=None, heartbeat_at=None,
+                    )
             # arm_requeue_cooldown=True (any unhandled workflow-slot exception) arms
             # the existing requeue_cooldown_secs grace window so a freshly-unblocked
             # task is not immediately re-dispatched and re-blocked in a tight loop.
-            self.scheduler.release(assignment.task_id, requeued=requeued or arm_requeue_cooldown)
-            sem.release()
+            lease.release(requeued=requeued or arm_requeue_cooldown)
 
     async def _run_deterministic_slot(self, assignment) -> TaskReport:
         """Run a deterministic gate task via DeterministicRunner.
@@ -11376,34 +11467,6 @@ class Harness:
             )
             await self.pause_scheduler('cost_ceiling_orch_exceeded')
 
-    @staticmethod
-    def _extract_task_id(submit_result: Any) -> str | None:
-        """Pull the task_id out of an MCP tools/call response wrapper.
-
-        ``dispatch_tool`` returns the raw MCP result envelope. The shape may
-        be ``{'task_id': ...}``, ``{'content': [{'text': '{...}'}], ...}``,
-        or ``{'structuredContent': {...}}`` depending on transport. Normalise.
-        """
-        if not isinstance(submit_result, dict):
-            return None
-        if submit_result.get('task_id'):
-            return str(submit_result['task_id'])
-        for key in ('structuredContent', 'result'):
-            inner = submit_result.get(key)
-            if isinstance(inner, dict) and inner.get('task_id'):
-                return str(inner['task_id'])
-        content = submit_result.get('content')
-        if isinstance(content, list):
-            for chunk in content:
-                if isinstance(chunk, dict) and chunk.get('type') == 'text':
-                    try:
-                        parsed = json.loads(str(chunk.get('text') or ''))
-                    except (TypeError, ValueError):
-                        continue
-                    if isinstance(parsed, dict) and parsed.get('task_id'):
-                        return str(parsed['task_id'])
-        return None
-
     async def _apply_retry_cap(
         self, task_id: str, report: TaskReport, requeued: bool,
     ) -> bool:
@@ -11912,6 +11975,13 @@ class Harness:
         its cleanup) has no report.
         """
         self._live_tasks.discard(t)
+        if t in self._force_released_slot_tasks():
+            self._force_released_slot_tasks().discard(t)
+            logger.warning(
+                '%s ended after its slot was force-released; its report is not recorded',
+                t.get_name(),
+            )
+            return
         if t.cancelled():
             logger.warning(
                 '%s was cancelled without returning a report', t.get_name(),
@@ -12151,7 +12221,7 @@ class Harness:
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
         )
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # K = 1 (local trust-anchor) + number of enabled remote verify runners.
         # Sizes the liveness guard (merge_ahead_bound + num_hosts), the
@@ -12233,6 +12303,8 @@ class Harness:
             usage_gate=getattr(self, 'usage_gate', None),
             cost_store=getattr(self, 'cost_store', None),
             provenance_conflict_sink=self._provenance_conflict_sink,
+            deployed_sha=self._deployed_sha,
+            verify_hosts=[r.name for r in self.config.verify_runners],
         )
 
         # task 2828 (limb 1) — STARTUP SURVIVOR BARRIER.  Reap any orphaned
@@ -12342,7 +12414,7 @@ class Harness:
     ) -> None:
         """Advisory pipeline-landing tripwire adapter (task 2382, merge-skew δ).
 
-        Thin fail-open wiring over ``orchestrator.merge_skew_tripwire
+        Thin fail-open wiring over ``orchestrator.merge_lane.skew_tripwire
         .emit_pipeline_landing_tripwire``: reads the per-project
         ``config.git.load_bearing_oracle_cmd`` knob (``None`` disables the
         tripwire — logged no-op), enumerates in-flight tasks (excluding the
@@ -12466,13 +12538,14 @@ class Harness:
         if self._offline_lane_task is not None and not self._offline_lane_task.done():
             return
 
-        lock_path = self.config.project_root / 'data' / 'orchestrator' / 'offline_lane.lock'
+        lock_path = orchestrator_data_dir(self.config.project_root) / 'offline_lane.lock'
         worker = OfflineLaneWorker(
             self.git_ops,
             self.config,
             lock_path=lock_path,
-            task_client=_OfflineLaneTaskClient(self.scheduler),
+            task_client=SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root),
             escalation_queue=self._escalation_queue,
+            pass_outcome_hooks=lane_pass_outcome_hooks(self.config, self._escalation_queue),
         )
         if not worker.acquire_lock():
             logger.warning(
@@ -12867,12 +12940,38 @@ class Harness:
                 ts_epoch=time.time(),
                 drain=reading.drain,
                 verifies_in_flight=reading.verifies_in_flight,
+                deployed_sha=(
+                    None if self._deployed_sha is None else self._deployed_sha.to_wire()
+                ),
             )
             await asyncio.to_thread(write_heartbeat, resolve_fleet_dir(), unit, payload)
         except Exception:
             logger.warning(
                 'merge heartbeat write failed; continuing (fail-open)',
                 exc_info=True,
+            )
+
+    def _announce_deployed_sha(self) -> None:
+        """Log the deployed sha; warn and emit an event when it is flagged (6565 D1).
+
+        A flagged sha keeps the remote gate in use (Leo, 2026-10-20): the flags
+        are made visible here, in the fleet heartbeat and in ``--report``.
+        """
+        deployed = self._deployed_sha
+        if deployed is None:
+            logger.info('deployed sha: unknown (no readable code checkout)')
+            return
+        if not deployed.flagged:
+            logger.info('deployed sha: %s', deployed.sha)
+            return
+        logger.warning(
+            'deployed sha %s is flagged (indeterminate=%s, dirty_wire_path=%s): the '
+            'loaded code may differ from it; restart from a clean, still tree to clear',
+            deployed.sha, deployed.indeterminate, deployed.dirty_wire_path,
+        )
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.deployed_sha_indeterminate, data=deployed.to_wire(),
             )
 
     def _emit_fleet_drain(self, event: FleetDrainEvent) -> None:
@@ -12954,9 +13053,7 @@ class Harness:
             return
         assert HAS_ESCALATION  # narrows type: EscalationQueue and create_server are defined
 
-        queue_dir = Path(self.config.escalation.queue_dir)
-        if not queue_dir.is_absolute():
-            queue_dir = self.config.project_root / queue_dir
+        queue_dir = escalation_queue_dir(self.config.project_root)
         self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-unbound]
         self._escalation_queue.set_notify_callback(self._on_escalation)
         self._escalation_queue.set_resolve_callback(self._on_escalation_resolved)
@@ -13515,7 +13612,16 @@ class Harness:
             delivered_checks_enabled=self.config.delivered_checks.enabled,
         )
 
-    async def _already_landed_dispatch_gate(self, task_id: str) -> bool:
+    async def _read_already_landed_tick_view(self) -> AlreadyLandedTickView:
+        return await read_already_landed_tick_view(self.git_ops)
+
+    async def _already_landed_dispatch_gate(
+        self,
+        task_id: str,
+        *,
+        task: dict | None = None,
+        tick_view: AlreadyLandedTickView | None = None,
+    ) -> bool:
         """Pre-dispatch gate for OUT-OF-BAND already-landed tasks (task 2313).
 
         Architecturally parallel to :meth:`_landed_dispatch_gate` but
@@ -13614,7 +13720,7 @@ class Harness:
         ancestors of main (squashed/rebased/manually-applied) by comparing
         the branch's actual changed files against main
         (:meth:`~orchestrator.git_ops.GitOps.branch_content_in_main`).  It
-        delegates to :func:`~orchestrator.landing_evidence.validate_landing_evidence`
+        delegates to :func:`~orchestrator.merge_lane.landing_evidence.validate_landing_evidence`
         (DISCOVERY mode, task 2678) to discover and attribute the citation
         commit and anchors on it; a content-equivalent landing that carries
         no task-citing commit (or whose citation's effect is no longer
@@ -13695,9 +13801,25 @@ class Harness:
         any-level escalation pin, the degenerate-branch check, and each
         arm's ``validate_landing_evidence`` verdict), so a landing that is
         being refused anyway never pays for check work.
+
+        **Per-tick inputs** (task 4900): ``task`` is the scheduler's candidate
+        dict, so the gate re-reads it via ``scheduler.get_task`` only when it
+        is absent. That dict is tick-start state, minutes old for a late
+        candidate in a long tick. That is safe only while nothing rewrites
+        this gate's veto inputs on a PENDING task mid-tick. ``reopen_at``
+        changes only when a done task is reopened, and fused-memory's
+        ``done_evidence_stale`` gate re-reads the stored value at write time
+        anyway. ``branch_base_sha`` is stamped by the task's own workflow,
+        which runs only after dispatch. A new mid-tick writer of either field
+        must make this gate re-read the task before it flips one.
+        ``tick_view`` is the consult's shared branch snapshot; it
+        is consulted only after every veto above, and only to abstain early —
+        the safety argument lives in
+        ``orchestrator/src/orchestrator/already_landed_tick_view.py``.
         """
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
-        task = await self.scheduler.get_task(task_id)
+        if task is None:
+            task = await self.scheduler.get_task(task_id)
         metadata = (task.get('metadata') or {}) if task else {}
 
         # task 2677: a prior tick may have already had this exact
@@ -13875,6 +13997,11 @@ class Harness:
                 RecoverySite.already_landed_gate, task_id,
             )
 
+        if tick_view is not None and await branch_absent_and_unmarked(
+            tick_view, self.git_ops, branch,
+        ):
+            return False
+
         branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
         branch_exists = branch_tip_sha is not None
 
@@ -13885,7 +14012,7 @@ class Harness:
                 return False
             # Delegates FIX 2 citation-lineage + FIX 1' effect-present to the
             # shared helper (task 2678, INV-5) — see
-            # orchestrator.landing_evidence's module docstring for the full
+            # orchestrator.merge_lane.landing_evidence's module docstring for the full
             # DISCOVERY-mode contract (citation discovery, both-direction
             # lineage guard, branch-tip-or-citation effect anchor).
             verdict = await validate_landing_evidence(
@@ -14005,7 +14132,7 @@ class Harness:
 
         Delegates the actual filing (queue-None guard, dedup, ``Escalation``
         construction, submit/log/except shape) to the shared
-        :func:`~orchestrator.landing_evidence.file_unattributed_landing_escalation`
+        :func:`~orchestrator.merge_lane.landing_evidence.file_unattributed_landing_escalation`
         (task 2678 amendment, INV-5) — this method now only supplies
         ``agent_role``, the one thing that distinguishes it from
         ``SpeculativeMergeWorker``'s equivalent method.
@@ -14343,6 +14470,17 @@ class Harness:
         """True iff a workflow slot is currently active for ``task_id``."""
         return task_id in self._workflow_cancel_events
 
+    async def clear_verify_host_quarantine(self, host: str) -> dict[str, Any]:
+        """Operator clear of a benched remote verify host (task 6565, design D6).
+
+        Delegates to the merge worker's
+        :meth:`~orchestrator.merge_lane.worker.SpeculativeMergeWorker.clear_host_quarantine`;
+        reports ``cleared=False`` with a reason when no merge worker runs.
+        """
+        if self._merge_worker is None:
+            return {'host': host, 'cleared': False, 'reason': 'no merge worker is running'}
+        return await self._merge_worker.clear_host_quarantine(host)
+
     def _cancel_causes(self) -> dict[str, str]:
         """The cancel-cause registry, lazily created when absent.
 
@@ -14357,6 +14495,199 @@ class Harness:
             self._workflow_cancel_causes = causes
         return causes
 
+    def _launch_slot(
+        self, assignment, sem: asyncio.Semaphore, task_reports: list[TaskReport],
+    ) -> asyncio.Task:
+        """Start the slot task for *assignment*, whose *sem* permit is already held."""
+        self._task_modules[assignment.task_id] = list(assignment.modules)
+        # Register escalation wake-event BEFORE create_task so Fix #1a
+        # (_on_escalation_resolved orphan-flip gate) sees task_id in
+        # _escalation_events immediately — closing the sub-second race
+        # where a resolving escalation would mis-classify a just-
+        # dispatched task as an orphan and double-flip it.
+        dispatched_esc_event = self._register_escalation_event(assignment.task_id)
+        task = asyncio.create_task(
+            self._run_slot(assignment, sem),
+            name=f'workflow-{assignment.task_id}',
+        )
+        self._live_tasks.add(task)
+        task.add_done_callback(
+            functools.partial(self._collect_slot_report, task_reports)
+        )
+        # Guard against the narrow resource-leak window where the slot
+        # task is cancelled before _run_slot's body begins executing
+        # (e.g. hard_cancel_workflow or shutdown sweeping pending tasks
+        # before the event loop schedules the coroutine's first step).
+        # In that case _run_slot's finally block never runs and
+        # _escalation_events[task_id] would leak — permanently
+        # satisfying the active-workflow gate and suppressing both the
+        # stranded_blocked re-file and Fix #1a orphan-flip for that
+        # task forever.  The done_callback fires unconditionally when
+        # the Task reaches any terminal state; pop() is idempotent (a
+        # no-op if _run_slot's finally already removed the entry).
+        # Identity-guarded (task 6660): a force-released slot ends
+        # later, maybe after a re-dispatch registered its own event.
+        _tid = assignment.task_id
+        task.add_done_callback(
+            lambda _t, tid=_tid, ev=dispatched_esc_event: (
+                self._escalation_events.pop(tid, None)
+                if self._escalation_events.get(tid) is ev else None
+            )
+        )
+        return task
+
+    def _slot_lease_registry(self) -> dict[str, SlotLease]:
+        """The slot-lease registry, lazily created when absent (``_cancel_causes``'s idiom)."""
+        leases = getattr(self, '_slot_leases', None)
+        if leases is None:
+            leases = {}
+            self._slot_leases = leases
+        return leases
+
+    def _unregister_slot(self, task_id: str) -> None:
+        """Drop every per-slot registration of *task_id*.
+
+        Only the slot that owns them may call this: ``_run_slot``'s ``finally``
+        while its lease is still the registered one, or the watcher's
+        force-release of that slot.
+
+        ``_workflow_cancel_at`` is deliberately NOT dropped: popping it at slot
+        exit defeated the R3 reconcile grace window, which must cover the brief
+        post-exit window.  It is cleared at (re)dispatch (top of ``_run_slot``)
+        and lazily pruned by the sweep's grace-check reader.
+        """
+        self._escalation_events.pop(task_id, None)
+        self._workflow_cancel_events.pop(task_id, None)
+        self._workflow_slot_tasks.pop(task_id, None)
+        self._slot_lease_registry().pop(task_id, None)
+        self._terminal_cancel_counts.pop(task_id, None)
+        # Belt-and-braces (task 3172): the CancelledError ladder consumes the
+        # cause on the cancel path; this covers every OTHER slot exit so a
+        # stamped-but-unconsumed entry can never leak into a later re-dispatch
+        # of the same task.
+        self._cancel_causes().pop(task_id, None)
+        # Defensive merge-phase grace clear (task 2753): mirrors the inline
+        # clear at the durable-enqueue boundary in _submit_to_merge_queue,
+        # covering abnormal slot exits (e.g. WorkflowCancelled raised before
+        # that inline clear).  Unlike _workflow_cancel_at, clearing here is
+        # CORRECT: once the slot is gone there is no pre-enqueue verify left to
+        # protect, so the grace goes now rather than when the monotonic stamp
+        # expires.
+        self.scheduler.clear_merge_phase(task_id)
+
+    def _owns_slot(self, task_id: str, lease: SlotLease) -> bool:
+        """True while *lease* is *task_id*'s registered slot, i.e. not force-released."""
+        return self._slot_lease_registry().get(task_id) is lease
+
+    async def _force_release_wedged_slot(self, task_id: str, status: str, polls: int) -> None:
+        """Release the slot and module locks of a terminal task whose workflow
+        never ended after its hard-cancel.
+
+        The watcher calls this only for rows in ``TERMINAL_STATUSES``, so no
+        live work is ever unlocked.  The coroutine is left running, holding
+        nothing: once its slot is unregistered its ``finally`` no longer acts
+        on the task, and its lease releases at most once.  Same order as that
+        ``finally``: unregister, clear the claimant, then release, so a
+        re-dispatch can never have its fresh claimant cleared.  Loud by INV-11:
+        an ERROR, a ``workflow_slot_force_released`` event and one deduped
+        ``workflow_slot_wedged`` L1 naming the await that holds the slot.
+        """
+        lease = self._slot_lease_registry().get(task_id)
+        slot_task = self._workflow_slot_tasks.get(task_id)
+        if lease is None or slot_task is None or slot_task.done():
+            return
+        modules = sorted(
+            module for module, holder in self.scheduler.lock_table.snapshot_holders().items()
+            if holder == task_id
+        )
+        stuck = suspended_slot_tasks(slot_task)
+        self._force_released_slot_tasks().add(slot_task)
+        self._unregister_slot(task_id)
+        await self._clear_claimant_bounded(task_id)
+        lease.release(requeued=False)
+        blamed = culprit(stuck)
+        logger.error(
+            'Terminal-status watcher: workflow for %s task %s never ended %d polls '
+            'after its hard-cancel; force-released its slot and module locks %s. '
+            'Held by %s at %s',
+            status, task_id, polls, modules, blamed.name, blamed.culprit_frame,
+        )
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.workflow_slot_force_released,
+                task_id=task_id,
+                data={'status': status, 'polls': polls, 'modules': modules},
+            )
+        self._file_slot_wedged_l1(task_id, status, polls, modules, stuck)
+
+    # How long the backstop waits for its claimant clear before releasing anyway.
+    # One set_task_claimant MCP call is bounded at 15s; a stranded one (the
+    # httpcore cancel trap) must not stall the backstop that exists for wedges.
+    _FORCE_RELEASE_CLAIMANT_CLEAR_SECS: float = 20.0
+
+    async def _clear_claimant_bounded(self, task_id: str) -> None:
+        """Clear *task_id*'s claimant, giving up after ``_FORCE_RELEASE_CLAIMANT_CLEAR_SECS``.
+
+        A clear that has not returned by then is cancelled without being
+        awaited and left to unwind; the claimant then self-heals, as any lost
+        clear does (``scheduler.py::Scheduler.set_task_claimant``).
+        """
+        clear = asyncio.create_task(
+            self.scheduler.set_task_claimant(task_id, claimant_run_id=None, heartbeat_at=None),
+            name=f'force-release-claimant-clear-{task_id}',
+        )
+        await asyncio.wait({clear}, timeout=self._FORCE_RELEASE_CLAIMANT_CLEAR_SECS)
+        if clear.done():
+            if not clear.cancelled() and clear.exception() is not None:
+                logger.warning(
+                    'Task %s: claimant clear during force-release failed (non-fatal): %s',
+                    task_id, clear.exception(),
+                )
+            return
+        logger.warning(
+            'Task %s: claimant clear during force-release did not return within '
+            '%.0fs; releasing the slot without it',
+            task_id, self._FORCE_RELEASE_CLAIMANT_CLEAR_SECS,
+        )
+        abandon_task(clear, _UNDRAINED_CLAIMANT_CLEARS)
+
+    def _force_released_slot_tasks(self) -> set[asyncio.Task]:
+        """Slot tasks force-released and not yet ended, lazily created (``_cancel_causes``'s idiom).
+
+        Their eventual report is not recorded: the force-release event is the
+        slot's record, and a late report could land on a re-dispatch's state.
+        """
+        tasks = getattr(self, '_force_released_slots', None)
+        if tasks is None:
+            tasks = set()
+            self._force_released_slots = tasks
+        return tasks
+
+    def _file_slot_wedged_l1(
+        self, task_id: str, status: str, polls: int, modules: list[str],
+        stuck: tuple[SuspendedTask, ...],
+    ) -> None:
+        queue = self._escalation_queue
+        if queue is None:
+            return
+        try:
+            if queue.has_open_l1(task_id, category=EscalationCategory.WORKFLOW_SLOT_WEDGED):
+                return
+            queue.submit(wedged_slot_escalation(
+                escalation_id=queue.make_id(task_id),
+                task_id=task_id,
+                status=status,
+                polls=polls,
+                modules=modules,
+                stuck=stuck,
+                filing_claimant_run_id=self._filing_claimant_run_id,
+            ))
+        except Exception:
+            logger.exception(
+                'Task %s: filing the %s L1 failed; the slot is released regardless',
+                task_id, EscalationCategory.WORKFLOW_SLOT_WEDGED,
+            )
+
     def hard_cancel_workflow(
         self, task_id: str, *, restamp: bool = True, reason: str | None = None
     ) -> bool:
@@ -14365,10 +14696,14 @@ class Harness:
         This is the escalation path when a workflow ignores the soft
         ``cancel_event`` (set by ``cancel_workflow``) for too long.
         Requesting asyncio.Task.cancel() forces a ``CancelledError`` into the
-        coroutine's next await point; the ``_run_slot`` finally block still
-        runs (CancelledError is BaseException, so it bypasses the
-        ``except Exception`` guard at harness.py:1833) ensuring lock release
-        and registry cleanup.
+        coroutine's next await point.  Lock release and registry cleanup
+        happen in ``_run_slot``'s ``finally`` only once the coroutine unwinds,
+        and a cancel-proof await can stop it from ever unwinding.  The run()
+        scope bounds its own terminal cleanup
+        (``orchestrator/src/orchestrator/workflow_types.py::CancellationScope``);
+        for anything else, the terminal-status watcher force-releases the slot
+        ``terminal_status_force_release_polls`` polls later
+        (:meth:`_force_release_wedged_slot`, task 6660).
 
         ``reason`` (task 3172) records WHY, stamped into
         ``_workflow_cancel_causes`` immediately before ``task.cancel()`` and
@@ -14475,7 +14810,9 @@ class Harness:
         final message.  The supervisor-side timeout is rotation_hours*3600 +
         _WATCHER_TIMEOUT_GRACE_SECS so that a wedged agent that ignores its
         own rotation instructions is force-killed (classified as unclean, feeds
-        the crashloop guard).
+        the crashloop guard).  An exhausted cap-retry bound raises
+        AllAccountsCappedException, which the supervisor treats as an unclean
+        exit.
         """
 
         cfg = self.config
@@ -14484,14 +14821,8 @@ class Harness:
         # injected env var and the banner below cannot disagree.
         df_root = resolve_dark_factory_root()
         # One queue string for both the 'Escalation queue:' line and the re-arm
-        # command below, so the two can never disagree (task 3605).  Joined with
-        # Path.__truediv__ -- NOT f-string concatenation -- to match the
-        # authoritative resolution of the same path in _emit_digest: queue_dir is
-        # an unconstrained str, so an operator who configures it ABSOLUTE would
-        # otherwise get '/project//abs/path' here while the harness itself watches
-        # '/abs/path', and the agent would arm an inotify watcher on a directory
-        # that never receives escalations (a silent per-slice timeout).
-        queue_dir = str(Path(cfg.project_root) / cfg.escalation.queue_dir)
+        # command below, so the two can never disagree (task 3605).
+        queue_dir = str(escalation_queue_dir(cfg.project_root))
         if df_root is None:
             # Omitting the key from env_overrides does NOT unset it in the child:
             # cli_invoke seeds the subprocess env from os.environ and updates it
@@ -14589,6 +14920,10 @@ class Harness:
             project_id=cfg.fused_memory.project_id,
             role='escalation-watcher-auto',
             task_id='',
+            # A stateless triage loop over a queue it re-reads every cycle, so a
+            # capped rotation retries fresh.
+            resume_on_cap_hit=False,
+            max_cap_retries=_WATCHER_MAX_CAP_RETRIES,
             prompt=user_prompt,
             system_prompt=system_prompt,
             cwd=cfg.project_root,
@@ -14960,6 +15295,10 @@ class Harness:
         cancelled the workflow's ``finally`` block clears the registry entry
         so subsequent scans skip the task naturally.
 
+        A workflow still alive ``config.terminal_status_force_release_polls``
+        polls past the hard-cancel never unwound; the scan then releases its
+        slot and locks itself (:meth:`_force_release_wedged_slot`, task 6660).
+
         Counts are cleared when a task's status is no longer terminal so
         stale state cannot accumulate across transient status fluctuations.
 
@@ -15029,6 +15368,8 @@ class Harness:
                         )
                 if result:
                     cancelled += 1
+                if count >= threshold + self.config.terminal_status_force_release_polls:
+                    await self._force_release_wedged_slot(task_id, status, count)
 
         return cancelled
 
@@ -18261,9 +18602,7 @@ class Harness:
                 window_start = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
 
             # (6) Gather escalation stats (fail-open via aggregate_escalations).
-            escalations_dir = (
-                Path(self.config.project_root) / self.config.escalation.queue_dir
-            )
+            escalations_dir = escalation_queue_dir(self.config.project_root)
             escalation_stats = digest_mod.aggregate_escalations(
                 escalations_dir, window_start, window_end
             )
@@ -18295,6 +18634,16 @@ class Harness:
                 )
                 if events_db_path is not None
                 else digest_mod.ModelRoleRollup()
+            )
+
+            # (8c) Deep merge-ahead chain telemetry (task 3188, PRD ε).  The
+            # reader is fail-open itself; the guard covers only a missing EventStore.
+            chain_telemetry = (
+                digest_mod.chain_telemetry_in_window(
+                    events_db_path, window_start, window_end
+                )
+                if events_db_path is not None
+                else ChainTelemetry()
             )
 
             # (9) Parked-task counts via public Scheduler properties (task 1327).
@@ -18359,6 +18708,7 @@ class Harness:
                 submissions_in_step=submissions_in_step,
                 lifecycle_events_in_step=diff,
                 pause_visibility=pause_visibility,
+                chain_telemetry=chain_telemetry,
             )
 
             digest_mod.write_digest_entry(digest_dir, inputs)

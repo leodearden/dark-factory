@@ -1,0 +1,84 @@
+{
+  "anchor_pairs": 35,
+  "attach_time_pairs": 13,
+  "attach_time_unrecoverable": [],
+  "by_binary": {
+    "conflict": {
+      "agree": 50,
+      "derived": 264,
+      "n_compared": 66,
+      "rated": 380
+    },
+    "digest": {
+      "agree": 0,
+      "derived": 0,
+      "n_compared": 0,
+      "rated": 356
+    },
+    "home": {
+      "agree": 261,
+      "derived": 308,
+      "n_compared": 389,
+      "rated": 57
+    },
+    "loss": {
+      "agree": 2,
+      "derived": 15,
+      "n_compared": 2,
+      "rated": 444
+    },
+    "scope": {
+      "agree": 30,
+      "derived": 230,
+      "n_compared": 38,
+      "rated": 142
+    }
+  },
+  "rated_current_pairs": 312,
+  "shards": {
+    "attach_00": {
+      "items": 13,
+      "rater": "opus-primary"
+    },
+    "primary_00": {
+      "items": 50,
+      "rater": "opus-primary"
+    },
+    "primary_01": {
+      "items": 50,
+      "rater": "opus-primary"
+    },
+    "primary_02": {
+      "items": 50,
+      "rater": "opus-primary"
+    },
+    "primary_03": {
+      "items": 50,
+      "rater": "opus-primary"
+    },
+    "primary_04": {
+      "items": 49,
+      "rater": "opus-primary"
+    },
+    "primary_05": {
+      "items": 49,
+      "rater": "opus-primary"
+    },
+    "primary_06": {
+      "items": 49,
+      "rater": "opus-primary"
+    },
+    "second_00": {
+      "items": 40,
+      "rater": "sonnet-second"
+    },
+    "second_01": {
+      "items": 40,
+      "rater": "sonnet-second"
+    },
+    "third_00": {
+      "items": 19,
+      "rater": "opus-third"
+    }
+  }
+}

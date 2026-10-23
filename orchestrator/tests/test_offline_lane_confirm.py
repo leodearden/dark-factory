@@ -7,7 +7,6 @@ scenarios follow in this file under ``TestRealPytest…`` classes.
 from __future__ import annotations
 
 import json
-import logging
 import os
 import shlex
 import sys
@@ -34,7 +33,6 @@ from orchestrator.offline_lane_confirm import (
     UnconfirmableReason,
     confirm,
     confirm_mode,
-    legacy_confirmed_ids,
     outcome_from_json,
     outcome_to_json,
     partition,
@@ -511,36 +509,6 @@ class TestConfirmTarget:
             ConfirmTarget(leg, tmp_path, _lane_command() if with_command else None)
 
 
-class TestLegacyConfirmedIds:
-    def test_confirmed_projects_to_its_sorted_reproduced_ids(self) -> None:
-        outcome = Confirmed(ConfirmMode.NARROWED, ('tests/t.py::b', 'tests/t.py::a'), ('tests/t.py::c',), ())
-        assert legacy_confirmed_ids(outcome, command_name='unit', leg=Leg.GENERIC) == ['tests/t.py::a', 'tests/t.py::b']
-
-    def test_a_generic_confirm_exiting_nonzero_naming_no_test_is_the_command_sentinel(self) -> None:
-        outcome = Unconfirmable(UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, '2')
-        assert legacy_confirmed_ids(outcome, command_name='unit', leg=Leg.GENERIC) == ['unit::unconfirmable']
-
-    @pytest.mark.parametrize(
-        ('reason', 'leg'),
-        [
-            (UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, Leg.INFRA),
-            (UnconfirmableReason.DETECT_RED_NAMED_NO_TEST, Leg.GENERIC),
-            (UnconfirmableReason.CONFIRM_SIGNAL_ENDED, Leg.GENERIC),
-            (UnconfirmableReason.ID_FAILED_ROUND_TRIP, Leg.GENERIC),
-            (UnconfirmableReason.NUMERIC_EXIT, Leg.NUMERIC),
-        ],
-    )
-    def test_every_other_unconfirmable_confirms_nothing_with_a_warning(
-        self, caplog: pytest.LogCaptureFixture, reason: UnconfirmableReason, leg: Leg,
-    ) -> None:
-        with caplog.at_level(logging.WARNING, logger='orchestrator.offline_lane_confirm'):
-            ids = legacy_confirmed_ids(Unconfirmable(reason, 'why'), command_name=LEGACY_INFRA_COMMAND, leg=leg)
-        assert ids == []
-        assert [r.getMessage() for r in caplog.records] == [
-            f'offline-lane: {LEGACY_INFRA_COMMAND} pass unconfirmable: {reason} why',
-        ]
-
-
 _PROBE = ProbeResult(result='outage', returncode=2, failed_dependency='qdrant', first_line='refused', duration=1.5)
 
 
@@ -597,6 +565,12 @@ class TestJunitNodeOutcomes:
             'tests/test_a.py::test_c': 'skipped',
         }
 
+    def test_an_xdist_loadgroup_name_resolves_to_the_plain_node_id(self, tmp_path: Path) -> None:
+        (tmp_path / 'tests').mkdir()
+        (tmp_path / 'tests' / 'test_a.py').write_text('')
+        report = _junit_report(tmp_path / 'r.xml', '<testcase classname="tests.test_a" name="test_b@grp"/>')
+        assert junit_node_outcomes(report, tmp_path) == {'tests/test_a.py::test_b': 'passed'}
+
     def test_no_report_is_none(self, tmp_path: Path) -> None:
         assert junit_node_outcomes(tmp_path / 'absent.xml', tmp_path) is None
 
@@ -633,6 +607,16 @@ class TestJunitFailingNodeIds:
             tmp_path / 'r.xml', '<testcase classname="" name="tests.t"><error message="collect"/></testcase>',
         )
         assert junit_failing_node_ids(report, tmp_path) == frozenset({'tests/t.py'})
+
+    def test_xdist_loadgroup_names_resolve_to_plain_node_ids(self, tmp_path: Path) -> None:
+        (tmp_path / 'tests').mkdir()
+        (tmp_path / 'tests' / 't.py').write_text('')
+        report = _junit_report(
+            tmp_path / 'r.xml', _failing_case('tests.t', 'test_a[1]@grp'), _failing_case('tests.t.TestK', 'test_e@grp'),
+        )
+        assert junit_failing_node_ids(report, tmp_path) == frozenset(
+            {'tests/t.py::test_a[1]', 'tests/t.py::TestK::test_e'},
+        )
 
     def test_a_failing_test_whose_classname_names_no_file_leaves_the_report_unable_to_say(
         self, tmp_path: Path,
@@ -789,6 +773,23 @@ class TestRealPytestGenericLeg:
         evidence = _confirm_record(store, LANE.name)
         assert evidence.junit_path == str(require_current_pass(store, LANE.name).junit_path(Phase.CONFIRM))
         assert evidence.outcomes == {node_id('test_flaky'): 'passed'}
+
+    @pytest.mark.asyncio
+    async def test_an_xdist_loadgroup_detection_is_confirmed_by_its_plain_node_id(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = lane_project(tmp_path / 'wt', 'test_grouped_flaky', 'test_ok')
+        (project / 'pyproject.toml').write_text(
+            '[tool.pytest.ini_options]\naddopts = "-p no:cacheprovider -n 2 --dist loadgroup"\n',
+        )
+
+        detect = await _detect(store, LANE, project)
+        assert [f.node for f in detect.failures] == [node_id('test_grouped_flaky')]
+
+        outcome = await _confirm(store, LANE, project, detect)
+
+        assert outcome == Confirmed(ConfirmMode.NARROWED, (), (node_id('test_grouped_flaky'),), ())
+        assert _confirm_record(store, LANE.name).outcomes == {node_id('test_grouped_flaky'): 'passed'}
 
     @pytest.mark.asyncio
     async def test_7_an_opaque_confirm_red_only_on_another_test_reproduces_only_the_detected_one(

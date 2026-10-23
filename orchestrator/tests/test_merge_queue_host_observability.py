@@ -39,7 +39,8 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     ItemLifecycleState,
@@ -48,7 +49,6 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     _HostUnavailability,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify_runner import HostAllocator, HostLease
 
 # ── fixtures (ported verbatim from test_merge_queue_finalize_head_visibility) ──
@@ -159,6 +159,7 @@ def _make_mock_allocator(host_names: list[str]) -> MagicMock:
 _HOST_KEYS = {
     'name', 'is_local', 'slot_state', 'quarantined', 'quarantine_class',
     'unavailable_since', 'unavailable_secs', 'streak', 'reason',
+    'kind', 'sticky', 'identity',
 }
 
 
@@ -267,11 +268,12 @@ def _by_name(snap: dict) -> dict:
 class TestSnapshotHostsBlock:
     """snapshot()['hosts']: per-host slot state + quarantine class.
 
-    Resolves the four-way ambiguity behind a `verifying 1/2 hosts` line:
+    Resolves the five-way ambiguity behind a `verifying 1/2 hosts` line:
       (a) RU-quarantined            → quarantine_class == 'ru'
       (b) divergence-quarantined    → quarantine_class == 'divergence'
       (c) leaked slot               → slot_state busy/parked, no occupant
       (d) free and never asked for  → slot_state == 'free', quarantined False
+      (e) skew-quarantined          → quarantine_class == 'skew' (task 6565)
 
     RED until 3275/step-4 adds the key (KeyError before that).
     """
@@ -321,6 +323,27 @@ class TestSnapshotHostsBlock:
         assert laptop['unavailable_since'] == 1000.0
         assert laptop['streak'] == 4
         assert laptop['reason'] == 'ssh: connect timed out'
+
+    async def test_case_e_skew_quarantined_shows_kind_and_both_identities(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(e) A gate-skew bench → class 'skew' with its kind, sticky flag and identity pair."""
+        from orchestrator.remote_gate import GateIdentity, GateIdentityPair
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        worker, _alloc, _ = _real_worker(git_ops)
+        pair = GateIdentityPair(GateIdentity('1' * 40, 'a' * 64), GateIdentity('2' * 40, 'a' * 64))
+        worker.bench_unavailable_runner(
+            'laptop', RunnerUnavailable('handshake mismatch', kind='wire_shape', identity=pair),
+        )
+
+        laptop = _by_name(worker.snapshot())['laptop']
+
+        assert laptop['quarantined'] is True
+        assert laptop['quarantine_class'] == 'skew'
+        assert (laptop['kind'], laptop['sticky']) == ('wire_shape', False)
+        assert laptop['identity'] == pair.to_wire()
+        assert laptop['reason'] == 'handshake mismatch'
 
     async def test_case_b_divergence_quarantined(self, git_ops: GitOps) -> None:
         """(b) Quarantined but NOT RU-tracked → class 'divergence', RU fields None.
@@ -772,7 +795,7 @@ class TestHeartbeatDegradation:
         await _quarantine_remote(alloc, 'laptop')
         _seed_ru(worker, 'laptop')
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -790,7 +813,7 @@ class TestHeartbeatDegradation:
         await _quarantine_remote(alloc, 'laptop')
         _seed_ru(worker, 'laptop')
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -809,7 +832,7 @@ class TestHeartbeatDegradation:
         self._add_local_inflight(worker, config, git_repo)
         await _quarantine_remote(alloc, 'laptop')
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -826,7 +849,7 @@ class TestHeartbeatDegradation:
             'nothing quarantined yet, on ANY managed host'
         )
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -856,7 +879,7 @@ class TestHeartbeatDegradation:
         assert snap['depth'] > 0
         assert snap['occupancy']['by_host'] == {}, 'precondition: occupancy is silent here'
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -901,7 +924,7 @@ class TestHeartbeatDegradation:
         await alloc.quarantine_and_release(lease)
         _seed_ru(worker, 'laptop', first_unavailable_at=now - 60.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
         assert 'DEGRADED' in _hb_message(caplog)
 
@@ -911,7 +934,7 @@ class TestHeartbeatDegradation:
         caplog.clear()
         # The rate limit is `now - _last_heartbeat_at < _heartbeat_interval_s`,
         # so a `now` past the interval reopens the gate.
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             later = time.time() + 2 * _HEARTBEAT_INTERVAL_S
             assert worker._maybe_log_queue_heartbeat(later) is True
 

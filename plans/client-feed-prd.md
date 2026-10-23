@@ -105,7 +105,7 @@ client-feed/src/client_feed/
   sources/prds.py    PRD title and excerpt from metadata.prd_path, path-redacted
   budget.py          counted set, spent, allowed; reveal identity; hostile-path refusal reasons
   criteria.py        criteria.yaml model, the {nodeid: criterion} map, junit join, results events
-  pytest_criterion.py  pytest plugin: @pytest.mark.criterion("C-12") → the map file beside the junit report
+  (no pytest plugin of its own: the collection map is written by the defect-tests PRD's injected plugin, see §12)
   publisher.py       the loop: sources → events → feed; heartbeat with degraded reasons
   cli.py             publish, snapshot (one pass), criteria-results, dump-state, validate-feed
 client-feed/tests/   contract fixtures, source tests over fixture stores, audit-hook isolation, canary, end-to-end on this repo
@@ -186,9 +186,10 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
     `TaskWorkflow._execute_verify_review_loop` where the aggregation is decided (both the PASS exit
     and the `review_cycle += 1` branch). `merge_landed.review` carries the last cycle's counts; until θ
     has written a row in production the feed says `not_recorded` (INV-13).
-17. **Criteria data is pytest-only and never written into the checkout** (§7.7). The plugin writes a
-    `{nodeid: criterion}` map beside the junit report; the publisher joins by nodeid; a staging run's
-    results are produced by the CLI into `out/`.
+17. **Criteria data is pytest-only and never written into the checkout** (§7.7). The defect-tests
+    PRD's injected plugin (`plans/defect-tests-prd.md` β) writes the collection map
+    `{nodeid: {defects, criterion}}` beside the junit report; the publisher joins by nodeid; a staging
+    run's results are produced by the CLI into `out/`. (Amended 2026-10-16, §12.)
 18. **Naming:** package `client-feed/`, module `client_feed`, CLI `client-feed`, unit
     `client-feed@<name>.service`. The portal's name is the other repo's decision.
 
@@ -252,8 +253,9 @@ the budget.
 
 `fold(feed)` up to `watermark_seq`: `{project_id, feed_version, watermark_seq, as_of, head,
 engagement_version, degraded, factory, prds: {prd_path: …}, tasks: {task_id: …}, in_flight: [{task_id,
-phase, since}], branches, tree, revealed: [{path, commit, lines}], criteria: {run_kind: …}, recent:
-[last 200 events]}`. Rewritten atomically after every pass that appended.
+phase, since}], branches, tree, revealed: [{path, commit, lines}], criteria: {run_kind: …},
+criteria_declared: {id: …}, recent: [last 200 events]}`. Each `criteria_declared` event replaces the
+whole `criteria_declared` map. Rewritten atomically after every pass that appended.
 
 ### 7.4 `in/inbox.jsonl` (portal → publisher)
 
@@ -276,10 +278,14 @@ repository, or an `out_dir` not owned by the running user, refuses to start.
 
 - `acceptance/criteria.yaml` in the client project:
   `{format: 1, criteria: [{id: "C-12", prd: "plans/x-prd.md", capability, statement, kind: success|failure}]}`.
-- `@pytest.mark.criterion("C-12")` via the plugin `client_feed.pytest_criterion` (loaded with
-  `pytest_plugins` in the project's `conftest.py`); at collection it writes
-  `<junit path>.criteria.json` = `{nodeid: criterion}` beside the `--junitxml` target when one is
-  given, so the archived junit has its map beside it. No results file is written into the checkout.
+- `@pytest.mark.criterion("C-12")`. The marker is registered, and the map written, by the
+  defect-tests PRD's single-file plugin `_df_defect_plugin` (`plans/defect-tests-prd.md` β,
+  decision 19), which the orchestrator injects into every structured pytest verify leg with `-p`;
+  a client project needs no conftest edit. At collection it writes
+  `<junit path>.tests.json` = `{nodeid: {"defects": [ref, ...], "criterion": str | null}}` beside
+  the `--junitxml` target when one is given, so the archived junit has its map beside it. A staging
+  run loads the same plugin with `-p _df_defect_plugin` on `PYTHONPATH`. No results file is written
+  into the checkout.
 - The publisher joins junit and map by nodeid into `criteria_results {run_kind: verify}`.
 - `client-feed criteria-results --junit <xml|xml.gz> --map <json> --criteria acceptance/criteria.yaml
   --run-kind staging --commit <sha> --out <out_dir>` writes `out/criteria-staging.json` and the
@@ -309,17 +315,17 @@ path. It writes nowhere but O. The portal account reads O and nothing under R.
 | B4 | Foreign project refusal | the policy names project X; feed lines name Y | `validate-feed` rejects; the portal's consumer test (other repo) rejects the same fixture |
 | B5 | Fixture round trip | the committed fixture feed `tests/fixtures/feed-v1/` | validates under `contract.py`; `fold(feed)` equals the committed `state.json`; the portal's suite validates and renders it |
 | B6 | Landed merge with review | `merge_finalized` `state=done` for task 7, two `review_completed` rows, a `Merge task/7 into main` commit | one `merge_landed` with that sha, stat counts from git, `review.cycles == 2` and the last row's counts; with no rows, `review == "not_recorded"` |
-| B7 | Red shown | `workflow_verify` `passed=false` and a junit with one failure | `verify_run.passed == false`; `test_results.counts.failed == 1`; `exception_type` present, no message |
+| B7 | Red shown | an archived red attempt summary (a leg rc ≠ 0) and a junit with one failure under the task's archive dir | `verify_run.passed == false`; `test_results.counts.failed == 1`; `exception_type` present, no message |
 | B8 | Not recorded | a `verify_run` whose task dir has no junit | `test_results` absent; `verify_run.legs == "not_recorded"` |
 | B9 | Factory state | `scheduler_paused` then nothing for 3 h | `factory_state.scheduler == paused`, `idle_seconds ≥ 10800` |
 | B10 | Waiting on Leo | task 9 blocked with an open `escalation_created` level 2 | `task_upserted.waiting_on == "leo"`; after `escalation_resolved`, `"factory"` |
 | B11 | Visible set | tree with `dark-factory-orchestrator.yaml`, `.mcp.json`, `plans/review.md`, `src/a.py`; policy visible `src/**`, `tests/**` | `tree_snapshot.files` lists only `src/a.py`; a reveal of `.mcp.json` is `reveal_refused not_visible` |
 | B12 | Reveal within budget | 1,000 counted lines, proportion 0.25, floor 50; request a 200-line production file | `file_revealed` with content; `spent_lines == 200` |
-| B13 | Reveal over budget and floor | spent 200 of 250; request a 100-line file; then a 10-line file | both `reveal_refused over_budget` (the second costs 50) |
+| B13 | Reveal over budget and floor | spent 210 of 250; request a 100-line file; then a 10-line file | both `reveal_refused over_budget` (the first costs 100: 310 > 250; the second costs the floor 50: 260 > 250) |
 | B14 | Free set | request a test file | granted; `spent_lines` unchanged |
 | B15 | Hostile paths | requests for `../x`, `/etc/passwd`, a symlink entry, an untracked path | four `reveal_refused` with reasons `not_in_tree`, `not_in_tree`, `symlink`, `not_in_tree`; nothing read outside the tree (B1's hook) |
 | B16 | Follow head | a revealed file changes in a later commit; another is renamed; a third deleted then recreated | re-emitted; `renamed_from`; `deleted: true` then no content until a new request |
-| B17 | Paid code free | `delivered_commit` set; a file unchanged since it | excluded from counted lines; its reveal costs 0 |
+| B17 | Paid code free | `delivered_commit` set; a file unchanged since it | outside the counted set: excluded from counted lines, and its reveal costs 0 |
 | B18 | Restart and torn tail | kill mid-append leaving a partial line; restart | the torn line is truncated and logged; no duplicate `seq`; no re-emitted `merge_landed`; `cursor.json` consistent |
 | B19 | Degraded source | runs.db unreadable | heartbeat `degraded` names `events`; other sources still publish |
 | B20 | Criteria | criteria.yaml with C-1..C-3; a junit and map binding C-1 pass, C-2 fail, none for C-3 | `criteria_results {verify}`: passed, failed, not_run |
@@ -339,7 +345,7 @@ assigned at decompose.
 | β2 | Policy, git and archive sources | `client_feed/policy.py`, `sources/git.py`, `sources/archive.py`, tests | a visible-set tree snapshot of this repo with kinds and counted lines (B11's listing half); junit → `test_results` with counts and exception types (B7, B8) | α |
 | γ | Publisher loop, feed writer, cursors, heartbeat, CLI | `client_feed/publisher.py`, `feed_io.py`, `cli.py` (publish, snapshot, dump-state), tests | `client-feed snapshot` on this repo writes a valid feed whose `state.json` equals `fold(feed)` (B22 minus reveals); restart and torn tail (B18); degraded heartbeat (B19) | β1, β2 |
 | δ | Reveals: engagement projection, budget, inbox, hostile-path refusal, follow-head | `client_feed/budget.py`, `feed_io.py` (inbox tail), `publisher.py`, tests | B11's refusal half, B12–B17 | γ |
-| ε | Acceptance criteria format, pytest plugin, map join, staging CLI | `client_feed/criteria.py`, `pytest_criterion.py`, `cli.py` (criteria-results), `publisher.py`, tests, `acceptance/criteria.yaml` exemplar | B20; `client-feed criteria-results` on a junit and map from this repo's own suite with one marked test | γ |
+| ε | Acceptance criteria format, map join (reading the defect-tests β map), staging CLI | `client_feed/criteria.py`, `cli.py` (criteria-results), `publisher.py`, tests, `acceptance/criteria.yaml` exemplar | B20; `client-feed criteria-results` on a junit and map from this repo's own suite with one marked test | γ |
 | ζ | Isolation gate: audit hook, canary, end to end | `client-feed/tests/test_isolation.py`, the two-project fixture builder | B1, B2, B15 and B22 pass on this checkout | δ, ε |
 | η | Publisher unit template, operator docs, README and ARCHITECTURE pointers | `scripts/client-feed.service.template`, `scripts/setup-host.sh` (sync the member; render only, no enable), `OPERATIONS.md` §"Client feed", `README.md`, `ARCHITECTURE.md` §2.3 | `systemctl --user cat client-feed@demo.service` renders from the template with the config path substituted; OPERATIONS names the install steps, the directory ownership and the isolation check | γ |
 
@@ -370,6 +376,139 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
 
 - 2026-10-15, from the portal PRD session (`~/src/scoping-intake/docs/prds/client-portal.md`, tasks 45–56, with 54 → `dark_factory:6966` and 56 → `dark_factory:6973`): `criteria_declared` event (α, ε); `stage` as `str` (α); out/ files group-readable 0640 (γ, task 6970); the portal's `in-v1` fixture vendored by δ (6971); a committed B22 snapshot fixture for the portal's κ (ζ, 6973). Task details amended accordingly.
 
+- 2026-10-16, from the defect-tests PRD session (`plans/defect-tests-prd.md`, Leo's go): the pytest
+  collection map moves to that PRD's injected plugin (β), which owns the `criterion` and `defect`
+  markers and writes `<junit path>.tests.json` = `{nodeid: {defects, criterion}}`; client-feed ships
+  no pytest plugin (§3, decision 17, §7.7, ε row). Task 6972 (ε) amended to consume it and made to
+  depend on β (7002's contract work does not touch the map, so it is unchanged); θ 6967 adds
+  `by_kind` counts to `review_completed`; the ε sidecar block's plugin check is replaced. The defect display
+  (`cases[].defects`, `defects_results`) is that PRD's ι, not a task of this one.
+
+- 2026-10-20, from β1 (task 6968), answering the esc-6969-1 note routed to it. These bind γ (6970):
+  - (a) Red task verifies come from the verify archive's per-attempt summaries, which
+    `orchestrator/src/orchestrator/verify.py::_archive_attempt_summary` writes for every attempt, green
+    or red. γ assembles them through `client-feed/src/client_feed/sources/archive.py::read_archived_run`.
+    `workflow_verify` cannot be that source: it is emitted only on VERIFY→REVIEW, with `passed=true`
+    (0 of 6,377 live rows are false). β1 still maps the recorded `passed` of `workflow_verify` and
+    `merge_verify` (`client-feed/src/client_feed/sources/events.py::read_events`), so either source
+    flows through unchanged. B7's precondition is amended to match.
+  - (b) `waiting_on` (`client-feed/src/client_feed/sources/tasks.py::waiting_on`): done or cancelled
+    gives null; an open escalation with recorded level 2 gives `leo`; any other open escalation, or a
+    blocked task, gives `factory`; otherwise null. An escalation is closed by `escalation_id`, else by
+    `escalation_ids`, else task-wide by an outcome-only `escalation_resolved`
+    (`client-feed/src/client_feed/sources/events.py::read_open_escalations`). Level promotions and
+    most resolutions are not recorded in runs.db, so `leo` rarely fires today; follow-up ticket
+    tkt_0RW1F0587N3HXAH0PN8A4A5TYJ covers recording them.
+  - (c) PRD title and excerpt are read from main's git objects, never the working tree (§8;
+    `client-feed/src/client_feed/sources/prds.py::read_prds`).
+  - (d) `review.cycles` = max(newest `review_completed` cycle, Σ `task_results.review_cycles` for the
+    task); a task with no valid row gives `not_recorded`
+    (`client-feed/src/client_feed/sources/events.py::read_review_counts`).
+
+- 2026-10-21, from β1's review amendments (task 6968). These bind γ (6970):
+  - (e) The tasks cursor (`client-feed/src/client_feed/sources/tasks.py::read_tasks`) is the last
+    projected row's raw `updated_at`. A skipped row never moves it, so it is read again until a
+    projected row passes it. The cursor is not exactly-once. Rows are ordered as the store spells
+    `updated_at` (`.mmmZ` beside microsecond `+00:00`), and the next read takes rows strictly after
+    the cursor. So a row stamped at or before the cursor (the producer stamps to the millisecond),
+    but committed after the read, is missed until that task is next written. If γ needs every
+    write, it re-reads with `since=None` on some cadence and emits only rows that differ from its
+    folded state.
+  - (f) `client-feed/src/client_feed/cli.py` is no longer vendorable: `dump-sources` pulls in
+    `yaml`, `shared.project_layout` and git through `policy` and the sources.
+    `client-feed/tests/test_import_boundary.py` still lists `cli` in `VENDORABLE_MODULES` and
+    passes, because it checks only each direct import's root package. That file is outside β1's
+    scope; ticket tkt_0RW1SJ7XHC6R7VVTB1AERS60T7 drops `cli` from the set.
+  - (g) `client-feed/tests/_stores.py` copies the producers' DDL by hand, citing each by
+    path::symbol. Nothing executable catches drift, so a renamed producer column would leave the
+    fixture tests green and a live read failing. The risk is accepted: `client-feed dump-sources`
+    against a live root is the check.
+
+- 2026-10-21, from γ (task 6970). These bind δ (6971), ε (6972), η (6974) and the portal:
+  - (a) A task `verify_run` is closed at each verify-phase exit. Its window runs from that task's
+    `phase_enter` with phase `verify` to the `phase_exit`, and it is read through
+    `client-feed/src/client_feed/sources/archive.py::read_archived_run`
+    (`client-feed/src/client_feed/stream_events.py::_task_run`). `passed` is "every archived leg's
+    rc is 0". A window with no archived summary emits no `verify_run`, because nothing records
+    whether it passed (§4.10). `workflow_verify` is not mapped: it follows the same phase exit, so
+    mapping it would report every green run twice. Merge runs come from `merge_verify`, which is
+    emitted after its run, so their window is `[at - duration_ms, at]`; with no duration or no
+    task id their legs are `not_recorded`
+    (`client-feed/src/client_feed/stream_events.py::_merge_run`). `run_key` is
+    `'<kind>-<runs.db event id>'`, from the closing `phase_exit` or the `merge_verify` row.
+  - (b) `heartbeat.watermark_seq` is the watermark of the `state.json` on disk when the heartbeat
+    was appended, i.e. the previous commit's
+    (`client-feed/src/client_feed/publisher.py::run_pass`), as in the committed feed-v1 fixture.
+  - (c) `factory_state` is emitted only when (`scheduler`, `since`, `last_event_at` floored to the
+    minute, `idle_seconds // 60`) differs from the folded state's
+    (`client-feed/src/client_feed/value_events.py::factory_event`, `IDLE_RESOLUTION_SECONDS`). So
+    the folded `idle_seconds` is at most a minute behind, and a busy factory emits at most one
+    line a minute.
+  - (d) A train's `merge_landed.review` is `not_recorded`: its members were reviewed separately,
+    and summing their counts would report a review that never happened
+    (`client-feed/src/client_feed/stream_events.py::_merge_landed`).
+  - (e) `cursor.json` adds `through_seq` and `feed_bytes`
+    (`client-feed/src/client_feed/feed_io.py::Cursor`). A commit appends and fsyncs, then
+    replaces `state.json`, then `cursor.json` (`client-feed/src/client_feed/feed_io.py::OutDir.commit`).
+    On restart, the lines past `through_seq` are folded. The first pass skips any stream event
+    whose identity is among them: `(type, natural_key)`, or for `task_phase` its payload without
+    `seq` (`client-feed/src/client_feed/stream_events.py::identity`,
+    `client-feed/src/client_feed/publisher.py::_published`). The stamps of skipped events are not
+    reused, so a `seq` gap can follow a crash. The contract requires only that `seq` strictly
+    increases.
+  - (f) An archive file that cannot be read loses only that run's archived details: a task run is
+    not emitted, a merge run's legs are `not_recorded`, and `archive` is named in `degraded`
+    (`client-feed/src/client_feed/stream_events.py::_archived`). A merge commit git cannot read holds
+    the whole events batch: `events_id` does not advance, and `git` is named in every heartbeat.
+    The hold is bounded only for a commit the repository does not hold. Once the landing is more
+    than `UNKNOWN_MERGE_GRACE` (one hour) old, and only on a pass where git still reads main's
+    head, it is skipped when git, running, reports that the repository does not hold the commit
+    (`client-feed/src/client_feed/sources/git.py::has_commit`): no `merge_landed`, an ERROR log
+    naming the commit and the runs.db event id, and `skipped N landing(s) whose merge commit is not
+    in the repository` under `git` (`client-feed/src/client_feed/publisher.py::_skip_missing_before`,
+    `client-feed/src/client_feed/stream_events.py::_missing_before`). A timeout, a failed spawn, a
+    killed git or any other failure reading a commit the repository holds keeps holding the batch,
+    however old the landing. The rule is stateless: a restart
+    neither resets nor extends it, and a broken repository never drops a landing. Git is read
+    lazily, in landing order and before any archive, and only for landings not already in the
+    uncommitted tail, so a held pass re-reads only the landings ahead of the one held
+    (`client-feed/src/client_feed/stream_events.py::_landed`). The stream read is not capped per
+    pass: one commit can land in more than one row, and `_first_landings` folds them only within
+    one read, so a batch boundary between them would publish a second `merge_landed`. The
+    other failure rules: each source unit fails alone, and its typed error becomes
+    `Degradation(source, redact_paths(str(exc)))` while any other exception propagates
+    (`client-feed/src/client_feed/publisher.py::_guarded`). Unprojectable rows are named as
+    `skipped N rows: <reason>=<count>, …` under `events` or `tasks`
+    (`client-feed/src/client_feed/publisher.py::_skipped`). While `runs.db` cannot be read, no
+    escalation is known: a re-read task whose status the state already records keeps its recorded
+    `waiting_on`, so a degraded pass holds the last known value rather than publishing a guess
+    (`client-feed/src/client_feed/value_events.py::task_events`).
+  - (g) Until δ, `tree_snapshot.budget` uses §4.12's null `delivered_commit` rule. `counted_lines`
+    counts the production files that match neither `free_globs` nor `never_reveal_globs`.
+    `budget_lines` is `floor(proportion × counted_lines)` and `spent_lines` is 0
+    (`client-feed/src/client_feed/value_events.py::_budget`). δ moves the rule into its budget module.
+  - (h) Tasks are read from the tasks cursor, and re-read with `since=None` on a process's first
+    pass and every `TASKS_RESCAN_PASSES` = 60 passes after it
+    (`client-feed/src/client_feed/publisher.py::publish`). A row is emitted only when it differs
+    from the folded state, which closes the tasks-cursor gap of β1's amendment (e). `snapshot` always re-reads
+    (`client-feed/src/client_feed/publisher.py::snapshot`). For η: `client-feed publish` exits 0 on
+    SIGTERM or SIGINT once its pass in progress completes. The loop runs on a worker thread, so the
+    handler never sets the stop Event while its own thread holds that Event's lock
+    (`client-feed/src/client_feed/cli.py::_publish_until_signalled`). δ's inbox tail is
+    `client-feed/src/client_feed/inbox.py::read_inbox`, with its offset in `Cursor.inbox_offset`.
+- 2026-10-22, from task 7221 (B22). These bind γ (6970) and ε (6972):
+  - (a) A test case id reaches the feed through
+    `client-feed/src/client_feed/sources/archive.py::_case_id`, which applies
+    `client-feed/src/client_feed/redact.py::redact_paths`. γ emits `read_archived_run`'s case ids as
+    they are and never re-derives them.
+  - (b) ε's `criteria_results` `results[].tests` carries those same ids. The collection map's nodeids
+    are converted to that spelling, redaction included, before the join, so both sides of the join
+    pass through the one rule and no raw nodeid is emitted. The staging CLI
+    (`client-feed criteria-results --run-kind staging`) follows the same rule.
+  - (c) Case ids were never unique, and redaction can merge parametrized ids (measured 2026-10-22 on
+    task 5244's archived junits: 90,933 cases, 3,199 duplicate ids before redaction and 3,220
+    after). A join must not assume one case per id.
+
 ## 13. Open questions (tactical)
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
@@ -379,7 +518,9 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
    per project, `--config ~/.config/client-feed/<name>.yaml`. Decide in η.
 3. **Default globs** for visible, test, docs and generated sets. Suggested as in §7.2 and §7.6, with
    `visible_globs` having no default (a policy must name it). Decide in β2.
-4. **`excerpt` rule for PRDs** whose first paragraph is a status line. Suggested: first paragraph after
-   the first `## ` heading. Decide in β1.
+4. **`excerpt` rule for PRDs** whose first paragraph is a status line. **Decided by β1 (6968):** the
+   first paragraph after the first `## ` heading, skipping subheadings and fenced blocks; the title is
+   the first H1, else the path; both are path-redacted
+   (`client-feed/src/client_feed/sources/prds.py::summarize_prd`).
 5. **Where the plugin writes the map when no `--junitxml` is given.** Suggested: nowhere; the plugin is
    inert without a junit target. Decide in ε.

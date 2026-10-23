@@ -30,6 +30,7 @@ from orchestrator.mcp.plan_tools import (
     _drop_plan_file,
     _mark_step_committed,
     _mark_step_done,
+    _record_step_deviation,
     _remove_plan_step,
     _replace_plan_step,
     _update_plan_metadata,
@@ -135,6 +136,14 @@ _CENSUS = [
             _step(plan, 'step-1')['status'] == 'done' and _step(plan, 'step-1')['commit'] == head
         ),
     ), id='mark_step_done'),
+    pytest.param(_Case(
+        mutate=lambda ta, head: _record_step_deviation(
+            ta, 'step-1', 'other', 'observed', 'expected', 'action taken',
+        ),
+        landed=lambda plan, head: [
+            d['observed'] for d in _step(plan, 'step-1')['deviations']
+        ] == ['observed'],
+    ), id='record_step_deviation'),
     pytest.param(_Case(
         mutate=lambda ta, head: _update_plan_metadata(ta, analysis='new'),
         landed=lambda plan, head: plan['analysis'] == 'new',

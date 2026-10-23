@@ -42,6 +42,7 @@ import {
   VENDORED_BABEL,
   babelScriptSrcs,
   classicScriptSrcs,
+  compileAsScriptTag,
   loadVendoredBabel,
   readIndexHtml,
 } from './_served_bundle.mjs';
@@ -78,6 +79,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'spend_readings.js': 'DF_SPEND_READINGS',
   'persisted_state.js': 'DF_PERSISTED_STATE',
   'invariant_chip.js': 'DF_INVARIANT_CHIP',
+  'deferral_cell.js': 'DF_DEFERRAL_CELL',
 };
 
 // NOTE — no `document` shim, and that omission is load-bearing rather than an
@@ -265,10 +267,6 @@ test('the harness actually detects a duplicate top-level const (negative control
 });
 
 // ── The text/babel .jsx tags ──────────────────────────────────────────────
-
-function compileAsScriptTag(source, filename) {
-  return loadVendoredBabel().transform(source, { ...SCRIPT_TAG_BABEL_OPTIONS, filename, sourceFileName: filename }).code;
-}
 
 const PROBE_SENTINEL = 'classic-scope probe: declarations instantiated, body not run';
 

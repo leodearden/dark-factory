@@ -17,7 +17,6 @@ after the output parse truncates it.
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
 import shlex
 from collections.abc import Mapping, Sequence
@@ -35,6 +34,7 @@ from orchestrator.offline_lane_runs import (
     RUN_OFFLINE_DEEP_SCRIPT,
     ConfirmRunner,
     OutputFormat,
+    command_cwd,
     junit_failing_node_ids,
 )
 from orchestrator.verify import (
@@ -50,8 +50,6 @@ from orchestrator.verify_cmd import ToolKind, VerifyCmd, parse_config_command, r
 
 if TYPE_CHECKING:
     from orchestrator.config import LaneCommand
-
-logger = logging.getLogger(__name__)
 
 CONFIRM_TEST_TIMEOUT_SECS = 300
 NUMERIC_CONFIRM_IDS_EXIT = 100
@@ -315,7 +313,7 @@ def _compared(mode: ConfirmMode, detect: RunRecord, rerun: RunRecord) -> Confirm
 async def _confirm_generic(
     cmd: LaneCommand, worktree: Path, detect: RunRecord, runner: ConfirmRunner,
 ) -> Confirmed | Unconfirmable:
-    run_cwd = worktree / cmd.cwd
+    run_cwd = command_cwd(worktree, cmd)
     mode = confirm_mode(cmd, detect)
     ids = node_ids_of(_as_pytest_failures(detect))
     narrowed = mode is ConfirmMode.NARROWED
@@ -398,21 +396,3 @@ async def confirm(
         return await _confirm_numeric(target.worktree, runner)
     return await _confirm_infra(target.worktree, detect, runner)
 
-
-def legacy_confirmed_ids(
-    outcome: Confirmed | Unconfirmable, *, command_name: str, leg: Leg,
-) -> list[str]:
-    """TRANSITIONAL (deleted by δ2): the id list the lane's existing red path consumes.
-
-    Only a generic command whose confirm exited non-zero naming no test gets the
-    command-level ``<command_name>::unconfirmable`` sentinel; every other
-    unconfirmable pass confirms nothing, with a warning naming its reason.
-    """
-    if isinstance(outcome, Confirmed):
-        return sorted(outcome.reproduced)
-    if leg is Leg.GENERIC and outcome.reason is UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST:
-        return [f'{command_name}::unconfirmable']
-    logger.warning(
-        'offline-lane: %s pass unconfirmable: %s %s', command_name, outcome.reason, outcome.detail,
-    )
-    return []

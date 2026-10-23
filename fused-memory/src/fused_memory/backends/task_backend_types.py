@@ -7,12 +7,21 @@ no defensive ``.get('data')`` unwrapping. Id-bearing fields surface as
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Any, NotRequired, TypedDict
 
 
 class AddTaskResult(TypedDict):
     id: str
     message: str
+
+
+class DefectWriteResult(TypedDict):
+    """``apply_defect_events``' reply: both defect keys as stored after the write."""
+
+    id: str
+    message: str
+    defects: list[dict[str, Any]]
+    defect_test_retirements: list[dict[str, Any]]
 
 
 class UpdateTaskResult(TypedDict):
@@ -80,10 +89,37 @@ class GetTasksResult(TypedDict):
     tasks: list[dict]
 
 
+class MetadataLookupRow(TypedDict):
+    """One task carrying the looked-up metadata key; ``task_id`` is an int."""
+
+    task_id: int
+    title: str
+    status: str
+    priority: str
+    updated_at: str
+    matched_value: NotRequired[Any]
+
+
+class MetadataLookupResult(TypedDict):
+    """DTO for ``find_tasks_by_metadata`` — one page plus whole-corpus counts.
+
+    ``total`` counts every match and ``tasks_with_key`` every task carrying
+    the key, both over the status-filtered corpus, not just this page.
+    """
+
+    results: list[MetadataLookupRow]
+    total: int
+    tasks_with_key: int
+    malformed_metadata_ids: list[int]
+
+
 __all__ = [
     'AddTaskResult',
+    'DefectWriteResult',
     'DependencyResult',
     'GetTasksResult',
+    'MetadataLookupResult',
+    'MetadataLookupRow',
     'RemoveTaskResult',
     'SetTaskStatusResult',
     'StatusWriteNotPersistedResult',

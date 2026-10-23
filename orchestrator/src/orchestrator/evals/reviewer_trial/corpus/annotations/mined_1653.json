@@ -24,6 +24,54 @@
       "severity": "suggestion",
       "description": "The verify-then-retry instruction ('confirm it returns >= 1 ... A return of 0 means ... retry the add_memory write once') assumes count_memories_by_metadata is immediately consistent with the just-completed add_memory. If Qdrant metadata indexing lags the write (read-after-write delay), the count can transiently return 0 even though the write persisted, and the mandated retry then creates a duplicate cycle summary \u2014 the same duplicate-per-cycle entry the surrounding text warns later cycles must clean up. The same pattern was added to stage2.py:227-233.",
       "mutation_type": "api_misuse"
+    },
+    {
+      "id": "mined_1653_pool_01",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:151",
+      "category": "unresolvable_reference",
+      "severity": "suggestion",
+      "description": "The new prompt text cites 'task 9af436fe' as where Stage 2's stage='task_knowledge_sync' metadata was introduced (stage1.py:151, stage1.py:357, stage3.py:98), and uses it to define which Stage 2 summaries are 'legacy' and lack metadata.stage. Task ids in this project are integers and 9af436fe is not a git object; the change that added the stage key is commit 134380786d (the task record calls 9af436fe a run). The pointer cannot be followed, so the legacy boundary it defines is unrecoverable.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1653_pool_02",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:160",
+      "category": "ineffective_retry",
+      "severity": "suggestion",
+      "description": "The new post-write self-check (stage1.py:153-161, copied at stage2.py:226-233) tells the agent, on a count of 0, to retry add_memory 'once with the same content and metadata', and stage1.py claims this 'mirrors the dedup-retry pattern at \"Verifying Writes\"'. Verifying Writes (stage1.py:66-69) says to retry with DIFFERENT content. Identical content (same summary_nonce, same uniqueness_token) is exactly what Mem0's ~0.92 cosine dedup drops or merges, so the retry cannot recover either failure mode it targets (first write deduped, or write landed without the stage key), and the prompt gives no way to tell these apart (e.g. checking the first write's memory_ids or a stage-less count). The 'mirrors' cross-reference misdescribes the instruction it cites.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1653_pool_03",
+      "location": "fused-memory/tests/test_stages.py",
+      "category": "missing_test",
+      "severity": "suggestion",
+      "description": "The change rewrites a cross-stage metadata contract in three prompts (Stage 1 writes cycle_summary with stage='memory_consolidator'; Stage 1/Stage 3 Path 2 lookups for the Stage 2 summary must include stage='task_knowledge_sync') but adds no test. test_stages.py already pins prompt content with substring assertions, so a later edit that drops the stage key from a lookup (silently suppressing a needed reconstruction) or from the Stage 1 write would pass every gate.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1653_pool_04",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage3.py:76",
+      "category": "duplication_spot",
+      "severity": "suggestion",
+      "description": "The cycle-summary filter literals {'kind': 'cycle_summary', 'run_id': ..., 'stage': '<stage>'} are hand-copied about eight times across stage1.py, stage2.py and stage3.py, the 'stage key is REQUIRED because Stage 1 shares the run_id' rationale paragraph is written three times, and the stage strings restate StageId.memory_consolidator / StageId.task_knowledge_sync as literals. prompts/__init__.py already shares cross-stage fragments, and the bug being fixed is itself drift between such copies; the next schema change must find every copy.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1653_pool_05",
+      "location": "fused-memory/src/fused_memory/server/tools.py:800",
+      "category": "stale_tool_contract",
+      "severity": "blocking",
+      "description": "The count_memories_by_metadata MCP tool docstring (the tool description every LLM caller sees) still gives filters={'kind': 'cycle_summary', 'run_id': '<run_id>'} as its 'Primary use-case: confirming whether a Stage 2 per-cycle summary exists' and says 'A return value > 0 means the summary is present' (tools.py:800-808, Args example at :816). Once this change has Stage 1 write its own cycle_summary under the same run_id, that stage-less filter returns >0 when only the Stage 1 summary exists, so the tool's own documented usage is the false-present query the new prompts forbid. Any new prompt or agent that copies the lookup from the tool description reintroduces the suppressed-reconstruction bug.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1653_pool_06",
+      "location": "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py",
+      "category": "llm_only_invariant",
+      "severity": "suggestion",
+      "description": "The invariant 'each Stage 1 cycle leaves a summary findable by {kind: cycle_summary, run_id, stage: memory_consolidator}' is enforced only by instructing the LLM to self-check; no harness-side count after the stage runs detects an agent that skips the write or the check, although the harness already calls count_memories_by_metadata deterministically elsewhere. A design-strength gap rather than a defect, since the task specified a prompt-level self-check.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

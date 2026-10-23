@@ -17,11 +17,22 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from types import MappingProxyType
+from typing import Any, ClassVar, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+from pydantic_core import PydanticCustomError
 
 from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
 from shared.task_deferral import DeferralRecord
@@ -47,6 +58,7 @@ __all__ = [
     'is_known_metadata_key',
     'parse_metadata',
     'register_metadata_submodel',
+    'script_root_kind_conflict',
     'validate_model_overrides',
 ]
 
@@ -168,6 +180,12 @@ class BeforeDone(BaseModel):
     ``deterministic_task_guard._validate_before_done`` (fused-memory); the
     filesystem-level checks (path containment, executable bit) stay at the
     ``submit_task`` guard — this model enforces only the type/shape layer.
+    With ``script_root='factory'`` the script resolves against
+    ``shared.repo_paths.resolve_dark_factory_root()`` while cwd stays
+    project_root. ``shared.before_done_paths`` resolves that path for both the
+    submit guard and the orchestrator's deterministic runner; only the guard
+    (``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``)
+    checks the resolved file on disk — the runner joins the path and runs it.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -179,14 +197,119 @@ class BeforeDone(BaseModel):
     timeout_secs: int = Field(gt=0)
     target_unit: str | None = None
     kind: Literal['deploy', 'predicate'] = 'deploy'
+    script_root: Literal['project', 'factory'] = 'project'
+
+    @model_validator(mode='after')
+    def _factory_script_root_requires_predicate(self) -> BeforeDone:
+        conflict = script_root_kind_conflict(self.script_root, self.kind)
+        if conflict is not None:
+            raise ValueError(f'BeforeDone: {conflict}')
+        return self
+
+
+def script_root_kind_conflict(script_root: str, kind: str) -> str | None:
+    """Why ``before_done`` may not pair *script_root* with *kind*; ``None`` when it may.
+
+    The single statement of the predicate-only rule for factory-rooted scripts,
+    called by ``BeforeDone``, the fused-memory submit guard and
+    ``shared.before_done_paths.resolve_script_base``.
+    """
+    if script_root == 'factory' and kind != 'predicate':
+        return (
+            f"script_root='factory' requires kind='predicate' (got kind={kind!r}); "
+            'a deploy runs a script from its own project.'
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class _KindRules:
+    """What one ``done_provenance.kind`` demands and records.
+
+    ``required`` and ``write_required`` pair a field with the remedy text a
+    caller sees when it is missing; ``evidence`` names the kind-specific
+    fields a done write records beyond ``kind``, ``commit`` and ``note``.
+    """
+
+    required: tuple[tuple[str, str], ...] = ()
+    write_required: tuple[tuple[str, str], ...] = ()
+    evidence: tuple[str, ...] = ()
+
+
+_DONE_PROVENANCE_RULES: Mapping[str, _KindRules] = MappingProxyType(
+    {
+        'merged': _KindRules(
+            required=(
+                (
+                    'commit',
+                    '<sha-or-ref>, the merge commit on main; use kind="found_on_main" '
+                    '(commit + note) when this branch did not supply the merge but the '
+                    'work is already on main under a different commit',
+                ),
+            ),
+        ),
+        'found_on_main': _KindRules(
+            required=(
+                (
+                    'commit',
+                    '<sha-or-ref>, the impl-providing commit on main (ancestor-checked); '
+                    'note alone is not accepted; use kind="merged" when this branch '
+                    'supplied the merge',
+                ),
+                ('note', '<text> citing the impl-providing task or commit'),
+            ),
+        ),
+        'operational-verified': _KindRules(
+            required=(
+                ('escalation_id', '<resolving escalation id>, recorded verbatim'),
+                ('note', '<text> describing the operational action taken'),
+            ),
+            evidence=('escalation_id',),
+        ),
+        'deterministic-gate': _KindRules(
+            write_required=(
+                (
+                    'escalation_id',
+                    '<resolving gate escalation id>, recorded verbatim; '
+                    'DeterministicRunner supplies it from the milestone_gate record, and '
+                    'a hand-built blob must at minimum name the record it closes against',
+                ),
+            ),
+            evidence=('escalation_id',),
+        ),
+        'deterministic-deploy': _KindRules(evidence=('unit', 'pid', 'active_enter_timestamp')),
+        'deterministic-deploy-scheduled': _KindRules(
+            evidence=('unit', 'transient_unit', 'fire_delay_secs'),
+        ),
+        'deterministic-milestone': _KindRules(),
+    }
+)
+
+_WRITE_CHOKEPOINT = 'shared.task_metadata.DoneProvenance.write_chokepoint'
 
 
 class DoneProvenance(BaseModel):
-    """``metadata.done_provenance`` — the single valid-kinds declaration (I2).
+    """``metadata.done_provenance`` — the done-evidence contract, per kind.
 
-    ``kind`` is the *only* place the valid-kinds vocabulary is declared;
-    fused-memory's ``_VALID_PROVENANCE_KINDS`` is retired in favour of
-    importing this model (see PRD §5, I2).
+    ``kind`` is the valid-kinds vocabulary (I2). ``_DONE_PROVENANCE_RULES`` is
+    the single home of what each kind requires and which evidence fields a
+    done write records for it; an import-time check keeps its keys equal to
+    the ``kind`` Literal.
+
+    A rule's ``write_required`` fields are enforced only by
+    :meth:`parse_for_write`, the write chokepoint's entry point, so blobs that
+    predate a tightening keep validating at read time: deterministic-gate
+    blobs written before task 5241 carry no ``escalation_id``.
+
+    A blank or whitespace-only string field reads as absent, so "commit is
+    required" means the same thing at read time and at the write chokepoint.
+
+    ``COMMIT_REQUIRED_KINDS`` also stands for "the ancestor-checked commit is
+    the evidence that this task's work landed on main": the phantom-done skip
+    in ``fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._apply_status_transition``
+    and ``fused-memory/src/fused_memory/middleware/task_interceptor.py::_check_reopen_freshness``
+    read it that way. A kind that requires a commit meaning anything else must
+    split that set first.
 
     ``stamped_at`` (task 3576) is the dedicated stamp-*write* timestamp
     (ISO-8601 UTC) for ``kind='found_on_main'``. It is written SERVER-SIDE
@@ -198,18 +321,23 @@ class DoneProvenance(BaseModel):
     soak-gate predicate needs that question answered to distinguish a
     genuinely new spurious stamp from legacy backlog.
 
-    It is deliberately OPTIONAL rather than conditionally-required for
-    ``found_on_main`` (i.e. ``_check_conditional_requirements`` is
-    deliberately NOT extended) for two reasons: ~193 historical stamps
-    predate the field and must keep validating at read time, and — more
-    importantly — its ABSENCE is itself load-bearing signal. Because every
-    write after task 3576 lands populates it at the chokepoint, a blob
-    lacking it provably predates that landing, which is exactly how
+    It is deliberately OPTIONAL rather than required for ``found_on_main``
+    for two reasons: ~193 historical stamps predate the field and must keep
+    validating at read time, and — more importantly — its ABSENCE is itself
+    load-bearing signal. Because every write after task 3576 lands populates
+    it at the chokepoint, a blob lacking it provably predates that landing,
+    which is exactly how
     ``fused-memory/scripts/check_found_on_main_spurious_rate.py`` separates
     legacy backlog from new stamps.
     """
 
     model_config = ConfigDict(extra='allow')
+
+    COMMIT_REQUIRED_KINDS: ClassVar[frozenset[str]] = frozenset(
+        kind
+        for kind, rules in _DONE_PROVENANCE_RULES.items()
+        if any(name == 'commit' for name, _ in rules.required)
+    )
 
     kind: Literal[
         'merged',
@@ -225,27 +353,73 @@ class DoneProvenance(BaseModel):
     pid: int | None = None
     unit: str | None = None
     active_enter_timestamp: str | None = None
+    transient_unit: str | None = None
+    fire_delay_secs: int | None = None
     escalation_id: str | None = None
     # Server-written; see the class docstring. Optional by design — absence
     # means "predates task 3576", which the soak-gate predicate relies on.
     stamped_at: str | None = None
 
+    @classmethod
+    def parse_for_write(cls, raw: object) -> DoneProvenance:
+        """Validate ``raw`` as a done write, enforcing every rule's ``write_required``."""
+        return cls.model_validate(raw, context={_WRITE_CHOKEPOINT: True})
+
+    def recorded_evidence(self) -> dict[str, Any]:
+        """The fields a done write records for this kind, absent ones omitted."""
+        names = ('commit', 'note', *_DONE_PROVENANCE_RULES[self.kind].evidence)
+        evidence: dict[str, Any] = {'kind': self.kind}
+        for name in names:
+            value = getattr(self, name)
+            if value is not None:
+                evidence[name] = value
+        return evidence
+
+    @field_validator(
+        'kind',
+        'commit',
+        'note',
+        'escalation_id',
+        'unit',
+        'active_enter_timestamp',
+        'transient_unit',
+        mode='before',
+    )
+    @classmethod
+    def _blank_is_absent(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
     @model_validator(mode='after')
-    def _check_conditional_requirements(self) -> DoneProvenance:
-        if self.kind in ('merged', 'found_on_main') and self.commit is None:
-            raise ValueError(f'DoneProvenance: commit is required when kind={self.kind!r}.')
-        if self.kind == 'found_on_main' and self.note is None:
-            raise ValueError("DoneProvenance: note is required when kind='found_on_main'.")
-        if self.kind == 'operational-verified':
-            if self.escalation_id is None:
-                raise ValueError(
-                    "DoneProvenance: escalation_id is required when kind='operational-verified'."
-                )
-            if self.note is None:
-                raise ValueError(
-                    "DoneProvenance: note is required when kind='operational-verified'."
+    def _check_conditional_requirements(self, info: ValidationInfo) -> DoneProvenance:
+        rules = _DONE_PROVENANCE_RULES[self.kind]
+        checked = rules.required
+        if info.context and info.context.get(_WRITE_CHOKEPOINT):
+            checked = checked + rules.write_required
+        for name, remedy in checked:
+            if getattr(self, name) is None:
+                raise PydanticCustomError(
+                    'done_provenance_field_required',
+                    'done_provenance with kind="{kind}" requires {field}={remedy}.',
+                    {'kind': self.kind, 'field': name, 'remedy': remedy},
                 )
         return self
+
+
+def _check_rules_cover_declared_kinds() -> None:
+    declared = set(get_args(DoneProvenance.model_fields['kind'].annotation))
+    kinds_without_rules = declared - set(_DONE_PROVENANCE_RULES)
+    rules_for_undeclared_kinds = set(_DONE_PROVENANCE_RULES) - declared
+    if kinds_without_rules or rules_for_undeclared_kinds:
+        raise RuntimeError(
+            '_DONE_PROVENANCE_RULES must have exactly one entry per DoneProvenance.kind: '
+            f'kinds without rules {sorted(kinds_without_rules)}, '
+            f'rules for undeclared kinds {sorted(rules_for_undeclared_kinds)}'
+        )
+
+
+_check_rules_cover_declared_kinds()
 
 
 class MemoryHints(BaseModel):
@@ -1041,6 +1215,8 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         'curator_action',
         'curator_justification',
         'combined_at',
+        # stamped by the task curator on every create its dedupe pass did not judge; the re-dedupe sweep key
+        'dedupe_skipped',
         'gate_escalated_at',
         'before_done_ran_at',
         'before_done_verified_at',
@@ -1266,9 +1442,12 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # writers `orchestrator/src/orchestrator/merge_queue.py::
         # SpeculativeMergeWorker::_spawn_main_health_fix_task` (auto-heal
         # main-health fix task, 'high'), `orchestrator/src/orchestrator/
-        # workflow.py::build_offline_lane_fix_task_arguments` (offline-lane fix
-        # task, 'normal') and `orchestrator/src/orchestrator/workflow.py::
-        # TaskWorkflow::_spawn_main_health_fix_task` (fix-main brief, 'high');
+        # offline_lane_filing.py::build_lane_fix_task_arguments` and
+        # `::build_lane_command_task_arguments` (offline-lane fix tasks,
+        # 'normal') and `orchestrator/src/orchestrator/workflow.py::
+        # TaskWorkflow::_spawn_main_health_fix_task` (fix-main brief, 'high'),
+        # plus the operator tool `escalation/src/escalation/server.py::
+        # merge_relane` (task 5246, either value, on every task it re-lanes);
         # reader `orchestrator/src/orchestrator/merge_queue.py::
         # lane_for_task_metadata` -> `_normalize_lane`, consumed at
         # `orchestrator/src/orchestrator/workflow.py::TaskWorkflow::
@@ -1337,6 +1516,15 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # §10): written and read back only by
         # `fused-memory/src/fused_memory/reconciliation/audit_trail_rotation.py`.
         'audit_trail_rotation',
+        # Plan task-text provenance mirror (task 4031): written by orchestrator
+        # TaskWorkflow._mirror_plan_text_fp at plan authoring; read by
+        # fused-memory's amendment advisory (task 4034).
+        'plan_text_fp',
+        'plan_authored_at',
+        # The sha-independent main-break signature a fix-main task owns (task 5471):
+        # written by orchestrator/src/orchestrator/main_health_fix_owner.py, which
+        # also reads it back through find_tasks_by_metadata as its dedupe key.
+        'main_health_signature',
     }
 )
 

@@ -36,18 +36,18 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import (
+    InflightStatus,
+    InflightVerifyResult,
+    QueuedBranch,
+)
+from orchestrator.merge_lane.worker import (
     InflightEntry,
     MergedOk,
     MergeRequest,
     RealMergeItem,
     SpeculativeMergeWorker,
     classify_and_merge,
-)
-from orchestrator.merge_types import (
-    InflightStatus,
-    InflightVerifyResult,
-    QueuedBranch,
 )
 from orchestrator.verify import VerifyResult
 
@@ -103,7 +103,7 @@ def _make_git_ops_mock() -> MagicMock:
     mock.get_main_sha = AsyncMock(return_value='main-sha')
     mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
     mock.cleanup_merge_worktree = AsyncMock()
-    mock.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+    mock.create_ephemeral_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
     return mock
 
 
@@ -153,7 +153,7 @@ class TestRunPostMergeVerifyDepthPlumbing:
     async def test_depth_and_speculative_propagate_into_merge_verify_event(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _make_bare_config()
         req = _make_request('t-depth', 'task/t-depth', tmp_path, config)
@@ -177,7 +177,7 @@ class TestRunPostMergeVerifyDepthPlumbing:
         self, tmp_path: Path,
     ) -> None:
         """Legacy call form (no depth/speculative kwargs) -> both None in the event."""
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _make_bare_config()
         req = _make_request('t-nodepth', 'task/t-nodepth', tmp_path, config)
@@ -241,7 +241,7 @@ class TestRunPostMergeVerifyChainItemsPlumbing:
         *results* is consumed one per ``pool.dispatch`` call (the last is
         repeated if the code dispatches more times than scripted).
         """
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _make_bare_config()
         req = _make_request('t-chain', 'task/t-chain', tmp_path, config)
@@ -523,7 +523,7 @@ class TestDispatchItemComputesTruthfulChainItems:
         relabelled all the way to the probe's 5 while ``chain_items`` does not
         move off 1 — the two fields visibly answer different questions.
         """
-        from orchestrator.merge_queue import ProbePlacement
+        from orchestrator.merge_lane.worker import ProbePlacement
 
         captured = await self._dispatch_kwargs(
             tmp_path, frontier=1, speculative=True,

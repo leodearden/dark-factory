@@ -29,7 +29,11 @@ CREATE TABLE IF NOT EXISTS runs (
     escalated      INTEGER DEFAULT 0,
     total_cost_usd REAL DEFAULT 0.0,
     paused_for_cap INTEGER DEFAULT 0,
-    cap_pause_secs REAL DEFAULT 0.0
+    cap_pause_secs REAL DEFAULT 0.0,
+    -- Task 6565: the commit the process's verify wire path was imported from
+    -- (orchestrator.deployed_sha.DeployedSha.sha); NULL when unreadable or the
+    -- row predates 6565.  Migrated by _migrate_runs_code_sha.
+    code_sha       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_results (
@@ -127,6 +131,7 @@ class RunStore:
             # already-deployed runs.db needs the explicit ALTER.
             self._migrate_task_results_block_context(conn)
             self._migrate_scheduler_state_ewa_value(conn)
+            self._migrate_runs_code_sha(conn)
         finally:
             conn.close()
 
@@ -230,25 +235,51 @@ class RunStore:
         conn.commit()
         logger.info('RunStore: migrated scheduler_state — added ewa_value')
 
+    def _migrate_runs_code_sha(self, conn: sqlite3.Connection) -> None:
+        """Add ``code_sha`` to a pre-6565 ``runs``.
+
+        Same shape as :meth:`_migrate_scheduler_state_ewa_value`, deliberately:
+        additive-only, ``PRAGMA table_info`` feature-detect, the column added
+        LAST, a concurrent construction's ``duplicate column name`` swallowed
+        and every other failure raised.  An existing row reads NULL, meaning
+        "the run predates task 6565".
+        """
+        existing = {row[1] for row in conn.execute('PRAGMA table_info(runs)')}
+        if 'code_sha' in existing:
+            return
+        try:
+            # Column name is a hard-coded literal, never caller input.
+            conn.execute('ALTER TABLE runs ADD COLUMN code_sha TEXT')
+        except sqlite3.OperationalError as exc:
+            if 'duplicate column name' not in str(exc).lower():
+                raise
+            logger.debug('RunStore: runs.code_sha already added concurrently')
+            return
+        conn.commit()
+        logger.info('RunStore: migrated runs — added code_sha')
+
     def start_run(
         self,
         run_id: str,
         project_id: str,
         started_at: str,
         prd_path: str | None = None,
+        *,
+        code_sha: str | None = None,
     ) -> None:
         """Insert an initial runs row at orchestrator startup.
 
-        The row is updated with final aggregates via :meth:`finish_run`
-        when the run completes.
+        *code_sha* is the commit the process's wire path was imported from
+        (task 6565), ``None`` when it could not be read.  The row is updated
+        with final aggregates via :meth:`finish_run` when the run completes.
         """
         conn = self._connect()
         try:
             conn.execute(
                 'INSERT OR IGNORE INTO runs '
-                '(run_id, project_id, prd_path, started_at) '
-                'VALUES (?, ?, ?, ?)',
-                (run_id, project_id, prd_path, started_at),
+                '(run_id, project_id, prd_path, started_at, code_sha) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (run_id, project_id, prd_path, started_at, code_sha),
             )
             conn.commit()
         finally:

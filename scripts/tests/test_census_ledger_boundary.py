@@ -7,6 +7,7 @@ fakes, passed through ``run_census``'s own parameters.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import random
@@ -22,18 +23,32 @@ from legibility import (
     census_identity,
     census_window,
     config,
+    embeddings,
     inventory,
     session_ledger,
     trickle_state,
     unlanded,
 )
 from legibility.session_ledger import CodedBy, LedgerRow, Outcome
+from legibility_task_store_fake import FakeTaskStore
 
 _NOW = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
 _DATE = "2026-10-06"
 _RUN_ID = "census-p-20261006"
 _EMPTY_JUDGMENT = json.dumps({"matches": [], "candidates": []})
 _LANDED = unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1)
+_EMPTY_SYNTHESIS = json.dumps(
+    {"new": [], "re_observed": [], "phase_refinements": [], "corrections": [], "notes": []},
+)
+_ONE_HOT_AXES = itertools.count()
+
+
+def _distinct_one_hot_embed(texts, *, model):
+    """An embed_fn under which no two texts are ever similar: each text gets
+    a one-hot vector on an axis no earlier text was given."""
+    axes = [next(_ONE_HOT_AXES) for _ in texts]
+    width = max(axes, default=-1) + 1
+    return [[1.0 if index == axis else 0.0 for index in range(width)] for axis in axes]
 
 
 @pytest.fixture(autouse=True)
@@ -159,13 +174,17 @@ class _Census:
             selection_of=lambda: source.selection,
             invoke=_Invoke(),
             verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
-            synthesize_fn=lambda verified, *, model: "No novel clusters this census.",
+            synthesize_fn=lambda brief, *, model: _EMPTY_SYNTHESIS,
             submit_fn=_Recorder({"ticket": "tkt_1"}),
+            task_store=FakeTaskStore(),
             escalate_fn=_Recorder(),
             status_fetcher=lambda: {"statuses": {}},
             commit=_Recorder(_LANDED),
             roll_back=_Recorder(unlanded.Rollback(quarantine_dir=None, paths=())),
             codebook_dict={"version": 2, "entries": [], "candidates": []},
+            embedder=embeddings.Embedder(
+                embed_fn=_distinct_one_hot_embed, cache_path=embeddings.cache_path("p"),
+            ),
             config=self.cfg,
             project_root=self.cwd,
             project_id="p",

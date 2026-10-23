@@ -32,13 +32,14 @@ import pytest
 # step-1: core surface
 # ---------------------------------------------------------------------------
 
-# The exact 16-member closed output domain of verify._classify_failure today
-# (the 12 legacy category strings, task 2549's DISK_FULL/SEMAPHORE_TIMEOUT
+# The exact 19-member closed domain of per-leg classification today (the 12
+# legacy category strings, task 2549's DISK_FULL/SEMAPHORE_TIMEOUT
 # host-infrastructure categories, task 3173's INFRA_KILL external-signal
-# category, and task 5580's PYTEST_USAGE_ERROR — the pytest-side analogue of
-# CARGO_CLI_ERROR), including the '' (NONE) empty-string sentinel (default of
-# _worst_category on empty input; a member of both _CATEGORY_PRIORITY and
-# _ARCHIVE_DENY_LIST).
+# category, task 5580's PYTEST_USAGE_ERROR — the pytest-side analogue of
+# CARGO_CLI_ERROR — and task 4843's LINT_ERROR/TYPE_ERROR leg-slot categories
+# and INFRA_ABORT verdictless-xdist-exit category), including the '' (NONE)
+# empty-string sentinel (default of _worst_category on empty input; a member
+# of both _CATEGORY_PRIORITY and _ARCHIVE_DENY_LIST).
 _EXPECTED_CATEGORY_VALUES = {
     'infra_timeout',
     'infra_kill',
@@ -51,24 +52,27 @@ _EXPECTED_CATEGORY_VALUES = {
     'flock_error',
     'npm_error',
     'pytest_internalerror',
-    'env_transient',
     'test_failure',
+    'type_error',
+    'lint_error',
     'unknown_test_failure',
+    'infra_abort',
+    'env_transient',
     'passed',
     '',
 }
 
 
 class TestFailureCategoryMemberSet:
-    """FailureCategory is a StrEnum with exactly the 16 category strings."""
+    """FailureCategory is a StrEnum with exactly the 19 category strings."""
 
     def test_member_values_match_legacy_category_set_exactly(self):
         from orchestrator.verify_categories import FailureCategory
         assert {c.value for c in FailureCategory} == _EXPECTED_CATEGORY_VALUES
 
-    def test_member_count_is_sixteen(self):
+    def test_member_count_is_nineteen(self):
         from orchestrator.verify_categories import FailureCategory
-        assert len(list(FailureCategory)) == 16
+        assert len(list(FailureCategory)) == 19
 
     def test_is_strenum_subclass(self):
         from enum import StrEnum
@@ -150,9 +154,9 @@ class TestCategoryPolicyExhaustive:
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         assert set(CATEGORY_POLICY) == set(FailureCategory)
 
-    def test_row_count_is_sixteen(self):
+    def test_row_count_is_nineteen(self):
         from orchestrator.verify_categories import CATEGORY_POLICY
-        assert len(CATEGORY_POLICY) == 16
+        assert len(CATEGORY_POLICY) == 19
 
 
 class TestCategoryPolicyGoldenRows:
@@ -189,7 +193,7 @@ class TestCategoryPolicyGoldenRows:
     def test_none_row(self):
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         row = CATEGORY_POLICY[FailureCategory.NONE]
-        assert row.severity_rank == 15
+        assert row.severity_rank == 18
 
     def test_pytest_usage_error_row(self):
         """Task 5580. Four of the five fields are CARGO_CLI_ERROR's, because
@@ -308,9 +312,12 @@ class TestDerivedRegistriesByteIdentity:
             'flock_error',
             'npm_error',
             'pytest_internalerror',
-            'env_transient',
             'test_failure',
+            'type_error',
+            'lint_error',
             'unknown_test_failure',
+            'infra_abort',
+            'env_transient',
             'passed',
             '',
         ]
@@ -348,14 +355,14 @@ class TestDerivedRegistriesByteIdentity:
         from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES
         assert frozenset({
             'infra_timeout', 'flock_error', 'pytest_internalerror', 'env_transient',
-            'disk_full', 'semaphore_timeout', 'infra_kill',
+            'disk_full', 'semaphore_timeout', 'infra_kill', 'infra_abort',
         }) == PREEXISTING_BREAK_SKIP_CATEGORIES
 
     def test_infra_transient_categories_matches_legacy_sweep_set(self):
         from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
         assert frozenset({
             'pytest_internalerror', 'env_transient', 'disk_full', 'semaphore_timeout',
-            'infra_kill',
+            'infra_kill', 'infra_abort',
         }) == INFRA_TRANSIENT_CATEGORIES
 
 
@@ -392,6 +399,9 @@ class TestShouldArchive:
             ('env_transient', True),
             ('test_failure', False),
             ('unknown_test_failure', True),
+            ('lint_error', True),
+            ('type_error', True),
+            ('infra_abort', True),
             ('passed', False),
             ('', False),
         ],
@@ -565,7 +575,8 @@ class TestCrossModulePreexistingSingleSourced:
     """
 
     def test_merge_queue_preexisting_is_the_derived_object(self):
-        from orchestrator import merge_queue, verify_categories
+        from orchestrator import verify_categories
+        from orchestrator.merge_lane import worker as merge_queue
         assert (
             merge_queue.PREEXISTING_BREAK_SKIP_CATEGORIES
             is verify_categories.PREEXISTING_BREAK_SKIP_CATEGORIES
@@ -1066,7 +1077,7 @@ class TestIndeterminateVerdictCategories:
         for category in (
             'test_failure', 'unknown_test_failure', 'compile_error',
             'cargo_cli_error', 'npm_error', 'tree_sitter_generate_error',
-            'flock_error', 'passed', '',
+            'flock_error', 'lint_error', 'type_error', 'passed', '',
         ):
             assert category not in INDETERMINATE_VERDICT_CATEGORIES, category
 
@@ -1165,6 +1176,23 @@ class TestIndeterminateExclusionsAreAdjudicated:
         assert 'disk_full' not in INDETERMINATE_VERDICT_CATEGORIES
         assert CATEGORY_POLICY[FailureCategory.DISK_FULL].verdict_indeterminate is False
 
+    def test_excludes_infra_abort(self):
+        # Fails parts (2) and (3) (task 4843). Its evidence is a shell-reported
+        # 128+N exit status or xdist's printed teardown signature, and a branch
+        # can produce either: a test that SIGTERMs its own pytest, an
+        # ``exit 143``, or a print of the signature text. So a verdictless
+        # abort is retried as infra but keeps its veto over another host's
+        # PASS. Fail CLOSED.
+        from orchestrator.verify_categories import (
+            CATEGORY_POLICY,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+            FailureCategory,
+        )
+        assert 'infra_abort' in INFRA_TRANSIENT_CATEGORIES
+        assert 'infra_abort' not in INDETERMINATE_VERDICT_CATEGORIES
+        assert CATEGORY_POLICY[FailureCategory.INFRA_ABORT].verdict_indeterminate is False
+
     def test_infra_kill_is_the_only_member_and_its_evidence_is_structural(self):
         # The positive half of the adjudication: infra_kill is the sole member
         # because it is the ONLY category whose evidence is a waitpid status
@@ -1206,3 +1234,100 @@ class TestIndeterminateExclusionsAreAdjudicated:
         )
         assert INDETERMINATE_VERDICT_CATEGORIES < INFRA_TRANSIENT_CATEGORIES
         assert len(INDETERMINATE_VERDICT_CATEGORIES) == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 4843: LINT_ERROR / TYPE_ERROR name the red gate a lint or type leg
+# reached, and INFRA_ABORT names a pytest-xdist leg torn down from outside the
+# tests before it reached a verdict. All rank-related work for the three lives
+# here, once.
+# ---------------------------------------------------------------------------
+
+
+class TestLintTypeAndInfraAbortCategories:
+    """The three members, their adjudicated policy rows, and the deliberate
+    severity order. The order rule: a leg's branch verdict is never masked by
+    ANOTHER leg's infra-transient category (task #4103)."""
+
+    _NEVER_MASKED = (
+        "a leg's branch verdict is never masked by ANOTHER leg's "
+        'infra-transient category'
+    )
+
+    def test_member_values(self):
+        from orchestrator.verify_categories import FailureCategory
+        assert FailureCategory.LINT_ERROR == 'lint_error'
+        assert FailureCategory.TYPE_ERROR == 'type_error'
+        assert FailureCategory.INFRA_ABORT == 'infra_abort'
+
+    @pytest.mark.parametrize('name', ['LINT_ERROR', 'TYPE_ERROR'])
+    def test_lint_and_type_rows_mirror_unknown_test_failure(self, name):
+        """Only the name changes for a lint/type red: every derived registry
+        keeps UNKNOWN_TEST_FAILURE's membership, asserted side by side."""
+        from orchestrator.verify_categories import (
+            ARCHIVE_DENY_LIST,
+            CATEGORY_POLICY,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+            PREEXISTING_BREAK_SKIP_CATEGORIES,
+            FailureCategory,
+            RetryKind,
+            should_archive,
+        )
+        member = FailureCategory[name]
+        mirror = FailureCategory.UNKNOWN_TEST_FAILURE
+        row = CATEGORY_POLICY[member]
+        assert row.archive is True
+        assert row.preexisting_probe is True
+        assert row.is_infra_transient is False
+        assert row.verdict_indeterminate is False
+        assert row.retry_kind == RetryKind.NONE
+        registries = (
+            INFRA_TRANSIENT_CATEGORIES,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            ARCHIVE_DENY_LIST,
+            PREEXISTING_BREAK_SKIP_CATEGORIES,
+        )
+        for registry in registries:
+            assert member not in registry
+            assert (member in registry) == (mirror in registry)
+        assert should_archive(member.value) is True
+        assert should_archive(member.value) == should_archive(mirror.value)
+
+    def test_infra_abort_row(self):
+        from orchestrator.verify_categories import (
+            CATEGORY_POLICY,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+            PREEXISTING_BREAK_SKIP_CATEGORIES,
+            FailureCategory,
+            RetryKind,
+        )
+        row = CATEGORY_POLICY[FailureCategory.INFRA_ABORT]
+        assert row.archive is True
+        assert row.preexisting_probe is False
+        assert row.is_infra_transient is True
+        assert row.verdict_indeterminate is False
+        assert row.retry_kind == RetryKind.NONE
+        assert 'infra_abort' in INFRA_TRANSIENT_CATEGORIES
+        assert 'infra_abort' in PREEXISTING_BREAK_SKIP_CATEGORIES
+        assert 'infra_abort' not in INDETERMINATE_VERDICT_CATEGORIES
+        assert set(INDETERMINATE_VERDICT_CATEGORIES) == {'infra_kill'}
+
+    @pytest.mark.parametrize(
+        ('stronger', 'weaker'),
+        [
+            ('pytest_internalerror', 'test_failure'),
+            ('test_failure', 'type_error'),
+            ('type_error', 'lint_error'),
+            ('lint_error', 'unknown_test_failure'),
+            ('unknown_test_failure', 'infra_abort'),
+            ('infra_abort', 'env_transient'),
+            ('env_transient', 'passed'),
+        ],
+    )
+    def test_severity_order(self, stronger, weaker):
+        from orchestrator.verify_categories import CATEGORY_PRIORITY
+        assert CATEGORY_PRIORITY.index(stronger) < CATEGORY_PRIORITY.index(weaker), (
+            f'{stronger} must outrank {weaker}: {self._NEVER_MASKED}'
+        )

@@ -4481,6 +4481,7 @@ class TestMarkerPayloadKeyInvariant:
         — a ``compute_flag_signature`` input — in its marker payload."""
         from fused_memory.reconciliation.flag_dedup import (
             compute_flag_signature,
+            compute_marker_signature,
             dedup_flags,
         )
 
@@ -4494,7 +4495,9 @@ class TestMarkerPayloadKeyInvariant:
         assert sig == ('3839,598', self.FLAG_TYPE), (
             f'pre-1 measured signature must still hold; got {sig!r}'
         )
-        tid, ftype = sig
+        marker_sig = compute_marker_signature(flag, project_id='know_live')
+        assert marker_sig is not None, 'a well-formed flag must yield a marker identity'
+        tid, ftype = marker_sig
 
         await dedup_flags(
             memory_service=ledger_memory_service,
@@ -4617,7 +4620,7 @@ class TestMarkerPayloadKeyInvariant:
         never write.
         """
         from fused_memory.reconciliation.flag_dedup import (
-            compute_flag_signature,
+            compute_marker_signature,
             dedup_flags,
         )
 
@@ -4657,10 +4660,10 @@ class TestMarkerPayloadKeyInvariant:
             f'cycle did, so it must be a MISS; got {r2[0]!r}'
         )
 
-        # (c) both rows exist, at compute_flag_signature of each cycle's own
+        # (c) both rows exist, at compute_marker_signature of each cycle's own
         # flag, and those two signatures DIFFER.
-        citing_sig = compute_flag_signature(citing_flag)
-        citation_less_sig = compute_flag_signature(citation_less_flag)
+        citing_sig = compute_marker_signature(citing_flag, project_id=self.PROJECT)
+        citation_less_sig = compute_marker_signature(citation_less_flag, project_id=self.PROJECT)
         assert citing_sig is not None, 'a well-formed citing flag must yield a signature'
         assert citation_less_sig is not None, (
             'a well-formed citation-less flag must yield a signature'
@@ -4814,9 +4817,11 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
 
     @staticmethod
     def _signature(flag):
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.flag_dedup import compute_marker_signature
 
-        sig = compute_flag_signature(flag)
+        sig = compute_marker_signature(
+            flag, project_id=TestDedupFlagsCrossProjectFixTaskSuppression.PROJECT
+        )
         assert sig is not None
         return sig
 
@@ -5430,7 +5435,7 @@ class TestDedupFlagsCrossProjectDiscovery:
     Everything the task-4381 gate does stays exactly as ruled — this only
     supplies the citation the gate could never get.  The anti-relocation
     assertion below is the load-bearing one: ``cited_tasks`` is a
-    ``compute_flag_signature`` INPUT read at the TOP of the per-flag loop, so
+    ``compute_marker_signature`` INPUT read at the TOP of the per-flag loop, so
     a discovered citation that reached the flag dict would move the marker to
     a different row.  Since the gate is HIT-only, the first enriched cycle
     would become a MISS; and because discovery matches a live backlog that
@@ -5447,9 +5452,8 @@ class TestDedupFlagsCrossProjectDiscovery:
     #: The signature a citation-less flag keys to — the identity that must
     #: SURVIVE a discovery-driven suppression untouched.
     CITATION_FREE_TID = '598'
-    #: What the row would relocate to if a discovered citation ever reached
-    #: the flag dict before compute_flag_signature read it.
-    RELOCATED_TID = '3839,598'
+    #: The foreign fix task discovery finds for this class's flag.
+    DISCOVERED_CITE = {'project_id': 'dark_factory', 'task_id': '3839'}
 
     @classmethod
     def _flag(cls, task_id: int = 598, description: str | None = None,
@@ -5533,6 +5537,7 @@ class TestDedupFlagsCrossProjectDiscovery:
         """
         from fused_memory.reconciliation.flag_dedup import (
             compute_flag_signature,
+            compute_marker_signature,
             dedup_flags,
         )
 
@@ -5540,6 +5545,10 @@ class TestDedupFlagsCrossProjectDiscovery:
         assert compute_flag_signature(flag) == (
             self.CITATION_FREE_TID, self.FLAG_TYPE,
         ), 'fixture must key to the citation-less signature'
+        relocated_sig = compute_marker_signature(
+            self._flag(cited_tasks=[self.DISCOVERED_CITE]), project_id=self.PROJECT,
+        )
+        assert relocated_sig is not None and relocated_sig[0] != self.CITATION_FREE_TID
         await _seed_marker(
             ledger_memory_service.recon_ledger, self.PROJECT,
             self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
@@ -5565,12 +5574,10 @@ class TestDedupFlagsCrossProjectDiscovery:
         )
         assert row.task_id == self.CITATION_FREE_TID
 
-        relocated = await _get_marker(
-            ledger, self.PROJECT, self.RELOCATED_TID, self.FLAG_TYPE,
-        )
+        relocated = await _get_marker(ledger, self.PROJECT, *relocated_sig)
         assert relocated is None, (
-            'a discovered citation must never reach compute_flag_signature: a '
-            f'row at {self.RELOCATED_TID!r} means the marker RELOCATED, which '
+            'a discovered citation must never reach compute_marker_signature: a '
+            f'row at {relocated_sig[0]!r} means the marker RELOCATED, which '
             'would make every enriched cycle a MISS under a HIT-only gate'
         )
 
@@ -5623,7 +5630,7 @@ class TestDedupFlagsCrossProjectDiscovery:
         task, discovery must not run at all — it is the fallback for findings
         that cite nothing usable, not a second sweep on every cycle."""
         from fused_memory.reconciliation.flag_dedup import (
-            compute_flag_signature,
+            compute_marker_signature,
             dedup_flags,
         )
 
@@ -5633,7 +5640,7 @@ class TestDedupFlagsCrossProjectDiscovery:
             'title': TestDiscoverForeignFixTaskCitations.LIVE_TITLE,
         }
         flag = self._flag(cited_tasks=[cite])
-        sig = compute_flag_signature(flag)
+        sig = compute_marker_signature(flag, project_id=self.PROJECT)
         assert sig is not None
         await _seed_marker(
             ledger_memory_service.recon_ledger, self.PROJECT, sig[0], sig[1],
@@ -5850,13 +5857,13 @@ class TestDedupFlagsCrossProjectDiscovery:
         backend cannot confirm.  The near-miss must not short-circuit the
         fallback."""
         from fused_memory.reconciliation.flag_dedup import (
-            compute_flag_signature,
+            compute_marker_signature,
             dedup_flags,
         )
 
         stale = {'project_id': 'dark_factory', 'task_id': '404', 'title': 'Gone'}
         flag = self._flag(cited_tasks=[stale])
-        sig = compute_flag_signature(flag)
+        sig = compute_marker_signature(flag, project_id=self.PROJECT)
         assert sig is not None, f'the flag must have a signature; got {flag!r}'
         tid, ftype = sig
         await _seed_marker(
@@ -11231,11 +11238,11 @@ class TestCrossProjectGateAmendments:
             flag['cited_tasks'] = cited
         return flag
 
-    @staticmethod
-    def _sig(flag):
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+    @classmethod
+    def _sig(cls, flag):
+        from fused_memory.reconciliation.flag_dedup import compute_marker_signature
 
-        sig = compute_flag_signature(flag)
+        sig = compute_marker_signature(flag, project_id=cls.PROJECT)
         assert sig is not None, f'the flag must have a signature; got {flag!r}'
         return sig
 
@@ -11250,7 +11257,7 @@ class TestCrossProjectGateAmendments:
     async def _seed(self, ledger, flag, **extra_payload):
         """Seed the prior-cycle marker for *flag* (the gate is HIT-only).
 
-        The identity is DERIVED from compute_flag_signature, which unions the
+        The identity is DERIVED from compute_marker_signature, which unions the
         top-level task_id with every cited_tasks id — hardcoding the top-level
         id would seed a row the gate never reads, and the test would pass
         vacuously.

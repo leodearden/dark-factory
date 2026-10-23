@@ -34,6 +34,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from shared.task_complexity import is_simple_complexity
+
 from orchestrator.agents.triage import has_simple_task_blocker
 from orchestrator.evals.snapshots import _run as _git_run
 from orchestrator.evals.snapshots import get_diff_between_commits
@@ -252,7 +254,7 @@ def classify_path(candidate: CompletedTaskCandidate) -> str:
     candidate toward ``'full'`` (never toward a spurious ``'simple'``), which
     is the safe direction for an eval-corpus stratifier.
     """
-    if (candidate.complexity or '').strip().lower() != 'simple':
+    if not is_simple_complexity(candidate.complexity):
         return 'full'
     text = f'{candidate.title}\n{candidate.description}'
     if has_simple_task_blocker(text):

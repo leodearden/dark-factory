@@ -1,24 +1,27 @@
-"""The seed report BOTH merge-lane ratchet suites measure against.
+"""What the merge-lane ratchet suites share: the instrument and the one seed report.
 
-ONE synthetic report, never two. ``test_merge_lane_ratchet.py`` pins what the
-instrument's pure comparators do with it, and
-``test_merge_lane_ratchet_commit_gate.py`` commits it into throwaway repos to
-pin what the commit-time auditor does with the resulting blobs. A second
-declaration would drift, and the two suites would then disagree about what a
-raise looks like.
+The ``scripts/`` modules are imported HERE, once, so no suite carries its own
+``sys.path`` bootstrap; orchestrator/pyproject.toml's [tool.pyright] extraPaths
+already carries "../scripts", so this needs no type-checker config.
 
-It lives HERE rather than in either suite because a test module reaching into a
-sibling test module for a private name is the shape this repo names an
-interface smell -- pointedly, one this very instrument MEASURES. It also tied
-collection of the gate suite to importing a 3700-line sibling. ``_orch_helpers``
-is the home for helpers the WHOLE suite shares; this is the narrower one for a
-single subject, matching the ``_*_fixtures.py`` modules already beside it.
-
-Only what both suites use lives here. ``_blank_file_entry`` stays in
-test_merge_lane_ratchet.py: it has one consumer, so moving it would widen a
-scope rather than single-source a shared one.
+``synthetic_report`` is the ONE seed every suite measures against. A second
+declaration would drift, and the suites would then disagree about what a raise
+looks like. A helper lives here only when more than one suite uses it;
+``_orch_helpers`` is the home for what the whole test tree shares.
 """
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_SCRIPTS = Path(__file__).parents[2] / 'scripts'
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
+import source_measures  # type: ignore[import-not-found]  # noqa: E402
+
+__all__ = ['blank_file_entry', 'metrics', 'source_measures', 'synthetic_report']
 
 
 def synthetic_report() -> dict:
@@ -67,3 +70,16 @@ def synthetic_report() -> dict:
             't2.py': {'patch_targets': ['bar', 'baz'], 'private_reads': 5},
         },
     }
+
+
+def blank_file_entry(**overrides: int) -> dict:
+    """A cluster-file entry with every measure zero, then *overrides* applied."""
+    entry = {
+        'lines': 0,
+        'prose_lines': 0,
+        'cognitive': 0,
+        'function_local_imports': 0,
+        'reexport_names': 0,
+    }
+    entry.update(overrides)
+    return entry

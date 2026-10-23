@@ -515,6 +515,49 @@ landed, have since landed under task 3134 (below).
 
 ### Changed
 
+#### Only a pending owner whose dependencies are not known unsatisfied may hold parks (task 6518, esc-6040-7)
+
+**Old behaviour.** Park GC expired a park only when its owner was terminal, missing from
+the task read, or blocked by a LOCAL dependency. A blocked, deferred, in-review,
+merge-deferred or running owner kept its parks indefinitely, and a cross-project or
+delivered-check dependency was never consulted, because park GC ran before the phases
+that fill those caches.
+
+**New behaviour.** One owner-state predicate,
+`orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal`, decides whether
+an owner may hold parks, pin reservations included: it must be `pending`, and no
+dependency may be known to be unsatisfied. An UNKNOWN dependency (resolver failed,
+dependency absent from the resolver's answer, delivered check not evaluated this tick)
+keeps the park.
+
+- **New `reservation_expired` reasons**: `not_pending:<status>` (any status other than
+  `pending`, terminal excepted), `deps_unsatisfied:external` (the resolver reports a
+  cross-project dependency other than `done`, sentinels included) and
+  `deps_unsatisfied:delivered_check` (a dependency's delivered check ran and failed).
+  `deps_unsatisfied` for a local dependency, `terminal:<status>` and `missing` are
+  unchanged. `LIKE 'deps_unsatisfied%'` catches every dependency expiry.
+- **Park GC moved** after `external_dep_policy` and `delivered_check_gate` in
+  `_TICK_PHASE_ORDER`, with the park-eviction drain still immediately ahead of it, so
+  the dependency arm reads this tick's caches. It still runs before `reserve_now` and the
+  dispatch loops, and on an idle tick.
+- **`request_park_eviction`** is no longer refused (`live_owner`) for an owner park GC
+  would expire: the drain evicts it first and emits `reservation_force_evicted`. It is
+  refused exactly for the owners park GC keeps.
+- **`reserve_now`** on an owner that fails the predicate installs nothing: its flag is
+  consumed and the new `reserve_now_refused` event carries `{reason}` in the vocabulary
+  above.
+- **A released pin head** completes the fairness parks its skips earned only while it
+  is still a dispatch candidate that tick, so a blocked or deferred head drops its whole
+  footprint instead of re-parking it.
+- Dispatch is unchanged: it still treats an unknown dependency as not satisfied. Dispatch
+  and park GC read one tri-state dependency predicate,
+  `orchestrator/src/orchestrator/dependency_verdict.py::deps_verdict`.
+
+**Operator-visible signal.** `reservation_expired` rows with the new reasons in
+`runs.db`, and no fairness `reservation_installed` for a non-pending owner. The design
+note is the task 6518 amendment in `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md`
+§7.
+
 #### Referent repair defers a degraded target lookup instead of minting off it (task 5191)
 
 When zeta's lookup of a repair target fails, the finding carries
@@ -1580,7 +1623,7 @@ contain it.)  The renamed event's pre-1230 form (`reservation_installed` +
 
 #### plan.json writers serialise on a cross-writer mutex (task 5745)
 
-Every plan.json read-modify-write now holds `TaskArtifacts.plan_mutex`: the 12 plan-tools
+Every plan.json read-modify-write now holds `TaskArtifacts.plan_mutex`: the 13 plan-tools
 mutators, the TaskArtifacts plan methods, `read_plan`'s normalization write-back, and the
 markup stamp. It is a reentrant `fcntl.flock` on a `plan.json.mutex` sidecar, keyed on the
 resolved plan path and honoured across threads and processes; the wait is bounded at 60s
