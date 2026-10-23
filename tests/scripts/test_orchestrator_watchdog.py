@@ -50,6 +50,7 @@ from df_pytest_isolation import (  # noqa: E402
     load_scaled_grace,
     read_drain_poll_trace,
     read_leaked_pid,
+    read_proc_state,
     run_in_new_session,
     run_in_new_session_until,
     synthetic_unit,
@@ -11275,7 +11276,11 @@ def _reliably_dead_pid() -> int:
     """A pid that has exited AND been reaped, so it names no live process."""
     proc = subprocess.Popen([sys.executable, "-c", ""])
     proc.wait()
-    assert wait_pid_gone(proc.pid), f"pid {proc.pid} outlived its own reaping"
+    state = read_proc_state(proc.pid)
+    assert state is None, (
+        f"pid {proc.pid} still has a /proc entry {state} after proc.wait() reaped it; "
+        "os.kill(pid, 0), which the lease liveness check uses, would read it as alive"
+    )
     return proc.pid
 
 
