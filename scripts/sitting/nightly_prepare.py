@@ -69,7 +69,7 @@ if str(_REPO_ROOT / 'scripts' / 'legibility') not in sys.path:
 
 from legibility import account_pool  # noqa: E402
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
-from shared.cli_invoke import build_claude_argv  # noqa: E402
+from shared.cli_invoke import build_claude_argv, claude_binary_spec  # noqa: E402  # debt: task 6760
 from sitting import inventory, preparation  # noqa: E402  # debt: task 6760
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
@@ -405,7 +405,7 @@ def _positive(cast: Callable[[str], float]) -> Callable[[str], Any]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='nightly_prepare.py', description='Run the prepare-sitting mode headless.')
-    parser.add_argument('--claude-bin', default='claude', help='the claude CLI (default: claude on PATH)')
+    parser.add_argument('--claude-bin', default=claude_binary_spec(), help='the claude CLI (default: $CLAUDE_BINARY, else claude on PATH)')
     parser.add_argument('--model', default=DEFAULT_MODEL)
     parser.add_argument('--budget-usd', type=_positive(float), default=DEFAULT_BUDGET_USD)
     parser.add_argument('--timeout-secs', type=_positive(float), default=DEFAULT_TIMEOUT_SECS)
