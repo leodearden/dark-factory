@@ -44,6 +44,7 @@ SHARED_SCENE_LAYER: tuple[str, ...] = (
     # repo fixtures and builders
     '_setup_repo',
     '_add_recording_seed_to_repo',
+    '_commit_seed_script',
     'git_repo',
     '_make_spec_git_config',
     '_make_git_ops',
@@ -61,6 +62,7 @@ SHARED_SCENE_LAYER: tuple[str, ...] = (
     '_merge_commit_onto',
     '_external_main_bump',
     '_abort_hook_at',
+    '_worktree_names',
 
     # spies, census and readers
     '_local_lease',
@@ -72,6 +74,10 @@ SHARED_SCENE_LAYER: tuple[str, ...] = (
     '_drain_residue',
     '_events_for_task',
     '_canary_predicate_items_per',
+    '_count_spec_lane_acquires',
+    '_spy_post_merge_verify',
+    '_StubRemoteAllocator',
+    '_fail_verify_result',
 )
 
 # These share a NAME with scene helpers, not a body: a README-only repo with no
