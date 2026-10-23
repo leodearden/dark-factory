@@ -6175,7 +6175,7 @@ async def _run_segmented(
     run_one: 'Callable[[str, Path, float, str], Awaitable[tuple[int, str, bool]]]',
     worktree: Path,
     budget_secs: float,
-    now: 'Callable[[], float]' = time.monotonic,
+    now: 'Callable[[], float] | None' = None,
 ) -> 'tuple[int, str, bool, list[dict]]':
     """Run EVERY segment of a decomposed `&&` chain — no short-circuit.
 
@@ -6218,7 +6218,14 @@ async def _run_segmented(
     aggregator is unit-testable with a recording fake and spawns no
     subprocesses. Its production binding wraps ``_run_cmd`` with the caller's
     per-segment cpu-governance, nice prefix and streamed log path.
+
+    *now* defaults to the running event loop's clock, the one ``_run_cmd``
+    measures each segment's budget on, so the chain budget and the segment
+    budgets it hands out are read off one clock (pinned by
+    test_verify_chain_budget_on_loop_clock.py).
     """
+    if now is None:
+        now = asyncio.get_running_loop().time
     results: list[dict] = []
     first_nonzero = 0
     any_timed_out = False
