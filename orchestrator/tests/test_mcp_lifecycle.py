@@ -638,6 +638,67 @@ class TestVerdictToolsLaunchMetaRoot:
 
 
 # ---------------------------------------------------------------------------
+# Task 3155: plan-tools and verdict-tools launch with the task-lifetime root
+# ---------------------------------------------------------------------------
+
+_LANE_ROOT = Path('/base/.task-meta/wt')
+_TASK_ROOT = Path('/base/.task-meta/task-3155')
+_UV_PREFIX = ['run', '--project', '/orch', '--no-sync', '--frozen', 'python']
+
+
+def _plan_tools_launch(**kwargs) -> dict:
+    return plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'), **kwargs)
+
+
+def _verdict_tools_launch(**kwargs) -> dict:
+    return verdict_tools_mcp_server(
+        orch_project_dir=Path('/orch'), worktree=Path('/wt'), role='judge', **kwargs,
+    )
+
+
+@pytest.mark.parametrize('python_executable', [None, '/venv/bin/python'])
+class TestStdioLaunchTaskRoot:
+    """``task_root`` is passed as ``--task-root`` right after the ``--meta-root``
+    pair, on the hot path and the uv fallback alike."""
+
+    @pytest.mark.parametrize('launch', [_plan_tools_launch, _verdict_tools_launch])
+    def test_task_root_pair_follows_meta_root_pair(self, launch, python_executable):
+        args = launch(
+            python_executable=python_executable, meta_root=_LANE_ROOT, task_root=_TASK_ROOT,
+        )['args']
+
+        start = args.index('--meta-root')
+        assert args[start:start + 4] == [
+            '--meta-root', str(_LANE_ROOT), '--task-root', str(_TASK_ROOT),
+        ]
+
+    def test_verdict_role_tail_follows_task_root_pair(self, python_executable):
+        args = _verdict_tools_launch(
+            python_executable=python_executable, meta_root=_LANE_ROOT, task_root=_TASK_ROOT,
+        )['args']
+
+        assert args[-4:] == ['--task-root', str(_TASK_ROOT), '--verdict-role', 'judge']
+
+    def test_plan_tools_args_without_task_root_are_unchanged(self, python_executable):
+        args = _plan_tools_launch(python_executable=python_executable, meta_root=_LANE_ROOT)['args']
+
+        prefix = [] if python_executable else _UV_PREFIX
+        assert args == [
+            *prefix, '-m', 'orchestrator.mcp.plan_tools',
+            '--worktree', '/wt', '--meta-root', str(_LANE_ROOT),
+        ]
+
+    def test_verdict_tools_args_without_task_root_are_unchanged(self, python_executable):
+        args = _verdict_tools_launch(python_executable=python_executable, meta_root=_LANE_ROOT)['args']
+
+        prefix = [] if python_executable else _UV_PREFIX
+        assert args == [
+            *prefix, '-m', 'orchestrator.mcp.verdict_tools',
+            '--worktree', '/wt', '--meta-root', str(_LANE_ROOT), '--verdict-role', 'judge',
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Step-1/Step-2 (task 2942): _stdio_mcp_server launch dicts carry the FastMCP
 # banner/update-check quiet-env
 # ---------------------------------------------------------------------------

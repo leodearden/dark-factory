@@ -1576,6 +1576,77 @@ class TestArtifactsFromArgs:
         assert artifacts.worktree == wt
 
 
+def _dual_root_argv(tmp_path: Path, task_root: Path) -> tuple[list[str], Path]:
+    wt = tmp_path / 'wt'
+    wt.mkdir()
+    lane = tmp_path / '.task-meta' / 'wt'
+    lane.mkdir(parents=True)
+    argv = ['--worktree', str(wt), '--meta-root', str(lane), '--task-root', str(task_root)]
+    return argv, lane
+
+
+class TestArtifactsFromArgsTaskRoot:
+    """``--task-root`` (task 3155) gives the agent-side server the same two
+    roots the workflow uses: task-lifetime artifacts land in the task root,
+    the architect's structured exits stay in the lane root."""
+
+    def test_task_root_flag_produces_dual_roots(self, tmp_path):
+        task = tmp_path / '.task-meta' / 'task-3155'
+        argv, lane = _dual_root_argv(tmp_path, task)
+        task.mkdir()
+
+        artifacts = _artifacts_from_args(argv)
+
+        assert artifacts.lane_root == lane.resolve()
+        assert artifacts.task_root == task.resolve()
+
+    def test_missing_task_root_exits_naming_it(self, tmp_path, capsys):
+        task = tmp_path / '.task-meta' / 'task-absent'
+        argv, _ = _dual_root_argv(tmp_path, task)
+
+        with pytest.raises(SystemExit) as exc:
+            _artifacts_from_args(argv)
+
+        assert exc.value.code == 1
+        assert str(task.resolve()) in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_plan_lifecycle_writes_the_task_root_plan(self, tmp_path):
+        task = tmp_path / '.task-meta' / 'task-3155'
+        argv, lane = _dual_root_argv(tmp_path, task)
+        task.mkdir()
+        server = plan_tools.create_server(_artifacts_from_args(argv))
+
+        for name, arguments in (
+            ('create_plan', {'task_id': '3155', 'title': 'T', 'analysis': 'A', 'files': ['m.py']}),
+            ('add_plan_step', {'step_id': 'step-1', 'step_type': 'test', 'description': 'Write a test'}),
+            ('confirm_plan', {}),
+            ('mark_step_done', {'step_id': 'step-1', 'commit_sha': 'abc123'}),
+        ):
+            tool = await server.get_tool(name)
+            assert tool is not None
+            await tool.run(arguments)
+
+        plan = TaskArtifacts(tmp_path / 'wt', task).read_plan()
+        assert plan['steps'][0]['status'] == 'done'
+        assert not (lane / 'plan.json').exists()
+
+    @pytest.mark.asyncio
+    async def test_blocking_dependency_report_stays_in_the_lane_root(self, tmp_path, monkeypatch):
+        task = tmp_path / '.task-meta' / 'task-3155'
+        argv, lane = _dual_root_argv(tmp_path, task)
+        task.mkdir()
+        monkeypatch.setattr(plan_tools, '_resolve_main_sha', lambda worktree: 'deadbeef')
+        server = plan_tools.create_server(_artifacts_from_args(argv))
+
+        tool = await server.get_tool('report_blocking_dependency')
+        assert tool is not None
+        await tool.run({'depends_on_task_id': '42', 'reason': 'missing foo()'})
+
+        assert (lane / 'blocking_dependency.json').is_file()
+        assert not (task / 'blocking_dependency.json').exists()
+
+
 # ---------------------------------------------------------------------------
 # Tool-level regression guard for plan_tools.py:603 (task 2258 amendment).
 # ---------------------------------------------------------------------------
