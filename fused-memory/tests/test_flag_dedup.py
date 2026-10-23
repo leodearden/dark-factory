@@ -12166,6 +12166,69 @@ class TestFilterStyleOnlyAuthorshipFlags:
             'the input list itself must never be mutated'
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_type',
+        ['Prompt-Injection', 'injection_possible', 'Foreign Authorship', 'CONTENT_FABRICATED'],
+    )
+    async def test_canonical_variant_spellings_are_candidates_and_dropped_when_house_authored(
+        self, flag_type,
+    ):
+        """A case/separator/word-order respelling of a known spelling is a candidate.
+
+        This widening (task 6005) is intentional and safe: the filter matches
+        through AUTHORSHIP_SUSPICION_FAMILY, and dropping still requires
+        wholly-house-authored provenance.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag(flag_type=flag_type)
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            return_value=self._record('recon-stage-memory_consolidator'),
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == []
+        memory_service.get_memory_by_id.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_possible_drift_log_keeps_its_event_name_and_names_the_family(self, caplog):
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flags = [
+            {'flag_type': 'injection_risk_detected'},
+            {'flag_type': 'fabrication_suspected'},
+            {'flag_type': 'foreign_key_violation'},
+            {'flag_type': 'Possible-Injection'},
+            {'flag_type': 'stale_metadata'},
+        ]
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_style_only_authorship_flags(AsyncMock(), 'dark_factory', flags)
+
+        drift = [
+            r.getMessage()
+            for r in caplog.records
+            if 'style_only_authorship_filter_possible_drift' in r.getMessage()
+        ]
+        assert len(drift) == 1, drift
+        assert drift[0].startswith(
+            'reconciliation.style_only_authorship_filter_possible_drift '
+        )
+        assert 'family=authorship_suspicion' in drift[0]
+        assert (
+            "unmatched_flag_types=['injection_risk_detected', 'fabrication_suspected', "
+            "'foreign_key_violation']"
+        ) in drift[0]
+
 
 # ---------------------------------------------------------------------------
 # ---- task 3476 step-1 ----
