@@ -1,12 +1,15 @@
 """Shared scene layer for the deep merge-ahead test modules.
 
-ONE home for the repo fixtures, builders, git helpers, spies, permit census and
-durable-tier readers that test_merge_queue_deep_integration_gate.py and
-test_merge_queue_deep_landing.py used to carry as code-identical clones.
-Membership was decided by comparing the two modules' ASTs, docstrings stripped
-and the ``merge_queue`` alias normalised: every helper here was identical in
-both.  test_merge_deep_scene_dedup.py guards the single-sourcing.  Greek
-letters (δ, η1) and "PRD decision #N" refer to plans/deep-merge-ahead-prd.md.
+ONE home for the repo fixtures, builders, git helpers, verify doubles, spies,
+permit census and durable-tier readers that the deep integration gate, deep
+landing, deep dispatch (γ) and build-chain (β) modules used to carry as clones:
+test_merge_queue_deep_integration_gate.py, test_merge_queue_deep_landing.py,
+test_merge_queue_deep_dispatch.py and test_merge_queue_build_chain.py.
+Membership is decided by comparing their ASTs, docstrings stripped and the
+worker-module alias normalised: a helper lives here when its consumers' copies
+were one body, or had drifted apart only by accident.
+test_merge_deep_scene_dedup.py guards the single-sourcing.  Greek letters
+(β, γ, δ, η1) and "PRD decision #N" refer to plans/deep-merge-ahead-prd.md.
 
 Deduplicate a BODY, never a NAME.  Some helpers share a name across consumers
 but not a body, so they stay local to each consumer: ``_make_worker`` (each
@@ -15,9 +18,6 @@ builds a differently-defaulted lane), ``_assert_quiescent`` and
 ``_lane_of``.  The invariant gate's ``_setup_repo``, ``git_repo`` and
 ``_make_req`` collide by name only (a README-only repo with no recording seed,
 a positional ``lane``), so that module imports nothing from here.
-
-test_merge_queue_deep_dispatch.py and test_merge_queue_build_chain.py still
-clone some of these helpers; task 5172 owns folding them in.
 
 This module follows the flat-helper convention ``_merge_queue_harness.py``
 documents: conftest.py puts the tests dir on ``sys.path``, so consumers import

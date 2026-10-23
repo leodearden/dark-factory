@@ -13,10 +13,10 @@ sweep also forbids a consumer from re-DEFINING any name the scene defines.
 Both checks carry a positive control, because a satisfied check and an inert
 one look the same.
 
-Scope: the deep integration gate and deep landing modules, plus the invariant
-gate's re-definition sweep.  test_merge_queue_deep_dispatch.py and
-test_merge_queue_build_chain.py are NOT yet covered; task 5172 owns extending
-this file to them.
+Scope: the four deep consumers -- the deep integration gate, deep landing,
+deep dispatch and build-chain modules -- get both the identity check and the
+re-definition sweep.  The invariant gate gets the re-definition sweep alone,
+minus the by-design name collisions INVARIANT_GATE_LOCAL_BY_DESIGN lists.
 """
 from __future__ import annotations
 

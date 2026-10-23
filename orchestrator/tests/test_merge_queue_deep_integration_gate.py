@@ -160,12 +160,13 @@ place to build.
 
 PROVENANCE
 ----------
-The repo fixtures, ``_make_*`` builders, git helpers, spies, permit census and
-durable-tier readers this file shares with test_merge_queue_deep_landing.py
-live in ``_merge_deep_scene.py``, imported by bare module name;
-test_merge_deep_scene_dedup.py guards that single home.  An earlier draft of
-this note claimed the absent ``__init__.py`` forced them to be cloned here, and
-that premise was false: flat ``_``-prefixed helper modules import by bare name.
+The repo fixtures, ``_make_*`` builders, git helpers, verify doubles, spies,
+permit census and durable-tier readers this file imports live in
+``_merge_deep_scene.py``, the scene layer every deep merge-ahead test module
+shares, imported by bare module name; test_merge_deep_scene_dedup.py guards
+that single home.  An earlier draft of this note claimed the absent
+``__init__.py`` forced them to be cloned here, and that premise was false:
+flat ``_``-prefixed helper modules import by bare name.
 
 Every helper still defined here is either a gate variant of a same-named helper
 elsewhere, or original to this file:
