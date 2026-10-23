@@ -1,9 +1,10 @@
-"""Read what ``shared.cli_boundary.run_cli`` reports, for every script suite that adopts it.
+"""Read what ``shared.cli_boundary.run_cli`` reports, for the script suites that adopt it.
 
 The boundary reports a failed stdout as exactly ONE ``error: ...`` line on
 stderr and exits ``EXIT_STDOUT_FAILED``. Each adoption of ``run_cli`` under
-``fused-memory/scripts/`` pins that contract for its own script, so the reading
-of it lives here once rather than in a copy per test module.
+``fused-memory/scripts/`` pins that contract for its own script. The in-process
+suites read it through :func:`closed_pipe_error_line`, and the child-process
+suite through :func:`assert_one_stdout_failure_line`.
 """
 
 from __future__ import annotations
@@ -24,6 +25,19 @@ def error_lines(stderr: str) -> list[str]:
     return [line for line in stderr.splitlines() if line.startswith('error: ')]
 
 
+def assert_one_stdout_failure_line(code: int, stderr: str) -> str:
+    """Assert the boundary's contract for one run; return its one ``error:`` line.
+
+    *code* must be ``EXIT_STDOUT_FAILED`` and *stderr* must hold exactly one
+    ``error: `` line. Both failures report the whole of *stderr*, which is the
+    only evidence a child process leaves behind.
+    """
+    assert code == EXIT_STDOUT_FAILED, stderr
+    errors = error_lines(stderr)
+    assert len(errors) == 1, stderr
+    return errors[0]
+
+
 def closed_pipe_error_line(
     monkeypatch: Any, capsys: Any, main: Callable[[], int], *, buffering: int | None,
 ) -> str:
@@ -36,7 +50,4 @@ def closed_pipe_error_line(
     """
     with closed_pipe_stdout(monkeypatch, buffering=buffering, quiet_close=True):
         code = run_cli(main)
-    errors = error_lines(capsys.readouterr().err)
-    assert code == EXIT_STDOUT_FAILED, errors
-    assert len(errors) == 1, errors
-    return errors[0]
+    return assert_one_stdout_failure_line(code, capsys.readouterr().err)

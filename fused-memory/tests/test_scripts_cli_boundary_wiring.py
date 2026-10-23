@@ -25,8 +25,8 @@ import uuid
 from pathlib import Path
 
 import pytest
+from _cli_boundary_assertions import assert_one_stdout_failure_line
 from _fm_helpers import load_script_module
-from shared.cli_boundary import EXIT_STDOUT_FAILED
 
 from fused_memory.services.write_journal import WriteJournal
 
@@ -166,18 +166,11 @@ def _spawn(script: str, *argv: str, closed_stdout: bool, unbuffered: bool) -> tu
     )
 
 
-def _error_lines(err: str) -> list[str]:
-    return [line for line in err.splitlines() if line.startswith('error: ')]
-
-
 def _assert_one_clean_stdout_failure(code: int, err: str) -> str:
     """The boundary's contract: its status, no shutdown noise, one error line."""
-    assert code == EXIT_STDOUT_FAILED, err
     assert 'Traceback' not in err
     assert 'Exception ignored' not in err
-    errors = _error_lines(err)
-    assert len(errors) == 1, err
-    return errors[0]
+    return assert_one_stdout_failure_line(code, err)
 
 
 @_MIGRATED
