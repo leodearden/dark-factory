@@ -1237,7 +1237,7 @@
     "orchestrator/tests/test_merge_queue_main_health.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_main_health_deferred.py": {"patch_targets": ["worker._run_post_merge_verify", "worker._spawn_main_health_probe", "worker.verify_failure_is_preexisting_on_main"], "private_reads": 19},
     "orchestrator/tests/test_merge_queue_metrics.py": {"patch_targets": [], "private_reads": 0},
-    "orchestrator/tests/test_merge_queue_multihost_wiring.py": {"patch_targets": ["worker.run_scoped_verification"], "private_reads": 285},
+    "orchestrator/tests/test_merge_queue_multihost_wiring.py": {"patch_targets": ["worker.run_scoped_verification"], "private_reads": 167},
     "orchestrator/tests/test_merge_queue_no_landings_breaker.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_orphan_reaper.py": {"patch_targets": [], "private_reads": 12},
     "orchestrator/tests/test_merge_queue_permit_conservation.py": {"patch_targets": [], "private_reads": 0},
