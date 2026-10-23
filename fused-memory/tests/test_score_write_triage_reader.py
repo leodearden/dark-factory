@@ -495,7 +495,8 @@ class TestRefusal:
             _item('X2', 'restated', 'P2', band='restated'),
             _item('X1', 'restated', 'P1', band='restated'),
         ]
-        verdicts = [_vote('X2', 'P2', home='YES', conflict='NO')]
+        verdicts = [_vote('X2', 'P2', home='YES'),
+                    _vote('X2', 'P2', rater='sonnet', role='second', conflict='NO')]
         with pytest.raises(_mod().IncompleteJudgementError) as refusal:
             _mod().score_reader(items, verdicts)
         assert refusal.value.gaps == (

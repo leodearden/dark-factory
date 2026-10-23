@@ -372,10 +372,16 @@ class TestUnreachedFollowUps:
         assert judgement.answer(rubric.Binary.DIGEST) == rubric.Resolved.UNCLEAR
         assert judgement.unreached_follow_ups == {rubric.Binary.DIGEST}
 
-    def test_raters_meeting_the_preconditions_without_a_derived_row_leave_loss_unrated(self) -> None:
+    @pytest.mark.parametrize('role', ['primary', 'second', 'third'])
+    def test_a_rater_row_meeting_the_preconditions_without_loss_is_refused(self, role: str) -> None:
+        rows = [_row(rater='v1', role='derived', conflict='NO'),
+                _row(rater='r2', role=role, home='YES', conflict='NO', non_consumed=['conflict'])]
+        with pytest.raises(ValueError, match="row 1.*e1.*t1.*lacks loss.*home 'YES'.*conflict 'NO'"):
+            _mod().resolve_judgements(rows)
+
+    def test_a_rater_row_with_home_and_conflict_on_separate_rows_leaves_loss_unrated(self) -> None:
         rubric = _mod()
-        rows = [_row(home='YES', conflict='NO'), _row(rater='r2', role='second', home='YES', conflict='NO')]
-        judgement = self._judgement(rows)
+        judgement = self._judgement([_row(home='YES'), _row(rater='r2', role='second', conflict='NO')])
         assert judgement.answer(rubric.Binary.LOSS) is None
         assert judgement.unreached_follow_ups == frozenset()
         result = rubric.derive('restated', {'t1': judgement})
@@ -383,6 +389,23 @@ class TestUnreachedFollowUps:
         assert [(gap.target_id, gap.binary, gap.kind) for gap in result.missing] == [
             ('t1', 'loss', 'unrated'),
         ]
+
+    def test_a_derived_row_meeting_the_preconditions_needs_no_loss(self) -> None:
+        rubric = _mod()
+        judgement = self._judgement([_row(rater='v1', role='derived', home='YES', conflict='NO')])
+        assert judgement.answer(rubric.Binary.LOSS) == rubric.Resolved.UNCLEAR
+        assert judgement.unreached_follow_ups == {rubric.Binary.LOSS}
+
+    @pytest.mark.parametrize('answers', [
+        {'conflict': 'YES'}, {'home': 'YES', 'conflict': 'YES'},
+    ])
+    def test_a_rater_row_may_leave_out_the_report_only_follow_ups(
+        self, answers: dict[str, str],
+    ) -> None:
+        rubric = _mod()
+        judgement = self._judgement([_row(**answers)])
+        assert judgement.answer(rubric.Binary.SCOPE) is None
+        assert judgement.answer(rubric.Binary.ACTION_CHANGING) is None
 
     def test_a_tied_precondition_leaves_the_follow_up_missing(self) -> None:
         rubric = _mod()
@@ -530,20 +553,19 @@ class TestDecisiveness:
         return [(gap.target_id, gap.binary, gap.kind) for gap in result.missing]
 
     def test_a_decisive_unrated_binary_is_incomplete(self) -> None:
-        assert self._gaps(_derive('restated', {'home': 'YES', 'conflict': 'NO'})) == [
+        assert self._gaps(_derive('restated', {'home': 'YES'}, {'conflict': 'NO'})) == [
             ('p', 'loss', 'unrated'),
         ]
 
     def test_a_decisive_tie_is_incomplete(self) -> None:
-        result = _derive('restated', {'home': 'YES', 'conflict': 'YES'},
-                         {'home': 'YES', 'conflict': 'NO'})
+        result = _derive('restated', {'home': 'YES', 'conflict': 'YES'}, {'conflict': 'NO'})
         assert self._gaps(result) == [('p', 'conflict', 'tied')]
 
     def test_an_unrated_pair_names_its_first_decisive_binary(self) -> None:
         assert self._gaps(_derive('contested')) == [('p', 'conflict', 'unrated')]
 
     def test_the_status_quo_regime_can_be_the_decisive_one(self) -> None:
-        assert self._gaps(_derive('amended', {'home': 'YES', 'conflict': 'NO'})) == [
+        assert self._gaps(_derive('amended', {'home': 'YES'}, {'conflict': 'NO'})) == [
             ('p', 'loss', 'unrated'),
         ]
 
