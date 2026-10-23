@@ -4017,50 +4017,83 @@ class ReconciliationHarness:
         server shutdown) cannot abort it and a write failure cannot replace the
         cancellation.
 
-        A run the journal already records completed is never relabelled, even
-        when the cancellation reached ``complete_run(run_id, 'completed')`` after
-        its commit landed: nothing is written, and the in-memory run is put back
-        to completed.
+        Like every failure arm, it ends the run through
+        :meth:`_end_run_unless_completed`, so a cancellation reaching
+        ``complete_run(run_id, 'completed')`` after its commit landed leaves the
+        run completed.
         """
         run_id = run.id
         if self.config.resume_after_restart:
             run.status = RunStatus.interrupted
-            if await self._journal_interrupted_unless_completed(run_id):
+            if await self._end_run_unless_completed(
+                run, project_id, current_stage_name,
+                lambda: self._journal_interrupted(run_id),
+            ):
                 logger.warning(
                     f'Reconciliation run {run_id} INTERRUPTED (resumable) for '
                     f'{project_id} (stage: {current_stage_name})'
                 )
-                return
-        else:
-            run.status = RunStatus.failed
-            run.stage_reports['_error'] = {
-                'error_type': 'CancelledError',
-                'error_message': 'Run cancelled (timeout or external cancellation)',
-                'failed_stage': current_stage_name,
-                'traceback': '',
-            }
-            if await self._journal_failed_and_restore_drained(run_id, project_id):
-                logger.error(
-                    f'Reconciliation run {run_id} cancelled for {project_id} '
-                    f'(stage: {current_stage_name})'
-                )
-                return
+            return
+        run.status = RunStatus.failed
+        run.stage_reports['_error'] = {
+            'error_type': 'CancelledError',
+            'error_message': 'Run cancelled (timeout or external cancellation)',
+            'failed_stage': current_stage_name,
+            'traceback': '',
+        }
+        if await self._end_run_unless_completed(
+            run, project_id, current_stage_name,
+            lambda: self._journal_failed_and_restore_drained(run_id, project_id),
+        ):
+            logger.error(
+                f'Reconciliation run {run_id} cancelled for {project_id} '
+                f'(stage: {current_stage_name})'
+            )
+
+    async def _end_run_unless_completed(
+        self,
+        run: ReconciliationRun,
+        project_id: str,
+        current_stage_name: str | None,
+        journal_end: Callable[[], Awaitable[None]],
+    ) -> bool:
+        """The one guard every ``run_full_cycle`` failure arm ends *run*
+        through: await *journal_end* unless the journal records *run* completed.
+
+        Durable completion is final. For a completed run nothing is written, the
+        in-memory run is put back to completed so the finally persists and GCs
+        it as the completed run it is, and this returns False.
+
+        The check and *journal_end* are shielded as one unit, so a second
+        cancellation landing mid-way cannot split them, and still propagates.
+        """
+        async def check_then_journal_end() -> bool:
+            if await self._journal_records_completed(run.id):
+                return False
+            await journal_end()
+            return True
+
+        if await asyncio.shield(check_then_journal_end()):
+            return True
         self._keep_durably_completed(run, project_id, current_stage_name)
+        return False
 
     @staticmethod
     def _keep_durably_completed(
         run: ReconciliationRun, project_id: str, current_stage_name: str | None,
     ) -> None:
-        """Put a cancelled run the journal records completed back to completed
-        in memory, so the finally persists and GCs it as the completed run it is."""
+        """Put a run a failure arm was ending, but the journal records
+        completed, back to completed in memory."""
+        status_not_written = run.status
         run.status = RunStatus.completed
         run.stage_reports.pop('_error', None)
         logger.warning(
-            'reconciliation.cancelled_after_durable_completion',
+            'reconciliation.run_end_skipped_after_durable_completion',
             extra={
                 'run_id': run.id,
                 'project_id': project_id,
                 'stage': current_stage_name,
+                'status_not_written': str(status_not_written),
             },
         )
 
@@ -4073,24 +4106,12 @@ class ReconciliationHarness:
             logger=logger, level=logging.ERROR,
         ) is True
 
-    async def _journal_interrupted_unless_completed(self, run_id: str) -> bool:
-        """Journal *run_id* interrupted unless the journal records it completed,
-        in which case nothing is written and this returns False.
-
-        The check and the write are shielded as one unit, so a second
-        cancellation cannot split them.
-        """
-        async def check_then_journal_interrupted() -> bool:
-            if await self._journal_records_completed(run_id):
-                return False
-            await await_best_effort(
-                self.journal.complete_run(run_id, 'interrupted'),
-                what='complete_run(interrupted)', run_id=run_id,
-                logger=logger, level=logging.ERROR,
-            )
-            return True
-
-        return await asyncio.shield(check_then_journal_interrupted())
+    async def _journal_interrupted(self, run_id: str) -> None:
+        await await_best_effort(
+            self.journal.complete_run(run_id, 'interrupted'),
+            what='complete_run(interrupted)', run_id=run_id,
+            logger=logger, level=logging.ERROR,
+        )
 
     async def _record_deferred_run(
         self,
@@ -4109,11 +4130,15 @@ class ReconciliationHarness:
             'failed_stage': current_stage_name,
             'deferred': True,
         }
-        await self._journal_failed_and_restore_drained(run.id, project_id)
-        logger.warning(
-            f'Reconciliation deferred: all accounts capped during stage '
-            f'{current_stage_name} ({exc.retries} retries in {exc.elapsed_secs:.1f}s)'
-        )
+        run_id = run.id
+        if await self._end_run_unless_completed(
+            run, project_id, current_stage_name,
+            lambda: self._journal_failed_and_restore_drained(run_id, project_id),
+        ):
+            logger.warning(
+                f'Reconciliation deferred: all accounts capped during stage '
+                f'{current_stage_name} ({exc.retries} retries in {exc.elapsed_secs:.1f}s)'
+            )
 
     async def _record_failed_run(
         self,
@@ -4136,34 +4161,26 @@ class ReconciliationHarness:
             'recon_failure', run_id,
             f'Stage {current_stage_name} failed: {exc}',
         )
-        await self._journal_failed_and_restore_drained(run_id, project_id)
+        await self._end_run_unless_completed(
+            run, project_id, current_stage_name,
+            lambda: self._journal_failed_and_restore_drained(run_id, project_id),
+        )
 
-    async def _journal_failed_and_restore_drained(self, run_id: str, project_id: str) -> bool:
-        """The bookkeeping every ``run_full_cycle`` failure arm shares: journal
-        *run_id* failed, then re-buffer *run_id*'s own drained events.
-
-        A run the journal already records completed is never relabelled: nothing
-        is written and this returns False.
+    async def _journal_failed_and_restore_drained(self, run_id: str, project_id: str) -> None:
+        """The ending the failed arms share: journal *run_id* failed, then
+        re-buffer *run_id*'s own drained events.
 
         Each write is best-effort, so neither skips the other nor replaces the
-        failure being handled. The check and the pair are shielded as one unit,
-        so a second cancellation landing mid-way still lets them land, and
-        still propagates.
+        failure being handled.
         """
-        async def journal_failed_then_restore() -> bool:
-            if await self._journal_records_completed(run_id):
-                return False
-            await await_best_effort(
-                self.journal.complete_run(run_id, 'failed'),
-                what='complete_run(failed)', run_id=run_id,
-                logger=logger, level=logging.ERROR,
-            )
-            await restore_unless_completed_best_effort(
-                self.journal, self.buffer, project_id, run_id,
-            )
-            return True
-
-        return await asyncio.shield(journal_failed_then_restore())
+        await await_best_effort(
+            self.journal.complete_run(run_id, 'failed'),
+            what='complete_run(failed)', run_id=run_id,
+            logger=logger, level=logging.ERROR,
+        )
+        await restore_unless_completed_best_effort(
+            self.journal, self.buffer, project_id, run_id,
+        )
 
     async def _finish_durably_completed_cycle(
         self,
