@@ -179,11 +179,17 @@ class Vote:
 
 @dataclass(frozen=True)
 class Judgement:
-    """Every vote on one pair key, and the binaries those votes resolve to."""
+    """Every vote on one pair key, and the binaries those votes resolve to.
+
+    ``unreached_follow_ups`` names each follow-up no vote carries whose
+    preconditions all resolve to the answers it needs, at least one of them
+    fixed by a derived row: no rater was asked it, so it resolves UNCLEAR.
+    """
 
     key: PairKey
     votes: tuple[Vote, ...]
     resolved: Mapping[Binary, Resolved]
+    unreached_follow_ups: frozenset[Binary] = frozenset()
 
     def answer(self, binary: Binary) -> Resolved | None:
         """The resolved answer on *binary*, or None when no row carries it."""
@@ -195,7 +201,8 @@ def resolve_judgements(rows: Iterable[Mapping[str, Any]]) -> Mapping[PairKey, Ju
 
     Votes on one binary come from the rows carrying it as a voting answer.
     UNCLEAR abstains, an all-UNCLEAR binary resolves UNCLEAR and an even split
-    resolves TIED. The ``current`` and ``attach_time`` bases are separate pair
+    resolves TIED, and a follow-up a derived row's precondition left unasked
+    resolves UNCLEAR. The ``current`` and ``attach_time`` bases are separate pair
     keys and never mix. A malformed row, a rater voting twice on one pair key,
     and a pair key whose rater answers and derived rows disagree about which
     binaries a derived row fixes are refused.
@@ -330,7 +337,17 @@ def _judgement(key: PairKey, votes: tuple[Vote, ...]) -> Judgement:
         for binary in _WORDS
         if any(binary in vote.answers for vote in votes)
     }
-    return Judgement(key=key, votes=votes, resolved=MappingProxyType(resolved))
+    derived = {binary for vote in votes if vote.role is Role.DERIVED for binary in vote.answers}
+    unreached = frozenset(
+        follow_up for follow_up, needs in FOLLOW_UPS.items()
+        if follow_up not in resolved
+        and all(resolved.get(binary) == Resolved(needed) for binary, needed in needs.items())
+        and not derived.isdisjoint(needs)
+    )
+    resolved.update(dict.fromkeys(unreached, Resolved.UNCLEAR))
+    return Judgement(
+        key=key, votes=votes, resolved=MappingProxyType(resolved), unreached_follow_ups=unreached,
+    )
 
 
 def _majority(words: list[StrEnum], binary: Binary) -> Resolved:
@@ -469,7 +486,7 @@ class Decided:
 
 @dataclass(frozen=True)
 class Unclear:
-    """A binary the derivation needed resolved UNCLEAR: every rater abstained on it."""
+    """A binary the derivation needed resolved UNCLEAR: every rater abstained, or none was asked it."""
 
     binaries: tuple[tuple[str, Binary], ...]
 

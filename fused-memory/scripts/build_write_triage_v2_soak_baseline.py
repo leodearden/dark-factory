@@ -498,8 +498,9 @@ def assemble(
     verdicts = [_derived_row(entry_id, target_id, answers)
                 for (entry_id, target_id), answers in fixed.items()]
     verdicts += [_assembled_rater_row(row, fixed, child_texts) for row in rated]
+    verdicts.sort(key=_verdict_order)
     return Assembly(
-        verdicts=sorted(verdicts, key=_verdict_order),
+        verdicts=verdicts,
         derivation={
             'check': {
                 'min_compared': DERIVATION_MIN_COMPARED,
@@ -509,8 +510,23 @@ def assemble(
             'rows': {name: {**asdict(row_check), 'binary': str(row_check.binary)}
                      for name, row_check in check.items()},
             'held_rows': sorted(held),
+            'unreached_follow_ups': _unreached_follow_ups(verdicts),
         },
     )
+
+
+def _unreached_follow_ups(verdicts: Iterable[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """Each (pair key, follow-up) the rubric resolves UNCLEAR because a derived row left it unasked."""
+    unreached = sorted(
+        (key, binary)
+        for key, judgement in _rubric.resolve_judgements(verdicts).items()
+        for binary in judgement.unreached_follow_ups
+    )
+    return [
+        {'entry_id': key.entry_id, 'target_id': key.target_id, 'basis': str(key.basis),
+         'binary': str(binary)}
+        for key, binary in unreached
+    ]
 
 
 def _assembled_rater_row(
