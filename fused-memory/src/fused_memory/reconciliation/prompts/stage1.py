@@ -35,7 +35,7 @@ from fused_memory.reconciliation.prompts import (
     render_finding_provenance_section,
 )
 from fused_memory.reconciliation.recon_self_model import (
-    MEM0_TOMBSTONE_DELETERS,
+    format_mem0_tombstone_deleters,
     render_entity_standing_decision_schema_section,
     render_marker_lifecycle_section,
     render_source_completion_section,
@@ -88,8 +88,6 @@ CHILD_MEMORY_AUTHORITY_RULE = (
     f"what the parent's sighting count counts, and an amendment holds the only copy of its "
     f'newer text.'
 )
-
-_DOCUMENTED_SWEEP_DELETERS = ', '.join(f'`{d}`' for d in MEM0_TOMBSTONE_DELETERS)
 
 STAGE1_SYSTEM_PROMPT = f"""\
 You are a Memory Consolidator agent operating in sleep mode. Your role is to review and \
@@ -1043,7 +1041,7 @@ metadata records every cited memory id, and keeps it whenever the lookup is inco
 The buffered-event deletion log shows THAT a Mem0 record was deleted, never WHY. Before \
 counting a swept id as a `mem0_evidentiary_anchor_deletion_pattern` occurrence, call \
 `get_memory_by_id` on it. A miss carrying a `tombstone` whose `deleter` is one of \
-{_DOCUMENTED_SWEEP_DELETERS} is a designed recon sweep — expected, not an anomaly — and \
+{format_mem0_tombstone_deleters()} is a designed recon sweep — expected, not an anomaly — and \
 must not be flagged. Only an id with no tombstone, or with an undocumented deleter, \
 supports the flag. Name every swept id's full UUID in the description, and do not bundle \
 unrelated deletions into this flag type. The code gate \
