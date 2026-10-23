@@ -33,6 +33,8 @@ GIT_CONFIG = GitConfig(
 )
 
 _HANG = 'sleep 60'
+_IMPATIENT_SECS = 5.0
+"""Cuts ``_HANG`` off, yet gives a loaded host time to spawn a shell."""
 
 
 def _config(root: Path, **overrides: Any) -> OrchestratorConfig:
@@ -47,12 +49,12 @@ def _config(root: Path, **overrides: Any) -> OrchestratorConfig:
 
 
 def _impatient(root: Path, **extra: Any) -> OrchestratorConfig:
-    """``_config`` with every per-command verify budget at one second."""
+    """``_config`` with every per-command verify budget at ``_IMPATIENT_SECS``."""
     return _config(
         root,
-        verify_command_timeout_secs=1.0,
-        verify_cold_command_timeout_secs=1.0,
-        merge_verify_cold_command_timeout_secs=1.0,
+        verify_command_timeout_secs=_IMPATIENT_SECS,
+        verify_cold_command_timeout_secs=_IMPATIENT_SECS,
+        merge_verify_cold_command_timeout_secs=_IMPATIENT_SECS,
         **extra,
     )
 
