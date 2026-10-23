@@ -2897,12 +2897,12 @@ def filter_stale_count_snapshot_corrections(
 # Terminal-metadata guard helpers (task-1725)
 # --------------------------------------------------------------------------- #
 
-#: Flag types that assert a task has stale / left-over metadata blobs.
-#: Both spellings are included to be robust against LLM naming drift.
-STALE_METADATA_FLAG_TYPES: frozenset[str] = frozenset({
-    'stale_metadata',
-    'task_metadata_stale',
-})
+#: The finding that a task has stale / left-over metadata blobs.
+STALE_METADATA_FAMILY = FlagTypeFamily(
+    name='stale_metadata',
+    spellings=frozenset({'stale_metadata', 'task_metadata_stale'}),
+    drift_tokens=frozenset({'stale'}),
+)
 
 #: Task statuses that represent terminal states with no further execution need.
 #: A task in one of these states will never re-execute, so its metadata blobs
@@ -2952,10 +2952,11 @@ async def filter_terminal_metadata_flags(
 ) -> list[dict[str, Any]]:
     """Drop stale_metadata flags for tasks that are in a terminal state.
 
-    For each flag whose ``flag_type`` is in ``STALE_METADATA_FLAG_TYPES`` and
-    that carries a ``task_id``, calls ``taskmaster.get_task(task_id,
-    project_root)`` and DROPS the flag iff the extracted status is in
-    ``TERMINAL_STATUSES`` (``'cancelled'`` or ``'done'``).
+    For each flag whose ``flag_type`` :data:`STALE_METADATA_FAMILY` matches
+    (case/separator/word-order variants included) and that carries a
+    ``task_id``, calls ``taskmaster.get_task(task_id, project_root)`` and DROPS
+    the flag iff the extracted status is in ``TERMINAL_STATUSES``
+    (``'cancelled'`` or ``'done'``).
 
     **Fail-safe direction**: this filter DROPS flags, so it drops ONLY on
     positively-confirmed terminal status.  get_task errors, non-dict results,
@@ -2986,32 +2987,13 @@ async def filter_terminal_metadata_flags(
     check_task_ids: list[Any] = []
 
     for i, flag in enumerate(flags):
-        flag_type = flag.get('flag_type')
-        if flag_type in STALE_METADATA_FLAG_TYPES and flag.get('task_id') is not None:
+        if STALE_METADATA_FAMILY.matches(flag.get('flag_type')) and flag.get('task_id') is not None:
             check_positions.append(i)
             check_task_ids.append(flag.get('task_id'))
 
-    # Detect potential LLM naming drift: flag_type strings that look like
-    # stale-metadata variants (contain 'stale') but are not in
-    # STALE_METADATA_FLAG_TYPES.  When the model emits an unrecognised spelling
-    # the filter silently becomes a no-op; this log makes that observable so
-    # operators can update STALE_METADATA_FLAG_TYPES.
-    drift_candidates = [
-        ft
-        for flag in flags
-        if (ft := flag.get('flag_type')) is not None
-        and isinstance(ft, str)
-        and 'stale' in ft.lower()
-        and ft not in STALE_METADATA_FLAG_TYPES
-    ]
-    if drift_candidates:
-        logger.info(
-            'reconciliation.terminal_metadata_filter_possible_drift '
-            'unmatched_flag_types=%s known_types=%s '
-            '— update STALE_METADATA_FLAG_TYPES if drift confirmed',
-            drift_candidates,
-            sorted(STALE_METADATA_FLAG_TYPES),
-        )
+    STALE_METADATA_FAMILY.log_drift(
+        flags, log_event='reconciliation.terminal_metadata_filter_possible_drift',
+    )
 
     if not check_positions:
         return list(flags)
@@ -3040,7 +3022,6 @@ async def filter_terminal_metadata_flags(
         result = results_by_pos[i]
         status = _extract_terminal_status(result)
         task_id = flag.get('task_id')
-        flag_type = flag.get('flag_type')
 
         if status in TERMINAL_STATUSES:
             logger.info(
@@ -4303,7 +4284,7 @@ def _is_systemic_pattern_candidate(flag: dict[str, Any]) -> bool:
     A flag qualifies iff its ``category`` OR ``flag_type`` is
     ``'systemic_pattern'`` (LLM-authored flags may carry the finding kind
     under either field — checking both is robust to shaping/naming drift,
-    mirroring ``STALE_METADATA_FLAG_TYPES``' both-spellings robustness) AND
+    mirroring ``STALE_METADATA_FAMILY``' both-spellings robustness) AND
     its ``description`` asserts never-tracked language per
     :func:`_asserts_never_tracked`.
 
