@@ -27,6 +27,7 @@ from client_feed.contract import (
     FeedState,
     Heartbeat,
     NonNegativeInt,
+    RevealBudget,
     Source,
     TreeFile,
     TreeSnapshot,
@@ -346,21 +347,40 @@ def _reveal_unit(
     )
 
 
+def _new_tree_budget(
+    policy: Policy,
+    tree: VisibleTree,
+    *,
+    engagement: EngagementProjection | None,
+    reveals: RevealOutput | None,
+    view: FeedState,
+) -> RevealBudget:
+    """The reveal unit's budget; the state's while that unit is degraded; PRD §4.12's null rule while the engagement is unusable.
+
+    A new tree is always reveal work, so with a usable engagement and no reveal output the unit degraded; with no
+    state tree to keep a budget from, the null rule applies.
+    """
+    if reveals is not None:
+        return reveals.budget
+    if engagement is not None and view.tree is not None:
+        return view.tree.budget
+    return counted_set(policy, tree.files).budget([file.path for file in view.revealed])
+
+
 def _tree_snapshot(
     policy: Policy,
     tree: VisibleTree | None,
+    *,
+    engagement: EngagementProjection | None,
     reveals: RevealOutput | None,
     view: FeedState,
     stamp: Stamp,
     now: datetime,
 ) -> TreeSnapshot | None:
-    """A new tree with the reveal unit's budget, else PRD §4.12's null rule; with no new tree, a changed budget re-emits the state's."""
+    """A new tree with its budget; with no new tree, a changed budget re-emits the state's."""
     if tree is None:
         return None if reveals is None else budget_event(reveals.budget, state=view, stamp=stamp, now=now)
-    if reveals is None:
-        budget = counted_set(policy, tree.files).budget([file.path for file in view.revealed])
-    else:
-        budget = reveals.budget
+    budget = _new_tree_budget(policy, tree, engagement=engagement, reveals=reveals, view=view)
     return tree_event(tree, budget=budget, stamp=stamp, now=now)
 
 
@@ -438,7 +458,9 @@ def run_pass(
         degraded=degraded,
     )
     tree = None if git is None or git.tree is None else git.tree
-    snapshot = _tree_snapshot(policy, tree, reveals, view, stamp, now)
+    snapshot = _tree_snapshot(
+        policy, tree, engagement=engagement, reveals=reveals, view=view, stamp=stamp, now=now
+    )
     prds = prd_events(
         tasks=view.tasks.values(),
         state=view,

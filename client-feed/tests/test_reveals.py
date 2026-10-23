@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _git_repo import Repo, make_repo
+from _git_repo import Repo, make_repo, path_with_git_killed_on
 from _in_dir import request_reveals, write_engagement
 from _stores import RunsDb, TasksDb
 
@@ -484,6 +484,25 @@ def test_b17_a_later_pass_charges_a_carried_blob_pair_without_diffing_it_again(
     project.run(minutes=61)
 
     assert newest_tree(project).budget.counted_lines == 100 + 30 + 5
+
+
+def test_a_new_tree_keeps_the_states_budget_while_the_reveal_unit_is_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _delivered_project(tmp_path, proportion=0.25)
+    project.run(minutes=60)
+    before = newest_tree(project).budget
+    project.repo.write('src/a.py', numbered('a', 200) + numbered('grown', 70))
+    c3 = project.repo.commit('c3', when=at(20))
+
+    with monkeypatch.context() as patched:
+        patched.setenv('PATH', path_with_git_killed_on(tmp_path / 'bin', 'diff'))
+        report = project.run(minutes=61)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.GIT]
+    assert (newest_tree(project).commit, newest_tree(project).budget) == (c3, before)
+    project.run(minutes=62)
+    assert newest_tree(project).budget.counted_lines == 70 + 30
 
 
 FOLLOWED = ('src/a.py', 'src/b.py', 'src/c.py', 'src/f.py')

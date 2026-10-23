@@ -540,7 +540,11 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     included) or invalid file, or a `delivered_commit` the repository does not hold, is named
     `engagement` in `degraded` (`client-feed/src/client_feed/engagement.py::EngagementUnusable`).
     Reveals are then disabled for that pass: the inbox is not read, its offset is held, nothing is
-    followed, and a new tree's budget uses §4.12's null `delivered_commit` rule. A `project_id` other
+    followed, and a new tree's budget uses §4.12's null `delivered_commit` rule. When the engagement
+    is usable but the reveal unit fails (a git error, say), that unit's source is named in
+    `degraded`, the inbox offset and `reveals_head` are held, and a new tree keeps the state's last
+    budget instead of switching to the null rule for one pass
+    (`client-feed/src/client_feed/publisher.py::_new_tree_budget`). A `project_id` other
     than the policy's is the refusal
     `client-feed/src/client_feed/engagement.py::EngagementProjectMismatch`, a `FeedError`: the pass
     stops before anything is appended, and the CLI exits 1. `heartbeat.engagement_version` echoes
