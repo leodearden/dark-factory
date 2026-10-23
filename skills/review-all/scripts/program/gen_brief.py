@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import enum
 import json
+import shlex
 import sys
 import types
 from collections.abc import Callable, Mapping, Sequence
@@ -24,7 +25,12 @@ import program_doc
 import program_facts
 import return_contract
 import run_cli
+import sessions
 import state
+
+sys.path.insert(0, str(state.CHECKOUT_ROOT / 'orchestrator' / 'src'))
+
+from orchestrator import session_registry
 
 
 class Section(enum.StrEnum):
@@ -58,6 +64,8 @@ _EXIT_MEANINGS: Mapping[Exit, str] = types.MappingProxyType({
 
 SEAT_TITLE = '<your seat title>'
 LAUNCHING = 'skills/review-all/references/deliberation.md §Launching'
+SELF_EXIT_ENV = 'CLAUDE_SPAWN_SELF_EXIT'
+SPAWN_SCRIPT = state.CHECKOUT_ROOT / 'skills' / 'spawn' / 'spawn-claude.sh'
 
 
 @dataclass(frozen=True)
@@ -192,6 +200,10 @@ class _Seat:
     @property
     def view(self) -> state.StreamView:
         return self.run.views[self.stream]
+
+    @property
+    def spawned(self) -> bool:
+        return self.session.kind is state.SessionKind.SPAWN
 
 
 _Sections = list[tuple[Section, list[str]]]
@@ -447,6 +459,34 @@ _BUILDERS: Mapping[state.Pass, Callable[[_Seat], _Built]] = types.MappingProxyTy
 })
 
 
+def _code_spans(outcomes: Sequence[session_registry.ResultOutcome]) -> str:
+    return ', '.join(f'`{outcome}`' for outcome in outcomes)
+
+
+def _spawn_section(seat: _Seat) -> tuple[Section, list[str]]:
+    """What a spawned session owes its record, in session_registry's outcome vocabulary."""
+    result = session_registry.RESULT_FILENAME
+    terminal = [o for o in session_registry.RESULT_OUTCOMES if o in session_registry.TERMINAL_RESULT_OUTCOMES]
+    inbox = seat.run.home.inbox_file(seat.stream, seat.pass_, seat.item)
+    return Section.SPAWN, [
+        f'- The inbox file `{inbox}` is your return. `{result}` names that path and carries no '
+        'copy of it.',
+        f'- After each pass, checkpoint `{result}` with outcome '
+        f'`{session_registry.ResultOutcome.IN_PROGRESS}`; its final write carries a terminal '
+        f'outcome: {_code_spans(terminal)}.',
+        f'- On a context or usage limit, write HANDOFF.md beside `{result}` and end with outcome '
+        f'`{session_registry.ResultOutcome.HANDED_OFF}`.',
+        '- Run /reflect before you end.',
+        '- End as the launch trailer says.',
+    ]
+
+
+def _spawn_command(project_root: str, title: str, brief: Path) -> str:
+    """The one command that spawns the session on *brief*, which it ends itself (self-exit)."""
+    argv = [str(SPAWN_SCRIPT), project_root, 'true', title, '--prompt-file', str(brief)]
+    return f'{SELF_EXIT_ENV}=1 ' + shlex.join(argv)
+
+
 def _title(seat: _Seat) -> str:
     program = seat.run.program
     item = '' if seat.item is None else f' {seat.item}'
@@ -466,22 +506,39 @@ def _seat(args: argparse.Namespace) -> _Seat:
     pass_ = state.Pass(args.pass_)
     if pass_ not in _BUILDERS:
         raise state.StateError(f'no {pass_} brief yet')
-    return _Seat(
-        home=home, stream=stream, pass_=pass_, item=args.item,
-        session=state.Session(state.SessionKind.AGENT, SEAT_TITLE),
+    if args.spawn is None:
+        session = state.Session(state.SessionKind.AGENT, SEAT_TITLE)
+    else:
+        session = state.Session(state.SessionKind.SPAWN, args.spawn)
+    return _Seat(home=home, stream=stream, pass_=pass_, item=args.item, session=session)
+
+
+def _spawned_session(seat: _Seat) -> sessions.SpawnedSession:
+    """The sessions.json entry for the spawn, refused before any write when its title is taken."""
+    sessions.refuse_taken(seat.run.home, seat.session.title)
+    return sessions.SpawnedSession(
+        title=seat.session.title, stream=seat.stream, pass_=seat.pass_, item=seat.item,
+        spawned_after=state.now_utc(), record_dir=None,
     )
 
 
 def _write(args: argparse.Namespace) -> Exit:
     seat = _seat(args)
     built = _BUILDERS[seat.pass_](seat)
-    text = _text(seat, built.sections)
-    path = seat.run.home.brief_file(seat.stream, seat.pass_, seat.item)
+    sections = [*built.sections, *([_spawn_section(seat)] if seat.spawned else [])]
+    text = _text(seat, sections)
+    spawned = _spawned_session(seat) if seat.spawned else None
+    home = seat.run.home
+    path = home.brief_file(seat.stream, seat.pass_, seat.item)
     path.parent.mkdir(exist_ok=True)
     path.write_text(text, encoding='utf-8')
     print(f'wrote {path}')
     if built.store_read is not None:
         print(f'store read {built.store_read}')
+    if spawned is not None:
+        sessions.add(home, spawned)
+        print(f'recorded {spawned.title} in {home.sessions_json}')
+        print(_spawn_command(seat.run.program.project_root, spawned.title, path))
     return Exit.WRITTEN
 
 
@@ -494,6 +551,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('stream', help='the stream the brief is for')
     parser.add_argument('pass_', metavar='pass', choices=[str(p) for p in state.Pass])
     parser.add_argument('--item', metavar='Q', help='the recorded question an investigate pass probes')
+    parser.add_argument('--spawn', metavar='TITLE',
+                        help='record a spawned session under TITLE and print its spawn command')
     return parser
 
 
@@ -504,6 +563,9 @@ def _usage_errors(args: argparse.Namespace) -> list[str]:
         errors.append('--item goes only with the investigate pass')
     if investigate and args.item is None:
         errors.append('the investigate pass needs --item')
+    if args.spawn is not None and args.pass_ == state.Pass.DECOMPOSE:
+        errors.append(f'--spawn goes only with author or investigate: a decompose runs as an agent '
+                      f'seat ({LAUNCHING})')
     return errors
 
 
