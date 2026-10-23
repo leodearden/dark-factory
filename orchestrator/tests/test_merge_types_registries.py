@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import time
+import weakref
 from collections.abc import Iterator
 
 import pytest
@@ -72,7 +73,7 @@ def _dispatch_591(loop: asyncio.AbstractEventLoop) -> tuple[InFlightMergeRegistr
     registry = InFlightMergeRegistry()
     registry.acquire('591', 'T-591', loop.create_future(), request_id='mr-1')
     at_dispatch = registry.eta_seconds('591')
-    assert at_dispatch is not None and at_dispatch > 1
+    assert at_dispatch is not None and at_dispatch > 1, f'estimate too small to probe: {at_dispatch}'
     return registry, at_dispatch
 
 
@@ -122,11 +123,14 @@ class TestDetachLastWaiter:
 
         assert registry.detach('591', 'mr-1') == 0
         loop.run_until_complete(asyncio.sleep(0))
-        assert not registry.is_inflight('591')
+        assert registry.entry('591') is None, 'the registry still holds the failed primary'
+        assert primary.done() and not primary.cancelled(), 'the failed primary must stay failed'
 
         loop.close()
+        primary_ref = weakref.ref(primary)
         del primary
         gc.collect()
+        assert primary_ref() is None, 'something still holds the failed primary, so asyncio cannot report it'
         assert messages == ['Future exception was never retrieved']
 
 
