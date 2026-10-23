@@ -12016,7 +12016,7 @@ class TestFilterStyleOnlyAuthorshipFlags:
 
     @pytest.mark.asyncio
     async def test_non_candidate_flag_type_passes_through_without_lookup(self):
-        """(SCOPE) Only AUTHORSHIP_SUSPICION_FLAG_TYPES are checked."""
+        """(SCOPE) Only flag_types AUTHORSHIP_SUSPICION_FAMILY matches are checked."""
         from fused_memory.reconciliation.flag_dedup import (
             filter_style_only_authorship_flags,
         )

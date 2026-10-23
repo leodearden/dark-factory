@@ -5282,21 +5282,24 @@ def filter_snapshot_stat_edge_findings(
 # Style-only authorship guard helpers (task 3138, PRD §9 leaf μ)
 # --------------------------------------------------------------------------- #
 
-#: Flag types asserting that an entry's content was injected, fabricated, or
-#: written by someone outside this deployment.  Several spellings are listed
-#: because the family has no committed schema entry — Stage 1 emits it as
-#: free-form LLM output, so the set is a best-effort census of the plausible
-#: spellings (the ``STALE_METADATA_FLAG_TYPES`` idiom).  An unrecognised
-#: spelling degrades to a visible drift log rather than a silent no-op.
-AUTHORSHIP_SUSPICION_FLAG_TYPES: frozenset[str] = frozenset({
-    'possible_injection',
-    'prompt_injection',
-    'injected_content',
-    'possible_fabrication',
-    'fabricated_content',
-    'foreign_authorship',
-    'suspicious_authorship',
-})
+#: The finding that an entry's content was injected, fabricated, or written by
+#: someone outside this deployment.  ``spellings`` are a best-effort census of
+#: the plausible ones, not a closed set; FlagTypeFamily tolerates their
+#: respellings, and any other spelling carrying one of the three stems
+#: degrades to a visible drift log rather than a silent no-op.
+AUTHORSHIP_SUSPICION_FAMILY = FlagTypeFamily(
+    name='authorship_suspicion',
+    spellings=frozenset({
+        'possible_injection',
+        'prompt_injection',
+        'injected_content',
+        'possible_fabrication',
+        'fabricated_content',
+        'foreign_authorship',
+        'suspicious_authorship',
+    }),
+    drift_tokens=frozenset({'inject', 'fabricat', 'foreign'}),
+)
 
 
 def _classify_authorship(agent_id: Any) -> str:
@@ -5351,9 +5354,9 @@ async def filter_style_only_authorship_flags(
     it — it never read the stored ``agent_id``.  Writing style is not evidence
     of authorship; provenance is.
 
-    A flag is a CANDIDATE iff its ``flag_type`` is in
-    :data:`AUTHORSHIP_SUSPICION_FLAG_TYPES`.  For each candidate, every mem0
-    citation in ``cited_memories`` is resolved via
+    A flag is a CANDIDATE iff :data:`AUTHORSHIP_SUSPICION_FAMILY` matches its
+    ``flag_type``.  For each candidate, every mem0 citation in
+    ``cited_memories`` is resolved via
     ``memory_service.get_memory_by_id(project_id, memory_id)`` — whose
     ``metadata`` is the raw Qdrant payload and therefore still carries the
     top-level ``agent_id`` that mem0's ``AsyncMemory`` promotes out of metadata
@@ -5406,29 +5409,12 @@ async def filter_style_only_authorship_flags(
 
     candidate_positions: list[int] = [
         i for i, flag in enumerate(flags)
-        if flag.get('flag_type') in AUTHORSHIP_SUSPICION_FLAG_TYPES
+        if AUTHORSHIP_SUSPICION_FAMILY.matches(flag.get('flag_type'))
     ]
 
-    # Detect potential LLM naming drift: flag_type strings that look like this
-    # family but are not in AUTHORSHIP_SUSPICION_FLAG_TYPES.  The family has no
-    # committed schema entry, so an unrecognised spelling would silently make
-    # the gate a no-op; this log makes that observable (the
-    # filter_terminal_metadata_flags drift-log precedent).
-    drift_candidates = [
-        ft
-        for flag in flags
-        if isinstance(ft := flag.get('flag_type'), str)
-        and any(token in ft.lower() for token in ('inject', 'fabricat', 'foreign'))
-        and ft not in AUTHORSHIP_SUSPICION_FLAG_TYPES
-    ]
-    if drift_candidates:
-        logger.info(
-            'reconciliation.style_only_authorship_filter_possible_drift '
-            'unmatched_flag_types=%s known_types=%s '
-            '— update AUTHORSHIP_SUSPICION_FLAG_TYPES if drift confirmed',
-            drift_candidates,
-            sorted(AUTHORSHIP_SUSPICION_FLAG_TYPES),
-        )
+    AUTHORSHIP_SUSPICION_FAMILY.log_drift(
+        flags, log_event='reconciliation.style_only_authorship_filter_possible_drift',
+    )
 
     if not candidate_positions:
         # No candidates at all — skip every lookup, so a normal cycle (in which
@@ -5538,17 +5524,18 @@ async def filter_style_only_authorship_flags(
 #: ``growth`` tokens (``'mem0_duplicate_cluster_growth'``,
 #: ``'memory_cluster_growth_detected'``).
 #:
-#: That token arm is deliberately BROADER than the exact-family matching used
-#: by the sibling filters (:func:`filter_terminal_metadata_flags`,
-#: :func:`filter_stale_bulk_get_statuses_flags`,
-#: :func:`filter_style_only_authorship_flags`).  Over-matching is safe HERE in
-#: a way it is not for :func:`filter_suppressed`, whose family collisions can
-#: hide a genuinely-recurring finding for cycles: this family only ever admits
-#: a flag to :func:`filter_accounted_cluster_growth_flags`, which DROPS solely
-#: after positively confirming that EVERY cited memory UUID is already written
-#: into the referenced task's own description body.  A mis-classified
-#: flag_type can therefore only ever reclassify a finding that is, by
-#: construction, already accounted for -- never silence an unaccounted one.
+#: That token arm is deliberately BROADER than the sibling families
+#: (:data:`STALE_METADATA_FAMILY`, :data:`STALE_BULK_GET_STATUSES_FAMILY`,
+#: :data:`AUTHORSHIP_SUSPICION_FAMILY`), which match only canonical variants
+#: of their spellings and carry no ``unseen_spelling_tokens``.  Over-matching
+#: is safe HERE in a way it is not for :func:`filter_suppressed`, whose family
+#: collisions can hide a genuinely-recurring finding for cycles: this family
+#: only ever admits a flag to :func:`filter_accounted_cluster_growth_flags`,
+#: which DROPS solely after positively confirming that EVERY cited memory UUID
+#: is already written into the referenced task's own description body.  A
+#: mis-classified flag_type can therefore only ever reclassify a finding that
+#: is, by construction, already accounted for -- never silence an unaccounted
+#: one.
 CLUSTER_GROWTH_FAMILY = FlagTypeFamily(
     name='cluster_growth',
     spellings=frozenset({
