@@ -209,7 +209,9 @@ def _arrival_counts(
       (task 4278), counted in the same transaction as the fold.
 
     Each pushed event lands in exactly one of the three, so summing them
-    double-counts nothing and loses nothing.
+    double-counts nothing and loses nothing.  One bound: a redelivered event
+    that folded in as an older or middle constituent of its row folds and is
+    counted again (``coalescing.merge_coalesced_payload``).
     """
     floor = _normalise_since(since)
     emitted: Counter[tuple[str, str]] = Counter()

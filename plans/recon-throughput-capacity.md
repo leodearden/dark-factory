@@ -259,7 +259,10 @@ pre-fold payload. That is benign: the task is already in that batch, and
 
 **Reading the report now.** Every folded event is counted in `event_coalesced_hourly` in
 the fold's own write unit. Each pushed event is therefore a live row, in
-`event_arrival_hourly`, or in `event_coalesced_hourly`, exactly once.
+`event_arrival_hourly`, or in `event_coalesced_hourly`, exactly once, with one bound.
+A fold recognises a redelivery only when the redelivered event is its row's newest
+constituent. At-least-once journal redelivery of an older or middle constituent
+therefore folds again, and over-counts that event by one.
 
 - `inflow.total_events` still counts every event producers emitted.
 - `inflow.coalesced` (same shape) is the folded share, and `total − coalesced` is the drain

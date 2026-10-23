@@ -95,9 +95,10 @@ CREATE TABLE IF NOT EXISTS event_arrival_hourly (
 );
 
 -- Task 4278 (recon lever 3): events push() folded into an older buffered row.
--- Counted in the same write unit as the fold, so the partition stays exact:
--- every pushed event is a live event_buffer row, OR in event_arrival_hourly,
--- OR in event_coalesced_hourly.
+-- Counted in the same write unit as the fold, so every pushed event is a live
+-- event_buffer row, OR in event_arrival_hourly, OR in event_coalesced_hourly.
+-- One bound: a redelivered event that folded in as an older or middle
+-- constituent is not recognised as a redelivery, so it is counted here again.
 CREATE TABLE IF NOT EXISTS event_coalesced_hourly (
     project_id TEXT NOT NULL,
     hour_bucket TEXT NOT NULL,
@@ -132,7 +133,7 @@ class _PushOutcome(StrEnum):
 
 class _PushResult(NamedTuple):
     outcome: _PushOutcome
-    coalesced_count: int = 1
+    fold_count: int = 1
 
 
 _UNFOLDED_PUSH_LOG_LINE = {
@@ -157,10 +158,10 @@ def _log_push(event: ReconciliationEvent, key: str | None, result: _PushResult) 
         'project_id': event.project_id,
         'event_type': event.type.value,
         'coalesce_key': key,
-        'coalesced_count': result.coalesced_count,
+        'coalesced_count': result.fold_count,
     }
     logger.info('reconciliation.event_coalesced', extra=fold_extra)
-    if result.coalesced_count % _COALESCE_HOT_TASK_WARNING_INTERVAL == 0:
+    if result.fold_count % _COALESCE_HOT_TASK_WARNING_INTERVAL == 0:
         logger.warning('reconciliation.coalesce_hot_task', extra=fold_extra)
 
 
@@ -300,7 +301,11 @@ class EventBuffer:
         an id ``peek_buffered`` handed out still drains via ``drain_by_ids``,
         and its timestamp, which only ever moves earlier, so ``ORDER BY
         timestamp`` positions and the ``MIN(timestamp)`` staleness trigger
-        hold.  The INSERT runs first: a unit whose first statement writes is
+        hold.  A folded event leaves no row of its own for ``ON CONFLICT`` to
+        hit, so its redelivery is recognised only when it is the row's newest
+        constituent (``coalescing.merge_coalesced_payload``); an older or
+        middle constituent folds again and over-counts by one.
+        The INSERT runs first: a unit whose first statement writes is
         serialised against other connections, which a unit that SELECTs first
         is not (``AtomicConnection.write``).  A fold landing between
         ``peek_buffered`` and ``drain_by_ids`` reaches the stage as the
