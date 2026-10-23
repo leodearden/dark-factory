@@ -17,6 +17,8 @@ import pytest
 from orchestrator.verify_event_channel import (
     VERIFY_EVENT_LOG_ENV,
     VerifyEventChannel,
+    VerifyEventLog,
+    allocate_verify_event_log,
     encode_channel_open,
     parse_verify_event_channel,
     read_verify_event_channel,
@@ -276,3 +278,96 @@ def test_complete_run_with_no_failures_gives_empty() -> None:
     producer = run_start() + run_finish(failed=[], failures=0)
 
     assert parse(header('V') + producer).failed_run_all_members() == []
+
+
+# allocator: VerifyEventLog / allocate_verify_event_log -----------------------
+
+
+def test_allocated_log_holds_only_this_verifys_header_and_is_removed_after(
+    tmp_path: Path,
+) -> None:
+    with allocate_verify_event_log(role='task', directory=tmp_path) as log:
+        assert isinstance(log, VerifyEventLog)
+        assert log.path is not None
+        path = log.path
+        assert path.is_absolute()
+        assert path.is_file()
+        assert path.parent == tmp_path
+        assert isinstance(log.verify_id, str) and log.verify_id
+
+        lines = path.read_bytes().splitlines()
+        assert len(lines) == 1
+        written = json.loads(lines[0])
+        assert written['event'] == 'channel_open'
+        assert written['role'] == 'task'
+        assert written['verify_id'] == log.verify_id
+
+        channel = log.read()
+        assert channel.present is True
+        assert channel.run_starts == 0
+        assert channel.failed_run_all_members() == []
+
+        base = {'A': '1'}
+        exported = log.export_into(base)
+        assert exported is not base
+        assert exported == {'A': '1', VERIFY_EVENT_LOG_ENV: str(path)}
+        assert base == {'A': '1'}
+
+    assert not path.exists()
+
+
+def test_allocated_log_is_removed_when_the_block_raises(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match='boom'):
+        with allocate_verify_event_log(role='task', directory=tmp_path) as log:
+            assert log.path is not None
+            path = log.path
+            raise RuntimeError('boom')
+
+    assert not path.exists()
+
+
+def test_producer_deleting_the_log_is_tolerated(tmp_path: Path) -> None:
+    with allocate_verify_event_log(role='task', directory=tmp_path) as log:
+        assert log.path is not None
+        log.path.unlink()
+
+        assert log.read().present is False
+
+
+def test_export_overrides_an_operator_supplied_channel(tmp_path: Path) -> None:
+    with allocate_verify_event_log(role='task', directory=tmp_path) as log:
+        exported = log.export_into({VERIFY_EVENT_LOG_ENV: str(tmp_path / 'operator.jsonl')})
+
+        assert exported[VERIFY_EVENT_LOG_ENV] == str(log.path)
+
+
+def test_nested_allocations_are_distinct(tmp_path: Path) -> None:
+    with allocate_verify_event_log(role='task', directory=tmp_path) as outer:
+        with allocate_verify_event_log(role='task', directory=tmp_path) as inner:
+            assert outer.path != inner.path
+            assert outer.verify_id != inner.verify_id
+
+
+def test_producer_bytes_appended_to_the_log_are_read(tmp_path: Path) -> None:
+    with allocate_verify_event_log(role='task', directory=tmp_path) as log:
+        assert log.path is not None
+        with log.path.open('ab') as channel_file:
+            channel_file.write(fixture_bytes(POOL))
+
+        channel = log.read()
+
+    assert channel.present is True
+    assert channel.failed_run_all_members() == ['test_fail.sh']
+
+
+def test_allocated_header_carries_the_role(tmp_path: Path) -> None:
+    with allocate_verify_event_log(role='merge', directory=tmp_path) as log:
+        assert log.path is not None
+        assert json.loads(log.path.read_bytes())['role'] == 'merge'
+
+
+def test_failed_allocation_fails_open_to_no_channel(tmp_path: Path) -> None:
+    with allocate_verify_event_log(role='task', directory=tmp_path / 'missing') as log:
+        assert log.path is None
+        assert log.export_into({VERIFY_EVENT_LOG_ENV: '/tmp/x', 'A': '1'}) == {'A': '1'}
+        assert log.read().present is False
