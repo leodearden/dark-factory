@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from shared.cli_invoke import _SubprocessResult
+from shared.invocation_outcome import CapHit, Failure, classify_invocation
 
 from orchestrator.agents.invoke import (
     _estimate_cost,
@@ -341,6 +342,76 @@ class TestParseCodexErrorCarriers:
 
         assert agent_result.success is False
         assert agent_result.output.count(_CODEX_USAGE_LIMIT_MESSAGE) == 1
+
+
+# A codex-cli 0.154.0 binary string: a fatal, non-cap turn failure.
+_CODEX_CONTEXT_WINDOW_ERROR = (
+    "Codex ran out of room in the model's context window. "
+    'Start a new thread or clear earlier history before retrying.'
+)
+# Agent prose quoting this repo's cap code, as a review of it would.
+_PROSE_QUOTING_CAP_TEXT = (
+    "The diff adds 'usage limit reached' to CODEX_CAP_PATTERNS; "
+    'on a real cap codex says try again at 1:07 PM.'
+)
+
+
+def _codex_fatal_pair(message: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    return (
+        {'type': 'error', 'message': message},
+        {'type': 'turn.failed', 'error': {'message': message}},
+    )
+
+
+class TestParseCodexFailedTurnReportsOnlyCodexErrors:
+    """A failed turn's output is codex's own error report, never the agent's
+    prose, so a reply that discusses caps is not read as one."""
+
+    def test_failed_turn_drops_agent_prose_and_is_not_a_cap(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-prose-1'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': _PROSE_QUOTING_CAP_TEXT}},
+            *_codex_fatal_pair(_CODEX_CONTEXT_WINDOW_ERROR),
+        ), 'gpt-6-astra')
+
+        assert agent_result.success is False
+        assert agent_result.output.count(_CODEX_CONTEXT_WINDOW_ERROR) == 1
+        assert _PROSE_QUOTING_CAP_TEXT not in agent_result.output
+        outcome = classify_invocation(agent_result, strict_confirm=True, backend='codex')
+        assert isinstance(outcome, Failure)
+
+    def test_measured_cap_still_classifies_as_a_cap_with_its_reset(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-cap-1'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'starting the review'}},
+            *_codex_fatal_pair(_CODEX_USAGE_LIMIT_MESSAGE),
+        ), 'gpt-6-astra')
+
+        assert agent_result.output == _CODEX_USAGE_LIMIT_MESSAGE
+        outcome = classify_invocation(agent_result, strict_confirm=True, backend='codex')
+        assert isinstance(outcome, CapHit)
+        assert outcome.resets_at is not None
+
+    def test_failed_turn_keeps_item_level_warnings(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-warn-1'},
+            {'type': 'item.completed', 'item': {'type': 'error', 'message': _CODEX_MODEL_METADATA_WARNING}},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'partial work'}},
+            *_codex_fatal_pair(_CODEX_CONTEXT_WINDOW_ERROR),
+        ), 'gpt-6-astra')
+
+        assert _CODEX_MODEL_METADATA_WARNING in agent_result.output
+        assert _CODEX_CONTEXT_WINDOW_ERROR in agent_result.output
+
+    def test_completed_turn_still_reports_agent_text(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-ok-1'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'review complete'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}},
+        ), 'gpt-6-astra')
+
+        assert agent_result.success is True
+        assert 'review complete' in agent_result.output
 
 
 _ASTRA_PRICES = {
