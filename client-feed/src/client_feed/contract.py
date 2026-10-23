@@ -663,6 +663,10 @@ class DefectReported(_Record):
     outcome: DefectOutcome
 
 
+InboxLine = Annotated[RevealRequested | DefectReported, Field(discriminator='type')]
+_INBOX_LINE_ADAPTER: Final = TypeAdapter(InboxLine)
+
+
 class EngagementProjection(_Record):
     """engagement.json: the portal's projection of the engagement record."""
 
@@ -724,10 +728,10 @@ def parse_feed_line(text: str, *, line_no: int) -> FeedLine:
     return _validated(FEED_EVENT_ADAPTER.validate_python, raw, line_no=line_no)
 
 
-def parse_inbox_line(text: str, *, line_no: int) -> RevealRequested:
-    """One inbox.jsonl line."""
+def parse_inbox_line(text: str, *, line_no: int) -> InboxLine:
+    """One inbox.jsonl line as the line type its `type` names."""
     return _validated(
-        RevealRequested.model_validate, _json_object(text, line_no=line_no), line_no=line_no
+        _INBOX_LINE_ADAPTER.validate_python, _json_object(text, line_no=line_no), line_no=line_no
     )
 
 

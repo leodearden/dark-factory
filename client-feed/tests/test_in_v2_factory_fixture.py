@@ -34,6 +34,7 @@ IN_V2 = Path(__file__).parent / 'fixtures' / 'in-v2-factory'
 PROJECT = 'demo-client'
 T0 = datetime(2026, 10, 23, 9, 0, tzinfo=UTC)
 NOW = datetime(2026, 10, 23, 10, 0, tzinfo=UTC)
+LEDGER = ''.join(f'entry_{index} = {index}\n' for index in range(60))
 RESTATED_LINE = 1
 QUARANTINED_LINE = 2
 
@@ -145,7 +146,7 @@ def test_a_defect_line_carrying_raw_text_is_rejected_and_the_rest_are_read(in_di
 def policy(tmp_path: Path, in_dir: Path) -> Policy:
     repo = make_repo(tmp_path / 'repo')
     repo.write('.gitignore', '.taskmaster/\ndata/\n')
-    repo.write('src/ledger.py', 'balance = 100\n')
+    repo.write('src/ledger.py', LEDGER)
     repo.commit('c1', when=T0)
     TasksDb.create(repo.root)
     RunsDb.create(repo.root)
