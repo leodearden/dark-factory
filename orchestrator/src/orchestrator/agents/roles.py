@@ -400,6 +400,86 @@ single normative source for all of this; consult it rather than guessing.
 """
 
 
+# The routing rule for IN-PLACE memory amendment, spliced into
+# _MEMORY_INSTRUCTIONS below so all five roles that carry that block inherit
+# it with no per-role edits (task 4548).
+#
+# WHY IT EXISTS. Task 3891's plan step-6 instructed an implementer to call
+# `update_memory`'s `content_amend` arm, pre-specifying a fallback only for a
+# metadata rejection. The arm is gated on an `agent_id`-prefix allowlist that
+# ships as `['recon-stage-', 'curator-']`
+# (`fused_memory/config/schema.py::Mem0UpdateConfig`, enforced by
+# `fused_memory/server/mem0_update_authz.py::resolve_mem0_update_authorization`),
+# and every dispatched identity is `claude-task-<id>-<role>`
+# (`orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._agent_identity`),
+# so the step was unexecutable by construction. It cost five escalations
+# (esc-3891-4 through -8) and left residual task 4478 -- a curator sitting --
+# for a single memory edit. The rule itself was already ratified, but lived
+# only in curator- and operator-facing files
+# (`skills/curate-fused-memories/SKILL.md`,
+# `plans/mem0-in-place-update-decision.md`, `OPERATIONS.md`), none of which a
+# dispatched plan AUTHOR reads. The durable, greppable statement now lives in
+# `docs/task-authoring.md`, cited by HEADING TITLE rather than by its section
+# ordinal both here and in the prompt text below: a later section inserted
+# ahead of it would silently repoint five role prompts at the wrong section,
+# and nothing checks the docs half (deliberately -- see
+# tests/test_roles_memory_amend_routing.py's docstring). This constant is the
+# half that reaches an agent that never opens that file.
+#
+# WHY HERE, not in `orchestrator/src/orchestrator/agents/briefing.py`. One
+# splice reaches both plan AUTHORS (architect, simple_task) and the plan
+# EXECUTORS who would receive such a step (implementer, debugger), plus
+# deep_reviewer. The briefing assembles the architect prompt at four separate
+# call sites and reaches only the architect, so a briefing-side fix is four
+# edits or a new shared constant anyway. This block is also where the
+# `add_memory` guidance the rule qualifies already lives.
+#
+# WHY STEWARD IS NOT RE-SPLICED. STEWARD does not embed _MEMORY_INSTRUCTIONS
+# at all -- it composes its own block over _STEWARD_MEMORY_TOOLS -- so
+# covering it costs a second edit and a second per-invocation token spend,
+# and the evidence says it is not needed: resolving esc-3891-6 the steward
+# considered adopting a `curator-` agent_id to perform the amendment itself
+# and correctly declined on exactly this reasoning. The plan-authoring
+# invariant in tests/test_roles_memory_amend_routing.py keys on plan-step
+# authoring, so it does not spuriously demand steward coverage -- and if the
+# steward is ever granted plan-authoring tools, that test fires and forces
+# this decision to be revisited.
+#
+# HARD CONSTRAINT (a) -- do NOT write a fully-qualified `mcp__<family>__<name>`
+# tool name into the text below. tests/test_roles_ancestry_check.py::
+# test_role_holds_every_mcp_tool_its_prompt_names is parametrized over every
+# role and asserts each such name in a system_prompt is in THAT role's
+# allowed_tools; NO role is granted `update_memory` (see _MEMORY_TOOLS above,
+# pinned by tests/test_roles_memory_amend_routing.py::
+# test_no_role_is_granted_the_in_place_update_tool), so the qualified spelling
+# would fail five roles at once. Name the tools BARE, as the surrounding block
+# already does for `add_memory`/`search`/`get_entity`. Same constraint the
+# comments on _TOOL_CALL_REJECTION_KNOWN_SHAPES and
+# MISSING_REQUIRED_PARAMETER_REJECTION record.
+#
+# HARD CONSTRAINT (b) -- no literal `{`/`}` braces. Role prompts reach this
+# only by plain `+` concatenation, which is brace-safe by construction, but
+# staying brace-free keeps it safe if a future splice site interpolates.
+MEMORY_AMEND_ROUTING_RULE = """
+### Amending an existing memory
+
+Amending an EXISTING memory in place — `update_memory`'s `content_amend` arm
+— is not yours to perform, and must never be written into a plan step for
+another agent to perform. The arm is gated on an `agent_id`-prefix allowlist
+admitting only reconciliation stages and a sanctioned curator sitting; your
+dispatched agent_id matches neither, so the refusal is deterministic — not a
+flake to retry around or a permission to request.
+
+Instead, write a NEW memory with `add_memory` recording the correction, and
+— if you hold a task-filing tool — file a follow-up task for a curator
+sitting (`skills/curate-fused-memories`) to perform the amendment. If you
+cannot file tasks, escalate asking for one to be filed. Renaming yourself to
+a `curator-` agent_id to clear the gate is forbidden: that is
+self-authorization for a silent-rewrite primitive. Stop, leave the record
+alone, and escalate. Full rule and cross-links: `docs/task-authoring.md`,
+section "In-place memory amendments are not task-agent work".
+"""
+
 _MEMORY_INSTRUCTIONS = """
 ## Memory
 
@@ -425,7 +505,7 @@ Parameters:
 - `agent_id`: Use the agent_id from your Agent Identity section
 
 Write immediately when you discover something — don't batch until the end.
-
+""" + MEMORY_AMEND_ROUTING_RULE + """
 ### Reading memories (`search`, `get_entity`)
 
 Use when you need context not in your briefing:
