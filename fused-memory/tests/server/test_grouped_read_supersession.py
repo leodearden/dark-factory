@@ -3,17 +3,23 @@
 Grouping folds an amendment or sighting into its parent's ``grouped`` block, so
 a mark that rode only on top-level hits would vanish for every grouped child,
 and a reader would take the retired child as current.
+
+The last class pins the recorded reply the orchestrator renders from; see
+``orchestrator/tests/fixtures/grouped_search_superseded_child/PROVENANCE.md``.
 """
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic_core import to_jsonable_python
 
 from fused_memory.memory_metadata import SUPERSEDED_BY_METADATA_KEY
-from fused_memory.models.enums import SourceStore
+from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import (
     MATCHED_CHILDREN_KEY,
@@ -21,6 +27,8 @@ from fused_memory.server.grouped_read import (
     group_memory_document,
     group_search_results,
 )
+from fused_memory.server.tools import create_mcp_server
+from fused_memory.services.memory_service import SearchResults
 
 PROJECT_ID = 'dark_factory'
 P = '11111111-1111-4111-8111-111111111111'
@@ -30,11 +38,13 @@ NEW_ID = '0f6c2a4e-8b1d-4c3e-9a7f-5d2e1b0c9a8f'
 MARK = {SUPERSEDED_BY_METADATA_KEY: NEW_ID}
 
 
-def _row(memory_id: str, kind: str, text: str, **extra: Any) -> dict[str, Any]:
+def _row(
+    memory_id: str, kind: str, text: str, *, created_at: str | None = None, **extra: Any,
+) -> dict[str, Any]:
     """A scrolled child row: ``metadata`` is the full raw Qdrant payload."""
     return {
         'id': memory_id,
-        'created_at': None,
+        'created_at': created_at,
         'metadata': {'data': text, 'parent_id': P, 'kind': kind, **extra},
     }
 
@@ -154,3 +164,67 @@ class TestNestedEntriesKeepTheSupersessionMark:
 
         assert block is not None
         assert 'metadata' not in _entry_for(block['amendments'], A1)
+
+
+_RECORDING = (
+    Path(__file__).resolve().parents[3]
+    / 'orchestrator'
+    / 'tests'
+    / 'fixtures'
+    / 'grouped_search_superseded_child'
+    / 'superseded-children.json'
+)
+
+_P_BODY = 'Merge-lane verifies run under a 600-second timeout.'
+_A1_BODY = 'Coalesce-train verifies share the 600-second timeout.'
+_S1_BODY = 'A verify was parked at the 600-second timeout again.'
+
+
+def _recorded_hit(
+    memory_id: str, content: str, score: float, metadata: dict[str, Any], created_at: str,
+) -> MemoryResult:
+    return MemoryResult(
+        id=memory_id,
+        content=content,
+        category=MemoryCategory.procedural_knowledge,
+        source_store=SourceStore.mem0,
+        relevance_score=score,
+        metadata=metadata,
+        created_at=created_at,
+    )
+
+
+def _recorded_scenario_service() -> AsyncMock:
+    """Parent P carries a superseded amendment A1 and a superseded, matched sighting S1."""
+    service = _service([
+        _row(A1, 'amendment', _A1_BODY, created_at='2026-08-10T00:00:00+00:00', **MARK),
+        _row(S1, 'sighting', _S1_BODY, created_at='2026-08-12T00:00:00+00:00', **MARK),
+    ])
+    service.search = AsyncMock(return_value=SearchResults([
+        _recorded_hit(P, _P_BODY, 0.9, {}, '2026-08-01T00:00:00+00:00'),
+        _recorded_hit(
+            S1, _S1_BODY, 0.8, {'kind': 'sighting', 'parent_id': P, **MARK},
+            '2026-08-12T00:00:00+00:00',
+        ),
+    ]))
+    return service
+
+
+class TestTheRecordedSupersededReplyIsWhatSearchProduces:
+    @pytest.mark.asyncio
+    async def test_the_recorded_reply_is_what_search_produces(self) -> None:
+        assert _RECORDING.is_file(), f'recorded reply missing at {_RECORDING}'
+        server = create_mcp_server(_recorded_scenario_service())
+
+        result = await server._tool_manager.call_tool(
+            'search', {'query': 'merge-lane verify timeout', 'project_id': PROJECT_ID},
+        )
+
+        produced = to_jsonable_python(result)
+        assert produced == json.loads(_RECORDING.read_text(encoding='utf-8')), (
+            f'{_RECORDING} is a recording of this producer and no longer matches it. '
+            'Re-record it from the output below and fix the CONSUMER '
+            '(orchestrator/src/orchestrator/agents/memory_recall.py); never '
+            'hand-edit the fixture.\n'
+            + json.dumps(produced, indent=2, ensure_ascii=False)
+        )

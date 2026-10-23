@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 from _briefing_helpers import (
+    SUPERSEDED_CHILD_FIXTURES,
     _edge,
     _grouped_block,
     _grouped_parent,
@@ -713,19 +714,20 @@ class TestSupersededRender:
         assert 'superseded by' in lines[0]
         assert 'superseded by' not in lines[1]
 
-    def test_a_superseded_grouped_child_is_tagged_in_its_nested_bullet(self):
-        parent = _grouped_parent(grouped={
-            'amendments': [
-                {'id': 'a1', 'digest': 'Old amendment.', 'created_at': None,
-                 'kind': 'amendment', 'metadata': {SUPERSEDED_BY_METADATA_KEY: _NEW_ID}},
-            ],
-            'amendment_count': 1,
-        })
+    def test_superseded_grouped_children_are_tagged_in_their_nested_bullets(self):
+        """Read from a reply the real ``search`` tool produced; see that fixture's PROVENANCE.md."""
+        reply = parse_search_reply(
+            recorded_search_text('superseded-children', fixtures=SUPERSEDED_CHILD_FIXTURES),
+        )
+        assert isinstance(reply, SearchReply), reply
 
-        assert render_memory_results((parent,)).splitlines() == [
-            '- [uncategorized · undated · mem0] Native canonical.',
-            f'  - [superseded by {_NEW_ID} · amendment · undated · mem0] Old amendment.',
-        ]
+        lines = render_memory_results(reply.results).splitlines()
+
+        assert len(lines) == 3, lines
+        parent, amendment, sighting = lines
+        assert parent.startswith('- [') and 'superseded by' not in parent, lines
+        assert amendment.startswith(f'  - [superseded by {_NEW_ID} · amendment · '), lines
+        assert sighting.startswith(f'  - [superseded by {_NEW_ID} · sighting · '), lines
 
     @pytest.mark.parametrize('mark', ['', 123], ids=['empty', 'not-a-str'])
     def test_an_unreadable_mark_renders_the_plain_tag(self, mark):
