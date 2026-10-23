@@ -92,9 +92,10 @@ lock_depth: 12
 # conflicts it was meant to prevent. Authorizations are now one file each and the
 # baseline merges through the ratchet-baseline driver, so concurrent declarers
 # no longer collide. The ledger keys are the RETIRED array path, kept because
-# pending tasks still declare it, and the directory's one fixed file. A PARK
-# still reserves these keys exclusively (task 7313 makes the park gate honour the
-# override). Same red tier as above.
+# pending tasks still declare it, and the directory's one fixed file. A PARK on
+# these keys takes one of the key's slots instead of reserving it exclusively
+# (orchestrator/src/orchestrator/scheduler.py::ModuleLockTable._iter_blocking_park_owners).
+# Same red tier as above.
 module_overrides:
   orchestrator/src/orchestrator/workflow.py: 2
   orchestrator/src/orchestrator/harness.py: 2
