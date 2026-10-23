@@ -97,6 +97,7 @@ from orchestrator.lane_lifecycle import (
     LaneState,
 )
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
+from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
     lane_lock_holder_pids,
@@ -4846,7 +4847,7 @@ class GitOps:
                     # self-heal branch below raises rather than destroying
                     # anything, and the sidecar is correctly left in place.
                     if dest is not None:
-                        self._relocate_foreign_meta_root(worktree_path, dest)
+                        await self._relocate_foreign_meta_root(worktree_path, dest)
                     reuse_ok = False
             if reuse_ok:
                 logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
@@ -5227,7 +5228,7 @@ class GitOps:
                 # detect the mismatch) and ONLY on this confirmed-mismatch
                 # route — never on the match/fail-open path below, a
                 # same-task resume whose own artifacts must be preserved.
-                self._relocate_foreign_meta_root(worktree_path, dest)
+                await self._relocate_foreign_meta_root(worktree_path, dest)
                 return None
 
         info = await self._reuse_warm_lane(worktree_path, full_branch)
@@ -5727,7 +5728,7 @@ class GitOps:
                 # mark_pool_storage_present() is irrelevant — scrub is
                 # idempotent/best-effort and never raises. Covers every seed
                 # site (create-once, reset-in-place, recycle) uniformly.
-                self._scrub_seeded_lane_target(lane_dir)
+                await asyncio.to_thread(self._scrub_seeded_lane_target, lane_dir)
             return rc
         except Exception:
             logger.warning(
@@ -7767,7 +7768,7 @@ class GitOps:
                 # fresh CoW copy rather than an in-place overlay on stale blobs.
                 # Defensive rmtree is robust even if reify α's replace-capable seed
                 # is not yet landed (an emptied target/ seeds cleanly either way).
-                shutil.rmtree(lane / 'target', ignore_errors=True)
+                await remove_tree(lane / 'target', ignore_errors=True)
                 rc = await self._seed_warm_lane(lane, '--fresh-checkout')
                 if rc != 0:
                     if rc == 127:
@@ -7853,7 +7854,7 @@ class GitOps:
                         'acquire_warm_lane: lane %s exists but is not registered; '
                         'removing stale directory (self-heal)', lane,
                     )
-                    shutil.rmtree(lane)
+                    await remove_tree(lane)
                 lane.parent.mkdir(parents=True, exist_ok=True)
 
                 # Clear the sibling .task-meta/<name> before (re)building the
@@ -7875,7 +7876,7 @@ class GitOps:
                 # sub-routes below AND the lane-dir-already-gone case where
                 # the self-heal rmtree never ran. init()/_reuse_warm_lane
                 # re-provision this task's own metadata afterward.
-                self._clear_foreign_meta_root(lane)
+                await self._clear_foreign_meta_root(lane)
 
                 # ── γ reattach guard (create-once site) ──────────────────────
                 # If the leftover task/<id> branch still carries commits beyond
@@ -8131,14 +8132,14 @@ class GitOps:
                     # same-task contract) — clear it here or the incoming task
                     # inherits a foreign plan.json/iterations.jsonl/reviews/
                     # (reify esc-4920-163: _lane-26 4949→4920 contamination).
-                    shutil.rmtree(lane / '.task', ignore_errors=True)
+                    await remove_tree(lane / '.task', ignore_errors=True)
                     # The sibling .task-meta/<name> (W11 ε1) belongs to the same
                     # previous occupant but, unlike .task/, lives OUTSIDE the
                     # worktree — checkout -f cannot touch it, so it must be
                     # cleared explicitly too (same rationale as immediately
                     # above; reviewer_comprehensive robustness/data-integrity
                     # blocker at workflow.py:1736).
-                    self._clear_foreign_meta_root(lane)
+                    await self._clear_foreign_meta_root(lane)
                     info = await self._reuse_warm_lane(lane, full_branch)
                     self._note_assigned_via_route(
                         info.path, route, branch_name, expected_title, full_branch,
@@ -8437,7 +8438,7 @@ class GitOps:
             return True, err
         return False, err
 
-    def _clear_foreign_meta_root(self, lane: Path) -> None:
+    async def _clear_foreign_meta_root(self, lane: Path) -> None:
         """Remove the sibling ``.task-meta/<name>`` dir for *lane* (W11 ε1).
 
         ``.task-meta/<name>`` lives OUTSIDE the worktree, so none of
@@ -8452,9 +8453,8 @@ class GitOps:
         on same-task reuse routes (REUSE / DISK_BACKSTOP_REUSE) — those
         legitimately preserve the lane's own artifacts.
         """
-        shutil.rmtree(
-            TaskArtifacts.meta_root_for(self.worktree_base, lane.name),
-            ignore_errors=True,
+        await remove_tree(
+            TaskArtifacts.meta_root_for(self.worktree_base, lane.name), ignore_errors=True,
         )
         logger.debug(
             '_clear_foreign_meta_root: cleared .task-meta/%s for a different-task '
@@ -8462,7 +8462,7 @@ class GitOps:
             lane.name,
         )
 
-    def _relocate_foreign_meta_root(self, lane: Path, dest: Path) -> None:
+    async def _relocate_foreign_meta_root(self, lane: Path, dest: Path) -> None:
         """Move the sibling ``.task-meta/<lane.name>`` dir alongside *dest*.
 
         Used by the two "nothing is destroyed" quarantine guards —
@@ -8503,7 +8503,7 @@ class GitOps:
                 '(%s) — falling back to clearing it in place',
                 src, dst, e,
             )
-            self._clear_foreign_meta_root(lane)
+            await self._clear_foreign_meta_root(lane)
 
     async def _reset_warm_lane(
         self, lane_dir: Path, full_branch: str, target_commit: str,
@@ -8544,7 +8544,7 @@ class GitOps:
             raise RuntimeError(
                 f'_reset_warm_lane: git clean failed for {lane_dir}: {err}'
             )
-        self._clear_foreign_meta_root(lane_dir)
+        await self._clear_foreign_meta_root(lane_dir)
 
     async def _reset_and_seed_recycled_lane(
         self,
@@ -8602,7 +8602,7 @@ class GitOps:
                     # at the seed site below is redundant on this path but
                     # intentional — it normalises lane state regardless of which
                     # attempt succeeded.
-                    shutil.rmtree(lane / 'target', ignore_errors=True)
+                    await remove_tree(lane / 'target', ignore_errors=True)
                     continue  # retry
                 # attempt == 2: fault persisted — genuine fault, escalate per 1859
                 logger.warning(
@@ -8622,7 +8622,7 @@ class GitOps:
 
         # Reset succeeded (attempt 1 or 2).  Run the thin re-seed unchanged.
         # β: rm target/ before seeding (no retained bloat).
-        shutil.rmtree(lane / 'target', ignore_errors=True)
+        await remove_tree(lane / 'target', ignore_errors=True)
         rc = await self._seed_warm_lane(lane, '--fresh-checkout')
         if rc != 0:
             if rc == 127:
