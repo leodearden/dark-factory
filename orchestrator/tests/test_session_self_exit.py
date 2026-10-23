@@ -8,6 +8,7 @@ process.
 
 from __future__ import annotations
 
+import errno
 import signal
 import subprocess
 import sys
@@ -30,6 +31,7 @@ OWNER = 7_193_001
 OWNER_PARENT = 7_193_000
 LAUNCHER = 7_193_050
 _SLUG = 'prd-df-7193-7193050'
+_TITLE = 'prd:df#7193 self-exit'
 _TERMINAL_RESULT = 'outcome: done\nchanged: x\naction_needed: none\n'
 
 
@@ -74,6 +76,7 @@ def _armed(
     record_dir = _record_dir(root)
     fields: dict = {
         'status': sr.Status.RUNNING,
+        'title': _TITLE,
         'self_exit': True,
         'claude_session_id': 'uuid-owner',
         'claude_owner_pid': OWNER,
@@ -337,3 +340,46 @@ class TestNoOwnerNoStamp:
         assert record.exit_request is None
         assert record.exit_requested_at is None
         assert kill.calls == []
+
+
+def _raising(exc: OSError) -> Callable[[int, int], None]:
+    def kill(pid: int, sig: int) -> None:
+        raise exc
+
+    return kill
+
+
+class TestKillFailure:
+    @pytest.mark.parametrize(('exc', 'reason'), [
+        (ProcessLookupError(errno.ESRCH, 'No such process'), 'ESRCH'),
+        (PermissionError(errno.EPERM, 'Operation not permitted'), 'EPERM'),
+    ], ids=['ESRCH', 'EPERM'])
+    def test_a_failed_signal_stamps_kill_failed_and_keeps_the_marker(self, tmp_path, exc, reason):
+        armed = _armed(tmp_path)
+
+        osc = _stop(tmp_path, armed, _raising(exc))
+
+        assert osc == sh.osc_retitle_sequence(sr.Status.IDLE, _TITLE)
+        record = _read(tmp_path)
+        request = record.exit_request
+        assert request is not None
+        assert request.state is sr.ExitRequestState.KILL_FAILED
+        assert request.reason == reason
+        assert request.pid == OWNER
+        assert request.marker_session_id == 'uuid-owner'
+        assert record.exit_requested_at == request.at
+        assert record.status is sr.Status.IDLE
+        assert _marker(tmp_path).exists()
+
+    def test_the_next_stop_retries(self, tmp_path):
+        armed = _armed(tmp_path)
+        _stop(tmp_path, armed, _raising(ProcessLookupError(errno.ESRCH, 'No such process')))
+        kill = _KillRecorder(tmp_path)
+
+        _stop(tmp_path, armed, kill)
+
+        assert kill.calls == [(OWNER, signal.SIGINT)]
+        request = _read(tmp_path).exit_request
+        assert request is not None
+        assert request.state is sr.ExitRequestState.ATTEMPTED
+        assert not _marker(tmp_path).exists()
