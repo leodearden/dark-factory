@@ -75,6 +75,10 @@ from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_arti
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.mcp_tools.scheduler_state import effective_lock_depth
+from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+from fused_memory.middleware.cancelled_premise_blocklist import (
+    match_candidate as match_blocklisted_premise,
+)
 from fused_memory.middleware.candidate_key import compute_candidate_key, normalize_title
 from fused_memory.middleware.curation_deferral import (
     POOL_UNAVAILABLE_ERRORS,
@@ -96,6 +100,23 @@ from fused_memory.middleware.curator_types import (
     empty_pool_sizes,
     is_combine_eligible_status,
 )
+from fused_memory.middleware.operational_ask_registry import load_operational_registry
+from fused_memory.middleware.operational_ask_registry import (
+    match_candidate as match_operational_ask,
+)
+from fused_memory.middleware.recon_claim_verification_guard import (
+    AttributedClaim,
+    extract_attributed_claims,
+    make_source_and_history_probe,
+    verify_attributed_claims,
+)
+from fused_memory.middleware.recon_code_fix_premise_guard import (
+    load_premise_registry,
+    verify_premise_refuted,
+)
+from fused_memory.middleware.recon_code_fix_premise_guard import (
+    match_candidate as match_refuted_premise,
+)
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_dependencies
 
@@ -107,7 +128,6 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
-    from fused_memory.middleware.recon_claim_verification_guard import AttributedClaim
 
 logger = logging.getLogger(__name__)
 
@@ -928,11 +948,6 @@ class TaskCurator:
 
         Never raises.
         """
-        from fused_memory.middleware.cancelled_premise_blocklist import (
-            load_blocklist,
-            match_candidate,
-        )
-
         cfg_path = self._config.curator.cancelled_premise_blocklist_path
         if cfg_path is None:
             return None
@@ -941,7 +956,7 @@ class TaskCurator:
         if not entries:
             return None
 
-        entry = match_candidate(candidate, entries)
+        entry = match_blocklisted_premise(candidate, entries)
         if entry is None:
             return None
 
@@ -989,7 +1004,7 @@ class TaskCurator:
         (task 4201, 2026-08-29): the one-shot registry load (via the shared
         :class:`_LazyRegistry`) and the per-match live-source re-verification
         are each dispatched via ``asyncio.to_thread``. The textual match
-        (``match_candidate``) is deliberately kept ON the loop — it is pure
+        (``match_refuted_premise``) is deliberately kept ON the loop — it is pure
         string work with no I/O, so the common case of a non-matching
         candidate pays no thread-pool dispatch. Measured on the shipped
         registry: registry load ~9.9ms (8.15ms of it ``yaml.safe_load``,
@@ -1033,12 +1048,6 @@ class TaskCurator:
 
         Never raises.
         """
-        from fused_memory.middleware.recon_code_fix_premise_guard import (
-            load_premise_registry,
-            match_candidate,
-            verify_premise_refuted,
-        )
-
         cfg_path = self._config.curator.recon_code_fix_premise_registry_path
         if cfg_path is None:
             return None
@@ -1063,7 +1072,7 @@ class TaskCurator:
         # thread-pool dispatch (measured 67us) nor extra curator-lock hold.
         # premise_refuted_entry composes exactly these two halves and already
         # short-circuits here; we split it so only the blocking half is offloaded.
-        entry = match_candidate(candidate, entries)
+        entry = match_refuted_premise(candidate, entries)
         if entry is None:
             return None
 
@@ -1180,12 +1189,6 @@ class TaskCurator:
             )
             return []
 
-        from fused_memory.middleware.recon_claim_verification_guard import (
-            extract_attributed_claims,
-            make_source_and_history_probe,
-            verify_attributed_claims,
-        )
-
         claims = extract_attributed_claims(self._claim_verification_text(candidate))
         if not claims:
             return []
@@ -1296,11 +1299,6 @@ class TaskCurator:
 
         Never raises.
         """
-        from fused_memory.middleware.operational_ask_registry import (
-            load_operational_registry,
-            match_candidate,
-        )
-
         cfg_path = self._config.curator.operational_ask_registry_path
         if cfg_path is None:
             return None
@@ -1311,7 +1309,7 @@ class TaskCurator:
         if not entries:
             return None
 
-        entry = match_candidate(candidate, entries)
+        entry = match_operational_ask(candidate, entries)
         if entry is None:
             return None
 
@@ -1912,11 +1910,6 @@ class TaskCurator:
         # advisory check.
         claim_probe: Callable[[str], bool] | None = None
         if self._config.curator.recon_claim_verification_enabled and self._cwd is not None:
-            from fused_memory.middleware.recon_claim_verification_guard import (
-                extract_attributed_claims,
-                make_source_and_history_probe,
-            )
-
             any_claims = any(
                 extract_attributed_claims(self._claim_verification_text(candidates[i]))
                 for i in unique_indices
