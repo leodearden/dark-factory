@@ -1206,6 +1206,7 @@
     "orchestrator/tests/test_merge_speculation_controller.py": {"patch_targets": [], "private_reads": 7},
     "orchestrator/tests/test_merge_types.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_types_invariants.py": {"patch_targets": [], "private_reads": 0},
+    "orchestrator/tests/test_merge_types_registries.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_unstack_admission.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_verify_lease_guard.py": {"patch_targets": [], "private_reads": 14},
     "orchestrator/tests/test_merge_verify_mock_autouse.py": {"patch_targets": [], "private_reads": 0},
