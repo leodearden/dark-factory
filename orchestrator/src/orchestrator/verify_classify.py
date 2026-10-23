@@ -24,6 +24,7 @@ import signal
 
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_cmd import ToolKind
+from orchestrator.verify_event_channel import VerifyEventChannel
 
 # ---------------------------------------------------------------------------
 # EXTERNAL termination signals (task 3173). ``_run_cmd`` returns
@@ -231,6 +232,8 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # task 3679: LINE-ANCHORED, producer-grounded slot-timeout markers — the
 # POSITIVE detector for the SEMAPHORE_TIMEOUT arm, replacing the whole-output
 # token co-occurrence above (deleted in the follow-up step).
+# Task 6856: these text arms are consulted only when the verify's event
+# channel is absent (`_reports_fatal_slot_timeout`, C3 rules 2 and 4).
 #
 # ANCHORING CONTRACT: `^` + re.MULTILINE, tolerating LEADING HORIZONTAL
 # WHITESPACE ONLY — deliberately NOT an arbitrary leading log/harness prefix.
@@ -756,7 +759,17 @@ _SCOPE_SPAWN_FAILURE_RE = re.compile(
 )
 
 
-def _classify_environmental(output: str) -> FailureCategory | None:
+def _reports_fatal_slot_timeout(
+    scoped: str, event_channel: VerifyEventChannel | None,
+) -> bool:
+    if event_channel is not None and event_channel.present:
+        return event_channel.fatal_slot_timeouts > 0
+    return bool(_has_fatal_slot_timeout_sentinel(scoped) or _SLOT_ACQUIRE_DEADLINE_RE.search(scoped))
+
+
+def _classify_environmental(
+    output: str, event_channel: VerifyEventChannel | None = None,
+) -> FailureCategory | None:
     """Tool-blind host-infrastructure guard: DISK_FULL / ENV_TRANSIENT (broken
     ``_merge-verify`` worktree, incl. restart collateral; mis-resolved pyright
     interpreter; a verify scope systemd-run could not start) /
@@ -1057,12 +1070,15 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     # task 4212: sentinel half is gated on disposition
     # (`_has_fatal_slot_timeout_sentinel` above has the full grounding);
     # basename half stays ungated — its emitters carry no `disposition` field.
-    if _has_fatal_slot_timeout_sentinel(scoped) or _SLOT_ACQUIRE_DEADLINE_RE.search(scoped):
+    if _reports_fatal_slot_timeout(scoped, event_channel):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
 
 
-def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> FailureCategory:
+def classify_failure(
+    tool: ToolKind, rc: int, output: str, timed_out: bool, *,
+    event_channel: VerifyEventChannel | None = None,
+) -> FailureCategory:
     """Classify a command failure into a ``FailureCategory``, dispatched by tool.
 
     Guards (checked before any per-tool dispatch, identically for every
@@ -1099,7 +1115,8 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
        reported zero failures is no longer evidence about the failure being
        classified; its one veto still reads the full *output*, which keeps
        the change able to move a classification only AWAY from a guard-3
-       category, never toward one.
+       category, never toward one. Task 6856: a PRESENT *event_channel*
+       alone decides SEMAPHORE_TIMEOUT (its fatal slot_timeout records).
 
     SCOPING BOUNDARY — a RECORDED CHOICE, not an oversight (review amendment
     #5). Guard 3 is the ONLY consumer of the scoped text. Guards 1/2/2.5 and
@@ -1167,7 +1184,7 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
         return FailureCategory.INFRA_TIMEOUT
     if is_external_kill_rc(rc):
         return FailureCategory.INFRA_KILL
-    environmental_category = _classify_environmental(output)
+    environmental_category = _classify_environmental(output, event_channel)
     if environmental_category is not None:
         return environmental_category
 

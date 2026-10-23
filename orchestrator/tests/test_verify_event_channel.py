@@ -402,22 +402,17 @@ def present(*producer_files: str) -> VerifyEventChannel:
 
 
 FATAL_SENTINEL = fixture_text('slot_timeout-fatal.stderr.txt').rstrip('\n')
-LIVE_MARKERS = [
-    pytest.param(FATAL_SENTINEL, id='fatal-sentinel'),
-    pytest.param(
+LIVE_MARKER_LINES = {
+    'fatal-sentinel': FATAL_SENTINEL,
+    'lib_test_semaphore':
         'lib_test_semaphore.sh: failed to acquire test slot within 1800s (LOCK=/tmp/x, N=8)',
-        id='lib_test_semaphore',
-    ),
-    pytest.param(
+    'cargo-test-occt-gated':
         'ERROR: cargo-test-occt-gated.sh: failed to acquire OCCT slot within 1800s '
         '(LOCK=/tmp/x, N=1)',
-        id='cargo-test-occt-gated',
-    ),
-    pytest.param(
+    'lib_lane_x_flock':
         'lib_lane_x_flock.sh: failed to acquire Lane-X lock within 600s (LOCK=/tmp/x)',
-        id='lib_lane_x_flock',
-    ),
-]
+}
+LIVE_MARKERS = [pytest.param(line, id=name) for name, line in LIVE_MARKER_LINES.items()]
 
 
 def splice_into_block(log: str, member: str, verdict: str, inserted: str) -> str:
@@ -550,7 +545,7 @@ D3_CORPUS = [
     ),
     pytest.param(fixture_text(POOL_LOG), id='run_all-pool-log'),
     pytest.param(fixture_text(SERIAL_LOG), id='run_all-serial-log'),
-    *[pytest.param(m.values[0] + '\n', id=f'marker-{m.id}') for m in LIVE_MARKERS],
+    *[pytest.param(line + '\n', id=f'marker-{name}') for name, line in LIVE_MARKER_LINES.items()],
     pytest.param(fixture_text('slot_timeout-soft.stderr.txt'), id='soft-sentinel'),
     pytest.param(ENOSPC + '\n', id='enospc'),
 ]
