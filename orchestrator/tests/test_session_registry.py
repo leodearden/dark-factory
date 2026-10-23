@@ -4990,6 +4990,18 @@ def _parse_kv(out: str) -> dict[str, str]:
     return dict(line.split('=', 1) for line in out.splitlines() if '=' in line)
 
 
+def _assert_age_between_clock_reads(
+    reported_secs: str, *, backdated_by: timedelta, before: datetime, after: datetime
+) -> None:
+    """lease-show's age is its own clock read, taken somewhere in [before, after], minus an mtime of before - backdated_by.
+
+    Bracket it there rather than in a fixed window: a loaded host stalls the call, not the arithmetic (task 6019).
+    The 1 s of upper slack covers filesystem mtime granularity.
+    """
+    reported = timedelta(seconds=int(reported_secs))
+    assert backdated_by <= reported <= backdated_by + (after - before) + timedelta(seconds=1)
+
+
 def test_main_lease_show_prints_machine_readable_fields_for_a_held_lease(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -4998,10 +5010,12 @@ def test_main_lease_show_prints_machine_readable_fields_for_a_held_lease(
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     _claim_via_cli()
     lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    _set_mtime(lease_path, datetime.now(UTC), timedelta(hours=1))
+    before = datetime.now(UTC)
+    _set_mtime(lease_path, before, timedelta(hours=1))
     capsys.readouterr()
 
     rc = sr.main(['lease-show', '--name', 'watcher-df'])
+    after = datetime.now(UTC)
 
     assert rc == 0
     fields = _parse_kv(capsys.readouterr().out)
@@ -5012,7 +5026,9 @@ def test_main_lease_show_prints_machine_readable_fields_for_a_held_lease(
     assert fields['holder_pid_alive'] == 'true'
     assert fields['reclaimable'] == 'false'
     # The freshness clock `cat <lease>` cannot show, replacing `stat -c %y`.
-    assert abs(int(fields['heartbeat_age_secs']) - 3600) <= 5
+    _assert_age_between_clock_reads(
+        fields['heartbeat_age_secs'], backdated_by=timedelta(hours=1), before=before, after=after
+    )
     assert datetime.fromisoformat(fields['heartbeat_ts']).tzinfo is not None
 
 
