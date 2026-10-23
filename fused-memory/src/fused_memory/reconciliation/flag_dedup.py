@@ -532,15 +532,23 @@ class FlagTypeFamily:
     collapses, and :meth:`log_drift` makes the rest observable.
 
     ``name`` labels the family in the drift log; ``spellings`` are the
-    measured ones; ``drift_token`` marks a ``flag_type`` as probably meant for
-    this family.  A non-empty ``unseen_spelling_tokens`` also admits a
-    never-observed spelling whose tokens include all of them.
+    measured ones; a ``flag_type`` whose casefolded text contains any one of
+    the ``drift_tokens`` is probably meant for this family.  A non-empty
+    ``unseen_spelling_tokens`` also admits a never-observed spelling whose
+    tokens include all of them.
     """
 
     name: str
     spellings: frozenset[str]
-    drift_token: str
+    drift_tokens: frozenset[str]
     unseen_spelling_tokens: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if not self.drift_tokens or any(not t or t != t.casefold() for t in self.drift_tokens):
+            raise ValueError(
+                f'FlagTypeFamily {self.name!r}: drift_tokens must be a non-empty set of '
+                f'non-empty casefolded substrings, got {sorted(self.drift_tokens)!r}'
+            )
 
     @cached_property
     def _canonical_spellings(self) -> frozenset[str]:
@@ -555,13 +563,17 @@ class FlagTypeFamily:
         tokens = {t for t in _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold()) if t}
         return bool(self.unseen_spelling_tokens) and self.unseen_spelling_tokens <= tokens
 
+    def _probably_meant_for_family(self, flag_type: str) -> bool:
+        folded = flag_type.casefold()
+        return any(token in folded for token in self.drift_tokens)
+
     def log_drift(self, flags: list[dict[str, Any]], *, log_event: str) -> None:
-        """Log as *log_event* each ``flag_type`` carrying ``drift_token`` that does not match."""
+        """Log as *log_event* each ``flag_type`` carrying a drift token that does not match."""
         unmatched = [
             ft
             for flag in flags
             if isinstance(ft := flag.get('flag_type'), str)
-            and self.drift_token in ft.casefold()
+            and self._probably_meant_for_family(ft)
             and not self.matches(ft)
         ]
         if unmatched:
@@ -5593,7 +5605,7 @@ CLUSTER_GROWTH_FAMILY = FlagTypeFamily(
         'procedural_knowledge_cluster_growth',
         'duplicate_procedural_knowledge_cluster_growth',
     }),
-    drift_token='cluster',
+    drift_tokens=frozenset({'cluster'}),
     unseen_spelling_tokens=frozenset({'cluster', 'growth'}),
 )
 
@@ -5966,7 +5978,7 @@ async def filter_accounted_cluster_growth_flags(
 PREMATURE_WIDENING_CAVEAT_FAMILY = FlagTypeFamily(
     name='premature_widening_caveat',
     spellings=frozenset({'premature_widening_evidence_caveat'}),
-    drift_token='caveat',
+    drift_tokens=frozenset({'caveat'}),
 )
 
 
