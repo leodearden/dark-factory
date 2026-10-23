@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Score write-triage outcomes by what a reader of the corpus meets (rubric v2).
+"""Score write-triage outcomes by what a reader of the corpus meets (rubric v2.1).
 
 An *item* is one write and the outcome triage gave it: attached under a
 target as restated, amended or contested, or stored standalone with the
 earlier records it might have joined. Raters judge each (write, record) pair
-on rubric v2's binaries; ``write_triage_reader_rubric.py`` resolves their
+on rubric v2.1's binaries; ``write_triage_reader_rubric.py`` resolves their
 verdict rows and derives each write's wrong cells under triage and under the
 status quo, where every write is stored flat. This module turns the cells
-into the reader-consequence metrics M1-M6, rater agreement, and the
-comparative harm per write.
+into the reader-consequence metrics M1-M6 (with M1 also read as if every band
+attach were amended), rater agreement over the answers the derivation
+consumed, and the comparative harm per write.
 
 The metric definitions, populations, sample sizes and gates are
 ``fused-memory/calibration/write_triage_reader_metrics.md``. This scorer
@@ -83,9 +84,11 @@ else:
 Cell = _rubric.Cell
 
 KAPPA_FLOOR = 0.70
-KAPPA_MIN_OVERLAP = 60
-"""A binary's primary/second agreement is good enough to score when kappa >= KAPPA_FLOOR
-on at least KAPPA_MIN_OVERLAP doubly rated pairs."""
+KAPPA_MIN_PAIRS = 60
+KAPPA_FLOOR_BINARIES = (_rubric.Binary.HOME, _rubric.Binary.CONFLICT, _rubric.Binary.LOSS)
+"""A floor binary's primary/second agreement is good enough to score when kappa >= KAPPA_FLOOR
+on at least KAPPA_MIN_PAIRS consumed pairs: answers both raters gave where the derivation, or
+M5's split, read that binary. Every other binary's agreement is report-only."""
 
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_SEED = 7157
@@ -117,6 +120,11 @@ _HIDDEN_ENDINGS = frozenset({OUTCOME_RESTATED, OUTCOME_AMENDED, 'stored_unlinked
 _SCOPE_LABELS: Mapping[str, str] = MappingProxyType({
     _rubric.Resolved.CENTRAL: 'central', _rubric.Resolved.SECONDARY: 'secondary',
 })
+_ACTION_CHANGING_LABELS: Mapping[str, str] = MappingProxyType({
+    _rubric.Resolved.YES: 'yes', _rubric.Resolved.NO: 'no',
+})
+_M5_SPLITS = (_rubric.Binary.SCOPE, _rubric.Binary.ACTION_CHANGING)
+"""The follow-ups M5 splits a contest's upheld CONFLICT by; reading them consumes their answers."""
 
 
 @dataclass(frozen=True)
@@ -232,12 +240,13 @@ class IncompleteJudgementError(ValueError):
 
 @dataclass(frozen=True)
 class _Scored:
-    """One item with its derivation on each basis and its resolved SCOPE (attach items)."""
+    """One item with its derivation on each basis and its resolved M5 splits (attach items)."""
 
     item: ReaderItem
     current: _rubric.Derivation
     attach_time: _rubric.Derivation | None
     scope: _rubric.Resolved | None
+    action_changing: _rubric.Resolved | None
 
     @property
     def decided(self) -> _rubric.Decided | None:
@@ -266,7 +275,7 @@ def score_reader(
     scored = [_score(item, judgements) for item in reader_items]
     _refuse_incomplete(scored)
     return {
-        'rubric': 'v2',
+        'rubric': 'v2.1',
         'cell_rules': {str(cell): rule for cell, rule in _rubric.CELL_RULES.items()},
         'harm_weights': {str(cell): weight for cell, weight in weights.items()},
         'harm_weights_status': (
@@ -274,10 +283,11 @@ def score_reader(
         ),
         'bootstrap': {'resamples': BOOTSTRAP_RESAMPLES, 'seed': BOOTSTRAP_SEED},
         'population': _population(scored, strata),
-        'kappa': _kappa(judgements),
+        'kappa': _kappa(scored, judgements),
         'cells': _cell_counts(scored),
         'metrics': {
             'm1': _m1(scored, stratum_weights),
+            'm1_as_amended': _m1_as_amended(scored, stratum_weights),
             'm2': _m2(scored, stratum_weights),
             'm3': _m3(scored, stratum_weights),
             'm4': _m4(scored, stratum_weights),
@@ -356,6 +366,7 @@ def _score(item: ReaderItem, judgements: Mapping[_rubric.PairKey, _rubric.Judgem
             if any(judgement is not None for judgement in attach_time.values()) else None
         ),
         scope=None if parent is None else parent.answer(_rubric.Binary.SCOPE),
+        action_changing=None if parent is None else parent.answer(_rubric.Binary.ACTION_CHANGING),
     )
 
 
@@ -392,32 +403,55 @@ def _population(scored: Sequence[_Scored], strata: Mapping[str, int] | None) -> 
     }
 
 
-def _kappa(judgements: Mapping[_rubric.PairKey, _rubric.Judgement]) -> dict[str, Any]:
-    """Cohen's kappa per binary between the primary and second rater of each pair key."""
+def _kappa(
+    scored: Sequence[_Scored], judgements: Mapping[_rubric.PairKey, _rubric.Judgement],
+) -> dict[str, Any]:
+    """Cohen's kappa per binary between the primary and second rater, over consumed answers."""
     pairs: dict[_rubric.Binary, list[tuple[str, str]]] = {binary: [] for binary in _rubric.Binary}
-    for judgement in judgements.values():
-        primary = [vote for vote in judgement.votes if vote.role is _rubric.Role.PRIMARY]
-        second = [vote for vote in judgement.votes if vote.role is _rubric.Role.SECOND]
-        if len(primary) != 1 or len(second) != 1:
+    for s in scored:
+        if s.decided is None:
             continue
-        for binary, overlap in pairs.items():
-            answers = (primary[0].answers.get(binary), second[0].answers.get(binary))
-            if all(answer is not None and not _rubric.is_abstain(answer) for answer in answers):
-                overlap.append((str(answers[0]), str(answers[1])))
+        for target, binary in sorted(_consumed(s, s.decided)):
+            judgement = judgements.get(_rubric.PairKey(s.item.entry_id, target, _rubric.Basis.CURRENT))
+            answers = None if judgement is None else _primary_and_second(judgement, binary)
+            if answers is not None:
+                pairs[binary].append(answers)
     return {
         'floor': KAPPA_FLOOR,
-        'min_overlap': KAPPA_MIN_OVERLAP,
-        'by_binary': {str(binary): _kappa_block(overlap) for binary, overlap in pairs.items()},
+        'min_pairs': KAPPA_MIN_PAIRS,
+        'floor_binaries': [str(binary) for binary in KAPPA_FLOOR_BINARIES],
+        'by_binary': {str(binary): _kappa_block(consumed) for binary, consumed in pairs.items()},
     }
 
 
-def _kappa_block(overlap: Sequence[tuple[str, str]]) -> dict[str, Any]:
-    kappa = _stats.cohen_kappa(overlap)
+def _consumed(s: _Scored, decided: _rubric.Decided) -> frozenset[tuple[str, _rubric.Binary]]:
+    """Every (target, binary) whose answers this item's figures read: derive's, plus M5's splits."""
+    if s.item.outcome != OUTCOME_CONTESTED or not decided.conflict or s.item.target_id is None:
+        return decided.consumed
+    return decided.consumed | {(s.item.target_id, binary) for binary in _M5_SPLITS}
+
+
+def _primary_and_second(
+    judgement: _rubric.Judgement, binary: _rubric.Binary,
+) -> tuple[str, str] | None:
+    """The primary and the second rater's voting answers on *binary*, when both decided it."""
+    primary = [vote for vote in judgement.votes if vote.role is _rubric.Role.PRIMARY]
+    second = [vote for vote in judgement.votes if vote.role is _rubric.Role.SECOND]
+    if len(primary) != 1 or len(second) != 1:
+        return None
+    answers = (primary[0].answers.get(binary), second[0].answers.get(binary))
+    if any(answer is None or _rubric.is_abstain(answer) for answer in answers):
+        return None
+    return str(answers[0]), str(answers[1])
+
+
+def _kappa_block(consumed: Sequence[tuple[str, str]]) -> dict[str, Any]:
+    kappa = _stats.cohen_kappa(consumed)
     return {
-        'n_overlap': len(overlap),
+        'n_consumed': len(consumed),
         'kappa': kappa,
         'floor_met': (
-            kappa is not None and len(overlap) >= KAPPA_MIN_OVERLAP and kappa >= KAPPA_FLOOR
+            kappa is not None and len(consumed) >= KAPPA_MIN_PAIRS and kappa >= KAPPA_FLOOR
         ),
     }
 
@@ -483,6 +517,21 @@ def _m1(scored: Sequence[_Scored], weights: Mapping[str, float] | None) -> dict[
         scored, lambda s: s.item.band == _rubric.M1_BAND, lambda _, d: bool(d.m1_hidden), weights,
     )
     return {**block, 'band_unknown': sum(s.item.band is None for s in scored)}
+
+
+def _m1_as_amended(scored: Sequence[_Scored], weights: Mapping[str, float] | None) -> dict[str, Any]:
+    """M1 if every band attach were amended (report-only): would the digest show it."""
+    return _proportion(
+        scored,
+        lambda s: _rubric.reads_as_amended(s.item.outcome, in_m1_band=s.item.band == _rubric.M1_BAND),
+        _hidden_as_amended, weights,
+    )
+
+
+def _hidden_as_amended(s: _Scored, decided: _rubric.Decided) -> bool:
+    if decided.m1_hidden_as_amended is None:
+        raise ValueError(f'item {s.item.entry_id!r}: derive read no M1 as amended for a band attach')
+    return decided.m1_hidden_as_amended
 
 
 def _m2(scored: Sequence[_Scored], weights: Mapping[str, float] | None) -> dict[str, Any]:
@@ -552,13 +601,15 @@ def _m5(scored: Sequence[_Scored], weights: Mapping[str, float] | None) -> dict[
     def contested(s: _Scored) -> bool:
         return s.item.outcome == OUTCOME_CONTESTED
 
-    scopes = Counter(
-        _SCOPE_LABELS.get(str(s.scope), 'unknown') for s in scored
-        if contested(s) and s.decided is not None and s.decided.conflict
+    upheld = [s for s in scored if contested(s) and s.decided is not None and s.decided.conflict]
+    scopes = Counter(_SCOPE_LABELS.get(str(s.scope), 'unknown') for s in upheld)
+    changing = Counter(
+        _ACTION_CHANGING_LABELS.get(str(s.action_changing), 'unknown') for s in upheld
     )
     return {
         **_proportion(scored, contested, lambda _, d: d.conflict, weights),
         'by_scope': {label: scopes[label] for label in ('central', 'secondary', 'unknown')},
+        'by_action_changing': {label: changing[label] for label in ('yes', 'no', 'unknown')},
     }
 
 
@@ -690,7 +741,9 @@ def _summary_markdown(report: Mapping[str, Any]) -> str:
 
 
 def _metrics_markdown(metrics: Mapping[str, Any]) -> str:
-    blocks: list[tuple[str, Mapping[str, Any]]] = [('M1', metrics['m1'])]
+    blocks: list[tuple[str, Mapping[str, Any]]] = [
+        ('M1', metrics['m1']), ('M1 as amended', metrics['m1_as_amended']),
+    ]
     blocks += [(f'M2 {outcome}', block) for outcome, block in metrics['m2'].items()]
     blocks += [('M3', metrics['m3']), ('M4', metrics['m4'])]
     blocks += [(f'M4 {_ROUTE_LABELS[key]}', block) for key, block in metrics['m4']['by_route'].items()]
@@ -709,9 +762,11 @@ def _metrics_markdown(metrics: Mapping[str, Any]) -> str:
         '',
         _table(header, rows),
         '',
-        f'- M1: items of unknown band (outside M1): {metrics["m1"]["band_unknown"]}.',
+        f'- M1: items of unknown band (outside M1): {metrics["m1"]["band_unknown"]}.'
+        ' M1 as amended reads every band attach as if it were amended (report-only).',
         f'- M3 by ending: {_listed(metrics["m3"]["by_ending"])}.',
         f'- M5 by scope: {_listed(metrics["m5"]["by_scope"])}.',
+        f'- M5 by action-changing: {_listed(metrics["m5"]["by_action_changing"])}.',
         f'- M6: n is attach-time-rated items, hits the drifted ones'
         f' ({", ".join(m6["drifted_entry_ids"]) or "none"}); parent edited after attach'
         f' {m6["parent_edited"]}, of which unrated at attach time {m6["attach_time_unrated"]}.',
@@ -754,15 +809,17 @@ def _harm_markdown(report: Mapping[str, Any]) -> str:
 
 def _kappa_markdown(kappa: Mapping[str, Any]) -> str:
     rows = [
-        [binary, block['n_overlap'], block['kappa'], block['floor_met']]
+        [binary, block['n_consumed'], block['kappa'], block['floor_met'],
+         binary in kappa['floor_binaries']]
         for binary, block in kappa['by_binary'].items()
     ]
     return '\n'.join([
-        '## Rater agreement (primary vs second)',
+        '## Rater agreement (primary vs second, consumed answers)',
         '',
-        f'Floor: kappa >= {kappa["floor"]} on at least {kappa["min_overlap"]} doubly rated pairs.',
+        f'Floor: kappa >= {kappa["floor"]} on at least {kappa["min_pairs"]} consumed pairs,'
+        f' for {", ".join(kappa["floor_binaries"])}; every other binary is report-only.',
         '',
-        _table(['binary', 'n overlap', 'kappa', 'floor met'], rows),
+        _table(['binary', 'n consumed', 'kappa', 'floor met', 'floor applies'], rows),
     ])
 
 
@@ -795,7 +852,7 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            'Score write-triage outcomes by what a reader meets (rubric v2): metrics M1-M6,'
+            'Score write-triage outcomes by what a reader meets (rubric v2.1): metrics M1-M6,'
             ' rater agreement and harm per write against storing every write flat.'
             ' Definitions: fused-memory/calibration/write_triage_reader_metrics.md.'
         ),
