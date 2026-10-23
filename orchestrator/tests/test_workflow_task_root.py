@@ -83,6 +83,7 @@ async def test_cold_dispatch_keeps_task_artifacts_in_the_task_root(
 ):
     workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
     observed: dict[str, object] = {}
+    lane_names: set[str] = set()
     original_cleanup = git_ops.cleanup_worktree
 
     async def observe_then_cleanup(worktree: Path, branch: str) -> None:
@@ -94,9 +95,9 @@ async def test_cold_dispatch_keeps_task_artifacts_in_the_task_root(
             lane_plan_is_symlink=lane_plan.is_symlink(),
             lane_plan_target=lane_plan.resolve(strict=True),
             expected_target=(task_root / 'plan.json').resolve(),
-            lane_names={
-                p.name for p in TaskArtifacts.meta_root_for(worktree.parent, worktree.name).iterdir()
-            },
+        )
+        lane_names.update(
+            p.name for p in TaskArtifacts.meta_root_for(worktree.parent, worktree.name).iterdir()
         )
         await original_cleanup(worktree, branch)
 
@@ -108,7 +109,7 @@ async def test_cold_dispatch_keeps_task_artifacts_in_the_task_root(
     assert observed['task_iterations'] is True
     assert observed['lane_plan_is_symlink'] is True
     assert observed['lane_plan_target'] == observed['expected_target']
-    assert observed['lane_names'] <= _LANE_KEYED
+    assert lane_names <= _LANE_KEYED
 
 
 @pytest.mark.asyncio

@@ -335,12 +335,13 @@ def _make_loop_workflow(tmp_path, *, round0, round1, call_order):
     (no in-scope suggestion) reaches DONE.
     """
     wf = _make_workflow(modules=['src'], lock_depth=1)
-    wf.worktree = tmp_path / 'wt'
+    worktree = tmp_path / 'wt'
+    wf.worktree = worktree
     wf.event_store = None  # inert task-2752 verify-checkpoint block
 
     # artifacts: real root (no archive dirs exist → copytree skipped), counters
     # seeded to 0 so amendment_round/review_cycle are ints, verdict cache inert.
-    paths = TaskArtifacts(wf.worktree, tmp_path)
+    paths = TaskArtifacts(worktree, tmp_path)
     wf.artifacts = MagicMock()
     wf.artifacts.artifact_path.side_effect = paths.artifact_path
     wf.artifacts.review_archive_dir.side_effect = paths.review_archive_dir
