@@ -800,14 +800,16 @@ class TestRunCmdBudgetOnLoopClock:
     stall cannot move the budget."""
 
     @pytest.mark.timeout(15)
-    @pytest.mark.parametrize('arming_kwargs', [
-        pytest.param(_no_log_path, id='communicate'),
-        pytest.param(_legacy_stream, id='legacy-stream'),
-        pytest.param(_clock_stop_loop, id='clock-stop-loop'),
+    @pytest.mark.parametrize(('arming_kwargs', 'timeout_message'), [
+        pytest.param(_no_log_path, 'Command timed out after 1.0s', id='communicate'),
+        pytest.param(_legacy_stream, 'Command timed out after 1.0s', id='legacy-stream'),
+        pytest.param(
+            _clock_stop_loop, 'wall-clock budget (1s), wall time 1.0s', id='clock-stop-loop',
+        ),
     ])
     @virtual_clock_test
     async def test_a_command_outliving_its_budget_times_out_at_the_budget_on_the_loop_clock(
-        self, tmp_path: Path, arming_kwargs,
+        self, tmp_path: Path, arming_kwargs, timeout_message,
     ):
         from unittest.mock import AsyncMock, patch
 
@@ -828,22 +830,7 @@ class TestRunCmdBudgetOnLoopClock:
         assert elapsed == pytest.approx(1.0), (
             f'Expected the timeout at the 1.0s budget on the loop clock; got {elapsed}'
         )
-
-    @pytest.mark.timeout(15)
-    @virtual_clock_test
-    async def test_a_clock_stop_expiry_on_the_loop_clock_names_the_budget(self, tmp_path: Path):
-        from unittest.mock import AsyncMock, patch
-
-        from orchestrator.verify import _run_cmd
-
-        proc = _ScriptedProcess(_TICKS_PAST_A_1S_BUDGET)
-        with patch('asyncio.create_subprocess_shell', AsyncMock(return_value=proc)):
-            rc, out, timed_out = await _run_cmd(
-                _SCRIPTED_CMD, tmp_path, timeout=1.0, **_clock_stop_loop(tmp_path),
-            )
-        assert 'wall-clock budget (1s), wall time 1.0s' in out, (
-            f'Unexpected message: rc={rc}, timed_out={timed_out}, out={out!r}'
-        )
+        assert timeout_message in out, f'Unexpected message: rc={rc}, out={out!r}'
         assert 'unattributed' not in out, f'Expiry wrongly reported unattributed: {out!r}'
 
 
