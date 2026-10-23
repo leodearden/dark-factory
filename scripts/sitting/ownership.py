@@ -29,6 +29,7 @@ from orchestrator.session_registry import (
     OWNING_OUTCOMES,
     RESULT_FILENAME,
     TERMINAL_STATUSES,
+    ResultOutcome,
     SessionRecord,
     parse_result_outcome,
 )
@@ -368,7 +369,7 @@ def _judge_session(probe: str, session: IndexedSession, measured_at: str) -> Pro
     return ProbeResult(probe, 'mentions', measured_at, owner=f'session {session.slug}', evidence=evidence)
 
 
-def _read_outcome(session: IndexedSession) -> str | None:
+def _read_outcome(session: IndexedSession) -> ResultOutcome | None:
     path = Path(session.record.result_file) if session.record.result_file else session.record_dir / RESULT_FILENAME
     try:
         return parse_result_outcome(path.read_text(encoding='utf-8'))
