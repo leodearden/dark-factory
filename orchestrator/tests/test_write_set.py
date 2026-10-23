@@ -54,10 +54,12 @@ def main_repo(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def worktree(tmp_path: Path, main_repo: Path) -> Path:
-    """A REAL linked worktree off `main_repo`, at `<base>/<name>`."""
+    """A REAL linked worktree off `main_repo`, at `<base>/<task id>` as
+    GitOps.create_worktree names it — never `task-<id>`, which is the
+    task-root shape (`TaskArtifacts.task_root_for`)."""
     base = tmp_path / 'worktrees'
     base.mkdir()
-    wt = base / 'task-2904'
+    wt = base / '2904'
     _git(['worktree', 'add', '-b', 'task/2904', str(wt), 'main'], main_repo)
     return wt
 

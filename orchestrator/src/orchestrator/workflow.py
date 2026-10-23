@@ -14183,7 +14183,7 @@ class TaskWorkflow:
         sandbox_modules = None
         sandbox_extras = None
         if self.config.sandbox.enabled and role.sandboxed:
-            write_set = compute_write_set(cwd)
+            write_set = compute_write_set(cwd, task_id=self.task_id)
             # Pre-create the load-bearing claude_fleet carve-out OUTSIDE the
             # sandbox at this single INV-5/D11 write-set consumption point, so it
             # exists before sandbox_extras (below) is built (task 2996) — see
