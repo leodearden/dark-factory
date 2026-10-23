@@ -78,6 +78,14 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
         'claude_session_id': 'uuid-claude-abc123',
         'claude_owner_pid': 424242,
         'self_exit': True,
+        'exit_request': sr.ExitRequest(
+            state=sr.ExitRequestState.ATTEMPTED,
+            reason=None,
+            pid=424242,
+            at='2026-07-07T00:00:00+00:00',
+            marker_session_id='uuid-claude-abc123',
+        ),
+        'exit_requested_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
