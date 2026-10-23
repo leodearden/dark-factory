@@ -35,19 +35,28 @@ async def remove_tree(path: Path, *, ignore_errors: bool = False) -> None:
     """Ensure *path* is absent, never following symlinks inside it.
 
     An absent *path* is already removed. A refused removal raises
-    :class:`TreeRemovalError`, or with *ignore_errors* logs a WARNING instead.
+    :class:`TreeRemovalError`, and an ``rm`` that cannot be spawned raises its
+    ``OSError``; with *ignore_errors* either one logs a WARNING instead, as
+    ``shutil.rmtree(ignore_errors=True)`` never raises.
     """
     if not os.path.lexists(path):
         return
-    # bounded=False: a multi-minute rm must not hold one of the short-probe
-    # spawn slots (shared/src/shared/git_async.py, "who should opt out").
-    result = await run_git(['rm', '-rf', '--', str(path)], None, bounded=False)
+    try:
+        # bounded=False: a multi-minute rm must not hold one of the short-probe
+        # spawn slots (shared/src/shared/git_async.py, "who should opt out").
+        result = await run_git(['rm', '-rf', '--', str(path)], None, bounded=False)
+    except OSError as err:
+        if not ignore_errors:
+            raise
+        _warn_left_in_place(path, err)
+        return
     if result.ok:
         return
-    if ignore_errors:
-        logger.warning(
-            'remove_tree: rm -rf %s failed (rc=%d), leaving it in place: %s',
-            path, result.returncode, result.stderr[-_STDERR_TAIL_CHARS:],
-        )
-        return
-    raise TreeRemovalError(path, result.returncode, result.stderr)
+    failure = TreeRemovalError(path, result.returncode, result.stderr)
+    if not ignore_errors:
+        raise failure
+    _warn_left_in_place(path, failure)
+
+
+def _warn_left_in_place(path: Path, err: OSError) -> None:
+    logger.warning('remove_tree: leaving %s in place: %s', path, err)

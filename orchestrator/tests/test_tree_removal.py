@@ -137,3 +137,38 @@ async def test_a_refused_removal_with_ignore_errors_warns_instead(
     ]
     assert len(warnings) == 1
     assert str(root) in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_a_removal_that_cannot_spawn_with_ignore_errors_warns_instead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    root = tmp_path / 'tree'
+    _build_nested_tree(root)
+    empty_bin = tmp_path / 'empty-bin'
+    empty_bin.mkdir()
+    monkeypatch.setenv('PATH', str(empty_bin))
+    caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
+
+    await remove_tree(root, ignore_errors=True)
+
+    warnings = [
+        r for r in caplog.records
+        if r.name == _LOGGER_NAME and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert str(root) in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_a_removal_that_cannot_spawn_raises_os_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / 'tree'
+    _build_nested_tree(root)
+    empty_bin = tmp_path / 'empty-bin'
+    empty_bin.mkdir()
+    monkeypatch.setenv('PATH', str(empty_bin))
+
+    with pytest.raises(OSError):
+        await remove_tree(root)

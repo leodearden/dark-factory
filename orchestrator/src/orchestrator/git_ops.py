@@ -3208,7 +3208,7 @@ class GitOps:
                 # deterministically with "'<path>' already exists", naming a
                 # self-inflicted cause instead of the real one.
                 if not path_predates_call:
-                    shutil.rmtree(path, ignore_errors=True)
+                    await remove_tree(path, ignore_errors=True)
                 await asyncio.sleep(0.5 * attempt)
         return rc, out, err, attempt
 
@@ -3236,7 +3236,7 @@ class GitOps:
 
         On exit — normal return OR an exception raised in the ``async
         with`` body — cleanup ALWAYS runs: scoped ``git worktree remove
-        --force <path>`` + an unconditional ``shutil.rmtree(path,
+        --force <path>`` + an unconditional ``remove_tree(path,
         ignore_errors=True)`` belt-and-suspenders in case ``remove`` left an
         empty skeleton.  This method NEVER issues ``git worktree prune``
         (DD5 — the comment-only invariant that failed in the 2026-07-04
@@ -3292,7 +3292,7 @@ class GitOps:
                 cases the caller's ``async with`` body never runs.
                 For (b) and (c), because the add never succeeded, no cleanup ``git
                 worktree remove`` is issued (there is nothing registered to
-                remove) — but a belt-and-suspenders ``shutil.rmtree`` of
+                remove) — but a belt-and-suspenders ``remove_tree`` of
                 *tmp_path* still runs before the exception propagates, in
                 case a failed add left a partial/empty directory behind
                 (this prefix is :data:`PROTECTED_PREFIXES`-registered, so
@@ -3370,7 +3370,7 @@ class GitOps:
                 # Restores the pre-extraction probes' unconditional
                 # "rmtree in case ... the worktree add never ran" guarantee.
                 with contextlib.suppress(Exception):
-                    shutil.rmtree(tmp_path, ignore_errors=True)
+                    await remove_tree(tmp_path, ignore_errors=True)
                 raise
 
             # task 2567: optionally CoW-seed the freshly-added worktree's
@@ -3436,7 +3436,7 @@ class GitOps:
                 with contextlib.suppress(Exception):
                     # Belt-and-suspenders: rmtree in case git worktree remove
                     # left an empty skeleton.
-                    shutil.rmtree(tmp_path, ignore_errors=True)
+                    await remove_tree(tmp_path, ignore_errors=True)
         finally:
             # Release the advisory lock and — ONLY when this call was the
             # one that acquired it — best-effort unlink the lock file,
@@ -4997,7 +4997,7 @@ class GitOps:
                         f'{self.config.main_branch}) — removing stale directory and '
                         f'creating fresh worktree'
                     )
-                    shutil.rmtree(worktree_path)
+                    await remove_tree(worktree_path)
 
         # If the branch ref already exists (stale from a previous run, or — the
         # 3576 trigger — still checked out in a leftover worktree), clean it up
@@ -5376,7 +5376,7 @@ class GitOps:
                         'create_interactive_worktree: %s exists but is not registered; '
                         'removing stale directory (self-heal)', path,
                     )
-                    shutil.rmtree(path)
+                    await remove_tree(path)
 
             # Branch-namespace self-heal: full_branch shares config.branch_prefix
             # with dispatch task branches and other interactive slugs (see the
@@ -6703,7 +6703,7 @@ class GitOps:
                 # Self-heal a stale unregistered directory first
                 # (mirrors reset_persistent_merge_worktree's self-heal pattern).
                 if lane.exists():
-                    shutil.rmtree(lane)
+                    await remove_tree(lane)
                 lane.parent.mkdir(parents=True, exist_ok=True)
                 rc, _, err = await _run(
                     ['git', 'worktree', 'add', '--detach', str(lane), merge_commit],
@@ -12361,7 +12361,7 @@ class GitOps:
             # from the branch being merged.
             task_dir = merge_wt / '.task'
             if task_dir.exists():
-                shutil.rmtree(task_dir)
+                await remove_tree(task_dir)
 
             # Merge with no-ff.
             # merge_source is the named branch ref when present, or the worktree
@@ -12502,7 +12502,7 @@ class GitOps:
         has already cleaned its worktree up) so callers always know which
         worktree to release.
 
-        Does NOT remove ``.task/``: the ``merge_to_main`` ``shutil.rmtree`` is
+        Does NOT remove ``.task/``: the ``merge_to_main`` ``remove_tree`` is
         worktree-CREATION hygiene, and the spec lane's own ``git clean`` in
         :meth:`acquire_spec_lane` already covers this path.
 
@@ -12692,7 +12692,7 @@ class GitOps:
             # can clear a path this call never returned — so without this
             # rmtree every failure here accretes one permanent directory under
             # worktree_base, feeding the disk pressure ENOSPC reports.
-            shutil.rmtree(merge_wt, ignore_errors=True)
+            await remove_tree(merge_wt, ignore_errors=True)
             raise RuntimeError(
                 f'Failed to create merge worktree: git worktree add --detach '
                 f'{merge_wt} {checkout_ref} failed after {attempts} attempt(s) '
@@ -12977,7 +12977,7 @@ class GitOps:
         :meth:`_refuse_foreign_band` (defense-in-depth — the outcome check
         is the primary safety gate, but this can never let a
         non-``_merge-`` path be rmtree'd); (2)
-        ``shutil.rmtree(..., ignore_errors=True)`` the on-disk tree git can
+        ``remove_tree(..., ignore_errors=True)`` the on-disk tree git can
         no longer remove; (3) unlinks the sibling :func:`lane_lock_path`
         ``.lock`` (the primitive RETAINS it on ``'failed'``, so we clear the
         now-orphaned lane lock, honouring the no-leak convention); (4)
@@ -13008,7 +13008,7 @@ class GitOps:
         ``create_subprocess_exec`` (→ ``'failed'``, lease already confirmed,
         so the fallback below is licensed). The two matter together because
         fd exhaustion fails both from one root cause. Downstream of the
-        primitive nothing else can raise either: ``shutil.rmtree`` runs with
+        primitive nothing else can raise either: ``remove_tree`` runs with
         ``ignore_errors=True``, the ``.lock`` unlink is wrapped in
         :func:`contextlib.suppress`, and both
         :meth:`_refuse_foreign_band` and :meth:`_prune_registrations` carry
@@ -13047,7 +13047,7 @@ class GitOps:
             'teardown; applying crash-safe rmtree fallback (task 2922 shape-1)',
             merge_wt,
         )
-        shutil.rmtree(merge_wt, ignore_errors=True)
+        await remove_tree(merge_wt, ignore_errors=True)
         # The primitive retains the sibling .lock on 'failed'; unlink it now
         # that the lane is gone (mirrors the primitive's 'removed'-path unlink).
         with contextlib.suppress(Exception):
@@ -13584,7 +13584,7 @@ class GitOps:
                         'fresh creation (self-heal)',
                         warm_path,
                     )
-                    shutil.rmtree(warm_path)
+                    await remove_tree(warm_path)
                 warm_path.parent.mkdir(parents=True, exist_ok=True)
                 rc, _, err = await _run(
                     ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
@@ -13667,7 +13667,7 @@ class GitOps:
                     'to allow fresh creation (self-heal)',
                     warm_path,
                 )
-                shutil.rmtree(warm_path)
+                await remove_tree(warm_path)
             warm_path.parent.mkdir(parents=True, exist_ok=True)
             rc, _, err = await _run(
                 ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
@@ -14183,7 +14183,7 @@ class GitOps:
                     # the worktree. Remove it here, best-effort, so a reaped
                     # worktree never leaves an orphaned .task-meta/<name> dir
                     # behind (I2: never an indefinite leak).
-                    shutil.rmtree(
+                    await remove_tree(
                         TaskArtifacts.meta_root_for(self.worktree_base, wt_resolved.name),
                         ignore_errors=True,
                     )
@@ -15858,7 +15858,7 @@ class GitOps:
             if not candidate.is_dir():
                 continue
             try:
-                shutil.rmtree(candidate)
+                await remove_tree(candidate)
                 removed.append(candidate)
             except Exception:
                 logger.warning(
