@@ -121,13 +121,18 @@ _STREAM_COLUMNS: tuple[tuple[str, Callable[[_StreamRow], Any]], ...] = (
 )
 
 
+def stream_cells(run: run_cli.Run, stream_id: str) -> tuple[tuple[str, str], ...]:
+    """The (column, cell text) pairs of *stream_id*'s row in the Streams table, after the ledger."""
+    row = _StreamRow(run.program.stream(stream_id), run.views[stream_id], state.waves(run.views)[stream_id])
+    return tuple((header, _line(_text(cell(row)))) for header, cell in _STREAM_COLUMNS)
+
+
 def _streams(home: HomeRead, store: StoreFacts) -> str:
     run = home.run
-    waves = state.waves(run.views)
-    rows = [_StreamRow(s, run.views[s.id], waves[s.id]) for s in run.program.streams]
+    rows = [stream_cells(run, stream_id) for stream_id in run.program.stream_ids]
     return _table(
         [header for header, _ in _STREAM_COLUMNS],
-        [[_text(cell(row)) for _, cell in _STREAM_COLUMNS] for row in rows],
+        [[cell for _, cell in row] for row in rows],
     )
 
 
@@ -147,7 +152,8 @@ _DECISION_FIELDS = (
 """Each ruling field a decision shows when the ruling gives it a value: every field is text or a list."""
 
 
-def _decision(current: program_facts.CurrentRuling) -> str:
+def decision_line(current: program_facts.CurrentRuling) -> str:
+    """A current ruling as one ``- `` line: its id first, then its fields, what it supersedes, a re-ask."""
     ruling = current.ruling
     parts = [ruling['id'], ruling['ruled_by'], ruling['date']]
     parts += [f'{name}: {_text(ruling[name])}' for name in _DECISION_FIELDS if ruling.get(name)]
@@ -159,7 +165,7 @@ def _decision(current: program_facts.CurrentRuling) -> str:
 
 
 def _decisions(home: HomeRead, store: StoreFacts) -> str:
-    return '\n'.join(map(_decision, program_facts.current_rulings(home.rulings))) or NONE
+    return '\n'.join(map(decision_line, program_facts.current_rulings(home.rulings))) or NONE
 
 
 def _task_name(row: state.TaskRow) -> str:

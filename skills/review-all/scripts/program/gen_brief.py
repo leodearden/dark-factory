@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import argparse
 import enum
+import json
 import sys
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import program_doc
 import program_facts
 import return_contract
 import run_cli
@@ -27,6 +30,12 @@ import state
 class Section(enum.StrEnum):
     """The brief's ``## `` headings."""
 
+    STREAM = 'Stream'
+    RULINGS = 'Rulings binding the stream'
+    FINDINGS = 'Findings'
+    FILINGS = 'Phase 5 filings'
+    XREFS = 'Cross-references to the stream'
+    SITTING = 'Design questions go to the sitting'
     RETURN = 'Return'
     SPAWN = 'Spawn'
 
@@ -44,17 +53,137 @@ _EXIT_MEANINGS: Mapping[Exit, str] = types.MappingProxyType({
 })
 
 SEAT_TITLE = '<your seat title>'
+LAUNCHING = 'skills/review-all/references/deliberation.md §Launching'
+
+
+@dataclass(frozen=True)
+class Measurement:
+    name: str
+    value: Any
+    rule: str
+
+
+@dataclass(frozen=True)
+class Dispute:
+    """A finding's ``calibration_disputes_verdict``: the verdict calibration would give, and why."""
+
+    to: str
+    note: str
+
+
+@dataclass(frozen=True)
+class Finding:
+    key: str
+    anchor: str
+    severity: str
+    statement: str
+    measurements: tuple[Measurement, ...]
+    verdict: str
+    dispute: Dispute | None
+
+
+@dataclass(frozen=True)
+class RunRecord:
+    """What a brief reads from the run record: its findings by key and its filings rows as written."""
+
+    path: Path
+    findings: Mapping[str, Finding]
+    filings: tuple[Mapping[str, Any], ...]
+
+
+class _RecordReader:
+    """Reads the run record at the boundary into typed values; a fault names the path and the field."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def fault(self, where: str, reason: str) -> state.StateError:
+        return state.StateError(f'the run record {self.path}: {where} {reason}')
+
+    def entry(self, value: Any, where: str) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping):
+            raise self.fault(where, f'is not an object: {value!r}')
+        return value
+
+    def entries(
+        self, parent: Mapping[str, Any], where: str, name: str,
+    ) -> list[tuple[str, Mapping[str, Any]]]:
+        """Each object of *parent*'s list *name*, with the path that names it (``findings[2]``)."""
+        path = f'{where}.{name}' if where else name
+        value = parent.get(name)
+        if not isinstance(value, list):
+            raise self.fault(path, f'is not a list: {value!r}')
+        return [(f'{path}[{i}]', self.entry(item, f'{path}[{i}]')) for i, item in enumerate(value)]
+
+    def text(self, entry: Mapping[str, Any], where: str, name: str) -> str:
+        value = entry.get(name)
+        if not isinstance(value, str):
+            raise self.fault(f'{where}.{name}', f'is not a string: {value!r}')
+        return value
+
+    def measurement(self, entry: Mapping[str, Any], where: str) -> Measurement:
+        if 'value' not in entry:
+            raise self.fault(f'{where}.value', 'is missing')
+        return Measurement(self.text(entry, where, 'name'), entry['value'], self.text(entry, where, 'rule'))
+
+    def dispute(self, finding: Mapping[str, Any], where: str) -> Dispute | None:
+        raw = finding.get('calibration_disputes_verdict')
+        if raw is None:
+            return None
+        where = f'{where}.calibration_disputes_verdict'
+        entry = self.entry(raw, where)
+        return Dispute(self.text(entry, where, 'to'), self.text(entry, where, 'note'))
+
+    def finding(self, entry: Mapping[str, Any], where: str) -> Finding:
+        return Finding(
+            key=self.text(entry, where, 'key'), anchor=self.text(entry, where, 'anchor'),
+            severity=self.text(entry, where, 'severity'),
+            statement=self.text(entry, where, 'statement'),
+            measurements=tuple(
+                self.measurement(m, at) for at, m in self.entries(entry, where, 'measurements')
+            ),
+            verdict=self.text(entry, where, 'verdict'), dispute=self.dispute(entry, where),
+        )
+
+    def filing(self, entry: Mapping[str, Any], where: str) -> Mapping[str, Any]:
+        """The row as written, once its ``key`` is known to be a string."""
+        self.text(entry, where, 'key')
+        return types.MappingProxyType(dict(entry))
+
+    def record(self) -> RunRecord:
+        try:
+            data = json.loads(self.path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            raise state.StateError(f'the run record {self.path} is absent') from None
+        except (OSError, ValueError) as bad:
+            raise state.StateError(f'the run record {self.path} is unreadable: {bad}') from None
+        if not isinstance(data, Mapping):
+            raise state.StateError(f'the run record {self.path} is not a JSON object')
+        findings = [self.finding(entry, at) for at, entry in self.entries(data, '', 'findings')]
+        return RunRecord(
+            path=self.path,
+            findings=types.MappingProxyType({finding.key: finding for finding in findings}),
+            filings=tuple(self.filing(entry, at) for at, entry in self.entries(data, '', 'filings')),
+        )
+
+
+def _run_record(program: state.Program) -> RunRecord:
+    return _RecordReader(Path(program.project_root) / program.record_path).record()
 
 
 @dataclass(frozen=True)
 class _Seat:
-    """What a brief is built from: the run, the stream it briefs, and the session that will read it."""
+    """What a brief is built from: the home read, the stream it briefs, and the session that will read it."""
 
-    run: run_cli.Run
+    home: program_facts.HomeRead
     stream: str
     pass_: state.Pass
     item: str | None
     session: state.Session
+
+    @property
+    def run(self) -> run_cli.Run:
+        return self.home.run
 
     @property
     def view(self) -> state.StreamView:
@@ -85,8 +214,119 @@ def _return_section(seat: _Seat) -> tuple[Section, list[str]]:
     return Section.RETURN, return_contract.section_lines(seat.run.home, _identity(seat))
 
 
+def _stream_section(seat: _Seat) -> tuple[Section, list[str]]:
+    cells = program_doc.stream_cells(seat.run, seat.stream)
+    return Section.STREAM, [
+        f'{seat.stream} after the ledger\'s amendments, as the program doc\'s Streams table shows it:',
+        '',
+        *(f'- {column}: {cell}' for column, cell in cells),
+    ]
+
+
+def _binds(ruling: Mapping[str, Any], view: state.StreamView) -> bool:
+    """A ruling binds the stream it names, every stream when it names none, and the streams whose keys
+    or recorded questions it rules on; a re-ask binds nothing, since the items it answers stay pending."""
+    if ruling.get('reask', False):
+        return False
+    answered = {state.ItemRef.parse(text).stream for text in ruling.get('answers', ())}
+    return (ruling['stream'] in (None, view.id) or not set(ruling['keys']).isdisjoint(view.keys)
+            or view.id in answered)
+
+
+def _rulings_section(seat: _Seat) -> tuple[Section, list[str]]:
+    binding = [
+        program_doc.decision_line(current)
+        for current in program_facts.current_rulings(seat.home.rulings)
+        if _binds(current.ruling, seat.view)
+    ]
+    return Section.RULINGS, binding or [f'No current ruling binds {seat.stream}.']
+
+
+def _filings_section(seat: _Seat, record: RunRecord) -> tuple[Section, list[str]]:
+    rows = [row for row in record.filings if row['key'] in seat.view.keys]
+    if not rows:
+        return Section.FILINGS, [f'The run record {record.path} files no row for {seat.stream}\'s keys.']
+    return Section.FILINGS, [
+        f'The rows of {record.path} `filings` for {seat.stream}\'s keys, verbatim:',
+        '',
+        '```jsonl',
+        *(json.dumps(dict(row), ensure_ascii=False) for row in rows),
+        '```',
+    ]
+
+
+def _xrefs_section(seat: _Seat) -> tuple[Section, list[str]]:
+    xrefs = [
+        f'- from {line["from"]} ({line["return"]}): {line["text"]}'
+        for line in seat.run.ledger
+        if line['op'] == state.LedgerOp.XREF and line['to'] == seat.stream
+    ]
+    return Section.XREFS, xrefs or [f'No applied return addresses an xref to {seat.stream}.']
+
+
+def _seat_sections(seat: _Seat, record: RunRecord) -> _Sections:
+    """The sections both seat passes carry, author and decompose."""
+    return [
+        _stream_section(seat),
+        _rulings_section(seat),
+        _filings_section(seat, record),
+        _xrefs_section(seat),
+    ]
+
+
+def _verdict_line(finding: Finding) -> str:
+    line = f'- verdict: {finding.verdict}'
+    if finding.dispute is not None:
+        line += f' · calibration disputes it: {finding.dispute.to} — {finding.dispute.note}'
+    return line
+
+
+def _finding_lines(key: str, finding: Finding | None) -> list[str]:
+    if finding is None:
+        return ['', f'### {key}', '', 'The run record carries no finding for this key.']
+    return [
+        '',
+        f'### {key} · {finding.anchor} · {finding.severity}',
+        '',
+        finding.statement,
+        '',
+        *(f'- {m.name} = {m.value} ({m.rule})' for m in finding.measurements),
+        _verdict_line(finding),
+    ]
+
+
+def _findings_section(seat: _Seat, record: RunRecord) -> tuple[Section, list[str]]:
+    return Section.FINDINGS, [
+        f'Measured at `{seat.run.program.as_of_sha}`. Re-measure any count a leaf\'s done-criteria '
+        'rest on before you cite it.',
+        *(line for key in seat.view.keys for line in _finding_lines(key, record.findings.get(key))),
+    ]
+
+
+def _sitting_section(seat: _Seat) -> tuple[Section, list[str]]:
+    run = seat.run
+    draft = program_doc.draft_copy(run, seat.stream, '<file name>')
+    reported = draft.destination.relative_to(run.program.project_root).as_posix()
+    return Section.SITTING, [
+        '- Every design-level question becomes an `open_questions` entry with `options` and a '
+        '`recommendation`, for the author-pass sitting. Never answer one in the seat.',
+        '- Mark `lead_rulable` true only for naming, file placement and seam ids; the human still '
+        'sees those, as one block.',
+        '- Mark `needs_human` true when the question reverses a ruling, cancels a live branch or '
+        'moves a board figure.',
+        f'- Write the PRD, its capability manifest and its sidecar as `{draft.source}`, and report '
+        f'each as `{reported}`.',
+        f'- The procedure is {LAUNCHING}.',
+    ]
+
+
 def _author_sections(seat: _Seat) -> _Sections:
-    return [_return_section(seat)]
+    record = _run_record(seat.run.program)
+    stream, rulings, filings, xrefs = _seat_sections(seat, record)
+    return [
+        stream, rulings, _findings_section(seat, record), filings, xrefs,
+        _sitting_section(seat), _return_section(seat),
+    ]
 
 
 _BUILDERS: Mapping[state.Pass, Callable[[_Seat], _Sections]] = types.MappingProxyType({
@@ -114,7 +354,7 @@ def _seat(args: argparse.Namespace) -> _Seat:
     if pass_ not in _BUILDERS:
         raise state.StateError(f'no {pass_} brief yet')
     return _Seat(
-        run=home.run, stream=stream, pass_=pass_, item=args.item,
+        home=home, stream=stream, pass_=pass_, item=args.item,
         session=state.Session(state.SessionKind.AGENT, SEAT_TITLE),
     )
 
