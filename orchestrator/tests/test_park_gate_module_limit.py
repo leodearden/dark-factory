@@ -7,11 +7,12 @@ request on M when either term fires:
 - the hold term: counting the park owners as holders, M is at its limit —
   ``|foreign holders conflicting with M ∪ blocking park owners| >=
   _limit_for(M)``;
-- the owner's-slot term: granting the request would leave o no slot on K —
-  ``|foreign holders conflicting with K ∪ {o}| >= _limit_for(K)``.
+- the owner's-slot term: granting the request would take o's slot on K — the
+  requester holds nothing conflicting with K yet, and
+  ``|holders conflicting with K ∪ {o}| >= _limit_for(K)``.
 
-A limit of 1 on either key still makes the park exclusive, hierarchical cases
-included.
+A limit of 1 on either key still makes the park admit no new occupant,
+hierarchical cases included.
 
 Every assertion goes through the lock table's public seams.
 """
@@ -205,6 +206,27 @@ class TestAWidenedAncestorPark:
 
         admitted = frozenset(table.park_owners_blocking('C', ['pkg/b.py']))
         assert table.try_acquire('C', ['pkg/b.py'], admitted_parks=admitted)
+
+    @staticmethod
+    def _parked_after_both_slots_were_taken() -> ModuleLockTable:
+        """R and H1 took both of pkg's slots on its children before P parked pkg."""
+        table = _two_slot_table()
+        _acquire_all(table, ['R'], 'pkg/a.py')
+        _acquire_all(table, ['H1'], 'pkg/c.py')
+        table.install_parks('P', ['pkg'], 'medium')
+        return table
+
+    def test_a_holder_already_under_the_park_expands_to_a_sibling(self):
+        table = self._parked_after_both_slots_were_taken()
+
+        assert table.try_acquire_additional('R', ['pkg/b.py'])
+        table.release('H1')
+        assert table.try_acquire('P', ['pkg']), 'one release still frees the owner'
+
+    def test_a_newcomer_under_the_full_parent_is_still_refused(self):
+        table = self._parked_after_both_slots_were_taken()
+
+        assert not table.try_acquire('C', ['pkg/b.py'])
 
 
 def test_a_child_park_does_not_refuse_a_parent_that_has_room():

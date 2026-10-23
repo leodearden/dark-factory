@@ -1346,8 +1346,12 @@ class ModuleLockTable:
             the request is refused when granting it would fill K for the owner
             (:meth:`_park_owner_slot_taken`).
 
-        A limit of 1 on either key makes its term always fire, so a limit-1
-        park stays exclusive, hierarchical cases included.  The rule is
+        A limit of 1 on *module* makes the hold term always fire, and a limit
+        of 1 on K makes the owner's-slot term fire for every requester not
+        already counted on K, so a limit-1 park admits no new occupant,
+        hierarchical cases included.  The hold term counts park owners first
+        and scans holders only when the owners alone leave *module* room, so a
+        limit-1 request pays no extra scan.  The rule is
         monotone in *ignore_owners*: ignoring an owner only removes hold-term
         occupants, and the owner's-slot term reads holders only, never
         *ignore_owners* — so once admission's named owners are ignored, no
@@ -1359,9 +1363,11 @@ class ModuleLockTable:
         parks = self._rank_blocking_parks(module, task_id, ignore_owners=ignore_owners)
         if not parks:
             return
-        occupants = self._conflicting_holders(module, exclude_task=task_id)
-        occupants.update(owner for owner, _key in parks)
-        if len(occupants) >= self._limit_for(module):
+        park_owners = {owner for owner, _key in parks}
+        limit = self._limit_for(module)
+        if len(park_owners) >= limit or len(
+            park_owners | self._conflicting_holders(module, exclude_task=task_id)
+        ) >= limit:
             yield from (owner for owner, _key in parks)
             return
         for owner, key in parks:
@@ -1369,13 +1375,18 @@ class ModuleLockTable:
                 yield owner
 
     def _park_owner_slot_taken(self, owner: str, key: str, requester: str) -> bool:
-        """Would granting *requester* a key conflicting with *key* leave *owner* no room on it?
+        """Would granting *requester* a key conflicting with *key* take *owner*'s slot on it?
 
-        True when the park owner's own later acquisition of *key* would then
-        fail the held gate: the holders conflicting with *key* other than
-        *requester*, plus *owner* itself, already reach ``_limit_for(key)``.
+        True when the grant is what leaves the park owner's own later
+        acquisition of *key* no room under the held gate: *requester* does not
+        already hold a key conflicting with *key*, and the holders conflicting
+        with *key* plus *owner* itself already reach ``_limit_for(key)``.  A
+        requester already counted on *key* — say, expanding to a sibling under
+        a parked parent — leaves the owner's room unchanged.
         """
-        holders = self._conflicting_holders(key, exclude_task=requester)
+        holders = self._conflicting_holders(key)
+        if requester in holders:
+            return False
         return len(holders | {owner}) >= self._limit_for(key)
 
     def _blocking_park_owner(
