@@ -1,8 +1,9 @@
 """B24: the one ref rule for a client defect report."""
 
 import pytest
-from client_feed.defect_ref import portal_ref
 from shared.defects import DefectOrigin, MalformedDefectRef, parse_ref
+
+from client_feed.defect_ref import portal_ref
 
 
 def test_a_client_report_mints_its_portal_ref() -> None:
