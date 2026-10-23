@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
-from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE, AgentResult
+from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE, AgentResult, claude_binary_spec
 from shared.config_dir import (
     CONFIG_DIR_PREFIX,
     TaskConfigDir,
@@ -2691,7 +2691,7 @@ class UsageGate:
             config_dir.write_credentials(acct.token)
 
         cmd = [
-            'claude',
+            claude_binary_spec(),
             '--print',
             '--output-format',
             'json',
