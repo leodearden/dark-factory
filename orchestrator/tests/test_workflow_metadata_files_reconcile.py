@@ -602,6 +602,41 @@ class TestLandedScopeStamp:
         assert get_task.await_count == 1
 
     @pytest.mark.parametrize(
+        'failed_read',
+        [
+            pytest.param({'return_value': None}, id='vanished-task'),
+            pytest.param({'side_effect': RuntimeError('backend down')}, id='read-raised'),
+            pytest.param(
+                {'return_value': {'id': '101', 'metadata': 'corrupt'}}, id='corrupt-blob',
+            ),
+        ],
+    )
+    async def test_unreadable_backend_stamps_metadata_basis_as_none(
+        self, tmp_path: Path, failed_read: dict,
+    ):
+        store = _event_store(tmp_path)
+        diff = ['src/a.py', 'src/b.py']
+        wf, update_task, _, get_merge_commit_diff_files = _make_workflow(
+            project_root=tmp_path, event_store=store,
+        )
+        wf.scheduler.get_task = AsyncMock(**failed_read)
+        wf.task['metadata'] = {'files': ['stale/in_memory.py'], 'memory_hints': _HINTS}
+        wf.plan = {'files': ['src/a.py'], 'steps': []}
+        wf._merge_sha = _MERGE_SHA
+        get_merge_commit_diff_files.return_value = (list(diff), None)
+
+        await wf._reconcile_metadata_files_for_done()
+
+        stamp = _only_stamp(store)
+        assert stamp['metadata_files'] is None
+        assert stamp['plan_files'] == {
+            'declared': ['src/a.py'], 'undeclared': ['src/b.py'], 'undelivered': [],
+        }
+        update_task.assert_awaited_once_with(
+            '101', {'files': diff, 'memory_hints': _HINTS},
+        )
+
+    @pytest.mark.parametrize(
         ('merge_sha', 'diff_result', 'override_files', 'expected_files'),
         [
             pytest.param(None, ([], None), None, _PRIOR_SCOPE, id='no-merge-sha'),

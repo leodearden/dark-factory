@@ -692,8 +692,15 @@ def _declared_files(metadata: Mapping[str, Any]) -> list[str]:
     return [f for f in _declared_entries(metadata, 'files') if isinstance(f, str)]
 
 
-def _scope_basis(declared: list[str], landed: list[str]) -> dict[str, list[str]]:
-    """One ``landed_scope_diff`` basis: a declaration and its coverage of *landed*."""
+def _scope_basis(
+    declared: list[str] | None, landed: list[str],
+) -> dict[str, list[str]] | None:
+    """One ``landed_scope_diff`` basis: a declaration and its coverage of *landed*.
+
+    An unknown declaration (None) stays None, never "declared nothing".
+    """
+    if declared is None:
+        return None
     coverage = declaration_coverage(declared, landed)
     return {
         'declared': list(declared),
@@ -2429,12 +2436,18 @@ class TaskWorkflow:
                 files, unknown_reason = None, f'merge diff failed: {err}'
             else:
                 landed = files
-        merged = await self._merge_fresh_metadata(
-            self.task.get('metadata') or {},
+        backend = await self._read_fresh_backend_metadata(
             log_context='done metadata files reconcile',
         )
+        # Same merge policy as _merge_fresh_metadata: an unreadable backend
+        # (None) falls back to in-memory metadata for the write, never for
+        # the stamp's record of what the write overwrites.
+        merged = {**(self.task.get('metadata') or {}), **(backend or {})}
         if landed is not None:
-            self._stamp_landed_scope(landed, recorded=_declared_files(merged))
+            self._stamp_landed_scope(
+                landed,
+                recorded=None if backend is None else _declared_files(backend),
+            )
         persisted = await self._write_metadata_files(merged, files)
         if files is None and persisted:
             logger.warning(
@@ -2476,12 +2489,15 @@ class TaskWorkflow:
         self.task['metadata'] = merged
         return merged['files']
 
-    def _stamp_landed_scope(self, landed: list[str], *, recorded: list[str]) -> None:
+    def _stamp_landed_scope(
+        self, landed: list[str], *, recorded: list[str] | None,
+    ) -> None:
         """Emit ``landed_scope_diff``: *landed* against plan.files and *recorded*.
 
         Both declarations arrive parsed to path strings, so nothing here can
         raise into the done write.  No plan loaded stamps ``plan_files`` as
-        None, never as "declared nothing".
+        None, and an unreadable backend (``recorded=None``) stamps
+        ``metadata_files`` as None.
         """
         if self.event_store is None:
             return
@@ -2495,10 +2511,7 @@ class TaskWorkflow:
             data={
                 'merge_sha': self._merge_sha,
                 'landed': sorted(landed),
-                'plan_files': (
-                    None if plan_declared is None
-                    else _scope_basis(plan_declared, landed)
-                ),
+                'plan_files': _scope_basis(plan_declared, landed),
                 'metadata_files': _scope_basis(recorded, landed),
             },
         )
