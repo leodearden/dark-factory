@@ -2255,7 +2255,7 @@ Worked precedents: `autopilot_video` 648 (mem0
 
 ---
 
-## 10. In-place memory amendments are not task-agent work
+## 11. In-place memory amendments are not task-agent work
 
 **A plan step — or a task description — that amends an EXISTING memory in
 place must be routed to a curator sitting or a reconciliation stage, never
@@ -2319,6 +2319,6 @@ For the mechanics, read these rather than re-deriving them:
   `/prd` decompose and `/review` phase 2.
 - **`skills/curate-fused-memories/SKILL.md`** — the sanctioned curator
   sitting: the only dispatched-agent-adjacent route that may amend a memory
-  in place (§10).
+  in place (§11).
 - **`plans/mem0-in-place-update-decision.md`** — the ratified `update_memory`
-  design: tool shape, and the two-arm authorization model behind §10.
+  design: tool shape, and the two-arm authorization model behind §11.

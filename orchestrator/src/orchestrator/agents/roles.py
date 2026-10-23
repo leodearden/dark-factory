@@ -419,7 +419,7 @@ single normative source for all of this; consult it rather than guessing.
 # (`skills/curate-fused-memories/SKILL.md`,
 # `plans/mem0-in-place-update-decision.md`, `OPERATIONS.md`), none of which a
 # dispatched plan AUTHOR reads. The durable, greppable statement now lives in
-# `docs/task-authoring.md`, cited by HEADING TITLE rather than by its `## 10.`
+# `docs/task-authoring.md`, cited by HEADING TITLE rather than by its section
 # ordinal both here and in the prompt text below: a later section inserted
 # ahead of it would silently repoint five role prompts at the wrong section,
 # and nothing checks the docs half (deliberately -- see
