@@ -13,6 +13,9 @@ lane internals.
 from __future__ import annotations
 
 import logging
+import os
+import shlex
+import shutil
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
@@ -83,6 +86,25 @@ def _record(caplog: pytest.LogCaptureFixture, needle: str) -> str:
         f'expected exactly one record containing {needle!r}; got {messages!r}'
     )
     return messages[0]
+
+
+def _fail_git_argv(
+    monkeypatch: pytest.MonkeyPatch, bin_dir: Path, argv_glob: str,
+) -> None:
+    """Fail every git argv matching *argv_glob* at the process boundary, so no ``_run`` patch is needed."""
+    real_git = shutil.which('git')
+    assert real_git is not None
+    bin_dir.mkdir(parents=True)
+    shim = bin_dir / 'git'
+    shim.write_text(
+        '#!/bin/sh\n'
+        f'fail_glob={shlex.quote(argv_glob)}\n'
+        'case "$*" in $fail_glob) '
+        "echo 'fatal: injected failure (test fault injection)' >&2; exit 128 ;; esac\n"
+        f'exec {shlex.quote(real_git)} "$@"\n'
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
 
 
 @pytest.mark.asyncio
@@ -281,4 +303,48 @@ class TestRenameCycleThroughMergeHistory:
         assert (
             'via unique basename match on pkg/b.py (after 2-hop rename chain);'
             in _record(caplog, 'resolved to')
+        )
+
+
+@pytest.mark.asyncio
+class TestResolverProbeFailuresNameTheTask:
+    """A failed resolver probe fails the entry closed and logs which task and entry it was for."""
+
+    async def test_rename_delete_probe_failure_is_logged_with_the_task(
+        self, git_repo: Path, git_ops: GitOps, tmp_path: Path,
+        caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _commit(git_repo, {'pkg/old.py': _module('mod')}, 'add old')
+        sha = _mv(git_repo, 'pkg/old.py', 'pkg/new.py', 'rename')
+        head = _commit(git_repo, {'pkg/new.py': _module('edited')}, 'edit')
+        _fail_git_argv(monkeypatch, tmp_path / 'bin', 'log --diff-filter=D *')
+
+        with caplog.at_level(logging.WARNING, logger=LANE_LOGGER):
+            result = await _check_plan_files_touched_in_branch(
+                ['pkg/old.py'], sha, head, git_ops, task_id=TASK,
+            )
+
+        assert result.missing_from_tree == ['pkg/old.py']
+        assert (
+            f'task_id={TASK} entry=pkg/old.py'
+            in _record(caplog, 'rename-probe git error')
+        )
+
+    async def test_history_probe_failure_is_logged_with_the_task(
+        self, git_repo: Path, git_ops: GitOps, tmp_path: Path,
+        caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    ):
+        base = _commit(git_repo, {'pkg/real.py': _module('real')}, 'add real')
+        head = _commit(git_repo, {'pkg/real.py': _module('edited')}, 'edit real')
+        _fail_git_argv(monkeypatch, tmp_path / 'bin', 'log -1 --format=%H *')
+
+        with caplog.at_level(logging.WARNING, logger=LANE_LOGGER):
+            result = await _check_plan_files_touched_in_branch(
+                ['docs/invented.md'], base, head, git_ops, task_id=TASK,
+            )
+
+        assert result.missing_from_tree == ['docs/invented.md']
+        assert (
+            f'task_id={TASK} entry=docs/invented.md'
+            in _record(caplog, 'history-probe git error')
         )
