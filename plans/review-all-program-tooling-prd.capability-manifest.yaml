@@ -1,7 +1,8 @@
 prd: plans/review-all-program-tooling-prd.md
 schema_version: 1
 # Authored 2026-10-19 in author mode; folded the same day from the D8 critic. task_id fields stay
-# null until commit_planning stamps them. Every grep/path/script check fails on main 3ed84d5c5a
+# null until commit_planning stamps them. Amended after landing (7a043cf4bc) with the A7 sitting fields and the
+# B6–B16 skill-text wave (κ2, λ1, λ3, λ4, λ5, μ); their phrases measured absent at 88f6fa8b01. Every grep/path/script check fails on main 3ed84d5c5a
 # (unchanged at 93f478fa3b) except κ's two expect-absent checks, whose phrases live only in the
 # sibling seat's uncommitted working-tree amendments; they fail once the wave commits, which precedes
 # decompose (GATE_REF is main of project_root); lint reads them vacuous_absent until then. σ1's absent check
@@ -9,7 +10,7 @@ schema_version: 1
 # several paths passes on any one of them, so every required path has its own check.
 tasks:
 - label: α
-  task_id: null
+  task_id: 7177
   title: 'state.py: schema constants, return validator, state home, append-only JSONL, the one store reader; fixture and fake store'
   capabilities:
   - name: lookup-tool-wired
@@ -69,6 +70,15 @@ tasks:
       expect: present
       paths:
       - skills/review-all/scripts/program/state.py
+  - name: sitting-fields
+    binding: built by this leaf — open_questions[].lead_rulable and .source, the investigate pass, accepted by validate_return (A7)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: lead_rulable
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/state.py
   - name: reader-refuses-missing-echo
     binding: built by this leaf — StoreReaderUnsupported raised when the include_rows echo or a row's metadata/dependencies is missing, or the server rejects the argument (INV-11)
     verdict: PASS
@@ -79,7 +89,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/state.py
 - label: ρ
-  task_id: null
+  task_id: 7178
   title: 'find_tasks_by_metadata(include_rows=True): metadata and dependencies per row under the byte budget, echoed'
   capabilities:
   - name: lookup-layering
@@ -172,7 +182,7 @@ tasks:
       kind: manual
       reason: requires the running service restarted onto the landed code; asserted by the fused-memory suite's boundary rows and observed live by the next lead
 - label: β
-  task_id: null
+  task_id: 7186
   title: 'apply_return.py and record.py: validate, move, append, digest, --check, --from-store, idempotence'
   capabilities:
   - name: state-library
@@ -196,6 +206,15 @@ tasks:
       expect: present
       paths:
       - skills/review-all/scripts/program/apply_return.py
+  - name: sitting-rulings
+    binding: built by this leaf — record.py rule --answers closes items and --reask keeps them pending (A7 §4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''--reask'''
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/record.py
   - name: from-store-reconstruction
     binding: built by this leaf — --from-store rebuilds filed/held/released from the store for a lost return
     verdict: PASS
@@ -206,7 +225,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/apply_return.py
 - label: γ
-  task_id: null
+  task_id: 7187
   title: 'program_doc.py: render into the home, .state/ snapshot, heading self-check, --publish, --roster, --handoff'
   capabilities:
   - name: state-library
@@ -235,6 +254,15 @@ tasks:
       expect: present
       paths:
       - skills/review-all/scripts/program/program_doc.py
+  - name: sitting-screens
+    binding: built by this leaf — --sitting renders the pending items as screens of at most four with the recommendation and the draft PRD path (A7 §3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''--sitting'''
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/program_doc.py
   - name: publish-step
     binding: built by this leaf — --publish copies the doc and .state/ from the home into plans_dir and prints the path list
     verdict: PASS
@@ -245,7 +273,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/program_doc.py
 - label: δ
-  task_id: null
+  task_id: 7190
   title: 'gen_brief.py: wave-aware brief at spawn time; --spawn creates the sessions.json entry and prints the pointer-prompt command'
   capabilities:
   - name: state-library
@@ -274,6 +302,15 @@ tasks:
       expect: present
       paths:
       - skills/review-all/scripts/program/gen_brief.py
+  - name: investigate-brief
+    binding: built by this leaf — the escalation brief for one item (A7 §5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: investigate
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/gen_brief.py
   - name: spawn-command-opts-in-to-self-exit
     binding: built by this leaf
     verdict: PASS
@@ -284,7 +321,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/gen_brief.py
 - label: ε
-  task_id: null
+  task_id: 7188
   title: 'clerk_batch.py: write (batch, CLERK_RULES prompt, release/repath recipes, --scan over moves), ingest'
   capabilities:
   - name: state-library
@@ -323,7 +360,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/clerk_batch.py
 - label: ζ
-  task_id: null
+  task_id: 7189
   title: 'gate_check.py (both trigger-chain forms) and seam_scan.py'
   capabilities:
   - name: state-library
@@ -351,7 +388,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/gate_check.py
 - label: η
-  task_id: null
+  task_id: 7191
   title: 'watch_sessions.py: resolve records, archive on first sight, final vs checkpoint, apply the inbox file once'
   capabilities:
   - name: state-library
@@ -393,7 +430,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/watch_sessions.py
 - label: σ1
-  task_id: null
+  task_id: 7179
   title: 'Spawn contract: --prompt-file pointer prompt, /reflect and in-progress in the trailer, the marker instruction, CLAUDE_SPAWN_SELF_EXIT → record.self_exit, the outcome vocabulary moved to session_registry.py'
   capabilities:
   - name: trailer-and-payload
@@ -499,7 +536,7 @@ tasks:
       paths:
       - skills/spawn/spawn-claude.sh
 - label: σ2
-  task_id: null
+  task_id: 7193
   title: 'Opt-in Stop-hook self-termination in session_self_exit.py'
   capabilities:
   - name: trailer-and-record-flag
@@ -570,7 +607,7 @@ tasks:
       paths:
       - orchestrator/tests/test_session_self_exit.py
 - label: σ3
-  task_id: null
+  task_id: 7194
   title: 'Acceptance probe: one scratch tmux-lane spawn with self-exit on and a brief over 16 KB self-terminates (human-run)'
   capabilities:
   - name: self-termination
@@ -583,7 +620,7 @@ tasks:
       kind: manual
       reason: a human spawns one scratch tmux-lane session with CLAUDE_SPAWN_SELF_EXIT=1 and a >16 KB brief and records exit 0, exited last, the --resume hint, record.exit_request's pid, the launcher command length, and the measured element shapes of background_tasks and session_crons in the task
 - label: κ
-  task_id: null
+  task_id: 7195
   title: 'Skill text cites the scripts and the machine homes (SKILL.md, deliberation.md, report-format.md)'
   capabilities:
   - name: scripts-landed
@@ -591,6 +628,9 @@ tasks:
     verdict: PASS
   - name: held-leaf-prose-owner
     binding: capability→producer (upstream) — task 6959 re-stamps the Held-leaf bullet κ then re-points at state.py
+    verdict: PASS
+  - name: skill-text-wave-landed
+    binding: capability→producer (upstream) — κ2, λ1, λ3 edit the same three files first; κ rebases on them
     verdict: PASS
   - name: phrases-present-today
     binding: capability→substrate (wired) — `grep:skills/review-all/references/deliberation.md` "by hand until the program-tooling PRD lands"; `grep:skills/review-all/SKILL.md` "by hand until then"; present in this worktree's working tree, absent at main until the wave commits
@@ -658,7 +698,7 @@ tasks:
       paths:
       - tests/scripts/test_review_all_skill_text_cites_scripts.py
 - label: ω
-  task_id: null
+  task_id: 7192
   title: 'Integration gate: the fixture walk (B1–B14), every script a subprocess under python3 -I -S'
   capabilities:
   - name: all-scripts
@@ -683,5 +723,280 @@ tasks:
       expect: present
       paths:
       - tests/scripts/test_review_all_program_fixture_walk.py
+- label: κ2
+  task_id: 7180
+  title: 'deliberation.md: the A7 author-pass sitting, the decompose gotchas (B8, B12)'
+  capabilities:
+  - name: a7-ruling
+    binding: capability→substrate (wired) — `grep:plans/review-all-feedback-synthesis-2026-10-17/A7-synthesis.md` §4, accepted by Leo 2026-10-19 after the landing commit
+    verdict: PASS
+  - name: current-text
+    binding: capability→substrate (wired) — `grep:skills/review-all/references/deliberation.md` §The program doc "a design-heavy stream becomes `spawn`" and the §Launching `spawn` bullet, present at 88f6fa8b01
+    verdict: PASS
+  - name: lead-rulable-rule
+    binding: built by this leaf — the lead rules only lead_rulable questions and shows even those as a block
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: lead_rulable
+      expect: present
+      paths:
+      - skills/review-all/references/deliberation.md
+  - name: author-pass-sitting
+    binding: built by this leaf — one author-pass sitting per wave, screens of at most four
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: author-pass sitting
+      expect: present
+      paths:
+      - skills/review-all/references/deliberation.md
+  - name: spawn-mode-retired
+    binding: built by this leaf — no stream is a spawn stream
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: design-heavy stream becomes
+      expect: absent
+      paths:
+      - skills/review-all/references/deliberation.md
+  - name: edge-not-cancel
+    binding: built by this leaf — B8 decompose rule
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: live heartbeat
+      expect: present
+      paths:
+      - skills/review-all/references/deliberation.md
+  - name: fold-then-cancel
+    binding: built by this leaf — B12
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: folded into stream leaves
+      expect: present
+      paths:
+      - skills/review-all/references/deliberation.md
+  - name: one-sidecar-per-call
+    binding: built by this leaf — B12
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: stamps one sidecar per call
+      expect: present
+      paths:
+      - skills/review-all/references/deliberation.md
+- label: λ1
+  task_id: 7181
+  title: 'SKILL.md: pinned worktree (B6), one area rule (B7), filing mechanics (B8), fan-out hygiene (B9), live defects (B11), cost-gate calibration (B13)'
+  capabilities:
+  - name: current-text
+    binding: capability→substrate (wired) — `grep:skills/review-all/SKILL.md` Phase 0 step 1 pins under .claude/worktrees/, step 2 reads subprojects keys, §Cost gate carries the human-hours paragraph, Phase 5 filing names FusedMemoryClient; present at 88f6fa8b01
+    verdict: PASS
+  - name: pinned-tree-home
+    binding: built by this leaf — B6
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: review-all/<run_id>/tree
+      expect: present
+      paths:
+      - skills/review-all/SKILL.md
+  - name: area-rules-recorded
+    binding: built by this leaf — B7
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: area_rules
+      expect: present
+      paths:
+      - skills/review-all/SKILL.md
+  - name: reconcile-before-resubmit
+    binding: built by this leaf — B8
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: reconcile-before-resubmit
+      expect: present
+      paths:
+      - skills/review-all/SKILL.md
+  - name: skill-sha-frozen
+    binding: built by this leaf — B9
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: extra.skill_sha
+      expect: present
+      paths:
+      - skills/review-all/SKILL.md
+  - name: live-defects-filed
+    binding: built by this leaf — B11
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: live correctness defect
+      expect: present
+      paths:
+      - skills/review-all/SKILL.md
+  - name: token-rule-stated
+    binding: built by this leaf — B13
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: extra.token_rule
+      expect: present
+      paths:
+      - skills/review-all/SKILL.md
+- label: λ3
+  task_id: 7182
+  title: 'report-format.md: area_rules, combined disposition, skill_sha, operational events, token_rule, measured-at labels (B7–B10, B13, B15)'
+  capabilities:
+  - name: current-text
+    binding: capability→substrate (wired) — `grep:skills/review-all/references/report-format.md` §Method yaml block, §Mechanical filings, §Dropped and degraded, §Artefact 3; present at 88f6fa8b01
+    verdict: PASS
+  - name: area-rules-field
+    binding: built by this leaf — B7
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'area_rules:'
+      expect: present
+      paths:
+      - skills/review-all/references/report-format.md
+  - name: combined-disposition
+    binding: built by this leaf — B8
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: combined:<id>
+      expect: present
+      paths:
+      - skills/review-all/references/report-format.md
+  - name: skill-sha-field
+    binding: built by this leaf — B9
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'skill_sha:'
+      expect: present
+      paths:
+      - skills/review-all/references/report-format.md
+  - name: operational-events
+    binding: built by this leaf — B10
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: usage-cap stops
+      expect: present
+      paths:
+      - skills/review-all/references/report-format.md
+  - name: token-rule-field
+    binding: built by this leaf — B13
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'token_rule:'
+      expect: present
+      paths:
+      - skills/review-all/references/report-format.md
+  - name: measured-at-label
+    binding: built by this leaf — B15
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: measured at <as_of>
+      expect: present
+      paths:
+      - skills/review-all/references/report-format.md
+- label: λ4
+  task_id: 7183
+  title: 'orchestration.md: git-archive fallback in the area prompt (B6), synthesis hardening (B14)'
+  capabilities:
+  - name: current-text
+    binding: capability→substrate (wired) — `grep:skills/review-all/references/orchestration.md` areaPrompt and synthesisPrompt JOBS 4–5, the critic revision; the landed calibrate()/reverifyHighStratum() code untouched; present at 88f6fa8b01
+    verdict: PASS
+  - name: tree-fallback
+    binding: built by this leaf — B6
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: git archive
+      expect: present
+      paths:
+      - skills/review-all/references/orchestration.md
+  - name: exoneration-check
+    binding: built by this leaf — B14
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: test-share ratio
+      expect: present
+      paths:
+      - skills/review-all/references/orchestration.md
+  - name: wrong-version-rule
+    binding: built by this leaf — B14
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: is the wrong version caught
+      expect: present
+      paths:
+      - skills/review-all/references/orchestration.md
+  - name: critic-recheck
+    binding: built by this leaf — B14
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: cheap re-check
+      expect: present
+      paths:
+      - skills/review-all/references/orchestration.md
+  - name: js-block-parses
+    binding: built by this leaf — node --check on the extracted js block passes
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a kind script check would need a checked-in script (TestCheckedInScriptCheckTargets); the leaf runs node --check on the extracted block as its own test
+- label: λ5
+  task_id: 7184
+  title: 'project-overlay.md: a second metrics instrument for a mixed repo (B16)'
+  capabilities:
+  - name: current-text
+    binding: capability→substrate (wired) — `grep:skills/review-all/references/project-overlay.md` Metrics instruments slot; present at 88f6fa8b01
+    verdict: PASS
+  - name: unranked-area
+    binding: built by this leaf — B16
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: unranked
+      expect: present
+      paths:
+      - skills/review-all/references/project-overlay.md
+- label: μ
+  task_id: 7185
+  title: 'Filing client: per-call timeout on FusedMemoryClient.call_tool (B8)'
+  capabilities:
+  - name: client-today
+    binding: capability→substrate (wired) — `grep:scripts/migrate_metadata_modules_to_files.py::FusedMemoryClient` (AsyncClient timeout=30.0; call_tool and _post take no timeout); `grep:scripts/tests/conftest.py` install_fake_httpx; verified at 88f6fa8b01
+    verdict: PASS
+  - name: per-call-timeout
+    binding: built by this leaf — call_tool(..., timeout=) forwarded to the request
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'timeout: float'
+      expect: present
+      paths:
+      - scripts/migrate_metadata_modules_to_files.py
+  - name: timeout-test
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - scripts/tests/test_migrate_metadata_client_timeout.py
 signal_leaves:
 - ω

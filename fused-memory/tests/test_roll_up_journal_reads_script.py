@@ -2,7 +2,9 @@
 
 Every test runs the script's ``main`` against a real ``WriteJournal``-initialized
 journal under ``tmp_path``, seeded by direct INSERT with history older than the
-deploy grace, the way an operator would run it against the live file.
+deploy grace, the way an operator would run it against the live file. A test that
+needs a seam ``main`` does not expose (the migration connection, the migration
+clock) calls the public function ``main`` would.
 """
 
 from __future__ import annotations
@@ -11,8 +13,9 @@ import asyncio
 import json
 import sqlite3
 import subprocess
-import time
 from collections import Counter
+from collections.abc import Callable
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -20,7 +23,12 @@ import pytest
 from _fm_helpers import load_script_module
 
 from fused_memory.config.schema import WriteJournalConfig
-from fused_memory.services.read_rollup import keeps_read_row
+from fused_memory.services.read_rollup import (
+    DELETE_COUNT_ONLY_READS_SQL,
+    FIRST_COUNT_ONLY_ROWID_SQL,
+    PREWARM_PRIMARY_KEY_SQL,
+    keeps_read_row,
+)
 from fused_memory.services.write_journal import SCHEMA_SQL, WriteJournal
 from fused_memory.services.write_ops_retention import prune_write_ops_pass
 
@@ -164,6 +172,34 @@ def _migrate(journal: Path, capsys, *extra: str) -> tuple[int, dict | None, str]
     )
 
 
+class _StatementClock:
+    """A virtual monotonic clock: each SQLite statement, as it starts, advances it
+    by the virtual seconds ``seconds_at`` gives that statement's text."""
+
+    def __init__(self, seconds_at: Callable[[str], float]) -> None:
+        self.now = 0.0
+        self._seconds_at = seconds_at
+
+    def __call__(self) -> float:
+        return self.now
+
+    def trace(self, statement: str) -> None:
+        self.now += self._seconds_at(statement)
+
+
+def _migrate_on_clock(journal: Path, seconds_at: Callable[[str], float]):
+    clock = _StatementClock(seconds_at)
+    with closing(_script.connect_for_migration(journal)) as conn:
+        conn.set_trace_callback(clock.trace)
+        return _script.migrate(
+            conn,
+            _script.MigrationLimits(
+                chunk_rowids=11, pause_seconds=0.0, max_seconds=None, max_chunks=None,
+            ),
+            clock=clock,
+        )
+
+
 class TestDryRun:
     def test_migrate_without_apply_changes_nothing(self, journal, capsys):
         before = _dump(journal)
@@ -190,6 +226,8 @@ class TestMigrateApply:
         assert report['rows_moved'] == sum(1 for row in history if _is_count_only(row))
         assert report['chunks'] > 1
         assert report['max_chunk_seconds'] >= report['mean_chunk_seconds'] > 0
+        assert 0 <= report['mean_lock_seconds'] <= report['max_lock_seconds']
+        assert report['max_lock_seconds'] <= report['max_chunk_seconds']
         assert _rollup_counts(journal) == expected
         after_rows = _write_ops_by_id(journal)
         kept_ids = {row['id'] for row in history if not _is_count_only(row)}
@@ -208,23 +246,84 @@ class TestMigrateApply:
 
         assert _rollup_counts(journal)[_PRE_EXISTING_ROLLUP[:4]] == 3 + raw_in_key
 
-    def test_the_work_queue_scan_is_reported_apart_from_the_chunk_rate(
-        self, journal, capsys, monkeypatch,
+    def test_the_work_queue_scan_is_reported_apart_from_the_chunk_rate(self, journal):
+        scan, chunk = 3.0, 1.0
+        seconds_at = {FIRST_COUNT_ONLY_ROWID_SQL: scan, 'COMMIT': chunk}
+
+        report = _migrate_on_clock(journal, lambda statement: seconds_at.get(statement, 0.0))
+
+        assert report.chunks > 1
+        assert report.setup_seconds == scan
+        assert report.seconds == chunk * report.chunks
+        assert report.rows_per_second == round(report.rows_moved / (chunk * report.chunks), 1)
+
+
+class TestTheWriteLockHold:
+    """What happens before BEGIN, inside the lock, and after COMMIT, seen through
+    the public connect_for_migration seam with SQLite's own statement trace."""
+
+    @pytest.fixture
+    def traced(self, monkeypatch):
+        statements: list[str] = []
+        connect = _script.connect_for_migration
+
+        def tracing_connect(path):
+            conn = connect(path)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        monkeypatch.setattr(_script, 'connect_for_migration', tracing_connect)
+        return statements
+
+    def test_each_chunk_prewarms_then_locks_then_commits_then_checkpoints(
+        self, journal, capsys, traced,
     ):
-        slow_scan = _script.count_only_span
-
-        def scan_taking_time(conn):
-            time.sleep(0.4)
-            return slow_scan(conn)
-
-        monkeypatch.setattr(_script, 'count_only_span', scan_taking_time)
+        statements = traced
+        prewarm_text = PREWARM_PRIMARY_KEY_SQL.split('?')[0]
 
         code, report, err = _migrate(journal, capsys)
 
         assert code == 0, err
-        assert report is not None
-        assert report['setup_seconds'] >= 0.4
-        assert report['seconds'] < 0.4
+        assert report is not None and report['chunks'] > 1
+        phases = {
+            'BEGIN IMMEDIATE': 'begin',
+            'COMMIT': 'commit',
+            'PRAGMA wal_checkpoint(PASSIVE)': 'checkpoint',
+        }
+        kinds = [
+            'prewarm' if statement.startswith(prewarm_text) else phases[statement]
+            for statement in statements
+            if statement.startswith(prewarm_text) or statement in phases
+        ]
+        assert kinds == ['prewarm', 'begin', 'commit', 'checkpoint'] * report['chunks']
+
+    def test_the_migration_connection_never_checkpoints_inside_a_commit(self, journal):
+        conn = _script.connect_for_migration(journal)
+        try:
+            assert conn.execute('PRAGMA wal_autocheckpoint').fetchone() == (0,)
+        finally:
+            conn.close()
+
+    def test_the_reported_lock_hold_spans_only_the_transaction(self, journal):
+        outside, inside = 2.0, 1.0
+        prewarm_text = PREWARM_PRIMARY_KEY_SQL.split('?')[0]
+        delete_text = DELETE_COUNT_ONLY_READS_SQL.split('?')[0]
+        deletes_seen: list[str] = []
+
+        def seconds_at(statement: str) -> float:
+            if statement.startswith(prewarm_text) or statement == 'PRAGMA wal_checkpoint(PASSIVE)':
+                return outside
+            if statement.startswith(delete_text) and not deletes_seen:
+                deletes_seen.append(statement)
+                return inside
+            return 0.0
+
+        report = _migrate_on_clock(journal, seconds_at)
+
+        assert report.chunks > 1
+        assert report.max_chunk_seconds == 2 * outside + inside
+        assert report.max_lock_seconds == inside
+        assert report.mean_lock_seconds == round(inside / report.chunks, 3)
 
 
 def _snapshot(journal: Path, capsys, out: Path, *extra: str) -> int:

@@ -57,7 +57,7 @@ REPO_ROOT="$(cd "$_self_dir/.." && pwd)"
 # restarted afterwards keeps stale bytecode -- which --no-sync means it can no longer
 # fix by re-syncing at its next start. This array is the single source of the list
 # within this script; tests/scripts/test_sync_orchestrator_env.py derives the expected
-# set from the committed units, so an eighth unit turns that guard red on its own.
+# set from the committed units, so a ninth unit turns that guard red on its own.
 SERVICES=(
   orchestrator-reify.service
   orchestrator-dark-factory.service
@@ -66,6 +66,7 @@ SERVICES=(
   orchestrator-my-solar-challenge.service
   orchestrator-pump-web-ui.service
   orchestrator-solar-challenge-platform.service
+  orchestrator-stream-touch.service
 )
 
 echo "==> Stopping watchdog timer (first, so it can't revive a unit mid-sync)"

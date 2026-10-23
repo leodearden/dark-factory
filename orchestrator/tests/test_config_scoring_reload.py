@@ -14,6 +14,8 @@ from orchestrator.config import (
     AGE_BUDGET,
     AGE_HALF_SECS,
     CONTINUITY_CREDIT,
+    CONTINUITY_CREDIT_MAX_AGE_SECS,
+    CONTINUITY_PROBE_TTL_SECS,
     CPM_BUDGET,
     CPM_D_CAP,
     RELOADABLE_FIELDS,
@@ -60,6 +62,12 @@ class TestDefaults:
         cfg = ScoringConfig()
 
         assert cfg.continuity_credit < _continuity_bound(cfg)
+
+    def test_continuity_probe_leaves_default_to_the_mandated_literals(self):
+        cfg = ScoringConfig()
+
+        assert cfg.continuity_probe_ttl_secs == 300.0 == CONTINUITY_PROBE_TTL_SECS
+        assert cfg.continuity_credit_max_age_secs == 604800.0 == CONTINUITY_CREDIT_MAX_AGE_SECS
 
 
 class TestBudgetSumInvariant:
@@ -110,6 +118,22 @@ class TestContinuityBelowCpmInvariant:
 def test_a_d_cap_below_one_is_rejected(bad_cap):
     with pytest.raises(ValidationError, match='cpm_d_cap'):
         ScoringConfig(cpm_d_cap=bad_cap)
+
+
+class TestContinuityProbeBounds:
+    """C3: the probe TTL floor bounds git occupancy under any tuning; credit must lapse."""
+
+    def test_a_probe_ttl_below_the_floor_is_rejected(self):
+        with pytest.raises(ValidationError, match='continuity_probe_ttl_secs'):
+            ScoringConfig(continuity_probe_ttl_secs=59.0)
+
+    def test_a_probe_ttl_at_the_floor_is_accepted(self):
+        assert ScoringConfig(continuity_probe_ttl_secs=60.0).continuity_probe_ttl_secs == 60.0
+
+    @pytest.mark.parametrize('bad_age', [0, -1.0])
+    def test_a_non_positive_credit_max_age_is_rejected(self, bad_age):
+        with pytest.raises(ValidationError, match='continuity_credit_max_age_secs'):
+            ScoringConfig(continuity_credit_max_age_secs=bad_age)
 
 
 class TestScoringReloadDisposition:

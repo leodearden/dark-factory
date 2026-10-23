@@ -84,6 +84,8 @@ def configure_triage_config(
     near_dup_threshold: float = 0.90,
     topic_clusters: list | None = None,
     judge_enabled: bool = False,
+    min_parent_cosine: float | None = None,
+    hoist_max_cosine_gap: float | None = None,
 ) -> None:
     """Stand in for ``memory_service.config`` with plain namespaces.
 
@@ -103,6 +105,9 @@ def configure_triage_config(
     `tools.judge_write` outright (see
     `tests/server/test_add_memory_write_triage_gate.py::TestTheRealJudgeIsWiredAtTheToolSeam`),
     which is both cheaper and a stronger assertion than a live call.
+
+    The attach-guard knobs (task 7158) DEFAULT None, i.e. both rules off, so an
+    importing suite stays on pre-guard routing unless it opts in.
     """
     mock_service.config = types.SimpleNamespace(
         write_triage=types.SimpleNamespace(
@@ -111,6 +116,8 @@ def configure_triage_config(
             t_high=t_high,
             t_low=t_low,
             judge_enabled=judge_enabled,
+            min_parent_cosine=min_parent_cosine,
+            hoist_max_cosine_gap=hoist_max_cosine_gap,
         ),
         reconciliation=_reject_guard_section(
             near_dup_guard_enabled, near_dup_threshold, topic_clusters

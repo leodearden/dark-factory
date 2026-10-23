@@ -82,6 +82,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, Protocol
 
+from shared.project_layout import runs_db
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.task_metadata import DoneProvenance, parse_metadata
 from shared.task_statuses import TERMINAL, owner_liveness
@@ -367,12 +368,8 @@ class DebtRow:
 
 
 def ledger_db_path(project_root: Path) -> Path:
-    """The project's ``runs.db``.
-
-    One spelling of a literal that is hand-built at 5+ sites today (harness.py:2119 and
-    friends) with no shared helper, so the ledger's consumers do not each re-derive it.
-    """
-    return project_root / 'data' / 'orchestrator' / 'runs.db'
+    """The flake ledger lives in the project's ``runs.db``."""
+    return runs_db(project_root)
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
@@ -1926,7 +1923,7 @@ def _report_regression(row: DebtRow, hook: Callable[[DebtRow], None] | None) -> 
 # How long, in seconds, the owner read that closes a cycle may take.  A healthy
 # `get_task` answers in well under a second, but `mcp_call` retries through a
 # fused-memory restart for ~120s
-# (`orchestrator/src/orchestrator/mcp_lifecycle.py::McpSession._retry_backoffs`).
+# (the `retry_backoffs` `orchestrator/src/orchestrator/mcp_lifecycle.py::fm_session` injects).
 _RESOLVE_BUDGET_SECS = 10.0
 
 

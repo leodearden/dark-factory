@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.offline_lane_confirm import Confirmed, Outage, Unconfirmable, reproduce_line
 from orchestrator.offline_lane_filing import EvidenceNote
-from orchestrator.offline_lane_records import Leg, ProbeKind, ProbeResult, RunRecord
+from orchestrator.offline_lane_records import Leg, PassRecord, ProbeKind, ProbeResult, RunRecord
 from orchestrator.offline_lane_runs import (
     INFRA_SCOPE,
     RUN_ALL_INFRA_SCRIPT,
@@ -479,6 +479,10 @@ class _Shows(StrEnum):
     NOTHING = 'nothing'
 
 
+def _detect_green(detect: RunRecord | None) -> bool:
+    return detect is not None and detect.returncode == 0
+
+
 def _passed(detect: RunRecord | None, node: str) -> bool:
     if detect is None:
         return False
@@ -730,7 +734,6 @@ class _PassApplier:
 
     def command_fields(self, episodes: Mapping[str, Episode]) -> CommandRecord:
         obs = self.obs
-        detect_green = obs.detect is not None and obs.detect.returncode == 0
         return replace(
             self.record,
             leg=obs.leg,
@@ -739,7 +742,7 @@ class _PassApplier:
             last_pass_started_at=obs.started_at,
             last_pass_head=obs.head,
             last_pass_id=obs.pass_id,
-            last_green_head=obs.head if detect_green else self.record.last_green_head,
+            last_green_head=obs.head if _detect_green(obs.detect) else self.record.last_green_head,
             fix_task_priority=obs.fix_task_priority,
         )
 
@@ -811,6 +814,15 @@ def apply_outage(record: CommandRecord, observation: PassObservation) -> Command
         for node, episode in record.episodes.items()
     }
     return replace(record, leg=observation.leg, episodes=episodes, fix_task_priority=observation.fix_task_priority)
+
+
+def with_recorded_history(record: CommandRecord, recorded: Sequence[PassRecord]) -> CommandRecord:
+    """R14: a record that has observed no pass takes its last pass id and last green head
+    from *recorded*, the command's run records before the pass, oldest first."""
+    if record.last_pass_id is not None or not recorded:
+        return record
+    green_head = next((earlier.head for earlier in reversed(recorded) if _detect_green(earlier.detect)), None)
+    return replace(record, last_pass_id=recorded[-1].pass_id, last_green_head=green_head)
 
 
 def with_probe(record: CommandRecord, probe: ProbeResult, at: datetime) -> CommandRecord:

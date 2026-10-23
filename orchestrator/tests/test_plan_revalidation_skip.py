@@ -27,7 +27,7 @@ from shared.task_text_fingerprint import TaskTextDrift, task_text_fingerprint
 from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.scheduler import BlastRadiusResult
+from orchestrator.scheduler import BlastRadiusResult, files_to_modules
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 
@@ -491,6 +491,59 @@ async def test_optimistic_stamp_preserves_narrowed_files(tmp_path: Path):
     # missing stamp.
     assert backend.blob['optimistic_path'] == 'revalidation_skip'
     assert f.wf.task['metadata']['optimistic_path'] == 'revalidation_skip'
+
+
+def _wiped_unchanged_lock_fixture(
+    tmp_path: Path, *, changed_files: list[str] | None = None,
+) -> tuple[_Fixture, FakeMetadataBackend]:
+    """Task 3113: a wiped ``metadata.files`` whose plan modules equal the held lock set."""
+    plan_files = ['mod_a/file.py']
+    held = files_to_modules(plan_files, 2)
+    backend = FakeMetadataBackend()
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_files=plan_files, modules=held,
+        task_metadata={'files': []}, metadata_backend=backend,
+        changed_files=changed_files,
+    )
+    assert set(f.wf.modules) == set(
+        files_to_modules(plan_files, f.wf.config.lock_depth),
+    )
+    return f, backend
+
+
+@pytest.mark.asyncio
+async def test_revalidation_skip_heals_wiped_metadata_files(tmp_path: Path):
+    """The skip path re-establishes plan.files with the lock set unchanged, so
+    the choke point's heal must restore the wiped record from plan.files."""
+    f, backend = _wiped_unchanged_lock_fixture(tmp_path)
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+    f.handle_blast_radius_expansion.assert_not_awaited()
+    assert backend.blob['files'] == ['mod_a/file.py']
+    assert backend.blob['optimistic_path'] == 'revalidation_skip'
+
+
+@pytest.mark.asyncio
+async def test_architect_plan_boundary_heals_wiped_metadata_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The architect ``_plan()`` boundary heals the same shape, keeping the
+    sibling ``plan_text_fp`` key task 4031's mirror wrote just before."""
+    f, backend = _wiped_unchanged_lock_fixture(
+        tmp_path, changed_files=['mod_a/file.py'],
+    )
+    _confirm_plan_architect(f, monkeypatch)
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert backend.blob['files'] == ['mod_a/file.py']
+    assert backend.blob['plan_text_fp'] == task_text_fingerprint('d', None)
+    f.handle_blast_radius_expansion.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

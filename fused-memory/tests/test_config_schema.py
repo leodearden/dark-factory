@@ -745,6 +745,44 @@ class TestReconciliationConfigJudgeInfraMaxConsecutiveFailures:
             ReconciliationConfig(judge_infra_max_consecutive_failures=-1)
 
 
+class TestReconTranscriptArchiveConfig:
+    """The recon transcript-archive leaves (task 3972)."""
+
+    FM_CONFIG_YAML = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+    LEGIBILITY_YAML = (
+        Path(__file__).resolve().parents[2] / 'docs' / 'legibility' / 'legibility.yaml'
+    )
+
+    def test_defaults(self):
+        cfg = ReconciliationConfig()
+        assert cfg.transcript_archive_enabled is True
+        assert cfg.transcript_archive_root == 'data/orchestrator/agent-transcripts'
+
+    def test_default_root_matches_the_shipped_legibility_archive_roots(self):
+        """Recon archives must land where the legibility miner walks; if the
+        two drift, they are written and never mined."""
+        assert self.LEGIBILITY_YAML.is_file(), f'expected {self.LEGIBILITY_YAML}'
+        legibility = yaml.safe_load(self.LEGIBILITY_YAML.read_text())
+
+        assert (
+            ReconciliationConfig().transcript_archive_root
+            in legibility['agent_transcript_roots']
+        )
+
+    def test_shipped_config_yaml_loads_the_leaves(self, monkeypatch):
+        assert self.FM_CONFIG_YAML.is_file(), f'expected {self.FM_CONFIG_YAML}'
+        shipped = yaml.safe_load(self.FM_CONFIG_YAML.read_text())['reconciliation']
+        assert 'transcript_archive_enabled' in shipped
+        assert 'transcript_archive_root' in shipped
+
+        monkeypatch.setenv('CONFIG_PATH', str(self.FM_CONFIG_YAML))
+        cfg = FusedMemoryConfig().reconciliation
+
+        assert isinstance(cfg.transcript_archive_enabled, bool)
+        assert isinstance(cfg.transcript_archive_root, str)
+        assert cfg.transcript_archive_root
+
+
 class TestReconciliationAutoUnhaltAfterCooldown:
     """Tests for auto_unhalt_after_cooldown (task 2920 deliverable c).
 
@@ -1377,8 +1415,10 @@ class TestReconciliationDeterministicProvenancePrefixes:
 
     def test_default_is_orchestrator_only(self):
         """The orchestrator sends no agent_id, so tools.py::_resolve_identity
-        falls back to the clientInfo.name that mcp_lifecycle.py::
-        McpSession.initialize advertises — the literal 'orchestrator'."""
+        falls back to the clientInfo.name the orchestrator advertises
+        (orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY,
+        sent by shared/src/shared/mcp_session.py::McpSession.initialize) — the
+        literal 'orchestrator'."""
         assert ReconciliationConfig().deterministic_provenance_allowed_agent_prefixes == [
             'orchestrator',
         ]
@@ -1808,6 +1848,58 @@ class TestCuratorZotDuplicateSweepConfig:
     def test_search_limit_must_be_positive(self):
         with pytest.raises(ValidationError):
             CuratorConfig(zot_duplicate_search_limit=0)
+
+
+class TestCurationDeferralConfig:
+    """Task 4503: the knobs behind parking a submission the curator could not judge."""
+
+    def test_defaults(self):
+        from fused_memory.config.schema import TicketJanitorConfig
+
+        cfg = CuratorConfig()
+        assert cfg.deferral_backoff_base_seconds == 60.0
+        assert cfg.deferral_backoff_max_seconds == 1800.0
+        assert TicketJanitorConfig().curation_backlog_escalation_min_attempts == 2
+
+    @pytest.mark.parametrize(
+        'field',
+        ['deferral_backoff_base_seconds', 'deferral_backoff_max_seconds'],
+    )
+    @pytest.mark.parametrize('value', [0.0, -1.0])
+    def test_seconds_must_be_positive(self, field, value):
+        with pytest.raises(ValidationError):
+            CuratorConfig(**{field: value})
+
+    def test_backlog_escalation_needs_at_least_one_attempt(self):
+        from fused_memory.config.schema import TicketJanitorConfig
+
+        with pytest.raises(ValidationError):
+            TicketJanitorConfig(curation_backlog_escalation_min_attempts=0)
+        assert TicketJanitorConfig(
+            curation_backlog_escalation_min_attempts=1,
+        ).curation_backlog_escalation_min_attempts == 1
+
+    def test_backoff_max_below_base_is_rejected_naming_both(self):
+        with pytest.raises(ValidationError) as excinfo:
+            CuratorConfig(deferral_backoff_base_seconds=120.0, deferral_backoff_max_seconds=90.0)
+        message = str(excinfo.value)
+        assert '120' in message
+        assert '90' in message
+
+    def test_backoff_max_equal_to_base_is_accepted(self):
+        cfg = CuratorConfig(deferral_backoff_base_seconds=90.0, deferral_backoff_max_seconds=90.0)
+        assert cfg.deferral_backoff_max_seconds == 90.0
+
+    def test_there_is_no_terminal_deferral_bound(self):
+        assert 'deferral_max_seconds' not in CuratorConfig.model_fields
+
+    def test_none_is_hot_reloadable(self):
+        from fused_memory.config.reload import RELOADABLE_FIELDS
+
+        assert not {
+            leaf for leaf in RELOADABLE_FIELDS
+            if 'deferral' in leaf or 'curation_backlog' in leaf
+        }
 
 
 class TestQueueConfigTransientErrorFields:

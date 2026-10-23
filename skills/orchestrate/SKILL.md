@@ -171,6 +171,11 @@ elif resolve["status"] == "refused":
     # is no task_id. Intended outcome — record resolve["reason"] and move on.
     # Do NOT retry and do NOT record a task id.
     note_refused(resolve["reason"])
+elif resolve["status"] == "awaiting_curation":
+    # The curator's pool could not serve: the ticket is durably parked and
+    # retried automatically. No task_id yet. Do NOT re-submit; see
+    # skills/_shared/ticket-failure-handling.md.
+    note_parked(ticket)
 elif resolve["status"] == "failed":
     # On `failed`: surface the reason to the user and skip this task (user can
     # resubmit manually after investigating).
@@ -538,7 +543,7 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
 
    **Otherwise** — when the work was already on main and you are deriving rather than recording a merge you performed — derive the sha with the task-scoped ladder, never from main's current HEAD and never from an eyeballed listing: [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder), the single normative copy (exact-subject marker search, ref-existence gate, containment, the group-merge candidate, the phantom-branch citation gate, and the `DoneProvenance` contract). Run it in full. Two adaptations for this call site: run every command in `$TARGET_PROJECT`, not dark-factory, and the shared doc writes the task id as `<TASK_ID>` where this workflow writes `<task-id>` — same value.
 
-   On the ladder's genuine not-landed outcomes — rc=0's **phantom-branch** exit, and, both **outside** the `coalesce-*` arm, rc=1 and rc=128 with an empty marker search — stamp nothing and report, rather than substituting a convenient sha. A citation gate that is **un-evaluable** (`git.commit_citation_pattern: ""`) proves neither verdict: stamp nothing there either, and report it as un-evaluable rather than as not-landed.
+   On the ladder's genuine not-landed outcomes — rc=0's **phantom-branch** exit, rc=1 **outside** both the `coalesce-*` and [rebased-solo-landing](../_shared/deriving-landed-sha.md#rebased-solo-landing) arms, and rc=128 with an empty marker search **outside** the `coalesce-*` arm — stamp nothing and report, rather than substituting a convenient sha. A citation gate that is **un-evaluable** (`git.commit_citation_pattern: ""`) proves neither verdict, and nor does the ladder's [landing-unattributable](../_shared/deriving-landed-sha.md#landing-unattributable) verdict: stamp nothing on either, and report each as such rather than as not-landed.
 
    A note-only `{"note": "<one-sentence explanation>"}` payload is **no longer accepted** — the post-3092 hardening requires a commit on every kind. For a fast-forward merge, or when the work was covered by a sibling task, still cite a commit: `{"kind": "found_on_main", "commit": "<the commit on main that cites this task>", "note": "<one-sentence explanation>"}`, derived task-scoped as above.
 7. **Clean up worktree** (from inside `$TARGET_PROJECT`):

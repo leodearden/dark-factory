@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from typing import get_args
 
 import pytest
@@ -37,6 +38,7 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
     register_metadata_submodel,
+    script_root_kind_conflict,
     validate_model_overrides,
 )
 
@@ -169,6 +171,51 @@ class TestBeforeDone:
         with pytest.raises(ValidationError):
             BeforeDone(script='scripts/x.sh', timeout_secs=60, kind='bogus')  # type: ignore[arg-type]
 
+    def test_script_root_defaults_to_project(self):
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60)
+        assert bd.script_root == 'project'
+
+    def test_factory_script_root_accepted_on_predicate(self):
+        bd = BeforeDone(
+            script='scripts/x.sh', timeout_secs=60, kind='predicate', script_root='factory',
+        )
+        assert bd.script_root == 'factory'
+
+    @pytest.mark.parametrize('kind_fields', [{'kind': 'deploy'}, {}], ids=['explicit', 'default'])
+    def test_factory_script_root_rejected_on_deploy(self, kind_fields):
+        with pytest.raises(ValidationError) as excinfo:
+            BeforeDone(script='scripts/x.sh', timeout_secs=60, script_root='factory', **kind_fields)
+        assert 'script_root' in str(excinfo.value)
+        assert 'predicate' in str(excinfo.value)
+
+    @pytest.mark.parametrize('kind', ['deploy', 'predicate'])
+    def test_project_script_root_accepted_on_both_kinds(self, kind):
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60, kind=kind, script_root='project')
+        assert bd.script_root == 'project'
+
+    def test_script_root_bogus_rejected(self):
+        with pytest.raises(ValidationError):
+            BeforeDone.model_validate(
+                {'script': 'scripts/x.sh', 'timeout_secs': 60, 'script_root': 'elsewhere'},
+            )
+
+    @pytest.mark.parametrize(
+        ('script_root', 'kind', 'refused'),
+        [
+            ('project', 'deploy', False),
+            ('project', 'predicate', False),
+            ('factory', 'predicate', False),
+            ('factory', 'deploy', True),
+        ],
+    )
+    def test_script_root_kind_conflict_matches_the_model(self, script_root, kind, refused):
+        conflict = script_root_kind_conflict(script_root, kind)
+
+        assert (conflict is not None) == refused
+        if conflict is not None:
+            with pytest.raises(ValidationError, match=re.escape(conflict)):
+                BeforeDone(script='scripts/x.sh', timeout_secs=60, kind=kind, script_root=script_root)
+
 
 class TestDoneProvenance:
     def test_merged_with_commit_constructs(self):
@@ -200,11 +247,17 @@ class TestDoneProvenance:
             DoneProvenance(kind='bogus')  # type: ignore[arg-type]
 
     def test_extra_subfields_retained_through_round_trip(self):
+        dp = DoneProvenance.model_validate(
+            {'kind': 'deterministic-deploy-scheduled', 'x_restart_reason': 'self-restart'}
+        )
+        assert dp.model_dump()['x_restart_reason'] == 'self-restart'
+
+    def test_scheduled_deploy_evidence_round_trips(self):
         dp = DoneProvenance(
             kind='deterministic-deploy-scheduled',
             unit='fused-memory.service',
-            transient_unit='fused-memory-restart-1234.service',  # type: ignore[call-arg]
-            fire_delay_secs=5,  # type: ignore[call-arg]
+            transient_unit='fused-memory-restart-1234.service',
+            fire_delay_secs=5,
         )
         dumped = dp.model_dump()
         assert dumped['transient_unit'] == 'fused-memory-restart-1234.service'
@@ -2029,6 +2082,27 @@ class TestParseMetadataFailurePolicy:
             w for w in warnings if w.code == 'unknown_key' and w.field == 'files_tagged_at'
         ]
         assert offending == [], f'Expected no unknown_key warning for files_tagged_at; got: {offending}'
+
+    def test_dedupe_skipped_metadata_key_is_blessed(self):
+        """The task curator's no-dedupe-verdict marker must not census-warn (task 4503).
+
+        Stamped on every create the curator's dedupe pass did not judge, and
+        the key a re-dedupe sweep selects on. The unblessed control key shows
+        the scan is live for this blob.
+        """
+        _, warnings = parse_metadata(
+            {
+                'dedupe_skipped': {
+                    'reason': 'create: curator-failed: llm unavailable',
+                    'at': '2026-10-18T12:00:00+00:00',
+                },
+                'dedupe_skipped_control': 'v',
+            },
+            direction='read',
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'dedupe_skipped' not in unknown_key_fields
+        assert 'dedupe_skipped_control' in unknown_key_fields
 
     def test_recurrence_metadata_key_is_blessed(self):
         """The recurring-chain link spec is deliberately blessed AND registered (task 4676).

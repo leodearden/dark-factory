@@ -4788,9 +4788,13 @@ class TestGetMergeQueue:
         async def fake_cleanup_merge_worktree(path):
             pass
 
+        async def not_on_main(ancestor, descendant):
+            return False
+
         git_ops_stub = types.SimpleNamespace(
             advance_main=fake_advance_main,
             cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            is_ancestor_checked=not_on_main,
             config=config,
         )
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
@@ -4950,10 +4954,10 @@ class TestGetMergeQueue:
         assert isinstance(entry['age_secs'], (int, float))
         assert entry['age_secs'] >= 0
 
-    # ── step-7: waiter_alive reflects cancelled future ────────────────────
+    # ── step-7: a cancelled queued request is not listed (task 3860) ──────
 
-    async def test_waiter_alive_reflects_cancelled_future(self, tmp_path: Path):
-        """waiter_alive=True for a live future, False for a cancelled future."""
+    async def test_cancelled_queued_request_is_not_listed(self, tmp_path: Path):
+        """A cancelled request still in the queue is gone from the snapshot."""
         import asyncio
         import types
 
@@ -4994,14 +4998,12 @@ class TestGetMergeQueue:
         live_entry = next((e for e in entries if e['task_id'] == 'LIVE'), None)
         dead_entry = next((e for e in entries if e['task_id'] == 'DEAD'), None)
 
+        assert dead_entry is None, f'a cancelled queued request is listed: {dead_entry}'
         assert live_entry is not None, 'LIVE entry missing from snapshot'
-        assert dead_entry is not None, 'DEAD entry missing from snapshot'
         assert live_entry['waiter_alive'] is True, (
             f'Expected waiter_alive=True for live future, got: {live_entry}'
         )
-        assert dead_entry['waiter_alive'] is False, (
-            f'Expected waiter_alive=False for cancelled future, got: {dead_entry}'
-        )
+        assert result['depth'] == 1, f'depth counts the cancelled request: {result}'
 
     # ── step-9: verifier/queue-level state mapping ────────────────────────
 
@@ -5188,9 +5190,13 @@ class TestGetMergeQueue:
         async def fake_cleanup_merge_worktree(path):
             pass
 
+        async def not_on_main(ancestor, descendant):
+            return False
+
         git_ops_stub = types.SimpleNamespace(
             advance_main=fake_advance_main,
             cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            is_ancestor_checked=not_on_main,
             config=config,
         )
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
@@ -5332,11 +5338,15 @@ class TestGetMergeQueue:
         async def fake_cleanup_merge_worktree(path):
             pass
 
+        async def not_on_main(ancestor, descendant):
+            return False
+
         # Deliberately NO _last_advanced_sha/_rebased_from/_rebased_onto —
         # the SHAs must ride the AdvanceOutcome return value alone (task 1997).
         git_ops_stub = types.SimpleNamespace(
             advance_main=fake_advance_main,
             cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            is_ancestor_checked=not_on_main,
             config=config,
         )
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]

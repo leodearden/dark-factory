@@ -4142,13 +4142,25 @@ def _one_account_gate():
     )
 
 
+def _real_cap_retry_with_no_cap_patience():
+    """The REAL ``invoke_with_cap_retry``, its public cap-wait bound set to zero.
+
+    The first cap hit exhausts the pool, so the gate, the retry loop and the
+    exhaustion path all run for real, in milliseconds rather than the
+    inherited bound.
+    """
+    from shared.cli_invoke import invoke_with_cap_retry
+
+    return functools.partial(invoke_with_cap_retry, cap_wait_sanity_secs=0.0)
+
+
 # ---------------------------------------------------------------------------
-# BOUNDED patience and a LOUD, correctly-labelled exhaustion (eval-revival φ)
+# Shared patience and a LOUD, correctly-labelled exhaustion (eval-revival φ)
 #
 # Failover is only half the contract. The other half is what happens when it
-# runs out: the campaign must never hang on the shared 14-day default, and the
-# resulting failure must land in the EXISTING cap_tainted backstop stamped as a
-# transport refusal — not as a harness crash of our own.
+# runs out: the cell inherits the shared default cap-wait patience, and when
+# that patience is exhausted the failure must land in the EXISTING cap_tainted
+# backstop stamped as a transport refusal — not as a harness crash of our own.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -4172,8 +4184,9 @@ class TestArchitectEvalCapPatience:
             cap_wait_secs=0.0,
         )
 
-        # It RETURNED. That is the requirement being pinned: a fully-capped
-        # pool must FAIL, not hang a campaign waiting for a reset 14 days out.
+        # It RETURNED. That is the requirement being pinned: when the real
+        # wrapper gives up, the cell lands in the cap_tainted backstop rather
+        # than propagating the exhaustion out of the campaign.
         assert result.outcome == 'blocked'
 
         # …into the pre-existing backstop, unchanged: no scorable plan landed,
@@ -4809,7 +4822,7 @@ class TestArchitectEvalSpendSurvivesFailover:
         makes an EXCLUDED cell's spend honest too, which matters because
         exclusions are still charged to the campaign's budget.
         """
-        result, _mocks = await _run_architect_eval_hermetic(
+        result, mocks = await _run_architect_eval_hermetic(
             self._cfg(),
             produced_plan={},
             usage_gate=_one_account_gate(),
@@ -4817,6 +4830,7 @@ class TestArchitectEvalSpendSurvivesFailover:
             cap_wait_secs=0.0,
         )
 
+        assert mocks['invoke'].await_count == 1
         assert result.outcome == 'blocked'
         assert result.metrics['cap_tainted'] is True
         assert result.metrics['cost_usd'] == pytest.approx(0.9)

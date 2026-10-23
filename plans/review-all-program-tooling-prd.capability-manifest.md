@@ -1,9 +1,9 @@
 # Capability manifest — review-all program tooling
 
 **PRD:** `plans/review-all-program-tooling-prd.md`. **Machine twin:** `plans/review-all-program-tooling-prd.capability-manifest.yaml` (the bindings below and the sidecar's `delivered_check`s are the same data; `task_id`s are stamped by `commit_planning` at decompose).
-**Substrate verified** on main `3ed84d5c5a` (2026-10-19), author mode; re-checked at the D8 critic fold against `93f478fa3b` the same day (no cited file changed). Every cite resolves by symbol; evidence pointers are backticked `grep:<repo-root-relative path>[::<symbol>]` spans (task 6423's grammar).
+**Substrate verified** on main `3ed84d5c5a` (2026-10-19), author mode; re-checked at the D8 critic fold against `93f478fa3b` the same day (no cited file changed); the A7/B6–B16 wave's phrases measured absent on main `88f6fa8b01` after the landing commit. Every cite resolves by symbol; evidence pointers are backticked `grep:<repo-root-relative path>[::<symbol>]` spans (task 6423's grammar).
 
-**Polarity.** Every `grep`/`path` check below was evaluated with `shared.delivered_check_polarity.evaluate_grep_at_tree` / `evaluate_path_at_tree` at the worktree `HEAD` (= main `3ed84d5c5a`) and read FAIL; `lint_delivered_checks` (named dict checks, `files=None`) reports exactly three findings: `warn absent_overbroad` on σ1's `vocabulary-copy-removed-from-ownership`, which clears when σ1's `metadata.files` names `scripts/sitting/ownership.py` (contract 7; verified), and `reject vacuous_absent` on κ's two `expect: absent` checks, whose phrases live in the sibling seat's **uncommitted** working-tree `deliberation.md` and `SKILL.md` (the lead's post-D10 wording): they read PASS (vacuous) against `HEAD` and `main` today and FAIL once the wave commits, which precedes decompose; the polarity gate reads `main` of `project_root` (`GATE_REF`), so re-measure at decompose after that commit. The `script` checks fail by construction (`scripts/check_review_all_program_fixture.py` does not exist; `check_method_param_wiring.py` finds no `include_rows`). Rules applied after D8 M2: no multi-path `grep` (git grep over several paths passes on any one of them — every required path has its own check; `path` checks are conjunctive and may list several); a pipe inside a pattern is the literal `\|`, and the vocabulary line is pinned in one stated order; a widened parameter is proved with `scripts/check_method_param_wiring.py --forwards-to`, not a grep. Patterns are single-line (`deliberation.md` §Launching step 4(b)) and anchored on a symbol where one exists; no `file:line`.
+**Polarity, re-measured after the A7/B6–B16 amendment on main `88f6fa8b01`:** 86 checks (67 grep, 14 path, 2 script, 3 manual); every grep/path check FAILs at that tree — κ's two `expect: absent` phrases are non-vacuous now that `7a043cf4bc` landed them — ρ's script checks exit 1, and `lint_delivered_checks` (named dict checks, `files=None`) reports only `warn absent_overbroad` on the four `expect: absent` checks (σ1, κ ×2, κ2), each clearing when its leaf's `metadata.files` names the one file it edits (contract 7). The earlier measurement, kept for provenance: every `grep`/`path` check below was evaluated with `shared.delivered_check_polarity.evaluate_grep_at_tree` / `evaluate_path_at_tree` at the worktree `HEAD` (= main `3ed84d5c5a`) and read FAIL; `lint_delivered_checks` (named dict checks, `files=None`) reports exactly three findings: `warn absent_overbroad` on σ1's `vocabulary-copy-removed-from-ownership`, which clears when σ1's `metadata.files` names `scripts/sitting/ownership.py` (contract 7; verified), and `reject vacuous_absent` on κ's two `expect: absent` checks, whose phrases live in the sibling seat's **uncommitted** working-tree `deliberation.md` and `SKILL.md` (the lead's post-D10 wording): they read PASS (vacuous) against `HEAD` and `main` today and FAIL once the wave commits, which precedes decompose; the polarity gate reads `main` of `project_root` (`GATE_REF`), so re-measure at decompose after that commit. The `script` checks fail by construction (`scripts/check_review_all_program_fixture.py` does not exist; `check_method_param_wiring.py` finds no `include_rows`). Rules applied after D8 M2: no multi-path `grep` (git grep over several paths passes on any one of them — every required path has its own check; `path` checks are conjunctive and may list several); a pipe inside a pattern is the literal `\|`, and the vocabulary line is pinned in one stated order; a widened parameter is proved with `scripts/check_method_param_wiring.py --forwards-to`, not a grep. Patterns are single-line (`deliberation.md` §Launching step 4(b)) and anchored on a symbol where one exists; no `file:line`.
 
 ## Decompose-time contracts (not in the PRD's words; the gates depend on them)
 
@@ -37,6 +37,7 @@
 | `return-schema-constant` | built by this leaf | PASS | grep present `^RETURN_SCHEMA = 'review-all-prd-return/1'` in `state.py` |
 | `seam-key-constants` | built by this leaf | PASS | grep present `^SEAM_WAIT_KEYS` in `state.py` |
 | `ledger-ops-and-ruling-ids` | built by this leaf (decision 17) | PASS | grep present `^def next_ruling_id\(` in `state.py` |
+| `sitting-fields` | built by this leaf (A7) | PASS | grep present `lead_rulable` in `state.py` |
 | `reader-refuses-missing-echo` | built by this leaf | PASS | grep present `^class StoreReaderUnsupported\(` in `state.py` |
 
 ## ρ — find_tasks_by_metadata(include_rows=True), echoed
@@ -63,6 +64,7 @@
 | `state-library` | capability→producer (upstream) — α | PASS | — |
 | `scripts-present` | built by this leaf | PASS | path present: `apply_return.py`, `record.py` |
 | `check-mode` | built by this leaf | PASS | grep present `'--check'` in `apply_return.py` |
+| `sitting-rulings` | built by this leaf (A7 §4) | PASS | grep present `'--reask'` in `record.py` |
 | `from-store-reconstruction` | built by this leaf | PASS | grep present `'--from-store'` in `apply_return.py` |
 
 ## γ — program_doc.py
@@ -74,6 +76,7 @@
 | `run-record-method-extra` | capability→substrate (wired) — `grep:skills/review-all/references/report-format.md` §Artefact 1 `method.extra` | PASS | — |
 | `script-present` | built by this leaf | PASS | path present: `program_doc.py` |
 | `heading-self-check` | built by this leaf | PASS | grep present `--allow-drop` in `program_doc.py` |
+| `sitting-screens` | built by this leaf (A7 §3) | PASS | grep present `'--sitting'` in `program_doc.py` |
 | `publish-step` | built by this leaf | PASS | grep present `'--publish'` in `program_doc.py` |
 
 ## δ — gen_brief.py
@@ -85,6 +88,7 @@
 | `run-record-findings-and-filings` | capability→substrate (wired) — `grep:skills/review-all/references/report-format.md` §Artefact 2 | PASS | — |
 | `script-present` | built by this leaf | PASS | path present: `gen_brief.py` |
 | `spawn-command-uses-prompt-file` | built by this leaf | PASS | grep present `--prompt-file` in `gen_brief.py` |
+| `investigate-brief` | built by this leaf (A7 §5) | PASS | grep present `investigate` in `gen_brief.py` |
 | `spawn-command-opts-in-to-self-exit` | built by this leaf | PASS | grep present `CLAUDE_SPAWN_SELF_EXIT` in `gen_brief.py` |
 
 ## ε — clerk_batch.py
@@ -167,6 +171,7 @@
 |---|---|---|---|
 | `scripts-landed` | capability→producer (upstream) — α–η, ω | PASS | — |
 | `held-leaf-prose-owner` | capability→producer (upstream) — task 6959 | PASS | — |
+| `skill-text-wave-landed` | capability→producer (upstream) — κ2, λ1, λ3 (same files) | PASS | — |
 | `phrases-present-today` | capability→substrate (wired) — the two phrases in this worktree's working tree | PASS | — |
 | `by-hand-pointer-removed` | built by this leaf | PASS | grep absent `by hand until the program-tooling PRD lands` in `deliberation.md` |
 | `handoff-pointer-removed` | built by this leaf | PASS | grep absent `by hand until then` in `SKILL.md` |
@@ -175,6 +180,69 @@
 | `held-leaves-section` | built by this leaf | PASS | grep present `## Held leaves` in `report-format.md` |
 | `seam-keys-cited` | built by this leaf | PASS | grep present `SEAM_WAIT_KEYS` in `report-format.md` |
 | `cites-test` | built by this leaf | PASS | path present: `tests/scripts/test_review_all_skill_text_cites_scripts.py` |
+
+## κ2 — deliberation.md (A7, B8, B12)
+
+| capability | binding | verdict | delivered_check |
+|---|---|---|---|
+| `a7-ruling` | capability→substrate (wired) — `grep:plans/review-all-feedback-synthesis-2026-10-17/A7-synthesis.md` §4 | PASS | — |
+| `current-text` | capability→substrate (wired) — `grep:skills/review-all/references/deliberation.md` §The program doc, §Launching | PASS | — |
+| `lead-rulable-rule` | built by this leaf | PASS | grep present `lead_rulable` in `deliberation.md` |
+| `author-pass-sitting` | built by this leaf | PASS | grep present `author-pass sitting` in `deliberation.md` |
+| `spawn-mode-retired` | built by this leaf | PASS | grep absent `design-heavy stream becomes` in `deliberation.md` |
+| `edge-not-cancel` | built by this leaf (B8) | PASS | grep present `live heartbeat` in `deliberation.md` |
+| `fold-then-cancel` | built by this leaf (B12) | PASS | grep present `folded into stream leaves` in `deliberation.md` |
+| `one-sidecar-per-call` | built by this leaf (B12) | PASS | grep present `stamps one sidecar per call` in `deliberation.md` |
+
+## λ1 — SKILL.md (B6, B7, B8, B9, B11, B13)
+
+| capability | binding | verdict | delivered_check |
+|---|---|---|---|
+| `current-text` | capability→substrate (wired) — `grep:skills/review-all/SKILL.md` Phase 0 steps 1–2, §Cost gate, Phase 5 filing | PASS | — |
+| `pinned-tree-home` | built by this leaf (B6) | PASS | grep present `review-all/<run_id>/tree` in `SKILL.md` |
+| `area-rules-recorded` | built by this leaf (B7) | PASS | grep present `area_rules` in `SKILL.md` |
+| `reconcile-before-resubmit` | built by this leaf (B8) | PASS | grep present `reconcile-before-resubmit` in `SKILL.md` |
+| `skill-sha-frozen` | built by this leaf (B9) | PASS | grep present `extra.skill_sha` in `SKILL.md` |
+| `live-defects-filed` | built by this leaf (B11) | PASS | grep present `live correctness defect` in `SKILL.md` |
+| `token-rule-stated` | built by this leaf (B13) | PASS | grep present `extra.token_rule` in `SKILL.md` |
+
+## λ3 — report-format.md (B7, B8, B9, B10, B13, B15)
+
+| capability | binding | verdict | delivered_check |
+|---|---|---|---|
+| `current-text` | capability→substrate (wired) — `grep:skills/review-all/references/report-format.md` §Method, §Mechanical filings, §Dropped and degraded, §Artefact 3 | PASS | — |
+| `area-rules-field` | built by this leaf (B7) | PASS | grep present `area_rules:` in `report-format.md` |
+| `combined-disposition` | built by this leaf (B8) | PASS | grep present `combined:<id>` in `report-format.md` |
+| `skill-sha-field` | built by this leaf (B9) | PASS | grep present `skill_sha:` in `report-format.md` |
+| `operational-events` | built by this leaf (B10) | PASS | grep present `usage-cap stops` in `report-format.md` |
+| `token-rule-field` | built by this leaf (B13) | PASS | grep present `token_rule:` in `report-format.md` |
+| `measured-at-label` | built by this leaf (B15) | PASS | grep present `measured at <as_of>` in `report-format.md` |
+
+## λ4 — orchestration.md (B6, B14)
+
+| capability | binding | verdict | delivered_check |
+|---|---|---|---|
+| `current-text` | capability→substrate (wired) — `grep:skills/review-all/references/orchestration.md` areaPrompt, synthesisPrompt JOBS 4–5, the critic revision | PASS | — |
+| `tree-fallback` | built by this leaf (B6) | PASS | grep present `git archive` in `orchestration.md` |
+| `exoneration-check` | built by this leaf (B14) | PASS | grep present `test-share ratio` in `orchestration.md` |
+| `wrong-version-rule` | built by this leaf (B14) | PASS | grep present `is the wrong version caught` in `orchestration.md` |
+| `critic-recheck` | built by this leaf (B14) | PASS | grep present `cheap re-check` in `orchestration.md` |
+| `js-block-parses` | built by this leaf | PASS | manual — `node --check` on the extracted block is the leaf's own test |
+
+## λ5 — project-overlay.md (B16)
+
+| capability | binding | verdict | delivered_check |
+|---|---|---|---|
+| `current-text` | capability→substrate (wired) — `grep:skills/review-all/references/project-overlay.md` Metrics instruments slot | PASS | — |
+| `unranked-area` | built by this leaf (B16) | PASS | grep present `unranked` in `project-overlay.md` |
+
+## μ — filing client per-call timeout (B8)
+
+| capability | binding | verdict | delivered_check |
+|---|---|---|---|
+| `client-today` | capability→substrate (wired) — `grep:scripts/migrate_metadata_modules_to_files.py::FusedMemoryClient`; `grep:scripts/tests/conftest.py` `install_fake_httpx` | PASS | — |
+| `per-call-timeout` | built by this leaf | PASS | grep present `timeout: float` in `scripts/migrate_metadata_modules_to_files.py` |
+| `timeout-test` | built by this leaf | PASS | path present: `scripts/tests/test_migrate_metadata_client_timeout.py` |
 
 ## ω — integration gate
 

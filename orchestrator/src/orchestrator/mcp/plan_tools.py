@@ -98,6 +98,7 @@ from shared.mcp_markup_middleware import (
     RepairPolicy,
     accepts_markup_override,
 )
+from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
 from shared.toolcall_markup import detect_for, repair
 
@@ -1958,9 +1959,6 @@ def _mark_step_committed(
 # the functions), so a test that substitutes either one still steers the sink
 # a `create_server` already built.
 
-#: Where the queue lives under project_root — see ``markup_sink``.
-_MARKUP_QUEUE_DIRNAME = markup_sink.MARKUP_QUEUE_DIRNAME
-
 #: Filed-by attribution. Names the GUARD, not the leaking agent.
 _MARKUP_AGENT_ROLE = 'plan-tools-markup-guard'
 
@@ -2283,6 +2281,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             fact_sink=_markup_fact_sink(artifacts),
         )
     )
+    mcp.add_middleware(MissingArgumentMiddleware())
 
     @mcp.tool()
     @accepts_markup_override

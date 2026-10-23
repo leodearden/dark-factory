@@ -377,7 +377,9 @@ class TestHarnessMergeLivenessGuard:
         = 600 < 8100 → safe).  Guards against a future refactor accidentally
         re-coupling K to the liveness check.
         """
-        r1 = VerifyRunnerConfig(name='r1', ssh_host='h1.local', git_remote='remote1')
+        r1 = VerifyRunnerConfig(
+            name='r1', ssh_host='h1.local', git_remote='remote1', df_checkout_path='/df',
+        )
         config = OrchestratorConfig(
             project_root=tmp_path,
             verify_runners=[r1],                           # → K = 1 + 1 = 2

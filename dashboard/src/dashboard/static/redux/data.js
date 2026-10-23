@@ -165,7 +165,10 @@ window.DF_DATA = {
   //   Each rows Datum's value is a list of rows shaped {id, project, title,
   //   status, agent, started, loops, attempts, lane, phase, lane_state,
   //   runtime_offline, deps, meta_files, train, external_deps, prd,
-  //   claimant_run_id, heartbeat_at, stranded}.
+  //   claimant_run_id, heartbeat_at, stranded}, plus `deferral` on a deferred
+  //   row from a backend that emits it: dashboard/src/dashboard/data/
+  //   deferral_summary.py's {label, state, age_seconds, needs_human, detail},
+  //   or null when the row carries no record.
   //   `agent` is worktree PRESENCE (it stays truthy after the agent dies);
   //   `stranded` (task 3543) is the independent liveness verdict, computed
   //   server-side from the claim columns via shared.task_claimant.is_stranded.
@@ -436,7 +439,7 @@ function pollKey(url) {
 function stateFor(state, stateKey) {
   let st = state.get(stateKey);
   if (!st) {
-    st = { inFlight: false, failures: 0, nextAllowedAt: 0, lastSuccessAt: 0 };
+    st = { inFlight: false, deferredForceUrl: null, failures: 0, nextAllowedAt: 0, lastSuccessAt: 0 };
     state.set(stateKey, st);
   }
   return st;
@@ -456,9 +459,11 @@ function backoffDelay(failures) {
 // the TIMER path's backoff — otherwise repeated chip clicks during an
 // outage would inflate failures/nextAllowedAt derived from user action
 // alone, and the dashboard could stay dark longer than the real failure
-// history warrants once the server recovers.
-function recordFailure(st, deps) {
-  if (deps.ignoreBackoff) return;
+// history warrants once the server recovers. `forced` is refreshOne's gate
+// verdict: a chip's own attempt, or the one it deferred past the in-flight
+// guard.
+function recordFailure(st, forced, deps) {
+  if (forced) return;
   st.failures += 1;
   st.nextAllowedAt = deps.now() + backoffDelay(st.failures);
 }
@@ -560,9 +565,10 @@ function staleFailureThreshold() {
 }
 
 // The abort deadline for an endpoint's next attempt, given its failure streak.
-// A forced (ignoreBackoff) chip-click attempt gets the same deadline, so clicks
-// hold a wedged endpoint's socket no longer than the timer path does; it never
-// moves the streak (recordFailure), so it can neither trigger nor skip a probe.
+// A forced attempt (a chip click, or the attempt it deferred) gets the same
+// deadline, so clicks hold a wedged endpoint's socket no longer than the timer
+// path does; it never moves the streak (recordFailure), so it can neither
+// trigger nor skip a probe.
 function attemptDeadlineMs(failures) {
   const pastThreshold = failures - staleFailureThreshold();
   if (pastThreshold < 0) return DEFAULT_TIMEOUT_MS;
@@ -660,10 +666,17 @@ function onDemandDatum(name, param, outcome) {
 // refreshDFData; when it is absent the request is one-shot and never paced.
 async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
   const st = stateFor(state, stateKey);
-  // already in flight for this endpoint — skip this tick, do not queue
-  if (st.inFlight) return REFRESH_OUTCOMES.skippedInFlight;
+  // already in flight for this endpoint — skip this tick, do not queue. A
+  // forced attempt refused here is deferred, not dropped: the endpoint's next
+  // attempt is forced instead, unless the answer in flight is for that url.
+  if (st.inFlight) {
+    if (deps.ignoreBackoff) st.deferredForceUrl = url;
+    return REFRESH_OUTCOMES.skippedInFlight;
+  }
+  const forced = Boolean(deps.ignoreBackoff || st.deferredForceUrl);
   // still backed off
-  if (deps.now() < st.nextAllowedAt && !deps.ignoreBackoff) return REFRESH_OUTCOMES.skippedBackoff;
+  if (deps.now() < st.nextAllowedAt && !forced) return REFRESH_OUTCOMES.skippedBackoff;
+  st.deferredForceUrl = null;
   st.inFlight = true;
   // Fall back inline (not via DEFAULT_POLL_DEPS) so a caller that hand-builds
   // a partial deps object — e.g. refreshOne invoked directly with just
@@ -700,7 +713,7 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
       timedOut,
     ]);
     if (!resp.ok) {
-      recordFailure(st, deps);
+      recordFailure(st, forced, deps);
       return REFRESH_OUTCOMES.failed;
     }
     const body = await resp.json();
@@ -713,7 +726,7 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
     publishReceipt(stateKey, receipt);
     return REFRESH_OUTCOMES.applied;
   } catch (err) {
-    recordFailure(st, deps);
+    recordFailure(st, forced, deps);
     // Network blip, or a timed-out/aborted request — keep the prior values
     // so the UI does not blank out.
     console.warn('DF_DATA fetch failed', url, err);
@@ -721,6 +734,7 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
   } finally {
     clearTimeoutFn(timeoutId);
     st.inFlight = false;
+    if (st.deferredForceUrl === url) st.deferredForceUrl = null;
     // In `finally` so the `!resp.ok` early return is covered too, not just
     // the success and thrown-error paths.
     publishStaleness(stateKey, st);
@@ -814,7 +828,9 @@ const DEFAULT_POLL_DEPS = {
 // clicks cannot escalate the timer path's own backoff schedule. The in-flight
 // check in refreshOne is unconditional regardless of ignoreBackoff, so a chip
 // change still cannot stack a second concurrent request for an endpoint
-// that's already running.
+// that's already running; the refused force is deferred to that endpoint's
+// next attempt instead (see refreshOne), so the hold the in-flight answer arms
+// cannot delay the chosen window past the next tick.
 //
 // While __DF_PAUSE is set a chip change fetches nothing (see refreshPollSet);
 // the window is recorded first, so the first tick after resume fetches it.

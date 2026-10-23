@@ -104,12 +104,12 @@ _NOW = 1_000_000.0
 async def _new_merge_worktree(git_ops: GitOps) -> Path:
     """Create a real ephemeral ``_merge-<uuid>`` worktree at main's tip.
 
-    ``create_throwaway_verify_worktree`` is GitOps' public wrapper over the
+    ``create_ephemeral_verify_worktree`` is GitOps' public wrapper over the
     same ``git worktree add --detach`` primitive the merge lane itself uses,
     so the reap primitive (``git worktree remove --force``) still has a
     genuine git admin entry to act on.
     """
-    return await git_ops.create_throwaway_verify_worktree(await git_ops.get_main_sha())
+    return await git_ops.create_ephemeral_verify_worktree(await git_ops.get_main_sha())
 
 
 async def _create_backdated_merge_worktree(git_ops: GitOps, *, age: float) -> Path:

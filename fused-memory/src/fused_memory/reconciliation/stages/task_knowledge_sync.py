@@ -3895,7 +3895,7 @@ class TaskKnowledgeSync(BaseStage):
                         self.filtered_task_tree.cancelled_tasks,
                     )
                 )
-            summary = await _queue_briefing_refresh_tasks(
+            summary = await queue_briefing_refresh_tasks(
                 self.taskmaster,
                 self.scope.project_root,
                 mismatches,
@@ -5285,7 +5285,7 @@ async def _run_briefing_known_gaps_script(project_root: ProjectRoot) -> list[dic
         return None
 
 
-async def _queue_briefing_refresh_tasks(
+async def queue_briefing_refresh_tasks(
     taskmaster: TaskBackendProtocol,
     project_root: ProjectRoot,
     mismatches: list[dict],
@@ -5293,6 +5293,10 @@ async def _queue_briefing_refresh_tasks(
     run_id: str = '',
 ) -> dict:
     """Create 'Refresh briefing: remove task N from known_gaps' tasks for each mismatch.
+
+    Each mismatch is a dict carrying the ``task_id`` still listed in a
+    briefing's known_gaps, its ``subproject``, its ``title``, and the gap
+    text ``what``; one refresh task is filed per mismatch.
 
     Skips creation when a task with status 'pending' and the same canonical title
     already exists (exact-title de-dup, case-sensitive string equality).

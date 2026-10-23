@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from orchestrator.session_registry import SessionRecord, Status
+from shared.task_deferral import CarriedByDeferral, UntilConditionDeferral, record_to_json
 from sitting import ownership as mod
 from sitting.inventory import OpenItem, escalation_key
 
@@ -165,21 +166,77 @@ class TestUnblockRunProbe:
         assert _probe(_sweep(_item(), sessions_root=sessions_root), 'unblock_run').status == 'empty'
 
 
-class TestCoalesceFoldProbe:
-    def test_fold_target_owns_with_its_live_status_and_title(self, sessions_root, seed_tasks):
-        rows = seed_tasks([
-            {'id': 4803, 'status': 'deferred', 'metadata': {'x_coalesced_into': 5255}},
-            {'id': 5255, 'status': 'pending', 'title': 'carrier for the fold'},
-        ])
+def _record(record) -> dict:
+    return record_to_json(record)
 
+
+STAMPS = {'deferred_at': NOW, 'stamped_at': NOW, 'stamped_by': 'claude-task-1'}
+
+
+class TestCoalesceFoldProbe:
+    def _fold(self, sessions_root, seed_tasks, subject: dict) -> mod.ProbeResult:
+        rows = seed_tasks([
+            {'id': 4803, **subject},
+            {'id': 5255, 'status': 'pending', 'title': 'carrier for the fold'},
+            {'id': 5300, 'status': 'in-progress', 'title': 'the recorded carrier'},
+        ])
         finding = _sweep(_item('esc-4803-2', '4803'), sessions_root=sessions_root, task_rows=rows)
-        result = _probe(finding, 'coalesce_fold')
+        return _probe(finding, 'coalesce_fold')
+
+    def test_fold_target_owns_with_its_live_status_and_title(self, sessions_root, seed_tasks):
+        result = self._fold(sessions_root, seed_tasks, {'status': 'deferred', 'metadata': {'x_coalesced_into': 5255}})
 
         assert result.status == 'owns'
         assert 'task 5255' in result.owner
         assert 'carrier for the fold' in result.owner
         assert result.owner_task_id == '5255'
         assert result.owner_task_status == 'pending'
+        assert result.evidence == 'task 4803 x_coalesced_into=5255 (no deferral recorded)'
+
+    def test_a_carried_by_record_owns_over_a_stale_legacy_key(self, sessions_root, seed_tasks):
+        record = _record(CarriedByDeferral(carrier_task_id=5300, **STAMPS))
+        metadata = {'deferral': record, 'x_coalesced_into': 5255}
+
+        result = self._fold(sessions_root, seed_tasks, {'status': 'deferred', 'metadata': metadata})
+
+        assert result.status == 'owns'
+        assert result.owner_task_id == '5300'
+        assert result.owner_task_status == 'in-progress'
+        assert 'the recorded carrier' in result.owner
+        assert 'deferral.carrier_task_id=5300' in result.evidence
+
+    def test_another_recorded_hold_is_not_owned_by_the_legacy_key(self, sessions_root, seed_tasks):
+        record = _record(UntilConditionDeferral(condition='upstream lands', **STAMPS))
+        metadata = {'deferral': record, 'x_coalesced_into': 5255}
+
+        result = self._fold(sessions_root, seed_tasks, {'status': 'deferred', 'metadata': metadata})
+
+        assert result.status == 'empty'
+        assert result.owner_task_id is None
+        assert 'until_condition' in result.evidence
+        assert 'x_coalesced_into' in result.evidence and 'history' in result.evidence
+
+    def test_a_malformed_record_reads_the_legacy_key(self, sessions_root, seed_tasks):
+        metadata = {'deferral': {'kind': 'carried_by'}, 'x_coalesced_into': 5255}
+
+        result = self._fold(sessions_root, seed_tasks, {'status': 'deferred', 'metadata': metadata})
+
+        assert result.status == 'owns'
+        assert result.owner_task_id == '5255'
+        assert result.evidence == 'task 4803 x_coalesced_into=5255 (deferral record unreadable)'
+
+    def test_a_row_that_is_not_deferred_reads_the_legacy_key_as_before(self, sessions_root, seed_tasks):
+        result = self._fold(sessions_root, seed_tasks, {'status': 'pending', 'metadata': {'x_coalesced_into': 5255}})
+
+        assert result.status == 'owns'
+        assert result.owner_task_id == '5255'
+        assert result.evidence == 'task 4803 x_coalesced_into=5255'
+
+    def test_a_row_with_neither_is_empty(self, sessions_root, seed_tasks):
+        result = self._fold(sessions_root, seed_tasks, {'status': 'deferred', 'metadata': {}})
+
+        assert result.status == 'empty'
+        assert result.owner_task_id is None
 
 
 class TestTaskRulingProbe:

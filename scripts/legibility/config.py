@@ -87,10 +87,30 @@ class TrickleCensusCaps(BaseModel):
     max_verify_clusters: int | None = Field(default=150, ge=1, strict=True)
 
 
+class Adjudication(BaseModel):
+    """``census.adjudication`` — the census similarity stage
+    (plans/census-incremental-prd.md D3, D4, T1): the cosine at which a novel
+    cluster or a pending candidate attaches to an entry, the cosine at which
+    pending candidates cluster into one queue item, the most queue clusters
+    one run verifies, and the embedding model. Both thresholds are
+    provisional: no signal asserts their precision, so every attach is
+    audited in the report. ``embedding_model`` has its one home here; the
+    vector cache key and the report read it from this block.
+    """
+
+    model_config = ConfigDict(extra='allow', frozen=True)
+
+    attach_min_similarity: float = Field(default=0.90, ge=0.0, le=1.0)
+    cluster_min_similarity: float = Field(default=0.85, ge=0.0, le=1.0)
+    max_clusters_per_run: int = Field(default=10, ge=0, strict=True)
+    embedding_model: str = 'text-embedding-3-small'
+
+
 class Census(BaseModel):
     """``census`` block — census-trigger (ζ), saturation tuning (PRD §5.2
-    points 6-7), the nightly trickle's census launch caps, and the length of
-    the census mining window (which is also the session ledger's retention)."""
+    points 6-7), the nightly trickle's census launch caps, the similarity
+    stage, and the length of the census mining window (which is also the
+    session ledger's retention)."""
 
     model_config = ConfigDict(extra='allow')
 
@@ -102,6 +122,7 @@ class Census(BaseModel):
     floor_days: int = 5
     saturation: Saturation = Field(default_factory=Saturation)
     trickle_caps: TrickleCensusCaps = Field(default_factory=TrickleCensusCaps)
+    adjudication: Adjudication = Field(default_factory=Adjudication)
 
 
 class Models(BaseModel):

@@ -28,6 +28,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import _init_harness_state_for_test
 from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
+from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.config import OrchestratorConfig
@@ -39,7 +41,6 @@ from orchestrator.harness import (
     _WATCHER_TIMEOUT_GRACE_SECS,
     Harness,
 )
-from orchestrator.repo_paths import DARK_FACTORY_ROOT_ENV
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
@@ -652,25 +653,14 @@ class TestRunWatcherRotation:
     ) -> None:
         """The banner's --queue-dir is the SAME path the orchestrator itself uses.
 
-        Task 3605 (review amendment).  escalation.queue_dir is an unconstrained
-        str with nothing forcing it relative, and the harness's own authoritative
-        resolution (_emit_digest) is `Path(project_root) / queue_dir`, which
-        returns an absolute RHS unchanged.  Building the banner's copy by f-string
-        concatenation instead would render '/project//abs/queue' — harmless while
-        it was only a display line, but this banner now hands the agent an
-        executable `--queue-dir` it is told to run verbatim, so a divergence arms
-        an inotify watcher on a directory that never receives escalations and
-        times out (exit 124) every slice for the whole rotation: a silent no-op,
-        precisely what watcher-rearm.sh's guards exist to prevent.
-
-        Asserted against `Path(project_root) / queue_dir` rather than a literal, so
-        this cannot pass by re-deriving the bug it is pinning.
+        Task 3605 (review amendment).  The banner hands the agent an executable
+        `--queue-dir` it is told to run verbatim, so a divergence arms an inotify
+        watcher on a directory that never receives escalations.  Both the banner
+        line and the argument must be shared.project_layout.escalation_queue_dir.
         """
         from shared.cli_invoke import AgentResult
 
         h = _make_rotation_harness(tmp_path)
-        abs_queue = tmp_path / 'elsewhere' / 'escalations'
-        h.config.escalation.queue_dir = str(abs_queue)
         df_root = tmp_path / 'df-tooling-checkout'
         captured: dict = {}
 
@@ -685,18 +675,13 @@ class TestRunWatcherRotation:
             await h._run_watcher_rotation()
 
         prompt = captured['prompt']
-        expected = str(
-            Path(h.config.project_root) / h.config.escalation.queue_dir
-        )
+        expected = str(escalation_queue_dir(h.config.project_root))
         assert f'--queue-dir {expected}' in prompt, (
             'the re-arm command must name the queue the harness itself watches; '
             f'expected --queue-dir {expected} in:\n{prompt}'
         )
         assert f'Escalation queue: {expected}' in prompt, (
             'the banner line and the re-arm argument must be the same string'
-        )
-        assert f'{h.config.project_root}{abs_queue}' not in prompt, (
-            'an absolute queue_dir must not be concatenated onto project_root'
         )
 
     @pytest.mark.asyncio
@@ -3174,6 +3159,30 @@ class TestWatcherAllowedTools:
             f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
             'silently blind the drain to archived L2s (task 3999); '
             f'current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+
+    def test_skill_tool_is_denied(self) -> None:
+        """The bare 'Skill' tool is denied, and never pre-granted.
+
+        On 2026-08-08 a resumed rotation invoked Skill{escalation-watcher}
+        and force-released the L2 watcher lease. The rotation runs under
+        bypassPermissions, where only the deny list blocks a tool, and an
+        allowlist entry is a permission pre-grant.
+        """
+        assert 'Skill' in _WATCHER_DISALLOWED_TOOLS, (
+            "'Skill' must be in _WATCHER_DISALLOWED_TOOLS: on 2026-08-08 a "
+            'resumed rotation invoked Skill{escalation-watcher} and '
+            'force-released the watcher lease, and under bypassPermissions '
+            f'only the deny list blocks; current list: {_WATCHER_DISALLOWED_TOOLS}'
+        )
+        granted = [
+            t for t in _WATCHER_ALLOWED_TOOLS
+            if t == 'Skill' or t.startswith('Skill(')
+        ]
+        assert granted == [], (
+            f'_WATCHER_ALLOWED_TOOLS pre-grants the Skill tool via {granted}; '
+            'the 2026-08-08 incident (Skill{escalation-watcher} took the '
+            'watcher lease) needs it denied, not granted'
         )
 
 

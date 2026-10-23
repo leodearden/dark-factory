@@ -82,6 +82,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # to stop. _iter_leaves yields the list WHOLE, so it reloads atomically: a
     # half-applied prefix list would admit a caller no operator ever wrote.
     'reconciliation.deterministic_provenance_allowed_agent_prefixes',
+    # Recon transcript archival (task 3972); why green: the schema descriptions.
+    'reconciliation.transcript_archive_enabled',
+    'reconciliation.transcript_archive_root',
     # Write-triage band thresholds (task 3130). Written by
     # scripts/calibrate_write_triage.py --write-config, which derives them from
     # measured similarity distributions -- so hot-reload is what lets a
@@ -127,6 +130,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Retrieval width, tuned against measured recall on a running server rather
     # than by redeploying. Read live per write, same path as the flag above.
     'write_triage.candidate_k',
+    # The attach-guard knobs (task 7158): hand-set, read live per write by
+    # server/write_triage.py's resolvers; None is each rule's hot off-switch.
+    'write_triage.min_parent_cosine',
+    'write_triage.hoist_max_cosine_gap',
     # The write-triage JUDGE knobs (task 3128, PRD leaf gamma). Green-tier
     # for exactly the reason the two operator knobs above are: every one of
     # them is read LIVE off the shared memory_service.config.write_triage

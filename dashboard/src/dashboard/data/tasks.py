@@ -827,10 +827,11 @@ async def fetch_task_prose(
 ) -> TaskProseRead:
     """Read ONE task's description/details for the Tasks tab's Task Detail pane.
 
-    The ACTIVE_TASKS rows omit both fields; the pane fetches them here for the
-    selected task only. Each outcome is its own type because the route answers
-    each with a different status: :class:`TaskProse`, :class:`TaskNotFound`
-    or :class:`TaskReadOffline`, classified by :func:`_read_task`.
+    The task rows (``TASKS_SNAPSHOT[p].rows``) omit both fields; the pane
+    fetches them here for the selected task only. Each outcome is its own type
+    because the route answers each with a different status:
+    :class:`TaskProse`, :class:`TaskNotFound` or :class:`TaskReadOffline`,
+    classified by :func:`_read_task`.
 
     *timeout* is per HTTP request; the caller bounds the whole read.
     Uncached, deliberately: a primary-key lookup fetched only on selection.

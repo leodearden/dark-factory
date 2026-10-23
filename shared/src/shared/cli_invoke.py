@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - exercised only when aiohttp absent
 if TYPE_CHECKING:
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
-    from shared.usage_gate import UsageGate
+    from shared.usage_gate import PoolFrozen, UsageGate
     from shared.vllm_bridge import VllmBridge
 else:
     # Re-expose the runtime binding under the public name so callers (and test
@@ -124,13 +124,36 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         stall.
 #
 # orchestrator/harness.py                 14-day default OK for both sites.
-#   (module tagging + watcher rotation)   AllAccountsCappedException handlers
-#                                         log and return / supervisor-driven
-#                                         restart; neither blocks a queue.
+#   (module tagging + watcher rotation)   Module tagging: the handler logs and
+#                                         returns.  Watcher rotation: also
+#                                         max_cap_retries=16, and a cap hit
+#                                         retries FRESH (resume_on_cap_hit=
+#                                         False); AllAccountsCappedException
+#                                         takes the supervisor's unclean path.
+#                                         Neither blocks a queue.
 #
-# fused_memory/middleware/task_curator.py _CURATOR_CAP_WAIT_SANITY_SECS=120s.
-#   (LLM triage calls)                    Best-effort middleware, fast-fail/
-#                                         defer contract; 120 s is intentional.
+# orchestrator/evals/architect_eval.py    14-day default OK (esc-4002-1, task
+#   (invoke_architect invocation)         7320).  A cap lands MID-cell after
+# orchestrator/evals/measurement.py       real spend, which --resume carries
+#   (measured_call invocation)            across the account switch: waiting
+#                                         is ~free, while tainting re-spends
+#                                         it.  AllAccountsCappedException is
+#                                         recorded as an Unmeasured with cause
+#                                         cap_exhausted, never raised.
+#
+# fused_memory/middleware/task_curator.py _CURATOR_CAP_WAIT_SANITY_SECS=120s
+#   (LLM triage calls)                    + park_on_frozen_pool=False.  DEFERS,
+#                                         never creates, when the pool cannot
+#                                         serve: AllAccountsCappedException
+#                                         (after ~120 s of cap-retry patience)
+#                                         or PoolFrozen (frozen at call start,
+#                                         no wait) parks the ticket
+#                                         awaiting_curation; the ticket janitor
+#                                         retries it until it is curated; every
+#                                         create the curator did not judge is
+#                                         marked metadata.dedupe_skipped
+#                                         (fused_memory/middleware/
+#                                         curation_deferral.py).
 #
 # fused_memory/reconciliation             _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS = 1800 s (30 min).
 #   (agent_loop, judge, cli_stage_runner) Shared by all three stage runners.
@@ -149,38 +172,9 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         cap storm. AllAccountsCappedException
 #                                         is caught and converted to a
 #                                         retryable 'infra_failure' proposal
-#                                         entry instead of raising.
-#
-# orchestrator/evals/eval_gate.py         EVAL_CAP_WAIT_SANITY_SECS = 172800 s (48 h).
-#   (architect_eval.invoke_architect)     RAISED from 1800 s on 2026-08-25
-#                                         (esc-3634-1).  It is the one caller in
-#                                         this table that does NOT take the
-#                                         short house value, deliberately.  The
-#                                         short bound was justified as "fail
-#                                         loud rather than park the campaign",
-#                                         but it never prevented the park — a
-#                                         fully-capped pool blocks in the gate's
-#                                         own unbounded _open.wait() regardless
-#                                         (see SCOPE note below), so the bound
-#                                         only chose how many in-flight cells
-#                                         were tainted on the way there.  And a
-#                                         cap lands MID-cell after real spend,
-#                                         which --resume preserves across the
-#                                         account switch: waiting is ~free,
-#                                         while tainting discards that spend and
-#                                         pays it again on the re-run.  48 h
-#                                         skates the 5-hour account caps that
-#                                         produce the common short all-capped
-#                                         windows.  AllAccountsCappedException
-#                                         is still caught and recorded as a
-#                                         `cap_exhausted:` marker on the cell
-#                                         (tainted, so the cell is EXCLUDED from
-#                                         the reported mean rather than scored a
-#                                         fabricated 0.0), never raised.  No
-#                                         max_cap_retries: cooldown doubles per
-#                                         pool cycle, so a fixed count would
-#                                         give a BIGGER account pool LESS
-#                                         wall-clock patience.
+#                                         entry instead of raising.  A cap hit
+#                                         retries FRESH (resume_on_cap_hit=
+#                                         False).
 #
 # scripts/legibility/session_runner.py    NO patience at all: park_on_frozen_
 #   (nightly legibility trickle + census, pool=False + max_cap_retries=
@@ -196,36 +190,24 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         PoolFrozen, which the runner types
 #                                         per task 5947 (all-capped defers at
 #                                         exit 0; all-auth-failed fails loud).
-#                                         is_usable_reply per stage: its
-#                                         codebook is dominated by usage-limit
-#                                         clusters, so a verdict QUOTING a
-#                                         banner must not cap a healthy
-#                                         account, while an unparseable exit-0
-#                                         banner still rotates.
 #                                         cap_wait_sanity_secs left at the
 #                                         default: the two bounds above always
 #                                         fire first.  Was an audited
 #                                         NON-caller (own text-mode spawn, no
 #                                         account pool) until task 6042.
 #
-# SCOPE OF EVERY BOUND IN THIS TABLE (task 3630 amendment, reviewer:
-# robustness).  cap_wait_sanity_secs is consulted at exactly one place —
-# _check_cap_wait — which runs in the cap-hit branch AFTER an invocation
-# returned and was classified as a cap.  It therefore bounds cap-RETRY
-# patience.  It does NOT bound the gate's own all-accounts-capped wait: the
-# next loop iteration re-enters usage_gate.invoke_slot -> before_invoke, which
-# ends in an unbounded `await self._open.wait()` (usage_gate.py) released only
-# by a real cap reset or a successful resume probe.  So a caller whose pool is
-# ALREADY frozen when it starts can still block for hours despite a 120 s or
-# 1800 s policy here.  Every caller in this table inherits that gap by
-# default.  It is now closable PER CALLER, inside the wrapper as it had to be
-# (task 6042): park_on_frozen_pool=False makes before_invoke raise
-# usage_gate.PoolFrozen where it would have parked, so a caller that must
-# defer rather than wait never blocks on a frozen pool.  The default stays
-# True, so every caller above still parks.  The fix belongs in the wrapper
-# because a wait in before_invoke is definitionally a cap wait and can be
-# attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
-# pool from a slow agent and would misattribute the latter.
+# SCOPE OF EVERY BOUND IN THIS TABLE (tasks 3630, 6042, 4002).  One deadline,
+# call start + cap_wait_sanity_secs, bounds BOTH places a call waits on caps:
+# the cap-retry branch (_check_cap_wait, after an invocation returned a cap)
+# and the gate's own park when no account is admissible (the time left on the
+# deadline, forwarded as before_invoke's max_wait_secs).  A park that outlives
+# it raises AllAccountsCappedException chained from the gate's PoolFrozen and
+# carrying it as pool_frozen, so an all-AUTH_FAILED freeze is not read as a cap.
+# park_on_frozen_pool=False (the curator, the legibility runner) still refuses
+# to park at all and gets PoolFrozen unconverted.  The bound lives in the
+# wrapper and the gate because a wait in before_invoke is definitionally a cap
+# wait — a caller-side asyncio.wait_for cannot tell a frozen pool from a slow
+# agent and would misattribute the latter.
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
@@ -349,26 +331,42 @@ def resolve_claude_binary() -> str | None:
 
 
 class AllAccountsCappedException(Exception):
-    """Raised when the cap-hit retry loop exceeds its patience bound.
+    """Raised when an invocation's cap patience runs out.
 
-    Two independent bounds share this exception, both raised from the same
-    ``_check_cap_wait`` choke point inside ``invoke_with_cap_retry``:
-    - the wall-clock ``cap_wait_sanity_secs`` sanity deadline (default 14
-      days), and
+    Three bounds share this exception, all raised through one log-and-raise
+    choke point inside ``invoke_with_cap_retry``:
+    - the wall-clock ``cap_wait_sanity_secs`` deadline (default 14 days)
+      reached in the cap-retry loop,
+    - the same deadline spent parked in the gate on a pool with no admissible
+      account, chained ``from`` the gate's ``PoolFrozen``, and
     - the count-based ``max_cap_retries`` bound, when the caller opts in.
 
     Attributes:
     - ``retries``: number of consecutive cap hits before giving up
-    - ``elapsed_secs``: wall-clock seconds elapsed since first cap hit
+    - ``elapsed_secs``: wall-clock seconds elapsed since the call started
     - ``label``: caller label from invoke_with_cap_retry (e.g. "Task 7 [impl]")
+    - ``pool_frozen``: the gate's ``PoolFrozen`` when the deadline was spent
+      parked, else ``None``.  It says which accounts were capped and which
+      AUTH_FAILED, and the message is built from it, because a pool frozen on
+      rejected credentials is not a cap and will not clear at a reset.
     """
 
-    def __init__(self, retries: int, elapsed_secs: float, label: str) -> None:
+    def __init__(
+        self,
+        retries: int,
+        elapsed_secs: float,
+        label: str,
+        *,
+        pool_frozen: PoolFrozen | None = None,
+    ) -> None:
         self.retries = retries
         self.elapsed_secs = elapsed_secs
         self.label = label
+        self.pool_frozen = pool_frozen
+        spent = f'after {retries} retries ({elapsed_secs:.1f}s elapsed)'
         super().__init__(
-            f'{label}: all accounts capped after {retries} retries ({elapsed_secs:.1f}s elapsed)'
+            f'{label}: all accounts capped {spent}' if pool_frozen is None
+            else f'{label}: cap-wait deadline spent parked {spent} — {pool_frozen}'
         )
 
 
@@ -2323,10 +2321,10 @@ async def invoke_with_cap_retry(
     max_cap_retries: int | None = None,
     rebuild_prompt: PromptBuilder | None = None,
     resume_delivers_prompt: bool = False,
+    resume_on_cap_hit: bool = True,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     park_on_frozen_pool: bool = True,
-    is_usable_reply: Callable[[str], bool] | None = None,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -2336,7 +2334,8 @@ async def invoke_with_cap_retry(
     cooldown doubles, capped at ``_MAX_CAP_COOLDOWN_SECS`` (300 s).
 
     On cap hit, if the capped invocation produced a ``session_id``, the
-    retry resumes that session via ``--resume`` instead of starting fresh.
+    retry resumes that session via ``--resume`` instead of starting fresh,
+    unless the caller passes ``resume_on_cap_hit=False``.
     This preserves all agent progress (tool calls, reasoning) across
     account switches.  If resume itself fails (non-cap-hit error), falls
     back to a fresh invocation with the original (or rebuilt) prompt.
@@ -2360,11 +2359,12 @@ async def invoke_with_cap_retry(
     transcript resumes, because a wrong downgrade discards real agent work.
     The specific reason is named in the cap-hit warning (``resume_or_fresh``).
 
-    *cap_wait_sanity_secs* is the outer wall-clock bound for cap-hit patience.
-    When total elapsed time since the first cap hit exceeds this value,
-    ``AllAccountsCappedException`` is raised so the caller can escalate.
-    Defaults to 14 days (``_DEFAULT_CAP_WAIT_SANITY_SECS``).  Pass ``None``
-    to wait indefinitely.
+    *cap_wait_sanity_secs* is the outer wall-clock bound for cap patience,
+    measured from call start.  It bounds the cap-retry loop and, through the
+    time left on it, the gate's park on a pool with no admissible account.
+    Once it is spent ``AllAccountsCappedException`` is raised so the caller
+    can escalate.  Defaults to 14 days (``_DEFAULT_CAP_WAIT_SANITY_SECS``).
+    Pass ``None`` to wait indefinitely.
 
     *max_cap_retries* is an optional count-based sibling of
     *cap_wait_sanity_secs*: when the number of consecutive cap hits reaches
@@ -2373,29 +2373,25 @@ async def invoke_with_cap_retry(
     ``None``, which preserves the existing patient, count-unbounded wait —
     only *cap_wait_sanity_secs* bounds the retry loop.
 
-    *park_on_frozen_pool* bounds the wait neither of the two above can see:
-    the gate's own park when NO account is admissible (every one capped or
-    AUTH_FAILED, or a scoped model exhausted everywhere).  ``True`` (the
-    default) parks until an account reopens, unchanged.  ``False`` lets
-    ``usage_gate.PoolFrozen`` propagate unconverted, for a caller that must
-    defer rather than wait (task 6042).  It is not converted to
-    ``AllAccountsCappedException`` because a pool frozen on rejected
-    credentials is not a cap and will not clear at a reset.
+    *park_on_frozen_pool* governs the gate's own park when NO account is
+    admissible (every one capped or AUTH_FAILED, or a scoped model exhausted
+    everywhere).  ``True`` (the default) parks within *cap_wait_sanity_secs*;
+    a park that spends it raises ``AllAccountsCappedException`` chained
+    ``from`` the gate's ``usage_gate.PoolFrozen`` and carrying it as
+    ``pool_frozen``: the snapshot of which accounts were capped and which
+    auth-failed.  ``False`` refuses
+    to park and lets ``PoolFrozen`` propagate unconverted, for a caller that
+    must defer rather than wait and must tell a cap from rejected
+    credentials, which will not clear at a reset (task 6042).
 
-    *is_usable_reply* decides which SUCCESSFUL results are offered to the cap
-    detector.  ``UsageGate.detect_cap_hit`` builds a synthetic
-    ``success=False`` result before classifying, so a successful reply that
-    merely QUOTES a banner reads as a cap: measured 2026-10-02, a verdict
-    whose evidence quotes ``REAL_CLI_CAP_HIT_MESSAGES[0]`` classifies ``OK()``
-    as it is and ``CapHit`` once forced to fail.  ``None`` (the default)
-    offers every result, unchanged for the fleet.  A predicate offers a
-    successful result only when it REJECTS the output — a reply the caller
-    could not use at all, which is where a banner delivered at exit 0 lands —
-    so a usable reply quoting cap text never costs an account, while an exit-0
-    banner still rotates it (task 5637's route).  The predicate decides only
-    whether to ASK; the gate's strict detector still decides whether it is a
-    cap.  Failed results are always offered.  Consumer: the legibility runner,
-    whose replies routinely quote cap text (task 6042).
+    Only FAILED results are offered to the cap detector.
+    ``UsageGate.detect_cap_hit`` classifies a synthetic ``success=False``
+    result, so a successful reply that merely QUOTES a banner would read as a
+    cap and bench a healthy account (task 6042).  A genuine cap under
+    ``--output-format json`` always arrives with ``is_error`` true at exit 1
+    (measured, task 6213), so it fails here; the one exception is a salvaged
+    structured payload, which is finished work and is returned.  A successful
+    run's near-cap annotation is therefore not recorded (task 7334).
 
     *rebuild_prompt*, when provided, is a ``PromptBuilder`` awaited with no
     arguments immediately before EVERY re-dispatch — whatever triggered it
@@ -2424,6 +2420,13 @@ async def invoke_with_cap_retry(
     ``workflow._invoke``: a crash-recovered session already holds the full
     task context, so the short crash-recovery continuation prompt is sufficient
     and the real prompt is kept only as ``original_prompt`` for fresh-fallback.
+
+    *resume_on_cap_hit*, when ``True`` (the default), applies the two-part
+    resume rule above.  ``False`` makes every cap-hit re-dispatch fresh, for
+    a stateless caller whose retry would preserve nothing worth keeping.  It
+    governs only the loop's own cap-hit re-arm: the first dispatch still
+    honours a preset ``resume_session_id`` (crash recovery); every cap-hit
+    re-dispatch is fresh.
 
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
@@ -2498,36 +2501,39 @@ async def invoke_with_cap_retry(
     cli_input_rejected_retries = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
     retry_start = time.monotonic()
+    cap_wait_deadline = None if cap_wait_sanity_secs is None else retry_start + cap_wait_sanity_secs
     last_cap_wait_log_at: float | None = None
+
+    def _cap_patience_spent(
+        why: str, hits: int, elapsed: float, *, pool_frozen: PoolFrozen | None = None,
+    ) -> AllAccountsCappedException:
+        """Log why this call's cap patience ran out; return the exception saying so."""
+        logger.error(f'{label}: {why}')
+        return AllAccountsCappedException(
+            retries=hits, elapsed_secs=elapsed, label=label, pool_frozen=pool_frozen,
+        )
 
     def _check_cap_wait(now: float, elapsed: float, cooldown: float, hits: int) -> None:
         """Guard and throttled log for cap-wait iterations.
 
-        Raises AllAccountsCappedException when the 14-day sanity bound is exceeded,
-        or when the count-based max_cap_retries bound is reached.
+        Raises AllAccountsCappedException once cap_wait_sanity_secs, measured
+        from call start, is spent, or when the count-based max_cap_retries
+        bound is reached.
         Emits a structured 'cap_wait' JSON log at most once per _CAP_WAIT_LOG_INTERVAL_SECS.
         Closes over: cap_wait_sanity_secs, max_cap_retries, label, num_accounts,
         usage_gate, last_cap_wait_log_at (nonlocal write).
         """
         nonlocal last_cap_wait_log_at
         if max_cap_retries is not None and hits >= max_cap_retries:
-            logger.error(
-                f'{label}: max cap-retries bound ({max_cap_retries}) reached after {hits} retries',
-            )
-            raise AllAccountsCappedException(
-                retries=hits,
-                elapsed_secs=elapsed,
-                label=label,
+            raise _cap_patience_spent(
+                f'max cap-retries bound ({max_cap_retries}) reached after {hits} retries',
+                hits, elapsed,
             )
         if cap_wait_sanity_secs is not None and elapsed > cap_wait_sanity_secs:
-            logger.error(
-                f'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s '
+            raise _cap_patience_spent(
+                f'cap-wait sanity bound exceeded after {elapsed:.1f}s '
                 f'({hits} retries, {num_accounts} account(s))',
-            )
-            raise AllAccountsCappedException(
-                retries=hits,
-                elapsed_secs=elapsed,
-                label=label,
+                hits, elapsed,
             )
         if (
             last_cap_wait_log_at is None
@@ -2639,12 +2645,36 @@ async def invoke_with_cap_retry(
         # getattr(...,'_config',None) is None for a spec'd MagicMock gate and
         # scope_for(m, <no config>) is None, so every existing mock-based suite
         # derives scope None → byte-equivalent.
-        from shared.usage_gate import scope_for
+        from shared.usage_gate import PoolFrozen, scope_for
 
         _cfg = getattr(usage_gate, '_config', None)
         scope = scope_for(model, _cfg) if (backend == 'claude' and _cfg is not None) else None
         while True:
-            async with usage_gate.invoke_slot(scope=scope, park=park_on_frozen_pool) as slot:
+            # An exit stack rather than `async with invoke_slot(...) as slot`, so
+            # the handler below covers slot ENTRY only and the body keeps its
+            # indentation and its break/continue release semantics.
+            async with contextlib.AsyncExitStack() as slot_exit:
+                park_allowance = (
+                    None if cap_wait_deadline is None
+                    else max(0.0, cap_wait_deadline - time.monotonic())
+                )
+                try:
+                    slot = await slot_exit.enter_async_context(
+                        usage_gate.invoke_slot(
+                            scope=scope,
+                            park=park_on_frozen_pool,
+                            max_wait_secs=park_allowance,
+                        ),
+                    )
+                except PoolFrozen as frozen:
+                    if not park_on_frozen_pool:
+                        raise
+                    elapsed = time.monotonic() - retry_start
+                    raise _cap_patience_spent(
+                        f'cap-wait sanity bound ({cap_wait_sanity_secs}s) spent parked '
+                        f'after {elapsed:.1f}s: {frozen}',
+                        consecutive_cap_hits, elapsed, pool_frozen=frozen,
+                    ) from frozen
                 # Consulted inside the acquired slot, after any cooldown or
                 # park, and before attribution and credentials: a declined
                 # retry keeps the last attempt's account, writes nothing, and
@@ -2820,12 +2850,7 @@ async def invoke_with_cap_retry(
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                     continue  # __aexit__ releases probe slot
 
-                offered_to_cap_detector = (
-                    not result.success
-                    or is_usable_reply is None
-                    or not is_usable_reply(result.output)
-                )
-                if offered_to_cap_detector and slot.detect_cap_hit(
+                if not result.success and slot.detect_cap_hit(
                     result.stderr, result.output, backend=backend,
                 ):
                     consecutive_cap_hits += 1
@@ -2983,6 +3008,9 @@ async def invoke_with_cap_retry(
                     if not result.session_id:
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         resume_or_fresh = 'fresh (no session_id)'
+                    elif not resume_on_cap_hit:
+                        _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                        resume_or_fresh = 'fresh (caller opted out of cap-hit resume)'
                     elif config_dir is not None and not transcript_exists(
                         config_dir.path, result.session_id
                     ):

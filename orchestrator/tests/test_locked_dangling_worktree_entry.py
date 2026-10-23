@@ -69,7 +69,7 @@ async def _plant_dangling_entry(git_ops: GitOps, *, locked: bool) -> tuple[Path,
     interrupted-``worktree add`` lock, reproducing the incident. Returns
     ``(worktree_path, admin_dir)``."""
     head = _git(git_ops.project_root, 'rev-parse', 'HEAD').strip()
-    wt = await git_ops.create_throwaway_verify_worktree(head)
+    wt = await git_ops.create_ephemeral_verify_worktree(head)
     admin = lane_admin_dir(wt)
     if locked:
         (admin / 'locked').write_text('initializing')
@@ -160,7 +160,7 @@ class TestPruneReclaimsLockedDanglingEntries:
         self, git_ops: GitOps, git_repo: Path,
     ):
         head = _git(git_repo, 'rev-parse', 'HEAD').strip()
-        wt = await git_ops.create_throwaway_verify_worktree(head)
+        wt = await git_ops.create_ephemeral_verify_worktree(head)
         admin = lane_admin_dir(wt)
         (admin / 'locked').write_text('initializing')
 

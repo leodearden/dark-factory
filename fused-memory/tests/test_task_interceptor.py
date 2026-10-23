@@ -1516,6 +1516,162 @@ async def test_curator_combine_refusal_records_claimed_reason(
     assert rec['old']['status'] == 'pending'
 
 
+def _combine_into_target_50() -> CuratorDecision:
+    """A combine aimed at target '50' (title 'Test Task'), averting 'Unified parser work'."""
+    return CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Test Task',
+        rewritten_task=RewrittenTask(
+            title='Unified parser work',
+            description='Combined',
+            details='d',
+            files_to_modify=[],
+            priority='medium',
+        ),
+        justification='same concern',
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'target_metadata',
+    [
+        {'branch_base_sha': 'a' * 40, 'files': ['src/parser.py']},
+        json.dumps({'branch_base_sha': 'a' * 40}),
+    ],
+    ids=['dict', 'json-string'],
+)
+async def test_curator_combine_target_with_branch_base_sha_refuses(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+    caplog,
+    target_metadata,
+):
+    """A pending, unclaimed target that already owns a branch is not rewritten (task 7199).
+
+    Rewriting it retitles a task whose branch the title-as-identity guard then
+    quarantines (tasks 4917, 5140), so the candidate is created as its own task.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'pending',
+            'title': 'Test Task',
+            'claimant_run_id': None,
+            'metadata': target_metadata,
+        }
+    )
+    curator_interceptor._curator = _mock_curator(_combine_into_target_50())
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
+
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.update_task.assert_not_called()
+    taskmaster.add_task.assert_called_once()
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec['refused_reason'] == 'target_has_branch'
+    assert rec['target_id'] == '50'
+    assert rec['old']['status'] == 'pending'
+    assert rec['old']['title'] == 'Test Task'
+    assert rec['new']['title'] == 'Unified parser work'
+    assert any(
+        r.levelno == logging.WARNING
+        and '50' in r.getMessage()
+        and 'branch_base_sha' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'target_extra',
+    [
+        {},
+        {'metadata': None},
+        {'metadata': {}},
+        {'metadata': {'files': ['src/parser.py']}},
+        {'metadata': {'branch_base_sha': ''}},
+        {'metadata': {'branch_base_sha': '   '}},
+        {'metadata': {'branch_base_sha': None}},
+        {'metadata': ['branch_base_sha']},
+        {'metadata': 'not json'},
+    ],
+    ids=[
+        'no-metadata-key',
+        'metadata-none',
+        'metadata-empty-dict',
+        'metadata-without-sha',
+        'sha-empty',
+        'sha-whitespace',
+        'sha-none',
+        'metadata-non-dict',
+        'metadata-unparseable-string',
+    ],
+)
+async def test_curator_combine_blank_or_unreadable_branch_base_sha_still_combines(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+    target_extra,
+):
+    """Only a non-blank branch_base_sha string refuses; absent, blank or unreadable does not (task 7199)."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '50', 'status': 'pending', 'title': 'Test Task', **target_extra}
+    )
+    curator_interceptor._curator = _mock_curator(_combine_into_target_50())
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
+
+    taskmaster.update_task.assert_called_once()
+    assert result['action'] == 'combine'
+    assert result['id'] == '50'
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    assert 'refused_reason' not in records[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('status', 'claimant_run_id', 'expected_reason'),
+    [
+        ('in-progress', 'run-abc:sess-1:4242', 'target_not_pending'),
+        ('pending', 'run-abc:sess-1:4242', 'target_claimed'),
+    ],
+    ids=['not-pending-wins', 'claimed-wins'],
+)
+async def test_curator_combine_branch_refusal_does_not_reclassify_existing_refusals(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+    status,
+    claimant_run_id,
+    expected_reason,
+):
+    """The branch check runs after status and claimant, keeping the existing target_not_pending / target_claimed populations unchanged (task 7199)."""
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': status,
+            'title': 'Test Task',
+            'claimant_run_id': claimant_run_id,
+            'metadata': {'branch_base_sha': 'a' * 40},
+        }
+    )
+    curator_interceptor._curator = _mock_curator(_combine_into_target_50())
+
+    await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
+
+    taskmaster.update_task.assert_not_called()
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    assert records[0]['refused_reason'] == expected_reason
+
+
 @pytest.mark.asyncio
 async def test_curator_combine_success_record_carries_no_refused_reason(
     curator_interceptor,

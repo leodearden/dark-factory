@@ -15,10 +15,11 @@ import dataclasses
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
 from shared.branch_names import canonical_queued_branch_name
@@ -26,6 +27,7 @@ from shared.branch_names import canonical_queued_branch_name
 from orchestrator.branch_stack import PreStackTip
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
 if TYPE_CHECKING:
@@ -99,6 +101,17 @@ class MergeBounceRegistry:
         self._bounces.pop(branch, None)
 
 
+def _cancel_args(future: asyncio.Future | None) -> tuple[Any, ...]:
+    """The ``cancel()`` arguments that pass *future*'s cancel message on, if it has one."""
+    if future is None or not future.cancelled():
+        return ()
+    try:
+        future.result()
+    except asyncio.CancelledError as cancelled:
+        return cancelled.args
+    return ()
+
+
 @dataclass
 class _InFlightEntry:
     """Registry slot for a single in-flight merge branch.
@@ -144,10 +157,15 @@ class _InFlightEntry:
     """request_ids of the waiters :meth:`release_waiters` cancelled and dropped."""
 
     def release_waiters(self) -> None:
-        """Cancel every still-pending waiter, then drop them all, keeping their ids."""
+        """Cancel every still-pending waiter, then drop them all, keeping their ids.
+
+        Each waiter is cancelled with the primary's own cancel message, so an
+        operator's cancel reaches an attached TaskWorkflow as one.
+        """
+        cancel_args = _cancel_args(self.primary_future)
         for w in self.waiters:
             if not w.future.done():
-                w.future.cancel()
+                w.future.cancel(*cancel_args)
         self.released_waiter_ids = tuple(w.request_id for w in self.waiters)
         self.waiters.clear()
 
@@ -441,9 +459,21 @@ class InFlightMergeRegistry:
         """True when *branch* has an active in-flight slot."""
         return branch in self._slots
 
+    def task_ids_in_flight(self) -> frozenset[str]:
+        """Each branch slot's first submitter's task id; a later id on a branch is not listed."""
+        return frozenset(entry.task_id for entry in self._slots.values())
+
     def entry(self, branch: str) -> _InFlightEntry | None:
         """Return the in-flight entry for *branch*, or None if free."""
         return self._slots.get(branch)
+
+    def has_workflow_waiter(self, branch: str, request_id: str) -> bool:
+        """True while a TaskWorkflow waits, attached, on *request_id*'s slot for *branch*."""
+        entry = self._slots.get(branch)
+        return (
+            entry is not None and entry.request_id == request_id
+            and any(w.source == 'workflow' for w in entry.waiters)
+        )
 
     def primary_entry(self, branch: str, future: asyncio.Future) -> _InFlightEntry | None:
         """The live entry for *branch* only while *future* is its primary.
@@ -514,7 +544,7 @@ class InFlightMergeRegistry:
                 if target.done():
                     return  # guard: pre-resolved / detached future — skip
                 if pf.cancelled():
-                    target.cancel()
+                    target.cancel(*_cancel_args(pf))
                 elif (exc := pf.exception()) is not None:
                     target.set_exception(exc)
                 else:
@@ -698,6 +728,59 @@ class MergeDispatchResult:
     verify_age_secs: int | None = None
     """Age in seconds of the in-flight verify at reject time, sourced from the
     live worker snapshot entry.  Set on a C3 reject; None otherwise."""
+
+
+class MergeCancelRefusal(StrEnum):
+    """Why ``MergeLane.cancel_request`` left a live request alone (task 5248)."""
+
+    NOT_LIVE = 'not_live'
+    """The lane holds no undecided request under that id."""
+    FINALIZE_WINDOW = 'finalize_window'
+    """The request is landing; a cancel could abandon a merge that still lands."""
+    TRAIN_CANCEL_UNSUPPORTED = 'train_cancel_unsupported'
+    """The request is, or is being stacked into, a merge train; see
+    ``worker.py::_train_cancel_refusal``."""
+
+
+@dataclass(frozen=True)
+class MergeCancelVerdict:
+    """What ``MergeLane.cancel_request`` did with one request id.
+
+    *task_id*/*branch* name the request the lane found, so the caller can
+    retire it by branch, *state* is the ``snapshot()`` wire state it was in,
+    and *awaited_by_workflow* is the request's own flag; all are empty when
+    nothing was found.  *lane_disposes_worktree* is True when the lane is still
+    re-verifying in the request's merge worktree and disposes of it itself once
+    that returns, so the caller must not reap it.
+    """
+
+    request_id: str
+    refusal: MergeCancelRefusal | None
+    task_id: str | None = None
+    branch: str | None = None
+    state: str | None = None
+    awaited_by_workflow: bool = False
+    lane_disposes_worktree: bool = False
+
+    @property
+    def cancelled(self) -> bool:
+        return self.refusal is None
+
+
+@dataclass(frozen=True)
+class OperatorMergeCancel:
+    """The message an operator's cancel puts on a request's result future.
+
+    ``Future.cancel(msg)`` hands it to whoever awaits the future, inside the
+    ``CancelledError`` they get, which is how a TaskWorkflow tells an
+    operator's cancel of its merge from its own cancellation.
+    """
+
+    request_id: str
+
+    @classmethod
+    def carried_by(cls, error: asyncio.CancelledError) -> OperatorMergeCancel | None:
+        return next((arg for arg in error.args if isinstance(arg, cls)), None)
 
 
 @dataclass
@@ -906,6 +989,53 @@ class MergeRequest:
     reaper and journal recovery, whose submitters never park. Not journaled: a
     recovered request's workflow died with the process. Read only on single
     requests; a GroupMergeRequest is never a coalesce candidate."""
+
+
+@dataclass(frozen=True)
+class LaneMetadataWrite:
+    """Whether ``merge_relane`` persisted the new lane as one task's
+    ``metadata.merge_lane`` (task 5246)."""
+
+    task_id: str
+    written: bool
+
+
+@dataclass(frozen=True)
+class RelaneOutcome:
+    """What an operator's ``merge_relane`` did to a waiting merge (task 5246).
+
+    ``relaned`` is True when the addressed request, or for a coalesced member
+    the train carrying it (``via_train``), now belongs to ``lane``.
+    ``request_id`` and ``from_lane`` name that queue entry, and ``task_ids``
+    lists the tasks it carries: the request's own task, or every member of
+    the train.
+
+    That is the LIVE lane, and it lives only as long as the queue entry. A
+    solo request's journal record keeps it across a restart, but a train is
+    never journaled and is dissolved by a restart drain, so its live lane is
+    lost there. The DURABLE lane is ``metadata.merge_lane`` on each of
+    ``task_ids``: re-enqueued members inherit it. ``metadata_writes`` reports
+    that write per task. It is empty when nothing moved, and a False entry
+    means that task will re-enqueue at its old lane.
+
+    Otherwise ``refusal`` says why nothing moved:
+    - ``'already_picked'``: the merger has taken the request, so no lane
+      orders it any more. ``state`` is its lifecycle state.
+    - ``'not_found'``: nothing the lane holds answers to that id, or its
+      outcome is already decided. It can be transient while the request
+      passes between two of the lane's containers, so re-read
+      ``get_merge_queue``.
+    """
+
+    relaned: bool
+    lane: Literal['normal', 'high']
+    request_id: str | None = None
+    from_lane: Literal['normal', 'high'] | None = None
+    via_train: str | None = None
+    task_ids: tuple[str, ...] = ()
+    metadata_writes: tuple[LaneMetadataWrite, ...] = ()
+    refusal: Literal['already_picked', 'not_found'] | None = None
+    state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1262,7 +1392,8 @@ class Decided:
 
 
 ChainTruncationReason: TypeAlias = Literal[
-    'conflict', 'train_request', 'already_merged', 'merge_error', 'lane_base_mismatch',
+    'conflict', 'train_request', 'stacked_on_unlanded_base', 'already_merged',
+    'merge_error', 'lane_base_mismatch',
 ]
 CHAIN_FAULT_REASONS: frozenset[ChainTruncationReason] = frozenset(
     {'merge_error', 'lane_base_mismatch'},
@@ -1277,7 +1408,7 @@ class ChainResult:
     Returned by :func:`orchestrator.merge_lane.worker.build_chain`, which
     sequentially merges queued items in submission order onto the frozen
     head's merge commit inside ONE scratch worktree, truncating at the first
-    textual conflict.  Sibling of the ``classify_and_merge`` sum type
+    item refused or not merging cleanly.  Sibling of the ``classify_and_merge`` sum type
     (:class:`MergedOk` / :class:`Decided`) — same family, one level up: those
     describe a single item's merge, this describes a whole speculative chain.
 
@@ -1297,6 +1428,9 @@ class ChainResult:
     * ``truncated_reason`` — ``'conflict'`` (genuine textual conflict — an
       expected, benign chain outcome), ``'train_request'`` (a
       :class:`GroupMergeRequest`, which ``_do_train_merge`` owns),
+      ``'stacked_on_unlanded_base'`` (the item's branch carries a recorded
+      stack base that never landed on main — benign: it takes the sequential
+      path, where ``classify_and_merge`` un-stacks it first),
       ``'already_merged'`` (the item's work is ALREADY in the base, so
       ``git merge --no-ff`` was a no-op — benign: it caps the chain but
       signals no fault, and the item's real verdict is rendered by the
@@ -1307,10 +1441,10 @@ class ChainResult:
       a lane-provisioning fault, distinct from ``'merge_error'``, which is
       an ITEM's merge failing).  **Only ``'merge_error'`` and
       ``'lane_base_mismatch'`` denote genuine faults**
-      (``CHAIN_FAULT_REASONS``) — conflict /
-      train_request / already_merged are benign caps and are deliberately
-      NOT collapsed into them, so ε's deep-fail reader is not inflated with
-      non-faults.
+      (``CHAIN_FAULT_REASONS``) — conflict / train_request /
+      stacked_on_unlanded_base / already_merged are benign caps and are
+      deliberately NOT collapsed into them, so a reader of truncation reasons
+      is not inflated with non-faults.
     * ``lane`` / ``lane_warm`` — the ONE scratch worktree holding ``tip``.
     * ``build_ms`` — wall-clock milliseconds the build cost, stamped by γ's
       caller (``_deep_chain_placement``) rather than by ``build_chain``
@@ -1801,23 +1935,76 @@ class VerifyInFlight:
         }
 
 
+# How a benched remote host is held and re-probed (design D6): 'ru' hosts are
+# unreachable and come back when ``ssh true`` answers; 'skew' hosts were reached
+# but could not run the dispatcher's gate, and come back when ensure-gate passes.
+QuarantineClass = Literal['ru', 'skew']
+
+# When a bench files its L1: at once, or on the 3-consecutive / 600 s ladder.
+EscalationTiming = Literal['immediate', 'ladder']
+
+
+def quarantine_class(kind: RunnerUnavailableKind) -> QuarantineClass:
+    """The quarantine class of a RunnerUnavailable *kind* (design D6)."""
+    return 'ru' if kind == 'transport' else 'skew'
+
+
+def escalation_policy(kind: RunnerUnavailableKind, *, sticky: bool) -> EscalationTiming:
+    """When a bench of *kind* files its L1 (design D6).
+
+    A wire-shape skew is filed at once.  So is a sticky bench: it can no
+    longer clear itself, so the ladder's wait would buy nothing.
+    """
+    return 'immediate' if sticky or kind == 'wire_shape' else 'ladder'
+
+
 @dataclass
 class _HostUnavailability:
-    """Per-host RunnerUnavailable streak tracker entry (task 1795).
+    """Per-host RunnerUnavailable tracker entry (task 1795; kinds, task 6565).
 
-    Tracks consecutive failures so the worker can fire a dedup'd escalation
-    once the streak threshold is reached, and can clear state on recovery.
+    One downtime episode of one remote host: the worker files a dedup'd
+    escalation per :func:`escalation_policy` and clears the entry on readmit.
 
     Fields
     ------
     streak              : consecutive RunnerUnavailable count for this host.
     first_unavailable_at: time.time() of the first failure in this episode.
-    reason              : str(exc) from the most recent RunnerUnavailable.
+    reason              : str(exc) from the RunnerUnavailable that set ``kind``.
+    kind                : what benched the host; a 'skew'-class kind is never
+                          downgraded to 'transport' within the episode.
+    identity            : both gate identities, when a handshake mismatched.
+    sticky              : no automatic readmit until an operator clear or a
+                          restart (the second skew bench of one host and sha).
     """
 
     streak: int
     first_unavailable_at: float
     reason: str
+    kind: RunnerUnavailableKind = 'transport'
+    identity: GateIdentityPair | None = None
+    sticky: bool = False
+
+    def to_wire(self, now: float) -> dict[str, Any]:
+        """This episode as the heartbeat ``hosts`` block shows it, aged against *now*.
+
+        The keys are exactly :data:`UNTRACKED_HOST_WIRE`'s, so a tracked and an
+        untracked host share one schema.
+        """
+        return {
+            'unavailable_since': self.first_unavailable_at,
+            'unavailable_secs': max(0.0, now - self.first_unavailable_at),
+            'streak': self.streak,
+            'reason': self.reason,
+            'kind': self.kind,
+            'sticky': self.sticky,
+            'identity': self.identity.to_wire() if self.identity is not None else None,
+        }
+
+
+# The ``hosts``-block fields of a host with no unavailability episode.
+UNTRACKED_HOST_WIRE: Mapping[str, None] = MappingProxyType(dict.fromkeys((
+    'unavailable_since', 'unavailable_secs', 'streak', 'reason', 'kind', 'sticky', 'identity',
+)))
 
 
 @dataclass
@@ -1845,6 +2032,8 @@ class InflightVerifyResult:
                   InflightStatus.RUNNER_UNAVAILABLE; None on all other paths.  Used by
                   the unavailability tracker + alarm to name the actual failure cause
                   in escalation summaries.
+    kind, identity: the RunnerUnavailable's ``kind`` and ``identity`` when status
+                  is InflightStatus.RUNNER_UNAVAILABLE; the defaults elsewhere.
     """
 
     outcome: MergeOutcome | None
@@ -1853,6 +2042,8 @@ class InflightVerifyResult:
     status: InflightStatus | None = None  # None | DROPPED | REQUEUED | RUNNER_UNAVAILABLE
     reason: str | None = None  # str(RunnerUnavailable exc) when status=RUNNER_UNAVAILABLE
     spec_warm: bool = False   # True when merge_wt is a warm _spec- lane (not an ephemeral wt)
+    kind: RunnerUnavailableKind = 'transport'
+    identity: GateIdentityPair | None = None
 
     def __post_init__(self) -> None:
         """Enforce status is restricted to the 3 verify-result sentinels (task

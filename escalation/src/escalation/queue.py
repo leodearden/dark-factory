@@ -3056,16 +3056,15 @@ class EscalationQueue:
         record in one sweep is aged against the same instant.
 
         Returns the number of escalations where resolve() returned non-None.
-        In the common single-writer case this equals the number actually dismissed.
-        In a concurrent-write race (another process resolves an escalation between
-        get_pending() and resolve()), resolve() is a no-op but still returns the
-        existing escalation, so the count may include those no-ops.  The counter
-        is best read as "attempted dismissals, including no-ops for concurrent
-        resolutions".  This function is single-writer in practice.  The count
-        does NOT distinguish the three per-record outcomes — age-annotated,
-        strand-stamped, or ``pending_secs=unknown`` for a record whose
-        timestamp would not parse; a caller that needs that detail reads the
-        resolved records themselves.
+        This is an UPPER BOUND on the records this call dismissed, not an exact
+        count.  Other processes, among them fused-memory's middlewares and
+        reconciliation, write this queue directory concurrently, so a record
+        one of them resolves between get_pending() and resolve() is still
+        counted: resolve() on an already-terminal record is a no-op that
+        returns the stored record.  Nor does the count distinguish the three
+        per-record outcomes — age-annotated, strand-stamped, or
+        ``pending_secs=unknown`` for a record whose timestamp would not parse;
+        a caller that needs that detail reads the resolved records themselves.
         """
         pending = self.get_pending()
         now = now or datetime.now(UTC)

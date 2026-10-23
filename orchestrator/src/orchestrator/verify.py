@@ -5,7 +5,6 @@ import concurrent.futures
 import contextlib
 import errno
 import fnmatch
-import functools
 import gzip
 import hashlib
 import json
@@ -25,7 +24,7 @@ from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, TypeVar, assert_never
 
 if TYPE_CHECKING:
     from shared.psi import PsiSample
@@ -78,6 +77,7 @@ from orchestrator.verify_classify import (
     is_external_kill_rc,
     is_interpreter_missing_workspace_packages,
     is_partially_provisioned_venv_type_failure,
+    is_shell_reported_external_kill,
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
@@ -428,7 +428,7 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
     """Rescope a fallback TYPE/LINT command into subpackage *sub*'s own uv context.
 
     Cold-verify dev-dep race (task 2355): on a cold throwaway merge-verify
-    worktree (:func:`create_throwaway_verify_worktree`) the shared ``.venv``
+    worktree (:func:`create_ephemeral_verify_worktree`) the shared ``.venv``
     starts empty. When a diff lives entirely under a single real subpackage
     (see :func:`_single_subproject_prefix`), the TEST command is already
     scoped to run *inside* that subpackage via ``uv run`` (task 2344), which
@@ -563,7 +563,7 @@ _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
 # Two consumers, both of which benefit — kept as ONE constant deliberately, a
 # parallel undecorated-only pattern would recreate the very
 # two-places-that-must-stay-in-sync drift task 4066 exists to fix:
-#   * _is_bare_xdist_worker_crash's veto set, where a wider match strictly
+#   * _carries_pytest_failure_verdict's veto set, where a wider match strictly
 #     INCREASES strictness (it can only flip True -> False, never mask more).
 #   * _extract_cause_hint's ladder rung 3, where it upgrades an undecorated
 #     tally from the generic last-non-blank-line fallback to a real rung-3
@@ -584,6 +584,21 @@ _PYTEST_PROGRESS_FILE_RE = re.compile(
 # Captures a progress line's percentage for _crashed_session_stop_percent.
 _PYTEST_PROGRESS_PERCENT_RE = re.compile(
     rf'^(?:\S+\.py )?{_PYTEST_STATUS_CHAR_CLASS}*[ \t]*{_PYTEST_PERCENT_FIELD}$',
+    re.MULTILINE,
+)
+# A killed session's final progress line is unterminated, so the next writer's
+# text is glued on (bash's `Terminated` or job report, a worker's warning path,
+# `Traceback`): all start uppercase or '/'; F/E-led prose continues lowercase.
+_PYTEST_PROGRESS_FAILURE_RE = re.compile(
+    rf'^(?:\S+\.py )?{_PYTEST_STATUS_CHAR_CLASS}*[FE]{_PYTEST_STATUS_CHAR_CLASS}*'
+    rf'(?:[ \t]+{_PYTEST_PERCENT_FIELD}|[A-Z/].*)?$',
+    re.MULTILINE,
+)
+# pytest -v prints each finished test's outcome on its own line: serially
+# `<nodeid> FAILED  [ 40%]`, under xdist `[gw0] [ 40%] FAILED <nodeid>`.
+_PYTEST_VERBOSE_FAILURE_RE = re.compile(
+    rf'^(?:\[gw\d+\] (?:{_PYTEST_PERCENT_FIELD} )?(?:FAILED|ERROR) '
+    r'|\S+::.*? (?:FAILED|ERROR)\b)',
     re.MULTILINE,
 )
 
@@ -624,6 +639,15 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 _XDIST_SESSION_ABORTED_RE = re.compile(
     r"worker gw\d+ crashed and worker restarting disabled"
     r"|maximum crashed workers reached: \d+",
+)
+
+
+# xdist workers outliving a signalled controller each fail to send at
+# pytest_sessionfinish (esc-4071-1, esc-4808-1). Requiring the two lines to be
+# adjacent keeps prose that merely quotes either one out.
+_XDIST_CHANNEL_COLLAPSE_RE = re.compile(
+    r'^Plugin: \S+, Hook: pytest_sessionfinish\nOSError: cannot send \(already closed\?\)$',
+    re.MULTILINE,
 )
 
 
@@ -823,16 +847,14 @@ def _first_surviving_failure_line(output: str) -> str | None:
     return None
 
 
-def _is_bare_xdist_worker_crash(output: str) -> bool:
-    """Return True when *output* is a bare xdist worker crash with no real failure.
+def _carries_pytest_failure_verdict(output: str) -> bool:
+    """Return True when *output* shows pytest reached a failure verdict.
 
-    A hard ``os._exit()`` worker kill (task 2361) produces no assertion
-    traceback, so ANY genuine pytest failure surface alongside the crash
-    signature means a real failure occurred and this returns ``False`` —
-    never mask a real failure. The surfaces are one flat veto set: a
-    ``^FAILED `` line, an ``^E   `` traceback line, a failure summary, an
-    ``INTERNALERROR>`` line, or either ``ERROR`` short-summary form (node-id
-    or bare-file).
+    The surfaces are one flat veto set: a ``^FAILED `` line, an ``^E   ``
+    traceback line, a failure summary, an ``INTERNALERROR>`` line, or either
+    ``ERROR`` short-summary form (node-id or bare-file). It is the single
+    veto set of every verdictless-exit recogniser
+    (``_is_bare_xdist_worker_crash``, ``_pytest_session_aborted_without_verdict``).
 
     The set is flat on purpose. It used to be two branches keyed on whether
     a ``FAILED`` line was present, and they drifted (task 4066): verify-log
@@ -851,6 +873,31 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     flaky. It stays strict: a second ``FAILED`` line for the same node-id,
     a ``FAILED`` line for any other test, an ``^E   `` traceback line, and
     every INTERNALERROR / ERROR surface still veto.
+    """
+    surviving_failed_lines = _failed_lines_not_crash_attributed(output)
+    only_crash_artefacts_failed = (
+        not surviving_failed_lines and _PYTEST_FAILED_LINE_RE.search(output) is not None
+    )
+    return bool(
+        surviving_failed_lines
+        or _PYTEST_TRACEBACK_E_RE.search(output)
+        or (
+            _PYTEST_FAILURE_SUMMARY_RE.search(output)
+            and not only_crash_artefacts_failed
+        )
+        or _PYTEST_INTERNALERROR_RE.search(output)
+        or _ERROR_LINE_NODEID_RE.search(output)
+        or _ERROR_LINE_FILE_RE.search(output)
+    )
+
+
+def _is_bare_xdist_worker_crash(output: str) -> bool:
+    """Return True when *output* is a bare xdist worker crash with no real failure.
+
+    A hard ``os._exit()`` worker kill (task 2361) produces no assertion
+    traceback, so ANY genuine pytest failure surface alongside the crash
+    signature (``_carries_pytest_failure_verdict``) means a real failure
+    occurred and this returns ``False`` — never mask a real failure.
 
     Accepted tradeoff, deliberately taken by task 4066: the
     ``INTERNALERROR>`` veto keys on a surface the worker crash can itself
@@ -886,21 +933,30 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
         return False
     if not _XDIST_WORKER_CRASH_RE.search(output):
         return False
-    surviving_failed_lines = _failed_lines_not_crash_attributed(output)
-    only_crash_artefacts_failed = (
-        not surviving_failed_lines and _PYTEST_FAILED_LINE_RE.search(output) is not None
-    )
-    return not (
-        surviving_failed_lines
-        or _PYTEST_TRACEBACK_E_RE.search(output)
-        or (
-            _PYTEST_FAILURE_SUMMARY_RE.search(output)
-            and not only_crash_artefacts_failed
-        )
-        or _PYTEST_INTERNALERROR_RE.search(output)
-        or _ERROR_LINE_NODEID_RE.search(output)
-        or _ERROR_LINE_FILE_RE.search(output)
-    )
+    return not _carries_pytest_failure_verdict(output)
+
+
+def _pytest_session_aborted_without_verdict(rc: int, output: str) -> bool:
+    """Return True when a pytest leg was torn down before reaching any verdict.
+
+    Two arms: a shell-reported SIGTERM/SIGINT/SIGHUP exit status, or the
+    channel-collapse signature (``_XDIST_CHANNEL_COLLAPSE_RE``). Decoding
+    ``128 + N`` is sound only here: every rc a leg classifier sees comes from
+    ``_run_cmd``'s ``/bin/bash`` wrapper, directly or as ``_run_segmented``'s
+    first nonzero rc, so verify knows the shell is its own.
+
+    Any failure evidence vetoes both arms, because a killed session prints no
+    short summary: an ``F`` or ``E`` in a progress line, including the
+    unterminated final one whatever another writer glued onto it, or a
+    ``FAILED``/``ERROR`` outcome on a ``-v`` line.
+    """
+    if (
+        _carries_pytest_failure_verdict(output)
+        or _PYTEST_PROGRESS_FAILURE_RE.search(output)
+        or _PYTEST_VERBOSE_FAILURE_RE.search(output)
+    ):
+        return False
+    return is_shell_reported_external_kill(rc) or bool(_XDIST_CHANNEL_COLLAPSE_RE.search(output))
 
 
 # Pytest node-id extraction for the main-tip-sweep isolated-rerun confirm gate
@@ -929,6 +985,7 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
 # one exception: the crash notice is not line-anchored (it can appear
 # mid-line), so it instead relies on its distinctive literal "crashed while
 # running" prefix to avoid false matches.
+# Every extracted id passes through ``strip_xdist_group_suffix``.
 _FAILED_LINE_NODEID_RE = re.compile(r'^FAILED\s+(\S+\.py::\S+)', re.MULTILINE)
 _ERROR_LINE_NODEID_RE = re.compile(r'^ERROR\s+(\S+\.py::\S+)', re.MULTILINE)
 _ERROR_LINE_FILE_RE = re.compile(r'^ERROR\s+(\S+\.py)(?:\s|$)', re.MULTILINE)
@@ -939,6 +996,23 @@ _XDIST_NODE_DOWN_PRECEDING_NODEID_RE = re.compile(
     r'^(\S+\.py::\S+?)\s*\n\[gw\d+\] node down: Not properly terminated',
     re.MULTILINE,
 )
+
+
+def strip_xdist_group_suffix(node_id: str) -> str:
+    """*node_id* without the ``@<groups>`` suffix xdist appends under ``--dist loadgroup``.
+
+    The suffix comes from ``xdist/remote.py::WorkerInteractor.pytest_collection_modifyitems``
+    and is not an id plain pytest accepts.  An id with no ``::`` or with an unclosed
+    ``[`` in its final segment is returned unchanged.
+    """
+    head, sep, name = node_id.rpartition('::')
+    if not sep:
+        return node_id
+    params_end = name.rfind(']')
+    if name.rfind('[') > params_end:
+        return node_id
+    at = name.find('@', params_end + 1)
+    return node_id if at < 0 else f'{head}{sep}{name[:at]}'
 
 
 class FailureKind(StrEnum):
@@ -985,12 +1059,14 @@ def _summary_reason(test_output: str, match: re.Match[str]) -> str:
 
 def _failure_matches(test_output: str) -> list[_FailureMatch]:
     matches = [
-        _FailureMatch(m.start(1), m.group(1), kind, _summary_reason(test_output, m))
+        _FailureMatch(
+            m.start(1), strip_xdist_group_suffix(m.group(1)), kind, _summary_reason(test_output, m),
+        )
         for pattern, kind in _SUMMARY_LINE_SURFACES
         for m in pattern.finditer(test_output)
     ]
     matches += [
-        _FailureMatch(m.start(1), m.group(1), kind, None)
+        _FailureMatch(m.start(1), strip_xdist_group_suffix(m.group(1)), kind, None)
         for pattern, kind in _XDIST_CRASH_SURFACES
         for m in pattern.finditer(test_output)
     ]
@@ -1109,6 +1185,31 @@ def _extract_failing_test_ids(test_output: str) -> list[str]:
     return list(dict.fromkeys(match.node_id for match in _failure_matches(test_output)))
 
 
+def _xdist_crash_message(
+    test_output: str,
+    worktree_log_paths: list[str],
+    archive_log_paths: list[str],
+) -> str:
+    """The VerifyInfraError message for a bare worker crash: what crashed, and where its logs are.
+
+    Names only paths the persistence step returned, so every named file exists.
+    """
+    crashed = ', '.join(_extract_failing_test_ids(test_output)) or 'no node-id in the crash notice'
+    if archive_log_paths:
+        where = f'logs archived: {", ".join(archive_log_paths)}'
+    elif worktree_log_paths:
+        where = (
+            'logs NOT archived, worktree copies only (lost with the worktree): '
+            f'{", ".join(worktree_log_paths)}'
+        )
+    else:
+        where = (
+            'no log was persisted for this verify (no attempt id/task id or no '
+            '.task/ dir; a persistence error is in the orchestrator log)'
+        )
+    return f'bare pytest-xdist worker crash reclassified as transient infra; crashed: {crashed}; {where}'
+
+
 class _JunitTestIds(NamedTuple):
     """One junitxml report's test ids, split by what the report says happened.
 
@@ -1139,11 +1240,8 @@ def _junit_testcase_id(testcase: ET.Element) -> str:
     spellings would make every such comparison silently miss.
     """
     name = testcase.get('name', '')
-    classname = testcase.get('classname')
-    if classname:
-        return f'{classname}::{name}'
-    file_attr = testcase.get('file')
-    return f'{file_attr}::{name}' if file_attr else name
+    owner = testcase.get('classname') or testcase.get('file')
+    return strip_xdist_group_suffix(f'{owner}::{name}' if owner else name)
 
 
 def _junit_testcase_never_ran(testcase: ET.Element) -> bool:
@@ -1376,16 +1474,18 @@ _WEAK_FAILURE_MARKER_RE = re.compile(
 )
 
 # Union of strong+weak, plus a trailing bare "FAILED" substring alternative —
-# used by failure_report() as the emit-gate for the ## Test Failures section
-# (broadened from the legacy `'FAILED' in test_output` substring check to
-# "any failure marker present, OR that legacy substring itself"). The
+# used by failure_report() to pick the test section's HEADING: a match is
+# headed ## Test Failures, no match is the labelled ## Test Output. It no
+# longer decides whether the section appears; any non-empty test output does
+# (task 5357). (Broadened from the legacy `'FAILED' in test_output` substring
+# check to "any failure marker present, OR that legacy substring itself".) The
 # trailing `FAILED` alternative is what makes this a *genuine* superset: a
 # structurally-anchored marker alone is NOT one, since e.g. a cargo summary
 # line like "test result: FAILED. 3 passed; 1 failed" has no line-start/
 # line-end FAILED (see _PYTEST_FAILED_LINE_RE / _TRAILING_FAILED_RE) and no
 # strong/weak marker at all, yet still contains the old substring — without
-# this alternative such output would silently stop emitting the section.
-# Note this union is the emit *gate* only; _failure_anchored_excerpt anchors
+# this alternative such output would be headed as marker-less.
+# Note this union is the heading *selector* only; _failure_anchored_excerpt anchors
 # windows using _STRONG_FAILURE_MARKER_RE/_WEAK_FAILURE_MARKER_RE directly
 # (not this pattern), so a gate-only match like the cargo line above falls
 # back to _failure_anchored_excerpt's tail slice — identical to pre-anchoring
@@ -1470,6 +1570,42 @@ def _failure_anchored_excerpt(output: str, *, cap: int = 3000, window: int = 10)
 
     # Still over cap (or no strong windows survived) — hard tail-truncate.
     return excerpt[-cap:]
+
+
+_NO_FAILURE_MARKER_NOTE = (
+    'No failure marker matched in this output; the block above is its raw '
+    'tail, unfiltered.'
+)
+
+
+def _render_output_section(
+    heading: str, output: str, *, cap: int, note: str | None = None,
+    logs_listed: bool = False,
+) -> str:
+    """Render one leg's captured output as a failure-report section.
+
+    Serves failure_report's invariant that a non-empty leg output is never
+    silently dropped: every leg goes through this one renderer, which excerpts
+    with :func:`_failure_anchored_excerpt` and labels what it shows, including
+    when the excerpt is shorter than the output. Shape contract: the fence
+    sits directly under the heading and every annotation follows the closing
+    fence, because
+    ``orchestrator/src/orchestrator/b3_gate.py::_strip_captured_output`` strips
+    only a fence opened directly under a heading listed in
+    ``_FAILURE_REPORT_CAPTURED_HEADINGS``, which must name every heading this
+    helper renders.
+    """
+    excerpt = _failure_anchored_excerpt(output, cap=cap)
+    annotations = [note] if note else []
+    if len(excerpt) < len(output):
+        truncation = f'Excerpt: {len(excerpt):,} of {len(output):,} characters shown.'
+        if logs_listed:
+            truncation += ' Full output: the log files listed under Verify Logs.'
+        annotations.append(truncation)
+    section = f'{heading}\n\n```\n{excerpt}\n```'
+    if annotations:
+        section += '\n\n' + '\n'.join(annotations)
+    return section
 
 
 # _ARCHIVE_DENY_LIST, _CATEGORY_PRIORITY, and PREEXISTING_BREAK_SKIP_CATEGORIES
@@ -1703,8 +1839,12 @@ async def _on_main_probe_worktree(
     git_ops: object,
     main_sha: str,
     body: Callable[[Path], Awaitable[_ProbeOutcome]],
+    *,
+    log_label: str,
 ) -> _ProbeOutcome | None:
     """*body*'s answer in a MAIN_PROBE worktree of *main_sha*; None when the worktree or *body* raised.
+
+    *log_label* names the caller in the failure log line.
 
     warm_seed=True: the probe shares the rolling warm-lane CoW base with the
     ordinary task verifies it adjudicates, so any warm-base artifact bias is
@@ -1720,11 +1860,9 @@ async def _on_main_probe_worktree(
         ) as worktree:
             return await body(worktree)
     except EphemeralWorktreeError as e:
-        logger.warning(
-            'main_baseline_failing_ids: %s — baseline probe disabled for this attempt', e,
-        )
+        logger.warning('%s: %s — main probe disabled for this attempt', log_label, e)
     except Exception:
-        logger.warning('main_baseline_failing_ids: probe raised', exc_info=True)
+        logger.warning('%s: main probe raised', log_label, exc_info=True)
     return None
 
 
@@ -1748,6 +1886,7 @@ async def _whole_tree_main_baseline(
         lambda worktree: run_scoped_verification(
             worktree, config, module_configs, task_files=None, max_retries=0, role='merge',
         ),
+        log_label='main_baseline_failing_ids',
     )
     if probe_result is None:
         return None
@@ -1828,7 +1967,9 @@ async def _probe_modules_on_main(
             *(_probe(worktree, mc) for mc in module_configs), return_exceptions=True,
         )
 
-    results = await _on_main_probe_worktree(git_ops, main_sha, _probe_each)
+    results = await _on_main_probe_worktree(
+        git_ops, main_sha, _probe_each, log_label='main_baseline_failing_ids',
+    )
     if results is None:
         return None
 
@@ -2227,7 +2368,9 @@ def _tool_for_cmd(cmd: str | None) -> ToolKind:
     token).
 
     The same gating applies unconditionally to the lint/type checks: their
-    commands never resolve here to ``ToolKind.PYTEST``, so the pytest-scoped
+    commands resolve here to ``ToolKind.RUFF``/``ToolKind.PYRIGHT`` (chained
+    ones too, since task 4843 — identity only, raw retained) or to
+    ``ToolKind.OPAQUE``, never to ``ToolKind.PYTEST``, so the pytest-scoped
     shared-venv-mutation signatures can never fire for them — unlike the pre-δ
     tool-blind ladder, which consulted these signatures for every check's
     output (see the env-recovery retry's comment in ``run_verification`` for
@@ -2346,8 +2489,65 @@ def _worker_death_leg_note(label: str) -> str:
     )
 
 
-def _classify_leg(rc: int, out: str, timed_out: bool, cmd: str | None) -> FailureCategory:
-    return classify_failure(_tool_for_cmd(cmd), rc, out, timed_out)
+class LegSlot(StrEnum):
+    """Which of a module's three verify commands a leg ran."""
+
+    TEST = 'test'
+    LINT = 'lint'
+    TYPE = 'type'
+
+
+def _red_gate_category(slot: LegSlot) -> FailureCategory:
+    match slot:
+        case LegSlot.TEST:
+            return FailureCategory.UNKNOWN_TEST_FAILURE
+        case LegSlot.LINT:
+            return FailureCategory.LINT_ERROR
+        case LegSlot.TYPE:
+            return FailureCategory.TYPE_ERROR
+        case _:
+            assert_never(slot)
+
+
+def classify_leg(
+    slot: LegSlot, rc: int, output: str, timed_out: bool, cmd: str | None,
+) -> FailureCategory:
+    """The ONE per-leg classifier. ``classify_failure`` answers what the tool's
+    OUTPUT says; this adds what only verify knows: the leg's slot, and that
+    verify interposed the shell. It rewrites only the UNKNOWN_TEST_FAILURE
+    fall-through, so every more specific diagnosis survives.
+    """
+    tool = _tool_for_cmd(cmd)
+    category = classify_failure(tool, rc, output, timed_out)
+    if category != FailureCategory.UNKNOWN_TEST_FAILURE:
+        return category
+    if tool is ToolKind.PYTEST and _pytest_session_aborted_without_verdict(rc, output):
+        return FailureCategory.INFRA_ABORT
+    return _red_gate_category(slot)
+
+
+def _classify_failing_legs(
+    legs: Iterable[tuple[LegSlot, int, str, bool, str | None]],
+) -> dict[LegSlot, FailureCategory]:
+    """Each failing leg's own category, keyed by slot, in *legs* order.
+
+    The TYPE leg alone takes a cross-leg refinement (task 6127): a type
+    failure that the same run's passing pytest leg shows to be a partially
+    provisioned venv is ENV_TRANSIENT, not TYPE_ERROR.
+    """
+    by_slot = {leg[0]: leg for leg in legs}
+    _, test_rc, _, _, test_cmd = by_slot[LegSlot.TEST]
+    categories: dict[LegSlot, FailureCategory] = {}
+    for slot, rc, output, timed_out, cmd in by_slot.values():
+        if rc == 0:
+            continue
+        if slot is LegSlot.TYPE and _type_leg_read_partially_provisioned_venv(
+            rc, output, timed_out, cmd, test_rc=test_rc, test_cmd=test_cmd,
+        ):
+            categories[slot] = FailureCategory.ENV_TRANSIENT
+        else:
+            categories[slot] = classify_leg(slot, rc, output, timed_out, cmd)
+    return categories
 
 
 def _type_leg_read_partially_provisioned_venv(
@@ -2355,29 +2555,21 @@ def _type_leg_read_partially_provisioned_venv(
 ) -> bool:
     """True when task 6127's cross-leg refinement decides the TYPE leg.
 
-    Only an UNKNOWN_TEST_FAILURE fall-through qualifies, so every
-    ``classify_failure`` guard and every specific per-tool category stays
-    authoritative.  The output must show a partially provisioned venv that the
-    same run's passing pytest leg corroborates
+    Only an UNKNOWN_TEST_FAILURE fall-through of ``classify_failure``
+    qualifies, so every ``classify_failure`` guard and every specific per-tool
+    category stays authoritative.  The output must show a partially
+    provisioned venv that the same run's passing pytest leg corroborates
     (``verify_classify.py::is_partially_provisioned_venv_type_failure``).
-    ``_classify_type_leg`` and ``_warn_if_type_leg_read_partially_provisioned_venv``
-    both ask this one question, so the log never disagrees with the category.
+    ``_classify_failing_legs`` and
+    ``_warn_if_type_leg_read_partially_provisioned_venv`` both ask this one
+    question, so the log never disagrees with the category.
     """
-    return _classify_leg(rc, out, timed_out, cmd) == FailureCategory.UNKNOWN_TEST_FAILURE and (
+    category = classify_failure(_tool_for_cmd(cmd), rc, out, timed_out)
+    return category == FailureCategory.UNKNOWN_TEST_FAILURE and (
         is_partially_provisioned_venv_type_failure(
             out, test_tool=_tool_for_cmd(test_cmd), test_leg_passed=test_rc == 0,
         )
     )
-
-
-def _classify_type_leg(
-    rc: int, out: str, timed_out: bool, cmd: str | None, *, test_rc: int, test_cmd: str | None,
-) -> FailureCategory:
-    if _type_leg_read_partially_provisioned_venv(
-        rc, out, timed_out, cmd, test_rc=test_rc, test_cmd=test_cmd,
-    ):
-        return FailureCategory.ENV_TRANSIENT
-    return _classify_leg(rc, out, timed_out, cmd)
 
 
 def _warn_if_type_leg_read_partially_provisioned_venv(attempt: 'VerifyAttempt') -> None:
@@ -2405,6 +2597,7 @@ def _summarize_checks(
     test_duration: float | None = None,
     lint_duration: float | None = None,
     type_duration: float | None = None,
+    leg_categories: Mapping[LegSlot, FailureCategory] | None = None,
 ) -> tuple[bool, str, str, str, list[str]]:
     """Classify the three checks into (passed, category, cause_hint, summary,
     failing_leg_categories).
@@ -2476,32 +2669,33 @@ def _summarize_checks(
     every pre-existing caller is byte-identical (see the design decision on
     not refactoring to take ``CheckRun`` objects).  Both production call sites
     pass ``attempt.<leg>.duration_secs``, which they already hold.
+
+    ``leg_categories`` is ``VerifyAttempt.classify_failing_legs()`` over these
+    same legs, for a caller that also reads one leg's category: classifying
+    scans the leg's whole output, so ``run_verification`` classifies once and
+    its env-recovery gate reads the test slot. Omitted, it is computed here.
     """
     passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
     if passed:
         return True, 'passed', '', 'All checks passed', []
 
-    classify_type_leg = functools.partial(_classify_type_leg, test_rc=test_rc, test_cmd=test_cmd)
-    hint_parts = []
-    per_check_categories: list[str] = []
-    for rc, out, to, cmd, classify in (
-        (test_rc, test_out, test_timed_out, test_cmd, _classify_leg),
-        (lint_rc, lint_out, lint_timed_out, lint_cmd, _classify_leg),
-        (type_rc, type_out, type_timed_out, type_cmd, classify_type_leg),
-    ):
-        if rc != 0:
-            h = _extract_cause_hint(out)
-            if h:
-                hint_parts.append(h)
-            per_check_categories.append(classify(rc, out, to, cmd))
-    cause_hint = ' | '.join(hint_parts)
+    legs = (
+        (LegSlot.TEST, test_rc, test_out, test_timed_out, test_cmd),
+        (LegSlot.LINT, lint_rc, lint_out, lint_timed_out, lint_cmd),
+        (LegSlot.TYPE, type_rc, type_out, type_timed_out, type_cmd),
+    )
+    if leg_categories is None:
+        leg_categories = _classify_failing_legs(legs)
+    hints = (_extract_cause_hint(out) for _, rc, out, _, _ in legs if rc != 0)
+    cause_hint = ' | '.join(hint for hint in hints if hint)
+    per_check_categories: list[str] = [*leg_categories.values()]
     category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
     parts = []
     for rc, out, label, tool_verdict, duration in (
-        (test_rc, test_out, 'test', 'tests failed', test_duration),
-        (lint_rc, lint_out, 'lint', 'lint issues', lint_duration),
-        (type_rc, type_out, 'type', 'type errors', type_duration),
+        (test_rc, test_out, LegSlot.TEST, 'tests failed', test_duration),
+        (lint_rc, lint_out, LegSlot.LINT, 'lint issues', lint_duration),
+        (type_rc, type_out, LegSlot.TYPE, 'type errors', type_duration),
     ):
         if rc == 0:
             continue
@@ -2517,7 +2711,7 @@ def _summarize_checks(
         # task 3173's wording for that case must not regress.
         if is_external_kill_rc(rc):
             parts.append(_killed_leg_note(label, rc, duration))
-        elif label == 'test' and _is_worker_death_truncated_session(out):
+        elif label is LegSlot.TEST and _is_worker_death_truncated_session(out):
             if _first_surviving_failure_line(out) is not None:
                 parts.append(tool_verdict)
             parts.append(_worker_death_leg_note(label))
@@ -2964,6 +3158,7 @@ def _archive_attempt_log(
     category: str,
     *,
     stamp: str,
+    infra_reclassified: bool = False,
 ) -> list[Path]:
     """Copy worktree logs to the durable archive when ``category`` warrants it.
 
@@ -2974,7 +3169,12 @@ def _archive_attempt_log(
 
     Early-returns ``[]`` when:
     - ``archive_root`` is ``None``
-    - ``_should_archive_category(category)`` is ``False``
+    - ``_should_archive_category(category)`` is ``False`` and the attempt is
+      not *infra_reclassified*
+
+    An *infra_reclassified* attempt archives whatever its category, because
+    like every infra-transient row it heads for a bounded retry ending in a
+    human hold (``verify_categories.py::_assert_infra_transient_rows_archive``).
 
     All filesystem errors are caught, logged, and swallowed (best-effort).
 
@@ -2986,7 +3186,7 @@ def _archive_attempt_log(
     """
     if archive_root is None:
         return []
-    if not _should_archive_category(category):
+    if not (infra_reclassified or _should_archive_category(category)):
         return []
 
     target_dir = archive_root / task_id
@@ -4306,29 +4506,37 @@ class VerifyAttempt:
             and all(c.rc == 0 or c.timed_out for c in self.checks)
         )
 
-    def _by_label(self, label: str) -> CheckRun:
-        found = next((c for c in self.checks if c.label == label), None)
+    def _by_label(self, slot: LegSlot) -> CheckRun:
+        found = next((c for c in self.checks if c.label == slot), None)
         if found is None:
             raise KeyError(
-                f'no check labeled {label!r} in {[c.label for c in self.checks]}'
+                f'no check labeled {slot.value!r} in {[str(c.label) for c in self.checks]}'
             )
         return found
 
     @property
     def test(self) -> CheckRun:
-        return self._by_label('test')
+        return self._by_label(LegSlot.TEST)
 
     @property
     def lint(self) -> CheckRun:
-        return self._by_label('lint')
+        return self._by_label(LegSlot.LINT)
 
     @property
     def type(self) -> CheckRun:
         # Shadows the `type` builtin, but this project's ruff config selects
         # ["E", "F", "UP", "B", "SIM", "I"] — flake8-builtins ("A") is not
         # enabled — so this is lint-safe; matches the CheckRun.label vocabulary
-        # ('test'/'lint'/'type') used throughout verify.py.
-        return self._by_label('type')
+        # (LegSlot) used throughout verify.py.
+        return self._by_label(LegSlot.TYPE)
+
+    def classify_failing_legs(self) -> dict[LegSlot, FailureCategory]:
+        """Each failing check's own category (``classify_leg``), keyed by slot."""
+        checks = ((slot, self._by_label(slot)) for slot in LegSlot)
+        return _classify_failing_legs(
+            (slot, check.rc, check.output, check.timed_out, check.cmd)
+            for slot, check in checks
+        )
 
 
 def _module_attribution_mismatch(
@@ -4447,6 +4655,14 @@ class VerifyResult:
     # UNSCOPED_TYPECHECK_* sentinel results, and any hand-constructed result.
     # `[]` = "no failing legs" (a pass), which is likewise not a licence.
     failing_leg_categories: list[str] | None = None
+    # Task 5357: True iff the TEST leg ran and exited non-zero. `lint_output` and
+    # `type_output` are blanked on a passing leg at construction but
+    # `test_output` is not (chronic_flake reads it on passes), so
+    # `failure_report` needs this to tell a failed test leg's raw tail from a
+    # green run's. False is the default for results that never recorded it
+    # (hand-built, `_trivial_pass`, an older remote's wire payload), which keeps
+    # their report as before: a marker-less test output is not shown.
+    test_leg_failed: bool = False
     # Task 2823: True IFF this result came from _trivial_pass — a config-only
     # (no .py/.rs) merge that short-circuited verification WITHOUT running any
     # suite. The merge worker's pass path keys on this to refuse advancing main
@@ -4580,13 +4796,31 @@ class VerifyResult:
                 for p in self.archive_log_paths:
                     log_lines.append(f'- {p}')
             sections.append('\n'.join(log_lines))
-        if self.test_output and _FAILURE_MARKER_RE.search(self.test_output):
-            excerpt = _failure_anchored_excerpt(self.test_output, cap=3000)
-            sections.append(f'## Test Failures\n\n```\n{excerpt}\n```')
-        if self.lint_output and self.lint_output.strip():
-            sections.append(f'## Lint Issues\n\n```\n{self.lint_output[-2000:]}\n```')
-        if self.type_output and 'error' in self.type_output.lower():
-            sections.append(f'## Type Errors\n\n```\n{self.type_output[-2000:]}\n```')
+        logs_listed = bool(self.worktree_log_paths or self.archive_log_paths)
+        if self.test_output.strip():
+            if _FAILURE_MARKER_RE.search(self.test_output):
+                sections.append(_render_output_section(
+                    '## Test Failures', self.test_output, cap=3000,
+                    logs_listed=logs_listed,
+                ))
+            elif self.test_leg_failed:
+                sections.append(_render_output_section(
+                    '## Test Output', self.test_output, cap=3000,
+                    note=_NO_FAILURE_MARKER_NOTE, logs_listed=logs_listed,
+                ))
+        if self.lint_output.strip():
+            sections.append(_render_output_section(
+                '## Lint Issues', self.lint_output, cap=2000, logs_listed=logs_listed,
+            ))
+        if 'error' in self.type_output.lower():
+            sections.append(_render_output_section(
+                '## Type Errors', self.type_output, cap=2000, logs_listed=logs_listed,
+            ))
+        elif self.type_output.strip():
+            sections.append(_render_output_section(
+                '## Type Check Output', self.type_output, cap=2000,
+                note=_NO_FAILURE_MARKER_NOTE, logs_listed=logs_listed,
+            ))
         return '\n\n'.join(sections) if sections else self.summary
 
 
@@ -6946,7 +7180,7 @@ async def run_verification(
     async def _run_or_skip_timed(
         cmd: str | None,
         *,
-        label: str,
+        label: LegSlot,
         current_attempt: int,
     ) -> CheckRun:
         """Like _run_cmd but returns a CheckRun capturing (rc, output, timed_out,
@@ -6970,7 +7204,7 @@ async def run_verification(
         # collected" (task 5671).
         chain_segments = (
             split_and_chain_segments(config_cmd)
-            if segment_chained_test and label == 'test'
+            if segment_chained_test and label is LegSlot.TEST
             else None
         )
         # junitxml injection (task μ, verify-scope-inversion-prd.md): only
@@ -6985,7 +7219,7 @@ async def run_verification(
         # before the cpu-governance wrap immediately below: once governed,
         # cmd is an opaque outer `<exec> -- /bin/bash -c '...'` string that
         # parse_config_command can no longer see as pytest.
-        if junit.leg_path is not None and label == 'test' and chain_segments is None:
+        if junit.leg_path is not None and label is LegSlot.TEST and chain_segments is None:
             # THE chokepoint: every test-leg invocation in this call reaches
             # here — all three branches of the retry loop and the env-recovery
             # re-run — so clearing here is once per pytest run, which is the
@@ -6999,7 +7233,7 @@ async def run_verification(
         # Resolved here rather than after the governance wrap below because
         # the `-n` gate reads it and must itself precede that wrap; it
         # depends on nothing but config/label, so the move is inert.
-        admission = _verify_admission_active(config) and label == 'test'
+        admission = _verify_admission_active(config) and label is LegSlot.TEST
         # -n cap (task 2394 T6): capping is a property of the SAME role set
         # the slot semaphore gates, so it asks T1's is_gated_role rather than
         # re-deriving that set (task 5424) — 'merge' bypasses slot-counting
@@ -7287,7 +7521,7 @@ async def run_verification(
         # test_verify_ruff_config_boundary.py::TestEscapeProbeIsGated). Fires
         # on green legs too: the escape is about which RULE SET ran, which is
         # exactly the question a green result cannot answer for itself.
-        if label == 'lint' and _command_invokes_ruff(config_cmd):
+        if label is LegSlot.LINT and _command_invokes_ruff(config_cmd):
             await _report_ruff_config_escape(worktree)
         if rc != 0 and is_interpreter_missing_workspace_packages(out):
             logger.error(
@@ -7300,7 +7534,7 @@ async def run_verification(
                 'instead of this worktree\'s own .venv. Fix surface: pin '
                 '[tool.pyright] venvPath/venv in the checked subproject\'s '
                 'pyproject.toml. See task 3367 / esc-3359-1.',
-                label,
+                label.value,
                 len(unresolved_top_level_modules(out)),
             )
         return CheckRun(
@@ -7387,33 +7621,33 @@ async def run_verification(
         # pre-loop sentinel scaffolding needed.
         if concurrent:
             attempt = VerifyAttempt(list(await asyncio.gather(
-                _run_or_skip_timed(test_cmd, label='test', current_attempt=current_attempt_id),
-                _run_or_skip_timed(lint_cmd, label='lint', current_attempt=current_attempt_id),
-                _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id),
+                _run_or_skip_timed(test_cmd, label=LegSlot.TEST, current_attempt=current_attempt_id),
+                _run_or_skip_timed(lint_cmd, label=LegSlot.LINT, current_attempt=current_attempt_id),
+                _run_or_skip_timed(type_cmd, label=LegSlot.TYPE, current_attempt=current_attempt_id),
             )))
         elif lint_first:
             # Merge-role fail-fast: run lint first; on a lint failure, short-
             # circuit — record test+type as skipped (vacuous rc=0 passes) and
             # let the attempt fail on the lint leg, so a lint-only-red merge
             # skips the long test phase entirely.
-            lint_run = await _run_or_skip_timed(lint_cmd, label='lint', current_attempt=current_attempt_id)
+            lint_run = await _run_or_skip_timed(lint_cmd, label=LegSlot.LINT, current_attempt=current_attempt_id)
             if lint_run.rc != 0:
                 attempt = VerifyAttempt([
-                    CheckRun.skipped('test'), lint_run, CheckRun.skipped('type'),
+                    CheckRun.skipped(LegSlot.TEST), lint_run, CheckRun.skipped(LegSlot.TYPE),
                 ])
             else:
                 # Lint green: run test+type, then assemble in canonical
                 # [test, lint, type] order (not execution order) so the green-
                 # path VerifyResult and persisted artifacts stay byte-identical
                 # to the plain-sequential branch below.
-                test_run = await _run_or_skip_timed(test_cmd, label='test', current_attempt=current_attempt_id)
-                type_run = await _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id)
+                test_run = await _run_or_skip_timed(test_cmd, label=LegSlot.TEST, current_attempt=current_attempt_id)
+                type_run = await _run_or_skip_timed(type_cmd, label=LegSlot.TYPE, current_attempt=current_attempt_id)
                 attempt = VerifyAttempt([test_run, lint_run, type_run])
         else:
             attempt = VerifyAttempt([
-                await _run_or_skip_timed(test_cmd, label='test', current_attempt=current_attempt_id),
-                await _run_or_skip_timed(lint_cmd, label='lint', current_attempt=current_attempt_id),
-                await _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id),
+                await _run_or_skip_timed(test_cmd, label=LegSlot.TEST, current_attempt=current_attempt_id),
+                await _run_or_skip_timed(lint_cmd, label=LegSlot.LINT, current_attempt=current_attempt_id),
+                await _run_or_skip_timed(type_cmd, label=LegSlot.TYPE, current_attempt=current_attempt_id),
             ])
 
         test_runs.append(attempt.test)
@@ -7433,6 +7667,7 @@ async def run_verification(
 
     # Build summary/category/cause_hint (shared with the env-recovery retry
     # below via _summarize_checks — see task 2048 code_duplication fix).
+    leg_categories = attempt.classify_failing_legs()
     passed, category, cause_hint, summary, failing_leg_categories = _summarize_checks(
         attempt.test.rc, attempt.test.output, attempt.test.timed_out, attempt.test.cmd,
         attempt.lint.rc, attempt.lint.output, attempt.lint.timed_out, attempt.lint.cmd,
@@ -7440,66 +7675,26 @@ async def run_verification(
         test_duration=attempt.test.duration_secs,
         lint_duration=attempt.lint.duration_secs,
         type_duration=attempt.type.duration_secs,
+        leg_categories=leg_categories,
     )
     if timed_out:
         summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
 
-    # Bounded env-recovery retry: a shared-venv-mutation transient (a
-    # concurrent `uv sync` elsewhere vanishing xdist/pip mid-run) is an infra
-    # transient, not a code regression. Auto-recover with a single
-    # forced-serial retry of the test command — mirrors the pure-timeout
-    # retry loop above, but is gated on `category` rather than a timeout
-    # flag, and only re-runs the test command since lint/type do not
-    # exercise xdist/pip. Recovery passing means the env recovered -> GREEN;
-    # recovery still hitting env_transient means it stays environmental
-    # (NOT misattributed to test_failure/unknown_test_failure); recovery
-    # surfacing a different category means that real signal is reported.
+    # Bounded env-recovery retry: a shared-venv mutation (a concurrent `uv
+    # sync` elsewhere vanishing xdist/pip mid-run) is an infra transient of the
+    # TEST leg, not a code regression, so only the test command is re-run,
+    # once and forced serial. A green re-run means the env recovered; a re-run
+    # still ENV_TRANSIENT stays environmental; any other result is reported.
     #
-    # This branch can only fire when test_cmd resolves to ToolKind.PYTEST via
-    # _tool_for_cmd (see that function's docstring) — a test command wrapped
-    # such that the parser can't see a literal `pytest` token never produces
-    # ENV_TRANSIENT and so never reaches this retry, even on a genuine
-    # shared-venv mutation. True of every production test_cmd today.
+    # It fires on the test leg's OWN classification: guard 3 makes
+    # ENV_TRANSIENT reachable from lint/type legs, and the run-wide category
+    # is the worst across legs, so neither says whether the test leg needs
+    # recovery (task #4103).
     #
-    # This PYTEST-only narrowing is broader than just that wrapped-test-cmd
-    # case: the pre-δ tool-blind ladder also consulted these env_transient
-    # signatures against the LINT and TYPE check outputs (it classified
-    # whatever output it was handed, uniformly across all three checks),
-    # whereas the RUFF/PYRIGHT tables and the OPAQUE fallback never do now.
-    # A conscious tradeoff, not an unnoticed side effect: the signatures are
-    # pytest/xdist-specific text ruff/pyright would not emit, and this retry
-    # only ever re-runs the test command regardless (lint/type don't exercise
-    # xdist/pip — see above).
-    #
-    # RETIRED COROLLARY (task 3367): this block used to conclude from the above
-    # that "a lint or type-check failure cannot classify as env_transient by
-    # construction, only the test leg can". That is FALSE as of task 3367.
-    # `classify_failure` guard 3 (`_classify_environmental`) is tool-blind and
-    # now has three ToolKind-independent ENV_TRANSIENT producers — task 2756's
-    # broken `_merge-verify` worktree, task 2831's restart collateral, and task
-    # 3367's mis-resolved pyright interpreter (esc-3359-1) — any of which a TYPE
-    # or LINT leg can trip. The category therefore no longer implies the TEST
-    # leg was the failing one, so the gate below establishes that itself with an
-    # explicit `attempt.test.rc != 0`.
-    #
-    # THE RULE (task 3367): this recovery exists for the TEST leg's shared-venv
-    # mutation, and its only action is to re-run the TEST command serially. It
-    # therefore fires only when the TEST leg is the failing one. When the test
-    # leg already passed there is nothing to recover and the re-run cannot
-    # change the verdict — it just spends a full test-suite wall-clock (1320.9s
-    # in esc-3359-1, where test rc=0, lint rc=0, type rc=1) before returning the
-    # same red, under a "vanished xdist/pip" warning that misdescribes the
-    # actual failure. A lint/type env_transient is instead reported directly —
-    # loudly (see the per-check ERROR in _run_or_skip_timed) and
-    # infra-transient at the merge lane — with no pointless test re-run.
-    #
-    # The rc check is correct on its own terms, independent of task 3367's new
-    # classification: re-running a passing leg can never recover anything.
-    if (
-        category == FailureCategory.ENV_TRANSIENT
-        and attempt.test.cmd is not None
-        and attempt.test.rc != 0
-    ):
+    # The vanished-xdist/pip signatures and the serial rewrite apply only to
+    # a test command resolving to ToolKind.PYTEST; any other test command
+    # classified ENV_TRANSIENT is re-run unchanged (_serial_pytest_str).
+    if leg_categories.get(LegSlot.TEST) == FailureCategory.ENV_TRANSIENT:
         recovered_test_cmd = _serial_pytest_str(attempt.test.cmd, invocation_dir=worktree)
         logger.warning(
             'Verification hit an environmental shared-venv transient '
@@ -7508,7 +7703,7 @@ async def run_verification(
             recovered_test_cmd,
         )
         new_test = await _run_or_skip_timed(
-            recovered_test_cmd, label='test', current_attempt=current_attempt_id,
+            recovered_test_cmd, label=LegSlot.TEST, current_attempt=current_attempt_id,
         )
         test_runs.append(new_test)
 
@@ -7561,8 +7756,10 @@ async def run_verification(
     # `not is_merge_verify` — mirrors the _mark_verify_warm precedent below
     # — because the merge path (merge_queue.py) has no VerifyInfraError
     # handler and an uncaught raise there would stall the merge queue.
-    # Raising here (rather than returning a failure category) routes
-    # through the EXISTING bounded exponential-backoff retry
+    # Raising (rather than returning a failure category) only after the
+    # persistence block below has persisted and archived the attempt's logs
+    # (task 5527), so the human who resolves a resulting infra_hold has them,
+    # routes through the EXISTING bounded exponential-backoff retry
     # (_run_scoped_verification_with_infra_retry in workflow.py) instead of
     # the debugfix loop's DEBUGGER invocation — the task-path's only
     # auto-retry-without-debugging mechanism.
@@ -7586,13 +7783,14 @@ async def run_verification(
     # line xdist synthesizes for that test is crash-attributed (task 5082), so
     # it too takes the bounded infra retry and, recurring, infra_hold +
     # escalate_to_human instead of the debugger.
-    if (
+    bare_xdist_crash = (
         not is_merge_verify
         and attempt.test.rc != 0
         and attempt.lint.rc == 0
         and attempt.type.rc == 0
         and _is_bare_xdist_worker_crash(attempt.test.output)
-    ):
+    )
+    if bare_xdist_crash:
         logger.warning(
             'Task %s: bare pytest-xdist worker crash detected (module_prefix=%r) '
             'with no real failure marker in test output — reclassifying as '
@@ -7600,7 +7798,7 @@ async def run_verification(
             'for the bounded whole-suite retry instead of invoking the debugger',
             task_id, module_prefix,
         )
-        raise VerifyInfraError(phase='xdist_worker_crash', errno=None)
+        cause_hint = f'{cause_hint} | reclassified as transient infra (xdist_worker_crash)'
 
     # Name the unrun segments in the one-line verdict (task 3338 / esc-3062-2).
     # `_summarize_checks` already surfaces the NOT RUN block's "unknown is not a
@@ -7670,10 +7868,19 @@ async def run_verification(
             worktree_log_paths = [str(p) for p in wt_paths]
             arch_paths = _archive_attempt_log(
                 wt_paths, archive_root, task_id, attempt_id, category, stamp=stamp,
+                infra_reclassified=bare_xdist_crash,
             )
             archive_log_paths = [str(p) for p in arch_paths]
         except Exception as exc:  # noqa: BLE001
             logger.warning('run_verification: persistence error (non-fatal): %s', exc)
+
+    if bare_xdist_crash:
+        raise VerifyInfraError(
+            phase='xdist_worker_crash', errno=None,
+            message=_xdist_crash_message(
+                attempt.test.output, worktree_log_paths, archive_log_paths,
+            ),
+        )
 
     # When the three verify commands ran concurrently (asyncio.gather) the
     # true wall-clock cost is the longest single command, not their sum.
@@ -7716,6 +7923,7 @@ async def run_verification(
         test_output=attempt.test.output,
         lint_output=attempt.lint.output if attempt.lint.rc != 0 else '',
         type_output=attempt.type.output if attempt.type.rc != 0 else '',
+        test_leg_failed=attempt.test.rc != 0,
         summary=summary,
         timed_out=timed_out,
         cause_hint=cause_hint,
@@ -7908,6 +8116,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        test_leg_failed=any(r.test_leg_failed for r in results),
         admission_legs=tuple(leg for r in results for leg in (r.admission_legs or ())) or None,
     )
 
@@ -8072,6 +8281,23 @@ def _worktree_reader(
     return _read
 
 
+def _worktree_pkg_test_lister(worktree: Path) -> Callable[[str], list[str]]:
+    """Build a ``verify_plan`` ``list_pkg_tests`` seam bound to *worktree*.
+
+    Maps a module prefix to every ``.py`` file under ``worktree/<pkg>/tests``
+    as worktree-relative POSIX paths. Which of them pytest can collect is the
+    consumer's decision, made in ``verify_plan``: the reverse-dependency
+    widening and ``derive_verify_plan``'s task-role whole-tree guard-family
+    enumeration.
+    """
+    def _list(pkg: str) -> list[str]:
+        tests_dir = worktree / pkg / 'tests'
+        if not tests_dir.is_dir():
+            return []
+        return [p.relative_to(worktree).as_posix() for p in tests_dir.rglob('*.py')]
+    return _list
+
+
 # Maps a PlannedRun's reason-string tool prefix to the ModuleConfig attribute
 # it renders into. Used by _executed_module_configs_from_plan to recover
 # which of test_command/lint_command/type_check_command a PlannedRun belongs
@@ -8079,10 +8305,12 @@ def _worktree_reader(
 # per-tool run's reason is prefixed with the tool name ... so a caller can
 # recover tool identity even for a SKIPPED slot") rather than `run.cmd.tool`,
 # because an OPAQUE-parsed command — an unrecognised head, e.g. a synthetic
-# test-fixture command or dark_factory's real multi-clause fleet lint/type
-# `&&`-chains (config.yaml) — always resolves to the SAME `ToolKind.OPAQUE`
-# regardless of which slot produced it, so `cmd.tool` alone cannot tell an
-# OPAQUE lint command apart from an OPAQUE test command. A SKIPPED run's cmd
+# test-fixture command, or a chain invoking no recognised tool or two of them
+# — always resolves to the SAME `ToolKind.OPAQUE` regardless of which slot
+# produced it, so `cmd.tool` alone cannot tell an OPAQUE lint command apart
+# from an OPAQUE test command. (dark_factory's own fleet lint/type `&&`-chains
+# resolve RUFF/PYRIGHT since task 4843, but nothing requires every project's
+# commands to.) A SKIPPED run's cmd
 # is None and needs no attribution, since the corresponding ModuleConfig
 # field is simply left unset (None) there.
 _MC_ATTR_BY_REASON_PREFIX: tuple[tuple[str, str], ...] = (
@@ -8404,11 +8632,10 @@ def _reverse_dependency_module_configs(
     scoping branch), not something this helper can close on its own.
 
     Thin impure wrapper around the pure
-    :func:`verify_plan.reverse_dependent_test_targets`: builds a
-    ``list_pkg_tests`` closure (rglobs ``worktree/<pkg>/tests`` for ``.py``
-    files, mapped to worktree-relative POSIX paths, filtered to genuinely
-    pytest-collectable files via ``verify_plan._is_collectable_test_file`` —
-    mirrors how ``derive_verify_plan`` selects collectable tests) and a
+    :func:`verify_plan.reverse_dependent_test_targets`: builds its
+    ``list_pkg_tests`` seam via :func:`_worktree_pkg_test_lister` (every
+    ``.py`` file under ``worktree/<pkg>/tests``, mapped to worktree-relative
+    POSIX paths; the pure function keeps only the collectable ones) and a
     ``read_content`` reader via :func:`_worktree_reader` (threaded with the
     caller's *content_cache*, so a file already read elsewhere this attempt
     is not read from disk twice).
@@ -8439,17 +8666,11 @@ def _reverse_dependency_module_configs(
     survives via ``replace`` so the widened run uses the dependent's normal
     per-module overrides.
     """
-    def _list_pkg_tests(pkg: str) -> list[str]:
-        tests_dir = worktree / pkg / 'tests'
-        if not tests_dir.is_dir():
-            return []
-        rel_paths = (p.relative_to(worktree).as_posix() for p in tests_dir.rglob('*.py'))
-        return [p for p in rel_paths if verify_plan._is_collectable_test_file(p)]
-
     read_content = _worktree_reader(worktree, cache=content_cache)
 
     triggered = verify_plan.reverse_dependent_test_targets(
-        changed_files, verify_plan._REVERSE_TEST_DEPENDENTS, _list_pkg_tests, read_content,
+        changed_files, verify_plan._REVERSE_TEST_DEPENDENTS,
+        _worktree_pkg_test_lister(worktree), read_content,
     )
 
     widened: list[ModuleConfig] = []
@@ -8811,6 +9032,7 @@ async def _run_scoped_verification_body(
                 plan = verify_plan.derive_verify_plan(
                     existing_files, module_configs, config,
                     _worktree_reader(worktree, cache=_content_cache), role=role,
+                    list_pkg_tests=_worktree_pkg_test_lister(worktree),
                 )
                 scoped = _executed_module_configs_from_plan(module_configs, plan)
                 scoped_prefixes = {mc.prefix for mc in scoped}
@@ -9248,6 +9470,100 @@ async def _run_scoped_verification_body(
         _maybe_prune_archive(archive_root)
 
 
+#: Receives the task-mu fork's ``passes_in_isolation`` observation and the main
+#: SHA it was re-run on. The merge lane binds it to the flake recorder
+#: (``merge_lane/worker.py::_main_probe_flake_sink``); this module never imports
+#: the recorder, so the discriminator stays pure.
+FlakeObservationSink = Callable[[FlakeSuppression, str], Awaitable[None]]
+
+
+def _mu_fork_confirmed_red_key(main_sha: str, branch_ids: frozenset[str]) -> tuple[str, str, str]:
+    digest = hashlib.sha1('\n'.join(sorted(branch_ids)).encode()).hexdigest()
+    return main_sha, 'mu_fork_confirmed_red', digest
+
+
+async def _wholly_preexisting_after_flake_gate(
+    failing_result: VerifyResult,
+    branch_ids: frozenset[str],
+    config: 'OrchestratorConfig',
+    module_configs: 'list[ModuleConfig]',
+    git_ops: object,
+    main_sha: str,
+    flake_sink: FlakeObservationSink | None,
+) -> tuple[bool, str]:
+    """The task-mu fork's verdict once every one of *branch_ids* is red in main's baseline.
+
+    ``(True, main_sha)`` stands unless the named failures, re-run in isolation
+    on main, all PASS: a load flake can starve the same test in the branch's
+    gate and in main's one-shot baseline probe, so matching id sets alone can
+    declare a green main broken. On ``passes_in_isolation`` the answer is
+    ``(False, '')`` and *flake_sink* receives the observation.
+
+    The re-run happens in a worktree pinned at *main_sha*, never the task's
+    worktree the caller passes: the verdict is a claim about main, and the
+    merge worktree that produced *failing_result* is already gone by the time
+    the merge lane classifies (``merge_lane/worker.py::_classify_main_health_red``).
+    A task tree is older main plus the branch, so a break that main gained
+    after the branch's base would pass there and be wrongly suppressed.
+
+    One-way ratchet: every other outcome keeps ``(True, main_sha)`` — no
+    recoverable node-id (checked before any worktree is made), a worktree that
+    could not be made, ``unconfirmable``, or an isolated pass that examined
+    fewer tests than the junit report names. A confirmed red is cached per
+    (main SHA, id set) so sibling merges against a genuinely red main pay one
+    re-run; a pass or an unconfirmable answer is a statement about host load
+    and is never cached. A raising *flake_sink* is logged and changes nothing.
+    """
+    if not _extract_failing_test_ids(failing_result.test_output):
+        return True, main_sha
+    cache_key = _mu_fork_confirmed_red_key(main_sha, branch_ids)
+    cached = _PROBE_CACHE.get(cache_key)
+    if cached is not None and time.monotonic() - cached[0] < _PROBE_CACHE_TTL:
+        return True, main_sha
+    # Widened here, not by the caller: at breadth='full' the merge gate ran every
+    # registered module, so a red id from a module the task never touched must still
+    # map to its subproject, while the signature probe keeps the task-scoped set.
+    rerun_modules = verify_plan.effective_merge_module_configs(config, module_configs)
+    observation = await _on_main_probe_worktree(
+        git_ops, main_sha,
+        lambda probe_worktree: confirm_isolated_rerun_verdict(
+            probe_worktree, config, rerun_modules, failing_result,
+            call_site=FlakeCallSite.main_probe,
+        ),
+        log_label='verify_failure_is_preexisting_on_main mu-fork flake gate',
+    )
+    if observation is None:
+        return True, main_sha
+    if observation.verdict is FlakeVerdict.fails_in_isolation:
+        _PROBE_CACHE[cache_key] = (time.monotonic(), True)
+        return True, main_sha
+    if observation.verdict is not FlakeVerdict.passes_in_isolation:
+        return True, main_sha
+    examined = frozenset(observation.test_ids)
+    if len(examined) < len(branch_ids):
+        logger.info(
+            'verify_failure_is_preexisting_on_main: isolated re-run on main %.8s '
+            'passed but examined %d test(s) of the %d the junit report names; '
+            'keeping the preexisting verdict', main_sha, len(examined), len(branch_ids),
+        )
+        return True, main_sha
+    logger.warning(
+        'verify_failure_is_preexisting_on_main: %s passed on isolated re-run on '
+        'main %.8s; downgrading the wholly-preexisting baseline verdict to task-own '
+        '(main is not red for these tests)', sorted(examined), main_sha,
+    )
+    if flake_sink is not None:
+        try:
+            await flake_sink(observation, main_sha)
+        except Exception:
+            logger.warning(
+                'verify_failure_is_preexisting_on_main: recording the mu-fork flake '
+                'observation failed (main_sha=%.8s); the verdict is unaffected',
+                main_sha, exc_info=True,
+            )
+    return False, ''
+
+
 async def verify_failure_is_preexisting_on_main(
     worktree: Path,
     config: 'OrchestratorConfig',
@@ -9255,6 +9571,8 @@ async def verify_failure_is_preexisting_on_main(
     task_files: 'list[str] | None',
     failing_result: VerifyResult,
     git_ops: object,
+    *,
+    flake_sink: FlakeObservationSink | None = None,
 ) -> tuple[bool, str]:
     """Detect whether *failing_result* is inherited from the current main HEAD.
 
@@ -9311,6 +9629,9 @@ async def verify_failure_is_preexisting_on_main(
             See the 2026-07-29 reify-allowlist incident, whose shape was a
             guard that skipped on one side of a comparison and looked
             pass-shaped on the other.
+          - CONFIRM GATE (task 3788): every branch-failing id is red in
+            main's baseline, but each named failure passed on an isolated
+            re-run on main (``_wholly_preexisting_after_flake_gate``).
           - CONFIRM GATE (task 3597): the signature matched, but
             ``_main_probe_failure_is_isolated_flake`` positively confirmed
             every named failing test passes in isolation on the main
@@ -9320,12 +9641,13 @@ async def verify_failure_is_preexisting_on_main(
             genuine lint/type break, the one-way-ratchet guarantee, and
             why the downgrade is deliberately not cached).
 
-    CONFIRM GATE (task 3597): a signature match alone is not trusted
-    blindly — see ``_main_probe_failure_is_isolated_flake``'s docstring for
-    the full contract.  This gate is scoped to the signature-comparison
-    path only — the task-μ baseline-diff fork above
-    (``failing_result.failing_test_ids is not None``) returns before this
-    point and is untouched.
+    CONFIRM GATES: neither decision path trusts a match blindly.  The
+    signature-comparison path re-runs through
+    ``_main_probe_failure_is_isolated_flake`` (task 3597); the task-μ
+    baseline-diff fork (``failing_result.failing_test_ids is not None``)
+    re-runs through ``_wholly_preexisting_after_flake_gate`` (task 3788),
+    which hands a ``passes_in_isolation`` observation to *flake_sink*.  Both
+    re-run on main, and both are documented on those functions.
 
     A process-wide TTL cache (keyed by (main_sha, category, normalised cause_hint))
     avoids redundant probes from the same or sibling tasks against an unchanged main.
@@ -9397,7 +9719,10 @@ async def verify_failure_is_preexisting_on_main(
             if baseline is not None:
                 branch_ids = frozenset(failing_result.failing_test_ids)
                 if is_wholly_preexisting(branch_ids, baseline):
-                    return True, main_sha
+                    return await _wholly_preexisting_after_flake_gate(
+                        failing_result, branch_ids, config, module_configs,
+                        git_ops, main_sha, flake_sink,
+                    )
                 # Task 3226: a SKIP is not a PASS.  An attributable id (main
                 # ran it green) blames the branch; a diff made up entirely of
                 # ids main skipped proves nothing and defers to the signature
@@ -10951,10 +11276,11 @@ def _psi_cpu_some10_or_none() -> float | None:
 #: assigns after the leg's tests ran to a verdict: a FAILED line, or the
 #: ladder's fall-through, where an ERROR-only session (a fixture-setup
 #: timeout) lands while still naming its node-ids. Every other category means
-#: the leg was stopped, or failed before any test was judged. Residual: the
-#: fall-through also holds a leg that named no test (pytest rc=5, a lint leg
-#: that printed nothing), which the aggregated list cannot tell apart. Why
-#: anything else refuses suppression:
+#: the leg was stopped, or failed before any test was judged; a red lint or
+#: type leg lands lint_error/type_error and a verdictless pytest exit lands
+#: infra_abort, all refused. Residual: the fall-through also holds a TEST leg
+#: that named no test (pytest rc=5), which the aggregated list cannot tell
+#: apart. Why anything else refuses suppression:
 #: test_flake_discriminator.py::TestLegWithoutVerdictIsUnconfirmable.
 _VERDICT_BEARING_LEG_CATEGORIES: frozenset[FailureCategory] = frozenset({
     FailureCategory.TEST_FAILURE, FailureCategory.UNKNOWN_TEST_FAILURE,
@@ -11103,12 +11429,13 @@ async def confirm_isolated_rerun_verdict(
     *module_configs* or files-not-on-disk naturally map nothing, which is an
     honest ``unconfirmable`` rather than a guess.
 
-    ``test_ids`` carries the RAW extracted node-ids, never the
-    prefix-qualified group ids — the qualified id is a re-run implementation
-    detail (which subproject to invoke pytest from), whereas the raw node-id is
-    the test's IDENTITY and is what α's ``flake_debt.test_id`` primary key and
-    §8.3's idempotency key are built on. Recording a prefix-qualified variant
-    would split one test's debt across two rows.
+    ``test_ids`` carries the extracted node-ids (xdist group suffix already
+    stripped at extraction), never the prefix-qualified group ids — the
+    qualified id is a re-run implementation detail (which subproject to invoke
+    pytest from), whereas the raw node-id is the test's IDENTITY and is what
+    α's ``flake_debt.test_id`` primary key and §8.3's idempotency key are built
+    on. Recording a prefix-qualified variant would split one test's debt across
+    two rows.
 
     Args:
         worktree: The tree to re-run in. Judged as given (INV-3).

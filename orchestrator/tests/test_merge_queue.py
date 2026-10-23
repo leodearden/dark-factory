@@ -64,8 +64,12 @@ from orchestrator.git_ops import (
     WorktreeMissing,
     _run,
 )
-from orchestrator.merge_lane.gates import DropGuardResult, _check_plan_files_touched_in_branch
+from orchestrator.merge_lane.gates import (
+    DropGuardResult,
+    _check_plan_files_touched_in_branch,
+)
 from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.merge_lane.types import DiskGuardOutcome, QueuedBranch
 from orchestrator.merge_lane.worker import (
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
@@ -13159,6 +13163,11 @@ class TestRunPostMergeVerify:
         git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
         return git_ops
 
+    @pytest.fixture(autouse=True)
+    def _real_project_root(self, tmp_path: Path) -> None:
+        """The flake recorder writes to runs_db(req.config.project_root), so it must be a real path."""
+        self._project_root = tmp_path / 'project_root'
+
     def _make_req(self) -> MagicMock:
         req = MagicMock()
         req.task_id = 'task-verify-test'
@@ -13166,6 +13175,7 @@ class TestRunPostMergeVerify:
         req.module_configs = []
         req.config.merge_verify_min_free_disk_bytes = 1024
         req.config.merge_verify_workspace = False
+        req.config.project_root = self._project_root
         return req
 
     async def test_disk_guard_none_verify_passed_returns_none(self) -> None:
@@ -16018,15 +16028,17 @@ class TestReverifyRebasedTree:
     """Unit tests for _reverify_rebased_tree shared gate.
 
     The gate:
+    (s) The rebased tree is the verified tree → GateClearance.same_tree,
+        run_scoped_verification NOT called; an unresolvable sha never skips.
     (a) Disjoint overlap AND the drift is a tip this queue landed green →
-        returns None, run_scoped_verification NOT called, merge_wt still
-        exists.
+        GateClearance.disjoint, run_scoped_verification NOT called, merge_wt
+        still exists.
     (a2) Disjoint overlap but the drift is NOT queue-verified → re-verifies
         anyway (the 2026-09-22 whole-tree-drift incident).
     (a3) Disjoint overlap, drift queue-verified, but the project declares a
         whole-tree merge gate → re-verifies anyway.
-    (b) Overlapping, green verify → returns None, run_scoped_verification
-        called exactly once, merge_wt still exists.
+    (b) Overlapping, green verify → GateClearance.reverified,
+        run_scoped_verification called exactly once, merge_wt still exists.
     (c) Overlapping, red verify → returns blocked MergeOutcome,
         merge_wt cleaned up.
     """
@@ -16041,6 +16053,97 @@ class TestReverifyRebasedTree:
         assert result.merge_worktree is not None
         req = _make_request(branch_name, branch_name, wt, config)
         return result.merge_worktree, req
+
+    async def _rebased_onto_drift(
+        self, git_ops: GitOps, config: OrchestratorConfig, branch_name: str,
+    ) -> tuple[Path, MergeRequest, str, str, str]:
+        """A merge worktree rebased onto a drift: (merge_wt, req, verified, rebased_from, rebased_onto)."""
+        merge_wt, req = await self._make_merge_wt(git_ops, branch_name, config)
+        rebased_from = await git_ops.get_main_sha()
+        _, verified, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
+        (git_ops.project_root / f'{branch_name}_drift.py').write_text('d = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        rebased_onto = await git_ops.get_main_sha()
+        rc, _, err = await _run(['git', 'rebase', rebased_onto], cwd=merge_wt)
+        assert rc == 0, err
+        return merge_wt, req, verified.strip(), rebased_from, rebased_onto
+
+    async def test_same_tree_skips_without_a_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(s) A rebased sha whose tree IS the verified tree clears with no verify."""
+        from orchestrator.merge_lane.worker import _reverify_rebased_tree, _run_post_merge_verify
+
+        merge_wt, req, verified, rebased_from, rebased_onto = await self._rebased_onto_drift(
+            git_ops,
+            config.model_copy(
+                update={'merge_verify_breadth': 'full', 'merge_gate_history_pure': True},
+            ),
+            'rvrt-same',
+        )
+        _, rewritten, _ = await _run(
+            ['git', 'commit-tree', f'{verified}^{{tree}}', '-p', rebased_onto, '-m', 'same tree'],
+            cwd=git_ops.project_root,
+        )
+        verify_mock = _mock_verify_pass()
+        try:
+            with patch('orchestrator.merge_lane.worker.run_scoped_verification', verify_mock):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    verified_merge_sha=verified,
+                    rebased_from=rebased_from,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha=rewritten.strip(),
+                    run_post_merge_verify=_run_post_merge_verify,
+                    event_store=None,
+                )
+            assert result == GateClearance.same_tree, result
+            verify_mock.assert_not_called()
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    @pytest.mark.parametrize('verified_merge_sha', ['', 'f' * 40], ids=['empty', 'unresolvable'])
+    async def test_unresolvable_verified_sha_never_skips(
+        self, git_ops: GitOps, config: OrchestratorConfig, verified_merge_sha: str,
+    ) -> None:
+        """(s) Fail closed: no tree to compare means the whole-tree gate re-verifies."""
+        from orchestrator.merge_lane.worker import _reverify_rebased_tree, _run_post_merge_verify
+
+        merge_wt, req, _, rebased_from, rebased_onto = await self._rebased_onto_drift(
+            git_ops,
+            config.model_copy(
+                update={'merge_verify_breadth': 'full', 'merge_gate_history_pure': True},
+            ),
+            f'rvrt-closed-{len(verified_merge_sha)}',
+        )
+        _, rebased_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
+        verify_mock = _mock_verify_pass()
+        try:
+            with patch('orchestrator.merge_lane.worker.run_scoped_verification', verify_mock):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    verified_merge_sha=verified_merge_sha,
+                    rebased_from=rebased_from,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha=rebased_sha.strip(),
+                    run_post_merge_verify=_run_post_merge_verify,
+                    event_store=None,
+                )
+            assert result == GateClearance.reverified, result
+            verify_mock.assert_called_once()
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
 
     async def test_disjoint_no_reverify(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -16080,6 +16183,7 @@ class TestReverifyRebasedTree:
             ):
                 result = await _reverify_rebased_tree(
                     git_ops, req, merge_wt,
+                    verified_merge_sha=fork_sha,
                     rebased_from=fork_sha,
                     rebased_onto=rebased_onto,
                     timeouts={},
@@ -16087,9 +16191,10 @@ class TestReverifyRebasedTree:
                     max_timeouts=3,
                     max_enospc=1,
                     run_post_merge_verify=_run_post_merge_verify,
+                    event_store=None,
                 )
-            assert result is None, (
-                f'Disjoint: expected None, got {result!r}'
+            assert result == GateClearance.disjoint, (
+                f'Disjoint: expected GateClearance.disjoint, got {result!r}'
             )
             verify_mock.assert_not_called()
             assert merge_wt.exists(), 'merge_wt must still exist (not cleaned up)'
@@ -16139,6 +16244,7 @@ class TestReverifyRebasedTree:
             ):
                 result = await _reverify_rebased_tree(
                     git_ops, req, merge_wt,
+                    verified_merge_sha=fork_sha,
                     rebased_from=fork_sha,
                     rebased_onto=rebased_onto,
                     timeouts={},
@@ -16146,9 +16252,10 @@ class TestReverifyRebasedTree:
                     max_timeouts=3,
                     max_enospc=1,
                     run_post_merge_verify=_run_post_merge_verify,
+                    event_store=None,
                 )
-            assert result is None, (
-                f'Re-verify ran and passed: expected None, got {result!r}'
+            assert result == GateClearance.reverified, (
+                f'Re-verify ran and passed: expected GateClearance.reverified, got {result!r}'
             )
             assert verify_mock.call_count == 1, (
                 f'Disjoint-but-unverified drift must still re-verify; '
@@ -16198,6 +16305,7 @@ class TestReverifyRebasedTree:
             ):
                 result = await _reverify_rebased_tree(
                     git_ops, req, merge_wt,
+                    verified_merge_sha=fork_sha,
                     rebased_from=fork_sha,
                     rebased_onto=rebased_onto,
                     timeouts={},
@@ -16205,9 +16313,10 @@ class TestReverifyRebasedTree:
                     max_timeouts=3,
                     max_enospc=1,
                     run_post_merge_verify=_run_post_merge_verify,
+                    event_store=None,
                 )
-            assert result is None, (
-                f'Re-verify ran and passed: expected None, got {result!r}'
+            assert result == GateClearance.reverified, (
+                f'Re-verify ran and passed: expected GateClearance.reverified, got {result!r}'
             )
             assert verify_mock.call_count == 1, (
                 f'A whole-tree merge gate must re-verify on ANY drift; '
@@ -16243,6 +16352,7 @@ class TestReverifyRebasedTree:
             ):
                 result = await _reverify_rebased_tree(
                     git_ops, req, merge_wt,
+                    verified_merge_sha=fork_sha,
                     rebased_from=fork_sha,
                     rebased_onto=rebased_onto,
                     timeouts={},
@@ -16250,9 +16360,10 @@ class TestReverifyRebasedTree:
                     max_timeouts=3,
                     max_enospc=1,
                     run_post_merge_verify=_run_post_merge_verify,
+                    event_store=None,
                 )
-            assert result is None, (
-                f'Green verify: expected None, got {result!r}'
+            assert result == GateClearance.reverified, (
+                f'Green verify: expected GateClearance.reverified, got {result!r}'
             )
             verify_mock.assert_called_once()
             assert merge_wt.exists(), 'merge_wt must still exist after green verify'
@@ -16288,6 +16399,7 @@ class TestReverifyRebasedTree:
         ):
             result = await _reverify_rebased_tree(
                 git_ops, req, merge_wt,
+                verified_merge_sha=fork_sha,
                 rebased_from=fork_sha,
                 rebased_onto=rebased_onto,
                 timeouts={},
@@ -16295,6 +16407,7 @@ class TestReverifyRebasedTree:
                 max_timeouts=3,
                 max_enospc=1,
                 run_post_merge_verify=_run_post_merge_verify,
+                event_store=None,
             )
         assert result is not None, 'Red verify: expected a MergeOutcome, got None'
         assert isinstance(result, MergeOutcome)
@@ -16341,6 +16454,7 @@ class TestReverifyRebasedTree:
         ):
             result = await _reverify_rebased_tree(
                 git_ops, req, merge_wt,
+                verified_merge_sha='a' * 40,
                 rebased_from='a' * 40,
                 rebased_onto='b' * 40,
                 timeouts={},
@@ -16349,9 +16463,10 @@ class TestReverifyRebasedTree:
                 max_enospc=1,
                 keep_worktrees={l1, l2},  # RED: TypeError until step-10
                 run_post_merge_verify=pmpv,
+                event_store=None,
             )
 
-        assert result is None, f'expected None (green verify), got {result!r}'
+        assert result == GateClearance.reverified, f'expected a green re-verify, got {result!r}'
         assert 'keep_worktrees' in captured_kw, (
             'keep_worktrees not forwarded to _run_post_merge_verify'
         )
@@ -16395,6 +16510,7 @@ class TestReverifyRebasedTree:
         ):
             result = await _reverify_rebased_tree(
                 git_ops, req, merge_wt,
+                verified_merge_sha='a' * 40,
                 rebased_from='a' * 40,
                 rebased_onto='b' * 40,
                 timeouts={},
@@ -16403,9 +16519,10 @@ class TestReverifyRebasedTree:
                 max_enospc=1,
                 # No keep_worktrees — regression test
                 run_post_merge_verify=pmpv,
+                event_store=None,
             )
 
-        assert result is None, f'expected None (green verify), got {result!r}'
+        assert result == GateClearance.reverified, f'expected a green re-verify, got {result!r}'
         assert captured_kw.get('keep_worktrees') is None, (
             f'default keep_worktrees must be None; got {captured_kw.get("keep_worktrees")!r}'
         )
@@ -20901,6 +21018,11 @@ class TestRunPostMergeVerifyRouting:
         git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
         return git_ops
 
+    @pytest.fixture(autouse=True)
+    def _real_project_root(self, tmp_path: Path) -> None:
+        """The flake recorder writes to runs_db(req.config.project_root), so it must be a real path."""
+        self._project_root = tmp_path / 'project_root'
+
     def _make_req(self) -> MagicMock:
         req = MagicMock()
         req.task_id = 'task-routing-test'
@@ -20911,6 +21033,7 @@ class TestRunPostMergeVerifyRouting:
         req.config.verify_env = {}
         req.config.merge_verify_cold_command_timeout_secs = None
         req.config.verify_cold_command_timeout_secs = None
+        req.config.project_root = self._project_root
         return req
 
     def _make_event_store(self, tmp_path: Path) -> EventStore:
@@ -21196,6 +21319,7 @@ class TestMergeShaThreading:
         ):
             result = await _reverify_rebased_tree(
                 git_ops, req, merge_wt,
+                verified_merge_sha='',
                 rebased_from='a' * 40,
                 rebased_onto='b' * 40,
                 timeouts={},
@@ -21204,9 +21328,10 @@ class TestMergeShaThreading:
                 max_enospc=1,
                 merge_sha='c' * 40,  # RED: TypeError until step-14 adds this kwarg
                 run_post_merge_verify=pmpv,
+                event_store=None,
             )
 
-        assert result is None, f'expected None (green verify), got {result!r}'
+        assert result == GateClearance.reverified, f'expected a green re-verify, got {result!r}'
         assert captured_sha == ['c' * 40], (
             f'merge_sha not forwarded to _run_post_merge_verify; captured: {captured_sha!r}'
         )

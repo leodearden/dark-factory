@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.middleware.ticket_janitor import TicketJanitor
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
@@ -1068,36 +1069,16 @@ async def run_server():
     # Ticket janitor — periodic sweep that surfaces failed tickets to the
     # orchestrator as info-severity ticket_failure escalations, and the curator
     # dedup-outage signature as a blocking infra_issue. Replaces the per-call
-    # resolve_ticket wait the steward / deep_reviewer used to chain.
+    # resolve_ticket wait the steward / deep_reviewer used to chain. It is also
+    # the only retrier of tickets parked awaiting_curation.
     janitor_task: asyncio.Task[None] | None = None
-    janitor_cfg = getattr(config.curator, 'janitor', None)
-    if janitor_cfg is not None and janitor_cfg.enabled and ticket_store is not None:
-        from fused_memory.middleware.ticket_janitor import TicketJanitor
-
-        _janitor_primary_root = (
-            config.taskmaster.project_root if config.taskmaster else ''
-        ) or ''
-        if _janitor_primary_root:
-            _janitor_primary_root = str(
-                Path(_janitor_primary_root).expanduser().resolve(),
-            )
+    ticket_janitor = (
+        _build_ticket_janitor(config, ticket_store, task_interceptor, _known_projects_map)
+        if ticket_store is not None else None
+    )
+    if ticket_janitor is not None:
+        janitor_cfg = config.curator.janitor
         dedup_outage_cfg = _dedup_outage_detector_config(config)
-        ticket_janitor = TicketJanitor(
-            ticket_store,
-            cooldown_secs=janitor_cfg.cooldown_seconds,
-            batch_limit=janitor_cfg.batch_limit,
-            primary_project_root=_janitor_primary_root,
-            liveness_probe=(
-                task_interceptor.is_worker_alive
-                if task_interceptor is not None else None
-            ),
-            signal_ticket_resolved=(
-                task_interceptor._signal_ticket_event
-                if task_interceptor is not None else None
-            ),
-            known_projects=_known_projects_map,
-            dedup_outage=dedup_outage_cfg,
-        )
         janitor_task = asyncio.create_task(
             ticket_janitor.run_loop(janitor_cfg.interval_seconds),
         )
@@ -1921,6 +1902,40 @@ def _resolve_curator_escalator_state_path(config: FusedMemoryConfig) -> Path:
     if config.reconciliation:
         return Path(config.reconciliation.data_dir) / 'curator_escalator_state.json'
     return Path('./data/curator_escalator_state.json')
+
+
+def _build_ticket_janitor(
+    config: FusedMemoryConfig,
+    ticket_store: TicketStore,
+    task_interceptor: TaskInterceptor | None,
+    known_projects: dict[str, str],
+) -> TicketJanitor | None:
+    """The ticket janitor, wired to drain parked tickets through *task_interceptor*; None when disabled."""
+    from fused_memory.middleware.ticket_janitor import TicketJanitor
+
+    janitor_cfg = getattr(config.curator, 'janitor', None)
+    if janitor_cfg is None or not janitor_cfg.enabled:
+        return None
+    primary_root = (config.taskmaster.project_root if config.taskmaster else '') or ''
+    if primary_root:
+        primary_root = str(Path(primary_root).expanduser().resolve())
+    return TicketJanitor(
+        ticket_store,
+        cooldown_secs=janitor_cfg.cooldown_seconds,
+        batch_limit=janitor_cfg.batch_limit,
+        primary_project_root=primary_root,
+        liveness_probe=task_interceptor.is_worker_alive if task_interceptor is not None else None,
+        signal_ticket_resolved=(
+            task_interceptor._signal_ticket_event if task_interceptor is not None else None
+        ),
+        requeue_ticket=(
+            task_interceptor.requeue_awaiting_curation_ticket
+            if task_interceptor is not None else None
+        ),
+        known_projects=known_projects,
+        dedup_outage=_dedup_outage_detector_config(config),
+        curation_backlog_min_attempts=janitor_cfg.curation_backlog_escalation_min_attempts,
+    )
 
 
 def _dedup_outage_detector_config(
