@@ -427,7 +427,7 @@ class TestLifetimeCounters:
             'description': 'helper name hides its side effect',
             'suggested_fix': 'rename helper',
         }
-        archive = wf.artifacts.root / 'reviews-amend-1'
+        archive = wf.artifacts.review_archive_dir('amend-1')
         archive.mkdir()
         (archive / 'analyst.json').write_text(
             json.dumps({'verdict': 'ISSUES_FOUND', 'issues': [settled]})

@@ -620,7 +620,7 @@ def make_plan_stamp(
     inside the read-merge-write. The pending buffer has its own lock, taken
     inside it: see :data:`_PENDING_LOCK`.
     """
-    plan_path = artifacts.root / 'plan.json'
+    plan_path = artifacts.artifact_path('plan.json')
 
     def stamp(record: dict[str, Any]) -> str | None:
         """The blocking body, run on a worker thread."""

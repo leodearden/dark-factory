@@ -1058,10 +1058,10 @@ class AgentStub:
         artifacts = TaskArtifacts(
             cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
         )
-        artifacts.root.mkdir(parents=True, exist_ok=True)
+        artifacts.task_root.mkdir(parents=True, exist_ok=True)
         plan = dict(PLAN)
         plan['_schema_version'] = 1
-        (artifacts.root / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+        artifacts.artifact_path('plan.json').write_text(json.dumps(plan, indent=2) + '\n')
         return AgentResult(success=True, output='Plan created', cost_usd=0.50)
 
     async def _implementer(self, cwd: Path) -> AgentResult:

@@ -8,11 +8,13 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 
 from shared import safe_io
 from shared.plan_deviation import DeviationRecord
@@ -292,6 +294,48 @@ def _validate_task_id(task_id: str) -> None:
         )
 
 
+class ArtifactRoot(Enum):
+    """Which `.task-meta` root an artifact lives under.
+
+    LANE is per-dispatch (``TaskArtifacts.meta_root_for``); TASK follows the
+    task across lanes (``TaskArtifacts.task_root_for``).
+    """
+
+    LANE = 'lane'
+    TASK = 'task'
+
+
+_REVIEW_ARCHIVE_FAMILY = 'reviews-<label>/'
+_ZERO_OUTPUT_EVIDENCE_FAMILY = 'zero_output_evidence-iter<n>.json'
+
+ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
+    'metadata.json': ArtifactRoot.LANE,
+    'agent_session.json': ArtifactRoot.LANE,
+    'interactive.json': ArtifactRoot.LANE,
+    'blocking_dependency.json': ArtifactRoot.LANE,
+    'already_done.json': ArtifactRoot.LANE,
+    'ready_to_merge.json': ArtifactRoot.LANE,
+    'false_premise.json': ArtifactRoot.LANE,
+    'unactionable_task.json': ArtifactRoot.LANE,
+    'plan.json': ArtifactRoot.TASK,
+    'plan.lock': ArtifactRoot.TASK,
+    'iterations.jsonl': ArtifactRoot.TASK,
+    'reviews': ArtifactRoot.TASK,
+    'verdicts': ArtifactRoot.TASK,
+    'review_state.json': ArtifactRoot.TASK,
+    'reconcile_state.json': ArtifactRoot.TASK,
+    _REVIEW_ARCHIVE_FAMILY: ArtifactRoot.TASK,
+    _ZERO_OUTPUT_EVIDENCE_FAMILY: ArtifactRoot.TASK,
+})
+"""The single routing table: artifact name (or family key) -> owning root.
+
+PRD ``plans/task-meta-task-keying-prd.md`` §Artifact routing, plus the
+architect's ``ready_to_merge.json`` exit and the review-archive and
+zero-output-evidence families. ``plan.json.mutex`` is deliberately absent: it
+is derived from the resolved plan.json, so it always sits beside that plan.
+"""
+
+
 @dataclass
 class ReviewAggregation:
     """Aggregated review results from all reviewers."""
@@ -338,21 +382,83 @@ def _format_issue_section(heading: str, issues: list[dict]) -> str:
 
 
 class TaskArtifacts:
-    """Manages .task/ directory in a worktree."""
+    """A task's artifacts, each resolved to its root through ``ARTIFACT_ROOTS``."""
 
-    def __init__(self, worktree: Path, meta_root: Path | None = None):
+    def __init__(
+        self,
+        worktree: Path,
+        meta_root: Path | None = None,
+        task_root: Path | None = None,
+    ):
         """
         Args:
             worktree: The task's git worktree.
-            meta_root: Optional `.task-meta` root (see ``meta_root_for``).
-                When omitted (``None``), ``self.root`` falls back to the
-                legacy ``<worktree>/.task`` path and this class behaves
-                byte-identically to before this argument existed. When
-                supplied, all reads and writes target ``meta_root`` only —
-                the legacy path is never consulted.
+            meta_root: The LANE root (see ``meta_root_for``). ``None`` means
+                the legacy ``<worktree>/.task``.
+            task_root: The TASK root (see ``task_root_for``). ``None`` means
+                the lane root, so omitting it keeps one single root for
+                every artifact. Production dual-root construction goes
+                through ``for_task``.
         """
         self.worktree = worktree
-        self.root = meta_root if meta_root is not None else worktree / '.task'
+        self._lane_root = meta_root if meta_root is not None else worktree / '.task'
+        self._task_root = task_root if task_root is not None else self._lane_root
+
+    @classmethod
+    def for_task(cls, worktree: Path, task_id: str) -> TaskArtifacts:
+        """Both roots of *task_id* dispatched into *worktree*.
+
+        Raises:
+            ValueError: *task_id* fails ``_validate_task_id``.
+        """
+        base = worktree.parent
+        return cls(worktree, cls.meta_root_for(base, worktree.name), cls.task_root_for(base, task_id))
+
+    @property
+    def lane_root(self) -> Path:
+        return self._lane_root
+
+    @property
+    def task_root(self) -> Path:
+        return self._task_root
+
+    def _root_for(self, key: str) -> Path:
+        owner = ARTIFACT_ROOTS.get(key)
+        if owner is None:
+            raise ValueError(
+                f'unknown task artifact {key!r}: known keys are {sorted(ARTIFACT_ROOTS)}'
+            )
+        return self._task_root if owner is ArtifactRoot.TASK else self._lane_root
+
+    def artifact_path(self, name: str) -> Path:
+        """Where artifact *name* (``'plan.json'``, ``'reviews/merge.json'``)
+        lives, routed on its first path component.
+
+        Raises:
+            ValueError: that component is not a key of ``ARTIFACT_ROOTS``.
+        """
+        return self._root_for(Path(name).parts[0]) / name
+
+    @property
+    def review_archives_root(self) -> Path:
+        """The directory holding every ``reviews-<label>`` archive."""
+        return self._root_for(_REVIEW_ARCHIVE_FAMILY)
+
+    def review_archive_dir(self, label: str) -> Path:
+        """The archive of one review round, e.g. ``label='amend-1'``."""
+        return self.review_archives_root / f'reviews-{label}'
+
+    def zero_output_evidence_path(self, iteration: int) -> Path:
+        return self._root_for(_ZERO_OUTPUT_EVIDENCE_FAMILY) / f'zero_output_evidence-iter{iteration}.json'
+
+    def read_title(self) -> str | None:
+        """metadata.json's title, else plan.json's; None unless a non-blank str."""
+        for name in ('metadata.json', 'plan.json'):
+            data = self._read_json_object(name)
+            title = data.get('title') if data is not None else None
+            if isinstance(title, str) and title.strip():
+                return title
+        return None
 
     @staticmethod
     def meta_root_for(worktree_base: Path, worktree_name: str) -> Path:
@@ -420,14 +526,15 @@ class TaskArtifacts:
         task_description: str,
         base_commit: str | None = None,
     ) -> None:
-        """Create .task/ with initial metadata.json.
+        """Create both roots, the reviews/ and verdicts/ dirs, and metadata.json.
 
-        IMPORTANT: This method is safe to call when .task/ already exists
+        IMPORTANT: This method is safe to call when the roots already exist
         (e.g. inherited from a contaminated main).
         """
-        self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / 'reviews').mkdir(exist_ok=True)
-        (self.root / 'verdicts').mkdir(exist_ok=True)
+        self._lane_root.mkdir(parents=True, exist_ok=True)
+        self._task_root.mkdir(parents=True, exist_ok=True)
+        self.artifact_path('reviews').mkdir(exist_ok=True)
+        self.artifact_path('verdicts').mkdir(exist_ok=True)
 
         metadata = {
             'task_id': task_id,
@@ -437,7 +544,7 @@ class TaskArtifacts:
         }
         if base_commit:
             metadata['base_commit'] = base_commit
-        self._write_json(self.root / 'metadata.json', metadata)
+        self._write_json(self.artifact_path('metadata.json'), metadata)
 
     def read_base_commit(self) -> str | None:
         """Read the base commit SHA stored at init time."""
@@ -466,7 +573,7 @@ class TaskArtifacts:
             return
         metadata = json.loads(meta_path.read_text())
         metadata['base_commit'] = new_base
-        self._write_json(self.root / 'metadata.json', metadata)
+        self._write_json(self.artifact_path('metadata.json'), metadata)
 
     @contextmanager
     def plan_mutex(self) -> Iterator[None]:
@@ -493,7 +600,7 @@ class TaskArtifacts:
             yield
 
     def _plan_mutex_path(self) -> Path | None:
-        lock_path = Path(os.path.realpath(self.root / 'plan.json')).with_name('plan.json.mutex')
+        lock_path = Path(os.path.realpath(self.artifact_path('plan.json'))).with_name('plan.json.mutex')
         return lock_path if lock_path.parent.is_dir() else None
 
     def write_plan(self, plan: dict, *, mutex_held: bool = False) -> None:
@@ -515,16 +622,16 @@ class TaskArtifacts:
         lock_path = self._plan_mutex_path()
         if lock_path is not None and not file_mutex.held(lock_path):
             raise PlanMutexNotHeld(
-                f'{self.root / "plan.json"} reached its write without {lock_path} held: '
+                f'{self.artifact_path("plan.json")} reached its write without {lock_path} held: '
                 'run the whole read-modify-write inside plan_mutex()'
             )
-        self._write_json(self.root / 'plan.json', plan)
+        self._write_json(self.artifact_path('plan.json'), plan)
 
     def ensure_lane_plan_symlink(self) -> None:
         """Single-source plan.json onto the durable meta-root copy.
 
         Makes the lane copy ``<worktree>/.task/plan.json`` an ABSOLUTE symlink
-        to ``self.root / 'plan.json'`` (the durable meta-root plan). Any
+        to ``artifact_path('plan.json')`` (the durable meta-root plan). Any
         residual reader of the lane path then transparently resolves to the
         meta-root file, so the lane copy can never diverge from the meta-root —
         the esc-5205-9 stale trap (a remediation agent appended steps to a
@@ -533,15 +640,13 @@ class TaskArtifacts:
 
         Idempotent and recreated each dispatch: replaces a pre-existing regular
         file, a stale/broken symlink, or a pathological stray directory. No-op
-        in legacy ``meta_root=None`` mode, where the lane path already IS the
-        durable copy (``self.root == <worktree>/.task``) so a self-referential
-        symlink would be broken/nonsensical.
+        when the durable plan already IS ``<worktree>/.task/plan.json`` (legacy
+        single-root mode), where a self-referential symlink would be broken.
         """
-        if self.root == self.worktree / '.task':
-            # Legacy meta_root=None mode: the lane path already IS the durable
-            # copy — a self-referential symlink would be broken/nonsensical.
-            return
+        durable_plan = self.artifact_path('plan.json')
         lane_task = self.worktree / '.task'
+        if durable_plan == lane_task / 'plan.json':
+            return
         # meta_root mode's init() never creates <worktree>/.task, so make it.
         lane_task.mkdir(parents=True, exist_ok=True)
         lane_plan = lane_task / 'plan.json'
@@ -552,7 +657,7 @@ class TaskArtifacts:
                 shutil.rmtree(lane_plan)
             else:
                 lane_plan.unlink(missing_ok=True)
-        os.symlink(self.root / 'plan.json', lane_plan)
+        os.symlink(durable_plan, lane_plan)
 
     def write_blocking_dependency(
         self,
@@ -574,7 +679,7 @@ class TaskArtifacts:
             'main_sha_at_report': main_sha_at_report,
             'reported_at': datetime.now(UTC).isoformat(),
         }
-        self._write_json(self.root / 'blocking_dependency.json', data)
+        self._write_json(self.artifact_path('blocking_dependency.json'), data)
 
     def read_blocking_dependency(self) -> dict | None:
         """Return the parsed ``.task/blocking_dependency.json`` artifact if
@@ -615,7 +720,7 @@ class TaskArtifacts:
             'evidence': evidence,
             'reported_at': datetime.now(UTC).isoformat(),
         }
-        self._write_json(self.root / 'already_done.json', data)
+        self._write_json(self.artifact_path('already_done.json'), data)
 
     def read_already_done(self) -> dict | None:
         """Return the parsed ``.task/already_done.json`` artifact if present,
@@ -646,7 +751,7 @@ class TaskArtifacts:
             'evidence': evidence,
             'reported_at': datetime.now(UTC).isoformat(),
         }
-        self._write_json(self.root / 'ready_to_merge.json', data)
+        self._write_json(self.artifact_path('ready_to_merge.json'), data)
 
     def read_ready_to_merge(self) -> dict | None:
         """Return the parsed ``.task/ready_to_merge.json`` artifact if
@@ -674,7 +779,7 @@ class TaskArtifacts:
             'evidence': evidence,
             'reported_at': datetime.now(UTC).isoformat(),
         }
-        self._write_json(self.root / 'unactionable_task.json', data)
+        self._write_json(self.artifact_path('unactionable_task.json'), data)
 
     def read_unactionable_task(self) -> dict | None:
         """Return the parsed ``.task/unactionable_task.json`` artifact if
@@ -709,7 +814,7 @@ class TaskArtifacts:
             'proposed_resolution': proposed_resolution,
             'reported_at': datetime.now(UTC).isoformat(),
         }
-        self._write_json(self.root / 'false_premise.json', data)
+        self._write_json(self.artifact_path('false_premise.json'), data)
 
     def read_false_premise(self) -> dict | None:
         """Return the parsed ``.task/false_premise.json`` artifact if present,
@@ -793,7 +898,7 @@ class TaskArtifacts:
             'reviewer_fingerprint': reviewer_fingerprint,
             'ts': datetime.now(UTC).isoformat(),
         }
-        self._write_json(self.root / 'review_state.json', state)
+        self._write_json(self.artifact_path('review_state.json'), state)
 
     def get_cached_verdict(self, tree_hash: str) -> dict | None:
         """Return the recorded verdict record for ``tree_hash``, else ``None``."""
@@ -830,7 +935,7 @@ class TaskArtifacts:
             state['amendment_rounds_total'] = int(amendment_rounds_total)
         if review_cycles_total is not None:
             state['review_cycles_total'] = int(review_cycles_total)
-        self._write_json(self.root / 'review_state.json', state)
+        self._write_json(self.artifact_path('review_state.json'), state)
 
     def clear_review_counters(self) -> None:
         """Reset the task-lifetime amendment/review counters to zero.
@@ -859,11 +964,10 @@ class TaskArtifacts:
         state = self.read_review_state()
         state['amendment_rounds_total'] = 0
         state['review_cycles_total'] = 0
-        self._write_json(self.root / 'review_state.json', state)
+        self._write_json(self.artifact_path('review_state.json'), state)
 
     def _read_path(self, name: str) -> Path:
-        """Resolve *name* under ``self.root``."""
-        return self.root / name
+        return self.artifact_path(name)
 
     def _read_json_object(self, name: str) -> dict | None:
         """The single fail-safe read seam for the whole-file JSON-object
@@ -887,8 +991,8 @@ class TaskArtifacts:
         return data
 
     def _clear_path(self, name: str) -> None:
-        """Remove *name* from ``self.root`` if present."""
-        (self.root / name).unlink(missing_ok=True)
+        """Remove artifact *name* if present."""
+        self.artifact_path(name).unlink(missing_ok=True)
 
     def read_plan(self) -> dict:
         """Read current plan state, auto-normalizing malformed shapes."""
@@ -900,7 +1004,7 @@ class TaskArtifacts:
             if modified:
                 logger.warning(
                     'Plan normalization applied — writing corrected plan to %s',
-                    self.root / 'plan.json',
+                    self.artifact_path('plan.json'),
                 )
                 self._write_held_plan(plan)
         return plan
@@ -1038,7 +1142,7 @@ class TaskArtifacts:
     def append_iteration_log(self, entry: dict) -> None:
         """Append to .task/iterations.jsonl — one JSON object per line."""
         entry['timestamp'] = datetime.now(UTC).isoformat()
-        log_path = self.root / 'iterations.jsonl'
+        log_path = self.artifact_path('iterations.jsonl')
         with open(log_path, 'a') as f:
             f.write(json.dumps(entry) + '\n')
 
@@ -1079,23 +1183,24 @@ class TaskArtifacts:
         Best-effort: if the artifacts root has been removed (worktree gone
         out-of-band), skip the write rather than raising — the review JSON
         is a debugging aid, not load-bearing for workflow correctness. This
-        method assumes ``init()`` has already created ``self.root``:
+        method assumes ``init()`` has already created the reviews' root:
         reviews are a post-implementation workflow phase, so init() has
         always run by the time a reviewer's output is written.
         """
-        if not self.root.is_dir():
+        root = self._root_for('reviews')
+        if not root.is_dir():
             logger.info(
                 'TaskArtifacts: skipping write_review %r — root %s no longer exists',
-                reviewer_name, self.root,
+                reviewer_name, root,
             )
             return
-        review_path = self.root / 'reviews' / f'{reviewer_name}.json'
+        review_path = self.artifact_path(f'reviews/{reviewer_name}.json')
         self._write_json(review_path, review)
 
     def read_reviews(self) -> dict[str, dict]:
         """Read all reviews from the reviews/ directory."""
         reviews: dict[str, dict] = {}
-        reviews_dir = self.root / 'reviews'
+        reviews_dir = self.artifact_path('reviews')
         if reviews_dir.is_dir():
             for path in reviews_dir.glob('*.json'):
                 reviews[path.stem] = json.loads(path.read_text())
@@ -1326,7 +1431,7 @@ class TaskArtifacts:
             resume_count=resume_count,
             schema_version=AGENT_SESSION_SCHEMA_VERSION,
         )
-        self._write_json(self.root / 'agent_session.json', session.to_dict())
+        self._write_json(self.artifact_path('agent_session.json'), session.to_dict())
 
     def clear_agent_session(self) -> None:
         """Remove ``.task/agent_session.json`` if present (idempotent)."""
@@ -1376,8 +1481,8 @@ class TaskArtifacts:
         """Return the set of ``(step_id, stale_commit)`` orphaned-done-step
         escalation keys already filed for this task, persisted across restarts.
 
-        Stored at ``self.root/reconcile_state.json`` (beside plan.json in the
-        meta-root).  JSON has no set/tuple types, so the on-disk shape is
+        Stored at ``artifact_path('reconcile_state.json')`` (beside plan.json
+        in the task root).  JSON has no set/tuple types, so the on-disk shape is
         ``{"emitted_done_step_escalations": [[step_id, commit], ...]}``; each
         2-element list is re-tupled here and malformed entries are skipped.
 
@@ -1424,7 +1529,7 @@ class TaskArtifacts:
             return
         keys.add((step_id, stale_commit))
         self._write_json(
-            self.root / 'reconcile_state.json',
+            self.artifact_path('reconcile_state.json'),
             {
                 'emitted_done_step_escalations': sorted(
                     [k[0], k[1]] for k in keys
@@ -1445,19 +1550,20 @@ class TaskArtifacts:
         Best-effort: if the artifacts root has been removed (worktree gone
         out-of-band), skip the write rather than raising — mirrors
         ``write_review``'s root-gone guard. This method assumes ``init()``
-        has already created ``self.root``.
+        has already created the verdicts' root.
 
         Raises:
             ValueError: if *role* is invalid — see ``_validate_verdict_role``.
         """
         _validate_verdict_role(role)
-        if not self.root.is_dir():
+        root = self._root_for('verdicts')
+        if not root.is_dir():
             logger.info(
                 'TaskArtifacts: skipping write_verdict %r — root %s no longer exists',
-                role, self.root,
+                role, root,
             )
             return
-        verdict_path = self.root / 'verdicts' / f'{role}.json'
+        verdict_path = self.artifact_path(f'verdicts/{role}.json')
         self._write_json(verdict_path, envelope)
 
     def read_verdict(self, role: str) -> dict | None:
@@ -1506,7 +1612,7 @@ class TaskArtifacts:
         the DB-composed filing identity and be read downstream as "a DIFFERENT
         incarnation is live", which is the unsafe direction.
         """
-        lock_path = self.root / 'plan.lock'
+        lock_path = self.artifact_path('plan.lock')
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
@@ -1538,11 +1644,11 @@ class TaskArtifacts:
 
     def is_plan_locked(self) -> bool:
         """Return True if plan.lock exists."""
-        return (self.root / 'plan.lock').exists()
+        return self.artifact_path('plan.lock').exists()
 
     def read_plan_lock(self) -> dict | None:
         """Read plan.lock contents. Returns dict or None if not locked."""
-        lock_path = self.root / 'plan.lock'
+        lock_path = self.artifact_path('plan.lock')
         if not lock_path.exists():
             return None
         return json.loads(lock_path.read_text())
@@ -1572,7 +1678,7 @@ class TaskArtifacts:
                 lock_session,
                 current_task_id,
             )
-            (self.root / 'plan.lock').unlink(missing_ok=True)
+            self.artifact_path('plan.lock').unlink(missing_ok=True)
             return True
 
         # Age-based stale detection
@@ -1586,14 +1692,14 @@ class TaskArtifacts:
                     age_secs,
                     stale_threshold_secs,
                 )
-                (self.root / 'plan.lock').unlink(missing_ok=True)
+                self.artifact_path('plan.lock').unlink(missing_ok=True)
                 return True
         except (ValueError, TypeError):
             # Unparseable timestamp — treat as stale
             logger.warning(
                 'Clearing plan.lock with unparseable timestamp: %r', locked_at_str
             )
-            (self.root / 'plan.lock').unlink(missing_ok=True)
+            self.artifact_path('plan.lock').unlink(missing_ok=True)
             return True
 
         return False
@@ -1684,7 +1790,7 @@ class TaskArtifacts:
         makes a truncated log still usable line-by-line.
         """
         # Tolerate a vanished worktree.  Callers that care about durability
-        # (init, plan, base_commit, etc.) check ``self.root`` themselves; the
+        # (init, plan, base_commit, etc.) check their root themselves; the
         # opportunistic writes (reviews, iteration log) just want a no-op
         # when the worktree has been deleted out-of-band.
         try:
@@ -1717,10 +1823,11 @@ class TaskArtifacts:
                 mkdir=True,
             )
         except FileNotFoundError:
-            if not self.root.is_dir():
+            root = self._task_root if path.is_relative_to(self._task_root) else self._lane_root
+            if not root.is_dir():
                 logger.info(
                     'TaskArtifacts: skipping _write_json to %s — root %s no longer exists',
-                    path, self.root,
+                    path, root,
                 )
                 return
             raise

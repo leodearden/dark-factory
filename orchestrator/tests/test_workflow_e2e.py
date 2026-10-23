@@ -856,7 +856,7 @@ class TestReviewLoop:
             async def _architect(self, cwd: Path) -> AgentResult:
                 """On re-plan, add a new step to address the review feedback."""
                 nonlocal review_round
-                task_dir = TaskArtifacts(cwd).root
+                task_dir = TaskArtifacts(cwd).lane_root
                 plan_path = task_dir / 'plan.json'
 
                 if plan_path.exists():
@@ -1116,7 +1116,7 @@ class TestBlastRadiusExpansion:
                 plan = dict(PLAN)
                 plan['files'] = ['lib.py', 'test_lib.py']  # wider than assigned ['lib']
                 plan['_schema_version'] = 1
-                task_dir = TaskArtifacts(cwd).root
+                task_dir = TaskArtifacts(cwd).lane_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
                 return AgentResult(success=True, output='Plan created', cost_usd=0.50)
@@ -1148,7 +1148,7 @@ class TestBlastRadiusExpansion:
                 plan = dict(PLAN)
                 plan['files'] = ['lib.py', 'locked_module.py']
                 plan['_schema_version'] = 1
-                task_dir = TaskArtifacts(cwd).root
+                task_dir = TaskArtifacts(cwd).lane_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
                 return AgentResult(success=True, output='Plan created', cost_usd=0.50)
@@ -1939,7 +1939,7 @@ class TestCorruptedIterationLogEscalation:
                 result = await super()._architect(cwd)
                 # Inject a corrupted iteration log line so the orchestrator
                 # finds it when it reads the log before the first implementer call
-                log_path = TaskArtifacts(cwd).root / 'iterations.jsonl'
+                log_path = TaskArtifacts(cwd).artifact_path('iterations.jsonl')
                 log_path.write_text(r'{"bad\!escape": true}' + '\n')
                 return result
 
@@ -2279,7 +2279,7 @@ class TestGhostLoopGuard:
         # 1. Create worktree and simulate prior implementation
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        task_dir = TaskArtifacts(wt).root
+        task_dir = TaskArtifacts(wt).lane_root
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
 
@@ -2508,7 +2508,7 @@ class StringPrereqsArchitectStub(AgentStub):
     """AgentStub subclass that writes a plan with plain-string prerequisites."""
 
     async def _architect(self, cwd: Path) -> AgentResult:
-        task_dir = TaskArtifacts(cwd).root
+        task_dir = TaskArtifacts(cwd).lane_root
         task_dir.mkdir(parents=True, exist_ok=True)
         bad_plan = {
             'task_id': '42',
@@ -2606,7 +2606,7 @@ class TestPlanFinalizeMarker:
 
         class CappedAfterFinalizeStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
-                task_dir = TaskArtifacts(cwd).root
+                task_dir = TaskArtifacts(cwd).lane_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 plan = dict(PLAN)  # PLAN carries _finalized_at
                 plan['_schema_version'] = 1
@@ -2650,7 +2650,7 @@ class TestPlanFinalizeMarker:
 
         class CappedBeforeFinalizeStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
-                task_dir = TaskArtifacts(cwd).root
+                task_dir = TaskArtifacts(cwd).lane_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 plan = {k: v for k, v in PLAN.items() if k != '_finalized_at'}
                 plan['_schema_version'] = 1
@@ -2693,7 +2693,7 @@ class TestPlanFinalizeMarker:
 
         class SuccessNoFinalizeStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
-                task_dir = TaskArtifacts(cwd).root
+                task_dir = TaskArtifacts(cwd).lane_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 plan = {k: v for k, v in PLAN.items() if k != '_finalized_at'}
                 plan['_schema_version'] = 1
@@ -4009,7 +4009,7 @@ class TestRecoverIfAlreadyMerged:
         # 1. Create worktree and write an implementer iteration entry
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        task_dir = TaskArtifacts(wt).root
+        task_dir = TaskArtifacts(wt).lane_root
         task_dir.mkdir(parents=True, exist_ok=True)
 
         # 1a. Capture base_commit BEFORE making the implementation commit and
@@ -4702,7 +4702,7 @@ class TestRecoverIfAlreadyMerged:
         # 1. Create worktree, stamp implementer entry, commit + merge to main
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        task_dir = TaskArtifacts(wt).root
+        task_dir = TaskArtifacts(wt).lane_root
         task_dir.mkdir(parents=True, exist_ok=True)
 
         # Capture base_commit BEFORE the implementation commit and stamp metadata.json
@@ -5204,7 +5204,7 @@ class TestRunPrePlanRecovery:
         # 1. Create worktree, stamp implementer entry, commit + merge to main
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        task_dir = TaskArtifacts(wt).root
+        task_dir = TaskArtifacts(wt).lane_root
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
         (task_dir / 'iterations.jsonl').write_text(
@@ -5658,10 +5658,10 @@ class TestEscalatePlanOverwriteMessage:
 
         # Manually initialise artifacts (normally done inside workflow.run)
         workflow.artifacts = TaskArtifacts(tmp_path)
-        workflow.artifacts.root.mkdir(parents=True, exist_ok=True)
+        workflow.artifacts.task_root.mkdir(parents=True, exist_ok=True)
 
         # plan.json exists but has no _session_id
-        plan_path = workflow.artifacts.root / 'plan.json'
+        plan_path = workflow.artifacts.artifact_path('plan.json')
         plan_path.write_text(json.dumps({'steps': [{'description': 'x'}]}))
 
         workflow._escalate_plan_overwrite()
@@ -5682,9 +5682,9 @@ class TestEscalatePlanOverwriteMessage:
         workflow.session_id = 'sess-current'
 
         workflow.artifacts = TaskArtifacts(tmp_path)
-        workflow.artifacts.root.mkdir(parents=True, exist_ok=True)
+        workflow.artifacts.task_root.mkdir(parents=True, exist_ok=True)
 
-        plan_path = workflow.artifacts.root / 'plan.json'
+        plan_path = workflow.artifacts.artifact_path('plan.json')
         plan_path.write_text(json.dumps({
             '_session_id': 'sess-foreign',
             'steps': [{'description': 'x'}],
@@ -5775,7 +5775,7 @@ class TestAmendOverwriteHaltsLoop:
         async def _amend_overwrites_plan(in_scope, amendment_round):
             amend_calls.append(amendment_round)
             assert workflow.artifacts is not None
-            plan_path = workflow.artifacts.root / 'plan.json'
+            plan_path = workflow.artifacts.artifact_path('plan.json')
             data = json.loads(plan_path.read_text())
             data['_session_id'] = 'foreign-session'
             plan_path.write_text(json.dumps(data))

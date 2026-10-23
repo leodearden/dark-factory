@@ -279,7 +279,7 @@ class TestArtifactsFromArgs:
             '--session-id', 'sess-9',
         ])
 
-        assert arts.root == mr
+        assert arts.lane_root == arts.task_root == mr
         assert arts.worktree == wt
         assert role == 'judge'
         assert sid == 'sess-9'
@@ -294,7 +294,7 @@ class TestArtifactsFromArgs:
             '--verdict-role', 'merger',
         ])
 
-        assert arts.root == wt / '.task'
+        assert arts.lane_root == arts.task_root == wt / '.task'
         assert arts.worktree == wt
         assert role == 'merger'
 

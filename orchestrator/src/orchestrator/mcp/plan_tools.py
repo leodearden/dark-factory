@@ -951,7 +951,7 @@ def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, 
     if not facts:
         return repaired, facts
 
-    plan_path = artifacts.root / 'plan.json'
+    plan_path = artifacts.artifact_path('plan.json')
     reportable = _report_markup_facts(plan_path, repaired, facts)
 
     if not any(fact['outcome'] == 'repaired' for fact in facts):
@@ -2068,8 +2068,8 @@ def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
         plan = artifacts.read_plan()
     except Exception:
         logger.warning(
-            'markup guard: could not read the plan for attribution under %s; '
-            'falling back to the worktree name', artifacts.root,
+            'markup guard: could not read the plan for attribution at %s; '
+            'falling back to the worktree name', artifacts.artifact_path('plan.json'),
         )
         plan = {}
     task_id = plan.get('task_id') if isinstance(plan, dict) else None
@@ -2649,8 +2649,8 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             reason: One-line explanation of what's missing — file/symbol
                 names and where this task expected to find them.
         """
-        # ``artifacts.root`` is a SIBLING of the worktree once a meta_root is
-        # supplied (`.task-meta/<name>/`), so `artifacts.root.parent` is the
+        # ``artifacts.lane_root`` is a SIBLING of the worktree once a meta_root
+        # is supplied (`.task-meta/<name>/`), so its parent is the
         # `.task-meta` base, NOT the worktree. `artifacts.worktree` is always
         # correct, legacy or relocated (see TaskArtifacts.__init__).
         worktree = artifacts.worktree

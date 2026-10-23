@@ -2950,9 +2950,8 @@ class TaskWorkflow:
                     # SIMPLE_TASK gave up — drop the plan so the architect
                     # path runs cleanly.
                     if self.artifacts is not None:
-                        plan_path = self.artifacts.root / 'plan.json'
-                        plan_path.unlink(missing_ok=True)
-                        (self.artifacts.root / 'plan.lock').unlink(
+                        self.artifacts.artifact_path('plan.json').unlink(missing_ok=True)
+                        self.artifacts.artifact_path('plan.lock').unlink(
                             missing_ok=True,
                         )
                 elif simple_outcome != WorkflowOutcome.PLANNED:
@@ -3878,10 +3877,10 @@ class TaskWorkflow:
             # satisfied as stamped is cleared rather than preserved.
             logger.warning(
                 'Task %s: merge_retry_pending HEAD match (%s) but the plan has '
-                'no files (artifacts root=%s) — cannot verify the merge-entry '
+                'no files (plan=%s) — cannot verify the merge-entry '
                 'scope invariant, clearing stamp and running full pipeline',
                 self.task_id, current_head,
-                self.artifacts.root if self.artifacts is not None else None,
+                self.artifacts.artifact_path('plan.json') if self.artifacts is not None else None,
             )
             await self._clear_merge_retry_pending()
             return None
@@ -5118,7 +5117,7 @@ class TaskWorkflow:
                 and not existing.get('_finalized_at')
                 and not existing.get('steps')
             ):
-                plan_path = self.artifacts.root / 'plan.json'
+                plan_path = self.artifacts.artifact_path('plan.json')
                 if plan_path.exists():
                     plan_path.unlink()
 
@@ -8198,7 +8197,7 @@ class TaskWorkflow:
         # Clear stale merge-failure review from prior runs — prevents
         # the review phase from re-surfacing resolved merge issues.
         if self.artifacts:
-            stale_merge = self.artifacts.root / 'reviews' / 'merge.json'
+            stale_merge = self.artifacts.artifact_path('reviews/merge.json')
             if stale_merge.exists():
                 logger.info('Task %s: removing stale merge.json review', self.task_id)
                 stale_merge.unlink()
@@ -8514,10 +8513,9 @@ class TaskWorkflow:
                     # Archive pre-amendment reviews so post-mortem can compare
                     if self.artifacts:
                         import shutil
-                        reviews_dir = self.artifacts.root / 'reviews'
-                        archive_dir = (
-                            self.artifacts.root
-                            / f'reviews-amend-{amendment_round}'
+                        reviews_dir = self.artifacts.artifact_path('reviews')
+                        archive_dir = self.artifacts.review_archive_dir(
+                            f'amend-{amendment_round}'
                         )
                         if reviews_dir.exists() and not archive_dir.exists():
                             shutil.copytree(reviews_dir, archive_dir)
@@ -8590,8 +8588,8 @@ class TaskWorkflow:
 
             # Archive reviews from this cycle before re-plan overwrites them
             if self.artifacts:
-                reviews_dir = self.artifacts.root / 'reviews'
-                archive_dir = self.artifacts.root / f'reviews-cycle-{review_cycle}'
+                reviews_dir = self.artifacts.artifact_path('reviews')
+                archive_dir = self.artifacts.review_archive_dir(f'cycle-{review_cycle}')
                 if reviews_dir.exists() and not archive_dir.exists():
                     import shutil
                     shutil.copytree(reviews_dir, archive_dir)
@@ -9342,7 +9340,7 @@ class TaskWorkflow:
 
         Called on EVERY zero-output timeout in ``_execute_iterations`` (before
         the threshold check) so both sub-threshold and tripping occurrences
-        are captured.  Writes to ``artifacts.root`` which outlives the per-task
+        are captured.  Writes to the task root, which outlives the per-task
         ``TaskConfigDir`` cleanup and the BLOCKED worktree (not GC'd since the
         task is not DONE).
 
@@ -9418,7 +9416,7 @@ class TaskWorkflow:
                         self.task_id, exc,
                     )
 
-            evidence_path = self.artifacts.root / f'zero_output_evidence-iter{iteration}.json'
+            evidence_path = self.artifacts.zero_output_evidence_path(iteration)
             evidence_path.write_text(json.dumps(evidence, indent=2))
             logger.info(
                 'Task %s: zero-output evidence written → %s',
@@ -10924,7 +10922,7 @@ class TaskWorkflow:
             return reviews
         if self.artifacts is None:
             return reviews
-        prior = load_prior_round_suggestions(self.artifacts.root)
+        prior = load_prior_round_suggestions(self.artifacts.review_archives_root)
         if not prior:
             return reviews
 
@@ -11310,7 +11308,7 @@ class TaskWorkflow:
             # itself a reviewer_comprehensive amendment on task 2483).
             # This is purely diagnostic; the fail-safe ERROR outcome below
             # is unchanged either way.
-            verdicts_dir = self.artifacts.root / 'verdicts'
+            verdicts_dir = self.artifacts.artifact_path('verdicts')
             if not verdicts_dir.is_dir():
                 logger.warning(
                     'Task %s: reviewer %s verdict absent AND %s does not '
@@ -12567,7 +12565,7 @@ class TaskWorkflow:
             # pre-triage meta-root diagnostic (steward.py:701-719). This
             # is purely diagnostic; the fail-safe blocked outcome below is
             # unchanged either way.
-            verdicts_dir = self.artifacts.root / 'verdicts'
+            verdicts_dir = self.artifacts.artifact_path('verdicts')
             if not verdicts_dir.is_dir():
                 logger.warning(
                     'Task %s: merger verdict absent AND %s does not '
@@ -16165,7 +16163,7 @@ class TaskWorkflow:
         foreign_session = ''
         if self.artifacts is not None:
             try:
-                plan_path = self.artifacts.root / 'plan.json'
+                plan_path = self.artifacts.artifact_path('plan.json')
                 data = json.loads(plan_path.read_text())
                 foreign_session = data.get('_session_id') or ''
             except Exception:

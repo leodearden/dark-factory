@@ -475,7 +475,7 @@ class _WideningArchitectStub(AgentStub):
         plan = dict(PLAN)
         plan['files'] = ['lib.py', 'locked_module.py']
         plan['_schema_version'] = 1
-        task_dir = TaskArtifacts(cwd).root
+        task_dir = TaskArtifacts(cwd).lane_root
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
         return AgentResult(success=True, output='Plan created', cost_usd=0.50)
@@ -508,7 +508,7 @@ class _WideningReplanStub(AgentStub):
         )
 
     async def _architect(self, cwd: Path) -> AgentResult:
-        plan_path = TaskArtifacts(cwd).root / 'plan.json'
+        plan_path = TaskArtifacts(cwd).artifact_path('plan.json')
         if plan_path.exists():
             plan = json.loads(plan_path.read_text())
             plan['files'] = [*plan['files'], 'locked_module.py']
@@ -602,7 +602,7 @@ def _wire_simple_task_run(
         stub.calls.append('simple_task')
         if simple_widens:
             cwd: Path = kwargs['cwd']
-            root = TaskArtifacts(cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)).root
+            root = TaskArtifacts(cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)).lane_root
             root.mkdir(parents=True, exist_ok=True)
             plan = {
                 **PLAN, '_schema_version': 1,

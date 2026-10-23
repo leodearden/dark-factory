@@ -750,7 +750,7 @@ class TestDeriveTruthLiveClaimant:
         # identity is the FULL composed shape — not the bare session id it
         # used to return.  The raw session id survives under session_id.
         artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
+        artifacts.task_root.mkdir(parents=True)
         artifacts.lock_plan('sess-13-abc123', run_id='run-13')
         lock_data = artifacts.read_plan_lock()
         assert lock_data is not None
@@ -775,7 +775,7 @@ class TestDeriveTruthLiveClaimant:
         # it must NOT fall through to the plan.lock fallback, which exists
         # only for rows with no db claimant at all (pre-2182 rows).
         artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
+        artifacts.task_root.mkdir(parents=True)
         artifacts.lock_plan('sess-14-abc123')
         fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
         task = {
@@ -820,8 +820,8 @@ class TestDeriveTruthLiveClaimant:
         # plan.lock whose owner process has died must NOT be treated as a
         # live claimant (review finding #3).
         artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text(json.dumps({
             'session_id': 'sess-dead-abc123',
             'locked_at': '2026-07-12T00:00:00+00:00',
@@ -848,8 +848,8 @@ class TestDeriveTruthLiveClaimant:
         # branch (task_ground_truth.py:368-376) must win: it returns
         # BEFORE the stale plan.lock at line 378+ is ever consulted.
         artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text(json.dumps({
             'session_id': 'sess-dead-abc123',
             'locked_at': '2026-07-12T00:00:00+00:00',
@@ -882,8 +882,8 @@ class TestDeriveTruthLiveClaimant:
         # TypeError/ValueError guard rather than raise out of derive_truth
         # (review finding #3).
         artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text(json.dumps({
             'session_id': 'sess-malformed-abc123',
             'locked_at': '2026-07-12T00:00:00+00:00',
@@ -909,8 +909,8 @@ class TestDeriveTruthLiveClaimant:
         # claimant, or it would silently block recovery of a genuinely
         # stranded task (review finding).
         artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text(json.dumps({
             'session_id': 'sess-reused-pid-abc123',
             'locked_at': '2026-07-01T00:00:00+00:00',
@@ -936,8 +936,8 @@ class TestDeriveTruthLiveClaimant:
         # claimant", not propagate json.JSONDecodeError out of derive_truth
         # (review finding #1).
         artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text('{not valid json')
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
@@ -957,8 +957,8 @@ class TestDeriveTruthLiveClaimant:
         # uncaught (amendment review finding #2). Must degrade to "no
         # plan-lock claimant", same as the corrupt-JSON case above.
         artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_bytes(b'\xff\xfe\x00\x01garbage')
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
@@ -986,8 +986,8 @@ class TestDeriveTruthLiveClaimant:
         # parametrization has since collapsed into
         # test_vestigial_worktree_lock_is_inert_and_unlinked (task 4028).
         artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text('["not", "an", "object"]')
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
@@ -1063,9 +1063,9 @@ class TestPlanLockIsReadFromTheMetaRoot:
         worktree = tmp_path / 'wt-4028'
         worktree.mkdir()
         legacy = TaskArtifacts(worktree)  # no meta_root -> <worktree>/.task
-        legacy.root.mkdir(parents=True)
+        legacy.task_root.mkdir(parents=True)
         assert legacy.lock_plan('sess-legacy-abc123', run_id='run-legacy-abc123')
-        assert not _plan_lock_artifacts(worktree).root.exists()
+        assert not _plan_lock_artifacts(worktree).task_root.exists()
 
         assert await self._resolve(worktree) is None
 
@@ -1126,7 +1126,7 @@ class TestPlanLockAttributionIsByAddress:
         lane = tmp_path / '_lane-0'
         lane.mkdir()
         artifacts = _plan_lock_artifacts(lane)
-        artifacts.root.mkdir(parents=True)
+        artifacts.task_root.mkdir(parents=True)
         assert artifacts.lock_plan('999-aaaaaaaa', run_id='run-999')
 
         claimant = await self._resolve(lane, tid='42')
@@ -1149,8 +1149,8 @@ class TestPlanLockAttributionIsByAddress:
         lane = tmp_path / '_lane-0'
         lane.mkdir()
         artifacts = _plan_lock_artifacts(lane)
-        artifacts.root.mkdir(parents=True)
-        (artifacts.root / 'plan.lock').write_text(json.dumps({
+        artifacts.task_root.mkdir(parents=True)
+        artifacts.artifact_path('plan.lock').write_text(json.dumps({
             'session_id': '999-aaaaaaaa',
             'run_id': 'run-999',
             'owner_pid': os.getpid(),
@@ -1180,8 +1180,8 @@ def _write_plan_lock(root: Path, payload: dict) -> Path:
     every degradation assertion below vacuous.
     """
     artifacts = _plan_lock_artifacts(root)
-    artifacts.root.mkdir(parents=True, exist_ok=True)
-    lock_path = artifacts.root / 'plan.lock'
+    artifacts.task_root.mkdir(parents=True, exist_ok=True)
+    lock_path = artifacts.artifact_path('plan.lock')
     lock_path.write_text(json.dumps(payload))
     return lock_path
 
@@ -1252,7 +1252,7 @@ class TestClaimantRunIdIsComposedOrNone:
         self, tmp_path: Path,
     ) -> None:
         artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
+        artifacts.task_root.mkdir(parents=True)
         artifacts.lock_plan('sess-13-abc123', run_id='run-abc')
 
         claimant = await self._resolve(tmp_path)
@@ -1416,7 +1416,7 @@ class TestClaimantRunIdIsComposedOrNone:
         NON-None value must carry the ``/pid=`` marker.
         """
         artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
+        artifacts.task_root.mkdir(parents=True)
         artifacts.lock_plan('sess-13-abc123', run_id='run-abc')
 
         claimant = await self._resolve(tmp_path)
@@ -1709,7 +1709,7 @@ class TestDeriveTruthRemainingFields:
         # finding #2). A bound plan.lock (and no db claimant) is required
         # to exercise the plan.lock leg that previously re-resolved.
         artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
+        artifacts.task_root.mkdir(parents=True)
         artifacts.lock_plan('sess-29-abc123')
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)

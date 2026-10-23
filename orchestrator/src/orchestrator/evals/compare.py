@@ -179,7 +179,7 @@ def _read_reviewer_verdict_envelopes(artifacts: TaskArtifacts) -> dict[str, Any]
     Returns ``{reviewer_name: {verdict, issues, summary, ...}}``. Returns
     empty dict if the verdicts dir doesn't exist or has no reviewer files.
     """
-    verdicts_dir = artifacts.root / 'verdicts'
+    verdicts_dir = artifacts.artifact_path('verdicts')
     if not verdicts_dir.is_dir():
         return {}
 
@@ -220,7 +220,7 @@ def _read_legacy_reviews(artifacts: TaskArtifacts) -> dict[str, Any]:
     Returns ``{reviewer_name: {verdict, issues, summary}}``. Returns empty
     dict if the reviews dir doesn't exist.
     """
-    reviews_dir = artifacts.root / 'reviews'
+    reviews_dir = artifacts.artifact_path('reviews')
     if not reviews_dir.is_dir():
         return {}
 

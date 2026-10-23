@@ -145,7 +145,7 @@ async def test_missing_reason_still_escalates_to_human(tmp_path: Path):
     """Malformed artifact: still L1 — the architect is signaling task is broken."""
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
     # Write artifact directly without reason field.
-    (f.artifacts.root / 'unactionable_task.json').write_text(
+    f.artifacts.artifact_path('unactionable_task.json').write_text(
         '{"evidence": "I forgot the reason"}\n'
     )
 

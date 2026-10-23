@@ -241,8 +241,8 @@ def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
         plan = artifacts.read_plan()
     except Exception:
         logger.warning(
-            'markup guard: could not read the plan for attribution under %s; '
-            'falling back to the worktree name', artifacts.root,
+            'markup guard: could not read the plan for attribution at %s; '
+            'falling back to the worktree name', artifacts.artifact_path('plan.json'),
         )
         return ''
     task_id = plan.get('task_id') if isinstance(plan, dict) else None

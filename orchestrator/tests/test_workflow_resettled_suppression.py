@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _orch_helpers import pydantic_spec
 
-from orchestrator.artifacts import ReviewAggregation
+from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow
 
@@ -242,8 +242,7 @@ class TestSuppressResettledSuggestions:
 
     @staticmethod
     def _with_artifacts(wf, root):
-        wf.artifacts = MagicMock()
-        wf.artifacts.root = root
+        wf.artifacts = TaskArtifacts(root / 'wt', root)
         return wf
 
     async def test_round_zero_is_noop(self, tmp_path):

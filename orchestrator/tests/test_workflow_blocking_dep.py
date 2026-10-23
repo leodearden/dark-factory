@@ -223,7 +223,7 @@ async def test_malformed_artifact_blocks(tmp_path: Path):
         project_root=tmp_path / 'proj',
     )
     # Write an artifact missing depends_on_task_id by hand.
-    (f.artifacts.root / 'blocking_dependency.json').write_text(
+    f.artifacts.artifact_path('blocking_dependency.json').write_text(
         '{"reason": "I forgot the dep id"}\n'
     )
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)

@@ -1544,7 +1544,7 @@ class TestArtifactsFromArgs:
             ['--worktree', str(wt), '--meta-root', str(mr)]
         )
 
-        assert artifacts.root == mr
+        assert artifacts.lane_root == artifacts.task_root == mr
         assert artifacts.worktree == wt
 
     def test_omitted_meta_root_falls_back_to_legacy_task_dir(self, tmp_path):
@@ -1554,12 +1554,12 @@ class TestArtifactsFromArgs:
 
         artifacts = _artifacts_from_args(['--worktree', str(wt)])
 
-        assert artifacts.root == wt / '.task'
+        assert artifacts.lane_root == artifacts.task_root == wt / '.task'
         assert artifacts.worktree == wt
 
     def test_worktree_attr_survives_sibling_root_relocation(self, tmp_path):
         """Documents the plan_tools.py:600 bug this task fixes: once ``root``
-        is a sibling ``.task-meta`` dir, ``artifacts.root.parent`` is the
+        is a sibling ``.task-meta`` dir, ``artifacts.lane_root.parent`` is the
         `.task-meta` BASE, not the worktree — callers needing the worktree
         (e.g. resolving main's SHA via git) must use ``artifacts.worktree``.
         """
@@ -1572,7 +1572,7 @@ class TestArtifactsFromArgs:
             ['--worktree', str(wt), '--meta-root', str(mr)]
         )
 
-        assert artifacts.root.parent != wt
+        assert artifacts.lane_root.parent != wt
         assert artifacts.worktree == wt
 
 
@@ -1591,7 +1591,7 @@ class TestReportBlockingDependencyToolResolvesRealWorktree:
     unit tests) call the private helper with an explicit ``main_sha=``,
     bypassing the tool wrapper's own ``worktree = artifacts.worktree`` /
     ``_resolve_main_sha(worktree)`` code path entirely — a regression that
-    reverted plan_tools.py:603 back to ``artifacts.root.parent`` would still
+    reverted plan_tools.py:603 back to ``artifacts.lane_root.parent`` would still
     pass every one of those tests. This test drives the actual registered
     MCP tool through ``create_server`` with a relocated (sibling)
     ``meta_root`` and monkeypatches ``_resolve_main_sha`` to capture the
@@ -1613,7 +1613,7 @@ class TestReportBlockingDependencyToolResolvesRealWorktree:
         # Sanity check this fixture actually reproduces the bug scenario:
         # once root is a relocated sibling, root.parent is the .task-meta
         # BASE, not the worktree.
-        assert artifacts.root.parent != artifacts.worktree
+        assert artifacts.lane_root.parent != artifacts.worktree
 
         captured: list[object] = []
 
@@ -1852,7 +1852,7 @@ class TestMarkStepCommitted:
         artifacts, _head = _init_git_repo_artifacts(tmp_path / 'repo')
         artifacts.write_plan(_committable_plan())
         artifacts.read_plan()  # stabilize any one-time normalization rewrite
-        before = (artifacts.root / 'plan.json').read_text()
+        before = artifacts.artifact_path('plan.json').read_text()
 
         bogus = 'f' * 40
         result = plan_tools._mark_step_committed(artifacts, 'step-1', bogus)
@@ -1862,7 +1862,7 @@ class TestMarkStepCommitted:
         assert bogus in result['message']
         # corroborate-before-acting: plan is byte-for-byte unchanged and the
         # step is still pending (the git cat-file -e guard refused the sha).
-        assert (artifacts.root / 'plan.json').read_text() == before
+        assert artifacts.artifact_path('plan.json').read_text() == before
         assert artifacts.read_plan()['steps'][0]['status'] == 'pending'
 
     async def test_unknown_step_id_errors(self, tmp_path):

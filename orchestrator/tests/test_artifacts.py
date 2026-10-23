@@ -42,23 +42,23 @@ def artifacts(worktree: Path) -> TaskArtifacts:
 
 class TestInit:
     def test_creates_directory_structure(self, artifacts: TaskArtifacts):
-        assert artifacts.root.exists()
-        assert (artifacts.root / 'metadata.json').exists()
-        assert (artifacts.root / 'reviews').is_dir()
+        assert artifacts.lane_root.exists()
+        assert artifacts.artifact_path('metadata.json').exists()
+        assert artifacts.artifact_path('reviews').is_dir()
 
     def test_creates_verdicts_directory(self, artifacts: TaskArtifacts):
-        assert (artifacts.root / 'verdicts').is_dir()
+        assert artifacts.artifact_path('verdicts').is_dir()
 
     def test_init_writes_no_gitignore(self, artifacts: TaskArtifacts):
         """W11-ι: init() no longer writes a .gitignore — .task-meta/ lives
         outside the worktree, so there's nothing for git to ignore.
         """
-        assert not (artifacts.root / '.gitignore').exists()
-        assert (artifacts.root / 'metadata.json').exists()
-        assert (artifacts.root / 'reviews').is_dir()
+        assert not (artifacts.lane_root / '.gitignore').exists()
+        assert artifacts.artifact_path('metadata.json').exists()
+        assert artifacts.artifact_path('reviews').is_dir()
 
     def test_metadata_contents(self, artifacts: TaskArtifacts):
-        metadata = json.loads((artifacts.root / 'metadata.json').read_text())
+        metadata = json.loads(artifacts.artifact_path('metadata.json').read_text())
         assert metadata['task_id'] == 'task-1'
         assert metadata['title'] == 'Test Task'
         assert metadata['description'] == 'A test task description'
@@ -89,8 +89,8 @@ class TestReadCreatedAt:
     def test_returns_none_when_created_at_key_missing(self, worktree: Path):
         worktree.mkdir()
         ta = TaskArtifacts(worktree)
-        ta.root.mkdir(parents=True, exist_ok=True)
-        (ta.root / 'metadata.json').write_text(json.dumps({'task_id': 'x'}))
+        ta.lane_root.mkdir(parents=True, exist_ok=True)
+        ta.artifact_path('metadata.json').write_text(json.dumps({'task_id': 'x'}))
         assert ta.read_created_at() is None
 
 
@@ -228,11 +228,11 @@ class TestMarkStepCommitted:
         artifacts.write_plan(self._plan())
         # Stabilize any one-time normalization rewrite before capturing bytes.
         artifacts.read_plan()
-        before = (artifacts.root / 'plan.json').read_text()
+        before = artifacts.artifact_path('plan.json').read_text()
 
         assert artifacts.mark_step_committed('nope', self.SHA) is False
 
-        after = (artifacts.root / 'plan.json').read_text()
+        after = artifacts.artifact_path('plan.json').read_text()
         assert after == before
 
     def test_idempotent_per_step_and_sha(self, artifacts: TaskArtifacts):
@@ -306,7 +306,7 @@ class TestIterationLog:
 
     def test_read_skips_corrupted_lines(self, artifacts: TaskArtifacts):
         """Good/bad/good lines → 2 entries, 1 corrupted."""
-        log_path = artifacts.root / 'iterations.jsonl'
+        log_path = artifacts.artifact_path('iterations.jsonl')
         lines = [
             json.dumps({'iteration': 1, 'agent': 'implementer', 'summary': 'ok'}),
             r'{"iteration": 2, "summary": "has bad escape \!"}',
@@ -323,7 +323,7 @@ class TestIterationLog:
 
     def test_read_all_corrupted(self, artifacts: TaskArtifacts):
         """All bad lines → empty entries, all lines in corrupted."""
-        log_path = artifacts.root / 'iterations.jsonl'
+        log_path = artifacts.artifact_path('iterations.jsonl')
         bad_lines = [
             r'not json at all',
             r'{"truncated": true',
@@ -345,7 +345,7 @@ class TestIterationLog:
         artifacts.append_iteration_log({
             'iteration': 1, 'agent': 'implementer', 'summary': 'stale',
         })
-        log_path = artifacts.root / 'iterations.jsonl'
+        log_path = artifacts.artifact_path('iterations.jsonl')
         assert log_path.exists()
 
         artifacts.clear_iteration_log()
@@ -355,7 +355,7 @@ class TestIterationLog:
 
     def test_clear_iteration_log_missing_ok(self, artifacts: TaskArtifacts):
         """clear_iteration_log() on a never-written log must not raise."""
-        log_path = artifacts.root / 'iterations.jsonl'
+        log_path = artifacts.artifact_path('iterations.jsonl')
         assert not log_path.exists()
 
         artifacts.clear_iteration_log()  # must not raise
@@ -484,7 +484,7 @@ class TestPlanProvenance:
     def test_stamp_plan_provenance_raises_on_missing_plan(self, artifacts: TaskArtifacts):
         """stamp_plan_provenance() must raise ValueError if plan.json does not exist."""
         # Ensure plan.json does not exist
-        plan_path = artifacts.root / 'plan.json'
+        plan_path = artifacts.artifact_path('plan.json')
         assert not plan_path.exists()
 
         with pytest.raises(ValueError, match='valid plan'):
@@ -493,7 +493,7 @@ class TestPlanProvenance:
     def test_stamp_plan_provenance_raises_on_empty_plan(self, artifacts: TaskArtifacts):
         """stamp_plan_provenance() must raise ValueError if plan.json has no steps key."""
         # Write a plan with no 'steps' key at all
-        (artifacts.root / 'plan.json').write_text('{}')
+        artifacts.artifact_path('plan.json').write_text('{}')
 
         with pytest.raises(ValueError, match='valid plan'):
             artifacts.stamp_plan_provenance('session-abc123')
@@ -505,7 +505,7 @@ class TestPlanProvenance:
         has no actual plan content — stamping it silently would hide data loss.
         """
         stub = {'_session_id': 'old-session', '_created_at': '2026-01-01T00:00:00+00:00'}
-        (artifacts.root / 'plan.json').write_text(
+        artifacts.artifact_path('plan.json').write_text(
             __import__('json').dumps(stub)
         )
 
@@ -516,7 +516,7 @@ class TestPlanProvenance:
         self, artifacts: TaskArtifacts
     ):
         """Corrupt (non-JSON) plan.json must return False, not raise JSONDecodeError."""
-        plan_path = artifacts.root / 'plan.json'
+        plan_path = artifacts.artifact_path('plan.json')
         plan_path.write_text('this is not valid json }{}{')
 
         # Must return False without raising any exception
@@ -527,7 +527,7 @@ class TestPlanProvenance:
         self, artifacts: TaskArtifacts
     ):
         """Unreadable plan.json (chmod 000) must return False, not raise OSError."""
-        plan_path = artifacts.root / 'plan.json'
+        plan_path = artifacts.artifact_path('plan.json')
         plan_path.write_text('{"_session_id": "session-abc123"}')
         plan_path.chmod(0o000)
         try:
@@ -566,7 +566,7 @@ class TestBumpRevalidationStamp:
             artifacts.bump_revalidation_stamp('sess-1')
 
     def test_raises_on_empty_steps(self, artifacts: TaskArtifacts):
-        (artifacts.root / 'plan.json').write_text('{"steps": []}')
+        artifacts.artifact_path('plan.json').write_text('{"steps": []}')
         with pytest.raises(ValueError, match='valid plan'):
             artifacts.bump_revalidation_stamp('sess-1')
 
@@ -621,7 +621,7 @@ class TestStalePlanLock:
     """Tests for stale plan.lock detection and cleanup."""
 
     def _create_lock(self, artifacts: TaskArtifacts, session_id: str, locked_at: str):
-        lock_path = artifacts.root / 'plan.lock'
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text(json.dumps({
             'session_id': session_id,
             'locked_at': locked_at,
@@ -632,7 +632,7 @@ class TestStalePlanLock:
         self._create_lock(artifacts, 'task-1-abcd1234', '2026-04-03T12:00:00+00:00')
         result = artifacts.clear_stale_plan_lock('task-1')
         assert result is True
-        assert not (artifacts.root / 'plan.lock').exists()
+        assert not artifacts.artifact_path('plan.lock').exists()
 
     def test_recent_foreign_lock_preserved(self, artifacts: TaskArtifacts):
         """Lock from a different task with recent timestamp is NOT cleared."""
@@ -641,14 +641,14 @@ class TestStalePlanLock:
         self._create_lock(artifacts, 'task-99-ffff0000', recent)
         result = artifacts.clear_stale_plan_lock('task-1')
         assert result is False
-        assert (artifacts.root / 'plan.lock').exists()
+        assert artifacts.artifact_path('plan.lock').exists()
 
     def test_old_foreign_lock_cleared(self, artifacts: TaskArtifacts):
         """Lock from a different task with old timestamp IS cleared."""
         self._create_lock(artifacts, 'task-99-ffff0000', '2025-01-01T00:00:00+00:00')
         result = artifacts.clear_stale_plan_lock('task-1', stale_threshold_secs=600.0)
         assert result is True
-        assert not (artifacts.root / 'plan.lock').exists()
+        assert not artifacts.artifact_path('plan.lock').exists()
 
     def test_no_lock_returns_false(self, artifacts: TaskArtifacts):
         """No lock file → returns False."""
@@ -660,7 +660,7 @@ class TestStalePlanLock:
         self._create_lock(artifacts, 'task-99-ffff0000', 'not-a-timestamp')
         result = artifacts.clear_stale_plan_lock('task-1')
         assert result is True
-        assert not (artifacts.root / 'plan.lock').exists()
+        assert not artifacts.artifact_path('plan.lock').exists()
 
 
 class TestPlanLock:
@@ -670,7 +670,7 @@ class TestPlanLock:
     def test_lock_plan_creates_file_returns_true(self, artifacts: TaskArtifacts):
         result = artifacts.lock_plan('session-abc123')
         assert result is True
-        assert (artifacts.root / 'plan.lock').exists()
+        assert artifacts.artifact_path('plan.lock').exists()
 
     def test_is_plan_locked_true_after_lock(self, artifacts: TaskArtifacts):
         artifacts.lock_plan('session-abc123')
@@ -705,7 +705,7 @@ class TestPlanLock:
     ):
         """lock_plan must raise ValueError and leave no plan.lock if os.getpid() returns non-int."""
         monkeypatch.setattr('orchestrator.artifacts.os.getpid', lambda: None)
-        lock_path = artifacts.root / 'plan.lock'
+        lock_path = artifacts.artifact_path('plan.lock')
 
         with pytest.raises(ValueError, match=r'owner_pid.*non-null int'):
             artifacts.lock_plan('session-abc')
@@ -819,9 +819,9 @@ class TestAgentSession:
         artifacts.write_agent_session(
             'sess-x', 'implementer', 'now', task_id='t-1',
         )
-        assert (artifacts.root / 'agent_session.json').exists()
+        assert artifacts.artifact_path('agent_session.json').exists()
         artifacts.clear_agent_session()
-        assert not (artifacts.root / 'agent_session.json').exists()
+        assert not artifacts.artifact_path('agent_session.json').exists()
 
     def test_clear_is_idempotent(self, artifacts: TaskArtifacts):
         # No file present
@@ -843,7 +843,7 @@ class TestAgentSession:
         artifacts.write_agent_session(
             'sess-d', 'architect', 'now', task_id='t-9', resume_count=1,
         )
-        raw = json.loads((artifacts.root / 'agent_session.json').read_text())
+        raw = json.loads(artifacts.artifact_path('agent_session.json').read_text())
         assert raw['schema_version'] == 2
         assert 'task_id' in raw
         assert 'resume_count' in raw
@@ -858,7 +858,7 @@ class TestAgentSession:
             'started_at': '2026-05-01T00:00:00+00:00',
             'owner_pid': 12345,
         }
-        (artifacts.root / 'agent_session.json').write_text(json.dumps(v1))
+        artifacts.artifact_path('agent_session.json').write_text(json.dumps(v1))
         data = artifacts.read_agent_session()
         assert data is not None
         # Legacy defaults for the absent v2 keys.
@@ -887,7 +887,7 @@ class TestAgentSession:
             'resume_count': 'abc',
             'schema_version': 2,
         }
-        (artifacts.root / 'agent_session.json').write_text(json.dumps(bad_str))
+        artifacts.artifact_path('agent_session.json').write_text(json.dumps(bad_str))
         assert artifacts.read_agent_session() is None
         # Null schema_version → int(None) raises TypeError.
         bad_null = {
@@ -898,7 +898,7 @@ class TestAgentSession:
             'resume_count': 0,
             'schema_version': None,
         }
-        (artifacts.root / 'agent_session.json').write_text(json.dumps(bad_null))
+        artifacts.artifact_path('agent_session.json').write_text(json.dumps(bad_null))
         assert artifacts.read_agent_session() is None
 
 
@@ -974,7 +974,7 @@ class TestVerdicts:
             'verdict': {'complete': True},
         }
         artifacts.write_verdict('judge', envelope)
-        assert (artifacts.root / 'verdicts' / 'judge.json').exists()
+        assert (artifacts.artifact_path('verdicts') / 'judge.json').exists()
         assert artifacts.read_verdict('judge') == envelope
 
     def test_read_returns_none_when_missing(self, artifacts: TaskArtifacts):
@@ -990,7 +990,7 @@ class TestVerdicts:
         }
         artifacts.write_verdict('judge', envelope)
         artifacts.clear_verdict('judge')
-        assert not (artifacts.root / 'verdicts' / 'judge.json').exists()
+        assert not (artifacts.artifact_path('verdicts') / 'judge.json').exists()
         assert artifacts.read_verdict('judge') is None
 
     def test_clear_is_idempotent(self, artifacts: TaskArtifacts):
@@ -1002,8 +1002,8 @@ class TestVerdicts:
         with pytest.raises(ValueError, match='invalid verdict role'):
             artifacts.write_verdict(bad_role, {'role': bad_role})
         # Nothing escaped verdicts/ or landed anywhere under root.
-        assert not any(artifacts.root.rglob('escape*'))
-        assert not any(artifacts.root.rglob('passwd*'))
+        assert not any(artifacts.task_root.rglob('escape*'))
+        assert not any(artifacts.task_root.rglob('passwd*'))
 
     @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd', 'judge\n'])
     def test_read_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
@@ -1066,7 +1066,7 @@ class TestJsonSidecarReadersFailSafe:
     def test_corrupt_sidecar_reads_as_fail_safe_value(
         self, artifacts: TaskArtifacts, caplog, name, read, expected, payload
     ):
-        (artifacts.root / name).write_bytes(payload)
+        artifacts.artifact_path(name).write_bytes(payload)
 
         with caplog.at_level('WARNING'):
             assert read(artifacts) == expected
@@ -1248,7 +1248,7 @@ class TestBlockingDependency:
 
     def test_artifact_path_is_under_task_dir(self, artifacts: TaskArtifacts):
         artifacts.write_blocking_dependency('5', 'r', 'sha')
-        path = artifacts.root / 'blocking_dependency.json'
+        path = artifacts.artifact_path('blocking_dependency.json')
         assert path.exists()
         # And contents must be JSON parseable.
         json.loads(path.read_text())
@@ -1315,7 +1315,7 @@ class TestReadyToMerge:
 
     def test_artifact_path_is_under_task_dir(self, artifacts: TaskArtifacts):
         artifacts.write_ready_to_merge('sha', 'e')
-        path = artifacts.root / 'ready_to_merge.json'
+        path = artifacts.artifact_path('ready_to_merge.json')
         assert path.exists()
         json.loads(path.read_text())
 
@@ -1691,14 +1691,14 @@ class TestPlanNormalizationIntegration:
     def test_read_plan_writes_back_when_normalized(self, artifacts: TaskArtifacts):
         # Write a malformed plan directly (bypass write_plan to skip schema version)
         raw = {'task_id': 'task-1', 'tdd_steps': [{'id': 'step-1', 'status': 'pending'}]}
-        (artifacts.root / 'plan.json').write_text(json.dumps(raw))
+        artifacts.artifact_path('plan.json').write_text(json.dumps(raw))
 
         plan = artifacts.read_plan()
         assert 'steps' in plan
         assert 'tdd_steps' not in plan
 
         # Re-read from disk — should now be normalized
-        raw_on_disk = json.loads((artifacts.root / 'plan.json').read_text())
+        raw_on_disk = json.loads(artifacts.artifact_path('plan.json').read_text())
         assert 'steps' in raw_on_disk
         assert 'tdd_steps' not in raw_on_disk
 
@@ -1707,13 +1707,13 @@ class TestPlanNormalizationIntegration:
             'task_id': 'task-1',
             'steps': [{'id': 'step-1', 'status': 'pending'}],
         }
-        (artifacts.root / 'plan.json').write_text(json.dumps(valid))
+        artifacts.artifact_path('plan.json').write_text(json.dumps(valid))
         import os
-        mtime_before = os.path.getmtime(artifacts.root / 'plan.json')
+        mtime_before = os.path.getmtime(artifacts.artifact_path('plan.json'))
 
         artifacts.read_plan()
 
-        mtime_after = os.path.getmtime(artifacts.root / 'plan.json')
+        mtime_after = os.path.getmtime(artifacts.artifact_path('plan.json'))
         assert mtime_before == mtime_after
 
 
@@ -1727,7 +1727,7 @@ class TestStringItemResilience:
             'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}],
         }
         # Write raw to bypass normalization in write_plan
-        (artifacts.root / 'plan.json').write_text(json.dumps(plan))
+        artifacts.artifact_path('plan.json').write_text(json.dumps(plan))
 
         # Should not crash — string items are skipped
         artifacts.update_step_status('step-1', 'done', commit='abc')
@@ -1741,7 +1741,7 @@ class TestStringItemResilience:
                 {'id': 'step-1', 'status': 'pending', 'commit': None},
             ],
         }
-        (artifacts.root / 'plan.json').write_text(json.dumps(plan))
+        artifacts.artifact_path('plan.json').write_text(json.dumps(plan))
 
         # read_plan normalizes steps (Rule 5) but not prerequisites (Rule 4 removed);
         # string prerequisites are skipped by the isinstance guard in get_pending_steps
@@ -1756,7 +1756,7 @@ class TestStringItemResilience:
                 {'id': 'step-1', 'status': 'done', 'commit': 'abc'},
             ],
         }
-        (artifacts.root / 'plan.json').write_text(json.dumps(plan))
+        artifacts.artifact_path('plan.json').write_text(json.dumps(plan))
 
         completed = artifacts.get_completed_steps()
         assert len(completed) == 1
@@ -1774,12 +1774,12 @@ class TestWorktreeMissingTolerance:
         # Remove the worktree out-of-band
         import shutil
         shutil.rmtree(worktree)
-        assert not ta.root.is_dir()
+        assert not ta.task_root.is_dir()
 
         # Must not raise
         ta.write_review('reviewer-x', {'verdict': 'PASS', 'issues': []})
         # And nothing was created
-        assert not ta.root.exists()
+        assert not ta.task_root.exists()
 
     def test_write_verdict_skips_when_root_gone(self, tmp_path: Path):
         worktree = tmp_path / 'gone-verdict'
@@ -1788,7 +1788,7 @@ class TestWorktreeMissingTolerance:
         ta.init('task-v', 'gone', 'desc')
         import shutil
         shutil.rmtree(worktree)
-        assert not ta.root.is_dir()
+        assert not ta.task_root.is_dir()
 
         # Must not raise
         ta.write_verdict('judge', {
@@ -1796,7 +1796,7 @@ class TestWorktreeMissingTolerance:
             'emitted_at': 't', 'verdict': {'complete': True},
         })
         # And nothing was created
-        assert not ta.root.exists()
+        assert not ta.task_root.exists()
         assert ta.read_verdict('judge') is None
 
     def test_write_json_skips_when_root_gone(self, tmp_path: Path):
@@ -1808,7 +1808,7 @@ class TestWorktreeMissingTolerance:
         shutil.rmtree(worktree)
 
         # _write_json into a path under .root with the dir gone — should swallow
-        target = ta.root / 'reviews' / 'foo.json'
+        target = ta.artifact_path('reviews') / 'foo.json'
         ta._write_json(target, {'a': 1})  # no exception
 
     def test_write_review_still_raises_for_genuine_io_errors(
@@ -1949,7 +1949,7 @@ class TestMetaRootConstructor:
     def test_root_is_meta_root_when_supplied(self, worktree: Path, meta_root: Path):
         worktree.mkdir()
         ta = TaskArtifacts(worktree, meta_root)
-        assert ta.root == meta_root
+        assert ta.lane_root == ta.task_root == meta_root
 
     def test_init_and_write_plan_land_under_meta_root_only(
         self, worktree: Path, meta_root: Path
@@ -2131,7 +2131,7 @@ class TestReviewVerdictCache:
     def test_get_cached_verdict_on_corrupt_review_state_returns_none(
         self, artifacts: TaskArtifacts
     ):
-        (artifacts.root / 'review_state.json').write_text('{not valid json')
+        artifacts.artifact_path('review_state.json').write_text('{not valid json')
         assert artifacts.get_cached_verdict('tree_abc') is None
 
     def test_reviewer_fingerprint_round_trips(self, artifacts: TaskArtifacts):
@@ -2211,7 +2211,7 @@ class TestReviewCounters:
 class TestEnsureLanePlanSymlink:
     """`ensure_lane_plan_symlink()` single-sources plan.json: the lane copy
     `<worktree>/.task/plan.json` becomes an ABSOLUTE symlink INTO the durable
-    meta-root plan.json (`self.root / 'plan.json'`). Any residual reader of the
+    meta-root plan.json (`artifact_path('plan.json')`). Any residual reader of the
     lane path then transparently resolves to the meta-root file — the esc-5205-9
     stale-trap (a regular-file lane copy that diverges from the meta-root) is
     impossible because the lane path IS the meta-root file. No-op in legacy
@@ -2343,10 +2343,10 @@ class TestEnsureLanePlanSymlink:
         self, artifacts: TaskArtifacts, worktree: Path
     ):
         # (e) legacy meta_root=None mode (the `artifacts` fixture builds
-        # TaskArtifacts(worktree) with self.root == worktree/.task): a
+        # TaskArtifacts(worktree), rooted at worktree/.task): a
         # pre-existing real plan.json is left a regular FILE — no
         # self-referential symlink is created.
-        assert artifacts.root == worktree / '.task'
+        assert artifacts.lane_root == artifacts.task_root == worktree / '.task'
         artifacts.write_plan(
             {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
         )
@@ -2666,7 +2666,7 @@ class TestWriteJsonIsAtomic:
     def test_readers_only_ever_observe_a_complete_document(
         self, artifacts: TaskArtifacts
     ):
-        plan_path = artifacts.root / 'plan.json'
+        plan_path = artifacts.artifact_path('plan.json')
 
         # Two documents of DELIBERATELY different sizes: a torn read of the
         # larger one cannot be mistaken for a clean read of the smaller.
@@ -2728,7 +2728,7 @@ class TestWriteJsonIsAtomic:
         guard on the tmp+rename implementation, where ``os.replace`` is what
         keeps the promise and a naive ``unlink`` + create would break it.
         """
-        plan_path = artifacts.root / 'plan.json'
+        plan_path = artifacts.artifact_path('plan.json')
         artifacts.write_plan({'task_id': 'task-1', 'steps': []})
 
         misses: list = []
@@ -2769,7 +2769,7 @@ class TestWriteJsonIsAtomic:
         Driven through ``write_verdict`` so nothing about it is
         plan-specific: if only ``write_plan`` were made atomic, this fails.
         """
-        verdict_path = artifacts.root / 'verdicts' / 'judge.json'
+        verdict_path = artifacts.artifact_path('verdicts') / 'judge.json'
 
         def envelope(payload: str) -> dict:
             return {
@@ -2827,7 +2827,7 @@ class TestWriteJsonPreservesMode:
     def test_an_existing_targets_mode_survives_the_write(
         self, artifacts: TaskArtifacts, mode: int
     ):
-        target = artifacts.root / 'plan.json'
+        target = artifacts.artifact_path('plan.json')
         target.write_text('{}')
         os.chmod(target, mode)
 
@@ -2853,7 +2853,7 @@ class TestWriteJsonPreservesMode:
         reference = tmp_path / 'reference.json'
         reference.write_text('{}')
 
-        target = artifacts.root / 'plan.json'
+        target = artifacts.artifact_path('plan.json')
         assert not target.exists()
 
         artifacts.write_plan({'task_id': 'task-1', 'title': 'fresh', 'steps': []})
@@ -2877,7 +2877,7 @@ class TestWriteJsonPreservesMode:
         umask".  Ports ``test_target_file_mode_propagates_a_non_missing_file_os_error``
         from the plan-tools suite, whose whole point this is.
         """
-        target = artifacts.root / 'plan.json'
+        target = artifacts.artifact_path('plan.json')
         real_stat = Path.stat
 
         # Scoped to *target*, falling back to the real stat() for every other
@@ -2901,9 +2901,9 @@ class TestWriteJsonFollowsSymlinks:
 
     `ensure_lane_plan_symlink` makes `<worktree>/.task/plan.json` an absolute
     symlink onto the meta-root plan, and `_artifacts_from_args` still supports
-    the legacy `meta_root=None` shape where `self.root` IS `<worktree>/.task`
+    the legacy `meta_root=None` shape rooted at `<worktree>/.task`
     (mcp_lifecycle's `meta_root` parameter defaults to None) — so
-    `self.root / 'plan.json'` can BE that symlink.
+    `artifact_path('plan.json')` can BE that symlink.
 
     `Path.write_text` followed the link.  A bare `os.replace` onto the link
     path would swap the LINK for a regular file, silently re-forking the lane
@@ -2928,10 +2928,10 @@ class TestWriteJsonFollowsSymlinks:
         lane_plan = worktree / '.task' / 'plan.json'
         assert lane_plan.is_symlink()
 
-        # The legacy view: self.root == <worktree>/.task, so write_plan's
+        # The legacy view is rooted at <worktree>/.task, so write_plan's
         # target is the symlink itself.
         legacy = TaskArtifacts(worktree)
-        assert legacy.root == worktree / '.task'
+        assert legacy.lane_root == legacy.task_root == worktree / '.task'
         return legacy, lane_plan, meta_root / 'plan.json'
 
     def test_symlink_survives_and_the_real_file_receives_the_write(
@@ -3049,7 +3049,7 @@ class TestWriteJsonFollowsSymlinks:
         An unconditional parent check would break artifact creation outright.
         """
         import shutil
-        shutil.rmtree(artifacts.root / 'verdicts')
+        shutil.rmtree(artifacts.artifact_path('verdicts'))
 
         artifacts.write_verdict('judge', {
             'role': 'judge', 'schema_version': 1, 'session_id': 's',
@@ -3114,7 +3114,7 @@ class TestWriteJsonDelegatesToSharedSafeIo:
             '_write_json must not re-implement or double-write'
         )
         call = calls[0]
-        assert call['path'] == artifacts.root / 'plan.json'
+        assert call['path'] == artifacts.artifact_path('plan.json')
         assert call['kwargs'].get('fsync') is True, (
             "fsync=True is _write_json's stated durability contract, and "
             'safe_io defaults it to False — so dropping or flipping the '
@@ -3124,7 +3124,7 @@ class TestWriteJsonDelegatesToSharedSafeIo:
             f'mkdir=True creates the artifact\'s parent.  Saw: {call["kwargs"]}'
         )
         # The write really happened — the spy is not standing in for it.
-        assert json.loads((artifacts.root / 'plan.json').read_text())['title'] == 'p'
+        assert json.loads(artifacts.artifact_path('plan.json').read_text())['title'] == 'p'
 
     def test_a_nested_artifact_delegates_on_the_same_terms(
         self, artifacts: TaskArtifacts, monkeypatch
@@ -3135,7 +3135,7 @@ class TestWriteJsonDelegatesToSharedSafeIo:
         parent directory is what ``mkdir`` has to conjure.
         """
         import shutil
-        shutil.rmtree(artifacts.root / 'verdicts')
+        shutil.rmtree(artifacts.artifact_path('verdicts'))
         calls = self._spy(monkeypatch)
 
         artifacts.write_verdict('judge', {
@@ -3145,5 +3145,5 @@ class TestWriteJsonDelegatesToSharedSafeIo:
 
         assert [c['kwargs'].get('fsync') for c in calls] == [True]
         assert [c['kwargs'].get('mkdir') for c in calls] == [True]
-        assert calls[0]['path'] == artifacts.root / 'verdicts' / 'judge.json'
+        assert calls[0]['path'] == artifacts.artifact_path('verdicts') / 'judge.json'
         assert artifacts.read_verdict('judge') is not None
