@@ -65,6 +65,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from shared.cli_boundary import LoudArgumentParser, run_cli
+
 # The probe IMPORTS what it measures rather than re-spelling it, so a code
 # change can never leave it measuring a stale spelling (the
 # measure_plural_enum_guard_recall.py precedent).
@@ -72,7 +74,6 @@ _SRC = Path(__file__).resolve().parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from shared.cli_boundary import LoudArgumentParser, run_cli  # noqa: E402
 from shared.task_statuses import TaskStatus  # noqa: E402
 
 from fused_memory.backends.graphiti_client import PagedRead  # noqa: E402
