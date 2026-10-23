@@ -17,7 +17,7 @@ from typing import Literal
 import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.verify import VerifyResult, run_verification
+from orchestrator.verify import VerifyResult, _aggregate_results, run_verification
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import ToolKind
@@ -221,3 +221,20 @@ def test_a_payload_without_run_all_failed_members_reads_as_absent() -> None:
     del payload['run_all_failed_members']
 
     assert result_from_dict(payload).run_all_failed_members is None
+
+
+@pytest.mark.parametrize(
+    ('children', 'expected'),
+    [
+        pytest.param([None, None, None], None, id='no-child-carries-one'),
+        pytest.param([['a.sh'], None, None], ['a.sh'], id='exactly-one-child'),
+        pytest.param([[], None], [], id='one-child-refusing-to-narrow'),
+        pytest.param([['a.sh'], ['b.sh']], [], id='two-channels-are-ambiguous'),
+    ],
+)
+def test_aggregate_run_all_failed_members(
+    children: list[list[str] | None], expected: list[str] | None,
+) -> None:
+    aggregate = _aggregate_results([_bare_result(members) for members in children])
+
+    assert aggregate.run_all_failed_members == expected
