@@ -3044,11 +3044,9 @@ class TestCollectSnapshotPerRootBudget:
         pre-empts a unit still inside its own bounds. Ceiling: half one
         collector cycle, so cycle N is done before cycle N+1 starts even when a
         root spends its whole budget."""
-        import dashboard.loops as loops_module
-
         budget = burndown_module._SNAPSHOT_PER_ROOT_BUDGET
         floor = burndown_module._SNAPSHOT_UNIT_WORST_CASE_SECONDS
-        ceiling = loops_module._SAMPLE_INTERVAL_SECONDS / 2
+        ceiling = burndown_module.SAMPLE_INTERVAL_SECONDS / 2
 
         assert budget >= floor, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the snapshot unit\'s own '
@@ -3057,8 +3055,8 @@ class TestCollectSnapshotPerRootBudget:
         )
         assert budget <= ceiling, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is above HALF one collector '
-            f'cycle ({ceiling} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
-            f'{loops_module._SAMPLE_INTERVAL_SECONDS} / 2).'
+            f'cycle ({ceiling} s = SAMPLE_INTERVAL_SECONDS / 2 = '
+            f'{burndown_module.SAMPLE_INTERVAL_SECONDS} / 2).'
         )
 
 

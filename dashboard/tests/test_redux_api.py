@@ -6,7 +6,6 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from dashboard import loops
 from dashboard.data import burndown, census, redux_api
 from dashboard.data.datum import (
     Datum,
@@ -1396,7 +1395,7 @@ def test_shape_burndown_aggregate_forecast_is_the_measured_rows_fold():
 # shape_burndown — every block serves its own provenance (task 5592)
 # ---------------------------------------------------------------------------
 
-_BOUND = 2 * loops._SAMPLE_INTERVAL_SECONDS
+_BOUND = 2 * burndown.SAMPLE_INTERVAL_SECONDS
 _BASE = datetime(2026, 5, 20, tzinfo=UTC)
 _WIRE_SERIES_KEYS = (*census.SERIES_KEYS.values(), *_SPLIT_SERIES_KEYS)
 _DATUM_KEYS = {'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds'}
