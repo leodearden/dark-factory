@@ -151,8 +151,12 @@ def normalize_supersedes(value: Any) -> list[Any]:
     tolerance for the legacy scalar stays.  The readers are
     ``reconciliation.targeted._is_authoritative_resolution`` (truthiness
     discriminator, which tests ``any()`` of the normalized members — see
-    ITS docstring for why member-level and not container truthiness) and
-    leaf 3112's closure predicate.  Both go through this helper — INV-5:
+    ITS docstring for why member-level and not container truthiness),
+    leaf 3112's closure predicate,
+    ``server/write_triage.py::declares_supersession`` (a declaration
+    force-stores the write instead of triaging it) and
+    ``services/supersession_mark.py::mark_superseded`` (which marks each
+    declared record superseded).  All go through this helper — INV-5:
     never a second ``supersedes`` parser.
 
     Accepts ``None`` (→ ``[]``), a scalar (→ single-element list), or any

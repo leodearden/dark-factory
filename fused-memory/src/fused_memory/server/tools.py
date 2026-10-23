@@ -199,6 +199,7 @@ from fused_memory.server.write_triage import (
     TriageFailOpenCounter,
     attach_write_landed,
     declares_attach_keys,
+    declares_supersession,
     emit_triage_fail_open_storm_escalation,
     resolve_write_triage_enabled,
     triage_write,
@@ -3825,6 +3826,7 @@ def create_mcp_server(
         # for why ANY `kind` counts (not just the child kinds) and what that
         # costs in coverage.
         caller_owns_attach_keys = declares_attach_keys(metadata)
+        caller_declares_supersession = declares_supersession(metadata)
         # Write triage (task 3127, PRD leaf beta) SUPERSEDES the two reject
         # guards below rather than layering on top of them (D2: redirect
         # supersedes reject). The two paths are mutually exclusive: when triage
@@ -3856,12 +3858,13 @@ def create_mcp_server(
                 # transport error, timeout and unparseable output, and that
                 # `except` arm counts it and returns `stored`.
                 judge=judge_write,
-                # Both predicates are already derived above, from the metadata
+                # The predicates are already derived above, from the metadata
                 # and agent_id this body holds. Passed IN rather than
                 # recomputed inside triage_write: a second derivation is a
                 # second place for the two to disagree about who is exempt.
                 allow_near_duplicate=allow_near_duplicate,
                 caller_owns_attach_keys=caller_owns_attach_keys,
+                caller_declares_supersession=caller_declares_supersession,
             )
         # DEFERRED, DELIBERATELY: the topic-cluster signal contributes nothing
         # to triage routing in this leaf. The PRD's band rule (§Bands) is
