@@ -7467,6 +7467,32 @@ class TestFilterStaleBulkGetStatusesFlags:
             'flags (100, 200) — never for the non-matching (999) or no-task-id flag'
         )
 
+    @pytest.mark.asyncio
+    async def test_possible_drift_log_keeps_its_event_name_and_names_the_family(self, caplog):
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        flags = [
+            {'task_id': None, 'flag_type': 'get_statuses_latency_regression'},
+            {'task_id': None, 'flag_type': 'Bulk-Get-Statuses-Stale'},
+        ]
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_stale_bulk_get_statuses_flags(taskmaster, '/proj', flags)
+
+        drift = [
+            r.getMessage()
+            for r in caplog.records
+            if 'stale_bulk_get_statuses_filter_possible_drift' in r.getMessage()
+        ]
+        assert len(drift) == 1, drift
+        assert drift[0].startswith(
+            'reconciliation.stale_bulk_get_statuses_filter_possible_drift '
+        )
+        assert 'family=stale_bulk_get_statuses' in drift[0]
+        assert "unmatched_flag_types=['get_statuses_latency_regression']" in drift[0]
+        taskmaster.get_statuses.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # task-1786 step-1 — filter_stale_count_snapshot_corrections
