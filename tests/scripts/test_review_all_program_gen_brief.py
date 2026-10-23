@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import shlex
 import subprocess
 from collections.abc import Iterator
@@ -332,3 +333,136 @@ def test_a_finding_without_a_statement_is_refused_naming_the_field(run: BriefRun
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert 'findings[0].statement' in proc.stderr
     assert not (run.home / 'briefs' / 'S1.author.md').exists()
+
+
+S1_UPSTREAM_TASKS = {101, 102, 103, 104, 109, 113}
+"""S1's program tasks in the fixture store; 104 and 113 appear in no return."""
+
+
+@pytest.fixture
+def decomposed(run: BriefRun) -> BriefRun:
+    run.applied('S1.author.json')
+    run.applied('S1.decompose.json')
+    run.applied('S2.author.json')
+    return run
+
+
+def task_ids(lines: list[str]) -> set[int]:
+    """The task id each ``- <id> …`` line opens with."""
+    return {int(entry.split()[0]) for entry in bullets(lines)}
+
+
+def task_line(lines: list[str], task_id: int) -> str:
+    (line,) = [entry for entry in bullets(lines) if entry.split()[0] == str(task_id)]
+    return line
+
+
+class NoRows:
+    """A StoreView whose every read answers no rows."""
+
+    def task(self, task_id: int) -> Any:
+        state = load_program_module('state')
+        return state.StoreRead((), state.now_utc())
+
+    def gate(self, run_id: str) -> Any:
+        state = load_program_module('state')
+        return state.StoreRead((), state.now_utc())
+
+
+def test_the_decompose_brief_reads_the_upstream_program_tasks_from_the_store(
+    decomposed: BriefRun,
+) -> None:
+    proc = decomposed.brief('S2', 'decompose')
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert re.search(r'^store read \S+$', proc.stdout, re.MULTILINE), proc.stdout
+    upstream = section(decomposed.written('S2', 'decompose'), _section_heading('UPSTREAM'))
+    assert task_ids(upstream) == S1_UPSTREAM_TASKS
+    assert 'held' in task_line(upstream, 103).split()
+
+
+def test_the_gate_section_names_the_gate_or_says_none_carries_the_run(decomposed: BriefRun) -> None:
+    gate = '\n'.join(section(decomposed.written('S2', 'decompose'), _section_heading('GATE')))
+    assert re.search(r'\b110\b', gate), gate
+
+    decomposed.store.edit({110: None})
+    gate = '\n'.join(section(decomposed.written('S2', 'decompose'), _section_heading('GATE')))
+
+    assert f'no human_gate task carries trigger_chain.run_id = {RUN_ID}' in gate
+
+
+def test_the_release_duties_are_the_unreleased_held_leaves_the_stream_owns(
+    decomposed: BriefRun,
+) -> None:
+    duties = section(decomposed.written('S2', 'decompose'), _section_heading('RELEASE_DUTIES'))
+
+    assert task_ids(duties) == {103}
+
+
+def test_the_decompose_brief_carries_the_xrefs_addressed_to_the_stream(decomposed: BriefRun) -> None:
+    xrefs = '\n'.join(section(decomposed.written('S2', 'decompose'), _section_heading('XREFS')))
+
+    assert "S2 consumes C2 once S1's alpha task 101 lands." in xrefs
+
+
+def test_the_decompose_brief_has_the_seat_sections_and_no_spawn(decomposed: BriefRun) -> None:
+    proc = decomposed.brief('S2', 'decompose')
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    text = (decomposed.home / 'briefs' / 'S2.decompose.md').read_text(encoding='utf-8')
+    for name in ('STREAM', 'RULINGS', 'FILINGS', 'RETURN'):
+        assert has_section(text, _section_heading(name)), name
+    assert not has_section(text, _section_heading('SPAWN'))
+    assert not (decomposed.home / 'sessions.json').exists()
+    assert 'spawn-claude.sh' not in proc.stdout
+
+
+def test_the_decompose_example_passes_the_form_checks(decomposed: BriefRun) -> None:
+    state = load_program_module('state')
+    home = state.Home(decomposed.home)
+    example = example_of(decomposed.written('S2', 'decompose'))
+
+    checked = state.validate_return(
+        json.dumps(example),
+        program=state.parse_program(json.loads(home.program_json.read_text())),
+        ledger=state.read_ledger(home), store=NoRows(),
+    )
+
+    assert [r for r in checked.rejections if r.kind is state.RejectionClass.FORM] == []
+    assert set(example) == pass_keys('decompose')
+
+
+def test_a_decompose_before_the_streams_author_return_is_refused(run: BriefRun) -> None:
+    state = load_program_module('state')
+    home = state.Home(run.home)
+    views = state.stream_views(
+        state.parse_program(json.loads(home.program_json.read_text())), state.read_ledger(home),
+    )
+
+    proc = run.brief('S2', 'decompose')
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert state.unauthored_reason(views['S2']) in proc.stderr
+    assert not (run.home / 'briefs' / 'S2.decompose.md').exists()
+
+
+def test_a_decompose_before_its_upstream_is_decomposed_is_refused(run: BriefRun) -> None:
+    run.applied('S1.author.json')
+    run.applied('S2.author.json')
+
+    proc = run.brief('S2', 'decompose')
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert 'S1' in proc.stderr and 'authored' in proc.stderr
+    assert not (run.home / 'briefs' / 'S2.decompose.md').exists()
+
+
+def test_a_store_without_include_rows_is_refused_naming_it(tmp_path: Path) -> None:
+    with _brief_run(tmp_path, '--no-include-rows') as run:
+        run.applied('S3.author.json')
+
+        proc = run.brief('S3', 'decompose')
+
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert 'include_rows' in proc.stderr
+        assert not (run.home / 'briefs' / 'S3.decompose.md').exists()
