@@ -8050,6 +8050,14 @@ def _aggregate_failing_ids_by_module(
     return {prefix: sorted(ids) for prefix, ids in merged.items()}
 
 
+def _aggregate_run_all_failed_members(results: list[VerifyResult]) -> list[str] | None:
+    # Two channels cannot be unioned: [] conflates "none failed" with "refused to narrow".
+    carried = [r.run_all_failed_members for r in results if r.run_all_failed_members is not None]
+    if not carried:
+        return None
+    return list(carried[0]) if len(carried) == 1 else []
+
+
 def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
     """Merge per-subproject VerifyResults into one."""
     if len(results) == 1:
@@ -8177,6 +8185,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        run_all_failed_members=_aggregate_run_all_failed_members(results),
         test_leg_failed=any(r.test_leg_failed for r in results),
         admission_legs=tuple(leg for r in results for leg in (r.admission_legs or ())) or None,
     )
