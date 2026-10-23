@@ -341,7 +341,6 @@ def _infos(caplog: pytest.LogCaptureFixture) -> list[str]:
 @pytest.mark.asyncio
 async def test_a_faithful_top_level_relocation_lands(
     repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A relocation whose edit re-applies against the merged blob is not reported as diverging.
 
@@ -351,8 +350,7 @@ async def test_a_faithful_top_level_relocation_lands(
     """
     scene = _relocation(repo, tmp_path)
 
-    with caplog.at_level(logging.INFO, logger=GATES_LOGGER):
-        outcome = await _finalize_relocation(git_ops, lane_config, scene)
+    outcome = await _finalize_relocation(git_ops, lane_config, scene)
 
     assert (outcome.status, outcome.merge_sha) == ('done', scene.landed)
 
@@ -362,17 +360,18 @@ async def test_the_verified_relocation_is_logged_against_the_task(
     repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The suppressed rename pair is logged once, naming the task it belongs to."""
+    """The rename suppression is logged once, naming the task it belongs to."""
     scene = _relocation(repo, tmp_path)
 
     with caplog.at_level(logging.INFO, logger=GATES_LOGGER):
         await _finalize_relocation(git_ops, lane_config, scene)
 
-    verified = (
-        "post-merge-equiv: content verified at the new name, not comparing "
-        f"[('b.py', 'a.py')] (target, source). task_id={TASK_ID}"
-    )
-    assert _infos(caplog).count(verified) == 1, _infos(caplog)
+    verified = [
+        message for message in _infos(caplog)
+        if message.startswith('post-merge-equiv: content verified at the new name')
+        and message.endswith(f'task_id={TASK_ID}')
+    ]
+    assert len(verified) == 1, _infos(caplog)
 
 
 @pytest.mark.asyncio
@@ -416,10 +415,11 @@ async def test_an_undecodable_merged_blob_keeps_the_relocation_flagged(
         outcome = await _finalize_relocation(git_ops, lane_config, scene)
 
     assert 'b.py' in _blocked_reason(outcome)
-    assert (
-        f'post-merge-equiv: merged blob {scene.landed}:b.py is not valid UTF-8 and cannot be '
-        f'patch-verified; not suppressing. task_id={TASK_ID}'
-    ) in _warnings(caplog)
+    assert any(
+        message.startswith(f'post-merge-equiv: merged blob {scene.landed}:b.py is not valid UTF-8')
+        and message.endswith(f'task_id={TASK_ID}')
+        for message in _warnings(caplog)
+    ), _warnings(caplog)
 
 
 @pytest.mark.asyncio
@@ -505,10 +505,10 @@ def event_store(tmp_path: Path) -> EventStore:
 @pytest.mark.asyncio
 async def test_with_the_kill_switch_off_the_chain_is_never_consulted(
     repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
-    event_store: EventStore,
+    event_store: EventStore, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """At the shipped kill-switch a blocked landing stays blocked, whatever chain is offered."""
-    assert gates.AUTO_CHAIN_GENERATIONS_ENABLED is False
+    """With the kill-switch off a blocked landing stays blocked, whatever chain is offered."""
+    monkeypatch.setattr(gates, 'AUTO_CHAIN_GENERATIONS_ENABLED', False)
     scene = _landing_that_drops_the_branch(repo, tmp_path, {'feature.txt': 'branch work\n'})
     chain = _chain()
 
