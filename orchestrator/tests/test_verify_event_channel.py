@@ -14,6 +14,9 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator.verify_categories import FailureCategory
+from orchestrator.verify_classify import classify_failure
+from orchestrator.verify_cmd import ToolKind
 from orchestrator.verify_event_channel import (
     VERIFY_EVENT_LOG_ENV,
     VerifyEventChannel,
@@ -25,6 +28,7 @@ from orchestrator.verify_event_channel import (
 )
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'reify_verify_event_channel'
+OTHER_FIXTURES = Path(__file__).parent / 'fixtures'
 C2_LINE_CAP = 4000
 
 
@@ -374,3 +378,206 @@ def test_failed_allocation_fails_open_to_no_channel(tmp_path: Path) -> None:
         assert log.path is None
         assert log.export_into({VERIFY_EVENT_LOG_ENV: '/tmp/x', 'A': '1'}) == {'A': '1'}
         assert log.read().present is False
+
+
+# classify_failure: C3 rule 4 (present channel decides SEMAPHORE_TIMEOUT) and
+# rule 2 (absent channel: the text arms, unchanged) ----------------------------
+
+TOOLS = [ToolKind.OPAQUE, ToolKind.PYTEST, ToolKind.CARGO_TEST]
+SEMAPHORE = FailureCategory.SEMAPHORE_TIMEOUT
+POOL_LOG = 'run_all-pool.log'
+SERIAL_LOG = 'run_all-serial.log'
+ORDINARY_FAILURE = 'FAILED tests/test_x.py::test_y - AssertionError\n'
+ENOSPC = 'error: No space left on device (os error 28)'
+
+
+def fixture_text(name: str) -> str:
+    return (FIXTURES / name).read_text()
+
+
+def present(*producer_files: str) -> VerifyEventChannel:
+    channel = parse(header('V') + b''.join(fixture_bytes(f) for f in producer_files))
+    assert channel.present is True
+    return channel
+
+
+FATAL_SENTINEL = fixture_text('slot_timeout-fatal.stderr.txt').rstrip('\n')
+LIVE_MARKERS = [
+    pytest.param(FATAL_SENTINEL, id='fatal-sentinel'),
+    pytest.param(
+        'lib_test_semaphore.sh: failed to acquire test slot within 1800s (LOCK=/tmp/x, N=8)',
+        id='lib_test_semaphore',
+    ),
+    pytest.param(
+        'ERROR: cargo-test-occt-gated.sh: failed to acquire OCCT slot within 1800s '
+        '(LOCK=/tmp/x, N=1)',
+        id='cargo-test-occt-gated',
+    ),
+    pytest.param(
+        'lib_lane_x_flock.sh: failed to acquire Lane-X lock within 600s (LOCK=/tmp/x)',
+        id='lib_lane_x_flock',
+    ),
+]
+
+
+def splice_into_block(log: str, member: str, verdict: str, inserted: str) -> str:
+    """Insert ``inserted`` as the first interior line of ``member``'s run_all block."""
+    lines = log.splitlines(keepends=True)
+    open_at = lines.index(f'--- Running: {member} ---\n')
+    close_at = lines.index(f'  RESULT: {verdict} ({member})\n')
+    assert open_at < close_at
+    return ''.join([*lines[: open_at + 1], inserted + '\n', *lines[open_at + 1 :]])
+
+
+def classify(
+    tool: ToolKind, text: str, channel: VerifyEventChannel | None, *, rc: int = 1,
+    timed_out: bool = False,
+) -> FailureCategory:
+    return classify_failure(tool, rc, text, timed_out, event_channel=channel)
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+@pytest.mark.parametrize('marker', LIVE_MARKERS)
+def test_live_marker_alone_is_a_semaphore_timeout_without_a_channel(
+    marker: str, tool: ToolKind,
+) -> None:
+    assert classify_failure(tool, 1, marker + '\n', False) is SEMAPHORE
+
+
+# D1 -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+def test_d1_sentinel_inside_a_passed_suite_is_not_a_semaphore_timeout(tool: ToolKind) -> None:
+    text = splice_into_block(fixture_text(POOL_LOG), 'test_pass.sh', 'PASS', FATAL_SENTINEL)
+
+    assert classify(tool, text, present(POOL)) is not SEMAPHORE
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+@pytest.mark.parametrize('marker', LIVE_MARKERS)
+def test_d1_marker_inside_a_failed_member_defers_to_the_present_channel(
+    marker: str, tool: ToolKind,
+) -> None:
+    text = splice_into_block(fixture_text(POOL_LOG), 'test_fail.sh', 'FAIL', marker)
+
+    assert classify(tool, text, None) is SEMAPHORE
+    assert classify(tool, text, present(POOL)) is not SEMAPHORE
+    if tool is ToolKind.OPAQUE:
+        assert classify(tool, text, present(POOL)) is FailureCategory.TEST_FAILURE
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+@pytest.mark.parametrize('marker', LIVE_MARKERS)
+def test_d1_task_role_marker_with_header_only_channel_is_not_a_semaphore_timeout(
+    marker: str, tool: ToolKind,
+) -> None:
+    text = marker + '\n' + ORDINARY_FAILURE
+
+    assert classify(tool, text, None) is SEMAPHORE
+    assert classify(tool, text, present()) is not SEMAPHORE
+
+
+# D2 -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+def test_d2_fatal_record_in_a_present_channel_is_a_semaphore_timeout(tool: ToolKind) -> None:
+    text = fixture_text(POOL_LOG)
+
+    assert classify(tool, text, None) is not SEMAPHORE
+    assert classify(tool, text, present(POOL, SLOT_FATAL)) is SEMAPHORE
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+def test_d2_task_role_fatal_record_without_run_start_is_a_semaphore_timeout(
+    tool: ToolKind,
+) -> None:
+    assert classify(tool, ORDINARY_FAILURE, None) is not SEMAPHORE
+    assert classify(tool, ORDINARY_FAILURE, present(SLOT_FATAL)) is SEMAPHORE
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+def test_soft_record_alone_is_not_a_semaphore_timeout(tool: ToolKind) -> None:
+    assert classify(tool, fixture_text(POOL_LOG), present(POOL, SLOT_SOFT)) is not SEMAPHORE
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+def test_fatal_record_wins_over_a_co_occurring_soft_one(tool: ToolKind) -> None:
+    channel = present(POOL, SLOT_FATAL, SLOT_SOFT)
+
+    assert classify(tool, fixture_text(POOL_LOG), channel) is SEMAPHORE
+
+
+# arm ordering is unchanged with a present fatal channel ----------------------
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+def test_disk_full_still_precedes_a_present_fatal_record(tool: ToolKind) -> None:
+    text = ENOSPC + '\n' + ORDINARY_FAILURE
+
+    assert classify(tool, text, present(SLOT_FATAL)) is FailureCategory.DISK_FULL
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+def test_broken_worktree_still_precedes_a_present_fatal_record(tool: ToolKind) -> None:
+    text = './scripts/verify.sh: No such file or directory\n'
+
+    assert classify(tool, text, present(SLOT_FATAL)) is FailureCategory.ENV_TRANSIENT
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+def test_guards_one_two_and_kill_still_precede_a_present_fatal_record(tool: ToolKind) -> None:
+    channel = present(SLOT_FATAL)
+
+    assert classify(tool, ORDINARY_FAILURE, channel, rc=0) is FailureCategory.PASSED
+    assert classify(tool, ORDINARY_FAILURE, channel, timed_out=True) is (
+        FailureCategory.INFRA_TIMEOUT
+    )
+    assert classify(tool, ORDINARY_FAILURE, channel, rc=-9) is FailureCategory.INFRA_KILL
+
+
+# D3: every absent channel classifies exactly as no channel at all -----------
+
+D3_CORPUS = [
+    pytest.param(
+        (OTHER_FIXTURES / 'verify_classify_run_all' / 'reify-5623-run-all-test-leg.log').read_text(),
+        id='reify-5623-run-all-test-leg',
+    ),
+    pytest.param(
+        (OTHER_FIXTURES / 'reify_verify_retry' / 'run_all-failed-marker.txt').read_text(),
+        id='run_all-failed-marker',
+    ),
+    pytest.param(fixture_text(POOL_LOG), id='run_all-pool-log'),
+    pytest.param(fixture_text(SERIAL_LOG), id='run_all-serial-log'),
+    *[pytest.param(m.values[0] + '\n', id=f'marker-{m.id}') for m in LIVE_MARKERS],
+    pytest.param(fixture_text('slot_timeout-soft.stderr.txt'), id='soft-sentinel'),
+    pytest.param(ENOSPC + '\n', id='enospc'),
+]
+
+
+def absent_channels() -> list[VerifyEventChannel | None]:
+    channels = [
+        parse(b''),
+        parse(fixture_bytes(POOL)),
+        parse(header('OTHER') + fixture_bytes(SLOT_FATAL)),
+    ]
+    assert not any(channel.present for channel in channels)
+    return [None, *channels]
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+@pytest.mark.parametrize('text', D3_CORPUS)
+def test_d3_absent_channel_classifies_as_no_channel(text: str, tool: ToolKind) -> None:
+    expected = classify_failure(tool, 1, text, False)
+
+    for channel in absent_channels():
+        assert classify(tool, text, channel) is expected
+
+
+@pytest.mark.parametrize('tool', TOOLS)
+def test_records_of_an_absent_channel_are_not_consulted(tool: ToolKind) -> None:
+    headerless = parse(fixture_bytes(SLOT_FATAL))
+    assert headerless.fatal_slot_timeouts == 1
+
+    assert classify(tool, ORDINARY_FAILURE, headerless) is not SEMAPHORE
