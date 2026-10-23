@@ -4,6 +4,7 @@ import copy
 import errno
 import json
 import os
+import re
 import stat
 import sys
 import threading
@@ -19,6 +20,7 @@ from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     PLAN_TASK_TEXT_FP_KEY,
     ArtifactWriteError,
+    PlanMutexNotHeld,
     ReviewAggregation,
     TaskArtifacts,
     _normalize_plan,
@@ -2356,6 +2358,241 @@ class TestEnsureLanePlanSymlink:
         # Still a regular file — no symlink, no self-reference.
         assert lane_plan.is_file()
         assert not lane_plan.is_symlink()
+
+
+_LANE_ARTIFACT_NAMES = (
+    'metadata.json', 'agent_session.json', 'interactive.json',
+    'blocking_dependency.json', 'already_done.json', 'ready_to_merge.json',
+    'false_premise.json', 'unactionable_task.json',
+)
+_TASK_ARTIFACT_NAMES = (
+    'plan.json', 'plan.lock', 'iterations.jsonl', 'reviews', 'verdicts',
+    'review_state.json', 'reconcile_state.json',
+)
+_PLAN = {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
+_VERDICT = {
+    'role': 'judge', 'schema_version': 1, 'session_id': 's',
+    'emitted_at': 't', 'verdict': {'complete': True},
+}
+
+
+class _DualRootLayout:
+    """One lane root and one task root for worktree ``wt-x`` / task ``42``."""
+
+    @pytest.fixture
+    def wt(self, tmp_path: Path) -> Path:
+        wt = tmp_path / 'wt-x'
+        wt.mkdir()
+        return wt
+
+    @pytest.fixture
+    def lane(self, wt: Path) -> Path:
+        return TaskArtifacts.meta_root_for(wt.parent, wt.name)
+
+    @pytest.fixture
+    def task(self, wt: Path) -> Path:
+        return TaskArtifacts.task_root_for(wt.parent, '42')
+
+    @pytest.fixture
+    def arts(self, wt: Path, lane: Path, task: Path) -> TaskArtifacts:
+        arts = TaskArtifacts(wt, lane, task)
+        arts.init('42', 'Dual', 'desc')
+        return arts
+
+
+def _names(root: Path) -> set[str]:
+    return {p.name for p in root.iterdir()}
+
+
+def _write_every_task_artifact(arts: TaskArtifacts) -> None:
+    arts.write_plan(copy.deepcopy(_PLAN))
+    arts.lock_plan('42-abc')
+    arts.append_iteration_log({'iteration': 1})
+    arts.write_review('r', {'verdict': 'PASS', 'issues': []})
+    arts.write_verdict('judge', _VERDICT)
+    arts.set_review_counters(amendment_rounds_total=1)
+    arts.record_review_verdict('tree', 'PASS', False)
+    arts.append_emitted_step_escalation('step-1', 'deadbeef')
+
+
+def _write_every_lane_artifact(arts: TaskArtifacts) -> None:
+    arts.write_agent_session('42-abc', 'implementer', 't', task_id='42')
+    arts.write_blocking_dependency('7', 'needs 7', 'sha')
+    arts.write_already_done('sha', 'ev')
+    arts.write_ready_to_merge('sha', 'ev')
+    arts.write_false_premise('c', 'p', 'e', 'r')
+    arts.write_unactionable_task('r', 'e')
+
+
+class TestDualRootRouting(_DualRootLayout):
+    """``TaskArtifacts(wt, lane, task)`` routes each artifact to the root the
+    frozen table names — task-lifetime state under ``task-<id>``, per-dispatch
+    exits under the lane — with no fallback between them (PRD
+    plans/task-meta-task-keying-prd.md decision 7).
+    """
+
+    def test_init_creates_both_roots_and_splits_them(self, arts, lane, task):
+        assert lane.is_dir() and task.is_dir()
+        assert (lane / 'metadata.json').is_file()
+        assert (task / 'reviews').is_dir() and (task / 'verdicts').is_dir()
+        assert not (lane / 'reviews').exists()
+        assert not (lane / 'verdicts').exists()
+
+    @pytest.mark.parametrize(('write', 'relpath'), [
+        (lambda a: a.write_plan(copy.deepcopy(_PLAN)), 'plan.json'),
+        (lambda a: a.lock_plan('42-abc'), 'plan.lock'),
+        (lambda a: a.append_iteration_log({'iteration': 1}), 'iterations.jsonl'),
+        (lambda a: a.write_review('r', {'verdict': 'PASS'}), 'reviews/r.json'),
+        (lambda a: a.write_verdict('judge', _VERDICT), 'verdicts/judge.json'),
+        (lambda a: a.set_review_counters(review_cycles_total=2), 'review_state.json'),
+        (lambda a: a.record_review_verdict('tree', 'PASS', False), 'review_state.json'),
+        (lambda a: a.append_emitted_step_escalation('s', 'c'), 'reconcile_state.json'),
+    ])
+    def test_task_keyed_writer_lands_under_task_only(self, arts, lane, task, write, relpath):
+        write(arts)
+        assert (task / relpath).is_file()
+        assert not (lane / relpath).exists()
+
+    @pytest.mark.parametrize(('write', 'name'), [
+        (lambda a: None, 'metadata.json'),
+        (lambda a: a.write_agent_session('s', 'implementer', 't'), 'agent_session.json'),
+        (lambda a: a.write_blocking_dependency('7', 'r', 'sha'), 'blocking_dependency.json'),
+        (lambda a: a.write_already_done('sha', 'ev'), 'already_done.json'),
+        (lambda a: a.write_ready_to_merge('sha', 'ev'), 'ready_to_merge.json'),
+        (lambda a: a.write_false_premise('c', 'p', 'e', 'r'), 'false_premise.json'),
+        (lambda a: a.write_unactionable_task('r', 'e'), 'unactionable_task.json'),
+    ])
+    def test_lane_keyed_writer_lands_under_lane_only(self, arts, lane, task, write, name):
+        write(arts)
+        assert (lane / name).is_file()
+        assert not (task / name).exists()
+
+    def test_lane_holds_only_lane_keyed_names_after_every_writer(self, arts, lane):
+        _write_every_task_artifact(arts)
+        _write_every_lane_artifact(arts)
+        assert _names(lane) <= set(_LANE_ARTIFACT_NAMES)
+        assert 'plan.json.mutex' not in _names(lane)
+
+    def test_plan_planted_in_lane_is_invisible(self, arts, lane):
+        (lane / 'plan.json').write_text(json.dumps(_PLAN))
+        assert arts.read_plan() == {}
+
+    def test_lane_exit_planted_in_task_is_invisible(self, arts, task):
+        (task / 'blocking_dependency.json').write_text(json.dumps({'depends_on_task_id': '7'}))
+        assert arts.read_blocking_dependency() is None
+
+    def test_artifact_path_resolves_through_the_table(self, arts, lane, task):
+        assert arts.artifact_path('plan.json') == task / 'plan.json'
+        assert arts.artifact_path('metadata.json') == lane / 'metadata.json'
+        assert arts.artifact_path('reviews/merge.json') == task / 'reviews' / 'merge.json'
+
+    def test_artifact_path_refuses_unknown_name(self, arts):
+        with pytest.raises(ValueError, match='nope.json'):
+            arts.artifact_path('nope.json')
+
+    def test_family_accessors_route_to_task(self, arts, task):
+        assert arts.review_archive_dir('amend-1') == task / 'reviews-amend-1'
+        assert arts.review_archive_dir('cycle-2') == task / 'reviews-cycle-2'
+        assert arts.review_archives_root == task
+        assert arts.zero_output_evidence_path(3) == task / 'zero_output_evidence-iter3.json'
+
+    def test_root_properties(self, arts, lane, task):
+        assert arts.lane_root == lane
+        assert arts.task_root == task
+
+    def test_for_task_derives_both_roots(self, wt):
+        arts = TaskArtifacts.for_task(wt, '42')
+        assert arts.lane_root == TaskArtifacts.meta_root_for(wt.parent, wt.name)
+        assert arts.task_root == TaskArtifacts.task_root_for(wt.parent, '42')
+
+    @pytest.mark.parametrize('single_root', ['legacy', 'meta'])
+    def test_single_root_modes_resolve_everything_under_one_root(self, wt, lane, single_root):
+        if single_root == 'legacy':
+            arts, root = TaskArtifacts(wt), wt / '.task'
+        else:
+            arts, root = TaskArtifacts(wt, lane), lane
+        assert arts.lane_root == arts.task_root == root
+        for name in (*_LANE_ARTIFACT_NAMES, *_TASK_ARTIFACT_NAMES):
+            assert arts.artifact_path(name) == root / name
+        assert arts.review_archive_dir('amend-1') == root / 'reviews-amend-1'
+        assert arts.review_archives_root == root
+        assert arts.zero_output_evidence_path(1) == root / 'zero_output_evidence-iter1.json'
+
+    def test_lane_plan_symlink_targets_the_task_plan(self, arts, wt, task):
+        arts.ensure_lane_plan_symlink()
+        lane_plan = wt / '.task' / 'plan.json'
+        assert lane_plan.is_symlink()
+        assert lane_plan.resolve() == (task / 'plan.json').resolve()
+
+        arts.write_plan(copy.deepcopy(_PLAN))
+        assert json.loads(lane_plan.read_text()) == arts.read_plan()
+
+        TaskArtifacts(wt).update_step_status('step-1', 'done', 'abc123')
+        assert lane_plan.is_symlink()
+        stored = json.loads((task / 'plan.json').read_text())
+        assert stored['steps'][0]['status'] == 'done'
+
+    def test_task_root_gone_is_tolerated(self, arts, lane, task):
+        import shutil
+        shutil.rmtree(task)
+
+        arts.write_review('r', {'verdict': 'PASS'})
+        arts.write_verdict('judge', _VERDICT)
+        with arts.plan_mutex():
+            pass
+        assert not task.exists()
+
+        arts.write_blocking_dependency('7', 'r', 'sha')
+        assert arts.read_blocking_dependency()['depends_on_task_id'] == '7'
+        assert (lane / 'blocking_dependency.json').is_file()
+
+    def test_plan_mutex_sits_beside_the_task_plan(self, arts, lane, task):
+        arts.write_plan(copy.deepcopy(_PLAN))
+        assert (task / 'plan.json.mutex').exists()
+        assert not (lane / 'plan.json.mutex').exists()
+
+    def test_lane_symlink_view_shares_the_task_plan_mutex(self, arts, wt):
+        arts.write_plan(copy.deepcopy(_PLAN))
+        arts.ensure_lane_plan_symlink()
+        with arts.plan_mutex():
+            TaskArtifacts(wt).write_plan(copy.deepcopy(_PLAN), mutex_held=True)
+
+    def test_unheld_mutex_claim_names_the_task_plan(self, arts, task):
+        with pytest.raises(PlanMutexNotHeld, match=re.escape(str(task / 'plan.json'))):
+            arts.write_plan(copy.deepcopy(_PLAN), mutex_held=True)
+
+
+class TestReadTitle:
+    """``read_title()`` — metadata.json's title, else plan.json's, else None."""
+
+    @pytest.fixture
+    def arts(self, worktree: Path) -> TaskArtifacts:
+        worktree.mkdir()
+        arts = TaskArtifacts(worktree)
+        arts.artifact_path('metadata.json').parent.mkdir(parents=True)
+        return arts
+
+    def _seed(self, arts: TaskArtifacts, name: str, payload) -> None:
+        text = payload if isinstance(payload, str) else json.dumps(payload)
+        arts.artifact_path(name).write_text(text)
+
+    def test_metadata_title_wins(self, arts):
+        self._seed(arts, 'metadata.json', {'title': 'From metadata'})
+        self._seed(arts, 'plan.json', {'title': 'From plan'})
+        assert arts.read_title() == 'From metadata'
+
+    def test_falls_back_to_plan_title(self, arts):
+        self._seed(arts, 'metadata.json', {'task_id': '1'})
+        self._seed(arts, 'plan.json', {'title': 'From plan'})
+        assert arts.read_title() == 'From plan'
+
+    def test_absent_is_none(self, arts):
+        assert arts.read_title() is None
+
+    @pytest.mark.parametrize('payload', ['{not json', {'title': '   '}, {'title': 7}, ['title']])
+    def test_unusable_title_is_none(self, arts, payload):
+        self._seed(arts, 'metadata.json', payload)
+        assert arts.read_title() is None
 
 
 # ---------------------------------------------------------------------------
