@@ -35,6 +35,8 @@ class ExampleIdentity:
     prd_path: str
     keys: tuple[str, ...]
     other_stream: str
+    question: str = '<the question the human ruled on in this session>'
+    options: tuple[str, ...] = ('<option A>', '<option B>')
 
 
 def _sibling_path(prd_path: str, suffix: str) -> str:
@@ -61,9 +63,8 @@ _EXAMPLES: Mapping[str, _Builder] = types.MappingProxyType({
         'needs_human': False, 'lead_rulable': False, 'source': str(state.QuestionSource.AUTHOR),
     }],
     'rulings_in_session': lambda i: [{
-        'id': 'R1', 'question': '<the question the human ruled on in this session>',
-        'ruling': '<option A>', 'options': ['<option A>', '<option B>'],
-        'consequence': '<what the ruling changes>',
+        'id': 'R1', 'question': i.question, 'ruling': '<the option the human chose>',
+        'options': list(i.options), 'consequence': '<what the ruling changes>',
     }],
     'seam_dependencies': lambda i: [{'stream': i.other_stream, 'contract': SEAM}],
     'xrefs': lambda i: [{'to': i.other_stream, 'text': f'<what {i.other_stream} must know>'}],

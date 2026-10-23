@@ -15,14 +15,15 @@ import shlex
 import sys
 import types
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import program_doc
 import program_facts
+import questions
 import return_contract
 import run_cli
 import sessions
@@ -42,6 +43,8 @@ class Section(enum.StrEnum):
     UPSTREAM = 'Upstream program tasks'
     GATE = 'Gate'
     RELEASE_DUTIES = 'Release duties'
+    INVESTIGATE = 'Investigate'
+    ITEM = 'Item'
     FINDINGS = 'Findings'
     FILINGS = 'Phase 5 filings'
     XREFS = 'Cross-references to the stream'
@@ -234,8 +237,8 @@ def _identity(seat: _Seat) -> return_contract.ExampleIdentity:
     )
 
 
-def _return_section(seat: _Seat) -> tuple[Section, list[str]]:
-    return Section.RETURN, return_contract.section_lines(seat.run.home, _identity(seat))
+def _return_section(seat: _Seat, identity: return_contract.ExampleIdentity) -> tuple[Section, list[str]]:
+    return Section.RETURN, return_contract.section_lines(seat.run.home, identity)
 
 
 def _stream_section(seat: _Seat) -> tuple[Section, list[str]]:
@@ -349,7 +352,7 @@ def _author_brief(seat: _Seat) -> _Built:
     stream, rulings, filings, xrefs = _seat_sections(seat, record)
     return _Built([
         stream, rulings, _findings_section(seat, record), filings, xrefs,
-        _sitting_section(seat), _return_section(seat),
+        _sitting_section(seat), _return_section(seat, _identity(seat)),
     ])
 
 
@@ -449,13 +452,60 @@ def _decompose_brief(seat: _Seat) -> _Built:
     return _Built([
         _decompose_section(seat), stream, rulings, _upstream_section(seat, store),
         _gate_section(seat, store), _release_duties_section(seat, store), filings, xrefs,
-        _return_section(seat),
+        _return_section(seat, _identity(seat)),
     ], store.measured_at)
+
+
+def _pending_item(seat: _Seat) -> questions.RecordedQuestion:
+    """The recorded question the seat investigates; refused when unrecorded or no longer pending."""
+    ref = state.ItemRef(seat.stream, str(seat.item))
+    recorded = questions.recorded_questions(seat.run.ledger)
+    if ref not in recorded:
+        raise state.StateError(f'{ref} is no question the ledger records')
+    if ref not in questions.pending_items(recorded, seat.home.rulings):
+        raise state.StateError(f'{ref} is not pending: a ruling that is no re-ask answers it')
+    return recorded[ref]
+
+
+def _draft_path(seat: _Seat) -> str:
+    """Where the stream's draft PRD lives in the home, as ``program_doc.py --sitting`` shows it."""
+    prd_path = seat.view.prd_path
+    if prd_path is None:
+        return f'no PRD is recorded for {seat.stream}'
+    return str(program_doc.draft_copy(seat.run, seat.stream, PurePosixPath(prd_path).name).source)
+
+
+def _investigate_section(seat: _Seat) -> tuple[Section, list[str]]:
+    return Section.INVESTIGATE, [
+        f'- Investigate this one item with the human: {seat.stream}:{seat.item}, below.',
+        '- Return the ruling under `rulings_in_session`, with its `options` and `consequence`.',
+        '- Never edit the program doc, and never commit.',
+    ]
+
+
+def _item_section(seat: _Seat, question: questions.RecordedQuestion) -> tuple[Section, list[str]]:
+    return Section.ITEM, [
+        f'- item: {question.ref}',
+        f'- source: {question.source}',
+        f'- question: {question.question}',
+        *(f'- option: {option}' for option in question.options),
+        f'- recommendation: {question.recommendation}',
+        f'- draft: {_draft_path(seat)}',
+    ]
+
+
+def _investigate_brief(seat: _Seat) -> _Built:
+    question = _pending_item(seat)
+    identity = replace(_identity(seat), question=question.question, options=question.options)
+    return _Built([
+        _investigate_section(seat), _item_section(seat, question), _return_section(seat, identity),
+    ])
 
 
 _BUILDERS: Mapping[state.Pass, Callable[[_Seat], _Built]] = types.MappingProxyType({
     state.Pass.AUTHOR: _author_brief,
     state.Pass.DECOMPOSE: _decompose_brief,
+    state.Pass.INVESTIGATE: _investigate_brief,
 })
 
 
@@ -504,8 +554,6 @@ def _seat(args: argparse.Namespace) -> _Seat:
     home = program_facts.read_home(args.run)
     stream = home.run.program.stream(args.stream).id
     pass_ = state.Pass(args.pass_)
-    if pass_ not in _BUILDERS:
-        raise state.StateError(f'no {pass_} brief yet')
     if args.spawn is None:
         session = state.Session(state.SessionKind.AGENT, SEAT_TITLE)
     else:
