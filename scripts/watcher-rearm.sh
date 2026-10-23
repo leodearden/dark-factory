@@ -33,16 +33,17 @@
 # consumer's escalations.
 #
 # Env:
-#   DARK_FACTORY_ROOT     required; repo root used to locate the escalation
-#                         project for `uv run --project`.
+#   DARK_FACTORY_ROOT     required; repo root whose shared .venv
+#                         ($DARK_FACTORY_ROOT/.venv/bin/python) runs the
+#                         watcher.
 #   PROJECT_ROOT          optional; used to derive a default --queue-dir
 #                         ($PROJECT_ROOT/data/escalations) when --queue-dir
 #                         is not passed.
 #   WATCHER_REARM_PYTHON  optional interpreter override (default:
-#                         `uv run --project $DARK_FACTORY_ROOT/escalation
-#                         python`); tests inject `sys.executable` here to
-#                         drive the REAL escalation.watcher module directly
-#                         instead of spawning `uv run`.
+#                         $DARK_FACTORY_ROOT/.venv/bin/python); tests inject
+#                         `sys.executable` here to drive the REAL
+#                         escalation.watcher module directly instead of the
+#                         root venv's interpreter.
 #
 # Exit codes (preserved verbatim from escalation.watcher, except usage=2):
 #   0    FIRED    -- one matching escalation printed to stdout.
@@ -191,19 +192,23 @@ touch "$EXCLUDE_FILE"
 # revealing that the filter is off (see the header note above).
 echo "watcher-rearm.sh: level=${LEVEL:-<all>} exclude-file=$EXCLUDE_FILE (append a deliberately-pending esc-id here to suppress it)" >&2
 
-# Interpreter prefix: WATCHER_REARM_PYTHON overrides the default `uv run`
-# invocation (tests inject sys.executable to drive the real module without
-# uv). Built as an array so the default branch keeps
-# "$DARK_FACTORY_ROOT/escalation" as a single argv token -- space-safe even
-# if DARK_FACTORY_ROOT contains spaces. Only an explicit WATCHER_REARM_PYTHON
-# override is word-split, on the assumption that a caller supplying a
-# multi-word interpreter command (e.g. "python3 -I") wants each word as a
-# separate argv entry.
+# Interpreter prefix: by default the one shared root .venv every workspace
+# member resolves to, run without uv so nothing on this path can sync,
+# recreate or prune it (why not `uv run --no-sync`:
+# escalation/tests/test_watcher_rearm.py::test_default_path_never_invokes_uv).
+# WATCHER_REARM_PYTHON overrides it (tests inject sys.executable). Built as
+# an array so the default branch keeps the interpreter path as a single argv
+# token -- space-safe even if DARK_FACTORY_ROOT contains spaces. Only an
+# explicit WATCHER_REARM_PYTHON override is word-split, on the assumption
+# that a caller supplying a multi-word interpreter command (e.g.
+# "python3 -I") wants each word as a separate argv entry.
+ROOT_VENV="$DARK_FACTORY_ROOT/.venv"
+ROOT_VENV_PYTHON="$ROOT_VENV/bin/python"
 if [ -n "${WATCHER_REARM_PYTHON:-}" ]; then
     # shellcheck disable=SC2206
     WATCHER_CMD=($WATCHER_REARM_PYTHON)
 else
-    WATCHER_CMD=(uv run --project "$DARK_FACTORY_ROOT/escalation" python)
+    WATCHER_CMD=("$ROOT_VENV_PYTHON")
 fi
 
 WATCHER_ARGS=(-m escalation.watcher --queue-dir "$QUEUE_DIR" --timeout "$TIMEOUT" --exclude-file "$EXCLUDE_FILE")
