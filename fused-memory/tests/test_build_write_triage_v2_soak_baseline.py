@@ -377,6 +377,7 @@ class TestRatingProblems:
                   'conflict_quote'), 'conflict_quote'),
         (_without(_rated('e1', home='YES', conflict='NO', loss='YES'), 'loss_spans'),
          'loss_spans'),
+        ({**_rated('e1', conflict='NO'), 'home': ['YES']}, "home ['YES']"),
     ])
     def test_a_line_breaking_the_row_contract_names_that_alone(
         self, row: dict[str, Any], fragment: str,

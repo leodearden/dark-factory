@@ -286,13 +286,13 @@ def _row_violation(row: Mapping[str, Any]) -> str | None:
         if not isinstance(row[key], str) or not row[key]:
             return f'{key} {row[key]!r} is not a non-empty string'
     for key, words in (('basis', Basis), ('role', Role)):
-        if row[key] not in set(words):
+        if not _is_word(row[key], words):
             return f'{key} {row[key]!r} is not one of {sorted(words)}'
     carried = [binary for binary in _WORDS if binary in row]
     if not carried:
         return f'carries no binary (one of {", ".join(_WORDS)})'
     for binary in carried:
-        if row[binary] not in set(_WORDS[binary]):
+        if not _is_word(row[binary], _WORDS[binary]):
             return f'{binary} {row[binary]!r} is not one of {sorted(_WORDS[binary])}'
     unclear = [binary for binary in carried if is_abstain(row[binary])]
     reason = row.get('unclear_reason')
@@ -311,6 +311,10 @@ def _row_violation(row: Mapping[str, Any]) -> str | None:
         _skipped_follow_up_violation(row) or _evidence_violation(row, carried)
         or _non_consumed_violation(row)
     )
+
+
+def _is_word(value: object, words: type[StrEnum]) -> bool:
+    return isinstance(value, str) and value in set(words)
 
 
 def _skipped_follow_up_violation(row: Mapping[str, Any]) -> str | None:

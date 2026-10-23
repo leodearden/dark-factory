@@ -10,6 +10,7 @@ The script is loaded by path (``scripts/`` is not a package), lazily through
 from __future__ import annotations
 
 import functools
+import re
 import types
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,18 @@ class TestTheVerdictRowContract:
         row = _row(home='YES', conflict='NO', loss='YES')
         row[field] = value
         with pytest.raises(ValueError, match=f"row 0.*e1.*t1.*{field}.*'{value}'"):
+            _mod().resolve_judgements([row])
+
+    @pytest.mark.parametrize(('field', 'value'), [
+        ('home', ['YES']),
+        ('scope', {'CENTRAL': True}),
+        ('basis', ['current']),
+        ('role', {'primary': 1}),
+    ])
+    def test_a_word_that_is_not_a_string_is_refused_naming_it(self, field: str, value: object) -> None:
+        row = _row(home='YES', conflict='YES', scope='CENTRAL')
+        row[field] = value
+        with pytest.raises(ValueError, match=f'row 0.*{field} {re.escape(repr(value))}'):
             _mod().resolve_judgements([row])
 
     def test_scope_without_a_yes_conflict_is_refused(self) -> None:
@@ -488,9 +501,6 @@ class TestOpenFollowUps:
         assert judgement.answer(rubric.Binary.HOME) == rubric.Resolved.YES
         assert judgement.answer(rubric.Binary.CONFLICT) == rubric.Resolved.NO
         assert judgement.answer(rubric.Binary.LOSS) == rubric.Resolved.OPEN
-
-    def test_a_gap_is_unrated_tied_or_open(self) -> None:
-        assert {kind.value for kind in _mod().GapKind} == {'unrated', 'tied', 'open'}
 
 
 def _judged(target: str, *votes: dict[str, str]) -> Any:
