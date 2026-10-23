@@ -559,7 +559,9 @@ def _parse_codex_output(
     timed_out is propagated directly from result.timed_out on every return path.
     *prices*, when provided, is forwarded to _estimate_cost (see there for the
     resolution order when None). codex exits 0 on ``turn.failed``, so
-    returncode alone is not a failure signal.
+    returncode alone is not a failure signal. A failed turn reports codex's
+    own error text, so a reply that discusses caps is never read as one by
+    classify_invocation.
     """
     if not result.stdout.strip():
         return AgentResult(
@@ -602,7 +604,8 @@ def _parse_codex_output(
     #       "cache_write_input_tokens":N,"output_tokens":N}}  cached is INSIDE input
     #   {"type":"error","message":"..."}                  fatal; paired with turn.failed
     #   {"type":"turn.failed","error":{"message":"..."}}  fatal
-    output_parts = []
+    agent_parts: list[str] = []
+    error_parts: list[str] = []
     total_input_tokens = 0
     total_cached_input_tokens = 0
     total_cache_write_tokens = 0
@@ -623,7 +626,7 @@ def _parse_codex_output(
             if item.get('type') == 'agent_message':
                 text = item.get('text', '')
                 if text:
-                    output_parts.append(text)
+                    agent_parts.append(text)
             elif item.get('type') == 'command_execution':
                 # Track command executions for debugging
                 pass
@@ -647,9 +650,10 @@ def _parse_codex_output(
             error_text = (event.get('error') or {}).get('message', 'Unknown error')
 
         # The measured cap arrives as an `error` AND a `turn.failed` with one text.
-        if error_text is not None and error_text not in output_parts:
-            output_parts.append(error_text)
+        if error_text is not None and error_text not in error_parts:
+            error_parts.append(error_text)
 
+    output_parts = error_parts if is_error else agent_parts + error_parts
     output_text = '\n'.join(output_parts) if output_parts else result.stdout[:2000]
 
     priced_input_tokens = total_input_tokens
