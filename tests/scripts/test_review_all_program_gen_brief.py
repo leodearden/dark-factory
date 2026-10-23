@@ -12,10 +12,13 @@ are only ever copied.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import re
 import shlex
 import subprocess
+import sys
+import types
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +26,7 @@ from typing import Any
 
 import pytest
 from review_all_program_cli import RUN_ID, ProgramEnv, load_program_module
-from review_all_program_fixture import FIXTURE_DIR, PROGRAM_DIR, running_fake_store
+from review_all_program_fixture import FIXTURE_DIR, PROGRAM_DIR, REPO_ROOT, running_fake_store
 from review_all_program_seeded_run import StoreCopy
 
 SCRIPT = 'gen_brief.py'
@@ -466,3 +469,115 @@ def test_a_store_without_include_rows_is_refused_naming_it(tmp_path: Path) -> No
         assert proc.returncode == 1, proc.stdout + proc.stderr
         assert 'include_rows' in proc.stderr
         assert not (run.home / 'briefs' / 'S3.decompose.md').exists()
+
+
+S1_TITLE = 'prd:fixture S1'
+SPAWN_SCRIPT = REPO_ROOT / 'skills' / 'spawn' / 'spawn-claude.sh'
+SESSION_REGISTRY_PATH = REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'session_registry.py'
+
+
+def session_registry() -> types.ModuleType:
+    """This checkout's ``orchestrator/session_registry.py``, loaded by path."""
+    name = 'review_all_gen_brief_session_registry'
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, SESSION_REGISTRY_PATH)
+        assert spec is not None and spec.loader is not None, SESSION_REGISTRY_PATH
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def sessions_json(run: BriefRun) -> dict[str, Any]:
+    return json.loads((run.home / 'sessions.json').read_text(encoding='utf-8'))
+
+
+def test_a_spawned_author_brief_records_the_session_and_prints_one_pointer_prompt_command(
+    run: BriefRun,
+) -> None:
+    state = load_program_module('state')
+    started = state.now_utc()
+    proc = run.brief('S1', 'author', '--spawn', S1_TITLE)
+    ended = state.now_utc()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    brief_path = run.home / 'briefs' / 'S1.author.md'
+    recorded = sessions_json(run)
+    assert recorded == {S1_TITLE: {
+        'stream': 'S1', 'pass': 'author', 'item': None,
+        'spawned_after': recorded[S1_TITLE]['spawned_after'], 'record_dir': None,
+    }}
+    assert started <= recorded[S1_TITLE]['spawned_after'] <= ended
+    command = shlex.split(proc.stdout.splitlines()[-1])
+    assert command == [
+        'CLAUDE_SPAWN_SELF_EXIT=1', str(SPAWN_SCRIPT), str(run.project), 'true', S1_TITLE,
+        '--prompt-file', str(brief_path),
+    ]
+    assert SPAWN_SCRIPT.is_file()
+    text = brief_path.read_text(encoding='utf-8')
+    spawn = '\n'.join(section(text, _section_heading('SPAWN')))
+    registry = session_registry()
+    for outcome in (registry.ResultOutcome.IN_PROGRESS, *registry.TERMINAL_RESULT_OUTCOMES):
+        assert f'`{outcome}`' in spawn, outcome
+    assert str(run.home / 'inbox' / 'S1.author.json') in spawn
+    assert example_of(text)['session'] == {'kind': 'spawn', 'title': S1_TITLE}
+
+
+def test_spawn_on_a_decompose_pass_is_a_usage_error(decomposed: BriefRun) -> None:
+    proc = decomposed.brief('S2', 'decompose', '--spawn', 'x')
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert '--spawn' in proc.stderr
+    assert not (decomposed.home / 'briefs' / 'S2.decompose.md').exists()
+    assert not (decomposed.home / 'sessions.json').exists()
+
+
+def test_a_taken_title_is_refused_and_nothing_changes(run: BriefRun) -> None:
+    first = run.brief('S1', 'author', '--spawn', S1_TITLE)
+    assert first.returncode == 0, first.stdout + first.stderr
+    brief_path = run.home / 'briefs' / 'S1.author.md'
+    before = (run.home / 'sessions.json').read_bytes(), brief_path.read_bytes()
+
+    proc = run.brief('S1', 'author', '--spawn', S1_TITLE)
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert S1_TITLE in proc.stderr
+    assert ((run.home / 'sessions.json').read_bytes(), brief_path.read_bytes()) == before
+
+
+def test_sessions_of_different_titles_are_all_kept(run: BriefRun) -> None:
+    for stream in ('S1', 'S3'):
+        proc = run.brief(stream, 'author', '--spawn', f'prd:fixture {stream}')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    assert set(sessions_json(run)) == {'prd:fixture S1', 'prd:fixture S3'}
+
+
+def test_a_title_with_a_line_break_is_refused_and_nothing_is_written(run: BriefRun) -> None:
+    proc = run.brief('S1', 'author', '--spawn', 'prd:fixture\nS1')
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert not (run.home / 'sessions.json').exists()
+    assert not (run.home / 'briefs' / 'S1.author.md').exists()
+
+
+def test_sessions_read_types_each_entry_and_names_a_bad_field(run: BriefRun) -> None:
+    state = load_program_module('state')
+    sessions = load_program_module('sessions')
+    home = state.Home(run.home)
+    assert sessions.read(home) == {}
+    proc = run.brief('S1', 'author', '--spawn', S1_TITLE)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    stamp = sessions_json(run)[S1_TITLE]['spawned_after']
+
+    assert sessions.read(home) == {S1_TITLE: sessions.SpawnedSession(
+        title=S1_TITLE, stream='S1', pass_=state.Pass.AUTHOR, item=None, spawned_after=stamp,
+        record_dir=None,
+    )}
+
+    corrupted = sessions_json(run)
+    corrupted[S1_TITLE]['pass'] = 'bogus'
+    home.sessions_json.write_text(json.dumps(corrupted), encoding='utf-8')
+    with pytest.raises(state.StateError) as refused:
+        sessions.read(home)
+    assert S1_TITLE in str(refused.value) and 'pass' in str(refused.value)
