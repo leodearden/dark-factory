@@ -49,8 +49,9 @@
 #   0    FIRED    -- one matching escalation printed to stdout.
 #   124  CEILING  -- --timeout expired with nothing pending.
 #   137|143|144  KILLED -- external kill (SIGKILL/SIGTERM/etc).
-#   2    usage error / missing required input (silent-no-op guard) --
-#        NEVER a silent no-op: a diagnostic is always printed to stderr.
+#   2    usage error / missing required input / a missing or unusable root
+#        venv (silent-no-op guard) -- NEVER a silent no-op: a diagnostic is
+#        always printed to stderr.
 #   *    ERROR -- any other non-zero exit from the watcher itself.
 #
 # A machine-readable `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR>
@@ -58,10 +59,10 @@
 # invocation outcome, so callers can grep the outcome without disturbing the
 # watcher's JSON on stdout -- do NOT pipe `2>&1` if you parse stdout as JSON.
 # NOTE: usage/guard failures (exit 2 -- missing DARK_FACTORY_ROOT, an
-# unresolved queue dir, or a bad flag) return BEFORE the watcher is ever
-# invoked, so they print a plain stderr diagnostic instead of
-# this marker -- do not grep for the marker to detect a usage error, check
-# for exit code 2 instead.
+# unresolved queue dir, a missing or unusable root venv, or a bad flag)
+# return BEFORE the watcher is ever invoked, so they print a plain stderr
+# diagnostic instead of this marker -- do not grep for the marker to detect
+# a usage error, check for exit code 2 instead.
 #
 # NOTE: escalation.watcher installs its own SIGTERM handler that converts a
 # SIGTERM into a clean `sys.exit(0)` (see the module docstring in
@@ -176,6 +177,43 @@ else
     EXCLUDE_FILE="$QUEUE_DIR/.watcher-rearm-exclude"
 fi
 
+# Interpreter prefix: by default the one shared root .venv every workspace
+# member resolves to, run without uv so nothing on this path can sync,
+# recreate or prune it (why not `uv run --no-sync`:
+# escalation/tests/test_watcher_rearm.py::test_default_path_never_invokes_uv).
+# WATCHER_REARM_PYTHON overrides it (tests inject sys.executable). Built as
+# an array so the default branch keeps the interpreter path as a single argv
+# token -- space-safe even if DARK_FACTORY_ROOT contains spaces. Only an
+# explicit WATCHER_REARM_PYTHON override is word-split, on the assumption
+# that a caller supplying a multi-word interpreter command (e.g.
+# "python3 -I") wants each word as a separate argv entry.
+ROOT_VENV="$DARK_FACTORY_ROOT/.venv"
+ROOT_VENV_PYTHON="$ROOT_VENV/bin/python"
+
+# The import probe inherits exactly the env the real run will, so the two
+# cannot disagree.
+require_runnable_root_venv() {
+    local repair="this script never creates, syncs or repairs that venv; repair it with scripts/sync-orchestrator-env.sh"
+    local problem err
+    if [ ! -x "$ROOT_VENV_PYTHON" ]; then
+        problem="$ROOT_VENV_PYTHON is not an executable interpreter (missing venv, missing bin/python, or a dangling link)"
+    elif ! err=$("$ROOT_VENV_PYTHON" -c 'import escalation.watcher' 2>&1 >/dev/null); then
+        problem="$ROOT_VENV_PYTHON cannot import escalation.watcher (${err##*$'\n'})"
+    else
+        return 0
+    fi
+    echo "watcher-rearm.sh: shared root venv $ROOT_VENV cannot run the watcher: $problem -- $repair" >&2
+    exit 2
+}
+
+if [ -n "${WATCHER_REARM_PYTHON:-}" ]; then
+    # shellcheck disable=SC2206
+    WATCHER_CMD=($WATCHER_REARM_PYTHON)
+else
+    require_runnable_root_venv
+    WATCHER_CMD=("$ROOT_VENV_PYTHON")
+fi
+
 if [ "$CHECK" -eq 1 ]; then
     # Render an unset LEVEL as the explicit token `<all>` rather than an
     # empty `level=`, which a human doing a dry-run would misread as an
@@ -191,25 +229,6 @@ touch "$EXCLUDE_FILE"
 # a levelled caller into match-all mode with nothing in the runtime output
 # revealing that the filter is off (see the header note above).
 echo "watcher-rearm.sh: level=${LEVEL:-<all>} exclude-file=$EXCLUDE_FILE (append a deliberately-pending esc-id here to suppress it)" >&2
-
-# Interpreter prefix: by default the one shared root .venv every workspace
-# member resolves to, run without uv so nothing on this path can sync,
-# recreate or prune it (why not `uv run --no-sync`:
-# escalation/tests/test_watcher_rearm.py::test_default_path_never_invokes_uv).
-# WATCHER_REARM_PYTHON overrides it (tests inject sys.executable). Built as
-# an array so the default branch keeps the interpreter path as a single argv
-# token -- space-safe even if DARK_FACTORY_ROOT contains spaces. Only an
-# explicit WATCHER_REARM_PYTHON override is word-split, on the assumption
-# that a caller supplying a multi-word interpreter command (e.g.
-# "python3 -I") wants each word as a separate argv entry.
-ROOT_VENV="$DARK_FACTORY_ROOT/.venv"
-ROOT_VENV_PYTHON="$ROOT_VENV/bin/python"
-if [ -n "${WATCHER_REARM_PYTHON:-}" ]; then
-    # shellcheck disable=SC2206
-    WATCHER_CMD=($WATCHER_REARM_PYTHON)
-else
-    WATCHER_CMD=("$ROOT_VENV_PYTHON")
-fi
 
 WATCHER_ARGS=(-m escalation.watcher --queue-dir "$QUEUE_DIR" --timeout "$TIMEOUT" --exclude-file "$EXCLUDE_FILE")
 # --level is OMITTED entirely when unset, never passed as an empty value:
