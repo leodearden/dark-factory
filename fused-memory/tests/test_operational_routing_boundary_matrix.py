@@ -43,9 +43,10 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from fused_memory.middleware.curator_types import CuratorDecision
 from fused_memory.middleware.operational_ask_registry import OperationalAskEntry
 from fused_memory.middleware.operational_routing_guard import OPERATIONAL_LLM_GATE_MARKER_KEY
-from fused_memory.middleware.task_curator import CuratorDecision, TaskCurator
+from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.server.tools import create_mcp_server
 
 

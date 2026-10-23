@@ -99,13 +99,10 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
+from fused_memory.middleware.curator_types import CandidateTask
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
-
-if TYPE_CHECKING:
-    from fused_memory.middleware.task_curator import CandidateTask
-
 
 # ---------------------------------------------------------------------------
 # Pattern cache

@@ -26,11 +26,11 @@ from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import curator_escalator
 from fused_memory.middleware.curator_escalator import CuratorEscalator
+from fused_memory.middleware.curator_types import CuratorFailureError
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     DUPLICATE_METADATA_KEY,
     DuplicateFinding,
 )
-from fused_memory.middleware.task_curator import CuratorFailureError
 
 
 @overload

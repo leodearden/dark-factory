@@ -34,13 +34,15 @@ from shared.usage_gate import UsageGate
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TicketJanitorConfig
 from fused_memory.middleware.curation_deferral import DEDUPE_SKIPPED_KEY, DeferReason
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
     CuratorFailureError,
     PoolWithheld,
     PreparedCandidate,
     RewrittenTask,
+)
+from fused_memory.middleware.task_curator import (
     TaskCurator,
     normalize_title,
 )

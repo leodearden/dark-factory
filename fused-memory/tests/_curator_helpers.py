@@ -11,12 +11,12 @@ from unittest.mock import AsyncMock, MagicMock
 from shared.cli_invoke import AgentResult
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
+    PoolEntry,
     PoolWithheld,
     PreparedCandidate,
-    _PoolEntry,
     empty_pool_sizes,
     is_combine_eligible_status,
 )
@@ -38,10 +38,10 @@ def agent_result(structured: dict | None = None, output: str = '') -> AgentResul
     )
 
 
-def pool_with_ids(*pairs: tuple[str, str]) -> list[_PoolEntry]:
+def pool_with_ids(*pairs: tuple[str, str]) -> list[PoolEntry]:
     """Build a pool with the given (task_id, status) pairs."""
     return [
-        _PoolEntry(
+        PoolEntry(
             task_id=tid,
             title='t',
             description='',
@@ -58,7 +58,7 @@ def pool_with_ids(*pairs: tuple[str, str]) -> list[_PoolEntry]:
 
 
 def prepared(
-    title: str, pool: Iterable[_PoolEntry] = (), corpus_error: str | None = None,
+    title: str, pool: Iterable[PoolEntry] = (), corpus_error: str | None = None,
 ) -> PreparedCandidate:
     """A prepared bundle for *title* over *pool*; *corpus_error* marks a failed assembly."""
     entries = list(pool)
@@ -79,7 +79,7 @@ def zot_agent_result() -> AgentResult:
     )
 
 
-async def empty_corpus(*_args, **_kwargs) -> tuple[list[_PoolEntry], dict[str, int], PoolWithheld]:
+async def empty_corpus(*_args, **_kwargs) -> tuple[list[PoolEntry], dict[str, int], PoolWithheld]:
     """A ``TaskCurator._build_corpus`` stand-in that assembles an empty pool."""
     return [], empty_pool_sizes(), PoolWithheld()
 

@@ -52,6 +52,14 @@ from fused_memory.middleware.curation_deferral import (
     dedupe_skipped_marker,
     pool_defer_reason,
 )
+from fused_memory.middleware.curator_types import (
+    CandidateTask,
+    CuratorDecision,
+    CuratorFailureError,
+    PreparedCandidate,
+    exception_summary,
+    is_combine_eligible_status,
+)
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     CorpusSearcher,
     build_duplicate_metadata,
@@ -111,14 +119,8 @@ from fused_memory.middleware.task_creation_journal import (
     creation_operation_for,
 )
 from fused_memory.middleware.task_curator import (
-    CandidateTask,
-    CuratorDecision,
-    CuratorFailureError,
-    PreparedCandidate,
     TaskCurator,
-    exception_summary,
     flatten_task_tree,
-    is_combine_eligible_status,
     normalize_title,
 )
 from fused_memory.middleware.ticket_store import AWAITING_CURATION
