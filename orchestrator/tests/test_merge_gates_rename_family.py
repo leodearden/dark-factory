@@ -85,6 +85,13 @@ def _module(tag: str) -> str:
     return ''.join(f'{tag} line {i}\n' for i in range(1, 31))
 
 
+# Merge scenes share one base and edit opposite ends of it, so git's 3-way merge applies both sides cleanly.
+_BASE_MODULE = ''.join(f'line{i}\n' for i in range(1, 41))
+_BRANCH_EDIT = _BASE_MODULE.replace('line2\n', 'line2\nBRANCH_EDIT\n')
+_MAIN_EDIT = _BASE_MODULE.replace('line37\n', 'line37\nMAIN_EDIT\n')
+_BASE_BLOB = b'\x89PNG\r\n\x1a\n' + bytes(range(256)) * 4
+
+
 def _record(caplog: pytest.LogCaptureFixture, needle: str) -> str:
     messages = [r.getMessage() for r in caplog.records if needle in r.getMessage()]
     assert len(messages) == 1, (
@@ -259,9 +266,6 @@ class TestRenameProbeReadsTheDeclaredPathsPair:
         assert result.resolved_renames == {'pkg/before.py': 'pkg/after.py'}
 
 
-_BASE_MODULE = ''.join(f'line{i}\n' for i in range(1, 41))
-
-
 @pytest.mark.asyncio
 class TestRenameCycleThroughMergeHistory:
     """A rename chain that revisits a path (reachable only across a merge) stops at the revisit."""
@@ -423,11 +427,6 @@ class TestPlanFilesGateArms:
         assert result.missing_from_tree == []
         assert result.resolved_renames == {'pkg/stale_old.py': 'pkg/stale_new.py'}
         assert 'entry=pkg/broken.py' in _record(caplog, 'ls-tree probe failed')
-
-
-_BRANCH_EDIT = _BASE_MODULE.replace('line2\n', 'line2\nBRANCH_EDIT\n')
-_MAIN_EDIT = _BASE_MODULE.replace('line37\n', 'line37\nMAIN_EDIT\n')
-_BASE_BLOB = b'\x89PNG\r\n\x1a\n' + bytes(range(256)) * 4
 
 
 def _on_branch(repo: Path, branch: str, files: Mapping[str, str | bytes], msg: str) -> str:
