@@ -5898,7 +5898,10 @@ async def _run_cmd(
     *timeout* is measured from launch: time spent spawning the subprocess
     counts against it, so a command whose result has not been collected
     *timeout* seconds after ``_run_cmd`` began launching it is reported timed
-    out however long the spawn took.
+    out however long the spawn took.  It is measured on the running event
+    loop's clock, the clock that enforces the asyncio timers armed from it —
+    ``time.monotonic()`` on the default loop (pinned by
+    test_verify_clock_stop.py::TestRunCmdBudgetOnLoopClock).
 
     ``PYTHONUNBUFFERED=1`` is unconditionally injected into the subprocess env
     so that python children (pytest, ruff, pyright via uv) flush their stdout
@@ -5954,7 +5957,8 @@ async def _run_cmd(
     # consistent with what genuinely elapsed, which deadline fired.
     _cs_timeout_msg: list[str] = []
 
-    launched_at = time.monotonic()
+    clock = asyncio.get_running_loop().time
+    launched_at = clock()
     wall_deadline = launched_at + timeout
     try:
         if scope_unit is not None:
@@ -5987,7 +5991,7 @@ async def _run_cmd(
 
         if log_path is None:
             stdout, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=wall_deadline - time.monotonic(),
+                proc.communicate(), timeout=wall_deadline - clock(),
             )
             rc = proc.returncode if proc.returncode is not None else 1
             return rc, stdout.decode(errors='replace'), False
@@ -6013,7 +6017,7 @@ async def _run_cmd(
                         log_fh.flush()
                     await proc.wait()
 
-                await asyncio.wait_for(_stream(), timeout=wall_deadline - time.monotonic())
+                await asyncio.wait_for(_stream(), timeout=wall_deadline - clock())
             else:
                 # ── Marker-aware clock-stop loop (task 1916) ────────────────
                 # State machine: RUNNING enforces a wall-clock deadline that
@@ -6048,7 +6052,7 @@ async def _run_cmd(
                 _cs_limit = timeout
 
                 while True:
-                    now = time.monotonic()
+                    now = clock()
                     if state == _CS_RUNNING:
                         read_timeout = deadline - now
                         _cs_kind = 'wall-clock budget'
@@ -6077,7 +6081,7 @@ async def _run_cmd(
                     _cs_armed = now + read_timeout
 
                     if read_timeout <= 0:
-                        t_stop = time.monotonic()
+                        t_stop = clock()
                         _cs_timeout_msg.append(_clock_stop_reason(
                             kind=_cs_kind, limit=_cs_limit,
                             elapsed=t_stop - launched_at, remaining=_cs_armed - t_stop,
@@ -6090,7 +6094,7 @@ async def _run_cmd(
                             timeout=read_timeout,
                         )
                     except TimeoutError:
-                        t_stop = time.monotonic()
+                        t_stop = clock()
                         _cs_timeout_msg.append(_clock_stop_reason(
                             kind=_cs_kind, limit=_cs_limit,
                             elapsed=t_stop - launched_at, remaining=_cs_armed - t_stop,
@@ -6100,7 +6104,7 @@ async def _run_cmd(
                     if not chunk:
                         # EOF: process finished; wait for exit code within
                         # remaining wall-clock budget (fast in practice).
-                        now = time.monotonic()
+                        now = clock()
                         wait_budget = max(5.0, deadline - now)
                         await asyncio.wait_for(proc.wait(), timeout=wait_budget)
                         break
@@ -6124,7 +6128,7 @@ async def _run_cmd(
                         if marker is None:
                             continue
 
-                        now = time.monotonic()
+                        now = clock()
                         if state == _CS_RUNNING:
                             if marker == 'stop':
                                 state = _CS_STOPPED
