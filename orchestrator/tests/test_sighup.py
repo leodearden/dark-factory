@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -25,6 +26,10 @@ import time
 from pathlib import Path
 
 import pytest
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+
+# Every test in this module spawns a python child.
+pytestmark = pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 
 SIGHUP_SCRIPT = textwrap.dedent('''
     """Minimal shape: build UsageGate outside loop, register inside loop."""
@@ -135,3 +140,34 @@ def test_sighup_does_not_kill_process(tmp_path: Path):
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(pgid, signal.SIGKILL)
             proc.wait(timeout=5.0)
+
+
+@pytest.mark.parametrize(
+    'code',
+    [
+        pytest.param(
+            "import sys, time; sys.stdout.write('REA'); sys.stdout.flush(); "
+            'time.sleep(600)',
+            id='alive-mid-line',
+        ),
+        pytest.param(
+            "import sys; sys.stdout.write('not ready\\n')",
+            id='exits-without-ready',
+        ),
+    ],
+)
+def test_ready_wait_fails_instead_of_blocking(code: str):
+    proc = subprocess.Popen(
+        [sys.executable, '-c', code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    pgid = proc.pid
+    try:
+        with pytest.raises(AssertionError, match='READY'):
+            _await_ready(proc, within_secs=2.0)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
+        proc.wait(timeout=5.0)
