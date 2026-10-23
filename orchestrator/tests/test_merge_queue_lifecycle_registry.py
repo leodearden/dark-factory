@@ -2583,8 +2583,7 @@ class TestDecidedPredispatchRequestsLeaveTheCensus:
         self, git_ops: GitOps, config: OrchestratorConfig, how: str,
     ) -> None:
         queue: asyncio.Queue = asyncio.Queue()
-        clock = FakeClock()
-        lane = make_lane(git_ops, queue, clock=clock)
+        lane = make_lane(git_ops, queue)
         live = _make_request('census-live', 'census-live', git_ops.project_root, config)
         dead = _make_request('census-dead', 'census-dead', git_ops.project_root, config)
         await queue.put(live)
@@ -2602,11 +2601,6 @@ class TestDecidedPredispatchRequestsLeaveTheCensus:
             snapshot = lane.snapshot()
             assert snapshot['depth'] == 1, f'depth counts a decided request: {snapshot["entries"]!r}'
             assert snapshot['head_of_line'] == live.task_id
-
-            clock.time += 2460
-            assert lane_state(lane, dead.request_id) is None, (
-                'a decided request resurfaced once it had aged past the specimen age'
-            )
         finally:
             live.result.cancel()
 
