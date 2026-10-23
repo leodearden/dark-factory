@@ -2803,9 +2803,8 @@ class TestRunApplyStoreMutationPreflight:
         service.update_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment stamps exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         service = self._service()
 
         report = await self._run(service, apply=True)
@@ -2852,7 +2851,8 @@ class TestRunApplyStoreMutationPreflight:
         ):
             await self._run(service, apply=True)
 
-        assert fail_closed_records(caplog, 'retro_stamp_topics'), (
+        (record,) = fail_closed_records(caplog, 'retro_stamp_topics')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

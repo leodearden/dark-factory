@@ -4302,9 +4302,8 @@ class TestRunApplyStoreMutationPreflight:
         memory_service.delete_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment sweeps exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         memory_service = self._service()
 
         report = await _mod.run(
@@ -4373,7 +4372,8 @@ class TestRunApplyStoreMutationPreflight:
         assert exit_code == 2
         # ``main``'s own generic "fatal error during sweep" ERROR shares this
         # logger AND this level, so only the markers can tell the two apart.
-        assert fail_closed_records(caplog, 'sweep_orphan_flag_markers'), (
+        (record,) = fail_closed_records(caplog, 'sweep_orphan_flag_markers')
+        assert SENTINEL in record.getMessage(), (
             "main's blanket handler only says 'fatal error during sweep', so "
             'the guard site must log the fail-closed diagnosis itself; got: '
             f'{[r.getMessage() for r in caplog.records]}'
@@ -4416,7 +4416,8 @@ class TestRunApplyStoreMutationPreflight:
         assert exit_code == 2, 'a refused --apply must never satisfy the --check gate'
         # ``main``'s own generic "fatal error during sweep" ERROR shares this
         # logger AND this level, so only the markers can tell the two apart.
-        assert fail_closed_records(caplog, 'sweep_orphan_flag_markers'), (
+        (record,) = fail_closed_records(caplog, 'sweep_orphan_flag_markers')
+        assert SENTINEL in record.getMessage(), (
             'a gate that fails must say WHY it failed -- an exit 2 with no '
             'fail-closed diagnosis is indistinguishable from a crashed sweep; '
             f'got: {[r.getMessage() for r in caplog.records]}'

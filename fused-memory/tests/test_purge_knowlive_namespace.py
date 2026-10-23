@@ -981,10 +981,9 @@ class TestRunApplyStoreMutationPreflight:
         memory_service.update_edge.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment purges exactly as before -- all
         three mutations fire and the post-purge re-scan still runs."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         memory_service, graph = self._make_memory_service(
             graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
             mem0_members=[_mem0_member('m1')],
@@ -1067,7 +1066,8 @@ class TestRunApplyStoreMutationPreflight:
         ):
             _mod.main()
 
-        assert fail_closed_records(caplog, 'purge_knowlive_namespace'), (
+        (record,) = fail_closed_records(caplog, 'purge_knowlive_namespace')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

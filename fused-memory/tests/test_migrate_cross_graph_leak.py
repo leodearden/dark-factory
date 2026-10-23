@@ -2330,7 +2330,6 @@ class TestRunApplyStoreMutationPreflight:
     ):
         """Happy path: a writable environment migrates exactly as before,
         driving all three dispositions through their phases."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         mocks, memory_service, _ = self._scenario(monkeypatch)
         manifest_path = self._manifest_path(tmp_path)
 
@@ -2393,7 +2392,8 @@ class TestRunApplyStoreMutationPreflight:
                 _args(apply=True, manifest=str(manifest_path)), memory_service,
             )
 
-        assert fail_closed_records(caplog, 'migrate_cross_graph_leak'), (
+        (record,) = fail_closed_records(caplog, 'migrate_cross_graph_leak')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

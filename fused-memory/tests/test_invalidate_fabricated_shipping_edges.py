@@ -210,7 +210,8 @@ class TestRunApplyStoreMutationPreflight:
 
         # The logger is ``invalidate_shipping_edges``, NOT the module name --
         # filtering on the module name would match nothing and be vacuous.
-        assert fail_closed_records(caplog, 'invalidate_shipping_edges'), (
+        (record,) = fail_closed_records(caplog, 'invalidate_shipping_edges')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'
