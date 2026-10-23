@@ -48,6 +48,7 @@ import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
@@ -71,6 +72,7 @@ from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
 from shared.streak import KeyedStreaks
+from shared.transcript_archive import ArchiveBeforeDelete, archive_before_delete
 
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
@@ -118,6 +120,7 @@ from fused_memory.middleware.recon_code_fix_premise_guard import (
     match_candidate as match_refuted_premise,
 )
 from fused_memory.middleware.zero_output_breaker import ZeroOutputBreaker
+from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_dependencies
 
@@ -156,8 +159,45 @@ _CURATOR_CAP_WAIT_SANITY_SECS = 120.0
 _CONFIG_DIR_TASK_PREFIX = 'fm-curator-'
 
 
-def _sweep_stale_curator_config_dirs_once(base_dir: Path | None) -> None:
-    """Reclaim curator config dirs whose owning process is dead. Never raises."""
+def _archive_curator_config_dir(config_dir: Path, archive_root: Path) -> ArchiveBeforeDelete:
+    """Archive a curator config dir's transcripts, then remove the dir. Never raises.
+
+    The archive key is the dir's TaskConfigDir task_id, ``fm-curator-<pid>``.
+    """
+    outcome = archive_before_delete(
+        config_dir, config_dir.name.removeprefix(CONFIG_DIR_PREFIX), archive_root=archive_root,
+    )
+    if outcome.archived or outcome.held:
+        logger.info(
+            'TaskCurator config dir %s transcripts archived before removal: archived=%d '
+            'already_current=%d held=%d archive_root=%s',
+            config_dir.name,
+            outcome.archived,
+            outcome.already_current,
+            len(outcome.held),
+            archive_root,
+        )
+    return outcome
+
+
+def _reclaim_by_archiving(path: Path, *, archive_root: Path) -> None:
+    """The dead-PID sweep's reclaim step, honouring ``shutil.rmtree``'s contract.
+
+    A dir left holding unarchivable transcripts keeps its dead-PID name, so the
+    next process's sweep retries it.
+    """
+    outcome = _archive_curator_config_dir(path, archive_root)
+    if outcome.config_dir_removed:
+        return
+    if not path.exists():
+        raise FileNotFoundError(path)
+    raise OSError(f'{len(outcome.held)} transcript(s) held, not archivable, in {path}')
+
+
+def _sweep_stale_curator_config_dirs_once(
+    base_dir: Path | None, archive_root: Path | None,
+) -> None:
+    """Archive, then reclaim, curator config dirs whose owning process is dead. Never raises."""
     prefix = CONFIG_DIR_PREFIX + _CONFIG_DIR_TASK_PREFIX
     sweep_stale_pid_dirs_once(
         prefix,
@@ -171,6 +211,9 @@ def _sweep_stale_curator_config_dirs_once(base_dir: Path | None) -> None:
             prefix, exc_info=True,
         ),
         base_dir=base_dir,
+        reclaim=None if archive_root is None else partial(
+            _reclaim_by_archiving, archive_root=archive_root,
+        ),
     )
 
 
@@ -2947,18 +2990,26 @@ class TaskCurator:
         The dead-PID sweep runs on a worker thread and is not awaited: it
         reclaims other processes' leftovers, so no call depends on it, and a
         readdir of a large system tempdir must stall neither the server's event
-        loop nor this call (task 7335).
+        loop nor this call (task 7335). It archives each dead dir's transcripts
+        before removing the dir.
         """
         if self._usage_gate is None:
             return None
         if self._config_dir is None:
             asyncio.get_running_loop().run_in_executor(
-                None, _sweep_stale_curator_config_dirs_once, self._config_dir_base,
+                None,
+                _sweep_stale_curator_config_dirs_once,
+                self._config_dir_base,
+                self._transcript_archive_root(),
             )
             self._config_dir = TaskConfigDir(
                 f'{_CONFIG_DIR_TASK_PREFIX}{os.getpid()}', base_dir=self._config_dir_base,
             )
         return self._config_dir
+
+    def _transcript_archive_root(self) -> Path | None:
+        """Where curator transcripts are archived: recon's root, under recon's kill switch."""
+        return recon_archive_root(self._config.reconciliation)
 
     def _ledger_kwargs(self, role: str) -> dict[str, Any]:
         """The ``invoke_with_cap_retry`` kwargs that land a call in the invocations ledger.
