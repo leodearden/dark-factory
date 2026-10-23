@@ -99,6 +99,7 @@ from orchestrator.verify_cmd import (
     with_junitxml,
     with_pytest_timeout,
 )
+from orchestrator.verify_event_channel import VerifyEventChannel, allocate_verify_event_log
 
 logger = logging.getLogger(__name__)
 
@@ -2503,15 +2504,17 @@ def _red_gate_category(slot: LegSlot) -> FailureCategory:
 
 
 def classify_leg(
-    slot: LegSlot, rc: int, output: str, timed_out: bool, cmd: str | None,
+    slot: LegSlot, rc: int, output: str, timed_out: bool, cmd: str | None, *,
+    event_channel: VerifyEventChannel | None = None,
 ) -> FailureCategory:
     """The ONE per-leg classifier. ``classify_failure`` answers what the tool's
-    OUTPUT says; this adds what only verify knows: the leg's slot, and that
-    verify interposed the shell. It rewrites only the UNKNOWN_TEST_FAILURE
-    fall-through, so every more specific diagnosis survives.
+    OUTPUT says (and the leg's *event_channel*, when present); this adds what
+    only verify knows: the leg's slot, and that verify interposed the shell.
+    It rewrites only the UNKNOWN_TEST_FAILURE fall-through, so every more
+    specific diagnosis survives.
     """
     tool = _tool_for_cmd(cmd)
-    category = classify_failure(tool, rc, output, timed_out)
+    category = classify_failure(tool, rc, output, timed_out, event_channel=event_channel)
     if category != FailureCategory.UNKNOWN_TEST_FAILURE:
         return category
     if tool is ToolKind.PYTEST and _pytest_session_aborted_without_verdict(rc, output):
@@ -2520,7 +2523,7 @@ def classify_leg(
 
 
 def _classify_failing_legs(
-    legs: Iterable[tuple[LegSlot, int, str, bool, str | None]],
+    legs: Iterable[tuple[LegSlot, int, str, bool, str | None, VerifyEventChannel | None]],
 ) -> dict[LegSlot, FailureCategory]:
     """Each failing leg's own category, keyed by slot, in *legs* order.
 
@@ -2529,22 +2532,26 @@ def _classify_failing_legs(
     provisioned venv is ENV_TRANSIENT, not TYPE_ERROR.
     """
     by_slot = {leg[0]: leg for leg in legs}
-    _, test_rc, _, _, test_cmd = by_slot[LegSlot.TEST]
+    _, test_rc, _, _, test_cmd, _ = by_slot[LegSlot.TEST]
     categories: dict[LegSlot, FailureCategory] = {}
-    for slot, rc, output, timed_out, cmd in by_slot.values():
+    for slot, rc, output, timed_out, cmd, event_channel in by_slot.values():
         if rc == 0:
             continue
         if slot is LegSlot.TYPE and _type_leg_read_partially_provisioned_venv(
             rc, output, timed_out, cmd, test_rc=test_rc, test_cmd=test_cmd,
+            event_channel=event_channel,
         ):
             categories[slot] = FailureCategory.ENV_TRANSIENT
         else:
-            categories[slot] = classify_leg(slot, rc, output, timed_out, cmd)
+            categories[slot] = classify_leg(
+                slot, rc, output, timed_out, cmd, event_channel=event_channel,
+            )
     return categories
 
 
 def _type_leg_read_partially_provisioned_venv(
     rc: int, out: str, timed_out: bool, cmd: str | None, *, test_rc: int, test_cmd: str | None,
+    event_channel: VerifyEventChannel | None = None,
 ) -> bool:
     """True when task 6127's cross-leg refinement decides the TYPE leg.
 
@@ -2557,7 +2564,9 @@ def _type_leg_read_partially_provisioned_venv(
     ``_warn_if_type_leg_read_partially_provisioned_venv`` both ask this one
     question, so the log never disagrees with the category.
     """
-    category = classify_failure(_tool_for_cmd(cmd), rc, out, timed_out)
+    category = classify_failure(
+        _tool_for_cmd(cmd), rc, out, timed_out, event_channel=event_channel,
+    )
     return category == FailureCategory.UNKNOWN_TEST_FAILURE and (
         is_partially_provisioned_venv_type_failure(
             out, test_tool=_tool_for_cmd(test_cmd), test_leg_passed=test_rc == 0,
@@ -2569,7 +2578,7 @@ def _warn_if_type_leg_read_partially_provisioned_venv(attempt: 'VerifyAttempt') 
     type_leg, test_leg = attempt.type, attempt.test
     if not _type_leg_read_partially_provisioned_venv(
         type_leg.rc, type_leg.output, type_leg.timed_out, type_leg.cmd,
-        test_rc=test_leg.rc, test_cmd=test_leg.cmd,
+        test_rc=test_leg.rc, test_cmd=test_leg.cmd, event_channel=type_leg.event_channel,
     ):
         return
     logger.warning(
@@ -2673,13 +2682,13 @@ def _summarize_checks(
         return True, 'passed', '', 'All checks passed', []
 
     legs = (
-        (LegSlot.TEST, test_rc, test_out, test_timed_out, test_cmd),
-        (LegSlot.LINT, lint_rc, lint_out, lint_timed_out, lint_cmd),
-        (LegSlot.TYPE, type_rc, type_out, type_timed_out, type_cmd),
+        (LegSlot.TEST, test_rc, test_out, test_timed_out, test_cmd, None),
+        (LegSlot.LINT, lint_rc, lint_out, lint_timed_out, lint_cmd, None),
+        (LegSlot.TYPE, type_rc, type_out, type_timed_out, type_cmd, None),
     )
     if leg_categories is None:
         leg_categories = _classify_failing_legs(legs)
-    hints = (_extract_cause_hint(out) for _, rc, out, _, _ in legs if rc != 0)
+    hints = (_extract_cause_hint(out) for _, rc, out, *_ in legs if rc != 0)
     cause_hint = ' | '.join(hint for hint in hints if hint)
     per_check_categories: list[str] = [*leg_categories.values()]
     category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
@@ -4397,6 +4406,9 @@ class CheckRun:
     # when it competed for no slot, on the terms ``slot_wait_secs`` states.
     # LAST field, as above.
     admission: 'AdmissionLeg | None' = None
+    # This leg invocation's parsed REIFY_VERIFY_EVENT_LOG (task 6856); None =
+    # no command ran. LAST field, as above, and kept out of ``to_dict``.
+    event_channel: 'VerifyEventChannel | None' = None
 
     @classmethod
     def skipped(cls, label: str) -> 'CheckRun':
@@ -4527,7 +4539,7 @@ class VerifyAttempt:
         """Each failing check's own category (``classify_leg``), keyed by slot."""
         checks = ((slot, self._by_label(slot)) for slot in LegSlot)
         return _classify_failing_legs(
-            (slot, check.rc, check.output, check.timed_out, check.cmd)
+            (slot, check.rc, check.output, check.timed_out, check.cmd, check.event_channel)
             for slot, check in checks
         )
 
@@ -4648,6 +4660,10 @@ class VerifyResult:
     # UNSCOPED_TYPECHECK_* sentinel results, and any hand-constructed result.
     # `[]` = "no failing legs" (a pass), which is likewise not a licence.
     failing_leg_categories: list[str] | None = None
+    # Task 6856: the TEST leg channel's C3 rule-3 failed run_all members. None =
+    # channel absent, so the text parse governs; [] = the channel cannot vouch
+    # for a complete set, i.e. the full suite.
+    run_all_failed_members: list[str] | None = None
     # Task 5357: True iff the TEST leg ran and exited non-zero. `lint_output` and
     # `type_output` are blanked on a passing leg at construction but
     # `test_output` is not (chronic_flake reads it on passes), so
@@ -6979,6 +6995,21 @@ async def _preprovision_shared_venv(
         _prune_preprovision_guard()
 
 
+def _log_event_channel(label: str, channel: VerifyEventChannel) -> None:
+    if channel.skipped_lines:
+        logger.warning(
+            'Verification %s leg: event channel had %d unparseable line(s), skipped',
+            label, channel.skipped_lines,
+        )
+    if channel.run_starts or channel.fatal_slot_timeouts or channel.soft_slot_timeouts:
+        logger.info(
+            'Verification %s leg: event channel run_starts=%d run_finishes=%d '
+            'fatal_slot_timeouts=%d soft_slot_timeouts=%d',
+            label, channel.run_starts, len(channel.run_finishes),
+            channel.fatal_slot_timeouts, channel.soft_slot_timeouts,
+        )
+
+
 async def run_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -7181,19 +7212,18 @@ async def run_verification(
             infix = ''
         return verify_dir / f'attempt-{current_attempt}{infix}.{label}.log'
 
-    async def _run_or_skip_timed(
-        cmd: str | None,
+    async def _run_leg_command(
+        leg_cmd: str,
         *,
         label: LegSlot,
         current_attempt: int,
+        leg_env: dict[str, str],
     ) -> CheckRun:
         """Like _run_cmd but returns a CheckRun capturing (rc, output, timed_out,
-        started_at, duration_secs) for this check.
-
-        When *cmd* is None (skipped check), returns ``CheckRun.skipped(label)``.
+        started_at, duration_secs) for this check, every spawn under *leg_env*.
         """
-        if cmd is None:
-            return CheckRun.skipped(label)
+        # Optional because the `_*_str` rewrites below return `str | None`.
+        cmd: str | None = leg_cmd
         # Capture the un-governed config command before _govern_cpu_str/the
         # nice-wrap below reassign the local `cmd` — CheckRun.cmd must reflect
         # what the caller configured, not the governed/wrapped string handed
@@ -7445,7 +7475,7 @@ async def run_verification(
                         governed,
                         segment_cwd,
                         segment_timeout,
-                        env=verify_env or None,
+                        env=leg_env or None,
                         log_path=_stream_log_path(
                             f'{label}.{segment_label}', current_attempt,
                         ),
@@ -7473,7 +7503,7 @@ async def run_verification(
                     cmd,
                     worktree,
                     timeout,
-                    env=verify_env or None,
+                    env=leg_env or None,
                     log_path=_stream_log_path(label, current_attempt),
                     **_scope_kw,
                     **_clock_kw,
@@ -7597,6 +7627,27 @@ async def run_verification(
                 rc=rc, timed_out=timed_out_flag,
             ),
         )
+
+    async def _run_or_skip_timed(
+        cmd: str | None,
+        *,
+        label: LegSlot,
+        current_attempt: int,
+    ) -> CheckRun:
+        """One leg invocation under its own fresh REIFY_VERIFY_EVENT_LOG channel,
+        read back onto ``CheckRun.event_channel``; ``CheckRun.skipped`` when
+        *cmd* is None.
+        """
+        if cmd is None:
+            return CheckRun.skipped(label)
+        with allocate_verify_event_log(role=role) as event_log:
+            run = await _run_leg_command(
+                cmd, label=label, current_attempt=current_attempt,
+                leg_env=event_log.export_into(verify_env),
+            )
+            channel = event_log.read()
+        _log_event_channel(label, channel)
+        return replace(run, event_channel=channel)
 
     # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3): populate
     # the shared .venv ONCE, synchronously, before the concurrent test/lint/type
@@ -7725,6 +7776,7 @@ async def run_verification(
         attempt = VerifyAttempt([new_test, attempt.lint, attempt.type])
         timed_out = (not attempt.passed) and attempt.pure_timeout_failure
 
+        leg_categories = attempt.classify_failing_legs()
         passed, category, cause_hint, summary, failing_leg_categories = _summarize_checks(
             attempt.test.rc, attempt.test.output, attempt.test.timed_out, attempt.test.cmd,
             attempt.lint.rc, attempt.lint.output, attempt.lint.timed_out, attempt.lint.cmd,
@@ -7732,6 +7784,7 @@ async def run_verification(
             test_duration=attempt.test.duration_secs,
             lint_duration=attempt.lint.duration_secs,
             type_duration=attempt.type.duration_secs,
+            leg_categories=leg_categories,
         )
         if timed_out:
             # Distinct wording from the first-pass timeout summary: this
@@ -7939,6 +7992,10 @@ async def run_verification(
         skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        run_all_failed_members=(
+            attempt.test.event_channel.failed_run_all_members()
+            if attempt.test.event_channel is not None else None
+        ),
         admission_legs=tuple(run.admission for run in test_runs if run.admission is not None) or None,
     )
 

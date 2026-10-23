@@ -203,9 +203,10 @@ async def test_the_env_recovery_rerun_classifies_with_its_own_channel(tmp_path: 
     assert result.category == FailureCategory.SEMAPHORE_TIMEOUT
 
 
-def _bare_result(**fields: object) -> VerifyResult:
+def _bare_result(run_all_failed_members: list[str] | None) -> VerifyResult:
     return VerifyResult(
-        passed=False, test_output='', lint_output='', type_output='', summary='', **fields,
+        passed=False, test_output='', lint_output='', type_output='', summary='',
+        run_all_failed_members=run_all_failed_members,
     )
 
 
