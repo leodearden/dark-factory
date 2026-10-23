@@ -387,7 +387,8 @@ class SessionRecord:
         only when the ``exit-requested`` marker is present on a proven-owner
         event. See ExitRequest and ``session_self_exit.py``.
     exit_requested_at: when the hook last stamped an ATTEMPTED evaluation, or
-        None; read by watch_sessions for sibling-mode final detection.
+        None if it never has; a later refusal or kill_failed stamp leaves it
+        in place.
     """
 
     session_slug: str

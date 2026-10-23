@@ -9,6 +9,8 @@ process.
 from __future__ import annotations
 
 import errno
+import logging
+import os
 import signal
 import subprocess
 import sys
@@ -244,6 +246,20 @@ class TestRefusals:
         assert request.state is sr.ExitRequestState.ATTEMPTED
         assert not _marker(tmp_path).exists()
 
+    def test_a_later_refusal_keeps_the_last_attempt_time(self, tmp_path):
+        armed = _armed(tmp_path)
+        _stop(tmp_path, armed, _KillRecorder(tmp_path))
+        attempted_at = _read(tmp_path).exit_requested_at
+        _marker(tmp_path).write_text('uuid-owner', encoding='utf-8')
+
+        _stop(tmp_path, armed, _KillRecorder(tmp_path), hook_input={**armed.hook_input, 'session_crons': None})
+
+        record = _read(tmp_path)
+        assert attempted_at is not None
+        assert record.exit_request is not None
+        assert record.exit_request.state is sr.ExitRequestState.REFUSED
+        assert record.exit_requested_at == attempted_at
+
 
 @pytest.fixture
 def shared_host_pid(tmp_path_factory: pytest.TempPathFactory) -> Iterator[int]:
@@ -383,3 +399,79 @@ class TestKillFailure:
         assert request is not None
         assert request.state is sr.ExitRequestState.ATTEMPTED
         assert not _marker(tmp_path).exists()
+
+
+_SELF_EXIT_LOGGER = 'orchestrator.session_self_exit'
+
+
+@dataclass
+class _LockingKill:
+    """A ``kill`` that makes the record dir read-only, then raises *exc* if one is given."""
+
+    record_dir: Path
+    exc: OSError | None = None
+    calls: list[tuple[int, int]] = field(default_factory=list)
+
+    def __call__(self, pid: int, sig: int) -> None:
+        self.calls.append((pid, sig))
+        self.record_dir.chmod(0o555)
+        if self.exc is not None:
+            raise self.exc
+
+
+@pytest.fixture
+def record_dir(tmp_path: Path) -> Iterator[Path]:
+    """The record dir, made writable again at teardown so tmp_path can be removed."""
+    path = _record_dir(tmp_path)
+    yield path
+    if path.exists():
+        path.chmod(0o755)
+
+
+def _self_exit_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == _SELF_EXIT_LOGGER and r.levelno == logging.WARNING]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root ignores file permission bits')
+class TestFailSoft:
+    def test_an_unwritable_kill_failed_stamp_is_logged_not_raised(self, tmp_path, record_dir, caplog):
+        armed = _armed(tmp_path)
+        kill = _LockingKill(record_dir, ProcessLookupError(errno.ESRCH, 'No such process'))
+
+        with caplog.at_level(logging.WARNING, logger=_SELF_EXIT_LOGGER):
+            osc = _stop(tmp_path, armed, kill)
+
+        assert osc == sh.osc_retitle_sequence(sr.Status.IDLE, _TITLE)
+        assert len(_self_exit_warnings(caplog)) == 1
+        request = _read(tmp_path).exit_request
+        assert request is not None
+        assert request.state is sr.ExitRequestState.ATTEMPTED
+        assert _marker(tmp_path).exists()
+
+    def test_an_undeletable_marker_is_logged_not_raised(self, tmp_path, record_dir, caplog):
+        armed = _armed(tmp_path)
+        kill = _LockingKill(record_dir)
+
+        with caplog.at_level(logging.WARNING, logger=_SELF_EXIT_LOGGER):
+            osc = _stop(tmp_path, armed, kill)
+
+        assert osc == sh.osc_retitle_sequence(sr.Status.IDLE, _TITLE)
+        assert kill.calls == [(OWNER, signal.SIGINT)]
+        assert len(_self_exit_warnings(caplog)) == 1
+        request = _read(tmp_path).exit_request
+        assert request is not None
+        assert request.state is sr.ExitRequestState.ATTEMPTED
+        assert _marker(tmp_path).exists()
+
+    def test_an_unreadable_marker_is_present_but_unattributed(self, tmp_path):
+        armed = _armed(tmp_path)
+        _marker(tmp_path).chmod(0o000)
+        kill = _KillRecorder(tmp_path)
+
+        _stop(tmp_path, armed, kill)
+
+        assert kill.calls == [(OWNER, signal.SIGINT)]
+        request = _read(tmp_path).exit_request
+        assert request is not None
+        assert request.state is sr.ExitRequestState.ATTEMPTED
+        assert request.marker_session_id is None
