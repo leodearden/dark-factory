@@ -2050,9 +2050,6 @@ class RemoteRunner:
     async def cancel_verify(self) -> int:
         """Cancel the in-flight remote verify on the remote host.
 
-        Returning 0 means no verify of the in-flight request runs on the host
-        and none will start.
-
         Returns 0 immediately (idempotent) when no ``_dispatch`` is in flight —
         including during run_merge_verify's main-mirror push, which precedes
         the claim — matching α's contract: cancel an unknown/finished id exits 0.
@@ -2060,7 +2057,8 @@ class RemoteRunner:
         Before the request's verify ssh starts (ensure_gate's sha publish and
         ensure-gate.sh, which may be building the gate binary, then the
         verify-ref push) it is a local no-op returning 0 that makes
-        ``_run_gate_verify`` refuse to start the verify.
+        ``_run_gate_verify`` refuse to start the verify, so this 0 guarantees
+        the verify never starts.
 
         Once the verify ssh has started it issues, through the gate binary
         (design D3):
@@ -2068,8 +2066,12 @@ class RemoteRunner:
                 env ORCH_GATE_BIN=<gate bin> orchestrator cancel-verify
                     --request-id <id> [--config <path>]
 
-        and returns the ssh return code.  An OSError (host unreachable) returns
-        a non-zero sentinel so the caller treats it as a cancel failure.
+        and returns the remote cancel-verify's rc.  That 0 is weaker: the remote
+        (``orchestrator/src/orchestrator/cli.py::cancel_verify``) also exits 0
+        when the verify has not yet written its pgid file, so a
+        verify still starting up can outlive it, and the caller must still
+        cancel its local dispatch.  An OSError (host unreachable) returns a
+        non-zero sentinel so the caller treats it as a cancel failure.
         """
         request_id = self._inflight_request_id
         if request_id is None:

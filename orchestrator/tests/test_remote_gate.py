@@ -1173,7 +1173,7 @@ async def _no_sleep(_: float) -> None:
 @pytest.mark.parametrize('held_role', _PRE_VERIFY_ROLES)
 async def test_a_cancel_before_the_verify_ssh_frees_the_slot_without_parking(held_role):
     transport = _Scripted(cancel=_UNBUILT_GATE_CANCEL)
-    entered, _ = _hold(transport, held_role)
+    entered, release = _hold(transport, held_role)
     allocator = HostAllocator([_scripted_runner(transport)])
     lease = allocator.acquire_remote()
     assert lease is not None
@@ -1186,11 +1186,12 @@ async def test_a_cancel_before_the_verify_ssh_frees_the_slot_without_parking(hel
     assert freed is True
     assert not allocator.is_parked('laptop')
     assert not allocator.is_busy('laptop')
+    release.set()
+    with pytest.raises(RunnerUnavailable):
+        await dispatch
+    assert 'verify' not in transport.roles()
     assert 'cancel' not in transport.roles()
     assert 'probe' not in transport.roles()
-    dispatch.cancel()
-    with contextlib.suppress(asyncio.CancelledError, RunnerUnavailable):
-        await dispatch
 
 
 @pytest.mark.asyncio
