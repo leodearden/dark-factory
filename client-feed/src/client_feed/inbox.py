@@ -11,7 +11,7 @@ from client_feed.contract import (
     RevealRequested,
     parse_inbox_line,
 )
-from client_feed.feed_io import FeedIoError, FeedIoProblem, read_tail
+from client_feed.feed_io import FeedIoError, FeedIoProblem, FileTail, read_tail
 
 
 @dataclass(frozen=True)
@@ -31,13 +31,30 @@ class InboxRead:
     offset: int
 
 
+class InboxUnusable(FeedIoError):
+    """An inbox that cannot be read this pass; its requests wait at the held offset."""
+
+
+def _inbox_tail(in_dir: Path, offset: int) -> FileTail | None:
+    try:
+        return read_tail(in_dir / INBOX_FILENAME, offset=offset)
+    except FeedIoError as exc:
+        raise InboxUnusable(problem=exc.problem, name=exc.name, detail=exc.detail) from exc
+    except OSError as exc:
+        raise InboxUnusable(
+            problem=FeedIoProblem.UNREADABLE,
+            name=INBOX_FILENAME,
+            detail=exc.strerror or type(exc).__name__,
+        ) from exc
+
+
 def _inbox_bytes(in_dir: Path, offset: int) -> bytes | None:
     """The inbox's bytes from `offset` to its end; None when there is no inbox."""
-    tail = read_tail(in_dir / INBOX_FILENAME, offset=offset)
+    tail = _inbox_tail(in_dir, offset)
     if tail is None:
         return None
     if offset > tail.size:
-        raise FeedIoError(
+        raise InboxUnusable(
             problem=FeedIoProblem.INBOX_REWOUND,
             name=INBOX_FILENAME,
             detail=f'offset {offset} lies beyond its {tail.size} bytes; the portal replaced it',
