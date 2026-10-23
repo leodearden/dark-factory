@@ -1013,7 +1013,7 @@ tainted. The ladder, in order:
   refusal.
 
 The runner adds the causes no `AgentResult` can show: `timeout`,
-`cap_exhausted` (every account stayed capped past the eval's cap-wait patience),
+`cap_exhausted` (every account stayed capped past the shared cap-wait patience),
 and `harness_error` (our own crash: worktree, config, briefing or artifact read
 raised). The plan judge adds `raised` and `unparseable` (a non-JSON, null or
 non-finite answer).
@@ -1259,7 +1259,7 @@ The plan judge is asked (`judge_plan`) only when that decision is `JUDGE`.
 `log_architect_cell` writes the route's warning and the completion line.
 `classify_attempt` and `assemble_metrics` are pure. Every effect boundary of a
 cell (worktree, artifacts, briefing, invoke, judge, reference-diff read, gate
-factory, cap-wait patience, store) is a field of `ArchitectEvalDeps`, whose
+factory, cap-retry wrapper, store) is a field of `ArchitectEvalDeps`, whose
 defaults are the production collaborators, so a test injects fakes rather than
 patching module paths. The orchestrator config the cell runs under is an
 input, not a boundary: `invoke_architect` takes it as `build_orch_config`,
@@ -1414,7 +1414,7 @@ would become the floor for full-workflow cells, and it would fabricate a 100%
 
 Code: `orchestrator/src/orchestrator/evals/eval_gate.py`
 (`build_eval_usage_gate`, `owned_usage_gate`, `campaign_usage_gate`,
-`GATE_UNSET`, `InjectedGate`, `EVAL_CAP_WAIT_SANITY_SECS`). Consumers:
+`GATE_UNSET`, `InjectedGate`). Consumers:
 `runner.py`'s three executors and stage fan-outs, `cli.py::_run_single_eval`
 and `reviewer_trial/__main__.py::campaign`.
 
@@ -1523,46 +1523,12 @@ and no config in this repo sets it. A campaign that wants per-cell budgeting
 should build from a `usage_cap` copy with `session_budget_usd=None` and let
 each invocation's `max_budget_usd` bound it instead.
 
-**Cap-wait patience: 48 h (`EVAL_CAP_WAIT_SANITY_SECS`).** It was raised from
-1800 s on 2026-08-25 (esc-3634-1). The 1800 s house value was justified as
-"fail loud rather than park a campaign for two weeks", and that rationale does
-not survive contact with the gate:
-
-- A short bound never prevented the park. When every account is capped,
-  `before_invoke` waits on the gate's own unbounded `_open.wait()`, released
-  only by a real cap reset or a successful resume probe. Freeing a campaign
-  slot buys no progress, because the next cell parks in the same wait. The
-  short bound only decided how many in-flight cells were destroyed on the way
-  to parking.
-- Tainting costs more than waiting. A cap lands mid-cell, after the architect
-  has spent real money (γ1 mean: $8.88 banked per cap-excluded cell).
-  `invoke_with_cap_retry` resumes the capped session with `--resume` on a
-  freed account, so waiting costs about nothing extra, while tainting discards
-  the banked spend and pays full freight again on the re-run.
-- Restart is not a cheap escape. `run_ofat_stage`, the path campaign drivers
-  use, has no skip-existing guard (that is `run_eval_matrix`'s
-  `ResultStore.exists` check). Cells persist individually, so a kill loses no
-  data, but a relaunch re-runs and re-spends them unless the operator
-  restricts `--tasks-dir` by hand.
-
-48 h is sized to the observed account regime: one to three accounts typically
-sit uncapped against the weekly cap and are hit repeatedly against their
-5-hour caps, giving short all-capped windows regularly plus one long window
-each week. 1800 s cannot skate a 5-hour window; 48 h skates it with margin. A
-weekly exhaustion outlasts even this bound, but no value of this constant
-makes that case loud, so the choice costs nothing there. There is deliberately
-no `max_cap_retries` companion: cooldown doubles per full cycle through the
-pool, so a fixed count would make a bigger, healthier pool give up sooner.
-
-What the bound does not cover: `cap_wait_sanity_secs` is consulted only in
-`_check_cap_wait`, in the cap-hit branch after an invocation returned and was
-classified as a cap. It bounds cap-retry patience and nothing else; the
-unbounded `_open.wait()` is out of its reach. That park is no longer silent
-(task 4945): `shared/usage_gate.py::UsageGate.before_invoke` emits a throttled
-`all_capped_park` WARNING carrying elapsed seconds, the account count and the
-soonest expected reopen, so a parked campaign is distinguishable from a hung
-one by reading the log, without aborting a park whose banked spend `--resume`
-would otherwise recover.
+**Cap-wait patience: the shared default.** The architect call passes no
+`cap_wait_sanity_secs` and no `max_cap_retries`, so it takes the shared default
+(`shared/src/shared/cli_invoke.py::_DEFAULT_CAP_WAIT_SANITY_SECS`; esc-4002-1,
+task 7320). Waiting is about free, because `--resume` carries banked spend
+across the account switch, while tainting re-spends it. A fixed retry count
+would give a bigger pool less patience.
 
 ---
 
