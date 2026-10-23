@@ -721,9 +721,7 @@ class TestMixedBackends:
         token = gate._accounts[0].token
         # 'RESOURCE_EXHAUSTED' is only checked for gemini backend
         hit = gate.detect_cap_hit('RESOURCE_EXHAUSTED', '', 'codex', token)
-        # 'resource exhausted' is NOT in CODEX_CAP_PATTERNS but 'rate limit' overlaps.
         # 'RESOURCE_EXHAUSTED' alone should not match codex patterns.
-        # Actually check: CODEX_CAP_PATTERNS has 'rate limit', 'quota exceeded'.
         # 'RESOURCE_EXHAUSTED' does not match any of them (case-insensitive).
         assert hit is False
         assert gate._accounts[0].capped is False

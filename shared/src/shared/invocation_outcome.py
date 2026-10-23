@@ -517,24 +517,26 @@ NEAR_CAP_PREFIXES = [
     "You're close to",
 ]
 
-# Codex (OpenAI) cap-hit patterns. Copied from usage_gate.py:86 (CODEX_CAP_PATTERNS).
+# Codex (OpenAI) patterns that name a cap by themselves.
 CODEX_CAP_PATTERNS = [
     'usage limit reached',
-    'rate limit',
-    'quota exceeded',
     'insufficient_quota',
     'rate_limit_exceeded',
     'hit your usage limit',  # ChatGPT usage window, measured on codex-cli 0.154.0 (task 5403)
 ]
 
-# Gemini (Google) cap-hit patterns. Copied from usage_gate.py:90 (GEMINI_CAP_PATTERNS).
+# Gemini (Google) patterns that name a cap by themselves.
 GEMINI_CAP_PATTERNS = [
-    'quota exceeded',
-    'rate limit',
     'resource exhausted',
     'RESOURCE_EXHAUSTED',
     'quota_exceeded',
 ]
+
+# A reply can use these phrases about any code, so for codex/gemini they name a cap only beside a
+# confirm keyword (the CAP_CONFIRM_KEYWORDS policy). Keywords measured from codex-cli 0.154.0's own
+# errors ("try again at/in", "Check your plan and billing details"); gemini shares them unmeasured.
+GENERIC_CAP_PHRASES = ['rate limit', 'quota exceeded']
+GENERIC_CAP_CONFIRM_KEYWORDS = ['try again', 'billing']
 
 
 def _extract_cap_message(text: str, prefix: str) -> str:
@@ -556,6 +558,26 @@ def _extract_cap_message(text: str, prefix: str) -> str:
     if end == -1:
         end = min(idx + 200, len(text))
     return text[idx:end].strip()
+
+
+def _backend_cap_match(
+    combined_lower: str, standalone_patterns: list[str], strict_confirm: bool,
+) -> str | None:
+    """The codex/gemini cap pattern *combined_lower* matches, or None.
+
+    A standalone pattern wins outright; a GENERIC_CAP_PHRASES hit counts
+    only under the same regime rule as the claude guard in
+    ``classify_invocation``.
+    """
+    for pattern in standalone_patterns:
+        if pattern.lower() in combined_lower:
+            return pattern
+    confirmed = not strict_confirm or any(
+        kw in combined_lower for kw in GENERIC_CAP_CONFIRM_KEYWORDS
+    )
+    if not confirmed:
+        return None
+    return next((p for p in GENERIC_CAP_PHRASES if p in combined_lower), None)
 
 
 def classify_invocation(
@@ -650,14 +672,14 @@ def classify_invocation(
     # logic below (mirrors usage_gate.py:386-397). codex's ChatGPT usage
     # window names its reset ("try again at 1:07 PM"), read by _parse_resets_at.
     if backend == 'codex':
-        for pattern in CODEX_CAP_PATTERNS:
-            if pattern.lower() in combined_lower:
-                return CapHit(resets_at=_parse_resets_at(combined), reason=f'Codex cap hit: {pattern}')
+        pattern = _backend_cap_match(combined_lower, CODEX_CAP_PATTERNS, strict_confirm)
+        if pattern is not None:
+            return CapHit(resets_at=_parse_resets_at(combined), reason=f'Codex cap hit: {pattern}')
     elif backend == 'gemini':
         # No measured gemini cap text names a reset time, so none is parsed.
-        for pattern in GEMINI_CAP_PATTERNS:
-            if pattern.lower() in combined_lower:
-                return CapHit(resets_at=None, reason=f'Gemini cap hit: {pattern}')
+        pattern = _backend_cap_match(combined_lower, GEMINI_CAP_PATTERNS, strict_confirm)
+        if pattern is not None:
+            return CapHit(resets_at=None, reason=f'Gemini cap hit: {pattern}')
 
     # Claude cap/near-cap detection: require both a prefix match AND a
     # secondary confirmation keyword (defence against false positives on
