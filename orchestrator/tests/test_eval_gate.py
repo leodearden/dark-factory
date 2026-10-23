@@ -11,7 +11,6 @@ lifecycle (task 6737)".
 
 from __future__ import annotations
 
-import inspect
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -19,13 +18,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _campaign_gate_helpers import eval_base_config
 from _orch_helpers import build_usage_gate
-from shared.cli_invoke import invoke_with_cap_retry
 from shared.config_models import UsageCapConfig
 from shared.testing import make_gate_mock
 
 from orchestrator.evals import eval_gate
 from orchestrator.evals.eval_gate import (
-    EVAL_CAP_WAIT_SANITY_SECS,
     GATE_UNSET,
     build_eval_usage_gate,
     campaign_usage_gate,
@@ -47,15 +44,6 @@ def _zero_account_gate(shutdown: AsyncMock):
     gate = build_usage_gate([], [])
     gate.shutdown = shutdown
     return gate
-
-
-def test_cap_wait_patience_is_eval_bounded_not_the_fourteen_day_default():
-    """Long enough to skate a 5-hour account cap, shorter than the 14-day default."""
-    signature = inspect.signature(invoke_with_cap_retry)
-    default_patience = signature.parameters['cap_wait_sanity_secs'].default
-
-    assert EVAL_CAP_WAIT_SANITY_SECS >= 6 * 3600
-    assert default_patience > EVAL_CAP_WAIT_SANITY_SECS
 
 
 @pytest.mark.asyncio

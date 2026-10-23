@@ -1344,7 +1344,7 @@ async def _run_architect_eval_hermetic(
     expose_mocks: dict | None = None,
     injected_gate=_NO_INJECTED_GATE,
     gate_factory=None,
-    cap_wait_secs: float | None = None,
+    cap_retry=None,
     store: ResultStore | None = None,
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary injected.
@@ -1451,8 +1451,8 @@ async def _run_architect_eval_hermetic(
     (deliberately ungated), which is NOT the same as omitting it.
 
     ``gate_factory=`` replaces the deps' gate factory outright (the owned path
-    then builds through it), and ``cap_wait_secs=`` the deps' cap-wait patience
-    (``0.0`` makes a fully-capped pool give up on its first cap hit).
+    then builds through it), and ``cap_retry=`` replaces the deps' cap-retry
+    wrapper (omitted, the cell rides the production ``invoke_with_cap_retry``).
 
     ``shared.cli_invoke.asyncio.sleep`` is patched unconditionally (the
     ``_SLEEP_PATCH`` idiom from shared/tests/test_cap_retry.py:224) so cap-retry
@@ -1551,13 +1551,10 @@ async def _run_architect_eval_hermetic(
         invoke=mock_invoke,
         judge=mock_judge,
         read_reference_diff=AsyncMock(return_value=reference_diff),
-        cap_wait_secs=(
-            eval_gate.EVAL_CAP_WAIT_SANITY_SECS if cap_wait_secs is None
-            else cap_wait_secs
-        ),
         gate_factory=(
             eval_gate.build_eval_usage_gate if gate_factory is None else gate_factory
         ),
+        **({} if cap_retry is None else {'cap_retry': cap_retry}),
     )
 
     with contextlib.ExitStack() as es:
@@ -4172,16 +4169,31 @@ class TestArchitectEvalCapPatience:
             'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
         )
 
+    async def test_architect_call_sets_no_cap_bound_of_its_own(self):
+        """One cap patience for every eval stage (esc-4002-1, task 7320).
+
+        Waiting is ~free because ``--resume`` carries banked spend across the
+        account switch; omitting the kwargs is what inherits the shared default.
+        """
+        wrapper = AsyncMock(return_value=_healthy_agent_result())
+        await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            usage_gate=_one_account_gate(),
+            cap_retry=wrapper,
+        )
+
+        assert wrapper.await_count == 1
+        assert 'cap_wait_sanity_secs' not in wrapper.call_args.kwargs
+        assert 'max_cap_retries' not in wrapper.call_args.kwargs
+
     async def test_fully_capped_pool_fails_loud_into_cap_tainted(self):
-        # `arch_result` (not a side_effect LIST) means EVERY attempt caps, and
-        # a zero patience trips on the first hit — so the pool is genuinely
-        # exhausted and the test still runs in milliseconds.
         result, _mocks = await _run_architect_eval_hermetic(
             self._cfg(),
             produced_plan={},
             usage_gate=_one_account_gate(),
             arch_result=_cap_agent_result(),
-            cap_wait_secs=0.0,
+            cap_retry=_real_cap_retry_with_no_cap_patience(),
         )
 
         # It RETURNED. That is the requirement being pinned: when the real
@@ -4209,7 +4221,7 @@ class TestArchitectEvalCapPatience:
             produced_plan=_well_formed_plan(),
             usage_gate=_one_account_gate(),
             arch_result=_cap_agent_result(),
-            cap_wait_secs=0.0,
+            cap_retry=_real_cap_retry_with_no_cap_patience(),
         )
 
         # The architect wrote a real plan through plan-tools BEFORE the pool ran
@@ -4827,7 +4839,7 @@ class TestArchitectEvalSpendSurvivesFailover:
             produced_plan={},
             usage_gate=_one_account_gate(),
             arch_result=_mid_run_cap_agent_result(cost_usd=0.9),
-            cap_wait_secs=0.0,
+            cap_retry=_real_cap_retry_with_no_cap_patience(),
         )
 
         assert mocks['invoke'].await_count == 1

@@ -14,16 +14,21 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _campaign_gate_helpers import eval_base_config
 from _orch_helpers import build_usage_gate
-from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.cli_invoke import (
+    AgentResult,
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+)
 from shared.config_models import AccountConfig
 from shared.testing import make_gate_mock
 
@@ -470,7 +475,7 @@ class TestArchitectEvalDeps:
         assert deps.judge is judge_plan_quality
         assert deps.read_reference_diff is snapshots.get_diff_between_commits
         assert deps.gate_factory is eval_gate.build_eval_usage_gate
-        assert deps.cap_wait_secs == eval_gate.EVAL_CAP_WAIT_SANITY_SECS
+        assert deps.cap_retry is invoke_with_cap_retry
 
 
 _REAL_SLEEP = asyncio.sleep
@@ -578,7 +583,7 @@ def _cell(
     declines: Mapping[str, dict] | None = None,
     invoke: AsyncMock | None = None,
     gate_factory: AsyncMock | None = None,
-    cap_wait_secs: float = eval_gate.EVAL_CAP_WAIT_SANITY_SECS,
+    cap_retry: Callable[..., Awaitable[AgentResult]] = invoke_with_cap_retry,
 ) -> _Cell:
     events: list[str] = []
     artifacts = _FakeArtifacts(
@@ -610,7 +615,7 @@ def _cell(
         judge=AsyncMock(return_value=_scored()),
         read_reference_diff=AsyncMock(return_value='--- a\n+++ b\n'),
         gate_factory=gate_factory,
-        cap_wait_secs=cap_wait_secs,
+        cap_retry=cap_retry,
     )
     return _Cell(
         events, artifacts, tmp_path, worktree, open_artifacts, build_prompt, cleanup,
@@ -896,11 +901,24 @@ class TestInvokeArchitectBounds:
         assert attempt.outcome == 'done'
         assert attempt.unmeasured is None
 
-    async def test_a_fully_capped_pool_gives_up_at_the_deps_patience(
+    async def test_the_architect_call_sets_no_cap_bound_of_its_own(
+        self, tmp_path: Path,
+    ):
+        wrapper = AsyncMock(return_value=_answered())
+        cell = _cell(tmp_path, plan=_scorable_plan(), cap_retry=wrapper)
+
+        await _invoke(cell)
+
+        wrapper.assert_awaited_once()
+        assert 'cap_wait_sanity_secs' not in wrapper.call_args.kwargs
+        assert 'max_cap_retries' not in wrapper.call_args.kwargs
+
+    async def test_a_fully_capped_pool_gives_up_when_the_cap_retry_wrapper_does(
         self, tmp_path: Path,
     ):
         cell = _cell(
-            tmp_path, invoke=AsyncMock(return_value=_capped()), cap_wait_secs=0.0,
+            tmp_path, invoke=AsyncMock(return_value=_capped()),
+            cap_retry=functools.partial(invoke_with_cap_retry, cap_wait_sanity_secs=0.0),
             gate_factory=AsyncMock(return_value=_one_account_gate()),
         )
 
