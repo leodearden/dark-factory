@@ -79,6 +79,7 @@ from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _gate_fixtures import gate_argv, gated_remote_runner
 from _leader_stderr import assert_watchdog_fire_trigger, drain_exited_stderr
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from click.testing import CliRunner
@@ -121,7 +122,6 @@ from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
 from orchestrator.verify_runner import (
     FLOCK_CONTENTION_CATEGORY,
     MergeVerifySpec,
-    RemoteRunner,
     RunnerUnavailable,
     UnscopedTypecheckSpec,
     VerifyCommand,
@@ -434,17 +434,15 @@ def loopback_ssh_run(
 
     ssh becomes a transparent pipe: the leader's stdin is the REAL heartbeat
     pipe of :func:`~orchestrator.verify_runner._default_ssh_heartbeat_run`,
-    and its stderr comes back exactly as ssh relays it.  The env reaches the
-    leader ambiently -- see :func:`apply_dispatcher_env`.
+    and its stderr comes back exactly as ssh relays it.  The gate binary the
+    remote command names is this worktree's own CLI, so the leader runs
+    under the stock bootstrap.  The env reaches the leader ambiently -- see
+    :func:`apply_dispatcher_env`.
     """
 
     async def ssh_run(argv: list[str], *, cwd: str | Path | None = None) -> tuple[int, str, str]:
         assert argv[0] == 'ssh', f'RemoteRunner no longer dispatches through ssh: {argv!r}'
-        entry_point, *cli_args = shlex.split(argv[-1])
-        assert entry_point == 'orchestrator', (
-            f'RemoteRunner\'s remote command no longer starts with the orchestrator '
-            f'CLI: {argv[-1]!r}'
-        )
+        cli_args = gate_argv(argv[-1])
         return await _default_ssh_heartbeat_run(
             [sys.executable, '-c', STOCK_BOOTSTRAP, *cli_args],
             cwd=cwd,
@@ -459,8 +457,9 @@ async def git_push_succeeds(
 ) -> tuple[int, str, str]:
     """A RemoteRunner ``run`` that accepts every ``git push`` and nothing else.
 
-    With no ``main_branch``, the merge-sha push and its ``--delete`` cleanup
-    are the only commands RemoteRunner sends through ``run``.
+    With no ``main_branch``, and the gate's own calls answered by
+    :func:`~_gate_fixtures.gated_run`, the merge-sha push and its
+    ``--delete`` cleanup are the only commands that reach this ``run``.
     """
     assert argv[:2] == ['git', 'push'], (
         f'RemoteRunner sent a non-push command through run: {argv!r}'
@@ -5207,8 +5206,9 @@ def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_wa
 ):
     """A starved remote self-kill stays attributable all the way to the worker's log.
 
-    Drives a real RemoteRunner whose only doubles are ``git push`` and an
-    ssh that is a transparent pipe, so the leader's stdin is the real
+    Drives a real RemoteRunner whose only doubles are ``git push``, the
+    gate's publish and ensure calls, and an ssh that is a transparent pipe,
+    so the leader's stdin is the real
     heartbeat pipe and its stderr comes back exactly as ssh relays it.  The
     reason must carry the watchdog's controlled rc 1 at its head and the
     starvation token at its tail.  That captured reason is then replayed,
@@ -5229,7 +5229,7 @@ def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_wa
         for key, value in ROW_WATCHDOG_ENV.items():
             env.setenv(key, value)
         env.setenv(HOLDER_TAG_ENV, tag)
-        runner = RemoteRunner(
+        runner = gated_remote_runner(
             'loopback',
             LOOPBACK_SSH_HOST,
             git_remote=str(repo),
