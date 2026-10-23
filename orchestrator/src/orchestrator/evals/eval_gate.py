@@ -15,9 +15,6 @@ from orchestrator.config import OrchestratorConfig
 
 logger = logging.getLogger(__name__)
 
-EVAL_CAP_WAIT_SANITY_SECS = 48 * 3600
-"""Cap-retry patience for an eval invoke: long enough to skate a 5-hour account cap."""
-
 
 class _UnsetGate:
     """The type of :data:`GATE_UNSET`: the caller passed no ``usage_gate`` at all."""

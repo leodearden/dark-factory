@@ -25,7 +25,6 @@ from orchestrator.workflow import _inject_plan_tools_mcp, _meta_root_for_worktre
 
 from .configs import EvalConfig
 from .eval_gate import (
-    EVAL_CAP_WAIT_SANITY_SECS,
     GateFactory,
     InjectedGate,
     build_eval_usage_gate,
@@ -67,6 +66,7 @@ CleanupWorktree = Callable[[Path, Path], Awaitable[None]]
 OpenArtifacts = Callable[[Path], TaskArtifacts]
 BuildPrompt = Callable[[OrchestratorConfig, dict, Path, str], Awaitable[str]]
 InvokeAgent = Callable[..., Awaitable[AgentResult]]
+CapRetry = Callable[..., Awaitable[AgentResult]]
 JudgePlan = Callable[[dict, str, dict], Awaitable[Scored[PlanQualityVerdict] | Unmeasured]]
 ReadDiff = Callable[[Path, str, str], Awaitable[str]]
 
@@ -114,7 +114,7 @@ class ArchitectEvalDeps:
     judge: JudgePlan = judge_plan_quality
     read_reference_diff: ReadDiff = get_diff_between_commits
     gate_factory: GateFactory = build_eval_usage_gate
-    cap_wait_secs: float = EVAL_CAP_WAIT_SANITY_SECS
+    cap_retry: CapRetry = invoke_with_cap_retry
 
 
 @dataclass(frozen=True)
@@ -281,10 +281,9 @@ class _ArchitectCall:
         async with owned_usage_gate(
             self.usage_gate, orch_config, factory=self.deps.gate_factory, label=self.label,
         ) as gate:
-            result = await invoke_with_cap_retry(
+            result = await self.deps.cap_retry(
                 gate,
                 f'Architect eval {self.label}',
-                cap_wait_sanity_secs=self.deps.cap_wait_secs,
                 invoke_fn=timed_attempt,
                 backend=self.config.backend,
                 **_architect_invocation(self.task, self.config, prompt, self.worktree),
@@ -362,8 +361,8 @@ def _cap_exhausted(
 ) -> _Exit:
     logger.error(
         f'Architect eval {label}: all accounts capped after {exc.retries} retries '
-        f'({exc.elapsed_secs:.1f}s) — giving up on this cell rather than stalling '
-        f'the campaign'
+        f'({exc.elapsed_secs:.1f}s) — giving up on this cell after the shared '
+        f'cap-wait bound; recorded as cap_tainted'
     )
     marker = Unmeasured(
         MeasurementStage.ARCHITECT, UnmeasuredCause.CAP_EXHAUSTED,
