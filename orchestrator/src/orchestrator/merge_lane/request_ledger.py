@@ -7,10 +7,10 @@ eventually resolve its ``result`` Future — either via a normal outcome
 (a bug in some future code path, a wedged verify that never finalizes, or a
 request that silently falls out of every pipeline structure) the caller
 hangs forever with no signal.  :class:`RequestLedger` arms an entry for
-every dequeued request and :class:`SpeculativeMergeWorker` (see
-``merge_queue.py``'s ``_check_request_liveness``) periodically sweeps it,
-firing a loud, dedup'd L1 escalation for any entry that has aged past the
-stuck threshold without resolving.
+every dequeued request and :func:`report_stuck_requests`, called from the
+merge worker's heartbeat, periodically sweeps it, raising a bounded ladder of
+loud alarms (a WARNING plus an L1 escalation) for any entry that has aged past
+the stuck threshold without resolving.
 
 This module is entirely OBSERVATION + ESCALATION — it never resolves a
 Future, mutates queue/inflight state, or halts the pipeline (PRD design
@@ -31,13 +31,12 @@ Lifecycle (see :class:`RequestLedger`):
   is True (set via any of the ~20 ``set_result`` call sites, the zeta
   chokepoint, or Future cancellation on abandonment) is swept on the next
   ``stuck_entries`` call.  No per-site instrumentation is required.
-* ``mark_warned`` records that the caller has already logged a WARNING for
-  an entry's current episode; ``stuck_entries`` surfaces this via
-  ``StuckRequest.already_warned`` so ``_check_request_liveness`` logs at
-  most one WARNING per open episode (mirroring the escalation's
-  ``has_open_l1`` dedup) instead of re-logging on every heartbeat poll. A
-  fresh episode (``on_requeued`` followed by a re-``on_dequeue``) resets
-  ``warned`` back to False.
+* ``mark_alarmed`` counts the stuck alarms raised for an entry's current
+  dequeue episode; ``stuck_entries`` surfaces the count as
+  ``StuckRequest.alarms_raised`` so ``report_stuck_requests`` walks the
+  :data:`STUCK_ALARM_THRESHOLD_MULTIPLES` ladder once per episode instead of
+  re-alarming on every heartbeat poll. A fresh episode (``on_requeued``
+  followed by a re-``on_dequeue``) starts the count at zero.
 * ``discard`` unconditionally drops an entry regardless of Future state — a
   manual/operator-driven "stop tracking this" for a request that will never
   resolve on its own and was never requeued (the genuine silent-hang case);
@@ -47,7 +46,8 @@ Lifecycle (see :class:`RequestLedger`):
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from escalation.models import Escalation
@@ -63,22 +63,23 @@ if TYPE_CHECKING:
 # one logger namespace for caplog / journalctl filtering.
 logger = logging.getLogger('orchestrator.merge_lane')
 
+# Alarm k of a dequeue episode is due once its age passes
+# STUCK_ALARM_THRESHOLD_MULTIPLES[k] x the stuck threshold; an episode raises
+# at most len(STUCK_ALARM_THRESHOLD_MULTIPLES) alarms.
+STUCK_ALARM_THRESHOLD_MULTIPLES: tuple[float, ...] = (1.0,)
+
 
 @dataclass(frozen=True)
 class StuckRequest:
     """A read-only snapshot of a ledger entry that has aged past the stuck threshold.
 
-    ``phase`` defaults to ``'unowned'`` — the caller (``_check_request_liveness``)
-    annotates it from ``snapshot()['entries']`` when the request_id is still
+    ``phase`` defaults to ``'unowned'`` — :func:`report_stuck_requests`
+    annotates it from its pipeline-phase lookup when the request_id is still
     visible somewhere in the pipeline (e.g. ``'verifying'``); a request absent
     from every pipeline structure (leaked) keeps the ``'unowned'`` default.
 
-    ``already_warned`` mirrors the ledger entry's ``warned`` flag — True once
-    ``_check_request_liveness`` has already logged a WARNING for this
-    request's CURRENT open episode, so the caller logs at most once per
-    episode instead of re-logging on every heartbeat poll. The dedup'd L1
-    escalation is unaffected by this flag — it continues to follow its own
-    independent ``has_open_l1`` contract.
+    ``alarms_raised`` counts the alarms already raised for this request's
+    current dequeue episode.
     """
 
     request_id: str
@@ -86,7 +87,7 @@ class StuckRequest:
     branch: str
     age_secs: float
     phase: str = 'unowned'
-    already_warned: bool = False
+    alarms_raised: int = 0
 
 
 @dataclass
@@ -98,11 +99,9 @@ class _LedgerEntry:
     branch: str
     request: Any  # MergeRequest — Any to avoid a runtime import of merge_types
     dequeued_at: float
-    # True once a WARNING has been logged for this episode (see mark_warned).
-    # Reset to False only by creating a brand-new entry (on_dequeue when no
-    # entry is already present) — i.e. after a prior entry was cleared by
-    # on_requeued or swept as resolved.
-    warned: bool = False
+    # Alarms raised in this dequeue episode (see mark_alarmed). The entry IS
+    # the episode, so only a brand-new entry starts back at zero.
+    alarms_raised: int = 0
 
 
 class RequestLedger:
@@ -120,11 +119,8 @@ class RequestLedger:
     automatically evicted. ``sweep_resolved`` only drops ``done()`` entries;
     nothing else removes an armed entry on a timer. Such an entry (and its
     strong reference to the ``MergeRequest``) persists for the life of the
-    process, continuing to surface via ``stuck_entries()`` /
-    ``_check_request_liveness`` on every heartbeat poll (subject to the
-    ``warned`` log-dedup contract) even after an operator has inspected and
-    resolved the corresponding L1 escalation — ``has_open_l1`` flipping back
-    to False (via ``resolve_issue``) makes the NEXT sweep resubmit. Call
+    process and keeps surfacing via ``stuck_entries()``, but raises at most
+    ``len(STUCK_ALARM_THRESHOLD_MULTIPLES)`` alarms per dequeue episode. Call
     ``discard(request_id)`` explicitly once an operator has finished
     investigating to stop tracking it (this does not touch escalation-queue
     state).
@@ -183,23 +179,15 @@ class RequestLedger:
         """
         self._entries.pop(request_id, None)
 
-    def mark_warned(self, request_id: str) -> None:
-        """Record that a stuck WARNING has been logged for this entry's current episode.
+    def mark_alarmed(self, request_id: str) -> None:
+        """Count one more stuck alarm raised for this entry's current dequeue episode.
 
-        Consulted via ``StuckRequest.already_warned`` (populated by
-        ``stuck_entries``) so callers (``_check_request_liveness``) log the
-        stuck WARNING at most once per open episode instead of on every
-        heartbeat poll — mirroring the escalation's ``has_open_l1`` dedup.
-        A fresh episode begins the next time ``on_dequeue`` creates a
-        brand-new entry (i.e. after the previous one was cleared by
-        ``on_requeued`` or swept as resolved), which resets ``warned`` back
-        to False. Idempotent and a silent no-op when *request_id* is absent
-        (already resolved/requeued/never armed) — mirrors ``on_requeued``'s
-        tolerance.
+        A silent no-op when *request_id* is absent (already resolved,
+        requeued or never armed), like ``on_requeued``.
         """
         entry = self._entries.get(request_id)
         if entry is not None:
-            entry.warned = True
+            entry.alarms_raised += 1
 
     def sweep_resolved(self) -> None:
         """Drop every entry whose request's Future is already ``done()``.
@@ -235,7 +223,7 @@ class RequestLedger:
                         task_id=entry.task_id,
                         branch=entry.branch,
                         age_secs=age_secs,
-                        already_warned=entry.warned,
+                        alarms_raised=entry.alarms_raised,
                     )
                 )
         return stuck
@@ -253,10 +241,64 @@ class RequestLedger:
 
 
 # ---------------------------------------------------------------------------
-# Dedup'd L1 escalation — fires when a request has aged past the stuck
-# threshold without resolving.  See ``SpeculativeMergeWorker._check_request_liveness``
-# in merge_queue.py, which calls this from the heartbeat loop.
+# Stuck-request alarms — report_stuck_requests walks each dequeue episode's
+# alarm ladder from the merge worker's heartbeat and files each alarm through
+# _alarm_merge_request_stuck.
 # ---------------------------------------------------------------------------
+
+
+def _alarm_due(stuck: StuckRequest, threshold_s: float) -> bool:
+    """True when *stuck*'s episode has passed the ladder tier of its next alarm."""
+    raised = stuck.alarms_raised
+    return (
+        raised < len(STUCK_ALARM_THRESHOLD_MULTIPLES)
+        and stuck.age_secs > STUCK_ALARM_THRESHOLD_MULTIPLES[raised] * threshold_s
+    )
+
+
+def report_stuck_requests(
+    ledger: RequestLedger,
+    *,
+    now: float,
+    threshold_s: float,
+    pipeline_phases: Callable[[], Mapping[str, str]],
+    escalation_queue: Any,
+    event_store: Any = None,
+) -> None:
+    """Raise every due stuck alarm: a WARNING plus an L1 filing per alarm.
+
+    Alarm k of a dequeue episode is due once the request's age passes
+    ``STUCK_ALARM_THRESHOLD_MULTIPLES[k] * threshold_s``, so an episode raises
+    at most ``len(STUCK_ALARM_THRESHOLD_MULTIPLES)`` alarms however long it
+    stays stuck and however its escalations are closed. A new dequeue of the
+    request is a new episode with a fresh ladder.
+
+    *pipeline_phases* maps request_id to its pipeline state; it is called at
+    most once per sweep, and only when an alarm is due. An alarm is counted
+    only after it was filed (or suppressed by an already-open L1), so a
+    raising submit retries on the next sweep.
+
+    OBSERVATION + ESCALATION only — never resolves a Future, mutates
+    pipeline state, or halts the pipeline (PRD design decision 4).
+    """
+    due = [
+        stuck for stuck in ledger.stuck_entries(now, threshold_s)
+        if _alarm_due(stuck, threshold_s)
+    ]
+    if not due:
+        return
+    phases = pipeline_phases()
+    for stuck in due:
+        stuck = replace(stuck, phase=phases.get(stuck.request_id, 'unowned'))
+        logger.warning(
+            'merge request stuck: request_id=%s task=%s branch=%s age=%.0fs '
+            'phase=%s alarm %d/%d — dequeued but never resolved (silent-hang failure mode)',
+            stuck.request_id, stuck.task_id, stuck.branch, stuck.age_secs, stuck.phase,
+            stuck.alarms_raised + 1, len(STUCK_ALARM_THRESHOLD_MULTIPLES),
+        )
+        _alarm_merge_request_stuck(escalation_queue, stuck, event_store=event_store)
+        ledger.mark_alarmed(stuck.request_id)
+
 
 _MERGE_REQUEST_STUCK_SENTINEL_PREFIX = '__merge_request_stuck__'
 
@@ -272,11 +314,14 @@ def _alarm_merge_request_stuck(
     *,
     event_store: Any = None,
 ) -> None:
-    """Submit a dedup'd L1 escalation for a request stuck past the liveness threshold.
+    """Submit an L1 escalation for one alarm of a request stuck past the liveness threshold.
 
-    Modeled verbatim on
-    :func:`orchestrator.merge_lane.liveness._alarm_verify_host_unreachable`. Fires at
-    most ONCE per open episode per request_id (dedup'd via ``has_open_l1``).
+    Modeled on
+    :func:`orchestrator.merge_lane.liveness._alarm_verify_host_unreachable`.
+    Per-dequeue-episode dedup is the alarm ladder, enforced by
+    :func:`report_stuck_requests`; this function files the alarm numbered
+    ``stuck.alarms_raised + 1``. ``has_open_l1`` remains only as the guard for
+    an L1 left open across a process restart, whose ledger starts empty.
     This is OBSERVATION + ESCALATION only — it never resolves the stuck
     request's Future, mutates queue/inflight state, or halts the pipeline
     (PRD design decision 4: invariants escalate loudly, degrade never).
@@ -289,7 +334,7 @@ def _alarm_merge_request_stuck(
     * ``task_id=_merge_request_stuck_sentinel(stuck.request_id)``
 
     None-safe: returns immediately when *escalation_queue* is None.
-    Dedup: returns immediately when an open L1 already exists for the sentinel.
+    Returns immediately when an open L1 already exists for the sentinel.
 
     Args:
         escalation_queue: Live escalation queue or ``None``.
@@ -307,6 +352,7 @@ def _alarm_merge_request_stuck(
         return
 
     age_int = int(stuck.age_secs)
+    alarm_number = stuck.alarms_raised + 1
     summary = (
         f'MergeRequest {stuck.request_id!r} (branch {stuck.branch!r}) has been '
         f'dequeued for {age_int}s without resolving (phase={stuck.phase!r}).'
@@ -317,13 +363,16 @@ def _alarm_merge_request_stuck(
         f'branch: {stuck.branch}\n'
         f'phase: {stuck.phase}\n'
         f'age_secs: {age_int}\n'
+        f'alarm: {alarm_number} of {len(STUCK_ALARM_THRESHOLD_MULTIPLES)} for this dequeue\n'
         '\n'
         'This request was dequeued by the merger loop but its result Future '
         'has neither resolved (set_result) nor been abandoned (cancel) within '
         'the stuck threshold. This is the silent-hang failure mode: some code '
         'path is holding the request without ever finalizing it. The '
         'orchestrator has NOT halted or mutated any pipeline state — this is '
-        'observation-only.'
+        'observation-only. Closing this escalation suppresses further stuck '
+        'alarms for this dequeue, until the next alarm tier or until the '
+        'request resolves or is re-dequeued.'
     )
 
     esc = Escalation(
@@ -354,5 +403,6 @@ def _alarm_merge_request_stuck(
                 'branch': stuck.branch,
                 'age_secs': stuck.age_secs,
                 'phase': stuck.phase,
+                'alarm_number': alarm_number,
             },
         )
