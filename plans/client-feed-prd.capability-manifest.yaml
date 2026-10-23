@@ -235,7 +235,7 @@ tasks:
           paths: ["OPERATIONS.md"]
           expect: present
   - label: "σ1a"
-    task_id: null
+    task_id: 7402
     title: "client-feed σ1a: inbox union with defect_reported, CriterionId, the ref rule and the filer policy"
     capabilities:
       - name: "defect-reported-inbox-model"
@@ -263,7 +263,7 @@ tasks:
           paths: ["client-feed/src/client_feed/policy.py"]
           expect: present
   - label: "σ1b"
-    task_id: null
+    task_id: 7403
     title: "client-feed σ1b: the acknowledgement — defect_filed, defects_filed, Source.filer, the ref reader and the unfiled check (feed 1.1)"
     capabilities:
       - name: "defect-filed-feed-event"
@@ -297,7 +297,7 @@ tasks:
           kind: manual
           reason: "a behavioural property of the publisher pass; B33 in σ1b's tests is the check"
   - label: "σ2"
-    task_id: null
+    task_id: 7404
     title: "client-feed σ2: the client defect filer — file-defects (--once, --check), closed MCP client, convergent gated filing, unit and docs"
     capabilities:
       - name: "file-defects-subcommand"
@@ -332,7 +332,7 @@ tasks:
           paths: ["scripts/client-feed-filer.service.template"]
           expect: present
   - label: "σ3"
-    task_id: null
+    task_id: 7407
     title: "client-feed σ3: integration gate — the real fused-memory tool layer and the portal's in-v2 fixture, end to end"
     capabilities:
       - name: "portal-in-v2-fixture-vendored"
@@ -350,7 +350,7 @@ tasks:
           kind: manual
           reason: "B36 passing is the check; σ3 decides the test's home (where client_feed and fused_memory.server both import)"
   - label: "σ4"
-    task_id: null
+    task_id: 7405
     title: "Human gate: enable the client defect filer for the first live client"
     capabilities:
       - name: "go-live-preconditions"
@@ -360,7 +360,7 @@ tasks:
           kind: manual
           reason: "Leo confirms the portal's dedicated account, π's check and the probe of every escalation port, the client project's orchestrator and L2 watch, declared criteria, and file-defects --check, then enables the unit; no code deliverable"
   - label: "σ5"
-    task_id: null
+    task_id: 7406
     title: "Human gate: flip filer.auto_dispatch after the restatement soak"
     capabilities:
       - name: "auto-dispatch-flip"
