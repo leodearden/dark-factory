@@ -271,6 +271,27 @@ def _validate_verdict_role(role: str) -> None:
         )
 
 
+_VALID_TASK_ID_RE = re.compile(r'^[A-Za-z0-9._-]+$')
+
+
+def _validate_task_id(task_id: str) -> None:
+    """Guard ``.task-meta/task-<id>`` against naming anything but one dir.
+
+    The ``task-`` prefix means even ``.`` or ``..`` can only produce a literal
+    ``task-..`` directory name, never a traversal; a separator, whitespace or
+    a non-str id is refused outright.
+
+    Raises:
+        ValueError: if *task_id* is not a str of letters, digits, dots,
+            underscores, or hyphens.
+    """
+    if not isinstance(task_id, str) or not _VALID_TASK_ID_RE.fullmatch(task_id):
+        raise ValueError(
+            f'invalid task id {task_id!r}: must be a str matching '
+            f'{_VALID_TASK_ID_RE.pattern!r}'
+        )
+
+
 @dataclass
 class ReviewAggregation:
     """Aggregated review results from all reviewers."""
@@ -335,30 +356,36 @@ class TaskArtifacts:
 
     @staticmethod
     def meta_root_for(worktree_base: Path, worktree_name: str) -> Path:
-        """Derive the `.task-meta` root for a worktree — the single owner of
-        this path shape (PRD `.task-meta path-derivation contract`,
-        worktree-lane-lifecycle W11-β).
+        """Derive the LANE (per-dispatch) `.task-meta` root for a worktree —
+        the single owner of this path shape. Its task-lifetime counterpart is
+        ``task_root_for`` (PRD ``plans/task-meta-task-keying-prd.md``
+        §Path-derivation contract).
 
         Returns ``<worktree_base>/.task-meta/<worktree_name>`` — a SIBLING
         of the worktree itself (``<worktree_base>/<worktree_name>``), not
-        nested inside it like the legacy ``<worktree>/.task``.  Callers
-        (γ/ε1/ε2/δ) must call this instead of joining ``'.task'`` (or
-        ``'.task-meta'``) by hand.
+        nested inside it like the legacy ``<worktree>/.task``. Callers must
+        call this instead of joining ``'.task'`` (or ``'.task-meta'``) by
+        hand.
 
-        Lane-reuse note for whichever of γ/ε1/ε2/δ first constructs
-        ``TaskArtifacts`` with a real ``meta_root``: because this path lives
-        OUTSIDE the worktree, it survives a worktree reset/``git clean`` that
-        would wipe a legacy ``<worktree>/.task``. With a pooled/reused lane
-        (e.g. the ``_lane-0``-style names used in this module's tests), a new
-        task assigned a previously-used lane name could otherwise see the
-        PRIOR task's leftover ``.task-meta/<name>`` artifacts directly (a
-        stale ``blocking_dependency``/``already_done``/``false_premise``
-        report). Nothing in β triggers this today (no caller passes
-        ``meta_root`` yet); the first caller that does so for a pooled lane
-        is responsible for clearing/re-initializing ``.task-meta/<name>`` on
+        Because this path lives OUTSIDE the worktree, it survives a worktree
+        reset/``git clean``; a pooled lane reused by a new task can therefore
+        hold the PRIOR dispatch's lane-keyed exits until they are cleared on
         lane acquisition. See ``plans/worktree-lane-lifecycle-prd.md``.
         """
         return worktree_base / TASK_META_DIRNAME / worktree_name
+
+    @staticmethod
+    def task_root_for(worktree_base: Path, task_id: str) -> Path:
+        """Derive the TASK-lifetime `.task-meta` root: the single owner of the
+        ``<worktree_base>/.task-meta/task-<task_id>`` shape that holds the
+        artifacts which follow a task across lanes (PRD
+        ``plans/task-meta-task-keying-prd.md`` §Path-derivation contract).
+
+        Raises:
+            ValueError: *task_id* fails ``_validate_task_id``.
+        """
+        _validate_task_id(task_id)
+        return worktree_base / TASK_META_DIRNAME / f'task-{task_id}'
 
     @staticmethod
     def read_lane_task_id(meta_root: Path) -> str | None:
