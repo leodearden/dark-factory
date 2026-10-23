@@ -159,3 +159,74 @@ class TestPlanFilesAuditTrail:
         assert result.resolved_renames == {'pkg/old/widget.py': 'pkg/new/widget.py'}
         assert result.not_touched == []
         assert 'via unique basename match;' in _record(caplog, 'resolved to')
+
+
+@pytest.mark.asyncio
+class TestRenameProbeReadsTheDeclaredPathsPair:
+    """The rename probe picks the declared path's own R line out of ``git show --name-status -M``."""
+
+    async def test_pair_found_among_other_changes_in_the_deleting_commit(
+        self, git_repo: Path, git_ops: GitOps,
+    ):
+        _commit(
+            git_repo,
+            {
+                'pkg/a0.txt': _module('a0'),
+                'pkg/aa_one.py': _module('aa'),
+                'pkg/zz_old.py': _module('zz'),
+            },
+            'add three files',
+        )
+        (git_repo / 'pkg' / 'a0.txt').write_text(_module('a0 edited'))
+        _git(git_repo, 'mv', 'pkg/aa_one.py', 'pkg/aa_two.py')
+        _git(git_repo, 'mv', 'pkg/zz_old.py', 'pkg/zz_new.py')
+        sha = _commit(git_repo, {}, 'edit one, rename two')
+        head = _commit(git_repo, {'pkg/zz_new.py': _module('zz edited')}, 'edit')
+
+        assert _git(
+            git_repo, 'show', '--name-status', '-M', '--format=', sha,
+        ).splitlines() == [
+            'M\tpkg/a0.txt',
+            'R100\tpkg/aa_one.py\tpkg/aa_two.py',
+            'R100\tpkg/zz_old.py\tpkg/zz_new.py',
+        ]
+
+        result = await _check_plan_files_touched_in_branch(
+            ['pkg/zz_old.py'], sha, head, git_ops, task_id=TASK,
+        )
+
+        assert result.not_touched == []
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {'pkg/zz_old.py': 'pkg/zz_new.py'}
+
+    async def test_declared_path_containing_a_space_resolves(
+        self, git_repo: Path, git_ops: GitOps,
+    ):
+        _commit(git_repo, {'pkg/old name.py': _module('spaced')}, 'add spaced')
+        sha = _mv(git_repo, 'pkg/old name.py', 'pkg/new_name.py', 'rename')
+        head = _commit(git_repo, {'pkg/new_name.py': _module('edited')}, 'edit')
+
+        result = await _check_plan_files_touched_in_branch(
+            ['pkg/old name.py'], sha, head, git_ops, task_id=TASK,
+        )
+
+        assert result.resolved_renames == {'pkg/old name.py': 'pkg/new_name.py'}
+        assert result.not_touched == []
+
+    async def test_rename_resolution_ignores_a_repo_that_disables_diff_renames(
+        self, git_repo: Path, git_ops: GitOps,
+    ):
+        _git(git_repo, 'config', 'diff.renames', 'false')
+        _commit(git_repo, {'pkg/before.py': _module('mod')}, 'add before')
+        sha = _mv(git_repo, 'pkg/before.py', 'pkg/after.py', 'rename')
+        head = _commit(git_repo, {'pkg/after.py': _module('edited')}, 'edit')
+
+        default_show = _git(git_repo, 'show', '--name-status', '--format=', sha)
+        assert 'D\tpkg/before.py' in default_show
+        assert not [ln for ln in default_show.splitlines() if ln.startswith('R')]
+
+        result = await _check_plan_files_touched_in_branch(
+            ['pkg/before.py'], sha, head, git_ops, task_id=TASK,
+        )
+
+        assert result.resolved_renames == {'pkg/before.py': 'pkg/after.py'}
