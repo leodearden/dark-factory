@@ -897,17 +897,17 @@ def _neutralize_verify_admission(monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _drain_async_mock_coroutines():
-    """Close this test's un-awaited AsyncMock call coroutines before the next test starts.
+    """Fail this test if it called an AsyncMock without awaiting it, closing the orphan first.
 
-    Task 1714 / esc-1702-13; rationale in ``_async_mock_orphans.py::drain_async_mock_coroutines``.
+    Tasks 1714 / 5669; rationale in ``_async_mock_orphans.py``.
     ``track_async_mock_coroutines()`` runs at conftest import, so collection-time mocks are covered.
 
     KNOWN LIMITATION: an orphan created in the teardown of a fixture set up
-    BEFORE this one (module- or session-scoped) is created after this drain has
-    run, so it is closed at the next test's boundary rather than this one's.
+    BEFORE this one (module- or session-scoped) is created after this check has
+    run, so the NEXT test fails instead; the message names where it was created.
     """
     yield
-    _async_mock_orphans.drain_async_mock_coroutines()
+    _async_mock_orphans.fail_on_orphaned_async_mock_calls()
 
 
 @pytest.fixture

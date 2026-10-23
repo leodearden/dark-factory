@@ -1,4 +1,4 @@
-"""Close AsyncMock call coroutines that a test created and never awaited.
+"""Enforce that a test awaits every AsyncMock call it makes.
 
 Calling an ``AsyncMock`` without awaiting the result leaves an orphaned
 ``_execute_mock_call`` coroutine.  Held in a reference cycle it outlives its
@@ -6,13 +6,15 @@ test, and whichever later test the garbage collector finalizes it in fails on
 ``RuntimeWarning("coroutine '...' was never awaited")`` under
 filterwarnings=error (task 1714 / esc-1702-13).  Tracking happens when each
 call coroutine is created, so the drain never searches the heap (task 5668).
+
+A test that leaves an orphan fails at its own teardown, naming the mock; the
+orphan is closed first, so it cannot fail a later test either (task 5669).
 """
 
 from __future__ import annotations
 
 import functools
 import inspect
-import logging
 import os
 import types
 import weakref
@@ -20,7 +22,7 @@ from collections import deque
 from typing import Any, NamedTuple
 from unittest.mock import AsyncMockMixin
 
-_log = logging.getLogger(__name__)
+import pytest
 
 
 class OrphanedAsyncMockCall(NamedTuple):
@@ -108,14 +110,31 @@ def drain_async_mock_coroutines() -> tuple[OrphanedAsyncMockCall, ...]:
         coroutine.close()
         if mock_name is not None:
             orphans.append(OrphanedAsyncMockCall(mock_name, created_during))
-    if orphans:
-        _log.debug(
-            'drain_async_mock_coroutines: closed %d orphaned AsyncMock '
-            '_execute_mock_call coroutine(s) — consider auditing un-awaited '
-            'AsyncMock calls in the preceding test',
-            len(orphans),
-        )
     return tuple(orphans)
+
+
+def fail_on_orphaned_async_mock_calls() -> None:
+    """Fail the running test if any AsyncMock call since the last drain was never awaited.
+
+    The drain closes every orphan before the failure is raised.
+    """
+    orphans = drain_async_mock_coroutines()
+    if orphans:
+        pytest.fail(_orphaned_calls_message(orphans), pytrace=False)
+
+
+def _orphaned_calls_message(orphans: tuple[OrphanedAsyncMockCall, ...]) -> str:
+    outside_any_test = 'no pytest test phase (e.g. collection)'
+    calls = '\n'.join(
+        f'  {orphan.mock_name!r} created during {orphan.created_during or outside_any_test}'
+        for orphan in orphans
+    )
+    return (
+        f'{len(orphans)} AsyncMock call(s) never awaited (now closed):\n{calls}\n'
+        'Await the call.  Where the code under test never awaits it (e.g. it is '
+        'handed to a patched asyncio.create_task), use a plain MagicMock instead, '
+        'or drive a real fake through its public seam.  Never add a per-test drain.'
+    )
 
 
 def _calling_mock_name(coroutine: types.CoroutineType[Any, Any, Any]) -> str | None:
