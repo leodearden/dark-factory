@@ -1336,17 +1336,24 @@ class ModuleLockTable:
         handed.
 
         Capacity (task 7313): a park takes one of its key's slots instead of
-        reserving the key exclusively.  Of the parks
-        :meth:`_rank_blocking_parks` names, one on key K blocks only once the
-        occupants — the foreign holders conflicting with *module* and the
-        owners of those parks, each task counted once — reach
-        ``min(_limit_for(module), _limit_for(K))``.  Where either limit is 1
-        every such park blocks, so a limit-1 park stays exclusive, hierarchical
-        cases included.  Ignoring an owner only removes occupants, so the rule
-        is monotone in *ignore_owners*: once admission's named owners are
-        ignored, no remaining park reaches its threshold.
+        reserving the key exclusively.  A park on key K that
+        :meth:`_rank_blocking_parks` names blocks when either term fires:
 
-        The threshold needs the full count, so nothing is yielded before every
+        (a) the hold term — a park counts as its owner's hold, so the request
+            is refused once *module* is at ``_limit_for(module)`` counting the
+            foreign holders and the blocking park owners, each task once;
+        (b) the owner's-slot term — a park keeps one slot of its own key, so
+            the request is refused when granting it would fill K for the owner
+            (:meth:`_park_owner_slot_taken`).
+
+        A limit of 1 on either key makes its term always fire, so a limit-1
+        park stays exclusive, hierarchical cases included.  The rule is
+        monotone in *ignore_owners*: ignoring an owner only removes hold-term
+        occupants, and the owner's-slot term reads holders only, never
+        *ignore_owners* — so once admission's named owners are ignored, no
+        remaining park starts blocking.
+
+        The hold term needs the full count, so nothing is yielded before every
         park has been scanned; a generator keeps every view's call shape.
         """
         parks = self._rank_blocking_parks(module, task_id, ignore_owners=ignore_owners)
@@ -1354,10 +1361,22 @@ class ModuleLockTable:
             return
         occupants = self._conflicting_holders(module, exclude_task=task_id)
         occupants.update(owner for owner, _key in parks)
-        request_limit = self._limit_for(module)
+        if len(occupants) >= self._limit_for(module):
+            yield from (owner for owner, _key in parks)
+            return
         for owner, key in parks:
-            if len(occupants) >= min(request_limit, self._limit_for(key)):
+            if self._park_owner_slot_taken(owner, key, task_id):
                 yield owner
+
+    def _park_owner_slot_taken(self, owner: str, key: str, requester: str) -> bool:
+        """Would granting *requester* a key conflicting with *key* leave *owner* no room on it?
+
+        True when the park owner's own later acquisition of *key* would then
+        fail the held gate: the holders conflicting with *key* other than
+        *requester*, plus *owner* itself, already reach ``_limit_for(key)``.
+        """
+        holders = self._conflicting_holders(key, exclude_task=requester)
+        return len(holders | {owner}) >= self._limit_for(key)
 
     def _blocking_park_owner(
         self,
@@ -1465,7 +1484,8 @@ class ModuleLockTable:
     ) -> bool:
         """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*,
         is owned by a different task that task_id cannot preempt (INV-2), and
-        leaves *module* no free slot (task 7313).
+        fires the two-term capacity rule of :meth:`_iter_blocking_park_owners`
+        (task 7313).
 
         The bool view of :meth:`_blocking_park_owner`, which carries the rank
         logic.  Kept as a delegate rather than inlined so ``try_acquire`` /
@@ -2027,8 +2047,8 @@ class ModuleLockTable:
         Uses hierarchical conflict detection: a lock on ``A/B`` conflicts with
         ``A/B/C`` (and vice-versa) but NOT with ``A/D``.  Also refuses if any
         requested module hierarchically conflicts with an active reservation
-        owned by a different task (see ``install_parks``) that leaves the
-        module no free slot (see ``_iter_blocking_park_owners``).
+        owned by a different task (see ``install_parks``) under the capacity
+        rule of ``_iter_blocking_park_owners``.
 
         Returns True if all acquired, False if any unavailable.
 
