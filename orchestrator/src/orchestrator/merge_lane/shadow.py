@@ -16,7 +16,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -543,6 +543,18 @@ def parse_failed_run_all_members(test_output: str) -> list[str]:
             seen.add(name)
             out.append(name)
     return out
+
+
+def select_failed_run_all_members(
+    test_output: str, channel_members: Sequence[str] | None,
+) -> list[str]:
+    """C3 rule 3: the verify event channel's failed set
+    (``VerifyResult.run_all_failed_members``) when the channel was present, else
+    the text marker parse (rule 2). ``[]`` means the full run_all suite.
+    """
+    if channel_members is not None:
+        return list(channel_members)
+    return parse_failed_run_all_members(test_output)
 
 
 # ---------------------------------------------------------------------------
