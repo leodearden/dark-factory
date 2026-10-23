@@ -24,6 +24,7 @@ from _briefing_helpers import (
     _result,
     recorded_search_text,
 )
+from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
 
 from orchestrator.agents.memory_recall import (
     FOREIGN_PROJECT_TAG_KEYS,
@@ -677,6 +678,64 @@ class TestRenderMemoryResults:
 
         assert render_memory_results(()) == ''
         assert render_memory_results(('stray', silent)) == ''
+
+
+_NEW_ID = '0f6c2a4e-8b1d-4c3e-9a7f-5d2e1b0c9a8f'
+
+
+def _dated(entry: dict) -> dict:
+    entry['category'] = 'preferences_and_norms'
+    entry['created_at'] = '2026-08-15T22:22:49+00:00'
+    return entry
+
+
+class TestSupersededRender:
+    """A superseded entry is tagged in place: never dropped, never reordered."""
+
+    def test_a_superseded_result_names_what_superseded_it(self):
+        entry = _dated(_result(
+            '1', 'Old text.', metadata={SUPERSEDED_BY_METADATA_KEY: _NEW_ID}, source_store='mem0',
+        ))
+
+        assert render_memory_results((entry,)) == (
+            f'- [superseded by {_NEW_ID} · preferences_and_norms · 2026-08-15 · mem0] Old text.'
+        )
+
+    def test_a_superseded_result_keeps_its_place_beside_the_current_one(self):
+        superseded = _dated(_result(
+            '1', 'Old text.', metadata={SUPERSEDED_BY_METADATA_KEY: _NEW_ID}, source_store='mem0',
+        ))
+        current = _dated(_result(_NEW_ID, 'New text.', source_store='mem0'))
+
+        lines = render_memory_results((superseded, current)).splitlines()
+
+        assert [line.rsplit('] ', 1)[1] for line in lines] == ['Old text.', 'New text.']
+        assert 'superseded by' in lines[0]
+        assert 'superseded by' not in lines[1]
+
+    def test_a_superseded_grouped_child_is_tagged_in_its_nested_bullet(self):
+        parent = _grouped_parent(grouped={
+            'amendments': [
+                {'id': 'a1', 'digest': 'Old amendment.', 'created_at': None,
+                 'kind': 'amendment', 'metadata': {SUPERSEDED_BY_METADATA_KEY: _NEW_ID}},
+            ],
+            'amendment_count': 1,
+        })
+
+        assert render_memory_results((parent,)).splitlines() == [
+            '- [uncategorized · undated · mem0] Native canonical.',
+            f'  - [superseded by {_NEW_ID} · amendment · undated · mem0] Old amendment.',
+        ]
+
+    @pytest.mark.parametrize('mark', ['', 123], ids=['empty', 'not-a-str'])
+    def test_an_unreadable_mark_renders_the_plain_tag(self, mark):
+        entry = _dated(_result(
+            '1', 'Old text.', metadata={SUPERSEDED_BY_METADATA_KEY: mark}, source_store='mem0',
+        ))
+
+        assert render_memory_results((entry,)) == (
+            '- [preferences_and_norms · 2026-08-15 · mem0] Old text.'
+        )
 
 
 def _recorded_results(name: str) -> tuple:
