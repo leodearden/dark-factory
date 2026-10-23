@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from fused_memory.memory_metadata import SUPERSEDED_BY_METADATA_KEY
 from fused_memory.server import write_triage
 from fused_memory.server.grouped_read import PARENT_ID_KEY
 from fused_memory.server.tools import create_mcp_server
@@ -28,6 +29,7 @@ from fused_memory.server.write_triage import (
     TriageJudgeVerdict,
     triage_write,
 )
+from fused_memory.services.supersession_mark import SUPERSESSION_ACK_KEY
 from server.write_triage_harness import configure_triage_config, search_candidate
 
 _PROJECT_ID = 'dark_factory'
@@ -170,3 +172,53 @@ class TestAddMemoryStoresASupersessionStandalone:
 
         assert ack[ROUTED_KEY] == OUTCOME_RESTATED, f'{ack!r}'
         assert ack[CANONICAL_ID_KEY] == OLD, f'{ack!r}'
+
+
+class TestAddMemoryMarksTheSupersededRecord:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('triage_enabled', [True, False], ids=['triage-on', 'triage-off'])
+    async def test_the_superseded_record_is_marked_with_the_new_id(
+        self, triage_enabled: bool,
+    ) -> None:
+        mock_service = _service(_HIGH_BAND, enabled=triage_enabled)
+
+        ack = await _call(mock_service, {'supersedes': [OLD]})
+
+        mock_service.update_memory.assert_awaited_once()
+        kwargs = mock_service.update_memory.await_args.kwargs
+        assert kwargs['memory_id'] == OLD
+        assert kwargs['content'] is None
+        assert kwargs['metadata_patch'] == {SUPERSEDED_BY_METADATA_KEY: NEW_ID}
+        assert kwargs['project_id'] == _PROJECT_ID
+        assert kwargs['agent_id'] == _AGENT_ID
+        assert ack[SUPERSESSION_ACK_KEY] == {
+            'superseded_by': NEW_ID, 'marked': [OLD], 'unmarked': [],
+        }, f'{ack!r}'
+        if triage_enabled:
+            assert ack[ROUTED_KEY] == OUTCOME_STORED, f'{ack!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_write_without_supersedes_marks_nothing(self) -> None:
+        mock_service = _service(_HIGH_BAND)
+
+        ack = await _call(mock_service, None)
+
+        mock_service.update_memory.assert_not_awaited()
+        assert SUPERSESSION_ACK_KEY not in ack, f'{ack!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_refused_mark_is_disclosed_and_the_write_still_acks(self) -> None:
+        mock_service = _service(_HIGH_BAND)
+        mock_service.update_memory.return_value = {
+            'error_type': 'MemoryNotFound', 'error': f'no memory {OLD}',
+        }
+
+        ack = await _call(mock_service, {'supersedes': [OLD]})
+
+        assert 'error' not in ack, f'{ack!r}'
+        assert ack['memory_ids'] == [NEW_ID], f'{ack!r}'
+        body = ack[SUPERSESSION_ACK_KEY]
+        assert body['marked'] == []
+        [unmarked] = body['unmarked']
+        assert unmarked['id'] == OLD
+        assert unmarked['reason'] == 'patch_failed'
