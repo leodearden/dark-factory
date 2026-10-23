@@ -158,7 +158,9 @@ def _exit_after_hup_then_term(
         except subprocess.TimeoutExpired as exc:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(pgid, signal.SIGKILL)
-            _, err = proc.communicate(timeout=5.0)
+            err = b''
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                _, err = proc.communicate(timeout=5.0)
             raise AssertionError(
                 f'process did not exit within {EXIT_WITHIN_SECS}s of SIGTERM; '
                 f'stderr={err!r}'
@@ -168,7 +170,8 @@ def _exit_after_hup_then_term(
         if proc.poll() is None:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(pgid, signal.SIGKILL)
-            proc.wait(timeout=5.0)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5.0)
 
 
 def test_sighup_does_not_kill_process(tmp_path: Path):
@@ -203,6 +206,7 @@ def test_sighup_does_not_kill_process(tmp_path: Path):
     ],
 )
 def test_ready_wait_fails_instead_of_blocking(code: str):
+    """The READY wait must fail rather than block, which was the old readline hazard."""
     proc = subprocess.Popen(
         [sys.executable, '-c', code],
         stdout=subprocess.PIPE,
