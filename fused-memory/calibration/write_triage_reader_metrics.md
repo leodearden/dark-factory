@@ -71,7 +71,7 @@ left out.
 
 | Metric | Rule | Population and unit | Sample | Status |
 |---|---|---|---|---|
-| **M1** hidden information in the high-cosine band | the write's dispute or needed detail is not visible to a reader of the parent: CONFLICT, or HOME with LOSS for a restated write, or HOME with LOSS and DIGEST=NO for an amended one (`derive`, `Decided.m1_hidden`); contested and stored writes are visible. DIGEST is YES only when every LOSS-YES rater's spans all lie in the digest (`digest_visible`, resolved all-visible) | every write whose band-winner cosine was >= t_high when it was written (about 105 a week), whatever its outcome; unit = write | census | **gate: point estimate <= 0.15**, Wilson reported. Soak baseline 0.50 (v1 proxy) |
+| **M1** hidden information in the high-cosine band | the write's dispute or needed detail is not visible to a reader of the parent: CONFLICT, or HOME with LOSS for a restated write, or HOME with LOSS and DIGEST=NO for an amended one (`derive`, `Decided.m1_hidden`); contested and stored writes are visible. DIGEST is YES only when every LOSS-YES rater's spans all lie in the digest (`digest_visible`, resolved all-visible) | every write whose band-winner cosine was >= t_high when it was written (about 105 a week), whatever its outcome; unit = write | census | **gate: point estimate <= 0.15**, Wilson reported. Soak baseline 0.3736 under rubric v2.1 (§8); the v1 proxy was 0.50 |
 | **M1 as amended** (counterfactual) | M1's rule with every band attach read as if it were amended: CONFLICT, or HOME with LOSS and DIGEST=NO (`Decided.m1_hidden_as_amended`) | M1's band writes that were attached; unit = write | shared with M1 | report-only |
 | **M2** ack truth per outcome | the outcome triage gave is correct, meaning no triage cell | attach and stored acks; unit = write, per outcome | 100 per outcome, stratified outcome × project | report-only |
 | **M3** hidden corrections | of the writes that dispute their parent or an earlier record (CONFLICT), the share that ended restated, amended, or stored with no mark on the record they dispute | every CONFLICT write; unit = write | >= 60 CONFLICT writes, drawn from the contested census, the M2 samples, and 150 stored writes rated against their nearest earlier records | **gate: bound unset — Leo sets it.** The critic's soak-equivalent after F3/F4 is >= ~0.06–0.07 |
@@ -105,8 +105,8 @@ left out.
   consumed until it has them. Below the floor, refine the brief and re-rate
   before scoring; never score through it.
 - SCOPE below the floor on its own is recorded and reported with
-  `escalate_info`, and does not block scoring. That is this session's
-  operational reading of the rulings, and Leo may veto it.
+  `escalate_info`, and does not block scoring. Leo ratified this reading of
+  R5 on 2026-10-21 (task 7174, metadata `x_ruling_ratified`).
 - A third rater, also Opus, is asked only about decisive disagreements: a
   binary that is tied and that the derivation needs. The scorer names them,
   refusing with `fused-memory/scripts/score_write_triage_reader.py::IncompleteJudgementError`
@@ -295,8 +295,11 @@ loss.
 
 The floor holds for home, conflict and loss, and each has at least 60
 consumed pairs without over-sampling. SCOPE, which the floor does not cover,
-is at 0.844 on 286 pairs. DIGEST is computed from the loss spans, and only 10
-pairs consume it, too few for a kappa.
+is at 0.844 on 286 pairs. DIGEST is computed from the loss spans. All 10
+consumed pairs carry one and the same label, NO from both raters (counted from
+the committed verdicts, not in the JSON), so chance agreement is 1 and kappa is
+undefined: `fused-memory/scripts/write_triage_stats.py::cohen_kappa` returns
+None.
 
 ### Derivation check
 
@@ -379,21 +382,26 @@ stratified bootstrap 95% interval.
 
 ### The counterfactual: F3′ alone
 
-M1 as amended reads every band attach as if it were amended, the outcome F3′
-(task 7155) gives a band write the judge finds new. It is 0.3846 on the
-sample and 0.3833 on the population, and both intervals lie wholly above
-0.15, so F3′ alone does not clear the gate on this evidence. The split of its
+M1 as amended reads every band attach as if it were amended. It is 0.3846 on
+the sample and 0.3833 on the population, and both intervals lie wholly above
+0.15. F3′ (task 7155), though, sends a band write to a judge that may amend it
+or contest it, and a contested write is visible to M1. The counterfactual is
+therefore the case in which the judge contests none of them, and what F3′ can
+reach depends on how many band CONFLICT writes it contests. The split of the
 35 hits, counted from the committed corpus with the scorer's own derivation
-(not in the JSON), shows why. 24 hits rest on CONFLICT, which an amendment
-still hides in an untagged digest. The other 11 rest on HOME with LOSS, and in
-all 11 DIGEST is NO: the needed detail lies past the first 240 characters, so
-amending them hides it as well. Without the 24 CONFLICT hits the rate would be
-11 / 91 = 0.1209, under the gate. Without the 11 detail hits it would be
-24 / 91 = 0.2637, over it. So 3131 also needs a change that shows a band
-CONFLICT write to its reader as a dispute: the judge contesting it, or a render
-that tags it. A digest change alone does not pass; added to that change, it
-would widen the margin under 0.15. The counterfactual does not model a judge that contests a
-band write: one it contests is visible, and M1 as amended counts it hidden.
+(not in the JSON), gives the bound. 24 hits rest on CONFLICT, which an
+amendment still hides in an untagged digest. One of them,
+`998b9d5d-a30a-4832-99de-6978736dfcf8`, is already contested and counts as
+hidden only inside the counterfactual. The other 11 rest on HOME with LOSS,
+and in all 11 DIGEST is NO: the needed detail lies past the first 240
+characters, so amending them hides it as well. With only those 11 hidden, M1
+would be 11 / 91 = 0.1209. The gate allows at most 13 hidden writes of 91:
+13 / 91 = 0.1429 passes and 14 / 91 = 0.1538 fails (computed from the JSON's
+n of 91 and the 0.15 gate). On this evidence F3′ alone clears the M1 gate only
+if its judge contests at least 22 of the 24 band CONFLICT writes. A digest or
+render change for the detail hits alone cannot clear it: with every CONFLICT
+write still hidden, M1 would be 24 / 91 = 0.2637. These are sample counts; the
+population rate is not split here.
 
 ### Caveats
 
@@ -416,6 +424,15 @@ band write: one it contests is visible, and M1 as amended counts it hidden.
   follow-up UNCLEAR (§4). A rater row whose own HOME is YES and CONFLICT NO
   must give LOSS, or the rubric refuses it
   (`write_triage_reader_rubric.py::DECISIVE_FOLLOW_UPS`).
+- One binary in the corpus was agreed by the primary and second raters and
+  then overturned. A third rater answers the whole item blind, and every vote
+  counts toward the majority. On `85c91566-7979-42c3-adbd-b37243d06530`
+  (restated, in the M1 band) the primary and second agreed HOME YES and split
+  on LOSS, primary NO and second YES. All three third rounds answered HOME NO,
+  so none of them gave LOSS, and HOME resolved NO 3 to 2. The item is
+  wrong_home and not M1-hidden. Had HOME resolved YES and LOSS YES, M1 would
+  be 35 / 91. Leo ruled on 2026-10-23 to keep the all-votes majority. The
+  votes are counted from the committed verdicts; the ruling is not in the JSON.
 
 ### v2.0 history
 
