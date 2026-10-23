@@ -544,10 +544,15 @@ class FlagTypeFamily:
     unseen_spelling_tokens: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
-        if not self.drift_tokens or any(not t or t != t.casefold() for t in self.drift_tokens):
+        tokens = self.drift_tokens
+        if (
+            not isinstance(tokens, frozenset)
+            or not tokens
+            or any(not t or t != t.casefold() for t in tokens)
+        ):
             raise ValueError(
-                f'FlagTypeFamily {self.name!r}: drift_tokens must be a non-empty set of '
-                f'non-empty casefolded substrings, got {sorted(self.drift_tokens)!r}'
+                f'FlagTypeFamily {self.name!r}: drift_tokens must be a non-empty frozenset '
+                f'of non-empty casefolded substrings, got {tokens!r}'
             )
 
     @cached_property

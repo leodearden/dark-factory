@@ -12403,12 +12403,10 @@ class TestFlagTypeFamily:
 
     @pytest.mark.parametrize(
         'drift_tokens',
-        [frozenset(), frozenset({''}), frozenset({'Widget'})],
-        ids=['empty_set', 'empty_token', 'not_casefolded'],
+        [frozenset(), frozenset({''}), frozenset({'Widget'}), 'widget', {'widget'}],
+        ids=['empty_set', 'empty_token', 'not_casefolded', 'bare_str', 'mutable_set'],
     )
-    def test_construction_rejects_drift_tokens_that_could_never_fire_or_always_fire(
-        self, drift_tokens,
-    ):
+    def test_construction_rejects_malformed_drift_tokens(self, drift_tokens):
         with pytest.raises(ValueError, match='drift_tokens'):
             flag_dedup.FlagTypeFamily(
                 name='w', spellings=frozenset({'w_x'}), drift_tokens=drift_tokens,
