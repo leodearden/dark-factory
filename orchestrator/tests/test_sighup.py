@@ -85,6 +85,31 @@ SIGHUP_SCRIPT = textwrap.dedent('''
 ''')
 
 
+def _await_ready(proc: subprocess.Popen[bytes], *, within_secs: float) -> bytes:
+    """Return the child's stdout through its READY line.
+
+    Fails with AssertionError on deadline or EOF rather than blocking.
+    """
+    assert proc.stdout is not None
+    fd = proc.stdout.fileno()
+    deadline = time.monotonic() + within_secs
+    seen = b''
+    while b'READY' not in seen.splitlines():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            raise AssertionError(
+                f'no READY line within {within_secs}s '
+                f'(rc={proc.poll()}, stdout={seen!r})'
+            )
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            raise AssertionError(
+                f'stdout closed before READY (rc={proc.poll()}, stdout={seen!r})'
+            )
+        seen += chunk
+    return seen
+
+
 @pytest.mark.timeout(30)
 def test_sighup_does_not_kill_process(tmp_path: Path):
     """Send SIGHUP and verify the process is still alive ~1s later.
