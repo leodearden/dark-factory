@@ -17,7 +17,6 @@ import dataclasses
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -48,6 +47,7 @@ from legibility.config import TrickleCensusCaps, load_config
 from pydantic import ValidationError
 from quality_doc_texts import definition_body, heuristic_headlines
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
+from shared.cli_invoke import resolve_claude_binary
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
@@ -1934,7 +1934,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         empty_bin = tmp_path / 'empty-bin'
         empty_bin.mkdir()
         monkeypatch.setenv('PATH', f'{empty_bin}{os.pathsep}/usr/bin')
-        assert shutil.which('claude') is None, 'the premise: no claude is reachable'
+        assert resolve_claude_binary() is None, 'the premise: no claude is reachable'
 
         with caplog.at_level(logging.DEBUG):
             result, escalations = _run_one_digest_night(tmp_path)

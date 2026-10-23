@@ -17,7 +17,6 @@ import dataclasses
 import json
 import logging
 import os
-import shutil
 from pathlib import Path
 
 import pytest
@@ -29,6 +28,7 @@ from legibility.session_runner import (
     StageSpec,
 )
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, REAL_CLI_NEAR_CAP_MESSAGES
+from shared.cli_invoke import resolve_claude_binary
 from shared.config_models import UsageCapConfig
 
 from shared import usage_gate
@@ -347,7 +347,7 @@ def test_a_missing_claude_binary_is_a_loud_failure_naming_the_cwd(
     empty_bin = tmp_path / 'empty-bin'
     empty_bin.mkdir()
     monkeypatch.setenv('PATH', f'{empty_bin}{os.pathsep}/usr/bin')
-    assert shutil.which('claude') is None, 'the premise: no claude is reachable'
+    assert resolve_claude_binary() is None, 'the premise: no claude is reachable'
     project = tmp_path / 'project'
     project.mkdir()
     accounts_file, env_file = pool_roster(_P)

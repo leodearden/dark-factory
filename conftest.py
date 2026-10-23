@@ -27,6 +27,7 @@ if str(_ROOT) not in sys.path:
 # collects fixtures bound into a conftest's namespace, so the F401 bindings are
 # load-bearing.
 from df_pytest_isolation import (  # noqa: E402
+    _df_claude_binary_unset,  # noqa: F401  # debt: task 6997
     _df_deploy_clocks_unwritten,  # noqa: F401
     _df_fleet_dir_redirect,  # noqa: F401
     _df_git_ceiling_at_basetemp,  # noqa: F401
