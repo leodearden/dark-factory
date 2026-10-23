@@ -36,6 +36,7 @@ as it is dated.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from fused_memory.models.reconciliation import ReconciliationRun, StageId, StageReport
@@ -43,23 +44,54 @@ from fused_memory.models.reconciliation import ReconciliationRun, StageId, Stage
 UNFINISHED_WRITE_START_STAT = 'stage1_unfinished_graphiti_write_start'
 
 
+@dataclass(frozen=True)
+class EpisodeWindowAnchor:
+    """Where the next cycle's episode window starts, and the Stage 1 sample it honoured."""
+
+    at: datetime
+    unfinished_write_start: datetime | None
+
+
 def unfinished_write_start_stat(start: datetime | None) -> str | None:
     """Stage 1's stat value for *start*: ISO-8601 with offset, or None."""
     return None if start is None else start.astimezone(UTC).isoformat()
 
 
+def _decoded_instant(encoded: object) -> datetime | None:
+    """*encoded* as an instant, or None unless it is an ISO-8601 string with an offset."""
+    if not isinstance(encoded, str):
+        return None
+    try:
+        decoded = datetime.fromisoformat(encoded)
+    except ValueError:
+        return None
+    return None if decoded.tzinfo is None else decoded
+
+
 def recorded_unfinished_write_start(run: ReconciliationRun) -> datetime | None:
-    """The unfinished-write start *run*'s Stage 1 recorded, or None if it recorded none."""
+    """The unfinished-write start *run*'s Stage 1 recorded, or None if it recorded none.
+
+    Raises ValueError for a stat that is neither None nor what
+    ``unfinished_write_start_stat`` encodes: ignoring it would anchor at
+    ``run.started_at`` and silently drop the episode it was recorded to keep.
+    """
     report = run.stage_reports.get(StageId.memory_consolidator.value)
     if not isinstance(report, StageReport):
         return None
     encoded = report.stats.get(UNFINISHED_WRITE_START_STAT)
-    if not isinstance(encoded, str):
+    if encoded is None:
         return None
-    return datetime.fromisoformat(encoded)
+    decoded = _decoded_instant(encoded)
+    if decoded is None:
+        raise ValueError(
+            f'Stage 1 stat {UNFINISHED_WRITE_START_STAT!r} must be None or an ISO-8601 '
+            f'string with an offset; got {type(encoded).__name__} {encoded!r}'
+        )
+    return decoded
 
 
-def next_episode_window_anchor(run: ReconciliationRun) -> datetime:
+def next_episode_window_anchor(run: ReconciliationRun) -> EpisodeWindowAnchor:
     """Where the cycle after *run* starts its episode window."""
     recorded = recorded_unfinished_write_start(run)
-    return run.started_at if recorded is None else min(run.started_at, recorded)
+    at = run.started_at if recorded is None else min(run.started_at, recorded)
+    return EpisodeWindowAnchor(at=at, unfinished_write_start=recorded)

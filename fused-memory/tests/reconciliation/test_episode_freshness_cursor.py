@@ -804,7 +804,7 @@ class TestUnfinishedGraphitiWriteSample:
         report = await self._run(stage)
 
         sample.assert_called_once_with('test_project')
-        assert next_episode_window_anchor(_run_with_stage1(report)) == unfinished
+        assert next_episode_window_anchor(_run_with_stage1(report)).at == unfinished
 
     @pytest.mark.asyncio
     async def test_sample_is_taken_before_the_episode_fetch(self):
@@ -833,7 +833,7 @@ class TestUnfinishedGraphitiWriteSample:
         report = await self._run(stage)
 
         assert UNFINISHED_WRITE_START_STAT in report.stats
-        assert next_episode_window_anchor(_run_with_stage1(report)) == RUN_START
+        assert next_episode_window_anchor(_run_with_stage1(report)).at == RUN_START
 
     @pytest.mark.asyncio
     async def test_reused_stage_records_none_on_a_later_assembled_run(self):

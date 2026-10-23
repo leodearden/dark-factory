@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
 
+import pytest
+
 from fused_memory.models.reconciliation import (
     ReconciliationRun,
     RunStatus,
@@ -13,6 +15,7 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation.episode_window import (
     UNFINISHED_WRITE_START_STAT,
+    EpisodeWindowAnchor,
     next_episode_window_anchor,
     recorded_unfinished_write_start,
     unfinished_write_start_stat,
@@ -50,18 +53,18 @@ def _run_recording(start: datetime | None) -> ReconciliationRun:
 def test_no_stage1_report_anchors_at_run_start():
     run = _run(None)
 
-    assert next_episode_window_anchor(run) == RUN_START
+    assert next_episode_window_anchor(run).at == RUN_START
     assert recorded_unfinished_write_start(run) is None
 
 
 def test_stage1_report_without_the_stat_anchors_at_run_start():
-    assert next_episode_window_anchor(_run({})) == RUN_START
+    assert next_episode_window_anchor(_run({})).at == RUN_START
 
 
 def test_nothing_executing_anchors_at_run_start():
     run = _run_recording(None)
 
-    assert next_episode_window_anchor(run) == RUN_START
+    assert next_episode_window_anchor(run).at == RUN_START
     assert recorded_unfinished_write_start(run) is None
 
 
@@ -70,13 +73,18 @@ def test_write_unfinished_since_before_run_start_lowers_the_anchor():
     run = _run_recording(start)
 
     assert recorded_unfinished_write_start(run) == start
-    assert next_episode_window_anchor(run) == start
+    assert next_episode_window_anchor(run) == EpisodeWindowAnchor(
+        at=start, unfinished_write_start=start,
+    )
 
 
 def test_write_begun_after_run_start_leaves_the_anchor_at_run_start():
-    run = _run_recording(RUN_START + timedelta(seconds=30))
+    begun = RUN_START + timedelta(seconds=30)
+    run = _run_recording(begun)
 
-    assert next_episode_window_anchor(run) == RUN_START
+    assert next_episode_window_anchor(run) == EpisodeWindowAnchor(
+        at=RUN_START, unfinished_write_start=begun,
+    )
 
 
 def test_anchor_survives_the_journal_stage_report_round_trip():
@@ -88,7 +96,7 @@ def test_anchor_survives_the_journal_stage_report_round_trip():
         update={'stage_reports': {STAGE1: StageReport(**report.model_dump(mode='json'))}},
     )
 
-    assert next_episode_window_anchor(reloaded) == start
+    assert next_episode_window_anchor(reloaded).at == start
 
 
 def test_start_with_a_non_utc_offset_compares_by_instant():
@@ -96,4 +104,31 @@ def test_start_with_a_non_utc_offset_compares_by_instant():
     run = _run_recording(start.astimezone(timezone(timedelta(hours=2))))
 
     assert recorded_unfinished_write_start(run) == start
-    assert next_episode_window_anchor(run) == start
+    assert next_episode_window_anchor(run).at == start
+
+
+@pytest.mark.parametrize(
+    'encoded',
+    [RUN_START - timedelta(minutes=3), 1760788620, ['2026-10-18T11:57:00+00:00']],
+    ids=['raw-datetime', 'epoch-int', 'list'],
+)
+def test_wrongly_typed_stat_raises_naming_the_stat_its_type_and_value(encoded):
+    run = _run({UNFINISHED_WRITE_START_STAT: encoded})
+
+    with pytest.raises(ValueError, match=UNFINISHED_WRITE_START_STAT) as raised:
+        recorded_unfinished_write_start(run)
+    assert type(encoded).__name__ in str(raised.value)
+    assert repr(encoded) in str(raised.value)
+    with pytest.raises(ValueError, match=UNFINISHED_WRITE_START_STAT):
+        next_episode_window_anchor(run)
+
+
+@pytest.mark.parametrize(
+    'encoded', ['not an instant', '2026-10-18T11:57:00'], ids=['garbage', 'no-offset'],
+)
+def test_string_stat_that_is_not_an_instant_with_offset_raises_naming_the_stat(encoded):
+    run = _run({UNFINISHED_WRITE_START_STAT: encoded})
+
+    with pytest.raises(ValueError, match=UNFINISHED_WRITE_START_STAT) as raised:
+        recorded_unfinished_write_start(run)
+    assert repr(encoded) in str(raised.value)

@@ -57,10 +57,7 @@ from fused_memory.reconciliation.dangling_citation import dangling_citation_iden
 from fused_memory.reconciliation.drained_event_restore import (
     restore_unless_completed_best_effort,
 )
-from fused_memory.reconciliation.episode_window import (
-    next_episode_window_anchor,
-    recorded_unfinished_write_start,
-)
+from fused_memory.reconciliation.episode_window import next_episode_window_anchor
 from fused_memory.reconciliation.escalation_archive import (
     scan_recently_resolved_fingerprints,
 )
@@ -3965,7 +3962,7 @@ class ReconciliationHarness:
 
                 completed_at = datetime.now(UTC)
                 episode_anchor = next_episode_window_anchor(run)
-                unfinished_write_start = recorded_unfinished_write_start(run)
+                unfinished_write_start = episode_anchor.unfinished_write_start
                 logger.info(
                     'reconciliation.episode_window_anchored',
                     extra={
@@ -3976,14 +3973,14 @@ class ReconciliationHarness:
                             None if unfinished_write_start is None
                             else unfinished_write_start.isoformat()
                         ),
-                        'anchor': episode_anchor.isoformat(),
+                        'anchor': episode_anchor.at.isoformat(),
                     },
                 )
                 watermark = watermark.model_copy(update={
                     'last_full_run_id': run_id,
                     'last_full_run_completed': completed_at,
                     # Why these two anchors differ and neither is completion: reconciliation/episode_window.py
-                    'last_episode_timestamp': episode_anchor,
+                    'last_episode_timestamp': episode_anchor.at,
                     'last_memory_timestamp': run.started_at,
                     'last_task_change_timestamp': run.started_at,
                 })
