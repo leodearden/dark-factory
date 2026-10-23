@@ -14,9 +14,11 @@ import os
 import shlex
 import shutil
 import subprocess
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import NamedTuple
+from unittest.mock import AsyncMock
 
 import pytest
 from _git_fixtures import seed_repo
@@ -25,13 +27,15 @@ from _orch_helpers import git_env_with_ceiling
 from df_pytest_isolation import git_redirect_env
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.event_store import EventStore
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane import gates
 from orchestrator.merge_lane.gates import (
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
     _finalize_advanced_merge,
+    _GenerationChainContext,
 )
-from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
+from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, OutcomeKind, QueuedBranch
 
 TASK_ID = '6413'
 TASK_BRANCH = f'task/{TASK_ID}'
@@ -80,7 +84,7 @@ def _git(cwd: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def _commit(cwd: Path, files: dict[str, str | bytes], message: str) -> str:
+def _commit(cwd: Path, files: Mapping[str, str | bytes], message: str) -> str:
     for relpath, content in files.items():
         target = cwd / relpath
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -461,3 +465,122 @@ async def test_a_working_tree_file_cannot_stand_in_for_a_dropped_relocation(
         )
         for message in _warnings(caplog)
     ), _warnings(caplog)
+
+
+# The chained landing is timed from a start a fixed 1_000_000 s in the past, so
+# its duration is that offset plus finalize's real elapsed time.  The real part
+# is bounded by the per-test timeout, and the ceiling stays far short of the
+# offset, so a duration measured in the wrong unit or scale cannot land inside.
+PRETEND_ELAPSED_S = 1_000_000.0
+PRETEND_ELAPSED_MS = 1_000_000_000
+REAL_ELAPSED_CEILING_MS = 600_000
+
+
+class Chain(NamedTuple):
+    """A γ2 chain context whose chaining step records its call and supersedes the landing."""
+
+    context: _GenerationChainContext
+    step: AsyncMock
+    chained: MergeOutcome
+    queue: asyncio.Queue
+    counts: dict[str, int]
+
+
+def _chain() -> Chain:
+    chained = MergeOutcome('superseded', superseded_by='gen-2-request')
+    step = AsyncMock(return_value=chained)
+    queue: asyncio.Queue = asyncio.Queue()
+    counts: dict[str, int] = {}
+    context = _GenerationChainContext(
+        queue=queue, counts=counts, max_auto_generations=2, maybe_auto_chain_generation=step,
+    )
+    return Chain(context=context, step=step, chained=chained, queue=queue, counts=counts)
+
+
+@pytest.fixture
+def event_store(tmp_path: Path) -> EventStore:
+    return EventStore(tmp_path / 'runs.db', run_id=f'run-{TASK_ID}')
+
+
+@pytest.mark.asyncio
+async def test_with_the_kill_switch_off_the_chain_is_never_consulted(
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+    event_store: EventStore,
+) -> None:
+    """At the shipped kill-switch a blocked landing stays blocked, whatever chain is offered."""
+    assert gates.AUTO_CHAIN_GENERATIONS_ENABLED is False
+    scene = _landing_that_drops_the_branch(repo, tmp_path, {'feature.txt': 'branch work\n'})
+    chain = _chain()
+
+    outcome = await _finalize(
+        git_ops, _request(lane_config, scene.worktree), landed=scene.landed, base=scene.base,
+        event_store=event_store, chain_ctx=chain.context, merged_branch_tip=scene.branch_tip,
+    )
+
+    assert _blocked_reason(outcome).startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+    assert chain.step.await_count == 0
+    assert chain.queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_an_enabled_chain_is_handed_the_landing(
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+    event_store: EventStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the kill-switch on, the chain receives the landing and its context, and its outcome wins."""
+    monkeypatch.setattr(gates, 'AUTO_CHAIN_GENERATIONS_ENABLED', True)
+    scene = _landing_that_drops_the_branch(repo, tmp_path, {'feature.txt': 'branch work\n'})
+    chain = _chain()
+    req = _request(lane_config, scene.worktree)
+
+    outcome = await _finalize(
+        git_ops, req, landed=scene.landed, base=scene.base,
+        event_store=event_store, chain_ctx=chain.context, merged_branch_tip=scene.branch_tip,
+    )
+
+    assert outcome is chain.chained
+    chain.step.assert_awaited_once_with(
+        req, scene.landed, git_ops, event_store,
+        merged_branch_tip=scene.branch_tip,
+        counts=chain.counts,
+        queue=chain.queue,
+        max_auto_generations=2,
+        retention=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_chained_landing_records_its_generation_chained_row(
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+    event_store: EventStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chained landing records the gate's failure, then a timed, train-tagged chained row."""
+    monkeypatch.setattr(gates, 'AUTO_CHAIN_GENERATIONS_ENABLED', True)
+    scene = _landing_that_drops_the_branch(repo, tmp_path, {'feature.txt': 'branch work\n'})
+    chain = _chain()
+
+    await _finalize(
+        git_ops, _request(lane_config, scene.worktree), landed=scene.landed, base=scene.base,
+        event_store=event_store, chain_ctx=chain.context, merged_branch_tip=scene.branch_tip,
+        started_monotonic=time.monotonic() - PRETEND_ELAPSED_S,
+        train_id=f'train-{TASK_ID}', member_task_ids=[TASK_ID, '6414'],
+    )
+
+    rows = event_store.fetch_events_by_type(EventType.merge_attempt)
+    assert [row['data']['outcome'] for row in rows] == [
+        OutcomeKind.post_merge_equivalence_failed, OutcomeKind.post_merge_generation_chained,
+    ]
+    chained_row = rows[1]
+    assert (chained_row['task_id'], chained_row['phase'], chained_row['data']) == (
+        TASK_ID, 'merge', {
+            'outcome': OutcomeKind.post_merge_generation_chained,
+            'train_id': f'train-{TASK_ID}',
+            'member_task_ids': [TASK_ID, '6414'],
+        },
+    )
+    assert chained_row['duration_ms'] is not None
+    assert (
+        PRETEND_ELAPSED_MS
+        <= chained_row['duration_ms']
+        <= PRETEND_ELAPSED_MS + REAL_ELAPSED_CEILING_MS
+    )
