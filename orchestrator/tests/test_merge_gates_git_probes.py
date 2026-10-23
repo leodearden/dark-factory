@@ -392,7 +392,7 @@ async def test_a_declared_directory_is_covered_by_a_file_beneath_it(
 
 
 @pytest.mark.asyncio
-async def test_a_directory_whose_name_ends_in_x_is_covered_by_its_contents(
+async def test_only_the_trailing_separator_is_trimmed_from_a_declared_directory(
     git_ops: GitOps, landed_and_reparked: str,
 ) -> None:
     """Only a trailing separator is trimmed from a declared directory, never its own last letters."""
