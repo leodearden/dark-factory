@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from review_all_program_cli import RUN_ID, ProgramEnv, load_program_module
+from review_all_program_cli import FIXTURE_RETURNS, RUN_ID, ProgramEnv, load_program_module
 from review_all_program_fixture import FIXTURE_DIR, PROGRAM_DIR, REPO_ROOT, running_fake_store
 from review_all_program_seeded_run import StoreCopy
 
@@ -68,11 +68,12 @@ class BriefRun:
         assert proc.returncode == 0, proc.stdout + proc.stderr
 
     def written(self, *args: str | Path) -> str:
-        """The brief ``gen_brief.py`` wrote for *args*, which must exit 0 and print its path."""
+        """The brief ``gen_brief.py`` wrote for *args*, which must exit 0 and print ``wrote <path>``."""
         proc = self.brief(*args)
         assert proc.returncode == 0, proc.stdout + proc.stderr
-        briefs = self.home / 'briefs'
-        (path,) = [Path(token) for token in proc.stdout.split() if Path(token).parent == briefs]
+        (path,) = [Path(line.removeprefix('wrote ')) for line in proc.stdout.splitlines()
+                   if line.startswith('wrote ')]
+        assert path.parent == self.home / 'briefs', path
         return path.read_text(encoding='utf-8')
 
 
@@ -581,3 +582,97 @@ def test_sessions_read_types_each_entry_and_names_a_bad_field(run: BriefRun) -> 
     with pytest.raises(state.StateError) as refused:
         sessions.read(home)
     assert S1_TITLE in str(refused.value) and 'pass' in str(refused.value)
+
+
+Q2_TITLE = 'team:fixture S1 Q2'
+
+
+@pytest.fixture
+def questioned(run: BriefRun) -> BriefRun:
+    """S1 authored, then amended with the critic question Q2."""
+    run.applied('S1.author.json')
+    run.applied('S1.author.amend.json', '--amend')
+    return run
+
+
+def q2() -> dict[str, Any]:
+    amended = json.loads((FIXTURE_RETURNS / 'S1.author.amend.json').read_text(encoding='utf-8'))
+    (question,) = [q for q in amended['open_questions'] if q['id'] == 'Q2']
+    return question
+
+
+def test_an_investigate_brief_carries_the_item_and_records_its_spawned_session(
+    questioned: BriefRun,
+) -> None:
+    proc = questioned.brief('S1', 'investigate', '--item', 'Q2', '--spawn', Q2_TITLE)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    brief_path = questioned.home / 'briefs' / 'S1.investigate-Q2.md'
+    text = brief_path.read_text(encoding='utf-8')
+    item = '\n'.join(section(text, _section_heading('ITEM')))
+    question = q2()
+    for value in (question['question'], *question['options'], question['recommendation']):
+        assert value in item, value
+    assert question['source'] == 'critic' and 'critic' in item
+    assert str(questioned.home / 'prds' / 'S1' / 'review-all-fixture-s1-prd.md') in item
+    entry = sessions_json(questioned)[Q2_TITLE]
+    assert {k: entry[k] for k in ('stream', 'pass', 'item', 'record_dir')} == {
+        'stream': 'S1', 'pass': 'investigate', 'item': 'Q2', 'record_dir': None,
+    }
+    command = shlex.split(proc.stdout.splitlines()[-1])
+    assert command[command.index('--prompt-file') + 1] == str(brief_path)
+    assert has_section(text, _section_heading('SPAWN'))
+
+
+def test_the_investigate_example_passes_the_briefs_own_check_line(questioned: BriefRun) -> None:
+    text = questioned.written('S1', 'investigate', '--item', 'Q2')
+    example = example_of(text)
+    inbox = questioned.home / 'inbox' / 'S1.investigate-Q2.json'
+
+    assert str(inbox) in '\n'.join(section(text, _section_heading('RETURN')))
+    inbox.write_text(json.dumps(example, indent=2, ensure_ascii=False), encoding='utf-8')
+    proc = run_check_line(questioned, check_argv(text))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert 'check ok' in proc.stdout
+    assert set(example) == pass_keys('investigate')
+
+
+def test_an_investigate_brief_without_spawn_records_no_session(questioned: BriefRun) -> None:
+    questioned.written('S1', 'investigate', '--item', 'Q2')
+
+    assert (questioned.home / 'briefs' / 'S1.investigate-Q2.md').is_file()
+    assert not (questioned.home / 'sessions.json').exists()
+
+
+def test_an_unrecorded_item_is_refused_and_nothing_is_written(questioned: BriefRun) -> None:
+    proc = questioned.brief('S1', 'investigate', '--item', 'Q9', '--spawn', 'team:fixture S1 Q9')
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert 'S1:Q9' in proc.stderr
+    assert not (questioned.home / 'briefs' / 'S1.investigate-Q9.md').exists()
+    assert not (questioned.home / 'sessions.json').exists()
+
+
+def test_an_answered_item_is_refused_until_a_reask_reopens_it(questioned: BriefRun) -> None:
+    rule(questioned, '--answers', 'S1:Q2')
+
+    closed = questioned.brief('S1', 'investigate', '--item', 'Q2')
+
+    assert closed.returncode == 1, closed.stdout + closed.stderr
+    assert 'S1:Q2' in closed.stderr
+    assert not (questioned.home / 'briefs' / 'S1.investigate-Q2.md').exists()
+
+    rule(questioned, '--answers', 'S1:Q2', '--reask')
+    reopened = questioned.brief('S1', 'investigate', '--item', 'Q2')
+
+    assert reopened.returncode == 0, reopened.stdout + reopened.stderr
+
+
+@pytest.mark.parametrize('args', [('S1', 'author', '--item', 'Q2'), ('S1', 'investigate')])
+def test_item_goes_with_the_investigate_pass_and_only_with_it(
+    questioned: BriefRun, args: tuple[str, ...],
+) -> None:
+    proc = questioned.brief(*args)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
