@@ -32,7 +32,7 @@ from _escalation_server_capture import create_server_kwargs
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
-from orchestrator.background_service import BackgroundService
+from orchestrator.background_service import BackgroundService, ManagedService
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_debt_drain import STALE_DUE_ESCALATION_SENTINEL
@@ -118,6 +118,7 @@ class TestLifecycleRegistrationOrder:
         harness._build_lifecycle_registry()
         assert harness._lifecycle is not None
         first = harness._lifecycle.services[0]
+        assert isinstance(first, ManagedService)
         assert first.name == 'loop-stall-monitor'
 
         await first.start()

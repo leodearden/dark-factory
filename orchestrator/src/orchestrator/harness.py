@@ -34,6 +34,7 @@ from shared.cli_invoke import (
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.eval_lane import eval_lane_provenance
+from shared.loop_stall import LoopStallMonitor
 from shared.mcp_envelope import resolver_failed
 from shared.project_layout import escalation_queue_dir, orchestrator_data_dir, runs_db
 from shared.repo_paths import (
@@ -2336,16 +2337,18 @@ class Harness:
         W10-η — PRD §5.3 LR-1/2/3).
 
         Registration order (also the ``stop_all()`` REVERSE order — LR-2):
-        escalation-server, merge-worker, offline-lane, orphan-l0-reaper,
-        terminal-status-watcher, watcher-supervisor, stranded-reconcile,
-        main-tip-sweep, no-landings-breaker, deterministic-recon-sweep,
-        warm-lane-gc, stale-service-restart, merge-heartbeat,
-        verify-admission-watch, flake-debt-drain.
-        escalation-server and merge-worker start first so the recovery block
-        (which runs immediately after ``start_all()`` returns) can depend on
-        both being live. The seven sweeps are conditionally registered on
-        their own ``config.X_enabled`` gate — ``BackgroundService`` itself has
-        no ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
+        loop-stall-monitor, escalation-server, merge-worker, offline-lane,
+        orphan-l0-reaper, terminal-status-watcher, watcher-supervisor,
+        stranded-reconcile, main-tip-sweep, no-landings-breaker,
+        deterministic-recon-sweep, warm-lane-gc, stale-service-restart,
+        merge-heartbeat, verify-admission-watch, flake-debt-drain.
+        loop-stall-monitor starts first so it watches every other service's
+        whole life, and stops last (task 7366). escalation-server and
+        merge-worker start next so the recovery block (which runs immediately
+        after ``start_all()`` returns) can depend on both being live. The
+        seven sweeps are conditionally registered on their own
+        ``config.X_enabled`` gate — ``BackgroundService`` itself has no
+        ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
         absent from the registry. The last four always run: they must keep
         their cadence whatever the dispatch loop is doing (task 5344; the
         verify-admission watch, task 5628; the flake-debt drain, task 6934).
@@ -2355,6 +2358,13 @@ class Harness:
         registry = LifecycleRegistry()
         sweep_backoff = BackoffPolicy(_BG_LOOP_FAILURE_BACKOFF_SECS)
 
+        monitor = LoopStallMonitor()
+        registry.register(ManagedService(
+            name='loop-stall-monitor',
+            start_fn=monitor.start,
+            stop_fn=monitor.stop,
+            stop_timeout_secs=_LIFECYCLE_SERVICE_STOP_TIMEOUT_SECS,
+        ))
         registry.register(ManagedService(
             name='escalation-server',
             start_fn=self._start_escalation_server,
