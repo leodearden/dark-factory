@@ -58,18 +58,17 @@ if str(REPO_ROOT) not in sys.path:
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
+import _async_mock_orphans  # noqa: E402
 from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
     ExitContractViolationCollector,
     ample_disk_usage,
-    drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
     stamp_stock_routing_config,
-    track_async_mock_coroutines,
 )
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
@@ -98,7 +97,7 @@ from orchestrator.merge_lane import worker  # noqa: E402
 # module-level _DEBUG_ASSERTS seed at False.
 worker._DEBUG_ASSERTS = True
 
-track_async_mock_coroutines()
+_async_mock_orphans.track_async_mock_coroutines()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -900,16 +899,15 @@ def _neutralize_verify_admission(monkeypatch, request):
 def _drain_async_mock_coroutines():
     """Close this test's un-awaited AsyncMock call coroutines before the next test starts.
 
-    Task 1714 / esc-1702-13; rationale in ``_orch_helpers.py::drain_async_mock_coroutines``.
-    ``track_async_mock_coroutines()`` runs when this conftest is imported, so
-    mocks called during collection are covered too.
+    Task 1714 / esc-1702-13; rationale in ``_async_mock_orphans.py::drain_async_mock_coroutines``.
+    ``track_async_mock_coroutines()`` runs at conftest import, so collection-time mocks are covered.
 
     KNOWN LIMITATION: an orphan created in the teardown of a fixture set up
     BEFORE this one (module- or session-scoped) is created after this drain has
     run, so it is closed at the next test's boundary rather than this one's.
     """
     yield
-    drain_async_mock_coroutines()
+    _async_mock_orphans.drain_async_mock_coroutines()
 
 
 @pytest.fixture

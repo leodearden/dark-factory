@@ -20,7 +20,7 @@ import threading
 from unittest.mock import AsyncMock, AsyncMockMixin
 
 import pytest
-from _orch_helpers import drain_async_mock_coroutines, track_async_mock_coroutines
+from _async_mock_orphans import drain_async_mock_coroutines, track_async_mock_coroutines
 
 
 def _count_open_mock_coros() -> int:
