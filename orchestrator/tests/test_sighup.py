@@ -196,3 +196,14 @@ def test_ready_wait_fails_instead_of_blocking(code: str):
         with contextlib.suppress(ProcessLookupError):
             os.killpg(pgid, signal.SIGKILL)
         proc.wait(timeout=5.0)
+
+
+def test_without_in_loop_registration_sighup_kills_the_process(tmp_path: Path):
+    """The original bug shape must die by SIGHUP under the exact signal
+    sequence the regression test uses, so a pass there means the handler is
+    installed, not that the check is blind."""
+    result = _exit_after_hup_then_term(tmp_path, register_in_loop=False)
+    assert result.returncode == -signal.SIGHUP, (
+        f'expected death by SIGHUP without in-loop registration, '
+        f'got rc={result.returncode}; stderr={result.stderr!r}'
+    )
