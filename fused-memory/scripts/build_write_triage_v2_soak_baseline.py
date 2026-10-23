@@ -17,8 +17,8 @@ Subcommands, run from ``fused-memory/``:
 - ``reask``: write a shard per rater holding the lines whose quotes or spans
   are not in the texts that rater saw. The rater's answer in the later round
   supersedes the earlier line.
-- ``third``: write a shard holding exactly the pairs whose decisive binaries
-  are tied, for a new third rater each round.
+- ``third``: write a shard holding exactly the pairs a decisive tie or an open
+  follow-up blocks, for a new third rater each round.
 - ``assemble``: map the effective ratings back through the key and write the
   committed corpus:
   ``write_triage_v2_soak_{items.jsonl,verdicts.jsonl,strata.json,derivation.json}``.
@@ -302,23 +302,32 @@ def _current_derivation(
     )
 
 
-def decisive_ties(
+_THIRD_ROUND_GAPS = frozenset({_rubric.GapKind.TIED, _rubric.GapKind.OPEN})
+"""The gaps a third rater answering the whole item can fill: a tie, or an open follow-up."""
+
+
+def third_round_pairs(
     items: Iterable[Mapping[str, Any]], verdicts: Iterable[Mapping[str, Any]],
 ) -> list[tuple[str, str]]:
-    """The (entry, target) pairs whose current-basis derivation is blocked by a tie."""
+    """The (entry, target) pairs whose current-basis derivation only a third rater can unblock.
+
+    Each is blocked by a decisive tie or an open follow-up alone. A pair also
+    blocked by an unrated decisive binary is refused.
+    """
     judgements = _rubric.resolve_judgements(verdicts)
-    tied: list[tuple[str, str]] = []
+    blocked: list[tuple[str, str]] = []
     for item in items:
         derivation = _current_derivation(item, judgements)
         if isinstance(derivation, _rubric.Incomplete):
-            kinds = {gap.kind for gap in derivation.missing}
-            if kinds != {_rubric.GapKind.TIED}:
+            unrated = [str(gap.binary) for gap in derivation.missing
+                       if gap.kind not in _THIRD_ROUND_GAPS]
+            if unrated:
                 raise ValueError(
-                    f'item {item["entry_id"]!r} has unrated decisive binaries'
-                    f' {[str(gap.binary) for gap in derivation.missing]}; rate its shard first'
+                    f'item {item["entry_id"]!r} has unrated decisive binaries {unrated};'
+                    ' a third rater fills only ties and open follow-ups'
                 )
-            tied.append((item['entry_id'], item['target_id']))
-    return sorted(tied)
+            blocked.append((item['entry_id'], item['target_id']))
+    return sorted(blocked)
 
 
 def attach_time_text(
@@ -927,16 +936,17 @@ def _reask_command(args: argparse.Namespace) -> dict[str, Any]:
 
 def _third_command(args: argparse.Namespace) -> dict[str, Any]:
     corpus = _corpus(args)
-    tied = set(decisive_ties([soaked.item for soaked in corpus.soak], corpus.assembly.verdicts))
+    blocked = set(third_round_pairs([soaked.item for soaked in corpus.soak],
+                                    corpus.assembly.verdicts))
     index = sum(spec['role'] == Role.THIRD for spec in corpus.key['shards'].values())
     name = f'third_{index:02d}'
     entries = [entry for (entry_id, target_id, basis), entry in sorted(corpus.entries.items())
-               if basis == Basis.CURRENT and (entry_id, target_id) in tied]
+               if basis == Basis.CURRENT and (entry_id, target_id) in blocked]
     if entries:
         corpus.scratch.write_shard(corpus.key, name, entries, role=Role.THIRD,
                                    rater=f'{RATER_MODELS[Role.THIRD]}-third-{index:02d}', round=0)
         corpus.scratch.save_key(corpus.key)
-    return {'tied_pairs': len(entries), 'shard': name if entries else None}
+    return {'pairs': len(entries), 'shard': name if entries else None}
 
 
 def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
