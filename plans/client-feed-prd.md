@@ -568,9 +568,9 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     (`client-feed/src/client_feed/feed_io.py::Cursor`). Both move only when the reveal unit runs and
     succeeds; an inbox read holding no request moves its offset alone
     (`client-feed/src/client_feed/publisher.py::_advanced`). After a crash between the append and
-    the cursor, an answer whose identity (its type and its JSON without `seq` and `at`) is in the
-    uncommitted tail is consumed there and not emitted again
-    (`client-feed/src/client_feed/reveals.py::answer_identity`).
+    the cursor, an answer whose identity (what it says, without its envelope) is in the uncommitted
+    tail is consumed there and not emitted again
+    (`client-feed/src/client_feed/reveals.py::answer_of`).
   - (h) The portal's `in-v1` fixture is vendored byte for byte at
     `client-feed/tests/fixtures/in-v1` from scoping-intake
     `f5cea40d8354190c9fa0cce260b2e69adc79ea3a`. Its `delivered_commit` is a fixture sha that no test

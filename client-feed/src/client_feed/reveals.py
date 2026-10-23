@@ -7,11 +7,9 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 from client_feed.budget import AddedLineCounts, CountedSet, Granted, counted_set, judge, lines_since
 from client_feed.contract import (
-    FEED_VERSION,
     EngagementProjection,
     EventHeader,
     FeedEvent,
@@ -38,30 +36,81 @@ from client_feed.sources.git import (
     tree_entries,
 )
 
-Answer = FileRevealed | RevealRefused
-AnswerIdentity = tuple[str, str]
-
-_UNPLACED_SEQ = 1
+AnswerEvent = FileRevealed | RevealRefused
 
 
-def answer_identity(event: FeedEvent) -> AnswerIdentity | None:
-    """What an answer says wherever it lands: its type and its JSON without seq and at; None for any other event."""
-    if not isinstance(event, FileRevealed | RevealRefused):
-        return None
-    return (event.type, event.model_dump_json(exclude={'seq', 'at'}))
+@dataclass(frozen=True)
+class RevealAnswer:
+    """What a file_revealed says, apart from the envelope that places it in the feed."""
+
+    path: str
+    commit: str
+    lines: int
+    content: str | None
+    deleted: bool
+    renamed_from: str | None
+
+    @classmethod
+    def of(cls, event: FileRevealed) -> RevealAnswer:
+        return cls(
+            path=event.path,
+            commit=event.commit,
+            lines=event.lines,
+            content=event.content,
+            deleted=event.deleted,
+            renamed_from=event.renamed_from,
+        )
+
+    def placed(self, envelope: Envelope) -> FileRevealed:
+        return FileRevealed(
+            **envelope,
+            path=self.path,
+            commit=self.commit,
+            lines=self.lines,
+            content=self.content,
+            deleted=self.deleted,
+            renamed_from=self.renamed_from,
+        )
 
 
-def answered_in(lines: Iterable[FeedLine]) -> Counter[AnswerIdentity]:
-    """The answers a stopped writer appended but never recorded in its cursor, counted by identity."""
-    keys = (answer_identity(line) for line in lines if not isinstance(line, EventHeader))
-    return Counter(key for key in keys if key is not None)
+@dataclass(frozen=True)
+class RefusalAnswer:
+    """What a reveal_refused says, apart from the envelope that places it in the feed."""
+
+    path: str
+    reason: RefusalReason
+
+    @classmethod
+    def of(cls, event: RevealRefused) -> RefusalAnswer:
+        return cls(path=event.path, reason=event.reason)
+
+    def placed(self, envelope: Envelope) -> RevealRefused:
+        return RevealRefused(**envelope, path=self.path, reason=self.reason)
+
+
+Answer = RevealAnswer | RefusalAnswer
+
+
+def answer_of(event: FeedEvent) -> Answer | None:
+    """What an answer event says wherever it lands, its identity; None for any other event."""
+    if isinstance(event, FileRevealed):
+        return RevealAnswer.of(event)
+    if isinstance(event, RevealRefused):
+        return RefusalAnswer.of(event)
+    return None
+
+
+def answered_in(lines: Iterable[FeedLine]) -> Counter[Answer]:
+    """The answers a stopped writer appended but never recorded in its cursor, counted by what they say."""
+    answers = (answer_of(line) for line in lines if not isinstance(line, EventHeader))
+    return Counter(answer for answer in answers if answer is not None)
 
 
 @dataclass(frozen=True)
 class RevealOutput:
     """One pass's reveal events, the budget after them, the positions they answered through, and the added-line counts to carry."""
 
-    events: tuple[Answer, ...]
+    events: tuple[AnswerEvent, ...]
     budget: RevealBudget
     inbox_offset: int
     reveals_head: str
@@ -89,42 +138,20 @@ class _Head:
         )
 
 
-@dataclass(frozen=True)
-class _Unstamped:
-    """An answer decided but not yet placed in the feed."""
-
-    model: type[Answer]
-    fields: Mapping[str, Any]
-
-    def placed(self, envelope: Envelope) -> Answer:
-        return self.model(**envelope, **self.fields)
-
-
-def _revealed(path: str, head: str, granted: Granted, *, renamed_from: str | None) -> _Unstamped:
-    return _Unstamped(
-        FileRevealed,
-        {
-            'path': path,
-            'commit': head,
-            'lines': granted.lines,
-            'content': granted.text,
-            'deleted': False,
-            'renamed_from': renamed_from,
-        },
+def _revealed(path: str, head: str, granted: Granted, *, renamed_from: str | None) -> RevealAnswer:
+    return RevealAnswer(
+        path=path,
+        commit=head,
+        lines=granted.lines,
+        content=granted.text,
+        deleted=False,
+        renamed_from=renamed_from,
     )
 
 
-def _ended(origin: str, head: str) -> _Unstamped:
-    return _Unstamped(
-        FileRevealed,
-        {
-            'path': origin,
-            'commit': head,
-            'lines': 0,
-            'content': None,
-            'deleted': True,
-            'renamed_from': None,
-        },
+def _ended(origin: str, head: str) -> RevealAnswer:
+    return RevealAnswer(
+        path=origin, commit=head, lines=0, content=None, deleted=True, renamed_from=None
     )
 
 
@@ -188,7 +215,7 @@ def _tracks(
 
 def _follow_events(
     tracks: Iterable[_Followed], at_head: _Head, revealed: set[str]
-) -> list[_Unstamped]:
+) -> list[Answer]:
     """A moved or changed file re-emitted at head while it stays revealable; otherwise its reveal ends at its origin, ends first."""
     touched = sorted((track for track in tracks if not track.untouched), key=lambda t: t.origin)
     verdicts = [
@@ -196,8 +223,8 @@ def _follow_events(
         for track in touched
     ]
     revealed.difference_update(track.origin for track in touched)
-    ended: list[_Unstamped] = []
-    moved: list[_Unstamped] = []
+    ended: list[Answer] = []
+    moved: list[Answer] = []
     for track, verdict in verdicts:
         if isinstance(verdict, Granted):
             revealed.add(track.path)
@@ -208,12 +235,12 @@ def _follow_events(
     return [*ended, *moved]
 
 
-def _answer(request: RevealRequested, at_head: _Head, revealed: set[str]) -> _Unstamped:
+def _answer(request: RevealRequested, at_head: _Head, revealed: set[str]) -> Answer:
     verdict = at_head.judge(request.path, revealed)
     if isinstance(verdict, Granted):
         revealed.add(request.path)
         return _revealed(request.path, at_head.commit, verdict, renamed_from=None)
-    return _Unstamped(RevealRefused, {'path': request.path, 'reason': verdict})
+    return RefusalAnswer(path=request.path, reason=verdict)
 
 
 def _counted(
@@ -234,21 +261,14 @@ def _counted(
 
 
 def _unanswered(
-    decided: Iterable[_Unstamped],
-    answered: Counter[AnswerIdentity],
-    *,
-    project_id: str,
-    stamp: Stamp,
-    now: datetime,
-) -> tuple[Answer, ...]:
+    decided: Iterable[Answer], answered: Counter[Answer], *, stamp: Stamp, now: datetime
+) -> tuple[AnswerEvent, ...]:
     """The decided answers stamped in order, but each one the tail already holds consumed there, spending no seq."""
-    unplaced = Envelope(seq=_UNPLACED_SEQ, at=now, project_id=project_id, feed_version=FEED_VERSION)
     unspent = Counter(answered)
-    events: list[Answer] = []
+    events: list[AnswerEvent] = []
     for answer in decided:
-        key = answer_identity(answer.placed(unplaced))
-        if key is not None and unspent[key] > 0:
-            unspent[key] -= 1
+        if unspent[answer] > 0:
+            unspent[answer] -= 1
         else:
             events.append(answer.placed(stamp(now)))
     return tuple(events)
@@ -265,7 +285,7 @@ def reveal_events(
     state: FeedState,
     requests: Sequence[RevealRequested],
     inbox_offset: int,
-    answered: Counter[AnswerIdentity],
+    answered: Counter[Answer],
     added_line_counts: AddedLineCounts | None,
     stamp: Stamp,
     now: datetime,
@@ -291,7 +311,7 @@ def reveal_events(
         decided = _follow_events(tracks, at_head, revealed)
         decided += [_answer(request, at_head, revealed) for request in requests]
     return RevealOutput(
-        events=_unanswered(decided, answered, project_id=state.project_id, stamp=stamp, now=now),
+        events=_unanswered(decided, answered, stamp=stamp, now=now),
         budget=counted.budget(revealed),
         inbox_offset=inbox_offset,
         reveals_head=head,

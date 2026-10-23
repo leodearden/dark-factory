@@ -38,7 +38,7 @@ from client_feed.fold import fold
 from client_feed.inbox import InboxRead, InboxUnusable, read_inbox
 from client_feed.policy import Policy
 from client_feed.redact import redact_paths
-from client_feed.reveals import AnswerIdentity, RevealOutput, answered_in, reveal_events
+from client_feed.reveals import Answer, RevealOutput, answered_in, reveal_events
 from client_feed.sources.archive import ArchiveReadError
 from client_feed.sources.events import (
     FactoryStatus,
@@ -312,7 +312,7 @@ def _reveal_unit(
     cursor: Cursor,
     engagement: EngagementProjection | None,
     inbox: InboxRead | None,
-    answered: Counter[AnswerIdentity],
+    answered: Counter[Answer],
     stamp: Stamp,
     now: datetime,
     degraded: list[Degradation],
