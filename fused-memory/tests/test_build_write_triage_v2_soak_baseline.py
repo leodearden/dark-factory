@@ -915,6 +915,14 @@ def _misfiled(_: dict[str, str]) -> Answer:
     return {'home': 'NO', 'conflict': 'NO'}
 
 
+def _conflict_unclear(_: dict[str, str]) -> Answer:
+    return {'home': 'YES', 'conflict': 'UNCLEAR', 'unclear_reason': 'cut where the claims meet'}
+
+
+def _home_unclear(_: dict[str, str]) -> Answer:
+    return {'home': 'UNCLEAR', 'conflict': 'NO', 'unclear_reason': 'cut at the subject'}
+
+
 HONEST: dict[str, Rule] = {'c-i-c0': _conflict_yes, 'c-i-r0': _loss_yes}
 """Each entry's answer when a test does not override it; any other entry is misfiled."""
 
@@ -957,6 +965,17 @@ def _primary_shard_of(key: dict[str, Any], keyed: tuple[str, str, str]) -> str:
 
 
 CORPUS_FILES = ('items.jsonl', 'verdicts.jsonl', 'strata.json', 'derivation.json')
+
+
+def _score(out: Path) -> int:
+    """The scorer's exit code over the corpus ``assemble`` wrote into *out*."""
+    score = load_script_module(SCRIPTS / 'score_write_triage_reader.py',
+                               mod_name='score_write_triage_reader')
+    paths = {name: out / f'write_triage_v2_soak_{name}' for name in CORPUS_FILES}
+    return score.main([
+        '--items', str(paths['items.jsonl']), '--verdicts', str(paths['verdicts.jsonl']),
+        '--strata', str(paths['strata.json']),
+    ])
 
 
 class TestTheRatingRounds:
@@ -1048,6 +1067,38 @@ class TestTheRatingRounds:
         assert bundle.shard_files() == shard_files
         assert self._assemble(bundle, out) == 0
 
+    def test_an_open_follow_up_goes_to_a_third_round_and_closes(
+        self, bundle: _Bundle, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        open_pair = _current(_drawn('restated', 3)[1])
+        overrides = {('primary', open_pair): _conflict_unclear,
+                     ('second', open_pair): _home_unclear, ('third', open_pair): _no_loss}
+        _rate(bundle, overrides)
+        before, after = tmp_path / 'before', tmp_path / 'after'
+        assert self._assemble(bundle, before) == 0
+        capsys.readouterr()
+        assert _score(before) == 1
+        assert capsys.readouterr().err.splitlines()[1:] == [
+            f'open {open_pair[0]} {open_pair[1]} loss',
+        ]
+
+        assert bundle.run('third') == 0
+        key = bundle.key()
+        assert {**key['shards']['third_00'], 'items': len(key['shards']['third_00']['items'])} == {
+            'role': 'third', 'rater': 'opus-third-00', 'round': 0, 'items': 1,
+        }
+        assert _shard_keyed(key, 'third_00') == {open_pair}
+
+        _rate(bundle, overrides)
+        shard_files = bundle.shard_files()
+        assert bundle.run('third') == 0
+        assert bundle.shard_files() == shard_files
+        assert self._assemble(bundle, after) == 0
+        assert _score(after) == 0
+        [third] = [row for row in _jsonl(after / 'write_triage_v2_soak_verdicts.jsonl')
+                   if _triple(row) == open_pair and row['rater'] == 'opus-third-00']
+        assert third['loss'] == 'NO'
+
     def test_assemble_writes_the_corpus_the_scorer_reads(self, bundle: _Bundle, out: Path) -> None:
         _rate(bundle)
         assert self._assemble(bundle, out) == 0
@@ -1093,12 +1144,7 @@ class TestTheRatingRounds:
             for name, spec in key['shards'].items()
         }
 
-        score = load_script_module(SCRIPTS / 'score_write_triage_reader.py',
-                                   mod_name='score_write_triage_reader')
-        assert score.main([
-            '--items', str(paths['items.jsonl']), '--verdicts', str(paths['verdicts.jsonl']),
-            '--strata', str(paths['strata.json']),
-        ]) == 0
+        assert _score(out) == 0
 
 
 class TestRatingVolume:
@@ -1134,21 +1180,24 @@ class TestTheCli:
         assert list(bundle.iterdir()) == []
 
 
-class TestDecisiveTies:
+class TestThirdRoundPairs:
     def _vote(self, entry: str, rater: str, role: str, **answers: str) -> dict[str, Any]:
         return {**_rated(entry, role=role, **answers), 'rater': rater, 'batch': 'b'}
 
-    def test_names_only_pairs_a_tie_blocks(self) -> None:
-        items = [_item(entry_id='tied'), _item(entry_id='calm'), _item(entry_id='harmless')]
+    def test_names_the_pairs_a_tie_or_an_open_follow_up_blocks(self) -> None:
+        items = [_item(entry_id='tied'), _item(entry_id='calm'), _item(entry_id='harmless'),
+                 _item(entry_id='open', outcome='restated')]
         verdicts = [
             self._vote('tied', 'opus', 'primary', conflict='YES'),
             self._vote('tied', 'sonnet', 'second', conflict='NO', home='YES', loss='NO'),
             self._vote('calm', 'opus', 'primary', conflict='YES'),
             self._vote('harmless', 'opus', 'primary', conflict='YES', home='YES'),
             self._vote('harmless', 'sonnet', 'second', conflict='YES', home='NO'),
+            self._vote('open', 'opus', 'primary', home='YES', conflict='UNCLEAR'),
+            self._vote('open', 'sonnet', 'second', home='UNCLEAR', conflict='NO'),
         ]
-        assert _mod().decisive_ties(items, verdicts) == [('tied', 'p1')]
+        assert _mod().third_round_pairs(items, verdicts) == [('open', 'p1'), ('tied', 'p1')]
 
     def test_an_unrated_decisive_binary_is_refused(self) -> None:
         with pytest.raises(ValueError, match="'unrated-item'"):
-            _mod().decisive_ties([_item(entry_id='unrated-item')], [])
+            _mod().third_round_pairs([_item(entry_id='unrated-item')], [])
