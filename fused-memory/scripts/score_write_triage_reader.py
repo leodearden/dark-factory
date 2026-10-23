@@ -23,8 +23,8 @@ also report a population rate, each sampled item weighted N_h / n_h.
 
 Refusal
 -------
-Every binary the derivation needs on the ``current`` basis must be rated and
-not tied. Otherwise :func:`score_reader` raises
+Every binary the derivation needs on the ``current`` basis must be rated, not
+tied and not an open follow-up. Otherwise :func:`score_reader` raises
 :class:`IncompleteJudgementError`, naming each gap, and scores nothing: an
 incomplete corpus must not read as a result. A binary the derivation never
 asks for needs no rating, and a missing ``attach_time`` judgement never
@@ -217,7 +217,7 @@ def _item_violation(row: Mapping[str, Any]) -> str | None:
 
 
 class JudgementGap(NamedTuple):
-    """A decisive binary of one (write, record) pair the verdicts leave unrated or tied."""
+    """A decisive binary of one (write, record) pair left unrated, tied or an open follow-up."""
 
     entry_id: str
     target_id: str
@@ -226,12 +226,12 @@ class JudgementGap(NamedTuple):
 
 
 class IncompleteJudgementError(ValueError):
-    """The verdicts leave decisive binaries unrated or tied, so nothing is scored."""
+    """Decisive binaries are unrated, tied or an open follow-up, so nothing is scored."""
 
     def __init__(self, gaps: tuple[JudgementGap, ...]) -> None:
         self.gaps = gaps
         header = (
-            f'verdicts are incomplete: {len(gaps)} decisive binaries unrated or tied'
+            f'verdicts are incomplete: {len(gaps)} decisive binaries unrated, tied or open'
             ' on the current basis'
         )
         lines = [f'{gap.kind} {gap.entry_id} {gap.target_id} {gap.binary}' for gap in gaps]

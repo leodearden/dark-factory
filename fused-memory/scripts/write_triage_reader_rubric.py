@@ -79,7 +79,11 @@ RATER_ROLES = frozenset({Role.PRIMARY, Role.SECOND, Role.THIRD})
 
 
 class Resolved(StrEnum):
-    """What the rows carrying one binary of one pair say, taken together."""
+    """What the rows carrying one binary of one pair say, taken together.
+
+    OPEN is a decisive follow-up no row carries, whose preconditions the rater
+    votes resolve to its needs.
+    """
 
     YES = 'YES'
     NO = 'NO'
@@ -87,6 +91,7 @@ class Resolved(StrEnum):
     SECONDARY = 'SECONDARY'
     UNCLEAR = ABSTAIN
     TIED = 'TIED'
+    OPEN = 'OPEN'
 
 
 _WORDS: Mapping[Binary, type[StrEnum]] = MappingProxyType({
@@ -111,7 +116,8 @@ DECISIVE_FOLLOW_UPS: frozenset[Binary] = frozenset({Binary.LOSS})
 """The follow-ups :func:`derive` reads that a rater answers; DIGEST is computed from loss_spans.
 
 A rater row whose own answers meet one's ``FOLLOW_UPS`` needs must give it, so a
-skipped one is refused, never resolved UNCLEAR.
+skipped one is refused, never resolved UNCLEAR. One the rater votes ask that no
+rater row reached resolves OPEN.
 """
 
 
@@ -192,6 +198,9 @@ class Judgement:
     preconditions all resolve to the answers it needs, at least one of them
     fixed by a derived row. A rater row meeting those needs must give a
     decisive follow-up, so no rater reached it, and it resolves UNCLEAR.
+    A decisive follow-up the rater votes alone ask, though no rater row met its
+    needs, resolves OPEN instead: a further blind rater answering the whole
+    item may reach it.
     """
 
     key: PairKey
@@ -200,7 +209,7 @@ class Judgement:
     unreached_follow_ups: frozenset[Binary] = frozenset()
 
     def answer(self, binary: Binary) -> Resolved | None:
-        """The resolved answer on *binary*, or None when no row carries it."""
+        """*binary*'s resolved answer; None only when no row carries it and no rule resolves it."""
         return self.resolved.get(binary)
 
 
@@ -209,9 +218,10 @@ def resolve_judgements(rows: Iterable[Mapping[str, Any]]) -> Mapping[PairKey, Ju
 
     Votes on one binary come from the rows carrying it as a voting answer.
     UNCLEAR abstains, an all-UNCLEAR binary resolves UNCLEAR and an even split
-    resolves TIED, and a follow-up a derived row's precondition left unasked
-    resolves UNCLEAR. The ``current`` and ``attach_time`` bases are separate pair
-    keys and never mix. A malformed row, a rater voting twice on one pair key,
+    resolves TIED, a follow-up a derived row's precondition left unasked
+    resolves UNCLEAR, and a decisive follow-up the rater votes ask but no rater
+    row reached resolves OPEN. The ``current`` and ``attach_time`` bases are
+    separate pair keys and never mix. A malformed row, a rater voting twice on one pair key,
     and a pair key whose rater answers and derived rows disagree about which
     binaries a derived row fixes are refused.
     """
@@ -361,13 +371,16 @@ def _judgement(key: PairKey, votes: tuple[Vote, ...]) -> Judgement:
         if any(binary in vote.answers for vote in votes)
     }
     derived = {binary for vote in votes if vote.role is Role.DERIVED for binary in vote.answers}
-    unreached = frozenset(
+    met = frozenset(
         follow_up for follow_up, needs in FOLLOW_UPS.items()
         if follow_up not in resolved
         and all(resolved.get(binary) == Resolved(needed) for binary, needed in needs.items())
-        and not derived.isdisjoint(needs)
+    )
+    unreached = frozenset(
+        follow_up for follow_up in met if not derived.isdisjoint(FOLLOW_UPS[follow_up])
     )
     resolved.update(dict.fromkeys(unreached, Resolved.UNCLEAR))
+    resolved.update(dict.fromkeys((met - unreached) & DECISIVE_FOLLOW_UPS, Resolved.OPEN))
     return Judgement(
         key=key, votes=votes, resolved=MappingProxyType(resolved), unreached_follow_ups=unreached,
     )
@@ -475,17 +488,27 @@ CELL_RULES: Mapping[Cell, str] = MappingProxyType({
 
 
 class GapKind(StrEnum):
+    """Why a binary blocks: no row carries it; its votes split evenly; or it is a decisive
+    follow-up the rater votes ask that no rater row reached."""
+
     UNRATED = 'unrated'
     TIED = 'tied'
+    OPEN = 'open'
 
 
 @dataclass(frozen=True, order=True)
 class Gap:
-    """A binary the derivation needed on one record that the verdicts leave unrated or tied."""
+    """A binary the derivation needed on one record that the verdicts leave unrated, tied or open."""
 
     target_id: str
     binary: Binary
     kind: GapKind
+
+
+_BLOCKING: Mapping[Resolved, GapKind] = MappingProxyType({
+    Resolved.TIED: GapKind.TIED, Resolved.OPEN: GapKind.OPEN,
+})
+"""Each resolution that blocks a derivation asking for it, and the gap it is."""
 
 
 @dataclass(frozen=True)
@@ -516,7 +539,7 @@ class Unclear:
 
 @dataclass(frozen=True)
 class Incomplete:
-    """The verdicts leave binaries the derivation needed unrated or tied."""
+    """The verdicts leave binaries the derivation needed unrated, tied or open."""
 
     missing: tuple[Gap, ...]
 
@@ -538,7 +561,7 @@ def derive(
     write is read against each earlier record it might have joined, and each
     one is derived on its own. Binaries are asked lazily, in a fixed order per
     outcome, so a binary is decisive exactly when the derivation asks for it: a
-    decisive unrated or tied binary makes the write Incomplete (naming every
+    decisive unrated, tied or open binary makes the write Incomplete (naming every
     gap the derivations met), a decisive UNCLEAR one makes it Unclear, and a
     binary never asked never blocks. The triage, status-quo, M1 and
     counterfactual-M1 derivations stand or fall together: a gap or an UNCLEAR
@@ -610,8 +633,8 @@ class _Reader:
         resolved = None if self.judgement is None else self.judgement.answer(binary)
         if resolved is None:
             raise _Undecided(Gap(self.target_id, binary, GapKind.UNRATED))
-        if resolved is Resolved.TIED:
-            raise _Undecided(Gap(self.target_id, binary, GapKind.TIED))
+        if resolved in _BLOCKING:
+            raise _Undecided(Gap(self.target_id, binary, _BLOCKING[resolved]))
         if resolved is Resolved.UNCLEAR:
             raise _Abstained(self.target_id, binary)
         return resolved is Resolved.YES
