@@ -298,30 +298,40 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
         'path': 'fused-memory/src/fused_memory/middleware/task_curator.py',
         'qualname': 'TaskCurator._transcript_config_dir',
         'destroyed_by': (
+            'TaskCurator.close at clean shutdown; in a later process, '
             'task_curator.py::_sweep_stale_curator_config_dirs_once -> '
-            'config_dir.py::sweep_stale_pid_dirs in a later process (owner pid '
-            'dead, dir >=300s old); cleanup_at_exit=False'
+            'config_dir.py::sweep_stale_pid_dirs with '
+            'reclaim=_reclaim_by_archiving (owner pid dead, dir >=300s old); '
+            'cleanup_at_exit=False'
         ),
-        'disposition': UNARCHIVED_GAP,
+        'disposition': ARCHIVED,
+        'archives_in': (
+            (
+                'fused-memory/src/fused_memory/middleware/task_curator.py',
+                '_archive_curator_config_dir',
+            ),
+        ),
         'rationale': (
             'Per-pid curator dir, built only on the gated path (usage_cap '
-            'enabled, i.e. production). Nothing archives it. Per-failure '
-            'evidence survives: at failure time transcript_turns/tools_used are '
-            'copied into the escalation. The population corpus does not — it '
-            'used to accumulate indefinitely under '
-            '~/.claude/projects/-tmp-fm-neutral-classifier-cwd-*, and is now '
-            'deleted at the first sweep after the owning process dies. Not '
-            'archived in task 3995 because fused-memory had no archive root '
-            'then. Task 3972 has since introduced one, '
-            'reconciliation.transcript_archive_root, resolved by '
-            'cli_stage_runner.py::recon_archive_root (see the BaseStage.run '
-            'entry). That is the root the follow-up below should reuse; '
-            'curator archival itself stays out of 3972\'s scope.'
+            'enabled, i.e. production). ARCHIVED as of task 6008, into '
+            "recon_archive_root's root (task 3972's decision, reused through "
+            'TaskCurator._transcript_archive_root) under the key '
+            'fm-curator-<pid>. Both hooks, TaskCurator.close and the dead-pid '
+            "sweep's reclaim step _reclaim_by_archiving, route through "
+            '_archive_curator_config_dir -> archive_before_delete, so deletion '
+            'is licensed by archival rather than scheduled after it. A held '
+            'transcript leaves its dead-pid dir in place, so the next '
+            "process's sweep retries it. The kill switch "
+            'reconciliation.transcript_archive_enabled restores the plain '
+            'rmtree: the sweep removes the dir unarchived and close leaves it '
+            'for the sweep.'
+            '\n\n'
+            'Not covered: a process SIGKILLed whose dir is wiped by a boot-time '
+            '/tmp clean before any later sweep runs.'
         ),
         'follow_up': (
-            'Filed from esc-3995-8 (ticket tkt_0RV5C7TGH7495ZW43KCPSE38KH): '
-            'archive the curator dir before the dead-pid sweep; reuse task '
-            "3972's fused-memory archive-root decision."
+            'CLOSED by task 6008; recorded UNARCHIVED_GAP by task 3995 '
+            '(esc-3995-8).'
         ),
     },
     {
