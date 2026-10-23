@@ -63,10 +63,9 @@ if TYPE_CHECKING:
 # one logger namespace for caplog / journalctl filtering.
 logger = logging.getLogger('orchestrator.merge_lane')
 
-# Alarm k of a dequeue episode is due once its age passes
-# STUCK_ALARM_THRESHOLD_MULTIPLES[k] x the stuck threshold; an episode raises
-# at most len(STUCK_ALARM_THRESHOLD_MULTIPLES) alarms.
-STUCK_ALARM_THRESHOLD_MULTIPLES: tuple[float, ...] = (1.0,)
+# One alarm when a dequeue first passes the stuck threshold, ONE final re-alarm past 3x
+# (13.5h at the 16200s default), then silence until the request resolves or is re-dequeued.
+STUCK_ALARM_THRESHOLD_MULTIPLES: tuple[float, ...] = (1.0, 3.0)
 
 
 @dataclass(frozen=True)
@@ -308,6 +307,40 @@ def _merge_request_stuck_sentinel(request_id: str) -> str:
     return f'{_MERGE_REQUEST_STUCK_SENTINEL_PREFIX}{request_id}'
 
 
+def _stuck_alarm_summary(stuck: StuckRequest, alarm_number: int) -> str:
+    age_int = int(stuck.age_secs)
+    if alarm_number == 1:
+        return (
+            f'MergeRequest {stuck.request_id!r} (branch {stuck.branch!r}) has been '
+            f'dequeued for {age_int}s without resolving (phase={stuck.phase!r}).'
+        )
+    multiple = STUCK_ALARM_THRESHOLD_MULTIPLES[alarm_number - 1]
+    ladder_size = len(STUCK_ALARM_THRESHOLD_MULTIPLES)
+    which = (
+        'final stuck alarm' if alarm_number == ladder_size
+        else f'stuck alarm {alarm_number} of {ladder_size}'
+    )
+    return (
+        f'MergeRequest {stuck.request_id!r} (branch {stuck.branch!r}) is still '
+        f'unresolved {age_int}s after dequeue, past {multiple:g}x the stuck threshold, '
+        f'after an earlier stuck alarm (phase={stuck.phase!r}); {which} for this dequeue.'
+    )
+
+
+def _stuck_alarm_close_note(alarm_number: int) -> str:
+    if alarm_number < len(STUCK_ALARM_THRESHOLD_MULTIPLES):
+        next_multiple = STUCK_ALARM_THRESHOLD_MULTIPLES[alarm_number]
+        return (
+            'Closing this escalation suppresses further stuck alarms for this '
+            'dequeue; the next follows only if the request is still unresolved '
+            f'past {next_multiple:g}x the stuck threshold.'
+        )
+    return (
+        'This is the final stuck alarm for this dequeue: none follow until the '
+        'request resolves or is re-dequeued.'
+    )
+
+
 def _alarm_merge_request_stuck(
     escalation_queue: Any,
     stuck: StuckRequest,
@@ -353,10 +386,6 @@ def _alarm_merge_request_stuck(
 
     age_int = int(stuck.age_secs)
     alarm_number = stuck.alarms_raised + 1
-    summary = (
-        f'MergeRequest {stuck.request_id!r} (branch {stuck.branch!r}) has been '
-        f'dequeued for {age_int}s without resolving (phase={stuck.phase!r}).'
-    )
     detail = (
         f'request_id: {stuck.request_id}\n'
         f'task_id: {stuck.task_id}\n'
@@ -370,9 +399,8 @@ def _alarm_merge_request_stuck(
         'the stuck threshold. This is the silent-hang failure mode: some code '
         'path is holding the request without ever finalizing it. The '
         'orchestrator has NOT halted or mutated any pipeline state — this is '
-        'observation-only. Closing this escalation suppresses further stuck '
-        'alarms for this dequeue, until the next alarm tier or until the '
-        'request resolves or is re-dequeued.'
+        'observation-only. '
+        f'{_stuck_alarm_close_note(alarm_number)}'
     )
 
     esc = Escalation(
@@ -382,7 +410,7 @@ def _alarm_merge_request_stuck(
         severity='blocking',
         level=1,
         category='merge_request_stuck',
-        summary=summary,
+        summary=_stuck_alarm_summary(stuck, alarm_number),
         detail=detail,
         suggested_action=(
             f'Inspect the merge worker for request {stuck.request_id!r} '
