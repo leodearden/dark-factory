@@ -347,6 +347,61 @@ class TestValidateRating:
         assert 'digest is computed from loss_spans' in problems[0]
 
 
+def _quoting(row: dict[str, Any], **evidence: Any) -> dict[str, Any]:
+    """*row* with its evidence fields set to *evidence*."""
+    return {**row, **evidence}
+
+
+def _without(row: dict[str, Any], field: str) -> dict[str, Any]:
+    return {name: value for name, value in row.items() if name != field}
+
+
+_VERBATIM_QUOTE = {'parent': 'The deploy uses canary releases.', 'child': 'The deploy uses blue-green.'}
+_DISPUTED = {'home': 'YES', 'conflict': 'YES', 'scope': 'CENTRAL', 'action_changing': 'YES'}
+
+
+class TestRatingProblems:
+    def _problems(self, row: dict[str, Any]) -> list[str]:
+        return _mod().rating_problems(row, CHILD, PARENT)
+
+    def test_a_valid_line_with_verbatim_evidence_has_none(self) -> None:
+        assert self._problems(_quoting(_rated('e1', **_DISPUTED), conflict_quote=_VERBATIM_QUOTE)) == []
+        assert self._problems(_quoting(
+            _rated('e1', home='YES', conflict='NO', loss='YES'),
+            loss_spans=['Rollback takes five minutes.'],
+        )) == []
+
+    @pytest.mark.parametrize(('row', 'fragment'), [
+        (_rated('e1', home='YES', conflict='NO'), 'lacks loss'),
+        (_without(_rated('e1', conflict='YES', scope='CENTRAL', action_changing='YES'),
+                  'conflict_quote'), 'conflict_quote'),
+        (_without(_rated('e1', home='YES', conflict='NO', loss='YES'), 'loss_spans'),
+         'loss_spans'),
+    ])
+    def test_a_line_breaking_the_row_contract_names_that_alone(
+        self, row: dict[str, Any], fragment: str,
+    ) -> None:
+        problems = self._problems(row)
+        assert len(problems) == 1
+        assert fragment in problems[0]
+
+    def test_a_contract_valid_line_with_unfound_evidence_names_it(self) -> None:
+        problems = self._problems(_quoting(
+            _rated('e1', **_DISPUTED),
+            conflict_quote={**_VERBATIM_QUOTE, 'child': 'The deploy is blue-green.'},
+        ))
+        assert len(problems) == 1
+        assert 'conflict_quote.child' in problems[0]
+
+    def test_a_contract_violation_hides_the_unfound_evidence_beside_it(self) -> None:
+        problems = self._problems(_quoting(
+            _rated('e1', home='YES', conflict='NO'), loss_spans=['not in the child'],
+        ))
+        assert len(problems) == 1
+        assert 'lacks loss' in problems[0]
+        assert 'not in the child' not in problems[0]
+
+
 class TestEffectiveRatings:
     def test_the_highest_round_of_each_rater_on_each_pair_and_basis_survives(self) -> None:
         reasked = {**_rated('e1', role='primary', home='YES'), 'batch': 'reask_01_primary'}
@@ -923,6 +978,18 @@ def _home_unclear(_: dict[str, str]) -> Answer:
     return {'home': 'UNCLEAR', 'conflict': 'NO', 'unclear_reason': 'cut at the subject'}
 
 
+def _lacks_loss(_: dict[str, str]) -> Answer:
+    return {'home': 'YES', 'conflict': 'NO'}
+
+
+def _conflict_unquoted(text: dict[str, str]) -> Answer:
+    return _without(_conflict_yes(text), 'conflict_quote')
+
+
+def _loss_unspanned(_: dict[str, str]) -> Answer:
+    return {'home': 'YES', 'conflict': 'NO', 'loss': 'YES'}
+
+
 HONEST: dict[str, Rule] = {'c-i-c0': _conflict_yes, 'c-i-r0': _loss_yes}
 """Each entry's answer when a test does not override it; any other entry is misfiled."""
 
@@ -1044,6 +1111,41 @@ class TestTheRatingRounds:
         assert verdict['batch'] == 'reask_01_primary'
         assert verdict['conflict_quote'] == {'parent': 'parent text of i-c0',
                                              'child': 'child text of i-c0'}
+        assert json.loads((out / 'write_triage_v2_soak_derivation.json').read_text())['reasked'] == 1
+
+    @pytest.mark.parametrize(('broken', 'fragment'), [
+        (_lacks_loss, 'lacks loss'), (_conflict_unquoted, 'conflict_quote'),
+        (_loss_unspanned, 'loss_spans'),
+    ])
+    def test_a_line_breaking_the_row_contract_is_reasked_and_the_new_line_supersedes_it(
+        self, bundle: _Bundle, out: Path, broken: Rule, fragment: str,
+    ) -> None:
+        keyed = _current('i-c0')
+        _rate(bundle, {('primary', keyed): broken})
+        key = bundle.key()
+        item_id = _item_holding(key, _primary_shard_of(key, keyed), keyed)
+        for refused in (lambda: bundle.run('third'), lambda: self._assemble(bundle, out)):
+            with pytest.raises(ValueError) as refusal:
+                refused()
+            assert item_id in str(refusal.value) and fragment in str(refusal.value)
+        assert not out.exists()
+
+        assert bundle.run('reask') == 0
+        key = bundle.key()
+        reasks = {name: spec for name, spec in key['shards'].items() if name.startswith('reask_')}
+        assert list(reasks) == ['reask_01_primary']
+        spec = reasks['reask_01_primary']
+        assert (spec['role'], spec['rater'], spec['round']) == ('primary', 'opus-primary', 1)
+        assert _shard_keyed(key, 'reask_01_primary') == {keyed}
+
+        _rate(bundle)
+        shard_files = bundle.shard_files()
+        assert bundle.run('reask') == 0
+        assert bundle.shard_files() == shard_files
+        assert self._assemble(bundle, out) == 0
+        [verdict] = [row for row in _jsonl(out / 'write_triage_v2_soak_verdicts.jsonl')
+                     if _triple(row) == keyed and row['rater'] == 'opus-primary']
+        assert verdict['batch'] == 'reask_01_primary'
         assert json.loads((out / 'write_triage_v2_soak_derivation.json').read_text())['reasked'] == 1
 
     def test_third_rounds_name_a_fresh_rater_until_no_decisive_tie_is_left(
