@@ -201,7 +201,12 @@ def test_sibling_covered_phantom_branch_fires_the_gate_with_a_workless_tip(
         'if this stops holding, the rc=0 arm is no longer reachable in this state'
     )
 
-    # Step 1: no merge marker, so the ladder does not stop there.
+    # Step 1: no merge marker, so the ladder does not stop there.  The search
+    # finds 4700's marker in this same history, so its None is not a git failure.
+    assert _real_marker_search(root, '4700') == base, (
+        'positive control: find_merge_marker must find the `Merge task/4700 into main` '
+        'marker in this history, or its None for this task proves nothing'
+    )
     assert _real_marker_search(root, TASK_ID) is None, (
         'expected no `Merge task/<ID> into main` marker on main for this task'
     )
