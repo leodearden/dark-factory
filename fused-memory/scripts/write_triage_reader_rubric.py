@@ -108,8 +108,11 @@ FOLLOW_UPS: Mapping[Binary, Mapping[Binary, Answer]] = MappingProxyType({
 """Each conditional follow-up, and the answers the same row must give before it is asked."""
 
 DECISIVE_FOLLOW_UPS: frozenset[Binary] = frozenset({Binary.LOSS})
-"""The asked follow-ups :func:`derive` reads: a rater row whose own answers meet one's
-``FOLLOW_UPS`` needs must give it, so a skipped one is refused, never resolved UNCLEAR."""
+"""The follow-ups :func:`derive` reads that a rater answers; DIGEST is computed from loss_spans.
+
+A rater row whose own answers meet one's ``FOLLOW_UPS`` needs must give it, so a
+skipped one is refused, never resolved UNCLEAR.
+"""
 
 
 def _is_conflict_quote(value: object) -> bool:
@@ -712,6 +715,11 @@ def _regimes(
         'm1': [partial(_m1_hidden, outcome, readers)] if in_m1_band else [],
         'm1_as_amended': (
             [partial(_m1_hidden, OUTCOME_AMENDED, readers)]
-            if in_m1_band and outcome != OUTCOME_STORED else []
+            if reads_as_amended(outcome, in_m1_band=in_m1_band) else []
         ),
     }
+
+
+def reads_as_amended(outcome: str, *, in_m1_band: bool) -> bool:
+    """Whether :func:`derive` gives a write a counterfactual M1 as amended: a band attach."""
+    return in_m1_band and outcome != OUTCOME_STORED

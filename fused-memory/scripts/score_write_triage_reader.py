@@ -522,9 +522,16 @@ def _m1(scored: Sequence[_Scored], weights: Mapping[str, float] | None) -> dict[
 def _m1_as_amended(scored: Sequence[_Scored], weights: Mapping[str, float] | None) -> dict[str, Any]:
     """M1 if every band attach were amended (report-only): would the digest show it."""
     return _proportion(
-        scored, lambda s: s.item.band == _rubric.M1_BAND and s.item.outcome != OUTCOME_STORED,
-        lambda _, d: bool(d.m1_hidden_as_amended), weights,
+        scored,
+        lambda s: _rubric.reads_as_amended(s.item.outcome, in_m1_band=s.item.band == _rubric.M1_BAND),
+        _hidden_as_amended, weights,
     )
+
+
+def _hidden_as_amended(s: _Scored, decided: _rubric.Decided) -> bool:
+    if decided.m1_hidden_as_amended is None:
+        raise ValueError(f'item {s.item.entry_id!r}: derive read no M1 as amended for a band attach')
+    return decided.m1_hidden_as_amended
 
 
 def _m2(scored: Sequence[_Scored], weights: Mapping[str, float] | None) -> dict[str, Any]:
