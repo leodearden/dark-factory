@@ -114,7 +114,10 @@ left out.
   id, because a resolved CONFLICT can open a tied LOSS. A tie on a binary the
   derivation never asks for is left as it is.
 - UNCLEAR only where a truncation falls at the deciding point, with the point
-  named. Such items are left out of every rate and counted.
+  named, or where no rater reached a follow-up because a held v1 row fixed an
+  answer it is conditioned on (`fused-memory/scripts/write_triage_reader_rubric.py::Judgement`,
+  its `unreached_follow_ups`). An item whose deciding binary is UNCLEAR is
+  left out of every rate and counted.
 
 ## 5. Reconstructing write-time state
 
@@ -221,103 +224,207 @@ edges and every cosine-derived threshold move with the embedder.
 
 ## 8. Soak baseline
 
-The 2026-10-19 soak's 553 adjudicated attaches, re-based on rubric v2. The
-report is `write_triage_v2_soak_baseline.json` (rendered as
-`write_triage_v2_soak_baseline.md`). It is the scorer's output over
-`write_triage_v2_soak_{items.jsonl,verdicts.jsonl,strata.json}`, and
-`fused-memory/tests/test_score_write_triage_reader.py::TestTheCommittedSoakBaseline`
-pins that re-scoring those inputs reproduces it. Every figure below is quoted
-from it unless marked otherwise.
+The 2026-10-19 soak's 553 adjudicated attaches and the R8 extension, rated
+under rubric v2.1. The report is `write_triage_v2_soak_baseline.json`
+(rendered as `write_triage_v2_soak_baseline.md`), the scorer's output over
+`write_triage_v2_soak_{items.jsonl,verdicts.jsonl,strata.json}`. The sample,
+the rating volume and the derivation check are in
+`write_triage_v2_soak_derivation.json`. Every figure below is quoted from one
+of those two JSON files, or computed from figures in them, unless it is marked
+otherwise. Rates and kappas are quoted to four places as the JSON gives them.
 
-**This baseline is scored through a kappa floor miss and through a failed
-derivation check (both below).** §4 forbids that for the 3131 measurement.
-Read the baseline as the record of what was measured, not as a calibrated
-comparison point.
+Every floor binary meets the kappa floor, and no v1 row that failed the
+derivation check fixes an answer (both below), so this baseline meets §4's
+conditions for scoring.
 
 ### Provenance
 
-- **Inputs**, read-only: the soak bundle's `correctness/adjudications.jsonl`,
-  `items_all.json` (current parent text, read from Qdrant on 2026-10-19),
-  `hoist.json` and `attaches_soak.json`, and `~/.mem0/history.db` for
+- **The run** (not in the JSON): a hand-carry by an operator session on
+  2026-10-23, per Leo's ruling 254=A on esc-7174-4. It reused the round-0
+  ratings that earlier implementer iterations of task 7174 had produced,
+  completed two partial shards, and re-rated nothing. Its scratch directory,
+  gitignored, is `data/write-triage-v21-rebase-2026-10-21/` (named in the
+  step-17 commit's message).
+- **Inputs**, read-only: the soak bundle's
+  `data/write-triage-soak-2026-10-19/correctness/` (gitignored, main checkout)
+  `adjudications.jsonl`, `attaches_soak.json`, `parents.json` (parent text as
+  read from Qdrant on 2026-10-19), `hoist.json` and
+  `parent_edited_after_attach.json`; the write journal
+  (`data/reconciliation/write_journal.db`); and `~/.mem0/history.db` for
   attach-time text. Built by `fused-memory/scripts/build_write_triage_v2_soak_baseline.py`
-  with seed 7157. Shards, the key and the raw rater output are in a gitignored
-  scratch directory, `data/write-triage-v2-rebase-2026-10-19/`.
-- **What the v1 labels fix**: `build_write_triage_v2_soak_baseline.py::v1_determined`.
-  312 items needed rating, and 241 were fully fixed by v1.
-  `write_triage_v2_soak_derivation.json` counts these 312 as
-  `rated_current_pairs`. Its `anchor_pairs` (35) and `attach_time_pairs` (13)
-  are the anchors and attach-time re-reads below.
-- **Rating volume**: 459 blind ratings in 11 shards. Opus primary: 7 shards,
-  347 items, of which 35 are fully fixed anchors. Opus attach-time: 1 shard, all
-  13 parent-edited items, every one recoverable from history.db. Sonnet second:
-  2 shards, an 80-item seeded overlap. Opus third: 1 shard, 19 decisive ties.
-  These raters read a brief that said "about 10" anchors per shard, while the
-  builder mixed in 5. The brief now says "a few", and no other wording has
-  changed.
-  16 binaries remain tied and are not decisive: loss 8, digest 5, scope 3.
-  One item resolved UNCLEAR and is left out of every rate.
-- **Kappa, primary against second.** In the corpus, a rated answer is kept only
-  on a binary that v1 left open. On that basis no binary meets the floor:
-  home 0.00 (n 3), loss 0.40 (n 80), conflict 0.58 (n 74), scope 0.49 (n 18),
-  digest −0.04 (n 48). Over every answer both raters gave, in the scratch
-  ratings: home 0.95 (n 80), loss 0.40 (n 80), conflict 0.62 (n 80), scope 0.59
-  (n 21), digest −0.04 (n 48). Raw agreement on digest is 42 of 48, but almost
-  every answer is NO, so kappa is near zero. LOSS, CONFLICT and DIGEST need the
-  brief refined before the 3131 measurement (§4).
-- **Derivation check** (`write_triage_v2_soak_derivation.json`): rated answers
-  compared with the v1-fixed answer on the same binary. Overall: home 261 of
-  389, conflict 50 of 66, scope 30 of 38, loss 2 of 2. Per v1 word:
-  - RELATED/UNRELATED → HOME NO: 223 of 223 hold.
-  - SAME → YES: 6 of 6 hold. SUBSUMED → YES: 2 of 3 hold.
-  - **EXTENDS → HOME YES: 30 of 157 hold.** Raters, who agree with each other
-    on HOME at kappa 0.95, read most v1 EXTENDS pairs as a different claim.
-  - CORRECTS + action-changing → CONFLICT YES: 38 of 40 hold.
-  - SAME/SUBSUMED/UNRELATED → CONFLICT NO: 10 of 10 hold.
-  - **CORRECTS, not action-changing → CONFLICT NO: 2 of 16 hold.**
+  with seed 7174, the `shards` default (not in the JSON). The report's
+  bootstrap seed, 7157, is the scorer's own `::BOOTSTRAP_SEED`.
+- **The R8 extension** (`sample`): restated 40 adjudicated + 60 drawn = 100
+  of 125; amended 40 + 60 = 100 of 1,224; contested 473 + 0, the census.
+  Unrecoverable: 0 in every stratum (`unrecoverable` is empty), and 0 of the
+  20 attach-time pairs (`attach_time_unrecoverable` is empty). The report
+  holds 673 items: amended 100, contested 473, restated 100, stored 0.
+- **Rating volume** (`rating_volume`, distinct pairs per role): current basis
+  primary 673, second 673, third 41; attach time primary 20, second 20. Every
+  rater in `shards` is Opus (`opus-primary`, `opus-second`, `opus-third-00`
+  to `-02`), so every item is double-rated by Opus on every basis it has. The
+  current-basis pairs sit in 17 primary and 17 second shards of 39 or 40, the
+  attach-time pairs in one primary and one second shard of 20.
+- **Re-asks and third rounds**: `reasked` is 0. Three third rounds, each its
+  own rater: `third_00` 41 pairs, `third_01` 2, `third_02` 2. The scorer
+  accepts the corpus, so no decisive tie is left. Ties left on binaries the
+  derivation does not need, counted with `write_triage_reader_rubric.py::resolve_judgements`
+  over the committed verdicts (not in the JSON): home 29, scope 25,
+  action_changing 22, loss 2 on the current basis, none at attach time.
+- **Every rater answer is committed** in `write_triage_v2_soak_verdicts.jsonl`,
+  beside the derived rows of the held v1 rows. A current-basis rater answer on
+  a binary a held row fixes carries `non_consumed`. The corpus therefore
+  re-scores from git alone, and
+  `fused-memory/tests/test_score_write_triage_reader.py::TestTheCommittedSoakBaseline`
+  pins that re-scoring it reproduces the report.
+
+### Rater agreement
+
+Cohen's kappa, primary against second, over consumed answers (`kappa`). The
+R5 floor is kappa >= 0.7 on at least 60 consumed pairs, for home, conflict and
+loss.
+
+| Binary | n consumed | Kappa | Floor met |
+|---|---|---|---|
+| home | 223 | 0.9462 | yes |
+| conflict | 423 | 0.8267 | yes |
+| loss | 81 | 0.9212 | yes |
+| scope | 286 | 0.844 | yes (report-only) |
+| action_changing | 286 | 0.7744 | yes (report-only) |
+| digest | 10 | none | no (report-only) |
+
+The floor holds for home, conflict and loss, and each has at least 60
+consumed pairs without over-sampling. SCOPE, which the floor does not cover,
+is at 0.844 on 286 pairs. DIGEST is computed from the loss spans, and only 10
+pairs consume it, too few for a kappa.
+
+### Derivation check
+
+Each v1 row compared with the primary and second raters' current-basis
+answers on its binary (`rows`). A candidate row is held, and fixes its
+binary, at >= 20 compared answers and >= 0.90 agreement (`check`). Compared
+counts answers, two raters to an item. Agreement is agree / compared, rounded
+to three places.
+
+| v1 row | Binary | Items | Agree / compared | Agreement | Status |
+|---|---|---|---|---|---|
+| related_unrelated_home_no | home | 176 | 352 / 352 | 1.000 | held |
+| corrects_action_changing_conflict_yes | conflict | 230 | 424 / 458 | 0.926 | held |
+| same_subsumed_unrelated_conflict_no | conflict | 20 | 36 / 40 | 0.900 | held |
+| same_subsumed_home_yes | home | 18 | 32 / 36 | 0.889 | not held |
+| no_new_detail_loss_no | loss | 15 | 25 / 28 | 0.893 | not held |
+| corrects_action_changing_scope | scope | 230 | 353 / 424 | 0.833 | not held |
+| corrects_noise_conflict_no | conflict | 0 | 0 / 0 | — | not held |
+| extends_home_yes | home | 114 | 98 / 228 | 0.430 | retired (R7) |
+| corrects_not_action_changing_conflict_no | conflict | 14 | 4 / 28 | 0.143 | retired (R7) |
+
+A row not held fixes nothing, and the raters answer its binary. The two rows
+R7 retired are measured and never applied; under v2.1 the raters still
+disagree with them as they did under v2.0. same_subsumed_unrelated_conflict_no
+holds at exactly the 0.90 bar.
 
 ### Headline figures
 
-Sample rate (Wilson 95%), then population rate (stratified bootstrap 95%).
+Sample rate with its Wilson 95% interval, then population rate with its
+stratified bootstrap 95% interval.
 
-| Figure | Soak baseline | Reference |
-|---|---|---|
-| M1 hidden in band | 18 / 39 = 0.46 [0.32, 0.61]; pop. 0.47 [0.32, 0.63] | v1 proxy 0.50; gate 0.15 |
-| M2 restated correct | 13 / 40 = 0.33 [0.20, 0.48] | |
-| M2 amended correct | 25 / 40 = 0.63 [0.47, 0.76] | |
-| M2 contested correct | 315 / 472 = 0.67 [0.62, 0.71] | |
-| M3 hidden corrections | 15 / 340 = 0.04 [0.03, 0.07]; pop. 0.36 [0.17, 0.50] | bound unset |
-| M4 wrong home | 127 / 552 = 0.23 [0.20, 0.27]; pop. 0.30 [0.20, 0.40] | 0.20 |
-| M4 direct / via sibling | 0.13 (n 426) / 0.56 (n 122) | |
-| M5 conflict-flag precision | 325 / 472 = 0.69 [0.65, 0.73]; central 166, secondary 156, unknown 3 | |
-| M6 drift | 9 of 13 parent-edited children change cells at attach time | report-only |
-| Harm per write, sample | triage 0.87, status quo 0.94, delta −0.07 [−0.22, 0.08] | provisional weights |
-| Harm per write, population | triage 0.70, status quo 0.46, delta +0.24 [0.12, 0.38] | provisional weights |
+| Figure | Sample | Population | Reference |
+|---|---|---|---|
+| M1 hidden in band | 34 / 91 = 0.3736 [0.2812, 0.4762] | 0.3744 [0.2766, 0.4752] | gate 0.15 |
+| M1 as amended | 35 / 91 = 0.3846 [0.2913, 0.4873] | 0.3833 [0.2857, 0.4835] | report-only |
+| M2 restated correct | 23 / 99 = 0.2323 [0.1601, 0.3246] | 0.2323 [0.1515, 0.3163] | |
+| M2 amended correct | 31 / 100 = 0.31 [0.2278, 0.4063] | 0.31 [0.22, 0.4] | |
+| M2 contested correct | 322 / 472 = 0.6822 [0.6389, 0.7226] | 0.6822 [0.6385, 0.7246] | |
+| M2 stored correct | n 0 | — | |
+| M3 hidden corrections | 39 / 371 = 0.1051 [0.0779, 0.1405] | 0.379 [0.2686, 0.4673] | bound unset |
+| M4 wrong home | 233 / 671 = 0.3472 [0.3122, 0.384] | 0.5416 [0.4761, 0.6043] | 0.20 |
+| M4 direct | 127 / 503 = 0.2525 [0.2165, 0.2922] | 0.4658 [0.3882, 0.5418] | 0.20 |
+| M4 via sibling | 104 / 164 = 0.6341 [0.5581, 0.704] | 0.7749 [0.6694, 0.8603] | 0.20 |
+| M4 route unknown | 2 / 4 = 0.5 [0.15, 0.85] | 0.5294 [0.0, 1.0] | 0.20 |
+| M4 same category | 156 / 445 = 0.3506 [0.3077, 0.396] | 0.5465 [0.4656, 0.6209] | 0.20 |
+| M4 cross category | 77 / 226 = 0.3407 [0.282, 0.4047] | 0.5314 [0.4125, 0.6395] | 0.20 |
+| M5 conflict-flag precision | 332 / 472 = 0.7034 [0.6607, 0.7428] | 0.7034 [0.661, 0.7442] | |
+| M6 drift | 11 of 20 parent-edited children drift | — | report-only |
+| Harm per write, sample | triage 0.9553, status quo 0.8525, delta +0.1028 [−0.0268, 0.2377] | | provisional weights |
+| Harm per write, population | triage 0.9511, status quo 0.4662, delta +0.4849 [0.396, 0.5742] | | provisional weights |
 
-M3's ending split: restated 10, amended 5, contested 325. The sample rate is
-dominated by the contested census. The population rate is dominated by the 5
-amended conflicts, each of which stands for 30.6 amended writes.
+- **M1**: one band item is UNCLEAR, and 4 items of unknown band are outside
+  M1 (`band_unknown`). The band holds 91 restated writes and 1 contested one
+  (counted from `items.jsonl`, not in the JSON).
+- **M2** per-project counts are in the JSON's `by_project`.
+- **M3 by ending**: restated 25, amended 14, contested 332, stored_unlinked 0,
+  stored_linked 0. The 39 hits are the restated and amended endings. The
+  sample rate is dominated by the contested census, 332 of 371. The
+  population rate is dominated by the 14 amended conflicts: each amended item
+  stands for 12.24 amended writes (1,224 / 100), each restated item for 1.25
+  (125 / 100).
+- **M4** counts every decided attach, contested ones included, and leaves 2
+  UNCLEAR out. Its population rate sits above the sample rate because the
+  amended stratum is weighted 12.24 per item.
+- **M5 by SCOPE**: central 158, secondary 140, unknown 34. **By
+  action_changing**: yes 273, no 32, unknown 27. Each unknown holds the 10
+  contested pairs that `unreached_follow_ups` lists for scope and
+  action_changing, where held corrects_action_changing_conflict_yes fixed
+  CONFLICT YES over the raters' NO, so no rater was asked the follow-up.
+  The rest of each unknown is ties: scope 24, action_changing 17 (counted
+  from the committed verdicts, not in the JSON).
+- **M6**: 20 children had their parent edited after attach, 20 were rated at
+  attach time, 0 are undecided there, and 11 drift (`drifted_entry_ids`).
+- **Harm** is under `PROVISIONAL_HARM_WEIGHTS`. Triage's cells: wrong_home
+  233, false_conflict 140, hidden_conflict 25, digest_conflict 14,
+  hidden_detail 13, attached_supersession 12. The status quo's: orphaned_conflict
+  371, duplicate_clutter 31. Triage costs more per write than the status quo
+  in both regimes. The sample interval spans 0 and the population interval
+  does not.
 
-**Sensitivity to the failed derivation rows** (scratch ratings, not committed,
-and not reproducible from the committed corpus). This takes the raters' HOME on
-all 114 v1 EXTENDS items in place of v1's YES:
+### The counterfactual: F3′ alone
 
-- M2 amended falls to 0.25 (10 / 40).
-- M4 rises to 0.34 sample and 0.61 population.
-- M1 falls to 0.41.
-- The population harm delta rises to +0.56 [0.42, 0.68].
-
-Also taking the raters' CONFLICT on the 16 CORRECTS, not action-changing,
-items moves M5 to 0.71 and M4 to 0.32 sample (0.61 population). Read the
-as-built M4 as a lower bound on wrong homes, and M2 amended as an upper bound
-on amended correctness.
+M1 as amended reads every band attach as if it were amended, the outcome F3′
+(task 7155) gives a band write the judge finds new. It is 0.3846 on the
+sample and 0.3833 on the population, and both intervals lie wholly above
+0.15, so F3′ alone does not clear the gate on this evidence. The split of its
+35 hits, counted from the committed corpus with the scorer's own derivation
+(not in the JSON), shows why. 24 hits rest on CONFLICT, which an amendment
+still hides in an untagged digest. The other 11 rest on HOME with LOSS, and in
+all 11 DIGEST is NO: the needed detail lies past the first 240 characters, so
+amending them hides it as well. Without the 24 CONFLICT hits the rate would be
+11 / 91 = 0.1209, under the gate. Without the 11 detail hits it would be
+24 / 91 = 0.2637, over it. So 3131 also needs a change that shows a band
+CONFLICT write to its reader as a dispute: the judge contesting it, or a render
+that tags it. A digest change alone does not pass; added to that change, it
+would widen the margin under 0.15. The counterfactual does not model a judge that contests a
+band write: one it contests is visible, and M1 as amended counts it hidden.
 
 ### Caveats
 
-- The soak holds no stored items, so stored cells and M3's stored endings are
-  unmeasured.
-- The status quo's earlier records are only each write's parent, so its
-  orphaned_conflict and duplicate_clutter counts are a lower bound on its harm.
-- Restated and amended are 40-item samples of 125 and 1,224, weighted by
-  strata. The contested stratum is the census of 473.
-- One contested item (`e7f06b8d-5bf4-4070-b085-e2db2d29d655`) resolved UNCLEAR
-  and is left out.
+- The soak holds no stored items, so the stored cells, M2 stored and M3's
+  stored endings are unmeasured (n 0).
+- The status quo's earlier records are only each write's parent (every item's
+  `earlier_ids` is empty, in `items.jsonl`). Its orphaned_conflict and
+  duplicate_clutter counts are a lower bound on its harm, and the harm delta an
+  upper bound on triage's excess.
+- The strata weights (`strata`): restated 100 sampled of 125, amended 100 of
+  1,224, contested the census of 473. Population rates of any figure that
+  counts amended writes (M3, M4, harm) rest on 100 amended items standing for
+  1,224.
+- Two items are UNCLEAR and left out of every rate (`unclear_entry_ids`):
+  `756c582f-ba18-4d51-88e3-5615cfa6c8cf` (contested) and
+  `adf43f4e-0405-4c5c-aec4-199fcd617d2e` (restated). On each, held
+  same_subsumed_unrelated_conflict_no fixed CONFLICT NO where both raters said
+  YES, so no rater reached LOSS (`unreached_follow_ups`). Leo's ruling of
+  2026-10-23, recorded on esc-7174-4 (not in the JSON), resolves such a
+  follow-up UNCLEAR (§4). A rater row whose own HOME is YES and CONFLICT NO
+  must give LOSS, or the rubric refuses it
+  (`write_triage_reader_rubric.py::DECISIVE_FOLLOW_UPS`).
+
+### v2.0 history
+
+Task 7157 first scored this soak under rubric v2.0 (553 items, seed 7157).
+Its headline figures, quoted from git and not from the current JSON: M1 0.46;
+M2 restated 0.33, amended 0.63, contested 0.67; M3 0.04 sample and 0.36
+population; M4 0.23; M5 0.69; harm delta −0.07 sample and +0.24 population.
+They are superseded because that baseline was scored through a kappa floor
+miss, with no binary at the floor on the corpus basis, and through two failed
+v1 derivation rows, EXTENDS → HOME YES and CORRECTS not action-changing →
+CONFLICT NO, which R7 then retired. git holds the full v2.0 section:
+`git show 076c1ad8f6:fused-memory/calibration/write_triage_reader_metrics.md` (task 7157).
