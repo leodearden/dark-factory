@@ -69,7 +69,15 @@ TASKS_RESCAN_PASSES: Final = 60
 UNKNOWN_MERGE_GRACE: Final = timedelta(hours=1)
 
 _NO_ESCALATIONS: Final = OpenEscalations(by_task=MappingProxyType({}))
-_SOURCE_ERRORS: Final = (StoreReadError, GitError, ArchiveReadError, EngagementUnusable, InboxUnusable)
+_FIXED_SOURCE_ERRORS: Final[Mapping[type[Exception], Source]] = MappingProxyType(
+    {
+        GitError: Source.GIT,
+        ArchiveReadError: Source.ARCHIVE,
+        EngagementUnusable: Source.ENGAGEMENT,
+        InboxUnusable: Source.INBOX,
+    }
+)
+_SOURCE_ERRORS: Final = (StoreReadError, *_FIXED_SOURCE_ERRORS)
 
 _log = logging.getLogger(__name__)
 
@@ -86,17 +94,11 @@ class PassReport(BaseModel):
     degraded: tuple[Degradation, ...]
 
 
-_SourceError = StoreReadError | GitError | ArchiveReadError | EngagementUnusable | InboxUnusable
-
-
-def _source_of(exc: _SourceError) -> Source:
+def _source_of(exc: Exception) -> Source:
+    """The source a typed source error degrades: a store names its own, every other error its table's."""
     if isinstance(exc, StoreReadError):
         return exc.source
-    if isinstance(exc, EngagementUnusable):
-        return Source.ENGAGEMENT
-    if isinstance(exc, InboxUnusable):
-        return Source.INBOX
-    return Source.GIT if isinstance(exc, GitError) else Source.ARCHIVE
+    return next(source for error, source in _FIXED_SOURCE_ERRORS.items() if isinstance(exc, error))
 
 
 def _guarded(unit: Callable[[], _T], degraded: list[Degradation]) -> _T | None:
