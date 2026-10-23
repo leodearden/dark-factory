@@ -34,6 +34,7 @@ import pytest
 DEEP_GATE = 'test_merge_queue_deep_integration_gate'
 DEEP_LANDING = 'test_merge_queue_deep_landing'
 DEEP_DISPATCH = 'test_merge_queue_deep_dispatch'
+BUILD_CHAIN = 'test_merge_queue_build_chain'
 INVARIANT_GATE = 'test_merge_queue_invariant_integration_gate'
 
 _TESTS_DIR = Path(__file__).parent
@@ -200,8 +201,8 @@ def test_the_scene_defines_every_name_in_the_shared_layer() -> None:
 
 _EACH_DEEP_CONSUMER = pytest.mark.parametrize(
     'consumer_name',
-    [DEEP_GATE, DEEP_LANDING, DEEP_DISPATCH],
-    ids=['deep_gate', 'deep_landing', 'deep_dispatch'],
+    [DEEP_GATE, DEEP_LANDING, DEEP_DISPATCH, BUILD_CHAIN],
+    ids=['deep_gate', 'deep_landing', 'deep_dispatch', 'build_chain'],
 )
 
 
