@@ -75,6 +75,7 @@ import os
 import signal
 import time
 from collections.abc import Iterable
+from enum import Enum, auto
 from pathlib import Path
 from typing import NamedTuple
 
@@ -268,9 +269,11 @@ def unsafe_pgid_reason(pgid: int, proc_pid: int | None = None) -> str | None:
     Applied as defence-in-depth: even if a caller (or a PID-reuse race) hands
     us a pgid that targets the user session or ourselves, we refuse.
 
-    Public: consumed cross-package by
-    ``orchestrator.deterministic_runner`` as the third defence layer of the
-    task-845 frozen-pgid contract (task 4333). *proc_pid* defaults to
+    Every caller is a group-killer in this module
+    (:func:`terminate_process_group`, :func:`sigkill_process_group`,
+    :func:`reap_process_groups`), where it is the third defence layer of the
+    task-845 frozen-pgid contract; ``df_pytest_isolation._unsafe_pgid_reason``
+    is a stdlib-only port of it. *proc_pid* defaults to
     ``None`` so a caller that has no companion pid to compare against (e.g.
     :func:`reap_process_groups`, reaping foreign pgids by number) can omit
     it.  Any caller that does hold a ``proc`` handle must pass ``proc.pid``:
@@ -354,7 +357,18 @@ async def terminate_process_group(
             await asyncio.wait_for(proc.wait(), grace_secs)
 
 
-def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> None:
+class SigkillDispatch(Enum):
+    """Which SIGKILL :func:`sigkill_process_group` dispatched — never what died."""
+
+    #: ``os.killpg`` returned: the whole group was signalled.
+    GROUP_KILLED = auto()
+    #: Only ``proc.kill()``, after the group kill was refused or failed.
+    DIRECT_KILLED = auto()
+    #: Nothing: the leader was already reaped.
+    NOT_SIGNALLED = auto()
+
+
+def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> SigkillDispatch:
     """SIGKILL group *pgid* at once; signal-only, never raises, never reaps.
 
     *pgid* must be the value frozen at a ``start_new_session=True`` spawn of
@@ -365,12 +379,20 @@ def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> None:
     stage: that helper stops escalating once the LEADER exits, so a grandchild
     that ignores SIGTERM would survive.
 
-    An already-reaped *proc* gets no signal (its pid may be recycled).  A
-    refused or failed group kill degrades to a direct ``proc.kill()``, which is
-    safe while the pid is unreaped.
+    An already-reaped *proc* gets no signal (its pid may be recycled), so any
+    grandchildren still running are deliberately forgone: refusing to kill a
+    stranger beats reaping an orphan.  A refused or failed group kill degrades
+    to a direct ``proc.kill()``, which is safe while the pid is unreaped.
+
+    Returns the :class:`SigkillDispatch` naming which of those it dispatched.
     """
     if proc.returncode is not None:
-        return
+        logger.debug(
+            'sigkill_process_group: proc %s already reaped — not signalling '
+            '(its pid may be recycled)',
+            proc.pid,
+        )
+        return SigkillDispatch.NOT_SIGNALLED
 
     reason = unsafe_pgid_reason(pgid, proc.pid)
     if reason is not None:
@@ -382,13 +404,22 @@ def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> None:
         )
         with contextlib.suppress(ProcessLookupError, OSError):
             proc.kill()
-        return
+        return SigkillDispatch.DIRECT_KILLED
 
     try:
         os.killpg(pgid, signal.SIGKILL)
-    except OSError:
+    except OSError as exc:
+        logger.debug(
+            'sigkill_process_group: killpg(%s) failed (%s: %s) — falling back '
+            'to direct kill()',
+            pgid,
+            type(exc).__name__,
+            exc,
+        )
         with contextlib.suppress(ProcessLookupError, OSError):
             proc.kill()
+        return SigkillDispatch.DIRECT_KILLED
+    return SigkillDispatch.GROUP_KILLED
 
 
 # ---------------------------------------------------------------------------
