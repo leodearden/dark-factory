@@ -6,7 +6,10 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -697,6 +700,32 @@ def _budget_cap_stdout() -> bytes:
     }).encode()
 
 
+def _strip_claude_from_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leave no `claude` on PATH, so a real spawn can never reach the real CLI."""
+    empty_bin = tmp_path / 'empty-bin'
+    empty_bin.mkdir()
+    monkeypatch.setenv('PATH', f'{empty_bin}{os.pathsep}/usr/bin')
+    assert shutil.which('claude') is None, 'the premise: no claude on PATH'
+
+
+def _recording_fake_claude(tmp_path: Path) -> tuple[Path, Path]:
+    """An executable that records its argv and prints a served result.
+
+    Returns ``(fake, argv_record)``; each run appends one JSON argv line.
+    """
+    fake = tmp_path / 'fake-claude'
+    record = tmp_path / 'fake-claude-argv.jsonl'
+    fake.write_text(
+        f'#!{sys.executable}\n'
+        'import json, sys\n'
+        f'with open({str(record)!r}, "a") as fh:\n'
+        '    fh.write(json.dumps(sys.argv) + "\\n")\n'
+        f'sys.stdout.write({_served_stdout().decode()!r})\n'
+    )
+    fake.chmod(0o755)
+    return fake, record
+
+
 @pytest.mark.asyncio
 class TestRunProbe:
     """Tests for _run_probe — mock asyncio.create_subprocess_exec."""
@@ -923,7 +952,7 @@ class TestRunProbe:
             await gate._run_probe(acct)
 
         cmd = captured_args[0]
-        assert 'claude' in cmd
+        assert cmd[0] == 'claude'
         assert '--print' in cmd
         assert '--output-format' in cmd
         assert 'json' in cmd
@@ -936,6 +965,32 @@ class TestRunProbe:
         assert '--permission-mode' in cmd
         assert 'bypassPermissions' in cmd
         assert 'Say ok' in cmd
+
+    async def test_the_probe_spawns_the_claude_binary_override(self, tmp_path, monkeypatch):
+        """CLAUDE_BINARY names the probe's binary, through a real spawn."""
+        _strip_claude_from_path(tmp_path, monkeypatch)
+        fake, record = _recording_fake_claude(tmp_path)
+        monkeypatch.setenv('CLAUDE_BINARY', str(fake))
+        gate, acct = await self._make_probing_gate()
+
+        assert await gate._run_probe(acct) is True
+
+        argv = json.loads(record.read_text().splitlines()[0])
+        assert argv[0] == str(fake)
+
+    async def test_an_unspawnable_override_is_named_by_the_spawn_fault(
+        self, tmp_path, monkeypatch,
+    ):
+        """The spawn fault names the override the operator set, not a bare 'claude'."""
+        _strip_claude_from_path(tmp_path, monkeypatch)
+        missing = tmp_path / 'no-such-claude'
+        monkeypatch.setenv('CLAUDE_BINARY', str(missing))
+        gate, acct = await self._make_probing_gate()
+
+        with pytest.raises(ProbeSpawnError) as excinfo:
+            await gate._run_probe(acct)
+
+        assert excinfo.value.binary == str(missing)
 
     async def test_empty_stdout_and_stderr_returns_false(self):
         """Empty stdout and stderr -> False even on exit 0: nothing proves the
