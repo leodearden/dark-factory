@@ -248,6 +248,10 @@ def state_of(project: Project) -> FeedState:
     return parse_state((project.out_dir / STATE_FILENAME).read_text())
 
 
+def cursor_of(project: Project) -> Cursor:
+    return Cursor.model_validate_json((project.out_dir / CURSOR_FILENAME).read_text())
+
+
 def request(project: Project, *paths: str, minutes: float = 30) -> None:
     request_reveals(project.in_dir, *paths, at=at(minutes))
 
@@ -362,7 +366,7 @@ def test_the_inbox_offset_moves_past_answered_requests_so_none_is_answered_twice
     hostile.run(minutes=61)
 
     assert len(answers(hostile)) == 2
-    cursor = Cursor.model_validate_json((hostile.out_dir / CURSOR_FILENAME).read_text())
+    cursor = cursor_of(hostile)
     assert cursor.inbox_offset == (hostile.in_dir / INBOX_FILENAME).stat().st_size
 
 
@@ -377,8 +381,41 @@ def test_a_symlinked_inbox_is_degraded_as_inbox_and_its_offset_held(
 
     assert [degradation.source for degradation in report.degraded] == [Source.INBOX]
     assert answers(hostile) == []
-    cursor = Cursor.model_validate_json((hostile.out_dir / CURSOR_FILENAME).read_text())
+    cursor = cursor_of(hostile)
     assert cursor.inbox_offset == 0
+    _publishes_every_other_source_but(hostile, Source.INBOX)
+
+
+def test_an_inbox_shorter_than_the_cursors_offset_is_degraded_as_inbox_and_its_offset_held(
+    hostile: Project,
+) -> None:
+    request(hostile, 'src/a.py', 'src/d.py')
+    hostile.run(minutes=60)
+    held = cursor_of(hostile).inbox_offset
+    (hostile.in_dir / INBOX_FILENAME).write_text('')
+    request(hostile, 'src/b.py', minutes=61)
+
+    report = hostile.run(minutes=62)
+
+    (degradation,) = report.degraded
+    assert degradation.source is Source.INBOX
+    assert '(inbox_rewound)' in degradation.reason
+    assert cursor_of(hostile).inbox_offset == held
+    assert [line.path for line in answers(hostile)] == ['src/a.py', 'src/d.py']
+    _publishes_every_other_source_but(hostile, Source.INBOX)
+
+
+def test_an_inbox_that_cannot_be_read_is_degraded_as_inbox_and_its_offset_held(
+    hostile: Project,
+) -> None:
+    (hostile.in_dir / INBOX_FILENAME).mkdir()
+
+    report = hostile.run()
+
+    (degradation,) = report.degraded
+    assert degradation.source is Source.INBOX
+    assert '(unreadable)' in degradation.reason
+    assert cursor_of(hostile).inbox_offset == 0
     _publishes_every_other_source_but(hostile, Source.INBOX)
 
 
@@ -448,10 +485,6 @@ def test_b17_a_changed_file_is_charged_its_lines_since_delivery_not_its_lines_at
     (revealed,) = answers(project)
     assert isinstance(revealed, FileRevealed) and revealed.lines == 260
     assert newest_tree(project).budget.spent_lines == 60
-
-
-def cursor_of(project: Project) -> Cursor:
-    return Cursor.model_validate_json((project.out_dir / CURSOR_FILENAME).read_text())
 
 
 def test_b17_the_cursor_carries_each_changed_blob_pairs_added_lines(tmp_path: Path) -> None:
@@ -674,6 +707,6 @@ def test_a_crash_between_append_and_cursor_neither_re_answers_nor_drops_a_reques
     ]
     seqs = [line.seq for line in hostile.feed()]
     assert seqs == sorted(set(seqs))
-    cursor = Cursor.model_validate_json((hostile.out_dir / CURSOR_FILENAME).read_text())
+    cursor = cursor_of(hostile)
     assert cursor.inbox_offset == (hostile.in_dir / INBOX_FILENAME).stat().st_size
     assert validate_out_dir(hostile.out_dir, expected_project_id=PROJECT).ok
