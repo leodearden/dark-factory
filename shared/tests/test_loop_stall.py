@@ -5,8 +5,10 @@ import asyncio
 import logging
 import threading
 import time
+from typing import Any
 
 import pytest
+
 from shared.loop_stall import LoopStallMonitor
 
 _LOGGER_NAME = 'shared.loop_stall'
@@ -15,6 +17,10 @@ _WATCHDOG_NAME = 'loop-stall-watchdog'
 
 def _hold_the_loop_thread(secs: float) -> None:
     time.sleep(secs)
+
+
+def _extra(record: logging.LogRecord, key: str) -> Any:
+    return vars(record)[key]
 
 
 def _stall_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
@@ -57,7 +63,7 @@ async def test_a_blocked_loop_is_reported_with_the_blocking_frame(
     record = stacks[0]
     assert record.levelno == logging.WARNING
     assert record.thread != threading.get_ident()
-    assert '_hold_the_loop_thread' in record.loop_stack
+    assert '_hold_the_loop_thread' in _extra(record, 'loop_stack')
 
 
 async def test_resume_reports_the_whole_stall(caplog: pytest.LogCaptureFixture) -> None:
@@ -73,7 +79,7 @@ async def test_resume_reports_the_whole_stall(caplog: pytest.LogCaptureFixture) 
         if r.thread == threading.get_ident() and hasattr(r, 'stall_secs')
     ]
     assert on_loop, [r.getMessage() for r in _stall_records(caplog)]
-    assert max(r.stall_secs for r in on_loop) >= 0.5
+    assert max(_extra(r, 'stall_secs') for r in on_loop) >= 0.5
 
 
 async def test_a_long_stall_is_restacked(caplog: pytest.LogCaptureFixture) -> None:
