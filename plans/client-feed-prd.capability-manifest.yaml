@@ -3,6 +3,7 @@
 # task_id values are stamped by commit_planning; grep checks are pattern-anchored, never file:line.
 prd: plans/client-feed-prd.md
 schema_version: 1
+signal_leaves: ["ζ", "σ3"]
 tasks:
   - label: "α"
     task_id: 6966
@@ -233,3 +234,138 @@ tasks:
           pattern: "### Client feed"
           paths: ["OPERATIONS.md"]
           expect: present
+  - label: "σ1a"
+    task_id: null
+    title: "client-feed σ1a: inbox union with defect_reported, CriterionId, the ref rule and the filer policy"
+    capabilities:
+      - name: "defect-reported-inbox-model"
+        binding: "capability→producer σ1a — absent on main 6885b119db: contract.py has RevealRequested only (parse_inbox_line returns it)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "defect_reported"
+          paths: ["client-feed/src/client_feed/contract.py"]
+          expect: present
+      - name: "ref-rule-outside-the-vendorable-modules"
+        binding: "substrate shared/src/shared/defects.py::mint_portal_ref exists (token/count grammar verified 2026-10-23); σ1a wraps it in non-vendorable client_feed/defect_ref.py; test_import_boundary.py keeps contract vendorable"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "mint_portal_ref"
+          paths: ["client-feed/src/client_feed/defect_ref.py"]
+          expect: present
+      - name: "filer-policy-block"
+        binding: "capability→producer σ1a — policy.py has no filer block or filer_grace_seconds on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "filer_grace_seconds"
+          paths: ["client-feed/src/client_feed/policy.py"]
+          expect: present
+  - label: "σ1b"
+    task_id: null
+    title: "client-feed σ1b: the acknowledgement — defect_filed, defects_filed, Source.filer, the ref reader and the unfiled check (feed 1.1)"
+    capabilities:
+      - name: "defect-filed-feed-event"
+        binding: "capability→producer σ1b — absent on main: no defect_filed anywhere under client_feed"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "defect_filed"
+          paths: ["client-feed/src/client_feed/fold.py"]
+          expect: present
+      - name: "feed-version-1-1"
+        binding: "capability→producer σ1b — main has FEED_VERSION = '1.0'"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FEED_VERSION = ['\"]1\\.1['\"]"
+          paths: ["client-feed/src/client_feed/contract.py"]
+          expect: present
+      - name: "unfiled-scan-cursor"
+        binding: "capability→producer σ1b — feed_io.py::Cursor has inbox_offset only (extra='forbid') on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "pending_reports"
+          paths: ["client-feed/src/client_feed/feed_io.py"]
+          expect: present
+      - name: "unfiled-report-is-degraded-filer"
+        binding: "capability→producer σ1b; judged by B33 (a line read before its grace, no carrier, reveals disabled, then a deferred carrier)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a behavioural property of the publisher pass; B33 in σ1b's tests is the check"
+  - label: "σ2"
+    task_id: null
+    title: "client-feed σ2: the client defect filer — file-defects (--once, --check), closed MCP client, convergent gated filing, unit and docs"
+    capabilities:
+      - name: "file-defects-subcommand"
+        binding: "capability→producer σ2 — absent on main: cli.py has publish, snapshot, dump-state, dump-sources, validate-feed, criteria-results only"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "file-defects"
+          paths: ["client-feed/src/client_feed/cli.py"]
+          expect: present
+      - name: "filer-module"
+        binding: "capability→producer σ2 — client-feed/src/client_feed/filer.py does not exist on main"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["client-feed/src/client_feed/filer.py"]
+          expect: present
+      - name: "planning-mode-filing-substrate"
+        binding: "substrate: submit_task planning_mode=True writes deferred, curator-bypassing (fused-memory task_interceptor.py::_submit_task_planning_mode); the creation floor accepts fresh client declarations (backends/defect_records.py::require_creation_floor); lookup_defect_ref and find_tasks_by_metadata see every status; commit_planning releases; SyncMcpSession exists (shared/src/shared/mcp_session.py) — verified by the critic seat 2026-10-23"
+        verdict: PASS
+      - name: "closed-tool-set-and-confinement"
+        binding: "capability→producer σ2; judged by B30 (recording fake MCP + audit hook + import boundary, proxy env set)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the closed set is a behavioural property the B30 test exercises; a grep of source would be a prose guard (guards-exercise-behaviour)"
+      - name: "filer-unit-template"
+        binding: "capability→producer σ2 — no filer unit template on main"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/client-feed-filer.service.template"]
+          expect: present
+  - label: "σ3"
+    task_id: null
+    title: "client-feed σ3: integration gate — the real fused-memory tool layer and the portal's in-v2 fixture, end to end"
+    capabilities:
+      - name: "portal-in-v2-fixture-vendored"
+        binding: "producer:scoping_intake ξ1 upstream (cross-project dep) writes tests/fixtures/in-v2/; σ3 vendors it byte for byte"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "defect_reported"
+          paths: ["client-feed/tests/fixtures/in-v2/"]
+          expect: present
+      - name: "real-tool-layer-harness"
+        binding: "substrate: fused-memory/tests/test_defect_write_tools.py builds SqliteTaskBackend + TaskInterceptor + create_mcp_server; fused_memory.server.main._install_tool_dispatch_guards installs the markup guard (verified 2026-10-23); σ3 serves it with uvicorn on a free loopback port"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "B36 passing is the check; σ3 decides the test's home (where client_feed and fused_memory.server both import)"
+  - label: "σ4"
+    task_id: null
+    title: "Human gate: enable the client defect filer for the first live client"
+    capabilities:
+      - name: "go-live-preconditions"
+        binding: "own deliverable — a deterministic always_escalates gate over σ3 and scoping_intake ξ2, π; no code"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "Leo confirms the portal's dedicated account, π's check and the probe of every escalation port, the client project's orchestrator and L2 watch, declared criteria, and file-defects --check, then enables the unit; no code deliverable"
+  - label: "σ5"
+    task_id: null
+    title: "Human gate: flip filer.auto_dispatch after the restatement soak"
+    capabilities:
+      - name: "auto-dispatch-flip"
+        binding: "own deliverable — a deterministic always_escalates gate (milestone delayed 30 days after σ4); no code"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "Leo flips filer.auto_dispatch after find_tasks_by_metadata(x_client_defect_review) counts at least 10 gated live reports with no corrected unquarantined restatement; else re-arms the milestone; no code deliverable"
