@@ -20,7 +20,11 @@ import threading
 from unittest.mock import AsyncMock, AsyncMockMixin, MagicMock
 
 import pytest
-from _async_mock_orphans import drain_async_mock_coroutines, track_async_mock_coroutines
+from _async_mock_orphans import (
+    drain_async_mock_coroutines,
+    fail_on_orphaned_async_mock_calls,
+    track_async_mock_coroutines,
+)
 
 
 def _count_open_mock_coros() -> int:
@@ -118,6 +122,22 @@ def test_an_orphan_created_outside_any_test_phase_is_attributed_to_none(monkeypa
     assert orphan.created_during is None
     assert orphan.mock_name == 'collection_time_mock'
     assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+def test_enforcement_fails_naming_the_mock_and_still_closes_the_orphan():
+    coro = AsyncMock(name='planted_notifier')('task-1')
+
+    with pytest.raises(pytest.fail.Exception, match='planted_notifier'):
+        fail_on_orphaned_async_mock_calls()
+
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+@pytest.mark.asyncio
+async def test_enforcement_is_silent_when_every_call_was_awaited():
+    assert await AsyncMock(return_value=7)() == 7
+
+    fail_on_orphaned_async_mock_calls()
 
 
 @pytest.mark.asyncio
