@@ -7,9 +7,10 @@ a ``--max-count=1`` stops at it. This guard extracts every marker search in
 ``skills/**/*.md`` (any fenced block or inline code span in which a
 ``git log`` or ``git rev-list`` greps for ``$S``, a ``Merge task/…`` /
 ``Merge branch 'task/…'`` subject or the bare ``task/…`` branch name, whatever
-its other flags), RUNS it against a
-fixture history where a body match shadows the genuine marker, and requires it
-to print the genuine marker and nothing else.
+its other flags), RUNS it against a fixture history where a body match and a
+newer sibling marker whose branch extends the fixture's (``task/70010`` beside
+``task/7001``) shadow the genuine marker, and requires it to print the genuine
+marker and nothing else.
 
 It executes rather than greps for a flag because INV-10
 ``guards-exercise-behaviour`` (``docs/legibility/design-invariants.md``) asks a
@@ -216,6 +217,7 @@ def test_marker_search_extractor_reads_every_snippet_shape() -> None:
 
 FIXTURE_TASK_ID = '7001'
 _FIXTURE_BRANCH = f'task/{FIXTURE_TASK_ID}'
+_SIBLING_BRANCH = f'{_FIXTURE_BRANCH}0'
 _MARKER_SUBJECT = format_merge_subject(_FIXTURE_BRANCH, 'main')
 _HAND_MERGE_SUBJECT = f"Merge branch '{_FIXTURE_BRANCH}'"
 _FIXTURE_IDENTITY = (
@@ -279,9 +281,9 @@ def _commit_file(root: Path, name: str, *messages: str) -> str:
     return _fixture_git(root, 'rev-parse', 'HEAD')
 
 
-def _merge_into_main(root: Path, message: str) -> str:
+def _merge_into_main(root: Path, branch: str, message: str) -> str:
     _fixture_git(root, 'checkout', '-q', 'main')
-    _fixture_git(root, 'merge', '--no-ff', '-m', message, _FIXTURE_BRANCH)
+    _fixture_git(root, 'merge', '--no-ff', '-m', message, branch)
     return _fixture_git(root, 'rev-parse', 'HEAD')
 
 
@@ -320,11 +322,14 @@ def _build_shadowed_history(root: Path, marker_message: str) -> ShadowedHistory:
     _commit_file(root, 'work-1', 'task work, part one')
     _fixture_git(root, 'checkout', '-q', 'main')
     _commit_file(root, 'main-1', 'main moves on')
-    orchestrator_marker = _merge_into_main(root, marker_message)
+    orchestrator_marker = _merge_into_main(root, _FIXTURE_BRANCH, marker_message)
     _assert_marker_subject_premise(root, orchestrator_marker, marker_message)
     _fixture_git(root, 'checkout', '-q', _FIXTURE_BRANCH)
     _commit_file(root, 'work-2', 'task work, part two')
-    hand_merge = _merge_into_main(root, _HAND_MERGE_SUBJECT)
+    hand_merge = _merge_into_main(root, _FIXTURE_BRANCH, _HAND_MERGE_SUBJECT)
+    _fixture_git(root, 'checkout', '-q', '-b', _SIBLING_BRANCH)
+    _commit_file(root, 'sibling-work', 'sibling task work')
+    _merge_into_main(root, _SIBLING_BRANCH, format_merge_subject(_SIBLING_BRANCH, 'main'))
     shadow = _commit_file(
         root, 'docs',
         'docs: explain the marker search',
@@ -398,8 +403,8 @@ def _with_max_count(search: MarkerSearch) -> MarkerSearch:
 def test_skills_present_marker_searches() -> None:
     assert _LIVE_MARKER_SEARCHES, (
         'no merge-marker search (a code snippet whose git log or git rev-list greps for '
-        '$S or a merge subject) was found in skills/**/*.md, so the parametrised guards below collected '
-        'nothing and would pass without running a single snippet'
+        '$S, a merge subject or the bare task/… branch name) was found in skills/**/*.md, so the '
+        'parametrised guards below collected nothing and would pass without running a single snippet'
     )
     assert _NORMATIVE_MARKER_SEARCH_SOURCE in {search.source for search in _LIVE_MARKER_SEARCHES}, (
         f'{_NORMATIVE_MARKER_SEARCH_SOURCE} presents no merge-marker search the selector '
@@ -425,4 +430,21 @@ def test_max_count_reintroduction_is_caught(
         'marker: the fixture history does not shadow this snippet\'s subject, so the '
         'guard could not go red for it. Extend shadowed_history to cover it.\n'
         f'mutant:\n{mutant.shell}'
+    )
+
+
+_SUBSTRING_SELECTING_SEARCH = MarkerSearch(
+    'tests/scripts/test_merge_marker_search_snippets.py', 0,
+    r"""git log main --fixed-strings --grep="task/<TASK_ID>" --format='%H%x09%s' """
+    r"""| awk -F'\t' 'index($2, "task/<TASK_ID>") && !seen {print $1; seen=1}'""",
+)
+
+
+def test_substring_selection_is_caught(shadowed_history: ShadowedHistory) -> None:
+    assert _selection_defect(shadowed_history, _SUBSTRING_SELECTING_SEARCH) is not None, (
+        'a search that selects by branch SUBSTRING rather than subject equality still '
+        'selected only genuine markers: the fixture history has no newer sibling marker '
+        f'whose branch extends {_FIXTURE_BRANCH}, so the guard cannot catch a task/1 vs '
+        'task/10 collision.\n'
+        f'search:\n{_SUBSTRING_SELECTING_SEARCH.shell}'
     )
