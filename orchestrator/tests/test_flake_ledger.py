@@ -441,7 +441,7 @@ class TestFailureEvidence:
 
         e = FailureEvidence(kind=EvidenceKind.failed, first_line='AssertionError: x')
         with pytest.raises(dataclasses.FrozenInstanceError):
-            e.first_line = 'other'  # type: ignore[misc]
+            cast(Any, e).first_line = 'other'
 
     def test_record_dir_defaults_to_none(self) -> None:
         from orchestrator.flake_ledger import EvidenceKind, FailureEvidence
@@ -1737,7 +1737,7 @@ class TestDebtContext:
         import dataclasses
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            _lane_context().command = 'other'  # type: ignore[misc]
+            cast(Any, _lane_context()).command = 'other'
 
     def test_debt_trigger_has_exactly_two_members(self) -> None:
         from orchestrator.flake_ledger import DebtTrigger
