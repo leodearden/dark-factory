@@ -30,8 +30,12 @@ import state
 class Section(enum.StrEnum):
     """The brief's ``## `` headings."""
 
+    DECOMPOSE = 'Decompose'
     STREAM = 'Stream'
     RULINGS = 'Rulings binding the stream'
+    UPSTREAM = 'Upstream program tasks'
+    GATE = 'Gate'
+    RELEASE_DUTIES = 'Release duties'
     FINDINGS = 'Findings'
     FILINGS = 'Phase 5 filings'
     XREFS = 'Cross-references to the stream'
@@ -193,6 +197,14 @@ class _Seat:
 _Sections = list[tuple[Section, list[str]]]
 
 
+@dataclass(frozen=True)
+class _Built:
+    """A brief's sections, and when the store was read for them; None when it was not read."""
+
+    sections: _Sections
+    store_read: str | None = None
+
+
 def _prd_path(seat: _Seat) -> str:
     """The stream's recorded PRD path; a placeholder under plans_dir until its author return is applied."""
     return seat.view.prd_path or f'{seat.run.program.plans_dir}/<your PRD file name>'
@@ -320,17 +332,118 @@ def _sitting_section(seat: _Seat) -> tuple[Section, list[str]]:
     ]
 
 
-def _author_sections(seat: _Seat) -> _Sections:
+def _author_brief(seat: _Seat) -> _Built:
     record = _run_record(seat.run.program)
     stream, rulings, filings, xrefs = _seat_sections(seat, record)
-    return [
+    return _Built([
         stream, rulings, _findings_section(seat, record), filings, xrefs,
         _sitting_section(seat), _return_section(seat),
+    ])
+
+
+def _refuse_out_of_order(seat: _Seat) -> None:
+    """A decompose waits for the stream's own author return and for every upstream stream's decompose."""
+    reason = state.unauthored_reason(seat.view)
+    if reason is not None:
+        raise state.StateError(reason)
+    for upstream in seat.view.deps:
+        status = seat.run.views[upstream].status
+        if status not in program_doc.SETTLED_STATUSES:
+            raise state.StateError(
+                f'upstream stream {upstream} is {status or program_doc.NO_STATUS}, not decomposed: '
+                f'{seat.stream} decomposes once {upstream}\'s filed ids are in the store'
+            )
+
+
+def _decompose_section(seat: _Seat) -> tuple[Section, list[str]]:
+    program = seat.run.program
+    return Section.DECOMPOSE, [
+        f'- Decompose the PRD at `{Path(program.project_root) / _prd_path(seat)}` into tasks.',
+        '- Immediately before filing, re-run docs/quality-findings-contract.md §8 step 1 for every '
+        'key, whatever the filings rows below say.',
+        f'- Stamp every task you file with `x_finding_key` and `x_finding_run` = `{program.run_id}`.',
+        '- File under `planning_mode`, run `commit_planning` on your own batch, and never commit.',
+        f'- The procedure and its gotchas are {LAUNCHING} step 3.',
     ]
 
 
-_BUILDERS: Mapping[state.Pass, Callable[[_Seat], _Sections]] = types.MappingProxyType({
-    state.Pass.AUTHOR: _author_sections,
+def _task_line(row: state.TaskRow) -> str:
+    programme_state = program_facts.program_state(row)
+    parts = [str(row.task_id), program_facts.task_label(row) or program_doc.ABSENT, row.priority,
+             str(programme_state)]
+    if programme_state is program_facts.ProgramState.HELD:
+        wait = state.SEAM_WAIT_KEYS
+        parts.append(f'waits on {wait.value(row, "stream")} {wait.value(row, "contract")}')
+    return '- ' + ' · '.join(parts)
+
+
+def _upstream_section(seat: _Seat, store: program_facts.StoreFacts) -> tuple[Section, list[str]]:
+    if not seat.view.deps:
+        return Section.UPSTREAM, [f'{seat.stream} has no upstream stream.']
+    lines = ['The store\'s program tasks of each upstream stream: id · label · priority · programme state.']
+    for upstream in seat.view.deps:
+        rows = store.by_stream[upstream]
+        prd = seat.run.views[upstream].prd_path or program_doc.ABSENT
+        lines += ['', f'### {upstream} · PRD {prd}', '']
+        lines += [_task_line(row) for row in rows] or [f'{upstream} has no program task in the store.']
+    return Section.UPSTREAM, lines
+
+
+def _gate_section(seat: _Seat, store: program_facts.StoreFacts) -> tuple[Section, list[str]]:
+    run_id = seat.run.program.run_id
+    if store.gate is None:
+        return Section.GATE, [
+            f'no {state.TriggerChainRole.HUMAN_GATE} task carries trigger_chain.run_id = {run_id}; '
+            'file every leaf with `gate_dep: false`.',
+        ]
+    gate = store.gate
+    deps = ', '.join(map(str, gate.dependencies)) or program_doc.NONE
+    return Section.GATE, [
+        f'The human gate is task {gate.task_id}; it depends on {deps}.',
+        f'Add every `{state.Priority.CRITICAL}` or `{state.Priority.HIGH}` leaf you file as a '
+        f'dependency of {gate.task_id}, and mark it `gate_dep: true`.',
+    ]
+
+
+def _release_duty_line(stream: str, row: state.TaskRow) -> str:
+    wait = state.SEAM_WAIT_KEYS
+    owned = ' '.join(part for part in (stream, program_facts.task_label(row)) if part)
+    return (f'- {row.task_id} · {owned} · waits on {wait.value(row, "stream")} '
+            f'{wait.value(row, "contract")}')
+
+
+def _release_duties_section(seat: _Seat, store: program_facts.StoreFacts) -> tuple[Section, list[str]]:
+    duties = [
+        _release_duty_line(stream, row) for stream, row in store.held
+        if state.SEAM_WAIT_KEYS.value(row, 'release_owner') == seat.stream
+    ]
+    if not duties:
+        return Section.RELEASE_DUTIES, [f'No held leaf names {seat.stream} as its release owner.']
+    return Section.RELEASE_DUTIES, [
+        f'The held leaves {seat.stream} releases: id · owning stream and label · what it waits on.',
+        '',
+        *duties,
+        '',
+        f'Release each once the leaf delivering its contract is filed, per {LAUNCHING} step 3 '
+        '(recipe `clerk_batch.py::CLERK_RULES` `release`), and list it under `released`.',
+    ]
+
+
+def _decompose_brief(seat: _Seat) -> _Built:
+    _refuse_out_of_order(seat)
+    record = _run_record(seat.run.program)
+    store = program_facts.read_store(state.open_reader(seat.run.program), seat.home)
+    stream, rulings, filings, xrefs = _seat_sections(seat, record)
+    return _Built([
+        _decompose_section(seat), stream, rulings, _upstream_section(seat, store),
+        _gate_section(seat, store), _release_duties_section(seat, store), filings, xrefs,
+        _return_section(seat),
+    ], store.measured_at)
+
+
+_BUILDERS: Mapping[state.Pass, Callable[[_Seat], _Built]] = types.MappingProxyType({
+    state.Pass.AUTHOR: _author_brief,
+    state.Pass.DECOMPOSE: _decompose_brief,
 })
 
 
@@ -361,11 +474,14 @@ def _seat(args: argparse.Namespace) -> _Seat:
 
 def _write(args: argparse.Namespace) -> Exit:
     seat = _seat(args)
-    text = _text(seat, _BUILDERS[seat.pass_](seat))
+    built = _BUILDERS[seat.pass_](seat)
+    text = _text(seat, built.sections)
     path = seat.run.home.brief_file(seat.stream, seat.pass_, seat.item)
     path.parent.mkdir(exist_ok=True)
     path.write_text(text, encoding='utf-8')
     print(f'wrote {path}')
+    if built.store_read is not None:
+        print(f'store read {built.store_read}')
     return Exit.WRITTEN
 
 
