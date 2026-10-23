@@ -585,6 +585,7 @@ class TestStringConstants:
             pytest.param("_T = 'a'\n_T = 'b'\n", '_T', id='bound-twice'),
             pytest.param("_T = 'a'\n_T += '.b'\n", '_T', id='aug-assign'),
             pytest.param("_T = 'a'\ndef f(_T): pass\n", '_T', id='also-a-parameter'),
+            pytest.param("_T = 'a'\ndef _T(): pass\n", '_T', id='also-a-def'),
             pytest.param('from h import _T\n', '_T', id='imported'),
             pytest.param('_N = 1\n', '_N', id='non-string'),
             pytest.param("_A, _B = 'x', 'y'\n", '_A', id='tuple-unpacking'),
