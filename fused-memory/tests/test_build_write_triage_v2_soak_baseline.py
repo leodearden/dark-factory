@@ -497,6 +497,22 @@ class TestAssemble:
             'related_unrelated_home_no', 'same_subsumed_unrelated_conflict_no',
         ]
 
+    def test_the_derivation_names_each_follow_up_a_held_row_left_unreached(self) -> None:
+        assert self._assembly().derivation['unreached_follow_ups'] == []
+        adjudications = {**self._adjudications(),
+                         ('s1', 'p1'): _adjudication('SAME', child_memory_id='s1')}
+        rated = self._rated_rows() + [
+            _rated('s1', role=role, home='YES', conflict='YES', scope='CENTRAL',
+                   action_changing='YES')
+            for role in ('primary', 'second')
+        ]
+        child_texts = {entry_id: LONG_CHILD for entry_id, _ in adjudications}
+        derivation = _mod().assemble(adjudications, rated, child_texts).derivation
+        assert 'same_subsumed_unrelated_conflict_no' in derivation['held_rows']
+        assert derivation['unreached_follow_ups'] == [
+            {'entry_id': 's1', 'target_id': 'p1', 'basis': 'current', 'binary': 'loss'},
+        ]
+
 
 CREATED = '2026-10-10T00:00:00+00:00'
 
@@ -1055,10 +1071,11 @@ class TestTheRatingRounds:
         assert json.loads(paths['strata.json'].read_text()) == dict(_mod().STRATA)
         derivation = json.loads(paths['derivation.json'].read_text())
         assert set(derivation) == {
-            'check', 'rows', 'held_rows', 'rating_volume', 'sample', 'unrecoverable',
-            'attach_time_unrecoverable', 'reasked', 'shards',
+            'check', 'rows', 'held_rows', 'unreached_follow_ups', 'rating_volume', 'sample',
+            'unrecoverable', 'attach_time_unrecoverable', 'reasked', 'shards',
         }
         assert derivation['held_rows'] == []
+        assert derivation['unreached_follow_ups'] == []
         assert derivation['rating_volume'] == {
             'current': {'primary': 6, 'second': 6}, 'attach_time': {'primary': 1, 'second': 1},
         }

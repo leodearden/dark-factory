@@ -330,6 +330,85 @@ class TestNonConsumedAnswers:
         assert _resolved(rows, 'home') == _mod().Resolved.NO
 
 
+_DISPUTED = {'home': 'YES', 'conflict': 'YES', 'scope': 'CENTRAL', 'action_changing': 'YES'}
+
+
+class TestUnreachedFollowUps:
+    """A follow-up no rater reached because a derived row overrode its precondition (esc-7174-4)."""
+
+    def _judgement(self, rows: list[dict[str, Any]]) -> Any:
+        rubric = _mod()
+        return rubric.resolve_judgements(rows)[rubric.PairKey('e1', 't1', rubric.Basis.CURRENT)]
+
+    def _overridden(self) -> list[dict[str, Any]]:
+        """A held row fixing CONFLICT NO beside two raters who both said CONFLICT YES."""
+        return [
+            _row(rater='v1', role='derived', conflict='NO'),
+            _row(**_DISPUTED, non_consumed=['conflict']),
+            _row(rater='r2', role='second', **_DISPUTED, non_consumed=['conflict']),
+        ]
+
+    def test_loss_resolves_unclear_when_a_derived_conflict_no_overrode_the_raters(self) -> None:
+        rubric = _mod()
+        judgement = self._judgement(self._overridden())
+        assert judgement.answer(rubric.Binary.HOME) == rubric.Resolved.YES
+        assert judgement.answer(rubric.Binary.CONFLICT) == rubric.Resolved.NO
+        assert judgement.answer(rubric.Binary.LOSS) == rubric.Resolved.UNCLEAR
+        assert judgement.unreached_follow_ups == {rubric.Binary.LOSS}
+
+    @pytest.mark.parametrize('outcome', ['restated', 'contested'])
+    def test_an_item_reading_the_unreached_loss_is_unclear_not_incomplete(self, outcome: str) -> None:
+        rubric = _mod()
+        result = rubric.derive(outcome, {'t1': self._judgement(self._overridden())})
+        assert isinstance(result, rubric.Unclear), result
+        assert result.binaries == (('t1', 'loss'),)
+
+    def test_a_transitive_follow_up_is_unreached_the_same_way(self) -> None:
+        rubric = _mod()
+        judgement = self._judgement([
+            _row(rater='v1', role='derived', home='YES', conflict='NO', loss='YES'),
+            _row(home='YES', conflict='NO', loss='NO', non_consumed=['home', 'conflict', 'loss']),
+        ])
+        assert judgement.answer(rubric.Binary.DIGEST) == rubric.Resolved.UNCLEAR
+        assert judgement.unreached_follow_ups == {rubric.Binary.DIGEST}
+
+    def test_raters_meeting_the_preconditions_without_a_derived_row_leave_loss_unrated(self) -> None:
+        rubric = _mod()
+        rows = [_row(home='YES', conflict='NO'), _row(rater='r2', role='second', home='YES', conflict='NO')]
+        judgement = self._judgement(rows)
+        assert judgement.answer(rubric.Binary.LOSS) is None
+        assert judgement.unreached_follow_ups == frozenset()
+        result = rubric.derive('restated', {'t1': judgement})
+        assert isinstance(result, rubric.Incomplete), result
+        assert [(gap.target_id, gap.binary, gap.kind) for gap in result.missing] == [
+            ('t1', 'loss', 'unrated'),
+        ]
+
+    def test_a_tied_precondition_leaves_the_follow_up_missing(self) -> None:
+        rubric = _mod()
+        judgement = self._judgement([
+            _row(rater='v1', role='derived', conflict='NO'),
+            _row(**_DISPUTED, non_consumed=['conflict']),
+            _row(rater='r2', role='second', **{**_DISPUTED, 'home': 'NO'}, non_consumed=['conflict']),
+        ])
+        assert judgement.answer(rubric.Binary.HOME) == rubric.Resolved.TIED
+        assert judgement.answer(rubric.Binary.LOSS) is None
+        assert judgement.unreached_follow_ups == frozenset()
+
+    def test_a_derived_precondition_the_raters_also_met_resolves_from_their_votes(self) -> None:
+        rubric = _mod()
+        judgement = self._judgement([
+            _row(rater='v1', role='derived', conflict='NO'),
+            _row(home='YES', conflict='NO', loss='YES', non_consumed=['conflict']),
+            _row(rater='r2', role='second', home='YES', conflict='NO', loss='YES',
+                 non_consumed=['conflict']),
+        ])
+        assert judgement.answer(rubric.Binary.LOSS) == rubric.Resolved.YES
+        assert judgement.unreached_follow_ups == frozenset()
+        result = _decided(rubric.derive('restated', {'t1': judgement}))
+        assert result.triage_cells == {'hidden_detail'}
+
+
 def _judged(target: str, *votes: dict[str, str]) -> Any:
     """The Judgement of write 'w' read against *target*, one rater per vote; None if no votes."""
     if not votes:
