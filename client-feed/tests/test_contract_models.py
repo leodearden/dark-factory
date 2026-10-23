@@ -505,7 +505,7 @@ def test_quarantined_refuses_a_repeated_reason() -> None:
     assert 'unique' in message
 
 
-def defect_reported(**overrides: Any) -> 'contract.DefectReported':
+def defect_reported(**overrides: Any) -> contract.DefectReported:
     return contract.DefectReported.model_validate({**DEFECT_REPORTED, **overrides})
 
 

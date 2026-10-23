@@ -1,10 +1,10 @@
-"""The one spelling of the client feed's shape; plans/client-feed-prd.md §7 is the normative prose."""
+"""The one spelling of the client feed's shape; plans/client-feed-prd.md §7 and §14.3 are the normative prose."""
 
 from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
 from enum import StrEnum
 from itertools import chain
@@ -95,7 +95,12 @@ FeedVersion = Annotated[str, StringConstraints(pattern=r'^\d+\.\d+$')]
 Seq = Annotated[StrictInt, Field(ge=1)]
 TaskId = Annotated[StrictInt, Field(ge=1)]
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
+PositiveInt = Annotated[StrictInt, Field(ge=1)]
 NonEmptyStr = Annotated[str, StringConstraints(min_length=1)]
+CriterionId = Annotated[str, StringConstraints(pattern=r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')]
+Token = Annotated[str, StringConstraints(pattern=r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')]
+_DefectText = Annotated[str, StringConstraints(min_length=1, max_length=2000)]
+_DefectStep = Annotated[str, StringConstraints(min_length=1, max_length=500)]
 
 
 class Source(StrEnum):
@@ -176,9 +181,21 @@ class CriterionKind(StrEnum):
     FAILURE = 'failure'
 
 
+class QuarantineReason(StrEnum):
+    SUSPECTED_INJECTION = 'suspected_injection'
+    NOT_RESTATABLE = 'not_restatable'
+    RESTATER_DECLINED = 'restater_declined'
+    RESTATER_FAILED = 'restater_failed'
+
+
 class _Record(BaseModel):
     model_config = ConfigDict(frozen=True, extra='forbid')
     __test__ = False  # pytest never collects a model imported into a test module
+
+
+def _duplicates(values: Iterable[str]) -> list[str]:
+    """The values that occur more than once, sorted."""
+    return sorted(value for value, count in Counter(values).items() if count > 1)
 
 
 class _Envelope(_Record):
@@ -496,8 +513,7 @@ class CriteriaDeclared(_Envelope):
 
     @model_validator(mode='after')
     def _ids_are_unique(self) -> Self:
-        declared = Counter(criterion.id for criterion in self.criteria)
-        duplicates = sorted(cid for cid, count in declared.items() if count > 1)
+        duplicates = _duplicates(criterion.id for criterion in self.criteria)
         if duplicates:
             raise ValueError(
                 f'criteria_declared ids must be unique: {", ".join(duplicates)} declared more'
@@ -598,6 +614,53 @@ class RevealRequested(_Record):
     at: UtcTimestamp
     type: Literal['reveal_requested'] = 'reveal_requested'
     path: str
+
+
+class Restated(_Record):
+    """A client's defect report in the restater's words."""
+
+    kind: Literal['restated'] = 'restated'
+    observed: _DefectText
+    expected: _DefectText
+    steps: Annotated[tuple[_DefectStep, ...], Field(max_length=20)]
+
+
+class Quarantined(_Record):
+    """A client's defect report the restater would not restate, and why."""
+
+    kind: Literal['quarantined'] = 'quarantined'
+    reasons: Annotated[tuple[QuarantineReason, ...], Field(min_length=1)]
+
+    @model_validator(mode='after')
+    def _reasons_are_unique(self) -> Self:
+        duplicates = _duplicates(self.reasons)
+        if duplicates:
+            raise ValueError(
+                f'quarantined reasons must be unique: {", ".join(duplicates)} given more than once'
+            )
+        return self
+
+
+class Restater(_Record):
+    """The restater that read the client's words."""
+
+    prompt_version: Token
+
+
+DefectOutcome = Annotated[Restated | Quarantined, Field(discriminator='kind')]
+
+
+class DefectReported(_Record):
+    """inbox.jsonl: the portal reporting a client defect, restated or quarantined; never the client's own words."""
+
+    seq: Seq
+    at: UtcTimestamp
+    type: Literal['defect_reported'] = 'defect_reported'
+    block: PositiveInt
+    report: PositiveInt
+    criterion_id: CriterionId
+    restater: Restater
+    outcome: DefectOutcome
 
 
 class EngagementProjection(_Record):
