@@ -128,6 +128,7 @@ from orchestrator.main_health_fix_owner import (
     ensure_main_fix_owner,
 )
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
+from orchestrator.merge_lane.gates import declaration_coverage
 from orchestrator.merge_lane.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
     LandingReason,
@@ -689,6 +690,16 @@ def _declared_entries(metadata: Mapping[str, Any], key: str) -> list[Any]:
 def _declared_files(metadata: Mapping[str, Any]) -> list[str]:
     """The task's declared ``metadata.files``, path strings only."""
     return [f for f in _declared_entries(metadata, 'files') if isinstance(f, str)]
+
+
+def _scope_basis(declared: list[str], landed: list[str]) -> dict[str, list[str]]:
+    """One ``landed_scope_diff`` basis: a declaration and its coverage of *landed*."""
+    coverage = declaration_coverage(declared, landed)
+    return {
+        'declared': list(declared),
+        'undeclared': list(coverage.undeclared),
+        'undelivered': list(coverage.undelivered),
+    }
 
 
 def _declared_checks(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2404,17 +2415,27 @@ class TaskWorkflow:
         ``update_task`` is not rejected by the lock-charter guard (changes #2/#3).
         The strip can only shrink the declared set (a file-level subset of what
         landed), which keeps the phantom-done gate honest.
+
+        The declaration is differenced against a MEASURED merge diff before it
+        is overwritten: see :meth:`_stamp_landed_scope`.
         """
         files, unknown_reason = override_files, 'no merge_sha'
+        landed: list[str] | None = None
         if files is None and self._merge_sha:
             files, err = await self.git_ops.get_merge_commit_diff_files(
                 self._merge_sha,
             )
             if err is not None:
                 files, unknown_reason = None, f'merge diff failed: {err}'
-        persisted = await self._persist_metadata_files(
-            files, log_context='done metadata files reconcile',
+            else:
+                landed = files
+        merged = await self._merge_fresh_metadata(
+            self.task.get('metadata') or {},
+            log_context='done metadata files reconcile',
         )
+        if landed is not None:
+            self._stamp_landed_scope(landed, recorded=_declared_files(merged))
+        persisted = await self._write_metadata_files(merged, files)
         if files is None and persisted:
             logger.warning(
                 'Task %s: done reconcile cannot compute the merge diff (%s); '
@@ -2425,27 +2446,62 @@ class TaskWorkflow:
     async def _persist_metadata_files(
         self, files: list[str] | None, *, log_context: str,
     ) -> list[str] | None:
-        """The one orchestrator-side write seam for ``metadata.files``.
+        """Read-modify-write ``metadata.files`` through :meth:`_merge_fresh_metadata`.
 
-        A read-modify-write through :meth:`_merge_fresh_metadata`, so sibling
-        keys (``memory_hints``, ``_causation_id``) survive and backend keys win
-        on collision.  ``files=None`` means "uncomputable here; keep what the
-        backend has".  The chosen list is sanitized to file-level paths
-        (``sanitize_files_for_persist``).  ``self.task['metadata']`` mirrors the
-        payload only once ``update_task`` reports it landed, so in-session reads
-        never see a record the backend refused.  Exceptions propagate: each
-        caller owns its failure policy.  Returns the persisted list, or None
-        when the backend refused the write.
+        Sibling keys (``memory_hints``, ``_causation_id``) survive and backend
+        keys win on collision; the write itself is :meth:`_write_metadata_files`.
         """
         merged = await self._merge_fresh_metadata(
             self.task.get('metadata') or {}, log_context=log_context,
         )
+        return await self._write_metadata_files(merged, files)
+
+    async def _write_metadata_files(
+        self, merged: dict, files: list[str] | None,
+    ) -> list[str] | None:
+        """The one orchestrator-side write seam for ``metadata.files``.
+
+        *merged* is a fresh :meth:`_merge_fresh_metadata` read.  ``files=None``
+        means "uncomputable here; keep what the backend has".  The chosen list
+        is sanitized to file-level paths (``sanitize_files_for_persist``).
+        ``self.task['metadata']`` mirrors the payload only once ``update_task``
+        reports it landed, so in-session reads never see a record the backend
+        refused.  Exceptions propagate: each caller owns its failure policy.
+        Returns the persisted list, or None when the backend refused the write.
+        """
         chosen = (merged.get('files') or []) if files is None else files
         merged['files'] = sanitize_files_for_persist(chosen)
         if not await self.scheduler.update_task(self.task_id, merged):
             return None
         self.task['metadata'] = merged
         return merged['files']
+
+    def _stamp_landed_scope(self, landed: list[str], *, recorded: list[str]) -> None:
+        """Emit ``landed_scope_diff``: *landed* against plan.files and *recorded*.
+
+        Both declarations arrive parsed to path strings, so nothing here can
+        raise into the done write.  No plan loaded stamps ``plan_files`` as
+        None, never as "declared nothing".
+        """
+        if self.event_store is None:
+            return
+        plan_declared = (
+            _declared_files(self.plan)
+            if isinstance(self.plan.get('files'), list) else None
+        )
+        self.event_store.emit(
+            EventType.landed_scope_diff,
+            task_id=self.task_id,
+            data={
+                'merge_sha': self._merge_sha,
+                'landed': sorted(landed),
+                'plan_files': (
+                    None if plan_declared is None
+                    else _scope_basis(plan_declared, landed)
+                ),
+                'metadata_files': _scope_basis(recorded, landed),
+            },
+        )
 
     def _enter_phase(self, new_state: WorkflowState) -> None:
         """Transition to a new workflow phase, emitting events.

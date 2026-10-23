@@ -106,6 +106,20 @@ class EventType(StrEnum):
     # by evidencing the DURABLE write; persisted=False means the in-memory
     # narrowing applied but the metadata write failed (non-critical).
     set_to_plan = 'set_to_plan'
+    # Declared-vs-landed at done, from workflow.py::TaskWorkflow._stamp_landed_scope.
+    # One row per done-time reconcile of a MEASURED merge diff (re-reconciles
+    # repeat it: dedupe on (task_id, merge_sha)).  data: {merge_sha, landed,
+    # plan_files: {declared, undeclared, undelivered} | null,
+    # metadata_files: {declared, undeclared, undelivered}}.  plan_files is the
+    # architect's plan.json declaration (the census basis; null when no plan
+    # was loaded); metadata_files is the last-persisted record this reconcile
+    # overwrites.  Coverage rule: merge_lane/gates.py::declaration_coverage
+    # (no rename arm).  Rate: SELECT COUNT(*), SUM(json_array_length(data,
+    # '$.plan_files.undeclared') > 0) FROM events WHERE event_type =
+    # 'landed_scope_diff' AND json_type(data, '$.plan_files') = 'object'.
+    # The dispatch-time declaration is a join on task_id against
+    # lock_acquired / set_to_plan rows, not a payload field.
+    landed_scope_diff = 'landed_scope_diff'
     merge_attempt = 'merge_attempt'
     # The merge worker's POST-rebase verify verdict (task_id-keyed).  data:
     # {runner, merge_sha, passed, duration_ms, attempt, depth, speculative}
