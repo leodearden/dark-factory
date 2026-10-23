@@ -7126,6 +7126,51 @@ class TestFilterTerminalMetadataFlags:
             'task_metadata_stale alias must also be dropped for cancelled tasks'
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_type',
+        ['Stale-Metadata', 'metadata_stale', 'Task Metadata Stale', 'STALE_TASK_METADATA'],
+    )
+    async def test_canonical_variant_spellings_are_dropped_for_a_terminal_task(self, flag_type):
+        """A case/separator/word-order respelling of a known spelling is checked and dropped.
+
+        This widening (task 6005) is intentional: the filter matches through
+        STALE_METADATA_FAMILY, and the drop still requires a live terminal status.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'cancelled'})
+
+        flag = {'task_id': '1703', 'flag_type': flag_type}
+        result = await filter_terminal_metadata_flags(taskmaster, '/proj', [flag])
+
+        assert result == []
+        taskmaster.get_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_possible_drift_log_keeps_its_event_name_and_names_the_family(self, caplog):
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        flags = [
+            {'task_id': None, 'flag_type': 'stale_task_reference'},
+            {'task_id': None, 'flag_type': 'Stale_Metadata'},
+            {'task_id': None, 'flag_type': 'orphaned_knowledge'},
+        ]
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_terminal_metadata_flags(AsyncMock(), '/proj', flags)
+
+        drift = [
+            r.getMessage()
+            for r in caplog.records
+            if 'terminal_metadata_filter_possible_drift' in r.getMessage()
+        ]
+        assert len(drift) == 1, drift
+        assert drift[0].startswith('reconciliation.terminal_metadata_filter_possible_drift ')
+        assert 'family=stale_metadata' in drift[0]
+        assert "unmatched_flag_types=['stale_task_reference']" in drift[0]
+
 
 # ---------------------------------------------------------------------------
 # task-3007 step-1 — filter_stale_bulk_get_statuses_flags
