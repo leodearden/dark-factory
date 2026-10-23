@@ -1298,7 +1298,7 @@
     "orchestrator/tests/test_workflow_escalated_steward_stall.py": {"patch_targets": [], "private_reads": 48},
     "orchestrator/tests/test_workflow_first_enqueue_stamp.py": {"patch_targets": [], "private_reads": 8},
     "orchestrator/tests/test_workflow_halt_owner.py": {"patch_targets": [], "private_reads": 20},
-    "orchestrator/tests/test_workflow_helpers.py": {"patch_targets": [], "private_reads": 16},
+    "orchestrator/tests/test_workflow_helpers.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/test_workflow_main_health_routing.py": {"patch_targets": ["worker.enqueue_merge_request"], "private_reads": 6},
     "orchestrator/tests/test_workflow_merge_blocked_surfacing.py": {"patch_targets": [], "private_reads": 7},
     "orchestrator/tests/test_workflow_merge_gating_strand.py": {"patch_targets": [], "private_reads": 43},

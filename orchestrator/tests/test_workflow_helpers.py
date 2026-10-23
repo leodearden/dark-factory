@@ -5,6 +5,9 @@ Import-contract verification for _make_resolving_steward and
 _make_status_setting_steward relies on indirect coverage from
 test_workflow_e2e.py and test_workflow_status_on_resume.py.
 
+The anti-duplication identity guards that pair with each promotion group's
+smoke test live in test_workflow_helpers_identity.py (see its docstring).
+
 Beyond those smoke checks this file also owns the behavioural CONTRACT tests
 for helpers _workflow_helpers defines — today `TestSameModuleSiblings`, which
 pins `same_module_siblings` across every plausible lock_depth (relocated here
@@ -121,16 +124,6 @@ def test_merge_provenance_factories_smoke(tmp_path) -> None:
     assert row.advanced_sha == 'deadbeef'
 
 
-def test_merge_provenance_factories_identity() -> None:
-    """Anti-duplication guard: the producer re-exports the SAME objects as the shared module."""
-    import test_workflow_merge_provenance as mp  # noqa: PLC0415
-    from _workflow_helpers import _bind_landed_row, _Fixture, _make  # noqa: PLC0415
-
-    assert mp._make is _make
-    assert mp._bind_landed_row is _bind_landed_row
-    assert mp._Fixture is _Fixture
-
-
 # ---------------------------------------------------------------------------
 # Group B: warm-lane workflow factory (_make_warmlane_workflow)
 # ---------------------------------------------------------------------------
@@ -147,14 +140,6 @@ def test_warmlane_workflow_factory_smoke(tmp_path) -> None:
     assert wf.worktree is None
 
 
-def test_warmlane_workflow_factory_identity() -> None:
-    """Anti-duplication guard: the producer re-imports the SAME object under its old local name."""
-    import test_workflow_warm_lane_requeue as wr  # noqa: PLC0415
-    from _workflow_helpers import _make_warmlane_workflow  # noqa: PLC0415
-
-    assert wr._make_workflow is _make_warmlane_workflow
-
-
 # ---------------------------------------------------------------------------
 # Group C: harness factories (_build_harness, _init_git_repo)
 # ---------------------------------------------------------------------------
@@ -168,15 +153,6 @@ async def test_init_git_repo_factory_smoke(tmp_path) -> None:
     await _init_git_repo(tmp_path)
     assert (tmp_path / '.git').is_dir()
     assert (tmp_path / 'README.md').exists()
-
-
-def test_harness_factories_identity() -> None:
-    """Anti-duplication guard: the producer re-exports the SAME objects as the shared module."""
-    import test_harness_warm_lane_wiring as hw  # noqa: PLC0415
-    from _workflow_helpers import _build_harness, _init_git_repo  # noqa: PLC0415
-
-    assert hw._build_harness is _build_harness
-    assert hw._init_git_repo is _init_git_repo
 
 
 # ---------------------------------------------------------------------------
@@ -204,47 +180,12 @@ async def test_e2e_factories_smoke(tmp_path) -> None:
     assert (tmp_path / '.git').is_dir()
 
 
-def test_e2e_factories_identity() -> None:
-    """Anti-duplication guard: the producer re-exports the SAME objects as the shared module.
-
-    Does NOT `from _workflow_helpers import _derive_meta_root_like_production` here —
-    that would pull the autouse-fixture NAME into this module's namespace and
-    activate it in every test in this file. Instead the fixture is referenced via
-    module-attribute access (`_workflow_helpers._derive_meta_root_like_production`),
-    which is inert.
-    """
-    import _workflow_helpers  # noqa: PLC0415
-    import test_workflow_e2e as e2e  # noqa: PLC0415
-    from _workflow_helpers import (  # noqa: PLC0415
-        PLAN,
-        AgentStub,
-        _build_workflow,
-        _build_workflow_with_escalation,
-        _init_repo,
-        _make_review,
-    )
-
-    assert e2e.AgentStub is AgentStub
-    assert e2e.PLAN is PLAN
-    assert e2e._make_review is _make_review
-    assert e2e._build_workflow is _build_workflow
-    assert e2e._build_workflow_with_escalation is _build_workflow_with_escalation
-    assert e2e._init_repo is _init_repo
-    assert e2e._derive_meta_root_like_production is _workflow_helpers._derive_meta_root_like_production
-
-
 # ---------------------------------------------------------------------------
 # Group E: transcript-archival harness (task 4384): ENC, _config,
 # _make_git_ops, _make_transcript_workflow, _config_dir, _write_transcript,
 # _archive_root, _archived —
 # promoted out of three divergent copies (test_transcript_archive_producer_hook.py,
 # test_transcript_archive_backstop.py, test_transcript_archival_boundary_gate.py).
-#
-# The anti-duplication identity guard that pairs with the smoke test below lives
-# in test_workflow_helpers_transcript_identity.py, NOT here: its reads of the
-# consumers' `_`-prefixed helper names are counted by the merge-lane ratchet,
-# which this file is enrolled in and that one deliberately is not. That module's
-# docstring carries the full reasoning.
 # ---------------------------------------------------------------------------
 
 
