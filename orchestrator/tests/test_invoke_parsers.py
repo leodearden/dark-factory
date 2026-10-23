@@ -469,7 +469,8 @@ def _codex_turns(*usages: dict[str, int]) -> _SubprocessResult:
 
 class TestParseCodexCachedUsage:
     """turn.completed usage carries cached_input_tokens INSIDE input_tokens;
-    the parser prices that split and reports every token count it read."""
+    the parser prices that split and reports the counts in AgentResult's
+    shared convention, where input_tokens excludes cache reads."""
 
     _MEASURED_USAGE = {
         'input_tokens': _ASTRA_INPUT_TOKENS,
@@ -491,7 +492,7 @@ class TestParseCodexCachedUsage:
             _codex_turns(self._MEASURED_USAGE), 'gpt-6-astra', _ASTRA_PRICES,
         )
 
-        assert agent_result.input_tokens == _ASTRA_INPUT_TOKENS
+        assert agent_result.input_tokens == _ASTRA_INPUT_TOKENS - _ASTRA_CACHED_INPUT_TOKENS
         assert agent_result.output_tokens == _ASTRA_OUTPUT_TOKENS
         assert agent_result.cache_read_tokens == _ASTRA_CACHED_INPUT_TOKENS
         assert agent_result.cache_create_tokens == 0
@@ -507,7 +508,7 @@ class TestParseCodexCachedUsage:
         )
 
         assert agent_result.turns == 2
-        assert agent_result.input_tokens == 312881
+        assert agent_result.input_tokens == 312881 - 278160
         assert agent_result.output_tokens == 1462
         assert agent_result.cache_read_tokens == 278160
         assert agent_result.cache_create_tokens == 50
@@ -522,6 +523,8 @@ class TestParseCodexCachedUsage:
 
         # Non-cached count clamped at 0: (0 * 10 + 1500 * 1 + 10 * 50) / 1e6
         assert agent_result.cost_usd == pytest.approx(0.002)
+        assert agent_result.input_tokens == 0
+        assert agent_result.cache_read_tokens == 1500
         warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1
         assert '1500' in warnings[0]
