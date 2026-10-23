@@ -24,7 +24,7 @@ import posixpath
 import re
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -2169,6 +2169,42 @@ def _entry_covered(norm: str, touched_set: set[str]) -> bool:
     return (
         _entry_touched_exactly(norm, touched_set)
         or _entry_touched_beneath(norm, touched_set)
+    )
+
+
+@dataclass(frozen=True)
+class DeclarationCoverage:
+    undeclared: tuple[str, ...]
+    """Changed paths no declared entry covers, sorted."""
+    undelivered: tuple[str, ...]
+    """Declared entries, exactly as written, that cover no changed path, sorted."""
+
+
+def declaration_coverage(
+    declared: Iterable[str], paths: Iterable[str],
+) -> DeclarationCoverage:
+    """Difference a declaration against changed paths, in both directions.
+
+    The git-free half of :func:`_check_plan_files_touched_in_branch`'s
+    coverage rule (:func:`_normalize_plan_path` + :func:`_entry_covered`),
+    applied per changed path for ``undeclared`` and per declared entry for
+    ``undelivered``.  The gate's existence probe and rename arm need git and
+    are not applied, so a renamed declared path reads as one undelivered
+    entry plus one undeclared path.  Caller:
+    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_landed_scope``.
+    """
+    norms = {entry: _normalize_plan_path(entry) for entry in declared if entry}
+    path_set = set(paths)
+    undeclared = sorted(
+        p for p in path_set
+        if not any(_entry_covered(norm, {p}) for norm in norms.values())
+    )
+    undelivered = sorted(
+        entry for entry, norm in norms.items()
+        if not _entry_covered(norm, path_set)
+    )
+    return DeclarationCoverage(
+        undeclared=tuple(undeclared), undelivered=tuple(undelivered),
     )
 
 
