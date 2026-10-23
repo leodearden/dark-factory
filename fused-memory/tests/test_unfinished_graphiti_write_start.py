@@ -3,35 +3,20 @@ DurableWriteQueue whose backend writes are held open until released."""
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 import pytest_asyncio
+from _fm_held_writes import HeldWrites
 from _fm_helpers import poll_until
 
 from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.services.memory_service import MemoryService
 
-
-class _HeldWrites:
-    """An execute_write fake: every write blocks until ``release`` is called."""
-
-    def __init__(self) -> None:
-        self.entered: set[str] = set()
-        self._release = asyncio.Event()
-
-    async def execute(self, operation: str, payload: dict) -> dict:
-        self.entered.add(payload['name'])
-        await self._release.wait()
-        return {'episode_uuid': f'ep-{payload["name"]}'}
-
-    def release(self) -> None:
-        self._release.set()
+HELD_WRITE = 'ep'
 
 
 @pytest.fixture
-def held() -> _HeldWrites:
-    return _HeldWrites()
+def held() -> HeldWrites:
+    return HeldWrites()
 
 
 @pytest_asyncio.fixture
@@ -47,17 +32,19 @@ async def service(mock_config, tmp_path, held):
     try:
         yield svc
     finally:
-        held.release()
+        held.release_all()
         await queue.close()
 
 
-async def _start_held_write(svc: MemoryService, held: _HeldWrites) -> None:
+async def _start_held_write(svc: MemoryService, held: HeldWrites) -> None:
     assert svc.durable_queue is not None
     await svc.durable_queue.enqueue(
         group_id='proj', operation='add_episode',
-        payload={'content': 'x', 'group_id': 'proj', 'name': 'ep'},
+        payload={'content': 'x', 'group_id': 'proj', 'name': HELD_WRITE},
     )
-    await poll_until(lambda: 'ep' in held.entered, message='the write never began executing')
+    await poll_until(
+        lambda: HELD_WRITE in held.entered_at, message='the write never began executing',
+    )
 
 
 @pytest.mark.asyncio
@@ -85,7 +72,7 @@ async def test_executing_write_is_not_reported_for_another_project(service, held
 @pytest.mark.asyncio
 async def test_completed_write_is_no_longer_reported(service, held):
     await _start_held_write(service, held)
-    held.release()
+    held.release(HELD_WRITE)
 
     async def _completed():
         stats = await service.durable_queue.get_stats()

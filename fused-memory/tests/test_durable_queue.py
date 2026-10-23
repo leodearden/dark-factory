@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import aiosqlite
 import pytest
 import pytest_asyncio
+from _fm_held_writes import HeldWrites
 from _fm_helpers import poll_until
 from shared.async_sqlite_base import CheckpointResult
 
@@ -3078,39 +3079,6 @@ class TestDeadByOperation:
             await q.close()
 
 
-class _HeldWrites:
-    """An execute_write fake that holds each write open until it is released.
-
-    Entry is stamped with ``datetime.now(UTC)``, standing in for the
-    ``utc_now()`` that graphiti_core's add_episode takes as the episode's
-    created_at. With ``fail_on_release`` a released write raises instead of
-    returning, so every retried attempt of it raises at once.
-    """
-
-    def __init__(self, *, fail_on_release: bool = False) -> None:
-        self.entered_at: dict[str, datetime] = {}
-        self._releases: dict[str, asyncio.Event] = {}
-        self._fail_on_release = fail_on_release
-
-    def _release_event(self, name: str) -> asyncio.Event:
-        return self._releases.setdefault(name, asyncio.Event())
-
-    async def execute(self, operation: str, payload: dict) -> dict:
-        name = payload['name']
-        self.entered_at[name] = datetime.now(UTC)
-        await self._release_event(name).wait()
-        if self._fail_on_release:
-            raise RuntimeError(f'write {name} failed')
-        return {'episode_uuid': f'ep-{name}'}
-
-    def release(self, name: str) -> None:
-        self._release_event(name).set()
-
-    def release_all(self) -> None:
-        for event in self._releases.values():
-            event.set()
-
-
 class TestEarliestExecutingStart:
     """earliest_executing_start: when the oldest write still inside execute_write began."""
 
@@ -3122,7 +3090,7 @@ class TestEarliestExecutingStart:
         )
 
     @staticmethod
-    async def _wait_entered(held: _HeldWrites, name: str) -> None:
+    async def _wait_entered(held: HeldWrites, name: str) -> None:
         await poll_until(
             lambda: name in held.entered_at,
             message=f'write {name} never entered execute_write',
@@ -3144,7 +3112,7 @@ class TestEarliestExecutingStart:
     async def test_executing_write_reports_its_start_for_its_own_group_only(
         self, queue, mock_execute,
     ):
-        held = _HeldWrites()
+        held = HeldWrites()
         mock_execute.side_effect = held.execute
         before = datetime.now(UTC)
         try:
@@ -3160,7 +3128,7 @@ class TestEarliestExecutingStart:
 
     @pytest.mark.asyncio
     async def test_reports_the_oldest_write_still_executing(self, queue, mock_execute):
-        held = _HeldWrites()
+        held = HeldWrites()
         mock_execute.side_effect = held.execute
         try:
             await self._enqueue(queue, 'A')
@@ -3186,7 +3154,7 @@ class TestEarliestExecutingStart:
 
     @pytest.mark.asyncio
     async def test_failed_write_leaves_nothing_executing(self, queue, mock_execute):
-        held = _HeldWrites(fail_on_release=True)
+        held = HeldWrites(fail_on_release=True)
         mock_execute.side_effect = held.execute
         try:
             await self._enqueue(queue, 'A')
