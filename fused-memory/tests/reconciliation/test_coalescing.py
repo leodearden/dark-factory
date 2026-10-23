@@ -20,12 +20,12 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.reconciliation.coalescing import (
-    _MAX_COALESCED_STATUS_PATH,
     COALESCED_COUNT_KEY,
     COALESCED_LAST_ID_KEY,
     COALESCED_LAST_TIMESTAMP_KEY,
     COALESCED_STATUS_PATH_KEY,
     COALESCED_STATUS_PATH_TRUNCATED_KEY,
+    MAX_COALESCED_STATUS_PATH,
     CoalescedFold,
     coalesce_key,
     merge_coalesced_payload,
@@ -235,11 +235,11 @@ def test_middle_arrival_only_bumps_the_count():
 
 def test_status_path_is_capped_and_flagged_but_new_status_stays_newest():
     payload = _status('s0', 's1')
-    folds = _MAX_COALESCED_STATUS_PATH + 5
+    folds = MAX_COALESCED_STATUS_PATH + 5
     for n in range(1, folds + 1):
         payload = _fold_status(payload, _status(f's{n}', f's{n + 1}'),
                                incoming_ts=_at(n)).payload
-    assert len(payload[COALESCED_STATUS_PATH_KEY]) == _MAX_COALESCED_STATUS_PATH
+    assert len(payload[COALESCED_STATUS_PATH_KEY]) == MAX_COALESCED_STATUS_PATH
     assert payload[COALESCED_STATUS_PATH_TRUNCATED_KEY] is True
     assert payload['new_status'] == f's{folds + 1}'
     assert payload[COALESCED_COUNT_KEY] == folds + 1

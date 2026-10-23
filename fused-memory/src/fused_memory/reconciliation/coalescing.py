@@ -29,6 +29,7 @@ __all__ = [
     'COALESCED_LAST_TIMESTAMP_KEY',
     'COALESCED_STATUS_PATH_KEY',
     'COALESCED_STATUS_PATH_TRUNCATED_KEY',
+    'MAX_COALESCED_STATUS_PATH',
     'CoalescedFold',
     'coalesce_key',
     'coalesced_count',
@@ -54,7 +55,7 @@ _BOOKKEEPING_KEYS = frozenset({
 })
 
 # Bounds the payload of a task that flaps for hours between drains.
-_MAX_COALESCED_STATUS_PATH = 20
+MAX_COALESCED_STATUS_PATH = 20
 
 
 def task_id_key(value: object) -> str | None:
@@ -121,7 +122,9 @@ def merge_coalesced_payload(
     """Fold ``incoming`` into a buffered row's ``existing`` payload.
 
     Returns None when ``incoming_id`` is the last event already folded in: a
-    redelivery, which must not be counted twice.
+    redelivery, which must not be counted twice.  Only that newest constituent
+    is recognised, so a redelivered event that folded in as an older or middle
+    constituent folds again and over-counts by one.
 
     Timestamps are minted when task_interceptor builds the event but committed
     later through EventQueue, by several MCP processes sharing one database, so
@@ -222,7 +225,7 @@ def _grown_path(existing: Mapping[str, Any], entry: Any, *, at_start: bool) -> d
     """The status-path keys after adding ``entry`` at one end, within the cap."""
     path = _status_path(existing)
     truncated = existing.get(COALESCED_STATUS_PATH_TRUNCATED_KEY) is True
-    if len(path) >= _MAX_COALESCED_STATUS_PATH:
+    if len(path) >= MAX_COALESCED_STATUS_PATH:
         truncated = True
     else:
         path = [entry, *path] if at_start else [*path, entry]
