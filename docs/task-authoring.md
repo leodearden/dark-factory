@@ -1559,8 +1559,9 @@ supply is dropped, not honoured, and the strip is logged under
 waiting to be dispatched. It is written only by the fused-memory status
 chokepoints (`sqlite_task_backend.py::stamp_pending_since`, reached from
 `add_task`, `set_task_status` and `set_status_and_stamp_audit`) on a
-`* -> pending` landing, and read by the scheduler's age term and the watchdog
-idle clock. `pending_since_backfilled` is written only by the one-shot v4 ->
+`* -> pending` landing, and read by the orchestrator scheduler's age term
+through `orchestrator/src/orchestrator/pending_age.py::read_pending_age`.
+`pending_since_backfilled` is written only by the one-shot v4 ->
 v5 migration, marking the rows it anchored from `updated_at` so that
 population stays countable.
 
