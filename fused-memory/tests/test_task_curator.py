@@ -513,8 +513,10 @@ class TestCandidateTaskExecutionClass:
 
 
 class TestHashShapeContract16:
-    """Shape-contract regression guard for the two task_curator.py sha256 mirror sites
-    that lack an existing 16-char length assertion.
+    """Shape-contract regression guard for the two curator sha256 mirror sites
+    (``curator_types.py::CandidateTask.payload_hash`` and
+    ``task_curator.py::TaskCurator._normalize_key``) that lack an existing
+    16-char length assertion.
 
     The canonical 16-char sha256-hex shape is owned by
     ``orchestrator.agents.triage.sha256_16`` — see the docstring there for the full

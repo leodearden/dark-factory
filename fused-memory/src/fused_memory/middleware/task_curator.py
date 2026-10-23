@@ -830,7 +830,8 @@ class TaskCurator:
         h.update(normalize_title(description).encode())
         # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
         # Any change to length or algorithm must be mirrored there and at the other
-        # task_curator.py mirror sites (payload_hash, _normalize_key).
+        # mirror sites: curator_types.py::CandidateTask.payload_hash and
+        # task_curator.py::TaskCurator._normalize_key.
         return h.hexdigest()[:16]
 
     @staticmethod
