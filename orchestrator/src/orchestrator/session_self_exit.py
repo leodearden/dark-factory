@@ -12,11 +12,12 @@ Contract: plans/review-all-program-tooling-prd.md §4 H5 and §5 decision 10.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import signal
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -98,13 +99,24 @@ class SelfExit:
         record: session_registry.SessionRecord,
         root: Path | str | None,
     ) -> None:
-        """Signal the owner of an ATTEMPTED evaluation, then delete its marker; anything else is a no-op."""
+        """Signal the owner of an ATTEMPTED evaluation, then delete its marker; anything else is a no-op.
+
+        A failed signal is stamped ``kill_failed`` in a second, fail-soft
+        write and the marker stays, so the next Stop retries.
+        """
         if evaluation is None:
             return
         request = evaluation.request
         if request.state is not session_registry.ExitRequestState.ATTEMPTED or request.pid is None:
             return
-        self.kill(request.pid, signal.SIGINT)
+        try:
+            self.kill(request.pid, signal.SIGINT)
+        except (OSError, OverflowError) as exc:
+            record.exit_request = replace(
+                request, state=session_registry.ExitRequestState.KILL_FAILED, reason=_kill_failure_reason(exc),
+            )
+            _write_kill_failed(record, root)
+            return
         _delete_marker(evaluation.marker, record.session_slug)
 
 
@@ -179,6 +191,21 @@ def _hook_list_refusal(
     if not isinstance(value, list):
         return unreported
     return busy if value else None
+
+
+def _kill_failure_reason(exc: OSError | OverflowError) -> str:
+    """The errno's symbolic name (``'ESRCH'``), else the exception's class name."""
+    code = getattr(exc, 'errno', None)
+    if isinstance(code, int) and code in errno.errorcode:
+        return errno.errorcode[code]
+    return type(exc).__name__
+
+
+def _write_kill_failed(record: session_registry.SessionRecord, root: Path | str | None) -> None:
+    try:
+        session_registry.write_record(record, root=root)
+    except OSError:
+        logger.warning('kill_failed stamp for session %s could not be written', record.session_slug, exc_info=True)
 
 
 def _delete_marker(marker: Path, slug: str) -> None:
