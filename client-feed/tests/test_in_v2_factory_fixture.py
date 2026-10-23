@@ -180,3 +180,20 @@ def test_a_publisher_pass_answers_both_requests_and_counts_nothing_under_inbox(
     cursor = Cursor.model_validate_json((policy.out_dir / CURSOR_FILENAME).read_text())
     assert cursor.inbox_offset == (in_dir / INBOX_FILENAME).stat().st_size
     assert validate_out_dir(policy.out_dir, expected_project_id=PROJECT).ok
+
+
+def test_a_pass_over_an_inbox_of_only_defect_reports_moves_the_offset_past_them(
+    policy: Policy, in_dir: Path
+) -> None:
+    lines = fixture_lines()
+    inbox = in_dir / INBOX_FILENAME
+    inbox.write_text(''.join(f'{lines[index]}\n' for index in (RESTATED_LINE, QUARANTINED_LINE)))
+
+    report = run_pass(policy, OutDir.open(policy.out_dir, project_id=PROJECT), now=NOW)
+
+    assert report.degraded == ()
+    assert not any(
+        isinstance(line, FileRevealed | RevealRefused) for line in read_feed_lines(policy.out_dir)
+    )
+    cursor = Cursor.model_validate_json((policy.out_dir / CURSOR_FILENAME).read_text())
+    assert cursor.inbox_offset == inbox.stat().st_size
