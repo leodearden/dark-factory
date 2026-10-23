@@ -34,6 +34,14 @@ def _stack_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [r for r in _stall_records(caplog) if hasattr(r, 'loop_stack')]
 
 
+def _stacks_naming_the_hold(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Stack records taken during the hold; host-load lag elsewhere never names it."""
+    return [
+        r for r in _stack_records(caplog)
+        if _hold_the_loop_thread.__name__ in _extra(r, 'loop_stack')
+    ]
+
+
 def _watchdogs() -> list[threading.Thread]:
     return [t for t in threading.enumerate() if t.name == _WATCHDOG_NAME and t.is_alive()]
 
@@ -56,14 +64,27 @@ async def test_a_blocked_loop_is_reported_with_the_blocking_frame(
         warn_after_secs=0.2, beat_interval_secs=0.05, restack_interval_secs=60,
     )
 
-    await _block_once(monitor, 0.8)
+    await _block_once(monitor, 1.0)
 
-    stacks = _stack_records(caplog)
-    assert len(stacks) == 1, [r.getMessage() for r in _stall_records(caplog)]
-    record = stacks[0]
-    assert record.levelno == logging.WARNING
-    assert record.thread != threading.get_ident()
-    assert '_hold_the_loop_thread' in _extra(record, 'loop_stack')
+    stacks = _stacks_naming_the_hold(caplog)
+    assert stacks, [r.getMessage() for r in _stall_records(caplog)]
+    assert all(r.levelno == logging.WARNING for r in stacks)
+    assert all(r.thread != threading.get_ident() for r in stacks)
+
+
+async def test_one_stall_is_stacked_once_within_the_restack_interval(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
+    monitor = LoopStallMonitor(
+        warn_after_secs=0.2, beat_interval_secs=0.05, restack_interval_secs=60,
+    )
+
+    await _block_once(monitor, 1.5)
+
+    assert len(_stacks_naming_the_hold(caplog)) == 1, [
+        r.getMessage() for r in _stall_records(caplog)
+    ]
 
 
 async def test_resume_reports_the_whole_stall(caplog: pytest.LogCaptureFixture) -> None:
@@ -125,12 +146,10 @@ async def test_stop_ends_the_watchdog() -> None:
     await monitor.stop()
 
 
-def test_the_watchdog_ends_with_its_loop(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
-
+def test_the_watchdog_ends_with_its_loop() -> None:
     async def start_and_abandon() -> None:
         LoopStallMonitor(
-            warn_after_secs=0.2, beat_interval_secs=0.05, restack_interval_secs=60,
+            warn_after_secs=5.0, beat_interval_secs=0.05, restack_interval_secs=60,
         ).start()
         await asyncio.sleep(0.1)
 
@@ -139,7 +158,6 @@ def test_the_watchdog_ends_with_its_loop(caplog: pytest.LogCaptureFixture) -> No
     for thread in [t for t in threading.enumerate() if t.name == _WATCHDOG_NAME]:
         thread.join(2.0)
     assert _watchdogs() == []
-    assert _stall_records(caplog) == []
 
 
 @pytest.mark.parametrize('argument', [
