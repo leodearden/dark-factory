@@ -29,6 +29,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.gates import (
     _check_plan_files_touched_in_branch,
     _check_plan_targets_in_tree,
+    _check_post_merge_equivalence,
 )
 
 TASK = 'task-6412'
@@ -542,3 +543,71 @@ class TestDropGuardAuditTrail:
         )
 
         assert result.dropped == []
+
+
+def _branch_relocates_what_main_edited(repo: Path) -> tuple[str, str]:
+    """Fork where the branch moves pkg/a.py to pkg/b.py and main edits pkg/a.py; returns (task_head, main_sha)."""
+    _commit(repo, {'pkg/a.py': _BASE_MODULE}, 'add pkg/a.py')
+    _git(repo, 'checkout', '-q', '-b', 'task/equiv')
+    _git(repo, 'mv', 'pkg/a.py', 'pkg/b.py')
+    task_head = _commit(repo, {'pkg/b.py': _BRANCH_EDIT}, 'branch: move and edit top')
+    _git(repo, 'checkout', '-q', 'main')
+    main_sha = _commit(repo, {'pkg/a.py': _MAIN_EDIT}, 'main: edit bottom')
+    return task_head, main_sha
+
+
+@pytest.mark.asyncio
+class TestEquivalenceGateAuditTrail:
+    """What the post-merge equivalence gate logs about a branch-side relocation."""
+
+    async def test_verified_branch_relocation_logs_the_suppressed_pair(
+        self, git_repo: Path, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        task_head, main_sha = _branch_relocates_what_main_edited(git_repo)
+        adv = _merge_no_ff(git_repo, 'task/equiv')
+
+        with caplog.at_level(logging.INFO, logger=LANE_LOGGER):
+            result = await _check_post_merge_equivalence(
+                git_repo, adv, git_ops, main_sha, task_id=TASK, merged_tip=task_head,
+            )
+
+        assert result == []
+        record = _record(caplog, 'post-merge-equiv: content verified at the new name')
+        assert "[('pkg/b.py', 'pkg/a.py')]" in record
+        assert record.endswith(f'task_id={TASK}')
+
+    async def test_relocated_target_missing_from_the_merge_logs_the_gate_and_the_task(
+        self, git_repo: Path, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        task_head, main_sha = _branch_relocates_what_main_edited(git_repo)
+        adv = await resolution_merge(
+            git_repo, main_sha=main_sha, branch_tip=task_head, kept_tree_of=main_sha,
+        )
+
+        with caplog.at_level(logging.WARNING, logger=LANE_LOGGER):
+            result = await _check_post_merge_equivalence(
+                git_repo, adv, git_ops, main_sha, task_id=TASK, merged_tip=task_head,
+            )
+
+        assert result == ['pkg/b.py']
+        record = _record(caplog, 'resolves to no blob')
+        assert record.startswith('post-merge-equiv: merged path ')
+        assert record.endswith(f'task_id={TASK}')
+
+    async def test_unreadable_rename_map_logs_the_gate_and_the_task(
+        self, git_repo: Path, git_ops: GitOps, tmp_path: Path,
+        caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    ):
+        task_head, main_sha = _branch_relocates_what_main_edited(git_repo)
+        adv = _merge_no_ff(git_repo, 'task/equiv')
+        _fail_git_argv(monkeypatch, tmp_path / 'bin', 'diff -M --name-status *')
+
+        with caplog.at_level(logging.WARNING, logger=LANE_LOGGER):
+            result = await _check_post_merge_equivalence(
+                git_repo, adv, git_ops, main_sha, task_id=TASK, merged_tip=task_head,
+            )
+
+        assert result == []
+        record = _record(caplog, 'rename-pair diff')
+        assert record.startswith('post-merge-equiv: rename-pair diff ')
+        assert record.endswith(f'task_id={TASK}')
