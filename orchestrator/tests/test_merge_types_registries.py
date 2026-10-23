@@ -7,7 +7,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from orchestrator.merge_lane.types import InFlightMergeRegistry
+from orchestrator.merge_lane.types import InFlightMergeRegistry, MergeBounceRegistry
 
 
 @pytest.fixture
@@ -46,3 +46,24 @@ class TestAcquireSeedsTheEntry:
         assert entry is not None
         assert entry.request_id is None
         assert [w.request_id for w in entry.waiters] == ['']
+
+
+class TestMergeBounceRegistryClear:
+    def test_clearing_a_branch_that_never_bounced_is_a_no_op(self) -> None:
+        registry = MergeBounceRegistry()
+        registry.record_bounce('task/592')
+
+        registry.clear('task/591')
+
+        assert registry.count('task/591') == 0
+        assert registry.count('task/592') == 1
+
+    def test_clear_resets_a_bounced_branch_to_zero(self) -> None:
+        registry = MergeBounceRegistry()
+        registry.record_bounce('task/591')
+        registry.record_bounce('task/591')
+
+        registry.clear('task/591')
+
+        assert registry.count('task/591') == 0
+        assert registry.record_bounce('task/591') == 1
