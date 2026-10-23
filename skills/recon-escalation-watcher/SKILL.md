@@ -998,7 +998,7 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `dark_factory`/`df`/`dark-factory`, each invisible to a reap scoped to either of the others).
   - **Caveat — check your project's existing rows before trusting the declared token.** Folding
     merges spellings that differ only by case or separator; only an entry in
-    `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
+    `shared.project_id.PROJECT_ID_ALIASES` can bridge a project whose filed decisions fold to something *other*
     than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
     **solar-challenge is the known standing case**: its config declares `my_solar_challenge`, but
     its decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but

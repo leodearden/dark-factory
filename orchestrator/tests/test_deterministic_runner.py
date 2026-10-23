@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.proc_group import SigkillDispatch
 
 # The one orchestrator symbol imported at module scope (the rest are imported
 # inside each test, as this file has always done): a `parametrize` decorator is
@@ -4494,11 +4495,13 @@ class TestDefaultRunScriptEnv:
 # ---------------------------------------------------------------------------
 
 def _fake_pgid() -> int:
-    """A stand-in pgid that ``_unsafe_pgid_reason`` will never refuse.
+    """A stand-in pgid that ``shared.proc_group.unsafe_pgid_reason`` will never refuse.
 
-    ``_terminate_process_tree`` sanity-checks the pgid against this process's
-    own identifiers (task 3884 amendment), so a hard-coded literal can collide
-    with ``os.getpid()``/``os.getppid()``/``os.getpgrp()`` and make the helper
+    ``_terminate_process_tree`` delegates to
+    ``shared/src/shared/proc_group.py::sigkill_process_group``, which
+    sanity-checks the pgid against this process's own identifiers (task 3884
+    amendment), so a hard-coded literal can collide with
+    ``os.getpid()``/``os.getppid()``/``os.getpgrp()`` and make the helper
     refuse-and-fall-back instead of dispatching the killpg these tests assert
     on. That is ~1-in-1.4M with this box's ``pid_max=4194304``, but ~1-in-10k
     on the older 32768 default — a real flake, and a baffling one to debug.
@@ -4740,7 +4743,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
 
         pgid = _fake_pgid()
         mock_proc = MagicMock()
-        # pid must equal the pgid: _unsafe_pgid_reason refuses a mismatch as a
+        # pid must equal the pgid: unsafe_pgid_reason refuses a mismatch as a
         # corrupted capture, which would short-circuit before the killpg.
         mock_proc.pid = pgid
         # A bare MagicMock's `.returncode` is a truthy Mock (i.e. `is not None`),
@@ -4867,10 +4870,9 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         """An unsafe pgid must be refused and degraded to a direct kill().
 
         The residual defence behind the frozen capture and the reaped-proc
-        short-circuit: this helper reuses
-        ``shared.proc_group._unsafe_pgid_reason`` rather than growing a third
-        divergent copy of the same sanity checks (the shared helper and
-        ``df_pytest_isolation._kill_process_group`` are the other two).
+        short-circuit: this helper delegates the signal choice to
+        ``shared/src/shared/proc_group.py::sigkill_process_group``, whose
+        ``unsafe_pgid_reason`` check is what refuses here.
 
         ``own_process_group`` is the consequential case, not a synthetic one —
         it is precisely the task-845 outcome. A pgid that resolves to our OWN
@@ -4917,6 +4919,27 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             f'spawned SURVIVES — the caller must be able to learn that instead '
             f'of telling an operator the whole group is gone (task 4252 reviewer '
             f'finding): {result!r}'
+        )
+
+
+class TestProcessTeardownFromDispatch:
+    """ProcessTeardown.from_dispatch renders shared.proc_group's SigkillDispatch."""
+
+    @pytest.mark.parametrize(
+        ('dispatch', 'expected'),
+        [
+            (SigkillDispatch.GROUP_KILLED, ProcessTeardown.GROUP_KILLED),
+            (SigkillDispatch.DIRECT_KILLED, ProcessTeardown.DIRECT_KILLED),
+            (SigkillDispatch.NOT_SIGNALLED, ProcessTeardown.NOT_SIGNALLED),
+        ],
+    )
+    def test_maps_each_dispatch_to_its_namesake(self, dispatch, expected):
+        assert ProcessTeardown.from_dispatch(dispatch) is expected
+
+    def test_the_mapping_is_a_bijection(self):
+        assert len(SigkillDispatch) == len(ProcessTeardown)
+        assert {ProcessTeardown.from_dispatch(d) for d in SigkillDispatch} == set(
+            ProcessTeardown
         )
 
 

@@ -1267,17 +1267,36 @@ takes no arguments: it always re-reads that process's own
   switch, it only ever ADDS one verify before an advance, and it cannot
   split an in-flight merge's breadth. Contrast its **restart-only**
   neighbour `merge_verify_breadth`, which does change breadth mid-merge.
-- `merge_gate_history_pure` (task 6647; default `false`). Declares that every
-  leg of the project's merge gate judges the tree alone, reading no git
-  history. Only then does `merge_lane/gates.py::_reverify_rebased_tree` skip
-  the re-verify of a rebased tree byte-identical to the tree that just passed
-  (`gate_clearance: same_tree` on the `gate_retry` row, which records the
-  outcome; the gate's decision itself, skip or fire, is its
-  `merge_reverify_gate` row, `reason: same_tree`). Dark-factory ships it
-  `false`: several of its legs read HEAD's history (named in
-  `dark-factory-orchestrator.yaml` beside the key). Green-tier for the same
-  reason as the bullet above: read per gate evaluation, and it only decides
-  whether one more verify runs.
+- `merge_gate_history_pure` (tasks 6647, 7248; default `false`). Declares that
+  every leg of the project's merge gate judges the tree alone, except the
+  tests `merge_gate_history_test_command` selects. Only then does
+  `merge_lane/gates.py::_reverify_rebased_tree` forgo the full re-verify of a
+  rebased tree byte-identical to the tree that just passed. With no history
+  leg declared the gate skips (`merge_reverify_gate` row `reason: same_tree`,
+  `gate_retry` row `gate_clearance: same_tree`). Dark-factory ships it `true`
+  with a history leg, so a same-tree rebase runs only that leg (`reason:
+  same_tree_history_leg`, `gate_clearance: history_leg`). The leg runs through
+  `merge_lane/worker.py::_run_post_merge_verify` (runner `history-leg`, with
+  its own `merge_verify` row), so a red or unrunnable leg gets the same disk
+  guard, ENOSPC and infra-transient retry, transient-infra hold, main-health
+  probe, timeout loop-breaker and task-fault reason as a red re-verify. The
+  main-health probe re-runs the task's own scoped commands on bare main, not
+  the leg, so a leg red that main shares is classified main-red only when
+  those commands reproduce its failure signature; otherwise it blocks as a
+  task fault.
+  Green-tier for the same reason as the bullet above: read per gate
+  evaluation, and it only decides whether one more verify runs.
+- `merge_gate_history_test_command` (task 7248; default unset). The shell
+  command, run from the merge worktree root, that runs exactly the gate's
+  history-reading tests. Dark-factory's leg runs the `reads_git_history`
+  marker per owning package;
+  `tests/scripts/test_merge_gate_history_leg.py::test_every_history_reader_in_the_gate_is_accounted_for`
+  fails on an unmarked reader,
+  `tests/scripts/test_merge_gate_history_leg.py::test_every_test_file_importing_a_history_helper_is_accounted_for`
+  on an unmarked test file importing a history-reading helper, and
+  `tests/scripts/test_merge_gate_history_leg.py::test_the_leg_runs_exactly_the_roots_that_own_marked_tests`
+  keeps the leg's segments on the packages that own marked tests. Green-tier
+  for the same reason as `merge_gate_history_pure`.
 - `merge_deep.chain_cap` (the deep merge-ahead chain cap — see
   [§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap);
   `0` is the shipped default and the feature's kill switch). Green-tier on
@@ -2855,9 +2874,18 @@ is how an operator ends up tuning the sampler for a crashed coder:
   re-observed the doors. The verdict deliberately names **no** door — the
   counters in that record belong to the crashed night, which legitimately
   has none.
+- **barren streak *carried under a deferral*** — the streak is at threshold
+  but the last recorded run was `deferred`: the usage cap deferred its
+  coding, so it re-observed neither door. The streak is still unresolved.
+  There is no crash to clear and no door to name; the deferral clears at the
+  cap reset, so re-read the probe once a run has completed.
 - **`missing` / `malformed` / stale** — the recorder itself stopped. The
   nightly is not writing state at all, so neither streak means anything yet.
 - **`quiet`** — a legitimately quiet night. Never alarms, by construction.
+- **`deferred`** — a usage-cap night (`coder.is_cap_deferral`): its digests
+  were selected and the cap deferred their coding. No action; it self-clears
+  at the reset. It keeps `last_productive_at` and both streaks unchanged and
+  owes its date a retry (see "Retried nights").
 - **census fired without advancing** — the census trigger FIREd on at least N
   (default 3) consecutive recorded trickle nights while `last_census_at`
   stayed put, and every such night launches a paid census. A census deferred
@@ -2872,8 +2900,8 @@ is how an operator ends up tuning the sampler for a crashed coder:
 **Retried nights** (task 5678). A night that did not finish (a non-zero exit,
 or a usage-cap DEFERRED night) leaves its date in the `retry_backlog` key of
 `trickle-state.json`, as `{date: unfinished attempts}`. A DEFERRED night
-records `capped: true` and still reads `productive`, since its digests were
-built, but it leaves `last_productive_at` unchanged, since it coded nothing.
+records `outcome: deferred` and `capped: true`, and leaves
+`last_productive_at` unchanged, since it coded nothing.
 The next night whose own pass finishes runs one extra pass for the oldest
 owed date, with its own byte budget. That pass skips sessions the session
 ledger already holds and never launches a census. It rewrites only `retry_backlog`, so the rest of the
@@ -2900,16 +2928,27 @@ dates already past the window are abandoned in one WARNING,
 `legibility-trickle-<project_id>`, so the two histories stay separately
 readable), `category=infra_issue`, `severity=info`. It stays **silent** in two
 cases: a liveness-only failure (a unit that ran and failed is already owned by
-the nightly's own escalation for that same run) and the exact night the
-nightly's edge-triggered barren-streak escalation fired — **and, in that
-second case, only while that record is still fresh** (within the same
-`max_age_hours` window the progress probe uses). So it never doubles an alarm
-the nightly already raised, and no failure mode can silence it permanently: a
-recorder that stops on a night landing exactly on the barren threshold goes
-stale, and the probe takes over. Those two silence cases apply to the
-progress and liveness probes only: a census-probe failure **always** posts,
-because nothing else escalates an unadvanced-fire streak. A non-zero exit is
-the authoritative signal whether or not the POST landed.
+the nightly's own escalation for that same run), and a night for which
+`trickle-state.json` **records** `barren_escalated: true` — the nightly posted
+its barren-streak escalation and wrote down that the post landed — **and only
+while that record is still fresh** (within the same `max_age_hours` window the
+progress probe uses). The probe never re-derives the nightly's threshold, so a
+nightly whose post failed, or one running at another threshold, does not
+silence it; and a recorder that stops on the threshold night goes stale, so
+nothing silences it permanently. A document written before the field existed
+reads `barren_escalated unrecorded` and does not suppress: at most one extra
+info escalation, on the first night after deploy, and its detail says why.
+Those silence cases apply to the progress and liveness probes only: a
+census-probe failure **always** posts, because nothing else escalates an
+unadvanced-fire streak. A non-zero exit is the authoritative signal whether or
+not the POST landed.
+
+The nightly escalates once per streak, on the night the barren streak reaches
+its threshold: `trickle_state.DEFAULT_MAX_BARREN_RUNS` (3), or
+`nightly.py run --max-barren-runs N`. To read whether it did, run
+`python3 scripts/legibility/check_trickle_progress.py <project> <N>`: every
+verdict on a readable record, and its OK line, prints `barren_escalated=` as
+`True`, `False`, or `unrecorded`.
 
 **Where the state file lives.**
 

@@ -321,11 +321,11 @@ path. It writes nowhere but O. The portal account reads O and nothing under R.
 | B10 | Waiting on Leo | task 9 blocked with an open `escalation_created` level 2 | `task_upserted.waiting_on == "leo"`; after `escalation_resolved`, `"factory"` |
 | B11 | Visible set | tree with `dark-factory-orchestrator.yaml`, `.mcp.json`, `plans/review.md`, `src/a.py`; policy visible `src/**`, `tests/**` | `tree_snapshot.files` lists only `src/a.py`; a reveal of `.mcp.json` is `reveal_refused not_visible` |
 | B12 | Reveal within budget | 1,000 counted lines, proportion 0.25, floor 50; request a 200-line production file | `file_revealed` with content; `spent_lines == 200` |
-| B13 | Reveal over budget and floor | spent 200 of 250; request a 100-line file; then a 10-line file | both `reveal_refused over_budget` (the second costs 50) |
+| B13 | Reveal over budget and floor | spent 210 of 250; request a 100-line file; then a 10-line file | both `reveal_refused over_budget` (the first costs 100: 310 > 250; the second costs the floor 50: 260 > 250) |
 | B14 | Free set | request a test file | granted; `spent_lines` unchanged |
 | B15 | Hostile paths | requests for `../x`, `/etc/passwd`, a symlink entry, an untracked path | four `reveal_refused` with reasons `not_in_tree`, `not_in_tree`, `symlink`, `not_in_tree`; nothing read outside the tree (B1's hook) |
 | B16 | Follow head | a revealed file changes in a later commit; another is renamed; a third deleted then recreated | re-emitted; `renamed_from`; `deleted: true` then no content until a new request |
-| B17 | Paid code free | `delivered_commit` set; a file unchanged since it | excluded from counted lines; its reveal costs 0 |
+| B17 | Paid code free | `delivered_commit` set; a file unchanged since it | outside the counted set: excluded from counted lines, and its reveal costs 0 |
 | B18 | Restart and torn tail | kill mid-append leaving a partial line; restart | the torn line is truncated and logged; no duplicate `seq`; no re-emitted `merge_landed`; `cursor.json` consistent |
 | B19 | Degraded source | runs.db unreadable | heartbeat `degraded` names `events`; other sources still publish |
 | B20 | Criteria | criteria.yaml with C-1..C-3; a junit and map binding C-1 pass, C-2 fail, none for C-3 | `criteria_results {verify}`: passed, failed, not_run |
@@ -496,6 +496,94 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     handler never sets the stop Event while its own thread holds that Event's lock
     (`client-feed/src/client_feed/cli.py::_publish_until_signalled`). δ's inbox tail is
     `client-feed/src/client_feed/inbox.py::read_inbox`, with its offset in `Cursor.inbox_offset`.
+- 2026-10-22, from task 7221 (B22). These bind γ (6970) and ε (6972):
+  - (a) A test case id reaches the feed through
+    `client-feed/src/client_feed/sources/archive.py::_case_id`, which applies
+    `client-feed/src/client_feed/redact.py::redact_paths`. γ emits `read_archived_run`'s case ids as
+    they are and never re-derives them.
+  - (b) ε's `criteria_results` `results[].tests` carries those same ids. The collection map's nodeids
+    are converted to that spelling, redaction included, before the join, so both sides of the join
+    pass through the one rule and no raw nodeid is emitted. The staging CLI
+    (`client-feed criteria-results --run-kind staging`) follows the same rule.
+  - (c) Case ids were never unique, and redaction can merge parametrized ids (measured 2026-10-22 on
+    task 5244's archived junits: 90,933 cases, 3,199 duplicate ids before redaction and 3,220
+    after). A join must not assume one case per id.
+
+- 2026-10-22, from δ (task 6971). These bind ζ (6973) and the portal:
+  - (a) A request is refused for the first reason that holds, in the order `not_in_tree`,
+    `not_visible`, `symlink`, `not_revealable` (a `never_reveal_globs` match, or a blob that is not
+    UTF-8), `over_budget` (`client-feed/src/client_feed/budget.py::judge`). A submodule is refused as
+    `symlink`. Tree membership is the request's raw `path` text looked up among the paths `git
+    ls-tree` lists at main's head (`client-feed/src/client_feed/sources/git.py::tree_entries`); it is
+    never normalized, joined to a directory or opened on disk. Content is read only after the path,
+    visibility and kind checks, by the entry's blob sha through `git cat-file --batch`
+    (`client-feed/src/client_feed/sources/git.py::blob_reader`).
+  - (b) A path costs `max(lines, reveal_floor_lines)` only inside the counted set, and 0 outside it
+    (`client-feed/src/client_feed/budget.py::CountedSet.cost`). The counted set is head's production
+    files that match neither `free_globs` nor `never_reveal_globs` and have more than 0 chargeable
+    lines (`client-feed/src/client_feed/budget.py::counted_set`). `spent_lines` is not a running
+    total: it is recomputed at head from the revealed set, so a path that leaves the counted set
+    stops costing (`client-feed/src/client_feed/budget.py::CountedSet.spent`). A path already
+    revealed is granted again without a budget check
+    (`client-feed/src/client_feed/budget.py::CountedSet.grantable`). With a `delivered_commit`, a
+    file's chargeable lines are the lines it added or changed since that commit. Paths are paired by
+    `git diff-tree -M`, and each changed blob pair's added lines are counted by
+    `client-feed/src/client_feed/policy.py::Policy.counted_lines`, not by numstat
+    (`client-feed/src/client_feed/budget.py::lines_since`). A file added since then is charged all
+    its counted lines, and a pure rename is charged none.
+  - (c) `RevealBudget` is said only inside `tree_snapshot`. When the budget changes and the tree
+    does not, the state's tree is re-emitted at the same commit with the new budget
+    (`client-feed/src/client_feed/value_events.py::budget_event`). Two `tree_snapshot` lines with one
+    `commit` are therefore not a duplicate: the later one's budget is current.
+  - (d) The engagement is read first in each pass
+    (`client-feed/src/client_feed/engagement.py::read_engagement`). A missing, unreadable (a symlink
+    included) or invalid file, or a `delivered_commit` the repository does not hold, is named
+    `engagement` in `degraded` (`client-feed/src/client_feed/engagement.py::EngagementUnusable`).
+    Reveals are then disabled for that pass: the inbox is not read, its offset is held, nothing is
+    followed, and a new tree's budget uses §4.12's null `delivered_commit` rule. When the engagement
+    is usable but the reveal unit fails (a git error, say), that unit's source is named in
+    `degraded`, the inbox offset and `reveals_head` are held, and a new tree keeps the state's last
+    budget instead of switching to the null rule for one pass
+    (`client-feed/src/client_feed/publisher.py::_new_tree_budget`). A `project_id` other
+    than the policy's is the refusal
+    `client-feed/src/client_feed/engagement.py::EngagementProjectMismatch`, a `FeedError`: the pass
+    stops before anything is appended, and the CLI exits 1. `heartbeat.engagement_version` echoes
+    only a usable engagement's version, and is null otherwise
+    (`client-feed/src/client_feed/publisher.py::run_pass`).
+  - (e) An inbox that cannot be read (unreadable, a symlink, or shorter than the cursor's offset) is
+    `inbox` in `degraded`, and its offset is held
+    (`client-feed/src/client_feed/inbox.py::InboxUnusable`). A line that is not a reveal request is
+    rejected, never raised: it is counted under `inbox`, and the tail moves past it with the requests
+    around it (`client-feed/src/client_feed/publisher.py::_inbox_unit`).
+  - (f) Follow-head walks main's first-parent commits after `Cursor.reveals_head` through head,
+    oldest first, in one `git log --first-parent -M --raw`
+    (`client-feed/src/client_feed/sources/git.py::first_parent_changes`,
+    `client-feed/src/client_feed/reveals.py::_tracks`). A revealed file whose blob changed is
+    re-emitted at head, and a renamed one is emitted at its new path with `renamed_from`. Its reveal
+    ends with a `file_revealed` at its revealed path with `deleted: true` when the path is deleted,
+    or when at head it is no longer revealable. A followed path is never refused for budget. A path
+    recreated after its delete is not followed, and a change reverted within the walk emits nothing
+    (`client-feed/src/client_feed/reveals.py::_follow_events`). When `reveals_head` is null or no
+    longer an ancestor of head, each revealed file is diffed from its own `commit` to head instead.
+    In one pass the ends come first, then the re-emits, then the inbox's answers in inbox order.
+  - (g) The revealed set's only home is `state.revealed` (path, commit, lines), folded from
+    `file_revealed` (`client-feed/src/client_feed/fold.py::_apply_file_revealed`). `cursor.json`
+    holds `reveals_head`, `inbox_offset` and `added_line_counts`, and no per-path blob shas
+    (`client-feed/src/client_feed/feed_io.py::Cursor`). `added_line_counts` caches (b)'s counted
+    added lines by old then new blob sha, valid only under the `max_line_bytes` they were counted
+    with, as `line_counts` does for whole blobs. A pair already counted is not diffed again, and
+    only the pairs of the latest count are kept
+    (`client-feed/src/client_feed/budget.py::AddedLineCounts`). All three move only when the reveal
+    unit runs and succeeds; an inbox read holding no request moves its offset alone
+    (`client-feed/src/client_feed/publisher.py::_advanced`). After a crash between the append and
+    the cursor, an answer whose identity (what it says, without its envelope) is in the uncommitted
+    tail is consumed there and not emitted again
+    (`client-feed/src/client_feed/reveals.py::answer_of`).
+  - (h) The portal's `in-v1` fixture is vendored byte for byte at
+    `client-feed/tests/fixtures/in-v1` from scoping-intake
+    `f5cea40d8354190c9fa0cce260b2e69adc79ea3a`. Its `delivered_commit` is a fixture sha that no test
+    repository holds, so read as vendored it disables reveals. A test that needs a usable engagement
+    sets it to null after reading the vendored file (`client-feed/tests/test_in_v1_fixture.py`).
 
 ## 13. Open questions (tactical)
 

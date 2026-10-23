@@ -26,9 +26,7 @@ const { plainDatum, derivedDatum, servedDatum, datumView } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState, burndownDatum, forecastText } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 // Every OrchTab count is a named reading over the served census — task_snapshot.js.
-const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRows, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS: TASK_CENSUS_VIEWS, CENSUS_TILES: TASK_CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
-// data.js's one copy of the on-demand terminal window's key.
-const { ON_DEMAND_KEYS: LOADER_ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
+const { projectCensus, censusOver, projectRows, viewRows, terminalSelectingProjects, createTerminalWindowHooks, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS: TASK_CENSUS_VIEWS, CENSUS_TILES: TASK_CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
 // Windowed headers are labelled from the payload's served-window echo — window_chip.js.
 const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const {
@@ -42,6 +40,8 @@ const { useState: uS } = React;
 // The persisted UI-preference hooks — persisted_state.js.
 const { createPersistedHooks } = window.DF_PERSISTED_STATE;
 const { usePersistedState, useOpenSet } = createPersistedHooks(React);
+// OrchTab requests and lists terminal windows through task_snapshot.js's hook.
+const { useTerminalWindows } = createTerminalWindowHooks(React, window.DF_DATA_LOADER);
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
 // endpoint-granular until PRD leaf beta puts a served Datum on the wire, and the
@@ -251,6 +251,8 @@ function OrchTab({ projectFilter, search }) {
     const cur = getFilter(pid);
     setFilterMap({ ...filterMap, [pid]: { ...cur, [key]: !cur[key] } });
   };
+  const wanted = terminalSelectingProjects(matches.map(o => ({ project: o.project, filter: getFilter(o.pid) })));
+  const terminalWindowOf = useTerminalWindows(DF, wanted);
 
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
@@ -264,7 +266,7 @@ function OrchTab({ projectFilter, search }) {
       {matches.map(o => {
         const census = projectCensus(DF, o.project);
         const filter = getFilter(o.pid);
-        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), unrequestedTerminalRows(DF[LOADER_ON_DEMAND_KEYS.terminal.key(o.project)]), filter);
+        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), terminalWindowOf(o.project), filter);
         const filtered = rows.filter(matchesSearch);
 
         const summary = (

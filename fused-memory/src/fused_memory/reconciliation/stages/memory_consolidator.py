@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -34,8 +34,7 @@ from fused_memory.reconciliation.degenerate_task_node_sweep import (
 from fused_memory.reconciliation.flag_dedup import (
     EntityStandingSuppressionResult,
     acknowledge_resolved_flags,
-    compute_content_fingerprint_signature,
-    compute_flag_signature,
+    compute_marker_signature,
     dedup_flags,
     filter_accounted_cluster_growth_flags,
     filter_already_recorded_caveat_flags,
@@ -911,16 +910,9 @@ class MemoryConsolidator(BaseStage):
             report.stats['entity_standing_decision_suppressed'] = sum(
                 _esd_result.suppressed_by_decision.values()
             )
-            _esd_kept_signatures = {
-                sig for f in report.items_flagged
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None
-            }
-            esd_suppressed_signatures = {
-                sig for f in _pre_esd_flags
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None and sig not in _esd_kept_signatures
-            }
+            esd_suppressed_signatures = _marker_signatures(
+                _pre_esd_flags, project_id=self.project_id
+            ) - _marker_signatures(report.items_flagged, project_id=self.project_id)
             # Per-cycle "storm escape": one active decision suppressing more than the
             # threshold in a single cycle is a signal it may be over-broad or the
             # entity's situation changed — file one L1 recon escalation for that
@@ -993,16 +985,9 @@ class MemoryConsolidator(BaseStage):
             # separately above, out of dedup_flags' `stats` out-dict, alongside
             # the `reconciliation.stage1_flag_cross_project_fix_task_suppressed`
             # INFO log that names the specific fix task behind each drop.
-            _post_dedup_signatures = {
-                sig for f in report.items_flagged
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None
-            }
-            suppressed_signatures = {
-                sig for f in _pre_dedup_flags
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None and sig not in _post_dedup_signatures
-            }
+            suppressed_signatures = _marker_signatures(
+                _pre_dedup_flags, project_id=self.project_id
+            ) - _marker_signatures(report.items_flagged, project_id=self.project_id)
             # Fold in the entity-standing-decision drops (task 2896 γ): they are a
             # suppression, not a resolution, so — exactly like dedup_flags' own
             # suppression drops above — their signatures are excluded from
@@ -1028,17 +1013,13 @@ class MemoryConsolidator(BaseStage):
             # list through each filter, so none of the filters' contracts change.
             # suppressed_signatures (computed above) is explicitly subtracted out —
             # suppression is not the same as resolved; see the snapshot comment above.
-            surviving_signatures = {
-                sig for f in report.items_flagged
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None
-            }
+            surviving_signatures = _marker_signatures(
+                report.items_flagged, project_id=self.project_id
+            )
             dropped_flags = [
                 f for f in _pre_filter_flags
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None
-                and sig not in surviving_signatures
-                and sig not in suppressed_signatures
+                if _marker_signatures([f], project_id=self.project_id)
+                - surviving_signatures - suppressed_signatures
             ]
             report.stats['stage1_flag_markers_acknowledged'] = await acknowledge_resolved_flags(
                 memory_service=self.memory,
@@ -1968,6 +1949,17 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}
 """
+
+
+def _marker_signatures(
+    flags: Iterable[dict[str, Any]], *, project_id: str
+) -> set[tuple[str, str]]:
+    """The ``stage1_flag_marker`` identities of *flags*, so every diff in
+    :meth:`MemoryConsolidator.run` compares keys from one identity space."""
+    return {
+        sig for f in flags
+        if (sig := compute_marker_signature(f, project_id=project_id)) is not None
+    }
 
 
 def _to_utc(dt: datetime) -> datetime:

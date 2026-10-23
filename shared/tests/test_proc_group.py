@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -22,6 +23,7 @@ import shared.proc_group as proc_group_module
 from shared.proc_group import (
     MalformedStatLine,
     ProcessGroupMember,
+    SigkillDispatch,
     StatFields,
     pid_running,
     process_group_members,
@@ -898,6 +900,15 @@ class _KillRecordingProc:
         self.killed = True
 
 
+def _pgid_no_guard_refuses() -> int:
+    """A stand-in pgid distinct from this process's pid, parent pid and own group."""
+    live = {os.getpid(), os.getppid(), os.getpgrp()}
+    candidate = 12345
+    while candidate in live:
+        candidate += 1
+    return candidate
+
+
 class TestSigkillProcessGroup:
     """sigkill_process_group: an immediate, signal-only SIGKILL of a frozen pgid."""
 
@@ -919,9 +930,10 @@ class TestSigkillProcessGroup:
             await _await_shell_ready(proc, what='both background jobs forked')
             await _await_group_membership(pgid, total=3, comm='sleep', comm_count=2)
 
-            sigkill_process_group(proc, pgid)
+            dispatch = sigkill_process_group(proc, pgid)
 
             await proc.wait()
+            assert dispatch is SigkillDispatch.GROUP_KILLED
             assert proc.returncode == -signal.SIGKILL, (
                 f'expected an immediate SIGKILL (-9), got {proc.returncode}'
             )
@@ -951,21 +963,24 @@ class TestSigkillProcessGroup:
             'shared.proc_group.os.killpg', lambda pgid, sig: calls.append((pgid, sig))
         )
 
-        sigkill_process_group(proc, pgid)
+        dispatch = sigkill_process_group(proc, pgid)
 
+        assert dispatch is SigkillDispatch.NOT_SIGNALLED
         assert calls == [], f'killpg must not fire on a reaped leader; got {calls}'
 
     @pytest.mark.timeout(5)
     def test_unsafe_pgid_is_refused_and_degrades_to_a_direct_kill(self, monkeypatch, caplog):
+        pgid = _pgid_no_guard_refuses()
         calls: list[tuple[int, int]] = []
         monkeypatch.setattr(
-            'shared.proc_group.os.killpg', lambda pgid, sig: calls.append((pgid, sig))
+            'shared.proc_group.os.killpg', lambda target, sig: calls.append((target, sig))
         )
-        fake = _KillRecordingProc(pid=999_999)
+        fake = _KillRecordingProc(pid=pgid + 1)
 
         with caplog.at_level(logging.ERROR, logger='shared.proc_group'):
-            sigkill_process_group(fake, 999_998)  # type: ignore[arg-type]
+            dispatch = sigkill_process_group(cast(asyncio.subprocess.Process, fake), pgid)
 
+        assert dispatch is SigkillDispatch.DIRECT_KILLED
         assert calls == [], f'killpg should be refused; got {calls}'
         assert fake.killed, 'a refused group kill must still kill the direct child'
         assert any(
@@ -974,14 +989,20 @@ class TestSigkillProcessGroup:
 
     @pytest.mark.timeout(5)
     def test_killpg_failure_degrades_to_a_direct_kill(self, monkeypatch):
-        def failing_killpg(pgid: int, sig: int) -> None:
+        pgid = _pgid_no_guard_refuses()
+        calls: list[tuple[int, int]] = []
+
+        def failing_killpg(target: int, sig: int) -> None:
+            calls.append((target, sig))
             raise ProcessLookupError(errno.ESRCH, 'no such process group')
 
         monkeypatch.setattr('shared.proc_group.os.killpg', failing_killpg)
-        fake = _KillRecordingProc(pid=999_999)
+        fake = _KillRecordingProc(pid=pgid)
 
-        sigkill_process_group(fake, 999_999)  # type: ignore[arg-type]
+        dispatch = sigkill_process_group(cast(asyncio.subprocess.Process, fake), pgid)
 
+        assert dispatch is SigkillDispatch.DIRECT_KILLED
+        assert calls == [(pgid, signal.SIGKILL)]
         assert fake.killed, 'a failed group kill must still kill the direct child'
 
 

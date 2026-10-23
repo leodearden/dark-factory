@@ -18,9 +18,11 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import click
 from dotenv import load_dotenv
+from shared.project_layout import tasks_db
 
 from orchestrator.config import ConfigRequiredError, OrchestratorConfig, load_config
 from orchestrator.config_census_ignore import audit_census_ignore_entries
+from orchestrator.main_checkout_defaults import cli_default
 from orchestrator.verify_cancel import (
     WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     WATCHDOG_KILL_GRACE_SECS,
@@ -1461,9 +1463,8 @@ def eval_list_fixtures_cmd(tasks_dir: Path | None, cohort: str | None, audit: bo
                    'branches or writing fixtures')
 @click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
               help='Where fixture JSONs are written (default: orchestrator/evals/tasks)')
-@click.option('--df-root', type=click.Path(path_type=Path),
-              default=Path('/home/leo/src/dark-factory'),
-              help='dark_factory checkout to discover merges in')
+@click.option('--df-root', type=click.Path(path_type=Path), default=None,
+              help='dark_factory checkout to discover merges in (default: the main checkout)')
 @click.option('--reify-root', type=click.Path(path_type=Path),
               default=Path('/home/leo/src/reify'),
               help='reify checkout to discover merges in')
@@ -1471,7 +1472,7 @@ def eval_list_fixtures_cmd(tasks_dir: Path | None, cohort: str | None, audit: bo
               help='ISO-8601 provenance timestamp (default: now, UTC)')
 def eval_sample_cmd(since: str, target_low: int, target_high: int, seed: int,
                     cohort: str, dry_run: bool, tasks_dir: Path | None,
-                    df_root: Path, reify_root: Path, sampled_at: str | None):
+                    df_root: Path | None, reify_root: Path, sampled_at: str | None):
     """Cut a stratified near-HEAD eval-fixture corpus from both repos.
 
     Discovers completed-task merges in the df + reify checkouts, samples them
@@ -1484,7 +1485,8 @@ def eval_sample_cmd(since: str, target_low: int, target_high: int, seed: int,
     asyncio.run(_run_eval_sample(
         since=since, target_low=target_low, target_high=target_high, seed=seed,
         cohort=cohort, dry_run=dry_run, tasks_dir=tasks_dir,
-        df_root=Path(df_root), reify_root=Path(reify_root), sampled_at=sampled_at,
+        df_root=df_root or cli_default('--df-root', Path), reify_root=Path(reify_root),
+        sampled_at=sampled_at,
     ))
 
 
@@ -1517,9 +1519,7 @@ async def _run_eval_sample(*, since: str, target_low: int, target_high: int,
         found = await discover_completed_tasks(
             root, since=since, project=project, project_root=str(root),
         )
-        found = enrich_candidates_from_task_db(
-            found, root / '.taskmaster' / 'tasks' / 'tasks.db',
-        )
+        found = enrich_candidates_from_task_db(found, tasks_db(root))
         click.echo(f'discovered {len(found)} completed-task merge(s) in {project}')
         candidates.extend(found)
 

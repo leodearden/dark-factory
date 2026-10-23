@@ -22,76 +22,76 @@
   "projects": {
     "dark_factory": {
       "total": {
-        "records": 33206,
+        "records": 33381,
         "keys": {
           "entries": [
             {
               "value": "category",
-              "count": 33206
+              "count": 33381
             },
             {
               "value": "created_at",
-              "count": 33206
+              "count": 33381
             },
             {
               "value": "data",
-              "count": 33206
+              "count": 33381
             },
             {
               "value": "hash",
-              "count": 33206
+              "count": 33381
             },
             {
               "value": "user_id",
-              "count": 33206
+              "count": 33381
             },
             {
               "value": "updated_at",
-              "count": 31946
+              "count": 32121
             },
             {
               "value": "agent_id",
-              "count": 26215
+              "count": 26334
             },
             {
               "value": "role",
-              "count": 24024
+              "count": 24199
             },
             {
               "value": "task_id",
-              "count": 10505
+              "count": 10628
             },
             {
               "value": "source",
-              "count": 8189
+              "count": 8267
             },
             {
               "value": "transition",
-              "count": 7350
+              "count": 7406
             },
             {
               "value": "_causation_id",
-              "count": 3620
+              "count": 3626
             },
             {
               "value": "_deferred",
-              "count": 3594
+              "count": 3600
             },
             {
               "value": "stage2_suppress",
-              "count": 3007
+              "count": 3063
             },
             {
               "value": "echo_used_provenance",
-              "count": 2936
+              "count": 2988
             },
             {
               "value": "kind",
-              "count": 2304
+              "count": 2368
             },
             {
               "value": "topic",
-              "count": 2256
+              "count": 2294
             },
             {
               "value": "run_id",
@@ -103,7 +103,7 @@
             },
             {
               "value": "parent_id",
-              "count": 1032
+              "count": 1096
             },
             {
               "value": "commit",
@@ -111,7 +111,7 @@
             },
             {
               "value": "x_contested",
-              "count": 263
+              "count": 282
             },
             {
               "value": "task_ref",
@@ -122,12 +122,12 @@
               "count": 234
             },
             {
-              "value": "task_ids",
+              "value": "supersedes",
               "count": 204
             },
             {
-              "value": "supersedes",
-              "count": 201
+              "value": "task_ids",
+              "count": 204
             },
             {
               "value": "date",
@@ -354,12 +354,20 @@
               "count": 36
             },
             {
+              "value": "echo_suppressed_stale_description",
+              "count": 35
+            },
+            {
               "value": "task_refs",
               "count": 35
             },
             {
-              "value": "echo_suppressed_stale_description",
-              "count": 34
+              "value": "x_contested_by_triage",
+              "count": 35
+            },
+            {
+              "value": "echo_unverified_completion",
+              "count": 32
             },
             {
               "value": "provenance",
@@ -383,10 +391,6 @@
             },
             {
               "value": "corrected_by_run",
-              "count": 29
-            },
-            {
-              "value": "echo_unverified_completion",
               "count": 29
             },
             {
@@ -515,10 +519,6 @@
             },
             {
               "value": "written_by_stage",
-              "count": 16
-            },
-            {
-              "value": "x_contested_by_triage",
               "count": 16
             },
             {
@@ -4458,6 +4458,10 @@
               "count": 1
             },
             {
+              "value": "x_parent_hint",
+              "count": 1
+            },
+            {
               "value": "x_prd",
               "count": 1
             },
@@ -4538,13 +4542,13 @@
               "count": 1
             }
           ],
-          "distinct_total": 1128
+          "distinct_total": 1129
         },
         "kind": {
           "entries": [
             {
               "value": "amendment",
-              "count": 981
+              "count": 1043
             },
             {
               "value": "cycle_summary",
@@ -4564,7 +4568,7 @@
             },
             {
               "value": "sighting",
-              "count": 56
+              "count": 58
             },
             {
               "value": "completion_note",
@@ -5473,16 +5477,16 @@
           ],
           "distinct_total": 232
         },
-        "kind_missing": 30902,
+        "kind_missing": 31013,
         "source": {
           "entries": [
             {
               "value": "targeted_reconciliation",
-              "count": 7263
+              "count": 7319
             },
             {
               "value": "orchestrator_completion",
-              "count": 437
+              "count": 458
             },
             {
               "value": "remediation_run",
@@ -5601,6 +5605,10 @@
               "count": 6
             },
             {
+              "value": "agent",
+              "count": 5
+            },
+            {
               "value": "esc-704-4",
               "count": 5
             },
@@ -5615,10 +5623,6 @@
             {
               "value": "stage1_milestone_flag",
               "count": 5
-            },
-            {
-              "value": "agent",
-              "count": 4
             },
             {
               "value": "escalation-measurement",
@@ -5975,11 +5979,11 @@
           "entries": [
             {
               "value": "targeted_reconciliation",
-              "count": 7257
+              "count": 7313
             },
             {
               "value": "orchestrator_completion",
-              "count": 376
+              "count": 388
             },
             {
               "value": "remediation_run",
@@ -6416,7 +6420,7 @@
           ],
           "distinct_total": 110
         },
-        "topic_present": 2256,
+        "topic_present": 2294,
         "topic": {
           "entries": [
             {
@@ -6800,6 +6804,10 @@
               "count": 3
             },
             {
+              "value": "asyncio-cancel-before-first-step",
+              "count": 3
+            },
+            {
               "value": "claude-cli-bash-cwd-persistence",
               "count": 3
             },
@@ -6813,6 +6821,10 @@
             },
             {
               "value": "eval-results-dir-cell-shapes",
+              "count": 3
+            },
+            {
+              "value": "fused-memory-test-helper-modules",
               "count": 3
             },
             {
@@ -6920,10 +6932,6 @@
               "count": 2
             },
             {
-              "value": "asyncio-cancel-before-first-step",
-              "count": 2
-            },
-            {
               "value": "asyncio-subprocess-mid-spawn-cancel",
               "count": 2
             },
@@ -7004,6 +7012,10 @@
               "count": 2
             },
             {
+              "value": "flake-debt-nested-pytest-basetemp-cluster",
+              "count": 2
+            },
+            {
               "value": "fleet-restart-cadence-2026-10-20",
               "count": 2
             },
@@ -7021,10 +7033,6 @@
             },
             {
               "value": "fused-memory-test-config-isolation",
-              "count": 2
-            },
-            {
-              "value": "fused-memory-test-helper-modules",
               "count": 2
             },
             {
@@ -7132,6 +7140,10 @@
               "count": 2
             },
             {
+              "value": "review-all-program-tooling",
+              "count": 2
+            },
+            {
               "value": "ruff-e402-sys-path-insert",
               "count": 2
             },
@@ -7148,6 +7160,10 @@
               "count": 2
             },
             {
+              "value": "test-done-phase-wedge-load-flake",
+              "count": 2
+            },
+            {
               "value": "update-memory-metadata-patch-authz-gate",
               "count": 2
             },
@@ -7157,6 +7173,10 @@
             },
             {
               "value": "verify-resource-measurement",
+              "count": 2
+            },
+            {
+              "value": "verify-scope-spawn-failure",
               "count": 2
             },
             {
@@ -7336,6 +7356,10 @@
               "count": 1
             },
             {
+              "value": "blocked-task-pinning",
+              "count": 1
+            },
+            {
               "value": "branch-touched-set-measurement",
               "count": 1
             },
@@ -7444,6 +7468,10 @@
               "count": 1
             },
             {
+              "value": "client-feed-delta-reveal-api",
+              "count": 1
+            },
+            {
               "value": "client-feed-fixtures",
               "count": 1
             },
@@ -7452,7 +7480,15 @@
               "count": 1
             },
             {
+              "value": "client-feed-reveals-api",
+              "count": 1
+            },
+            {
               "value": "client-feed-sources-api",
+              "count": 1
+            },
+            {
+              "value": "clip-disclosure-migration",
               "count": 1
             },
             {
@@ -7505,6 +7541,10 @@
             },
             {
               "value": "config-and-fleet-facts",
+              "count": 1
+            },
+            {
+              "value": "config-dir-archival-allowlist",
               "count": 1
             },
             {
@@ -7733,6 +7773,10 @@
             },
             {
               "value": "delivered-checks-constrain-refactors",
+              "count": 1
+            },
+            {
+              "value": "delivered-checks-grep-semantics",
               "count": 1
             },
             {
@@ -8108,7 +8152,7 @@
               "count": 1
             },
             {
-              "value": "flake-debt-nested-pytest-basetemp-cluster",
+              "value": "flake-debt-duplicate-check",
               "count": 1
             },
             {
@@ -8176,11 +8220,19 @@
               "count": 1
             },
             {
+              "value": "fused-memory-async-worker-test-flakes",
+              "count": 1
+            },
+            {
               "value": "fused-memory-backend-timeout-posture",
               "count": 1
             },
             {
               "value": "fused-memory-classifier-test-stubs",
+              "count": 1
+            },
+            {
+              "value": "fused-memory-config-reconciliation-non-optional",
               "count": 1
             },
             {
@@ -8225,6 +8277,10 @@
             },
             {
               "value": "fused-memory-pytest-xdist",
+              "count": 1
+            },
+            {
+              "value": "fused-memory-real-store-test-seeding",
               "count": 1
             },
             {
@@ -8432,6 +8488,10 @@
               "count": 1
             },
             {
+              "value": "inline-suppression-disposition-markers",
+              "count": 1
+            },
+            {
               "value": "instrument-report-records",
               "count": 1
             },
@@ -8453,6 +8513,10 @@
             },
             {
               "value": "inv13_convention",
+              "count": 1
+            },
+            {
+              "value": "inv8-loop-blocking-scanner",
               "count": 1
             },
             {
@@ -8665,6 +8729,10 @@
             },
             {
               "value": "malformed-milestone-repair-path",
+              "count": 1
+            },
+            {
+              "value": "mark-step-done-commit-sha",
               "count": 1
             },
             {
@@ -8964,6 +9032,10 @@
               "count": 1
             },
             {
+              "value": "merge-marker-search-guard",
+              "count": 1
+            },
+            {
               "value": "merge-queue-ghost-entries",
               "count": 1
             },
@@ -9088,6 +9160,10 @@
               "count": 1
             },
             {
+              "value": "offline-lane-environment",
+              "count": 1
+            },
+            {
               "value": "offline-lane-episode-engine",
               "count": 1
             },
@@ -9153,6 +9229,10 @@
             },
             {
               "value": "park-eviction-stray-magicmock-file-leak",
+              "count": 1
+            },
+            {
+              "value": "park-info-severity-cover",
               "count": 1
             },
             {
@@ -9289,6 +9369,10 @@
             },
             {
               "value": "pytest-factory-fixture-binding-name",
+              "count": 1
+            },
+            {
+              "value": "pytest-host-temproot-cleanup",
               "count": 1
             },
             {
@@ -9488,6 +9572,10 @@
               "count": 1
             },
             {
+              "value": "remote-runner-gate-test-fixtures",
+              "count": 1
+            },
+            {
               "value": "remote-task-leg-verify-prd",
               "count": 1
             },
@@ -9540,11 +9628,19 @@
               "count": 1
             },
             {
-              "value": "review-all-program-tooling",
+              "value": "review-all-program-ledger-action-shape",
+              "count": 1
+            },
+            {
+              "value": "review-all-program-scripts-type-check",
               "count": 1
             },
             {
               "value": "review-briefing-refresh",
+              "count": 1
+            },
+            {
+              "value": "review-checkpoint-cap-skip",
               "count": 1
             },
             {
@@ -9556,7 +9652,19 @@
               "count": 1
             },
             {
+              "value": "reviewer-trial-answer-key-pooling",
+              "count": 1
+            },
+            {
+              "value": "reviewer-trial-campaign-briefing-cli",
+              "count": 1
+            },
+            {
               "value": "reviewer-trial-campaign-results-dir",
+              "count": 1
+            },
+            {
+              "value": "reviewer-trial-corpus",
               "count": 1
             },
             {
@@ -9669,6 +9777,10 @@
             },
             {
               "value": "scheduler-pause-event-timeline",
+              "count": 1
+            },
+            {
+              "value": "scheduler-pause-rehydration",
               "count": 1
             },
             {
@@ -9872,6 +9984,10 @@
               "count": 1
             },
             {
+              "value": "stale-pid-dir-sweep-loop-blocking",
+              "count": 1
+            },
+            {
               "value": "stale-status-snapshot-extraction-prefilter",
               "count": 1
             },
@@ -9896,7 +10012,15 @@
               "count": 1
             },
             {
+              "value": "steward-construction-census",
+              "count": 1
+            },
+            {
               "value": "steward-merge-wait-abandons-working-steward",
+              "count": 1
+            },
+            {
+              "value": "steward-outcome-channel",
               "count": 1
             },
             {
@@ -10060,6 +10184,10 @@
               "count": 1
             },
             {
+              "value": "test-file-split-parity",
+              "count": 1
+            },
+            {
               "value": "test-suite-inherits-operational-preprovision-command",
               "count": 1
             },
@@ -10208,6 +10336,10 @@
               "count": 1
             },
             {
+              "value": "uv-required-version-behaviour",
+              "count": 1
+            },
+            {
               "value": "uv-venv-not-relocatable",
               "count": 1
             },
@@ -10253,10 +10385,6 @@
             },
             {
               "value": "verify-run-cmd-fault-injection",
-              "count": 1
-            },
-            {
-              "value": "verify-scope-spawn-failure",
               "count": 1
             },
             {
@@ -10333,6 +10461,10 @@
             },
             {
               "value": "whole-tree-ast-scan-cost",
+              "count": 1
+            },
+            {
+              "value": "wildcard-mcp-scoping-gate",
               "count": 1
             },
             {
@@ -10488,9 +10620,9 @@
               "count": 1
             }
           ],
-          "distinct_total": 1017
+          "distinct_total": 1049
         },
-        "parent_id_present": 1032,
+        "parent_id_present": 1096,
         "canonical_true": 85,
         "canonical_false": 45,
         "canonical_non_bool": 0,
@@ -10844,11 +10976,11 @@
           "entries": [
             {
               "value": "absent",
-              "count": 33005
+              "count": 33177
             },
             {
               "value": "list",
-              "count": 168
+              "count": 171
             },
             {
               "value": "scalar",
@@ -10861,7 +10993,7 @@
           "entries": [
             {
               "value": "full_uuid",
-              "count": 191
+              "count": 194
             },
             {
               "value": "other",
@@ -10882,7 +11014,7 @@
             },
             {
               "value": 1,
-              "count": 58
+              "count": 61
             },
             {
               "value": 2,
@@ -10913,12 +11045,12 @@
         }
       },
       "topic_coverage": {
-        "records": 33206,
-        "topic_present": 2256,
-        "topic_coverage_pct": 6.794,
-        "distinct_topics": 1017,
+        "records": 33381,
+        "topic_present": 2294,
+        "topic_coverage_pct": 6.8722,
+        "distinct_topics": 1049,
         "topics_with_one_canonical": 85,
-        "topics_with_zero_canonical": 932,
+        "topics_with_zero_canonical": 964,
         "topics_with_multiple_canonical": 0,
         "multiple_canonical_topics": [],
         "canonical_uniqueness_enforced": false,
@@ -10946,7 +11078,7 @@
             "source": "task 3626 ([MILESTONE] memory_metadata.enforce flip gate)"
           }
         ],
-        "slug_conforming": 924,
+        "slug_conforming": 956,
         "slug_non_conforming": 93,
         "non_conforming_topics": [
           {
@@ -11330,68 +11462,68 @@
       },
       "categories": {
         "observations_and_summaries": {
-          "records": 23310,
+          "records": 23438,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 23310
+                "count": 23438
               },
               {
                 "value": "created_at",
-                "count": 23310
+                "count": 23438
               },
               {
                 "value": "data",
-                "count": 23310
+                "count": 23438
               },
               {
                 "value": "hash",
-                "count": 23310
+                "count": 23438
               },
               {
                 "value": "user_id",
-                "count": 23310
+                "count": 23438
               },
               {
                 "value": "updated_at",
-                "count": 22171
+                "count": 22299
               },
               {
                 "value": "agent_id",
-                "count": 16326
+                "count": 16398
               },
               {
                 "value": "role",
-                "count": 14831
+                "count": 14959
               },
               {
                 "value": "task_id",
-                "count": 9429
+                "count": 9516
               },
               {
                 "value": "source",
-                "count": 8056
+                "count": 8133
               },
               {
                 "value": "transition",
-                "count": 7348
+                "count": 7404
               },
               {
                 "value": "_causation_id",
-                "count": 3599
+                "count": 3605
               },
               {
                 "value": "_deferred",
-                "count": 3594
+                "count": 3600
               },
               {
                 "value": "stage2_suppress",
-                "count": 3002
+                "count": 3058
               },
               {
                 "value": "echo_used_provenance",
-                "count": 2936
+                "count": 2988
               },
               {
                 "value": "run_id",
@@ -11399,7 +11531,7 @@
               },
               {
                 "value": "kind",
-                "count": 1608
+                "count": 1645
               },
               {
                 "value": "stage",
@@ -11407,11 +11539,11 @@
               },
               {
                 "value": "topic",
-                "count": 500
+                "count": 510
               },
               {
                 "value": "parent_id",
-                "count": 413
+                "count": 450
               },
               {
                 "value": "task_ids",
@@ -11486,6 +11618,10 @@
                 "count": 123
               },
               {
+                "value": "x_contested",
+                "count": 121
+              },
+              {
                 "value": "dst_entity",
                 "count": 115
               },
@@ -11496,10 +11632,6 @@
               {
                 "value": "src_entity",
                 "count": 115
-              },
-              {
-                "value": "x_contested",
-                "count": 114
               },
               {
                 "value": "edge_uuid",
@@ -11630,6 +11762,10 @@
                 "count": 37
               },
               {
+                "value": "echo_suppressed_stale_description",
+                "count": 35
+              },
+              {
                 "value": "related_task_ids",
                 "count": 35
               },
@@ -11638,8 +11774,8 @@
                 "count": 35
               },
               {
-                "value": "echo_suppressed_stale_description",
-                "count": 34
+                "value": "echo_unverified_completion",
+                "count": 32
               },
               {
                 "value": "flag",
@@ -11656,10 +11792,6 @@
               {
                 "value": "remediation_finding",
                 "count": 30
-              },
-              {
-                "value": "echo_unverified_completion",
-                "count": 29
               },
               {
                 "value": "cycle_type",
@@ -11775,6 +11907,10 @@
               },
               {
                 "value": "verification_verdict",
+                "count": 15
+              },
+              {
+                "value": "x_contested_by_triage",
                 "count": 15
               },
               {
@@ -12031,10 +12167,6 @@
               },
               {
                 "value": "tracking_task",
-                "count": 8
-              },
-              {
-                "value": "x_contested_by_triage",
                 "count": 8
               },
               {
@@ -15136,7 +15268,7 @@
               },
               {
                 "value": "amendment",
-                "count": 382
+                "count": 417
               },
               {
                 "value": "cgl_eta_cross_target_rehome",
@@ -15156,7 +15288,7 @@
               },
               {
                 "value": "sighting",
-                "count": 29
+                "count": 31
               },
               {
                 "value": "investigation_outcome",
@@ -15941,16 +16073,16 @@
             ],
             "distinct_total": 202
           },
-          "kind_missing": 21702,
+          "kind_missing": 21793,
           "source": {
             "entries": [
               {
                 "value": "targeted_reconciliation",
-                "count": 7253
+                "count": 7309
               },
               {
                 "value": "orchestrator_completion",
-                "count": 437
+                "count": 458
               },
               {
                 "value": "remediation_run",
@@ -16315,11 +16447,11 @@
             "entries": [
               {
                 "value": "targeted_reconciliation",
-                "count": 7247
+                "count": 7303
               },
               {
                 "value": "orchestrator_completion",
-                "count": 376
+                "count": 388
               },
               {
                 "value": "reconciliation_stage2",
@@ -16640,7 +16772,7 @@
             ],
             "distinct_total": 81
           },
-          "topic_present": 500,
+          "topic_present": 510,
           "topic": {
             "entries": [
               {
@@ -16780,6 +16912,10 @@
                 "count": 2
               },
               {
+                "value": "flake-debt-nested-pytest-basetemp-cluster",
+                "count": 2
+              },
+              {
                 "value": "fleet-restart-cadence-2026-10-20",
                 "count": 2
               },
@@ -16833,6 +16969,10 @@
               },
               {
                 "value": "submit-task-metadata-files-directory-rejection",
+                "count": 2
+              },
+              {
+                "value": "test-done-phase-wedge-load-flake",
                 "count": 2
               },
               {
@@ -16944,7 +17084,15 @@
                 "count": 1
               },
               {
+                "value": "client-feed-delta-reveal-api",
+                "count": 1
+              },
+              {
                 "value": "client-feed-gamma-api",
+                "count": 1
+              },
+              {
+                "value": "client-feed-reveals-api",
                 "count": 1
               },
               {
@@ -17212,10 +17360,6 @@
                 "count": 1
               },
               {
-                "value": "flake-debt-nested-pytest-basetemp-cluster",
-                "count": 1
-              },
-              {
                 "value": "flake_debt_empty_by_sequencing",
                 "count": 1
               },
@@ -17237,6 +17381,10 @@
               },
               {
                 "value": "fresh_review_yield_3790_carry",
+                "count": 1
+              },
+              {
+                "value": "fused-memory-async-worker-test-flakes",
                 "count": 1
               },
               {
@@ -17532,6 +17680,10 @@
                 "count": 1
               },
               {
+                "value": "park-info-severity-cover",
+                "count": 1
+              },
+              {
                 "value": "pipeline-exit-status",
                 "count": 1
               },
@@ -17652,7 +17804,19 @@
                 "count": 1
               },
               {
+                "value": "review-all-program-ledger-action-shape",
+                "count": 1
+              },
+              {
                 "value": "review-all-program-tooling",
+                "count": 1
+              },
+              {
+                "value": "review-checkpoint-cap-skip",
+                "count": 1
+              },
+              {
+                "value": "reviewer-trial-answer-key-pooling",
                 "count": 1
               },
               {
@@ -18008,9 +18172,9 @@
                 "count": 1
               }
             ],
-            "distinct_total": 341
+            "distinct_total": 349
           },
-          "parent_id_present": 413,
+          "parent_id_present": 450,
           "canonical_true": 10,
           "canonical_false": 3,
           "canonical_non_bool": 0,
@@ -18064,7 +18228,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 23249
+                "count": 23377
               },
               {
                 "value": "list",
@@ -18117,52 +18281,52 @@
           }
         },
         "preferences_and_norms": {
-          "records": 2254,
+          "records": 2258,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 2254
+                "count": 2258
               },
               {
                 "value": "created_at",
-                "count": 2254
+                "count": 2258
               },
               {
                 "value": "data",
-                "count": 2254
+                "count": 2258
               },
               {
                 "value": "hash",
-                "count": 2254
+                "count": 2258
               },
               {
                 "value": "user_id",
-                "count": 2254
+                "count": 2258
               },
               {
                 "value": "agent_id",
-                "count": 2250
+                "count": 2254
               },
               {
                 "value": "updated_at",
-                "count": 2156
+                "count": 2160
               },
               {
                 "value": "role",
-                "count": 1840
+                "count": 1844
               },
               {
                 "value": "topic",
-                "count": 193
+                "count": 195
               },
               {
                 "value": "task_id",
-                "count": 94
+                "count": 96
               },
               {
                 "value": "kind",
-                "count": 67
+                "count": 71
               },
               {
                 "value": "source",
@@ -18170,7 +18334,7 @@
               },
               {
                 "value": "parent_id",
-                "count": 55
+                "count": 59
               },
               {
                 "value": "escalation_id",
@@ -18185,19 +18349,19 @@
                 "count": 18
               },
               {
+                "value": "supersedes",
+                "count": 17
+              },
+              {
                 "value": "commit",
                 "count": 16
               },
               {
-                "value": "supersedes",
+                "value": "x_contested",
                 "count": 16
               },
               {
                 "value": "date",
-                "count": 14
-              },
-              {
-                "value": "x_contested",
                 "count": 14
               },
               {
@@ -18338,6 +18502,10 @@
               },
               {
                 "value": "tasks",
+                "count": 2
+              },
+              {
+                "value": "x_contested_by_triage",
                 "count": 2
               },
               {
@@ -18589,13 +18757,13 @@
                 "count": 1
               }
             ],
-            "distinct_total": 117
+            "distinct_total": 118
           },
           "kind": {
             "entries": [
               {
                 "value": "amendment",
-                "count": 54
+                "count": 58
               },
               {
                 "value": "convention",
@@ -18851,7 +19019,7 @@
             ],
             "distinct_total": 26
           },
-          "topic_present": 193,
+          "topic_present": 195,
           "topic": {
             "entries": [
               {
@@ -18899,6 +19067,10 @@
                 "count": 4
               },
               {
+                "value": "fused-memory-test-helper-modules",
+                "count": 3
+              },
+              {
                 "value": "architect-plan-tools-recipe",
                 "count": 2
               },
@@ -18912,10 +19084,6 @@
               },
               {
                 "value": "fused-memory-lint-cli-contract",
-                "count": 2
-              },
-              {
-                "value": "fused-memory-test-helper-modules",
                 "count": 2
               },
               {
@@ -19203,6 +19371,10 @@
                 "count": 1
               },
               {
+                "value": "wildcard-mcp-scoping-gate",
+                "count": 1
+              },
+              {
                 "value": "workflow-optimistic-path-fall-through",
                 "count": 1
               },
@@ -19215,9 +19387,9 @@
                 "count": 1
               }
             ],
-            "distinct_total": 90
+            "distinct_total": 91
           },
-          "parent_id_present": 55,
+          "parent_id_present": 59,
           "canonical_true": 8,
           "canonical_false": 2,
           "canonical_non_bool": 0,
@@ -19263,11 +19435,11 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 2238
+                "count": 2241
               },
               {
                 "value": "list",
-                "count": 15
+                "count": 16
               },
               {
                 "value": "scalar",
@@ -19280,7 +19452,7 @@
             "entries": [
               {
                 "value": "full_uuid",
-                "count": 12
+                "count": 13
               }
             ],
             "distinct_total": 1
@@ -19293,7 +19465,7 @@
               },
               {
                 "value": 1,
-                "count": 5
+                "count": 6
               },
               {
                 "value": 2,
@@ -19304,72 +19476,72 @@
           }
         },
         "procedural_knowledge": {
-          "records": 7618,
+          "records": 7661,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 7618
+                "count": 7661
               },
               {
                 "value": "created_at",
-                "count": 7618
+                "count": 7661
               },
               {
                 "value": "data",
-                "count": 7618
+                "count": 7661
               },
               {
                 "value": "hash",
-                "count": 7618
+                "count": 7661
               },
               {
                 "value": "user_id",
-                "count": 7618
+                "count": 7661
               },
               {
                 "value": "agent_id",
-                "count": 7615
+                "count": 7658
               },
               {
                 "value": "updated_at",
-                "count": 7595
+                "count": 7638
               },
               {
                 "value": "role",
-                "count": 7329
+                "count": 7372
               },
               {
                 "value": "topic",
-                "count": 1558
+                "count": 1584
               },
               {
                 "value": "task_id",
-                "count": 979
+                "count": 1013
               },
               {
                 "value": "kind",
-                "count": 629
+                "count": 652
               },
               {
                 "value": "parent_id",
-                "count": 564
+                "count": 587
               },
               {
                 "value": "task_ref",
                 "count": 206
               },
               {
+                "value": "x_contested",
+                "count": 145
+              },
+              {
                 "value": "commit",
                 "count": 144
               },
               {
-                "value": "x_contested",
-                "count": 135
-              },
-              {
                 "value": "supersedes",
-                "count": 124
+                "count": 126
               },
               {
                 "value": "canonical",
@@ -19381,7 +19553,7 @@
               },
               {
                 "value": "source",
-                "count": 69
+                "count": 70
               },
               {
                 "value": "run_id",
@@ -19425,6 +19597,10 @@
               },
               {
                 "value": "related_tasks",
+                "count": 18
+              },
+              {
+                "value": "x_contested_by_triage",
                 "count": 18
               },
               {
@@ -19477,10 +19653,6 @@
               },
               {
                 "value": "related_task",
-                "count": 8
-              },
-              {
-                "value": "x_contested_by_triage",
                 "count": 8
               },
               {
@@ -20368,6 +20540,10 @@
                 "count": 1
               },
               {
+                "value": "x_parent_hint",
+                "count": 1
+              },
+              {
                 "value": "x_retracted",
                 "count": 1
               },
@@ -20388,13 +20564,13 @@
                 "count": 1
               }
             ],
-            "distinct_total": 270
+            "distinct_total": 271
           },
           "kind": {
             "entries": [
               {
                 "value": "amendment",
-                "count": 545
+                "count": 568
               },
               {
                 "value": "gotcha",
@@ -20507,7 +20683,7 @@
             ],
             "distinct_total": 28
           },
-          "kind_missing": 6989,
+          "kind_missing": 7009,
           "source": {
             "entries": [
               {
@@ -20528,7 +20704,7 @@
               },
               {
                 "value": "agent",
-                "count": 3
+                "count": 4
               },
               {
                 "value": "stage1_finding_1",
@@ -20718,7 +20894,7 @@
             ],
             "distinct_total": 22
           },
-          "topic_present": 1558,
+          "topic_present": 1584,
           "topic": {
             "entries": [
               {
@@ -20986,6 +21162,10 @@
                 "count": 3
               },
               {
+                "value": "asyncio-cancel-before-first-step",
+                "count": 3
+              },
+              {
                 "value": "claude-cli-bash-cwd-persistence",
                 "count": 3
               },
@@ -21067,10 +21247,6 @@
               },
               {
                 "value": "architect-narrowing-legitimate-drop-directions",
-                "count": 2
-              },
-              {
-                "value": "asyncio-cancel-before-first-step",
                 "count": 2
               },
               {
@@ -21230,6 +21406,10 @@
                 "count": 2
               },
               {
+                "value": "verify-scope-spawn-failure",
+                "count": 2
+              },
+              {
                 "value": "virtual-clock-test-scope",
                 "count": 2
               },
@@ -21342,6 +21522,10 @@
                 "count": 1
               },
               {
+                "value": "blocked-task-pinning",
+                "count": 1
+              },
+              {
                 "value": "branch-touched-set-measurement",
                 "count": 1
               },
@@ -21406,6 +21590,10 @@
                 "count": 1
               },
               {
+                "value": "clip-disclosure-migration",
+                "count": 1
+              },
+              {
                 "value": "cockpit-poll-race-replay",
                 "count": 1
               },
@@ -21435,6 +21623,10 @@
               },
               {
                 "value": "completion-claim-gate-measurement",
+                "count": 1
+              },
+              {
+                "value": "config-dir-archival-allowlist",
                 "count": 1
               },
               {
@@ -21543,6 +21735,10 @@
               },
               {
                 "value": "delivered-checks-constrain-refactors",
+                "count": 1
+              },
+              {
+                "value": "delivered-checks-grep-semantics",
                 "count": 1
               },
               {
@@ -21782,6 +21978,10 @@
                 "count": 1
               },
               {
+                "value": "flake-debt-duplicate-check",
+                "count": 1
+              },
+              {
                 "value": "flake-debt-routing",
                 "count": 1
               },
@@ -21822,6 +22022,10 @@
                 "count": 1
               },
               {
+                "value": "fused-memory-config-reconciliation-non-optional",
+                "count": 1
+              },
+              {
                 "value": "fused-memory-dashboard-deploy-order",
                 "count": 1
               },
@@ -21847,6 +22051,10 @@
               },
               {
                 "value": "fused-memory-pytest-xdist",
+                "count": 1
+              },
+              {
+                "value": "fused-memory-real-store-test-seeding",
                 "count": 1
               },
               {
@@ -22014,6 +22222,10 @@
                 "count": 1
               },
               {
+                "value": "inline-suppression-disposition-markers",
+                "count": 1
+              },
+              {
                 "value": "instrument-report-records",
                 "count": 1
               },
@@ -22023,6 +22235,10 @@
               },
               {
                 "value": "inv12-inline-suppression-rename",
+                "count": 1
+              },
+              {
+                "value": "inv8-loop-blocking-scanner",
                 "count": 1
               },
               {
@@ -22179,6 +22395,10 @@
               },
               {
                 "value": "malformed-milestone-repair-path",
+                "count": 1
+              },
+              {
+                "value": "mark-step-done-commit-sha",
                 "count": 1
               },
               {
@@ -22382,6 +22602,10 @@
                 "count": 1
               },
               {
+                "value": "merge-marker-search-guard",
+                "count": 1
+              },
+              {
                 "value": "merge-queue-test-worker-teardown",
                 "count": 1
               },
@@ -22459,6 +22683,10 @@
               },
               {
                 "value": "npx-npx-cache-enotempty-wedge",
+                "count": 1
+              },
+              {
+                "value": "offline-lane-environment",
                 "count": 1
               },
               {
@@ -22618,6 +22846,10 @@
                 "count": 1
               },
               {
+                "value": "pytest-host-temproot-cleanup",
+                "count": 1
+              },
+              {
                 "value": "pytest-junitxml-skipped-semantics",
                 "count": 1
               },
@@ -22750,6 +22982,10 @@
                 "count": 1
               },
               {
+                "value": "remote-runner-gate-test-fixtures",
+                "count": 1
+              },
+              {
                 "value": "remote-verify-cancel-release-ordering",
                 "count": 1
               },
@@ -22766,6 +23002,14 @@
                 "count": 1
               },
               {
+                "value": "review-all-program-scripts-type-check",
+                "count": 1
+              },
+              {
+                "value": "review-all-program-tooling",
+                "count": 1
+              },
+              {
                 "value": "review-briefing-refresh",
                 "count": 1
               },
@@ -22778,7 +23022,15 @@
                 "count": 1
               },
               {
+                "value": "reviewer-trial-campaign-briefing-cli",
+                "count": 1
+              },
+              {
                 "value": "reviewer-trial-campaign-results-dir",
+                "count": 1
+              },
+              {
+                "value": "reviewer-trial-corpus",
                 "count": 1
               },
               {
@@ -22867,6 +23119,10 @@
               },
               {
                 "value": "scheduler-pause-event-timeline",
+                "count": 1
+              },
+              {
+                "value": "scheduler-pause-rehydration",
                 "count": 1
               },
               {
@@ -22994,6 +23250,10 @@
                 "count": 1
               },
               {
+                "value": "stale-pid-dir-sweep-loop-blocking",
+                "count": 1
+              },
+              {
                 "value": "stale-status-snapshot-extraction-prefilter",
                 "count": 1
               },
@@ -23003,6 +23263,14 @@
               },
               {
                 "value": "stale_memory_finding_task_id_discipline",
+                "count": 1
+              },
+              {
+                "value": "steward-construction-census",
+                "count": 1
+              },
+              {
+                "value": "steward-outcome-channel",
                 "count": 1
               },
               {
@@ -23083,6 +23351,10 @@
               },
               {
                 "value": "test-fake-venv-fixtures",
+                "count": 1
+              },
+              {
+                "value": "test-file-split-parity",
                 "count": 1
               },
               {
@@ -23182,6 +23454,10 @@
                 "count": 1
               },
               {
+                "value": "uv-required-version-behaviour",
+                "count": 1
+              },
+              {
                 "value": "uv-venv-not-relocatable",
                 "count": 1
               },
@@ -23215,10 +23491,6 @@
               },
               {
                 "value": "verify-run-cmd-fault-injection",
-                "count": 1
-              },
-              {
-                "value": "verify-scope-spawn-failure",
                 "count": 1
               },
               {
@@ -23350,9 +23622,9 @@
                 "count": 1
               }
             ],
-            "distinct_total": 657
+            "distinct_total": 681
           },
-          "parent_id_present": 564,
+          "parent_id_present": 587,
           "canonical_true": 67,
           "canonical_false": 40,
           "canonical_non_bool": 0,
@@ -23634,11 +23906,11 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 7494
+                "count": 7535
               },
               {
                 "value": "list",
-                "count": 118
+                "count": 120
               },
               {
                 "value": "scalar",
@@ -23651,7 +23923,7 @@
             "entries": [
               {
                 "value": "full_uuid",
-                "count": 124
+                "count": 126
               },
               {
                 "value": "other",
@@ -23672,7 +23944,7 @@
               },
               {
                 "value": 1,
-                "count": 31
+                "count": 33
               },
               {
                 "value": 2,
@@ -23973,60 +24245,60 @@
     },
     "reify": {
       "total": {
-        "records": 38627,
+        "records": 38699,
         "keys": {
           "entries": [
             {
               "value": "category",
-              "count": 38627
+              "count": 38699
             },
             {
               "value": "created_at",
-              "count": 38627
+              "count": 38699
             },
             {
               "value": "data",
-              "count": 38627
+              "count": 38699
             },
             {
               "value": "hash",
-              "count": 38627
+              "count": 38699
             },
             {
               "value": "user_id",
-              "count": 38627
+              "count": 38699
             },
             {
               "value": "updated_at",
-              "count": 36151
+              "count": 36223
             },
             {
               "value": "agent_id",
-              "count": 27771
+              "count": 27830
             },
             {
               "value": "role",
-              "count": 25082
+              "count": 25154
             },
             {
               "value": "task_id",
-              "count": 14714
+              "count": 14756
             },
             {
               "value": "source",
-              "count": 12396
+              "count": 12417
             },
             {
               "value": "transition",
-              "count": 11501
+              "count": 11514
             },
             {
               "value": "_causation_id",
-              "count": 5549
+              "count": 5550
             },
             {
               "value": "_deferred",
-              "count": 5514
+              "count": 5515
             },
             {
               "value": "run_id",
@@ -24034,15 +24306,15 @@
             },
             {
               "value": "kind",
-              "count": 2304
+              "count": 2334
             },
             {
               "value": "stage2_suppress",
-              "count": 1925
+              "count": 1939
             },
             {
               "value": "topic",
-              "count": 1818
+              "count": 1840
             },
             {
               "value": "stage",
@@ -24050,11 +24322,11 @@
             },
             {
               "value": "echo_used_provenance",
-              "count": 1590
+              "count": 1602
             },
             {
               "value": "parent_id",
-              "count": 630
+              "count": 659
             },
             {
               "value": "task_ids",
@@ -24066,7 +24338,7 @@
             },
             {
               "value": "supersedes",
-              "count": 236
+              "count": 237
             },
             {
               "value": "flag_id",
@@ -24086,7 +24358,7 @@
             },
             {
               "value": "x_contested",
-              "count": 173
+              "count": 181
             },
             {
               "value": "flag_type",
@@ -24365,16 +24637,16 @@
               "count": 28
             },
             {
+              "value": "echo_suppressed_stale_description",
+              "count": 28
+            },
+            {
               "value": "flags_processed",
               "count": 28
             },
             {
               "value": "status",
               "count": 28
-            },
-            {
-              "value": "echo_suppressed_stale_description",
-              "count": 27
             },
             {
               "value": "actions",
@@ -24730,6 +25002,10 @@
             },
             {
               "value": "watch_target_task",
+              "count": 10
+            },
+            {
+              "value": "x_contested_by_triage",
               "count": 10
             },
             {
@@ -26598,10 +26874,6 @@
             },
             {
               "value": "working_tools",
-              "count": 2
-            },
-            {
-              "value": "x_contested_by_triage",
               "count": 2
             },
             {
@@ -29023,7 +29295,7 @@
             },
             {
               "value": "amendment",
-              "count": 589
+              "count": 613
             },
             {
               "value": "cgl_eta_cross_target_rehome",
@@ -29039,7 +29311,7 @@
             },
             {
               "value": "sighting",
-              "count": 38
+              "count": 43
             },
             {
               "value": "completion_capture",
@@ -29078,15 +29350,15 @@
               "count": 11
             },
             {
+              "value": "stage2_suppress_guard",
+              "count": 9
+            },
+            {
               "value": "pin_queue_edge_cleanup_audit",
               "count": 8
             },
             {
               "value": "stage2_completion_guard",
-              "count": 8
-            },
-            {
-              "value": "stage2_suppress_guard",
               "count": 8
             },
             {
@@ -30168,16 +30440,16 @@
           ],
           "distinct_total": 287
         },
-        "kind_missing": 36323,
+        "kind_missing": 36365,
         "source": {
           "entries": [
             {
               "value": "targeted_reconciliation",
-              "count": 11253
+              "count": 11266
             },
             {
               "value": "orchestrator_completion",
-              "count": 215
+              "count": 223
             },
             {
               "value": "consolidation",
@@ -30762,11 +31034,11 @@
           "entries": [
             {
               "value": "targeted_reconciliation",
-              "count": 11244
+              "count": 11257
             },
             {
               "value": "orchestrator_completion",
-              "count": 199
+              "count": 207
             },
             {
               "value": "consolidation",
@@ -31271,7 +31543,7 @@
           ],
           "distinct_total": 127
         },
-        "topic_present": 1818,
+        "topic_present": 1840,
         "topic": {
           "entries": [
             {
@@ -31767,6 +32039,10 @@
               "count": 2
             },
             {
+              "value": "gui-vitest-4-upgrade",
+              "count": 2
+            },
+            {
               "value": "harness-git-diff-output-unreliable",
               "count": 2
             },
@@ -31812,6 +32088,10 @@
             },
             {
               "value": "open-bug-is-dirty-race",
+              "count": 2
+            },
+            {
+              "value": "openvdb-stub-build-probe",
               "count": 2
             },
             {
@@ -32387,6 +32667,10 @@
               "count": 1
             },
             {
+              "value": "construct-ratchet-hosts",
+              "count": 1
+            },
+            {
               "value": "contains-undef-map-sentinel-false-positive",
               "count": 1
             },
@@ -32664,6 +32948,10 @@
             },
             {
               "value": "elastic-p2-cantilever-accuracy",
+              "count": 1
+            },
+            {
+              "value": "elastic-static-body-layout-detection",
               "count": 1
             },
             {
@@ -33047,6 +33335,10 @@
               "count": 1
             },
             {
+              "value": "gui-document-identity-key",
+              "count": 1
+            },
+            {
               "value": "gui-editor-test-cursor-mapping",
               "count": 1
             },
@@ -33079,6 +33371,10 @@
               "count": 1
             },
             {
+              "value": "gui-path-spelling-identity",
+              "count": 1
+            },
+            {
               "value": "gui-side-panel-grid-tracks",
               "count": 1
             },
@@ -33087,11 +33383,23 @@
               "count": 1
             },
             {
+              "value": "gui-sidecar-placeholder",
+              "count": 1
+            },
+            {
+              "value": "gui-source-location-navigation",
+              "count": 1
+            },
+            {
               "value": "gui-state-diagnostic-streams",
               "count": 1
             },
             {
               "value": "gui-valuedata-declared-dimension",
+              "count": 1
+            },
+            {
+              "value": "gui-viewport-measurement-attribution",
               "count": 1
             },
             {
@@ -33395,6 +33703,10 @@
               "count": 1
             },
             {
+              "value": "merge-head-hook-timing",
+              "count": 1
+            },
+            {
               "value": "merge-landing-truth",
               "count": 1
             },
@@ -33619,11 +33931,11 @@
               "count": 1
             },
             {
-              "value": "openvdb-stub-build",
+              "value": "openvdb-ingest-units",
               "count": 1
             },
             {
-              "value": "openvdb-stub-build-probe",
+              "value": "openvdb-stub-build",
               "count": 1
             },
             {
@@ -33687,7 +33999,15 @@
               "count": 1
             },
             {
+              "value": "orphan-audit-pin-files",
+              "count": 1
+            },
+            {
               "value": "orphan-audit-scope",
+              "count": 1
+            },
+            {
+              "value": "orphan-audit-skip-policy",
               "count": 1
             },
             {
@@ -33883,6 +34203,10 @@
               "count": 1
             },
             {
+              "value": "ptodo-ratchet-scope",
+              "count": 1
+            },
+            {
               "value": "ptodo-scoped-scan-oracle",
               "count": 1
             },
@@ -33992,6 +34316,10 @@
             },
             {
               "value": "reify-audit-offline-run",
+              "count": 1
+            },
+            {
+              "value": "reify-audit-pattern-registration",
               "count": 1
             },
             {
@@ -34184,6 +34512,10 @@
             },
             {
               "value": "reify-instance-scope-evaluation-gotchas",
+              "count": 1
+            },
+            {
+              "value": "reify-ir-module-scc",
               "count": 1
             },
             {
@@ -34515,6 +34847,10 @@
               "count": 1
             },
             {
+              "value": "selector-list-geometry-runtime-resolution",
+              "count": 1
+            },
+            {
               "value": "selector-test-assertion-helpers",
               "count": 1
             },
@@ -34560,6 +34896,10 @@
             },
             {
               "value": "shell-classification-ratio",
+              "count": 1
+            },
+            {
+              "value": "shell-extract-min-wall-spacing-validation",
               "count": 1
             },
             {
@@ -34939,6 +35279,10 @@
               "count": 1
             },
             {
+              "value": "test-move-citation-gates",
+              "count": 1
+            },
+            {
               "value": "test-output-probe-capture",
               "count": 1
             },
@@ -35291,6 +35635,10 @@
               "count": 1
             },
             {
+              "value": "warm-base-refresh-cadence",
+              "count": 1
+            },
+            {
               "value": "warm-cold-shadow-compare-cadence",
               "count": 1
             },
@@ -35379,6 +35727,10 @@
               "count": 1
             },
             {
+              "value": "warm-lane-reclaim-wip-commits",
+              "count": 1
+            },
+            {
               "value": "warm-lane-seed-mode-by-role",
               "count": 1
             },
@@ -35435,9 +35787,9 @@
               "count": 1
             }
           ],
-          "distinct_total": 1040
+          "distinct_total": 1060
         },
-        "parent_id_present": 630,
+        "parent_id_present": 659,
         "canonical_true": 122,
         "canonical_false": 6,
         "canonical_non_bool": 1,
@@ -35939,11 +36291,11 @@
           "entries": [
             {
               "value": "absent",
-              "count": 38391
+              "count": 38462
             },
             {
               "value": "list",
-              "count": 183
+              "count": 184
             },
             {
               "value": "scalar",
@@ -35956,7 +36308,7 @@
           "entries": [
             {
               "value": "full_uuid",
-              "count": 341
+              "count": 342
             },
             {
               "value": "other",
@@ -35973,7 +36325,7 @@
             },
             {
               "value": 1,
-              "count": 42
+              "count": 43
             },
             {
               "value": 2,
@@ -36020,12 +36372,12 @@
         }
       },
       "topic_coverage": {
-        "records": 38627,
-        "topic_present": 1818,
-        "topic_coverage_pct": 4.7066,
-        "distinct_topics": 1040,
+        "records": 38699,
+        "topic_present": 1840,
+        "topic_coverage_pct": 4.7546,
+        "distinct_topics": 1060,
         "topics_with_one_canonical": 122,
-        "topics_with_zero_canonical": 918,
+        "topics_with_zero_canonical": 938,
         "topics_with_multiple_canonical": 0,
         "multiple_canonical_topics": [],
         "canonical_uniqueness_enforced": false,
@@ -36053,7 +36405,7 @@
             "source": "task 3626 ([MILESTONE] memory_metadata.enforce flip gate)"
           }
         ],
-        "slug_conforming": 974,
+        "slug_conforming": 994,
         "slug_non_conforming": 66,
         "non_conforming_topics": [
           {
@@ -36338,60 +36690,60 @@
       },
       "categories": {
         "observations_and_summaries": {
-          "records": 29326,
+          "records": 29375,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 29326
+                "count": 29375
               },
               {
                 "value": "created_at",
-                "count": 29326
+                "count": 29375
               },
               {
                 "value": "data",
-                "count": 29326
+                "count": 29375
               },
               {
                 "value": "hash",
-                "count": 29326
+                "count": 29375
               },
               {
                 "value": "user_id",
-                "count": 29326
+                "count": 29375
               },
               {
                 "value": "updated_at",
-                "count": 27107
+                "count": 27156
               },
               {
                 "value": "agent_id",
-                "count": 18476
+                "count": 18512
               },
               {
                 "value": "role",
-                "count": 16876
+                "count": 16925
               },
               {
                 "value": "task_id",
-                "count": 13862
+                "count": 13893
               },
               {
                 "value": "source",
-                "count": 12124
+                "count": 12145
               },
               {
                 "value": "transition",
-                "count": 11493
+                "count": 11506
               },
               {
                 "value": "_causation_id",
-                "count": 5525
+                "count": 5526
               },
               {
                 "value": "_deferred",
-                "count": 5514
+                "count": 5515
               },
               {
                 "value": "run_id",
@@ -36399,11 +36751,11 @@
               },
               {
                 "value": "stage2_suppress",
-                "count": 1922
+                "count": 1936
               },
               {
                 "value": "kind",
-                "count": 1834
+                "count": 1850
               },
               {
                 "value": "stage",
@@ -36411,11 +36763,11 @@
               },
               {
                 "value": "echo_used_provenance",
-                "count": 1590
+                "count": 1602
               },
               {
                 "value": "topic",
-                "count": 636
+                "count": 645
               },
               {
                 "value": "task_ids",
@@ -36423,7 +36775,7 @@
               },
               {
                 "value": "parent_id",
-                "count": 305
+                "count": 320
               },
               {
                 "value": "commit",
@@ -36522,6 +36874,10 @@
                 "count": 99
               },
               {
+                "value": "x_contested",
+                "count": 90
+              },
+              {
                 "value": "related_tasks",
                 "count": 89
               },
@@ -36531,10 +36887,6 @@
               },
               {
                 "value": "summary_nonce",
-                "count": 86
-              },
-              {
-                "value": "x_contested",
                 "count": 86
               },
               {
@@ -36678,16 +37030,16 @@
                 "count": 28
               },
               {
+                "value": "echo_suppressed_stale_description",
+                "count": 28
+              },
+              {
                 "value": "file",
                 "count": 28
               },
               {
                 "value": "flags_processed",
                 "count": 28
-              },
-              {
-                "value": "echo_suppressed_stale_description",
-                "count": 27
               },
               {
                 "value": "status",
@@ -37831,6 +38183,10 @@
               },
               {
                 "value": "verified_via",
+                "count": 4
+              },
+              {
+                "value": "x_contested_by_triage",
                 "count": 4
               },
               {
@@ -40654,7 +41010,7 @@
                 "count": 1
               }
             ],
-            "distinct_total": 1078
+            "distinct_total": 1079
           },
           "kind": {
             "entries": [
@@ -40664,7 +41020,7 @@
               },
               {
                 "value": "amendment",
-                "count": 293
+                "count": 306
               },
               {
                 "value": "cgl_eta_cross_target_rehome",
@@ -40700,11 +41056,15 @@
               },
               {
                 "value": "sighting",
-                "count": 12
+                "count": 14
               },
               {
                 "value": "stage1_cycle_summary",
                 "count": 11
+              },
+              {
+                "value": "stage2_suppress_guard",
+                "count": 9
               },
               {
                 "value": "pin_queue_edge_cleanup_audit",
@@ -40712,10 +41072,6 @@
               },
               {
                 "value": "stage2_completion_guard",
-                "count": 8
-              },
-              {
-                "value": "stage2_suppress_guard",
                 "count": 8
               },
               {
@@ -41489,16 +41845,16 @@
             ],
             "distinct_total": 207
           },
-          "kind_missing": 27492,
+          "kind_missing": 27525,
           "source": {
             "entries": [
               {
                 "value": "targeted_reconciliation",
-                "count": 11231
+                "count": 11244
               },
               {
                 "value": "orchestrator_completion",
-                "count": 215
+                "count": 223
               },
               {
                 "value": "consolidation",
@@ -41863,11 +42219,11 @@
             "entries": [
               {
                 "value": "targeted_reconciliation",
-                "count": 11222
+                "count": 11235
               },
               {
                 "value": "orchestrator_completion",
-                "count": 199
+                "count": 207
               },
               {
                 "value": "consolidation",
@@ -42212,7 +42568,7 @@
             ],
             "distinct_total": 87
           },
-          "topic_present": 636,
+          "topic_present": 645,
           "topic": {
             "entries": [
               {
@@ -43012,11 +43368,23 @@
                 "count": 1
               },
               {
+                "value": "gui-path-spelling-identity",
+                "count": 1
+              },
+              {
                 "value": "gui-sidecar-mcp-config",
                 "count": 1
               },
               {
+                "value": "gui-source-location-navigation",
+                "count": 1
+              },
+              {
                 "value": "gui-valuedata-declared-dimension",
+                "count": 1
+              },
+              {
+                "value": "gui-viewport-measurement-attribution",
                 "count": 1
               },
               {
@@ -43176,6 +43544,10 @@
                 "count": 1
               },
               {
+                "value": "merge-head-hook-timing",
+                "count": 1
+              },
+              {
                 "value": "merge-queue-depth-and-verify-latency-calibration",
                 "count": 1
               },
@@ -43281,6 +43653,10 @@
               },
               {
                 "value": "openvdb-dense-sdf-ingest",
+                "count": 1
+              },
+              {
+                "value": "openvdb-ingest-units",
                 "count": 1
               },
               {
@@ -43596,6 +43972,10 @@
                 "count": 1
               },
               {
+                "value": "selector-list-geometry-runtime-resolution",
+                "count": 1
+              },
+              {
                 "value": "session-summary-esc-6890-3-adjudication",
                 "count": 1
               },
@@ -43625,6 +44005,10 @@
               },
               {
                 "value": "shell-classification-ratio",
+                "count": 1
+              },
+              {
+                "value": "shell-extract-min-wall-spacing-validation",
                 "count": 1
               },
               {
@@ -43916,6 +44300,10 @@
                 "count": 1
               },
               {
+                "value": "warm-base-refresh-cadence",
+                "count": 1
+              },
+              {
                 "value": "warm-cold-shadow-compare-cadence",
                 "count": 1
               },
@@ -43956,6 +44344,10 @@
                 "count": 1
               },
               {
+                "value": "warm-lane-reclaim-wip-commits",
+                "count": 1
+              },
+              {
                 "value": "warm-lane-seed-mode-by-role",
                 "count": 1
               },
@@ -43984,9 +44376,9 @@
                 "count": 1
               }
             ],
-            "distinct_total": 442
+            "distinct_total": 451
           },
-          "parent_id_present": 305,
+          "parent_id_present": 320,
           "canonical_true": 27,
           "canonical_false": 0,
           "canonical_non_bool": 1,
@@ -44108,7 +44500,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 29242
+                "count": 29291
               },
               {
                 "value": "list",
@@ -44161,40 +44553,40 @@
           }
         },
         "preferences_and_norms": {
-          "records": 2095,
+          "records": 2098,
           "keys": {
             "entries": [
               {
                 "value": "agent_id",
-                "count": 2095
+                "count": 2098
               },
               {
                 "value": "category",
-                "count": 2095
+                "count": 2098
               },
               {
                 "value": "created_at",
-                "count": 2095
+                "count": 2098
               },
               {
                 "value": "data",
-                "count": 2095
+                "count": 2098
               },
               {
                 "value": "hash",
-                "count": 2095
+                "count": 2098
               },
               {
                 "value": "user_id",
-                "count": 2095
+                "count": 2098
               },
               {
                 "value": "updated_at",
-                "count": 1973
+                "count": 1976
               },
               {
                 "value": "role",
-                "count": 1565
+                "count": 1568
               },
               {
                 "value": "topic",
@@ -44214,11 +44606,11 @@
               },
               {
                 "value": "kind",
-                "count": 33
+                "count": 35
               },
               {
                 "value": "parent_id",
-                "count": 22
+                "count": 24
               },
               {
                 "value": "spawned_from",
@@ -44663,7 +45055,7 @@
             "entries": [
               {
                 "value": "amendment",
-                "count": 20
+                "count": 22
               },
               {
                 "value": "consolidation_closure_norm",
@@ -44716,7 +45108,7 @@
             ],
             "distinct_total": 13
           },
-          "kind_missing": 2062,
+          "kind_missing": 2063,
           "source": {
             "entries": [
               {
@@ -45273,7 +45665,7 @@
             ],
             "distinct_total": 80
           },
-          "parent_id_present": 22,
+          "parent_id_present": 24,
           "canonical_true": 12,
           "canonical_false": 0,
           "canonical_non_bool": 0,
@@ -45335,7 +45727,7 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 2080
+                "count": 2083
               },
               {
                 "value": "list",
@@ -45380,60 +45772,60 @@
           }
         },
         "procedural_knowledge": {
-          "records": 7126,
+          "records": 7146,
           "keys": {
             "entries": [
               {
                 "value": "category",
-                "count": 7126
+                "count": 7146
               },
               {
                 "value": "created_at",
-                "count": 7126
+                "count": 7146
               },
               {
                 "value": "data",
-                "count": 7126
+                "count": 7146
               },
               {
                 "value": "hash",
-                "count": 7126
+                "count": 7146
               },
               {
                 "value": "user_id",
-                "count": 7126
+                "count": 7146
               },
               {
                 "value": "agent_id",
-                "count": 7120
+                "count": 7140
               },
               {
                 "value": "updated_at",
-                "count": 7053
+                "count": 7073
               },
               {
                 "value": "role",
-                "count": 6636
+                "count": 6656
               },
               {
                 "value": "topic",
-                "count": 1026
+                "count": 1039
               },
               {
                 "value": "task_id",
-                "count": 741
+                "count": 752
               },
               {
                 "value": "kind",
-                "count": 436
+                "count": 448
               },
               {
                 "value": "parent_id",
-                "count": 303
+                "count": 315
               },
               {
                 "value": "supersedes",
-                "count": 137
+                "count": 138
               },
               {
                 "value": "source",
@@ -45445,7 +45837,7 @@
               },
               {
                 "value": "x_contested",
-                "count": 78
+                "count": 82
               },
               {
                 "value": "run_id",
@@ -45673,6 +46065,10 @@
               },
               {
                 "value": "root_cause_task",
+                "count": 5
+              },
+              {
+                "value": "x_contested_by_triage",
                 "count": 5
               },
               {
@@ -46520,10 +46916,6 @@
                 "count": 1
               },
               {
-                "value": "x_contested_by_triage",
-                "count": 1
-              },
-              {
                 "value": "x_corroboration_correction_run_id",
                 "count": 1
               },
@@ -46562,11 +46954,11 @@
             "entries": [
               {
                 "value": "amendment",
-                "count": 276
+                "count": 285
               },
               {
                 "value": "sighting",
-                "count": 25
+                "count": 28
               },
               {
                 "value": "procedural_consolidation",
@@ -46871,7 +47263,7 @@
             ],
             "distinct_total": 77
           },
-          "kind_missing": 6690,
+          "kind_missing": 6698,
           "source": {
             "entries": [
               {
@@ -47290,7 +47682,7 @@
             ],
             "distinct_total": 44
           },
-          "topic_present": 1026,
+          "topic_present": 1039,
           "topic": {
             "entries": [
               {
@@ -47578,6 +47970,10 @@
                 "count": 2
               },
               {
+                "value": "gui-vitest-4-upgrade",
+                "count": 2
+              },
+              {
                 "value": "harness-git-diff-output-unreliable",
                 "count": 2
               },
@@ -47611,6 +48007,10 @@
               },
               {
                 "value": "occt-stub-mode-testing",
+                "count": 2
+              },
+              {
+                "value": "openvdb-stub-build-probe",
                 "count": 2
               },
               {
@@ -47918,6 +48318,10 @@
                 "count": 1
               },
               {
+                "value": "construct-ratchet-hosts",
+                "count": 1
+              },
+              {
                 "value": "contains-undef-map-sentinel-false-positive",
                 "count": 1
               },
@@ -48019,6 +48423,10 @@
               },
               {
                 "value": "eigensolve-lanczos-floor",
+                "count": 1
+              },
+              {
+                "value": "elastic-static-body-layout-detection",
                 "count": 1
               },
               {
@@ -48214,6 +48622,10 @@
                 "count": 1
               },
               {
+                "value": "gui-document-identity-key",
+                "count": 1
+              },
+              {
                 "value": "gui-editor-test-cursor-mapping",
                 "count": 1
               },
@@ -48223,6 +48635,10 @@
               },
               {
                 "value": "gui-layout-store-tests",
+                "count": 1
+              },
+              {
+                "value": "gui-sidecar-placeholder",
                 "count": 1
               },
               {
@@ -48498,10 +48914,6 @@
                 "count": 1
               },
               {
-                "value": "openvdb-stub-build-probe",
-                "count": 1
-              },
-              {
                 "value": "openvdb-stub-build-typecheck",
                 "count": 1
               },
@@ -48543,6 +48955,14 @@
               },
               {
                 "value": "orphan-audit-caller-scope",
+                "count": 1
+              },
+              {
+                "value": "orphan-audit-pin-files",
+                "count": 1
+              },
+              {
+                "value": "orphan-audit-skip-policy",
                 "count": 1
               },
               {
@@ -48690,6 +49110,10 @@
                 "count": 1
               },
               {
+                "value": "ptodo-ratchet-scope",
+                "count": 1
+              },
+              {
                 "value": "ptodo-scoped-scan-oracle",
                 "count": 1
               },
@@ -48767,6 +49191,10 @@
               },
               {
                 "value": "reify-audit-offline-run",
+                "count": 1
+              },
+              {
+                "value": "reify-audit-pattern-registration",
                 "count": 1
               },
               {
@@ -48915,6 +49343,10 @@
               },
               {
                 "value": "reify-infra-test-mutation-validation",
+                "count": 1
+              },
+              {
+                "value": "reify-ir-module-scc",
                 "count": 1
               },
               {
@@ -49326,6 +49758,10 @@
                 "count": 1
               },
               {
+                "value": "test-move-citation-gates",
+                "count": 1
+              },
+              {
                 "value": "test-output-probe-capture",
                 "count": 1
               },
@@ -49602,9 +50038,9 @@
                 "count": 1
               }
             ],
-            "distinct_total": 577
+            "distinct_total": 588
           },
-          "parent_id_present": 303,
+          "parent_id_present": 315,
           "canonical_true": 83,
           "canonical_false": 6,
           "canonical_non_bool": 0,
@@ -49950,11 +50386,11 @@
             "entries": [
               {
                 "value": "absent",
-                "count": 6989
+                "count": 7008
               },
               {
                 "value": "list",
-                "count": 124
+                "count": 125
               },
               {
                 "value": "scalar",
@@ -49967,7 +50403,7 @@
             "entries": [
               {
                 "value": "full_uuid",
-                "count": 220
+                "count": 221
               },
               {
                 "value": "other",
@@ -49984,7 +50420,7 @@
               },
               {
                 "value": 1,
-                "count": 31
+                "count": 32
               },
               {
                 "value": 2,
@@ -50453,80 +50889,80 @@
     }
   },
   "grand_total": {
-    "records": 71833,
+    "records": 72080,
     "keys": {
       "entries": [
         {
           "value": "category",
-          "count": 71833
+          "count": 72080
         },
         {
           "value": "created_at",
-          "count": 71833
+          "count": 72080
         },
         {
           "value": "data",
-          "count": 71833
+          "count": 72080
         },
         {
           "value": "hash",
-          "count": 71833
+          "count": 72080
         },
         {
           "value": "user_id",
-          "count": 71833
+          "count": 72080
         },
         {
           "value": "updated_at",
-          "count": 68097
+          "count": 68344
         },
         {
           "value": "agent_id",
-          "count": 53986
+          "count": 54164
         },
         {
           "value": "role",
-          "count": 49106
+          "count": 49353
         },
         {
           "value": "task_id",
-          "count": 25219
+          "count": 25384
         },
         {
           "value": "source",
-          "count": 20585
+          "count": 20684
         },
         {
           "value": "transition",
-          "count": 18851
+          "count": 18920
         },
         {
           "value": "_causation_id",
-          "count": 9169
+          "count": 9176
         },
         {
           "value": "_deferred",
-          "count": 9108
+          "count": 9115
         },
         {
           "value": "stage2_suppress",
-          "count": 4932
+          "count": 5002
+        },
+        {
+          "value": "kind",
+          "count": 4702
         },
         {
           "value": "run_id",
           "count": 4644
         },
         {
-          "value": "kind",
-          "count": 4608
-        },
-        {
           "value": "echo_used_provenance",
-          "count": 4526
+          "count": 4590
         },
         {
           "value": "topic",
-          "count": 4074
+          "count": 4134
         },
         {
           "value": "stage",
@@ -50534,7 +50970,7 @@
         },
         {
           "value": "parent_id",
-          "count": 1662
+          "count": 1755
         },
         {
           "value": "commit",
@@ -50545,16 +50981,16 @@
           "count": 601
         },
         {
-          "value": "escalation_id",
-          "count": 437
+          "value": "x_contested",
+          "count": 463
         },
         {
           "value": "supersedes",
-          "count": 437
+          "count": 441
         },
         {
-          "value": "x_contested",
-          "count": 436
+          "value": "escalation_id",
+          "count": 437
         },
         {
           "value": "memories_deleted",
@@ -50817,12 +51253,12 @@
           "count": 65
         },
         {
-          "value": "pattern",
+          "value": "echo_suppressed_stale_description",
           "count": 63
         },
         {
-          "value": "echo_suppressed_stale_description",
-          "count": 61
+          "value": "pattern",
+          "count": 63
         },
         {
           "value": "unverified_claim",
@@ -50887,6 +51323,10 @@
         {
           "value": "reconstructed_by",
           "count": 46
+        },
+        {
+          "value": "x_contested_by_triage",
+          "count": 45
         },
         {
           "value": "completed_at",
@@ -50957,6 +51397,10 @@
           "count": 35
         },
         {
+          "value": "echo_unverified_completion",
+          "count": 33
+        },
+        {
           "value": "outcome",
           "count": 33
         },
@@ -50990,10 +51434,6 @@
         },
         {
           "value": "corrects_memory_id",
-          "count": 30
-        },
-        {
-          "value": "echo_unverified_completion",
           "count": 30
         },
         {
@@ -51194,10 +51634,6 @@
         },
         {
           "value": "stage3_finding",
-          "count": 18
-        },
-        {
-          "value": "x_contested_by_triage",
           "count": 18
         },
         {
@@ -58393,6 +58829,10 @@
           "count": 1
         },
         {
+          "value": "x_parent_hint",
+          "count": 1
+        },
+        {
           "value": "x_prd",
           "count": 1
         },
@@ -58521,13 +58961,13 @@
           "count": 1
         }
       ],
-      "distinct_total": 2016
+      "distinct_total": 2017
     },
     "kind": {
       "entries": [
         {
           "value": "amendment",
-          "count": 1570
+          "count": 1656
         },
         {
           "value": "cycle_summary",
@@ -58547,7 +58987,7 @@
         },
         {
           "value": "sighting",
-          "count": 94
+          "count": 101
         },
         {
           "value": "task_completion",
@@ -58603,7 +59043,7 @@
         },
         {
           "value": "stage2_suppress_guard",
-          "count": 16
+          "count": 17
         },
         {
           "value": "failure_mode",
@@ -60460,16 +60900,16 @@
       ],
       "distinct_total": 483
     },
-    "kind_missing": 67225,
+    "kind_missing": 67378,
     "source": {
       "entries": [
         {
           "value": "targeted_reconciliation",
-          "count": 18516
+          "count": 18585
         },
         {
           "value": "orchestrator_completion",
-          "count": 652
+          "count": 681
         },
         {
           "value": "consolidation",
@@ -60632,6 +61072,10 @@
           "count": 8
         },
         {
+          "value": "agent",
+          "count": 7
+        },
+        {
           "value": "prd-decomposition",
           "count": 7
         },
@@ -60658,10 +61102,6 @@
         {
           "value": "verify-pipeline-study-2026-06-08",
           "count": 7
-        },
-        {
-          "value": "agent",
-          "count": 6
         },
         {
           "value": "docs/reify-implementation-plan.md",
@@ -61434,11 +61874,11 @@
       "entries": [
         {
           "value": "targeted_reconciliation",
-          "count": 18501
+          "count": 18570
         },
         {
           "value": "orchestrator_completion",
-          "count": 575
+          "count": 595
         },
         {
           "value": "consolidation",
@@ -62279,7 +62719,7 @@
       ],
       "distinct_total": 211
     },
-    "topic_present": 4074,
+    "topic_present": 4134,
     "topic": {
       "entries": [
         {
@@ -63011,6 +63451,10 @@
           "count": 3
         },
         {
+          "value": "asyncio-cancel-before-first-step",
+          "count": 3
+        },
+        {
           "value": "batch_deferral_triage_2026_04_11",
           "count": 3
         },
@@ -63036,6 +63480,10 @@
         },
         {
           "value": "eval-results-dir-cell-shapes",
+          "count": 3
+        },
+        {
+          "value": "fused-memory-test-helper-modules",
           "count": 3
         },
         {
@@ -63207,10 +63655,6 @@
           "count": 2
         },
         {
-          "value": "asyncio-cancel-before-first-step",
-          "count": 2
-        },
-        {
           "value": "asyncio-subprocess-mid-spawn-cancel",
           "count": 2
         },
@@ -63327,6 +63771,10 @@
           "count": 2
         },
         {
+          "value": "flake-debt-nested-pytest-basetemp-cluster",
+          "count": 2
+        },
+        {
           "value": "fleet-restart-cadence-2026-10-20",
           "count": 2
         },
@@ -63351,10 +63799,6 @@
           "count": 2
         },
         {
-          "value": "fused-memory-test-helper-modules",
-          "count": 2
-        },
-        {
           "value": "generic-type-param-placeholder-types",
           "count": 2
         },
@@ -63376,6 +63820,10 @@
         },
         {
           "value": "gui-viewstate-tree-reactivity",
+          "count": 2
+        },
+        {
+          "value": "gui-vitest-4-upgrade",
           "count": 2
         },
         {
@@ -63492,6 +63940,10 @@
         },
         {
           "value": "open-bug-is-dirty-race",
+          "count": 2
+        },
+        {
+          "value": "openvdb-stub-build-probe",
           "count": 2
         },
         {
@@ -63631,6 +64083,10 @@
           "count": 2
         },
         {
+          "value": "review-all-program-tooling",
+          "count": 2
+        },
+        {
           "value": "ruff-e402-sys-path-insert",
           "count": 2
         },
@@ -63687,6 +64143,10 @@
           "count": 2
         },
         {
+          "value": "test-done-phase-wedge-load-flake",
+          "count": 2
+        },
+        {
           "value": "tmp-purge-safety",
           "count": 2
         },
@@ -63704,6 +64164,10 @@
         },
         {
           "value": "verify-resource-measurement",
+          "count": 2
+        },
+        {
+          "value": "verify-scope-spawn-failure",
           "count": 2
         },
         {
@@ -64111,6 +64575,10 @@
           "count": 1
         },
         {
+          "value": "blocked-task-pinning",
+          "count": 1
+        },
+        {
           "value": "bool-auto-needs-reading-constraint",
           "count": 1
         },
@@ -64311,6 +64779,10 @@
           "count": 1
         },
         {
+          "value": "client-feed-delta-reveal-api",
+          "count": 1
+        },
+        {
           "value": "client-feed-fixtures",
           "count": 1
         },
@@ -64319,7 +64791,15 @@
           "count": 1
         },
         {
+          "value": "client-feed-reveals-api",
+          "count": 1
+        },
+        {
           "value": "client-feed-sources-api",
+          "count": 1
+        },
+        {
+          "value": "clip-disclosure-migration",
           "count": 1
         },
         {
@@ -64447,6 +64927,10 @@
           "count": 1
         },
         {
+          "value": "config-dir-archival-allowlist",
+          "count": 1
+        },
+        {
           "value": "config-hot-reload-submodel-validation",
           "count": 1
         },
@@ -64496,6 +64980,10 @@
         },
         {
           "value": "consolidation_gate_backlog",
+          "count": 1
+        },
+        {
+          "value": "construct-ratchet-hosts",
           "count": 1
         },
         {
@@ -64831,6 +65319,10 @@
           "count": 1
         },
         {
+          "value": "delivered-checks-grep-semantics",
+          "count": 1
+        },
+        {
           "value": "delivered-checks-pin-symbols",
           "count": 1
         },
@@ -65072,6 +65564,10 @@
         },
         {
           "value": "elastic-p2-cantilever-accuracy",
+          "count": 1
+        },
+        {
+          "value": "elastic-static-body-layout-detection",
           "count": 1
         },
         {
@@ -65523,7 +66019,7 @@
           "count": 1
         },
         {
-          "value": "flake-debt-nested-pytest-basetemp-cluster",
+          "value": "flake-debt-duplicate-check",
           "count": 1
         },
         {
@@ -65627,11 +66123,19 @@
           "count": 1
         },
         {
+          "value": "fused-memory-async-worker-test-flakes",
+          "count": 1
+        },
+        {
           "value": "fused-memory-backend-timeout-posture",
           "count": 1
         },
         {
           "value": "fused-memory-classifier-test-stubs",
+          "count": 1
+        },
+        {
+          "value": "fused-memory-config-reconciliation-non-optional",
           "count": 1
         },
         {
@@ -65680,6 +66184,10 @@
         },
         {
           "value": "fused-memory-pytest-xdist",
+          "count": 1
+        },
+        {
+          "value": "fused-memory-real-store-test-seeding",
           "count": 1
         },
         {
@@ -66031,6 +66539,10 @@
           "count": 1
         },
         {
+          "value": "gui-document-identity-key",
+          "count": 1
+        },
+        {
           "value": "gui-editor-test-cursor-mapping",
           "count": 1
         },
@@ -66063,6 +66575,10 @@
           "count": 1
         },
         {
+          "value": "gui-path-spelling-identity",
+          "count": 1
+        },
+        {
           "value": "gui-side-panel-grid-tracks",
           "count": 1
         },
@@ -66071,11 +66587,23 @@
           "count": 1
         },
         {
+          "value": "gui-sidecar-placeholder",
+          "count": 1
+        },
+        {
+          "value": "gui-source-location-navigation",
+          "count": 1
+        },
+        {
           "value": "gui-state-diagnostic-streams",
           "count": 1
         },
         {
           "value": "gui-valuedata-declared-dimension",
+          "count": 1
+        },
+        {
+          "value": "gui-viewport-measurement-attribution",
           "count": 1
         },
         {
@@ -66183,6 +66711,10 @@
           "count": 1
         },
         {
+          "value": "inline-suppression-disposition-markers",
+          "count": 1
+        },
+        {
           "value": "input-cone-fold-sub-consumers",
           "count": 1
         },
@@ -66224,6 +66756,10 @@
         },
         {
           "value": "inv13_convention",
+          "count": 1
+        },
+        {
+          "value": "inv8-loop-blocking-scanner",
           "count": 1
         },
         {
@@ -66555,6 +67091,10 @@
           "count": 1
         },
         {
+          "value": "mark-step-done-commit-sha",
+          "count": 1
+        },
+        {
           "value": "markup-guard-storm-state",
           "count": 1
         },
@@ -66807,6 +67347,10 @@
           "count": 1
         },
         {
+          "value": "merge-head-hook-timing",
+          "count": 1
+        },
+        {
           "value": "merge-landing-truth",
           "count": 1
         },
@@ -66944,6 +67488,10 @@
         },
         {
           "value": "merge-main-into-task-branch-verification",
+          "count": 1
+        },
+        {
+          "value": "merge-marker-search-guard",
           "count": 1
         },
         {
@@ -67271,6 +67819,10 @@
           "count": 1
         },
         {
+          "value": "offline-lane-environment",
+          "count": 1
+        },
+        {
           "value": "offline-lane-episode-engine",
           "count": 1
         },
@@ -67291,11 +67843,11 @@
           "count": 1
         },
         {
-          "value": "openvdb-stub-build",
+          "value": "openvdb-ingest-units",
           "count": 1
         },
         {
-          "value": "openvdb-stub-build-probe",
+          "value": "openvdb-stub-build",
           "count": 1
         },
         {
@@ -67411,7 +67963,15 @@
           "count": 1
         },
         {
+          "value": "orphan-audit-pin-files",
+          "count": 1
+        },
+        {
           "value": "orphan-audit-scope",
+          "count": 1
+        },
+        {
+          "value": "orphan-audit-skip-policy",
           "count": 1
         },
         {
@@ -67444,6 +68004,10 @@
         },
         {
           "value": "park-eviction-stray-magicmock-file-leak",
+          "count": 1
+        },
+        {
+          "value": "park-info-severity-cover",
           "count": 1
         },
         {
@@ -67687,6 +68251,10 @@
           "count": 1
         },
         {
+          "value": "ptodo-ratchet-scope",
+          "count": 1
+        },
+        {
           "value": "ptodo-scoped-scan-oracle",
           "count": 1
         },
@@ -67752,6 +68320,10 @@
         },
         {
           "value": "pytest-factory-fixture-binding-name",
+          "count": 1
+        },
+        {
+          "value": "pytest-host-temproot-cleanup",
           "count": 1
         },
         {
@@ -68043,6 +68615,10 @@
           "count": 1
         },
         {
+          "value": "reify-audit-pattern-registration",
+          "count": 1
+        },
+        {
           "value": "reify-audit-pattern-variant",
           "count": 1
         },
@@ -68235,6 +68811,10 @@
           "count": 1
         },
         {
+          "value": "reify-ir-module-scc",
+          "count": 1
+        },
+        {
           "value": "reify-kernel-gmsh-tests-common",
           "count": 1
         },
@@ -68391,6 +68971,10 @@
           "count": 1
         },
         {
+          "value": "remote-runner-gate-test-fixtures",
+          "count": 1
+        },
+        {
           "value": "remote-task-leg-verify-prd",
           "count": 1
         },
@@ -68467,11 +69051,19 @@
           "count": 1
         },
         {
-          "value": "review-all-program-tooling",
+          "value": "review-all-program-ledger-action-shape",
+          "count": 1
+        },
+        {
+          "value": "review-all-program-scripts-type-check",
           "count": 1
         },
         {
           "value": "review-briefing-refresh",
+          "count": 1
+        },
+        {
+          "value": "review-checkpoint-cap-skip",
           "count": 1
         },
         {
@@ -68487,7 +69079,19 @@
           "count": 1
         },
         {
+          "value": "reviewer-trial-answer-key-pooling",
+          "count": 1
+        },
+        {
+          "value": "reviewer-trial-campaign-briefing-cli",
+          "count": 1
+        },
+        {
           "value": "reviewer-trial-campaign-results-dir",
+          "count": 1
+        },
+        {
+          "value": "reviewer-trial-corpus",
           "count": 1
         },
         {
@@ -68731,6 +69335,10 @@
           "count": 1
         },
         {
+          "value": "scheduler-pause-rehydration",
+          "count": 1
+        },
+        {
           "value": "scheduler-psi-reader-seam",
           "count": 1
         },
@@ -68812,6 +69420,10 @@
         },
         {
           "value": "selector-leaf-test-assertions",
+          "count": 1
+        },
+        {
+          "value": "selector-list-geometry-runtime-resolution",
           "count": 1
         },
         {
@@ -68916,6 +69528,10 @@
         },
         {
           "value": "shell-classification-ratio",
+          "count": 1
+        },
+        {
+          "value": "shell-extract-min-wall-spacing-validation",
           "count": 1
         },
         {
@@ -69163,6 +69779,10 @@
           "count": 1
         },
         {
+          "value": "stale-pid-dir-sweep-loop-blocking",
+          "count": 1
+        },
+        {
           "value": "stale-status-snapshot-extraction-prefilter",
           "count": 1
         },
@@ -69235,11 +69855,19 @@
           "count": 1
         },
         {
+          "value": "steward-construction-census",
+          "count": 1
+        },
+        {
           "value": "steward-mcp-fallback",
           "count": 1
         },
         {
           "value": "steward-merge-wait-abandons-working-steward",
+          "count": 1
+        },
+        {
+          "value": "steward-outcome-channel",
           "count": 1
         },
         {
@@ -69567,11 +70195,19 @@
           "count": 1
         },
         {
+          "value": "test-file-split-parity",
+          "count": 1
+        },
+        {
           "value": "test-file-split-verification",
           "count": 1
         },
         {
           "value": "test-module-move-release-coverage",
+          "count": 1
+        },
+        {
+          "value": "test-move-citation-gates",
           "count": 1
         },
         {
@@ -69935,6 +70571,10 @@
           "count": 1
         },
         {
+          "value": "uv-required-version-behaviour",
+          "count": 1
+        },
+        {
           "value": "uv-venv-not-relocatable",
           "count": 1
         },
@@ -70091,10 +70731,6 @@
           "count": 1
         },
         {
-          "value": "verify-scope-spawn-failure",
-          "count": 1
-        },
-        {
           "value": "verify-scope-unit-naming",
           "count": 1
         },
@@ -70176,6 +70812,10 @@
         },
         {
           "value": "warm-base-deps-generation-prune",
+          "count": 1
+        },
+        {
+          "value": "warm-base-refresh-cadence",
           "count": 1
         },
         {
@@ -70271,6 +70911,10 @@
           "count": 1
         },
         {
+          "value": "warm-lane-reclaim-wip-commits",
+          "count": 1
+        },
+        {
           "value": "warm-lane-seed-mode-by-role",
           "count": 1
         },
@@ -70324,6 +70968,10 @@
         },
         {
           "value": "whole-tree-ast-scan-cost",
+          "count": 1
+        },
+        {
+          "value": "wildcard-mcp-scoping-gate",
           "count": 1
         },
         {
@@ -70499,9 +71147,9 @@
           "count": 1
         }
       ],
-      "distinct_total": 2054
+      "distinct_total": 2106
     },
-    "parent_id_present": 1662,
+    "parent_id_present": 1755,
     "canonical_true": 207,
     "canonical_false": 51,
     "canonical_non_bool": 1,
@@ -71339,11 +71987,11 @@
       "entries": [
         {
           "value": "absent",
-          "count": 71396
+          "count": 71639
         },
         {
           "value": "list",
-          "count": 351
+          "count": 355
         },
         {
           "value": "scalar",
@@ -71356,7 +72004,7 @@
       "entries": [
         {
           "value": "full_uuid",
-          "count": 532
+          "count": 536
         },
         {
           "value": "other",
@@ -71377,7 +72025,7 @@
         },
         {
           "value": 1,
-          "count": 100
+          "count": 104
         },
         {
           "value": 2,
@@ -71428,12 +72076,12 @@
     }
   },
   "topic_coverage": {
-    "records": 71833,
-    "topic_present": 4074,
-    "topic_coverage_pct": 5.6715,
-    "distinct_topics": 2054,
+    "records": 72080,
+    "topic_present": 4134,
+    "topic_coverage_pct": 5.7353,
+    "distinct_topics": 2106,
     "topics_with_one_canonical": 207,
-    "topics_with_zero_canonical": 1850,
+    "topics_with_zero_canonical": 1902,
     "topics_with_multiple_canonical": 0,
     "multiple_canonical_topics": [],
     "canonical_uniqueness_enforced": false,
@@ -71461,7 +72109,7 @@
         "source": "task 3626 ([MILESTONE] memory_metadata.enforce flip gate)"
       }
     ],
-    "slug_conforming": 1895,
+    "slug_conforming": 1947,
     "slug_non_conforming": 159,
     "non_conforming_topics": [
       {
@@ -72517,31 +73165,31 @@
   },
   "registry_error": null,
   "coverage_trend": {
-    "baseline": "2026-10-21T04:03:41+00:00",
-    "baseline_reason": "compared against the most recent prior run (2026-10-21T04:03:41+00:00)",
+    "baseline": "2026-10-22T04:02:40+00:00",
+    "baseline_reason": "compared against the most recent prior run (2026-10-22T04:02:40+00:00)",
     "projects": {
       "dark_factory": {
         "status": "compared",
         "columns": {
           "records": {
-            "before": 33037,
-            "after": 33206,
-            "delta": 169
+            "before": 33206,
+            "after": 33381,
+            "delta": 175
           },
           "topic_present": {
-            "before": 2190,
-            "after": 2256,
-            "delta": 66
+            "before": 2256,
+            "after": 2294,
+            "delta": 38
           },
           "topic_coverage_pct": {
-            "before": 6.6289,
-            "after": 6.794,
-            "delta": 0.1651
+            "before": 6.794,
+            "after": 6.8722,
+            "delta": 0.0782
           },
           "distinct_topics": {
-            "before": 972,
-            "after": 1017,
-            "delta": 45
+            "before": 1017,
+            "after": 1049,
+            "delta": 32
           },
           "topics_with_one_canonical": {
             "before": 85,
@@ -72549,9 +73197,9 @@
             "delta": 0
           },
           "topics_with_zero_canonical": {
-            "before": 887,
-            "after": 932,
-            "delta": 45
+            "before": 932,
+            "after": 964,
+            "delta": 32
           },
           "topics_with_multiple_canonical": {
             "before": 0,
@@ -72569,9 +73217,9 @@
             "delta": 0
           },
           "slug_conforming": {
-            "before": 879,
-            "after": 924,
-            "delta": 45
+            "before": 924,
+            "after": 956,
+            "delta": 32
           },
           "slug_non_conforming": {
             "before": 93,
@@ -72614,24 +73262,24 @@
         "status": "compared",
         "columns": {
           "records": {
-            "before": 38584,
-            "after": 38627,
-            "delta": 43
+            "before": 38627,
+            "after": 38699,
+            "delta": 72
           },
           "topic_present": {
-            "before": 1797,
-            "after": 1818,
-            "delta": 21
+            "before": 1818,
+            "after": 1840,
+            "delta": 22
           },
           "topic_coverage_pct": {
-            "before": 4.6574,
-            "after": 4.7066,
-            "delta": 0.0492
+            "before": 4.7066,
+            "after": 4.7546,
+            "delta": 0.048
           },
           "distinct_topics": {
-            "before": 1023,
-            "after": 1040,
-            "delta": 17
+            "before": 1040,
+            "after": 1060,
+            "delta": 20
           },
           "topics_with_one_canonical": {
             "before": 122,
@@ -72639,9 +73287,9 @@
             "delta": 0
           },
           "topics_with_zero_canonical": {
-            "before": 901,
-            "after": 918,
-            "delta": 17
+            "before": 918,
+            "after": 938,
+            "delta": 20
           },
           "topics_with_multiple_canonical": {
             "before": 0,
@@ -72659,9 +73307,9 @@
             "delta": 0
           },
           "slug_conforming": {
-            "before": 957,
-            "after": 974,
-            "delta": 17
+            "before": 974,
+            "after": 994,
+            "delta": 20
           },
           "slug_non_conforming": {
             "before": 66,
@@ -72718,41 +73366,41 @@
     "projects": {
       "dark_factory": {
         "collection": "fused_dark_factory",
-        "collection_points": 33206,
-        "collection_points_before": 33206,
+        "collection_points": 33381,
+        "collection_points_before": 33381,
         "collection_points_interval": [
-          33206,
-          33206
+          33381,
+          33381
         ],
-        "counted": 33206,
-        "counted_recount": 33206,
+        "counted": 33381,
+        "counted_recount": 33381,
         "counted_interval": [
-          33206,
-          33206
+          33381,
+          33381
         ],
         "uncovered_points": 0,
         "complete": true,
         "categories": {
           "observations_and_summaries": {
-            "expected": 23310,
-            "recount": 23310,
-            "scrolled": 23310,
+            "expected": 23438,
+            "recount": 23438,
+            "scrolled": 23438,
             "delta": 0,
             "complete": true,
             "churn": false
           },
           "preferences_and_norms": {
-            "expected": 2254,
-            "recount": 2254,
-            "scrolled": 2254,
+            "expected": 2258,
+            "recount": 2258,
+            "scrolled": 2258,
             "delta": 0,
             "complete": true,
             "churn": false
           },
           "procedural_knowledge": {
-            "expected": 7618,
-            "recount": 7618,
-            "scrolled": 7618,
+            "expected": 7661,
+            "recount": 7661,
+            "scrolled": 7661,
             "delta": 0,
             "complete": true,
             "churn": false
@@ -72785,41 +73433,41 @@
       },
       "reify": {
         "collection": "fused_reify",
-        "collection_points": 38627,
-        "collection_points_before": 38627,
+        "collection_points": 38699,
+        "collection_points_before": 38699,
         "collection_points_interval": [
-          38627,
-          38627
+          38699,
+          38699
         ],
-        "counted": 38627,
-        "counted_recount": 38627,
+        "counted": 38699,
+        "counted_recount": 38699,
         "counted_interval": [
-          38627,
-          38627
+          38699,
+          38699
         ],
         "uncovered_points": 0,
         "complete": true,
         "categories": {
           "observations_and_summaries": {
-            "expected": 29326,
-            "recount": 29326,
-            "scrolled": 29326,
+            "expected": 29375,
+            "recount": 29375,
+            "scrolled": 29375,
             "delta": 0,
             "complete": true,
             "churn": false
           },
           "preferences_and_norms": {
-            "expected": 2095,
-            "recount": 2095,
-            "scrolled": 2095,
+            "expected": 2098,
+            "recount": 2098,
+            "scrolled": 2098,
             "delta": 0,
             "complete": true,
             "churn": false
           },
           "procedural_knowledge": {
-            "expected": 7126,
-            "recount": 7126,
-            "scrolled": 7126,
+            "expected": 7146,
+            "recount": 7146,
+            "scrolled": 7146,
             "delta": 0,
             "complete": true,
             "churn": false

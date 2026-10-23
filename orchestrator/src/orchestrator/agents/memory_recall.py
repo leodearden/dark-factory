@@ -16,6 +16,7 @@ from typing import Any
 
 from shared.briefing_queries import BriefingQuerySpec, BriefingScope, queries_for
 from shared.mcp_session import is_timeout_failure
+from shared.project_id import normalize_project_id
 
 from orchestrator.mcp_lifecycle import (
     mcp_call,
@@ -62,17 +63,6 @@ under ``orchestrator/tests/fixtures/grouped_search_contesting_child/`` pin it
 """
 
 
-def _canonical_project(value: str) -> str:
-    """Canonicalise a project identifier the way fused-memory does.
-
-    Mirrors ``canonicalize_project_id`` (strip, lowercase, ``'-'`` -> ``'_'``)
-    so ``dark-factory`` is not mistaken for a project distinct from
-    ``dark_factory``. Re-implemented because the orchestrator has no runtime
-    dependency on fused-memory.
-    """
-    return value.strip().lower().replace('-', '_')
-
-
 def _result_project(entry: dict) -> tuple[str, str] | None:
     """The ``(key, value)`` of the first non-empty string project tag, or None if untagged."""
     metadata = entry.get('metadata')
@@ -97,7 +87,7 @@ def _foreign_tag(entry: dict, target: str) -> tuple[str, str] | None:
     if match is None:
         return None
     key, tag = match
-    if _canonical_project(tag) == target:
+    if normalize_project_id(tag.strip()) == target:
         return None
     return key, tag
 
@@ -186,7 +176,7 @@ def filter_foreign_project_results(results: Sequence[Any], project_id: str) -> F
     result, or one with non-dict metadata, is kept as untagged. *results* is
     never mutated.
     """
-    target = _canonical_project(project_id)
+    target = normalize_project_id(project_id.strip())
     kept = []
     dropped = 0
     nested_dropped = 0

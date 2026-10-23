@@ -16,6 +16,8 @@ from shared.cli_invoke import (
     invoke_with_cap_retry,
     is_zero_output_timeout,
 )
+from shared.config_dir import CONFIG_DIR_PREFIX
+from shared.transcript_archive import archive_before_delete, resolve_archive_root
 
 from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, StageAgentOutcome
 from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
@@ -674,19 +676,134 @@ def recon_config_base_dir(data_dir: Path) -> Path:
     return base / 'recon-config'
 
 
-def gc_run_config_dir(data_dir: Path, run_id: str) -> None:
+def run_config_dir_path(data_dir: Path, run_id: str) -> Path:
+    """Path of a run's per-run recon CLI config dir — a PURE derivation.
+
+    Names exactly ``TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(data_dir)).path``
+    without constructing one. That is the point: ``TaskConfigDir.__init__``
+    mkdirs the dir and symlinks settings into it, so a read-only caller — the
+    resume-eligibility probe asking whether a transcript survives — would
+    resurrect the very directory it is probing for.
+    """
+    return recon_config_base_dir(data_dir) / f'{CONFIG_DIR_PREFIX}{run_id}'
+
+
+def recon_transcript_archive_key(run_id: str) -> str:
+    """Key a recon run's transcripts are archived under, inside the archive root.
+
+    ``shared.transcript_archive`` files everything under a key it calls
+    ``task_id``, but a recon run has no task id — its run_id is a UUID — so the
+    run needs a key of its own. Its shape is fixed by two constraints:
+
+    - EXACTLY ONE path segment. The archive layout is ``<key>/<enc>/<sid>.jsonl``
+      and ``scripts/legibility/inventory.py::_archive_enc`` reads the
+      archive-root-relative ``parts[1]`` as ``<enc>``; a key with an extra
+      segment would land the archives on disk yet make them unenumerable.
+    - A ``recon-`` prefix. Recon shares the archive root with the
+      orchestrator, whose per-task dirs are bare numeric task ids; the prefix
+      keeps the two producers distinguishable.
+    """
+    return f'recon-{run_id}'
+
+
+def recon_archive_root(config: ReconciliationConfig) -> Path | None:
+    """Archive root for recon transcripts, or ``None`` when archival is off.
+
+    The SINGLE composition home for both consumers — the ``BaseStage.run``
+    producer hook and ``gc_run_config_dir``'s teardown hook — for the reason
+    ``shared/src/shared/transcript_archive.py::resolve_archive_root`` gives
+    (INV-5): a layout with one home in read and write but several in
+    composition can still drift.
+
+    Anchored at ``explore_codebase_root``, the cwd every recon stage runs in.
+    That makes it ONE root for every project_id this server reconciles: recon
+    is dark-factory's own agent work whatever project's memory it touches, so
+    its transcripts are mined as dark-factory's. A relative anchor resolves
+    against the process cwd; ``announce_recon_archive_root`` says so at start.
+
+    ``resolve_archive_root`` is deliberately not total. A malformed config
+    (e.g. a reload that lands a non-path root) disables archival with one
+    WARNING instead of raising on the recon dispatch path — the posture the
+    orchestrator's ``Harness._archive_available`` takes for the same call.
+    """
+    if not config.transcript_archive_enabled:
+        return None
+    try:
+        return resolve_archive_root(
+            config.explore_codebase_root, config.transcript_archive_root,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            'recon transcript archival disabled: archive root unresolvable '
+            '(explore_codebase_root=%r transcript_archive_root=%r): %s: %s',
+            config.explore_codebase_root,
+            config.transcript_archive_root,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
+def announce_recon_archive_root(config: ReconciliationConfig) -> None:
+    """Log, once at harness start, where recon transcripts will be archived.
+
+    A relative root WARNs with its absolute resolution: it lands under the
+    process cwd, which ``docs/legibility/legibility.yaml``'s
+    ``agent_transcript_roots`` reach only when that cwd is the repo root.
+    """
+    archive_root = recon_archive_root(config)
+    if archive_root is None:
+        logger.info('recon transcript archival: disabled')
+    elif archive_root.is_absolute():
+        logger.info('recon transcript archive root: %s', archive_root)
+    else:
+        logger.warning(
+            'recon transcript archive root %s is relative '
+            '(explore_codebase_root=%r) and resolves against the process cwd '
+            'to %s; set PROJECT_ROOT so the legibility miner finds it',
+            archive_root,
+            config.explore_codebase_root,
+            Path.cwd() / archive_root,
+        )
+
+
+def gc_run_config_dir(
+    data_dir: Path, run_id: str, *, archive_root: Path | None,
+) -> None:
     """Remove a run's per-run recon CLI config dir, if present (task 2744).
 
-    ``TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(data_dir)).path``
-    is ``recon_config_base_dir(data_dir) / f'claude-config-{run_id}'`` by
-    construction (config_dir.py's deterministic naming); this rmtrees exactly
-    that path. ``ignore_errors=True`` makes it a silent no-op when the dir was
-    never created (e.g. a run that short-circuited before any stage launch).
+    Targets ``run_config_dir_path(data_dir, run_id)``, the same path the
+    creator builds, and is a silent no-op when the dir was never created (e.g.
+    a run that short-circuited before any stage launch).
+
+    With an ``archive_root``, deletion is a step archival LICENSES rather than
+    one scheduled after it (task 3619's shape): ``archive_before_delete`` moves
+    each transcript into the archive and unlinks it only once the durable copy
+    exists, holding any it cannot archive. ``archive_root=None`` is the
+    DISABLED branch (``recon_archive_root`` returned None) and keeps the plain
+    rmtree. The keyword is required so every caller states which it means.
+
+    SYNCHRONOUS by contract and never raises: callers must not wrap it in
+    ``asyncio.to_thread``, since an ``await`` is a cancellation point and a
+    SIGTERM-driven teardown is exactly what would then skip it.
     """
-    shutil.rmtree(
-        recon_config_base_dir(data_dir) / f'claude-config-{run_id}',
-        ignore_errors=True,
+    config_dir = run_config_dir_path(data_dir, run_id)
+    if archive_root is None:
+        shutil.rmtree(config_dir, ignore_errors=True)
+        return
+    outcome = archive_before_delete(
+        config_dir, recon_transcript_archive_key(run_id), archive_root=archive_root,
     )
+    if outcome.archived or outcome.held:
+        logger.info(
+            'recon run %s transcripts archived before gc: archived=%d '
+            'already_current=%d held=%d archive_root=%s',
+            run_id,
+            outcome.archived,
+            outcome.already_current,
+            len(outcome.held),
+            archive_root,
+        )
 
 
 async def run_stage_via_cli(

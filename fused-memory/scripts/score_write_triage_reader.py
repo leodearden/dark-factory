@@ -49,11 +49,9 @@ prints one stderr line per gap, and writes nothing.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import math
 import sys
-import types
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -70,34 +68,17 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
 )
+from fused_memory.utils.script_loader import load_script
 
 _SCRIPTS = Path(__file__).resolve().parent
-
-
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
 
 
 if TYPE_CHECKING:
     import write_triage_reader_rubric as _rubric
     import write_triage_stats as _stats
 else:
-    _rubric = _load_script(_SCRIPTS / 'write_triage_reader_rubric.py', 'write_triage_reader_rubric')
-    _stats = _load_script(_SCRIPTS / 'write_triage_stats.py', 'write_triage_stats')
+    _rubric = load_script(_SCRIPTS / 'write_triage_reader_rubric.py', 'write_triage_reader_rubric')
+    _stats = load_script(_SCRIPTS / 'write_triage_stats.py', 'write_triage_stats')
 
 Cell = _rubric.Cell
 

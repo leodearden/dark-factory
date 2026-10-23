@@ -8,6 +8,54 @@
       "severity": "suggestion",
       "description": "The filter `e.level == 0` preserves ALL non-L0 escalations, including born-at-L2 escalations (level=2, per the deterministic/milestone escalation paths), yet the docstring and harness comments claim only 'Level-1' escalations are preserved. The behavior (preserving L2 too) is likely correct, but the documentation is misleading about which levels survive restart.",
       "mutation_type": "style"
+    },
+    {
+      "id": "mined_1321_pool_01",
+      "location": "escalation/src/escalation/queue.py:358",
+      "category": "naming",
+      "severity": "blocking",
+      "description": "`EscalationQueue.dismiss_all_pending` now dismisses only level-0 pending escalations and silently leaves every other level pending, so its name (and the module/test-class docstrings and skills/escalation-watcher/SKILL.md:463 that describe it) promises a full flush it no longer performs. The orchestrator's restart policy ('only L0 is stale on restart') is hard-coded inside the generic queue primitive rather than being visible at the single harness call site (e.g. via an explicit `level` argument mirroring `get_by_task(..., level=)` or a rename such as `dismiss_pending_l0`). A future caller choosing the method by name (queue reset, teardown, recovery path) will silently leave L1s behind.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1321_pool_02",
+      "location": "escalation/src/escalation/queue.py:375",
+      "category": "structured_data",
+      "severity": "suggestion",
+      "description": "The new restart filter compares the escalation tier against a bare integer literal (`e.level == 0`) with no named constant or enum, adding another raw-int routing site to the existing `level=1` / `level != 0` literals, and filters by hand although `get_by_task` already offers a `level` filter that `get_pending` lacks.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1321_pool_03",
+      "location": "orchestrator/tests/test_stale_escalation_cleanup.py:65",
+      "category": "test_coverage",
+      "severity": "suggestion",
+      "description": "The harness-level tests of `_dismiss_stale_escalations` were not updated for the L0-only contract: every test replaces the queue with a MagicMock, the class docstring and `test_pending_escalations_dismissed` still say pending escalations are 'all dismissed', and no test drives the startup path against a real `EscalationQueue` to show an L1 survives while the L0 is dismissed. The filter itself is covered at the queue layer, as the task required.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1321_pool_04",
+      "location": "orchestrator/src/orchestrator/harness.py:2223",
+      "category": "observability",
+      "severity": "suggestion",
+      "description": "The harness startup log asserts 'L1 escalations preserved across restart' without knowing whether any exist (it only receives the L0 dismissal count), and it is emitted only when at least one L0 was dismissed, so when L1s are carried over and no L0 is dismissed nothing is logged. The operator never sees how many human-attention escalations survived the restart.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1321_pool_05",
+      "location": "orchestrator/src/orchestrator/harness.py:2224",
+      "category": "duplication",
+      "severity": "suggestion",
+      "description": "Both `EscalationQueue.dismiss_all_pending` and `Harness._dismiss_stale_escalations` log an INFO line for the same dismissal count, so each restart emits two near-identical 'Dismissed N stale L0 escalation(s)' lines and any wording change must be made in both; this change edited both copies.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1321_pool_06",
+      "location": "escalation/tests/test_queue.py:244",
+      "category": "test_quality",
+      "severity": "suggestion",
+      "description": "`test_dismiss_all_pending_idempotent_with_l1` repeats the setup and assertions of `test_dismiss_all_pending_skips_level_1_escalations` and adds only a second-call `== 0` check, while more informative cases (an L0 and an L1 on the same task_id; a mixed L0/L1 queue where one L0 resolve raises) are untested.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

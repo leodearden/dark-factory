@@ -497,6 +497,7 @@ if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
+    from orchestrator.merge_lane.types import OperatorMergeCancel
     from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome, SoloVerifyResult
     from orchestrator.scheduler import SchedulerFacade
     from orchestrator.usage_gate import UsageGate
@@ -1706,6 +1707,22 @@ class TaskWorkflow:
         if trigger_outcome is not None:
             return trigger_outcome
         return WorkflowOutcome.MERGE_DEFERRED
+
+    async def _block_on_operator_merge_cancel(
+        self, operator_cancel: OperatorMergeCancel, *, merge_phase: bool,
+    ) -> WorkflowOutcome:
+        """Block, escalating to a human, after an operator cancelled this task's merge.
+
+        The cancel is a human's decision to stop the merge, so no steward retries
+        it (Leo's 2026-10-21 ruling on task 5248).
+        """
+        return await self._mark_blocked(
+            f'Merge request {operator_cancel.request_id} cancelled by an operator '
+            '(merge_cancel); the branch was not merged',
+            merge_phase=merge_phase,
+            escalate_to_human=True,
+            category='merge_cancelled_by_operator',
+        )
 
     async def _handle_superseded(self, result: MergeOutcome) -> WorkflowOutcome:
         """Park a single-task workflow whose merge was absorbed by a coalesced train or γ2 chain.
@@ -11539,6 +11556,7 @@ class TaskWorkflow:
         """
         from orchestrator.merge_lane import (
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
+            OperatorMergeCancel,
             WaiterRecord,
         )
         from orchestrator.merge_lane.disposition import MergeFailureDisposition
@@ -11986,10 +12004,18 @@ class TaskWorkflow:
         # waiting for the merge worker to finish. W9-θ: a cancel-win now
         # raises WorkflowCancelled('soft') (propagating to run()'s single
         # catch) instead of returning None — no `result is None` branch.
-        result = await self._await_cancellable(
-            future,
-            on_soft_cancel=_on_soft_cancel_detach,
-        )
+        try:
+            result = await self._await_cancellable(
+                future,
+                on_soft_cancel=_on_soft_cancel_detach,
+            )
+        except asyncio.CancelledError as cancelled:
+            operator_cancel = OperatorMergeCancel.carried_by(cancelled)
+            if operator_cancel is None:
+                raise
+            return await self._block_on_operator_merge_cancel(
+                operator_cancel, merge_phase=merge_phase,
+            )
 
         if result.status == 'wip_halted':
             return await self._handle_wip_conflict(result, branch_name)
@@ -14148,10 +14174,17 @@ class TaskWorkflow:
         if 'verdict_tools' in role.mcp_families and cwd:
             mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role)
 
-        # Strict scoping (EVAL_PROFILE, task 4757) is a no-op without a truthy
-        # --mcp-config, so a role whose families composed none gets the
-        # zero-server one rather than keeping the worktree's ambient .mcp.json.
-        if self.config.strict_mcp_config and not mcp_config:
+        # --strict-mcp-config stops the CLI unioning in the ambient project/user
+        # .mcp.json. EVAL_PROFILE scopes every role (task 4757). A role whose
+        # servers are all spawned above per invocation is scoped too, so its
+        # verdict tool is not deferred behind ToolSearch (task 3849; the
+        # reviewer trial does the same in
+        # orchestrator/src/orchestrator/evals/reviewer_trial/runner.py::_review).
+        # Strict scoping is a no-op without a truthy --mcp-config, so a role
+        # whose families composed none gets the zero-server one rather than
+        # keeping the worktree's ambient .mcp.json.
+        strict_mcp = self.config.strict_mcp_config or role.strict_mcp_scope
+        if strict_mcp and not mcp_config:
             mcp_config = no_mcp_servers_config()
 
         # Session-resume lifecycle: if the harness recovered a sidecar that
@@ -14447,7 +14480,7 @@ class TaskWorkflow:
                 allowed_tools=role.allowed_tools or None,
                 disallowed_tools=role.disallowed_tools or None,
                 mcp_config=mcp_config,
-                strict_mcp_config=self.config.strict_mcp_config,
+                strict_mcp_config=strict_mcp,
                 output_schema=output_schema,
                 sandbox_modules=sandbox_modules,
                 sandbox_extras=sandbox_extras,

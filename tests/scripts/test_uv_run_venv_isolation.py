@@ -66,6 +66,7 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "scripts/orchestrator-pump-web-ui.service",
         "scripts/orchestrator-reify.service",
         "scripts/orchestrator-solar-challenge-platform.service",
+        "scripts/orchestrator-stream-touch.service",
     }
 )
 

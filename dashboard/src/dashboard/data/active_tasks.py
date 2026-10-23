@@ -4,7 +4,10 @@ Joins three sources — the per-root task snapshot unit
 (``dashboard.data.task_snapshot``, which owns every read of the task tree),
 per-task runtime state (via the orchestrator's escalation MCP,
 ``get_task_runtime_state``), and optional burst state from reconciliation —
-into the ``ACTIVE_TASKS`` shape consumed by the React dashboard's tasks tab.
+into the per-root task rows that ``/api/v2/dashboard/tasks`` serves as
+``TASKS_SNAPSHOT[p].rows`` and that
+``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state`` joins
+against.
 
 THIS MODULE READS NOTHING ITSELF beyond the runtime fan-out and the batched
 external-status tail. A root's task state arrives as a ``TaskSnapshot``,
@@ -13,9 +16,11 @@ half, whether that measurement succeeded and why not. What lives here is the
 WALK — the budget, the admission width, the rotation, the canonical
 re-assembly — and the SHAPING of one root's rows out of one unit.
 
-Output shape (per task) matches ``data.js`` mock fixtures. A task's
-description/details are NOT on it: the Task Detail pane fetches them for the
-selected task from ``dashboard/src/dashboard/api/task_prose.py::api_task_prose``.
+Output shape (per row); the ``TASKS_SNAPSHOT`` seed comment in
+``dashboard/src/dashboard/static/redux/data.js`` documents the same shape for
+the client. A task's description/details are NOT on it: the Task Detail pane
+fetches them for the selected task from
+``dashboard/src/dashboard/api/task_prose.py::api_task_prose``.
 
     {
         'id': 'dark_factory/T-19',
@@ -214,12 +219,13 @@ _TASKS_PER_PROJECT_BUDGET = 14.0
 # called in-process against the live fused-memory with the production roots,
 # served 30.4 MB: 9 roots, all fresh on both halves, and 3128 active rows.
 # ACTIVE_TASKS was 15.2 MB, and the same rows again under
-# TASKS_SNAPSHOT[p].rows were another 15.2 MB, until γ3 (task 5590) retires
-# ACTIVE_TASKS. Main's live endpoint, at the same hour, served 17.4 MB
-# for 3634 rows. 506 of those rows were terminal, at 2.2 MB, so that 2.2 MB is
-# all that leaving terminal rows out of the default render saved on the wire.
-# The PRD baseline's 9.4 MB terminal-window row measures the READ (its caption:
-# the dashboard's own fetch_tasks), not the capped slice of it that shipped.
+# TASKS_SNAPSHOT[p].rows were another 15.2 MB, until γ3 (task 5590) retired
+# ACTIVE_TASKS (sizes not re-measured since). Main's live endpoint, at the same
+# hour, served 17.4 MB for 3634 rows. 506 of those rows were terminal, at
+# 2.2 MB, so that 2.2 MB is all that leaving terminal rows out of the default
+# render saved on the wire. The PRD baseline's 9.4 MB terminal-window row
+# measures the READ (its caption: the dashboard's own fetch_tasks), not the
+# capped slice of it that shipped.
 _TASKS_TOTAL_BUDGET = 20.0
 
 # How many project roots ``collect_tasks_with_counts`` may have in flight.

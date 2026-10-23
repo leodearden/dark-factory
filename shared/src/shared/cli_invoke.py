@@ -132,6 +132,15 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         takes the supervisor's unclean path.
 #                                         Neither blocks a queue.
 #
+# orchestrator/evals/runner.py            14-day default OK (esc-4002-1, task
+#   (run_architect_eval invocation)       7320).  A cap lands MID-cell after
+# orchestrator/evals/measurement.py       real spend, which --resume carries
+#   (measured_call invocation)            across the account switch: waiting
+#                                         is ~free, while tainting re-spends
+#                                         it.  AllAccountsCappedException is
+#                                         recorded as an Unmeasured with cause
+#                                         cap_exhausted, never raised.
+#
 # fused_memory/middleware/task_curator.py _CURATOR_CAP_WAIT_SANITY_SECS=120s
 #   (LLM triage calls)                    + park_on_frozen_pool=False.  DEFERS,
 #                                         never creates, when the pool cannot
@@ -166,34 +175,6 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         entry instead of raising.  A cap hit
 #                                         retries FRESH (resume_on_cap_hit=
 #                                         False).
-#
-# orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 172800 s (48 h).
-#   (run_architect_eval invocation)       RAISED from 1800 s on 2026-08-25
-#                                         (esc-3634-1).  It is the one caller in
-#                                         this table that does NOT take the
-#                                         short house value, deliberately.  A
-#                                         cap lands MID-cell after real spend,
-#                                         which --resume preserves across the
-#                                         account switch: waiting is ~free,
-#                                         while tainting discards that spend and
-#                                         pays it again on the re-run.  48 h
-#                                         skates the 5-hour account caps that
-#                                         produce the common short all-capped
-#                                         windows.  Since task 4002 it also
-#                                         bounds the gate park, so an
-#                                         all-capped window longer than 48 h
-#                                         taints the cell rather than parking
-#                                         to the reset (esc-4002-1).
-#                                         AllAccountsCappedException
-#                                         is still caught and recorded as a
-#                                         `cap_exhausted:` marker on the cell
-#                                         (tainted, so the cell is EXCLUDED from
-#                                         the reported mean rather than scored a
-#                                         fabricated 0.0), never raised.  No
-#                                         max_cap_retries: cooldown doubles per
-#                                         pool cycle, so a fixed count would
-#                                         give a BIGGER account pool LESS
-#                                         wall-clock patience.
 #
 # scripts/legibility/session_runner.py    NO patience at all: park_on_frozen_
 #   (nightly legibility trickle + census, pool=False + max_cap_retries=

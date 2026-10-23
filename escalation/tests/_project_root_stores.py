@@ -1,7 +1,8 @@
-"""Store layout shared by the two suites of the γ2 ``project_root`` guard.
+"""Store layout shared by the suites that drive the γ2 ``project_root`` guard.
 
 ``test_mismatch_streak.py`` drives ``MismatchStreak`` directly and
-``test_project_root_assertion.py`` drives it through ``create_server``. Both
+``test_project_root_assertion.py`` drives it through ``create_server``, as does
+``test_store_identity_boundary.py`` over a real MCP session. All three
 must agree on what counts as the storm escape's output and on how a project
 store and a reconciliation store are laid out, so that lives here once.
 
@@ -40,9 +41,11 @@ def recon_queue(tmp_path: Path) -> EscalationQueue:
     return EscalationQueue(tmp_path / 'recon')
 
 
-def project_identity(queue: EscalationQueue, project_root: Path) -> StoreIdentity:
+def project_identity(
+    queue: EscalationQueue, project_root: Path, *, project_id: str = PROJECT_ID,
+) -> StoreIdentity:
     return StoreIdentity(
-        kind='project', queue_dir=queue.queue_dir, project_id=PROJECT_ID,
+        kind='project', queue_dir=queue.queue_dir, project_id=project_id,
         project_root=project_root,
     )
 

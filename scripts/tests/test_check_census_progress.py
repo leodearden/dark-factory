@@ -18,6 +18,7 @@ import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from legibility import trickle_state
 
 SCRIPT = Path(__file__).parent.parent / "legibility" / "check_census_progress.py"
@@ -95,22 +96,36 @@ def _seed(tmp_path, monkeypatch, *, nights, anchor: str | None = "2026-08-02",
     path = census_state_path or _census_state_path(tmp_path)
     stamp = recorded_at or datetime.now(UTC)
 
-    doc = None
+    state = None
     for i, night in enumerate(nights):
         exit_code, fired = _NIGHTS[night]
         census = None if fired is None else trickle_state.CensusObservation(
             fired=fired, last_census_at=anchor, census_state_path=str(path),
         )
-        doc = trickle_state.record_run(
+        state = trickle_state.record_run(
             project_id,
-            target_date=_FIRST_NIGHT + timedelta(days=i),
-            recorded_at=stamp - timedelta(days=len(nights) - 1 - i),
-            exit_code=exit_code,
-            total_records=1, zero_signal_dropped=1, dedupe_collapsed=0,
-            below_sampling_cut=0, budget_skipped=0, selected_count=0,
-            census=census,
+            trickle_state.NightRun(
+                target_date=_FIRST_NIGHT + timedelta(days=i),
+                recorded_at=stamp - timedelta(days=len(nights) - 1 - i),
+                exit_code=exit_code,
+                counters=trickle_state.RunCounters(
+                    total_records=1, zero_signal_dropped=1, dedupe_collapsed=0,
+                    below_sampling_cut=0, budget_skipped=0, selected_count=0,
+                ),
+                census=census,
+            ),
+            barren_escalated=False,
         )
-    return doc
+    return state
+
+
+def _rewrite_state(project_id, edit):
+    """Apply *edit* to the recorded JSON document in place, to hand-write a
+    document the current writer would not produce."""
+    path = trickle_state.trickle_state_path(project_id)
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    edit(doc)
+    path.write_text(json.dumps(doc), encoding="utf-8")
 
 
 def _assert_no_git(git_marker):
@@ -191,6 +206,7 @@ def test_a_streak_below_the_threshold_passes(tmp_path, monkeypatch):
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
+    assert "census_fired=True" in result.stdout
     assert "fires=2" in result.stdout
     assert "threshold 3" in result.stdout
     _assert_no_git(git_marker)
@@ -320,6 +336,51 @@ def test_a_corrupt_trickle_record_is_its_own_verdict(tmp_path, monkeypatch):
     lowered = result.stderr.lower()
     assert "unreadable" in lowered or "corrupt" in lowered
     assert "never recorded" not in lowered
+    _assert_no_git(git_marker)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [("fires", 0), ("fires", True), ("since", 20260901)],
+)
+def test_an_unusable_census_fire_streak_reads_as_no_streak(
+    tmp_path, monkeypatch, field, bad_value,
+):
+    """A damaged streak under-reports rather than making the whole record
+    unreadable: the trickle's own health stays assessable."""
+    _write_census_state(_census_state_path(tmp_path), "2026-08-02")
+    _seed(tmp_path, monkeypatch, nights=["fire"] * 3)
+    _rewrite_state(
+        "dark_factory",
+        lambda doc: doc["census_fire_streak"].update({field: bad_value}),
+    )
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "fires=0" in result.stdout
+    _assert_no_git(git_marker)
+
+
+def test_a_record_invalid_elsewhere_is_the_corrupt_verdict_naming_the_field(
+    tmp_path, monkeypatch,
+):
+    _write_census_state(_census_state_path(tmp_path), "2026-08-02")
+    _seed(tmp_path, monkeypatch, nights=["fire"] * 3)
+    _rewrite_state("dark_factory", lambda doc: doc.update(outcome="exploded"))
+
+    result, git_marker = _run_probe(tmp_path, "dark_factory", 3)
+
+    assert result.returncode == 1, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    [verdict] = [
+        line for line in result.stderr.splitlines() if line.startswith("ERROR:")
+    ]
+    assert "unreadable" in verdict or "corrupt" in verdict
+    assert "outcome" in verdict, "the verdict must name the field it rejected"
     _assert_no_git(git_marker)
 
 

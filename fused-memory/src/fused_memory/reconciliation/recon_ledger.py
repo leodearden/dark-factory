@@ -651,7 +651,10 @@ class ReconLedgerStore:
         early-collection path is narrowed to single-task markers, the
         dominant/incident-driving shape, by this collapse). Fail-safe
         direction is preserved either way: uncertain/unmatched => keep, never
-        delete on partial information.
+        delete on partial information.  A project-qualified component (e.g.
+        ``'reify:650'``, from ``flag_dedup.compute_marker_signature``) never
+        equals a terminal id either, so foreign-cited markers are reaped by
+        TTL only — the same fail-safe direction.
 
         When ``terminal_task_ids`` is empty, the terminal-referenced clause is
         omitted entirely and an expiry-only DELETE runs instead — an explicit

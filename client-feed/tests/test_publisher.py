@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from _archive_files import junit_xml, passed, red, write_junit, write_plan, write_summary
 from _git_repo import Repo, make_repo, path_with_git_killed_on
+from _in_dir import write_engagement
 from _stores import RunsDb, TasksDb
 from shared.project_layout import runs_db, tasks_db
 
@@ -167,6 +168,7 @@ def project(tmp_path: Path) -> Project:
     out_dir = tmp_path / 'out'
     out_dir.mkdir()
     policy = policy_over(repo.root, out_dir, tmp_path / 'in')
+    write_engagement(policy.in_dir, project_id=PROJECT)
     return Project(repo=repo, tasks=tasks, runs=runs, policy=policy, merge=merge, last_stream_id=landed)
 
 
@@ -226,7 +228,7 @@ def test_a_first_pass_publishes_every_source_in_order_with_the_heartbeat_last(pr
     assert (
         heartbeat.at, heartbeat.head, heartbeat.as_of, heartbeat.engagement_version,
         heartbeat.watermark_seq, heartbeat.degraded,
-    ) == (NOW, project.repo.rev('main'), NOW, None, 0, ())
+    ) == (NOW, project.repo.rev('main'), NOW, 1, 0, ())
 
 
 def test_the_pass_leaves_a_valid_out_dir_whose_state_is_the_fold_of_its_feed(project: Project) -> None:

@@ -258,6 +258,38 @@ def _info_only_refusal(members: dict[str, Escalation | None]) -> dict[str, Any]:
     }
 
 
+def _park_on_info_refusal(rec: Escalation) -> dict[str, Any] | None:
+    """The ``park_on_info`` refusal for parking a never-pinning *rec*, else None.
+
+    Whether *rec* pins is the pin chain's answer
+    (``escalation/src/escalation/pins.py::classify_pins``), whose non-pinning
+    class is the info record (link 1). A park could not hold that record's task
+    (task 6578). The chain is asked with no live claimant, because the park's
+    teardown kills the run before the stranded-blocked sweep looks.
+    """
+    if not classify_pins(rec.task_id, [rec], live_claimant=False).non_pinning:
+        return None
+    return {
+        'error': (
+            f'refusing to park info-severity escalation {rec.id} (task '
+            f'{rec.task_id}): an info record never pins its task (pins.py '
+            'link 1), so the park could not hold it and the stranded-blocked '
+            'sweep would re-pend it'
+        ),
+        'code': 'park_on_info',
+        'hint': (
+            f'to hold task {rec.task_id}, defer it on fused-memory: '
+            f"set_task_status(id='{rec.task_id}', status='deferred', "
+            f"deferral={{'kind': 'until_condition', 'condition': 'Leo rules "
+            f"{rec.id}', 'reason': '<one line>'}}) -- see "
+            'docs/task-authoring.md §9 "Deferring a task". Otherwise leave '
+            f"{rec.id} pending, or close it with action='close_only'."
+        ),
+        'escalation_id': rec.id,
+        'task_id': rec.task_id,
+    }
+
+
 def _sentinel_bound_task_ids(members: dict[str, Escalation | None]) -> frozenset[str]:
     """Return the task ids a promote of *members* must be minted under, or empty if unconstrained.
 
@@ -1096,9 +1128,12 @@ def create_server(
     registry is never imported, preserving the standalone import path.
 
     *startup_sweep* (default True) — when True, runs
-    ``sweep.run_startup_sweep(queue.queue_dir)`` at construction time (the
-    pre-serving single-writer window) to relocate resolved/dismissed root
-    orphans and loose archive files, and prune stale dated subdirs.  Non-fatal:
+    ``sweep.run_startup_sweep(queue.queue_dir)`` at construction time, before
+    the server binds, to relocate resolved/dismissed root orphans and loose
+    archive files, prune stale dated subdirs and reap orphaned sidecar locks.
+    Other processes write the same queue directory concurrently; the
+    concurrency contract the sweep honours is stated in the
+    ``escalation/src/escalation/sweep.py`` module docstring.  Non-fatal:
     any exception is logged at WARNING level and the server continues binding.
     Pass False in tests that pre-populate the queue and do not want the sweep
     to run.
@@ -1372,7 +1407,7 @@ def create_server(
         _project_root_refusal,
     )
 
-    # --- Startup sweep (pre-serving single-writer window) ---
+    # --- Startup sweep (before binding; other processes write this queue concurrently) ---
     if startup_sweep:
         try:
             _sweep.run_startup_sweep(queue.queue_dir, now=startup_sweep_now)
@@ -2218,6 +2253,9 @@ def create_server(
         |              |            | workflow effect            |                        |
         +--------------+------------+----------------------------+------------------------+
 
+        A ``park`` on an info-severity target is refused with code
+        ``park_on_info`` and the record is not touched (see Gate precedence).
+
         **Resolution text** reaches the agent only on the L0 live-resume path
         (``action='resume'``).  For all other actions the text is stored on the
         record for audit purposes but is not injected into any agent briefing.
@@ -2315,12 +2353,15 @@ def create_server(
         ``escalation.action_effects`` module docstring for the archive
         verification behind this).
 
-        **Gate precedence**: the connection-capability gate (``bad_capability_header``
-        / ``level_forbidden``, checked first) runs BEFORE this Table B legality
-        gate. A caller that both asserts a forbidden/unparseable capability
-        header AND passes an illegal ``action`` receives the capability error,
-        not ``illegal_transition`` — no record is mutated by either gate, so
-        this ordering is an error-reporting precedence only, not a correctness
+        **Gate precedence**, in order: the connection-capability gate
+        (``bad_capability_header`` / ``level_forbidden``) → this Table B
+        legality gate (``illegal_transition``) → the park-on-info gate
+        (``park_on_info``, via ``_park_on_info_refusal``; ``park`` only, on an
+        info-severity target, because an info record never pins its task,
+        pins.py link 1) → park's early return → the declared-pin gate
+        (``declared_pin_refused``). A caller failing several gates receives the
+        earliest one's error. None of these gates mutates the record, so the
+        ordering is an error-reporting precedence only, not a correctness
         difference.
 
         **Declared-pin gate** (task 4377).  A record carrying
@@ -2397,11 +2438,11 @@ def create_server(
         POSITIONALLY (the gate sits after park's early return) so it cannot be
         got wrong by a later edit.
 
-        In the **Gate precedence** ordering this gate runs LAST: after
-        ``bad_capability_header`` / ``level_forbidden`` and after
-        ``illegal_transition``, so a caller failing several gates learns about
-        the capability and legality problems first.  None of the four mutates
-        the record, so the ordering is an error-reporting precedence only.
+        In the **Gate precedence** ordering this gate runs LAST: after the
+        capability, Table B and park-on-info gates, so a caller failing several
+        gates learns about the capability and legality problems first.  None
+        of them mutates the record, so the ordering is an error-reporting
+        precedence only.
 
         NOTE: resolve_issue itself writes no task status — this call changes
         only the escalation record. The orchestrator harness applies the
@@ -2543,6 +2584,8 @@ def create_server(
             }
 
         if action == 'park':
+            if (refusal := _park_on_info_refusal(rec)) is not None:
+                return refusal
             # Version-a: park keeps the escalation open at L2.
             # queue.park() handles all stamping (level=2, resolution_action='park',
             # resolution text) and fires the resolve callback for teardown WITHOUT
@@ -5274,6 +5317,95 @@ def create_server(
         key = _PollKey(request_id=request_id, branch=branch, task_id=task_id)
         return (await _resolve(key)).to_response()
 
+    async def _cancel_in_lane(request_id: str) -> dict[str, Any]:
+        """merge_cancel for a live request this server holds no waiter for (task 5248).
+
+        The merge lane cancels it by id, whoever awaits it; a cancel then
+        retires it here exactly as the waiter path does.  A TaskWorkflow that
+        awaits it blocks and escalates on the cancel; when none does, this
+        server files that escalation itself, so no cancel goes unowned.
+        """
+        from orchestrator.merge_lane import (
+            MergeCancelRefusal,
+            MergeCancelVerdict,
+            retire_cancelled_merge_request,
+        )
+
+        worker = _get_merge_worker(harness)
+        verdict = (
+            worker.cancel_request(request_id) if worker is not None
+            else MergeCancelVerdict(request_id, MergeCancelRefusal.NOT_LIVE)
+        )
+        if verdict.refusal is not None:
+            refusal_reasons = {
+                MergeCancelRefusal.NOT_LIVE: (
+                    f'Request {request_id!r} left the live merge queue before the '
+                    'cancel reached it; poll merge_status for its outcome.'
+                ),
+                MergeCancelRefusal.FINALIZE_WINDOW: (
+                    f'Request {request_id!r} is landing (its CAS is in progress); a '
+                    'cancel now could abandon a merge that still lands. Poll '
+                    'merge_status for its outcome.'
+                ),
+                MergeCancelRefusal.TRAIN_CANCEL_UNSUPPORTED: (
+                    f'Request {request_id!r} is, or is being stacked into, a merge '
+                    'train, and trains cannot be cancelled yet. Block the member '
+                    "tasks instead, or wait for the train's outcome."
+                ),
+            }
+            state = (
+                _map_live_state(verdict.state) if verdict.state is not None
+                else (await _resolve(_PollKey(request_id=request_id))).state
+            )
+            return {
+                'cancelled': False,
+                'state': state,
+                'reason': refusal_reasons[verdict.refusal],
+                'code': verdict.refusal.value,
+            }
+        workflow_awaits = verdict.awaited_by_workflow or (
+            _registry is not None and verdict.branch is not None
+            and _registry.has_workflow_waiter(verdict.branch, request_id)
+        )
+        await retire_cancelled_merge_request(
+            request_id=request_id,
+            branch=verdict.branch,
+            task_id=verdict.task_id,
+            registry=_registry,
+            retention=_get_terminal_retention(harness),
+            git_ops=getattr(harness, 'git_ops', None),
+            event_store=event_store,
+            reap_worktree=not verdict.lane_disposes_worktree,
+        )
+        if not workflow_awaits and verdict.task_id is not None:
+            await _escalate_workflowless_cancel(verdict.task_id, request_id, verdict.branch)
+        return {'cancelled': True, 'state': MergeState.abandoned, 'reason': None}
+
+    async def _escalate_workflowless_cancel(
+        task_id: str, request_id: str, branch: str | None,
+    ) -> None:
+        """File the L1 a TaskWorkflow would have filed for an operator's cancel."""
+        await _submit_or_dedupe(Escalation(
+            id=await asyncio.to_thread(queue.make_id, task_id),
+            task_id=task_id,
+            agent_role='escalation-server',
+            severity='blocking',
+            category='merge_cancelled_by_operator',
+            summary=(
+                f'Merge request {request_id} for task {task_id} cancelled by an '
+                'operator (merge_cancel); no workflow awaited it and the branch '
+                'was not merged. A later workflow for this task may resubmit; '
+                'block the task to stop it'
+            ),
+            detail=(
+                f'request_id={request_id} branch={branch} task_id={task_id}. The '
+                'request was submitted with no TaskWorkflow awaiting it (journal '
+                'recovery, the stranded-branch reaper, or an MCP merge_request '
+                'whose submitter is gone).'
+            ),
+            level=1,
+        ))
+
     # ── merge_cancel — explicit cancellation via waiter-future cancel (PRD β2 / task 1632) ──
 
     @mcp.tool()
@@ -5281,9 +5413,10 @@ def create_server(
         """Cancel an in-flight merge request by its request_id.
 
         Accepts a single *request_id* parameter (authoritative merge-request identifier
-        returned by merge_request).  Returns a dict with three fields:
+        returned by merge_request).  Returns a dict with three fields, plus
+        ``code`` when the merge lane refused a live request (path 1):
 
-            cancelled (bool)  — True only when a pending waiter was successfully cancelled.
+            cancelled (bool)  — True only when the request was cancelled by this call.
             state     (str)   — A ``shared.merge_state.MergeState`` member, except
                                 that the live branch relays merge_status's live
                                 state verbatim, including its deliberate
@@ -5300,6 +5433,8 @@ def create_server(
                                 (the CONTRIBUTING.md lint-command-mirror convention) — edit
                                 the partition, not this list.
             reason    (str|None) — None on success; non-None string on every other path.
+            code      (str)   — the lane's refusal, a MergeCancelRefusal value
+                                ('not_live' | 'finalize_window' | 'train_cancel_unsupported').
 
         Branch order (every path returns; the one raise is a breached
         merge_status_answer.py invariant on path 1, which surfaces as a tool
@@ -5308,8 +5443,13 @@ def create_server(
              restarted, a coalesced id, or a request this server never held): resolve
              the request_id through merge_status's walk (live → current run → journal →
              prior runs → no_record; git needs a branch, so it is skipped).  A live hit
-             means the worker holds the request but this server has no waiter for it:
-             cancelled False with the live state, not cancellable here.  A current-run
+             (a workflow-enqueued, recovered, or otherwise waiterless request) is
+             cancelled by the merge lane itself, MergeLane.cancel_request, then
+             retired as on path 4; when no TaskWorkflow awaits it, this server files
+             the merge_cancelled_by_operator L1 the workflow would have.  The lane
+             refuses a request mid-CAS or a train: cancelled False with the lane's
+             state and a ``code`` naming the refusal
+             (orchestrator.merge_lane.MergeCancelRefusal).  A current-run
              outcome returns that state with 'Request already finalized; cannot
              cancel.'; an epistemic answer returns its state with the reason's hint.
              Coalesced submissions (in_flight / attached paths in merge_request) do
@@ -5365,18 +5505,7 @@ def create_server(
                     ),
                 }
             if answer.source is MergeStatusSource.live:
-                return {
-                    'cancelled': False,
-                    'state': answer.state,
-                    'reason': (
-                        f'Request {request_id!r} is in the live merge queue, but this '
-                        'server holds no waiter for it, so it cannot be cancelled '
-                        "here: merge_cancel only cancels requests submitted through "
-                        "this server's merge_request that are still awaiting an "
-                        'outcome (for example, a workflow-enqueued or startup-'
-                        'recovered request has no such waiter).'
-                    ),
-                }
+                return await _cancel_in_lane(request_id)
             return {
                 'cancelled': False,
                 'state': answer.state,

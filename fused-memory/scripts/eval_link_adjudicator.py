@@ -50,12 +50,10 @@ import argparse
 import asyncio
 import copy
 import hashlib
-import importlib.util
 import json
 import logging
 import math
 import sys
-import types
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
@@ -99,26 +97,9 @@ from fused_memory.maintenance.link_heal_store import (
     server_tool_caller,
 )
 from fused_memory.server.grouped_read import AMENDMENT_KIND
+from fused_memory.utils.script_loader import load_script
 
 _SCRIPTS = Path(__file__).resolve().parent
-
-
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
 
 
 # Pyright cannot follow the by-path loader, so it alone resolves `_iota` through
@@ -126,7 +107,7 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 if TYPE_CHECKING:
     import score_write_triage_pairs as _iota
 else:
-    _iota = _load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
+    _iota = load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
 
 
 class TruthClass(StrEnum):

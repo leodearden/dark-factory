@@ -25,13 +25,13 @@ from client_feed.contract import (
 )
 from client_feed.envelope import Stamp
 from client_feed.fold import fold
-from client_feed.policy import Policy
 from client_feed.sources.events import FactoryStatus, OpenEscalation, OpenEscalations
 from client_feed.sources.prds import PrdText
 from client_feed.sources.tasks import TaskRow
 from client_feed.sources.tree import LineCounts, VisibleTree
 from client_feed.value_events import (
     branch_event,
+    budget_event,
     factory_event,
     prd_events,
     task_events,
@@ -406,34 +406,25 @@ def tree_file(path: str, kind: FileKind, lines: int) -> TreeFile:
     return TreeFile(path=path, kind=kind, lines=lines, bytes=lines * 10, last_changed_at=at(0))
 
 
-def test_a_tree_snapshot_counts_only_production_lines_outside_free_and_never_reveal_globs() -> None:
-    policy = Policy.model_validate(
-        {
-            'project_id': PROJECT,
-            'project_root': '/srv/acme',
-            'out_dir': '/srv/feed/out',
-            'in_dir': '/srv/feed/in',
-            'visible_globs': ['**'],
-            'reveal_proportion': 0.3,
-            'reveal_floor_lines': 40,
-            'free_globs': ['core/src/free/**'],
-            'never_reveal_globs': ['core/src/secret/**'],
-        }
-    )
-    files = (
-        tree_file('core/src/a.py', FileKind.PRODUCTION, 100),
-        tree_file('core/src/b.py', FileKind.PRODUCTION, 33),
-        tree_file('core/src/free/c.py', FileKind.PRODUCTION, 1000),
-        tree_file('core/src/secret/d.py', FileKind.PRODUCTION, 2000),
-        tree_file('core/tests/test_a.py', FileKind.TEST, 400),
-        tree_file('docs/a.md', FileKind.DOCS, 500),
-        tree_file('core/src/gen.py', FileKind.GENERATED, 600),
-    )
-    totals = TreeTotals(files=7, production_lines=3133, test_lines=400, docs_lines=500)
-    line_counts = LineCounts(max_line_bytes=400, by_blob={})
-    tree = VisibleTree(commit='c' * 40, files=files, totals=totals, line_counts=line_counts)
+FILES = (
+    tree_file('src/a.py', FileKind.PRODUCTION, 100),
+    tree_file('tests/test_a.py', FileKind.TEST, 40),
+)
+TOTALS = TreeTotals(files=2, production_lines=100, test_lines=40, docs_lines=0)
+TREE = VisibleTree(
+    commit='c' * 40,
+    files=FILES,
+    totals=TOTALS,
+    line_counts=LineCounts(max_line_bytes=400, by_blob={}),
+)
+BUDGET = RevealBudget(
+    proportion=0.25, counted_lines=100, budget_lines=25, spent_lines=0, floor_lines=50
+)
+SPENT = BUDGET.model_copy(update={'spent_lines': 50})
 
-    event = tree_event(tree, policy=policy, stamp=stamp(), now=NOW)
+
+def test_a_tree_snapshot_carries_the_tree_and_exactly_the_budget_it_is_given() -> None:
+    event = tree_event(TREE, budget=SPENT, stamp=stamp(), now=NOW)
 
     assert event == TreeSnapshot(
         seq=100,
@@ -441,9 +432,31 @@ def test_a_tree_snapshot_counts_only_production_lines_outside_free_and_never_rev
         project_id=PROJECT,
         feed_version=FEED_VERSION,
         commit='c' * 40,
-        totals=totals,
-        files=files,
-        budget=RevealBudget(
-            proportion=0.3, counted_lines=133, budget_lines=39, spent_lines=0, floor_lines=40
-        ),
+        totals=TOTALS,
+        files=FILES,
+        budget=SPENT,
     )
+
+
+def test_a_changed_budget_re_emits_the_states_tree_with_it() -> None:
+    state = state_of(tree_event(TREE, budget=BUDGET, stamp=stamp(5), now=at(0)))
+
+    event = budget_event(SPENT, state=state, stamp=stamp(), now=NOW)
+
+    assert event == TreeSnapshot(
+        seq=100,
+        at=NOW,
+        project_id=PROJECT,
+        feed_version=FEED_VERSION,
+        commit='c' * 40,
+        totals=TOTALS,
+        files=FILES,
+        budget=SPENT,
+    )
+
+
+def test_an_unchanged_budget_or_a_state_without_a_tree_emits_nothing() -> None:
+    state = state_of(tree_event(TREE, budget=BUDGET, stamp=stamp(5), now=at(0)))
+
+    assert budget_event(BUDGET, state=state, stamp=stamp(), now=NOW) is None
+    assert budget_event(SPENT, state=state_of(), stamp=stamp(), now=NOW) is None

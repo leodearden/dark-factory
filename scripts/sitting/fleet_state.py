@@ -50,8 +50,8 @@ from orchestrator.session_registry import (
     DecisionState,
     decisions_dir,
     normalize_escalations_dir,
-    normalize_project_token,
 )
+from shared.project_id import fold_project_token
 from sitting import inventory, payloads
 from sitting.inventory import QUEUE_SUBDIRS, PendingRecords, Shortfall
 from sitting.payloads import RejectedMarker
@@ -350,7 +350,7 @@ def measure_projects(
     _stamp(now)
     by_project: dict[str, list[Path | str]] = defaultdict(list)
     for root in project_roots:
-        by_project[normalize_project_token(Path(root).name)].append(root)
+        by_project[fold_project_token(Path(root).name)].append(root)
     return MappingProxyType({
         project: _measure_project(project, roots[0], _fold_collisions(project, roots), pending, window, now)
         for project, roots in by_project.items()
@@ -490,7 +490,7 @@ def _autonomous_close(record: DecisionRecord) -> AutonomousClose:
     return AutonomousClose(
         decision_id=record.id,
         escalation_id=record.escalation_id,
-        project=normalize_project_token(record.project),
+        project=fold_project_token(record.project),
         state=str(record.state),
         filed_at=record.filed_at,
         closed_at=record.closed_at,

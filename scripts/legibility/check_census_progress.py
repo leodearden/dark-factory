@@ -28,6 +28,7 @@ from pathlib import Path
 # package context): see check_trickle_progress.py's identical shim.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import state_docs
 import trickle_state
 
 USAGE = 'usage: check_census_progress.py <project_id> [max_unadvanced_fires]'
@@ -119,26 +120,32 @@ def main(argv: list[str]) -> int:
     project_id, threshold = parsed
 
     path = trickle_state.trickle_state_path(project_id)
-    status, doc = trickle_state.load_state(path)
-    if status == 'missing':
-        return _fail(
-            f'legibility trickle for {project_id} has never recorded a run '
-            f'(no state file at {path}), so census progress cannot be '
-            f"assessed; the recorder's health is check_trickle_progress.py's "
-            f'verdict.'
-        )
-    if status != 'ok' or doc is None:
-        return _fail(
-            f'legibility trickle state for {project_id} is unreadable/corrupt '
-            f'at {path}, so census progress cannot be assessed; see '
-            f'check_trickle_progress.py.'
-        )
+    match trickle_state.load_state(path):
+        case state_docs.Missing():
+            return _fail(
+                f'legibility trickle for {project_id} has never recorded a run '
+                f'(no state file at {path}), so census progress cannot be '
+                f"assessed; the recorder's health is check_trickle_progress.py's "
+                f'verdict.'
+            )
+        case state_docs.Malformed(reason=reason):
+            return _fail(
+                f'legibility trickle state for {project_id} is unreadable/corrupt '
+                f'at {path}: {reason}. Census progress cannot be assessed; see '
+                f'check_trickle_progress.py.'
+            )
+        case state_docs.Ok(value=state):
+            return _assess_streak(project_id, state, threshold)
 
-    streak = trickle_state.read_census_fire_streak(doc)
+
+def _assess_streak(
+    project_id: str, state: trickle_state.TrickleState, threshold: int,
+) -> int:
+    streak = state.census_fire_streak
     if streak is None or streak.fires < threshold:
         print(
             f'OK: census trigger for {project_id}: census_fired='
-            f'{doc.get("census_fired")}, '
+            f'{state.census_fired}, '
             f'fires={0 if streak is None else streak.fires} '
             f'(threshold {threshold}).'
         )

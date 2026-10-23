@@ -45,7 +45,7 @@ SKIPPED + COUNTED NOW ALSO MEANS ANNOUNCED (task 4511): every per-digest
 failure is logged at WARNING on ``legibility.coder`` as it happens, naming
 the session and the reason. Counting alone was not enough, because the
 count only ever reaches a human through epsilon's storm escalation — and a
-SUB-storm batch (failed/total <= 0.5) is ``status="ok"``, so those failures
+SUB-storm batch (failed/total <= 0.5) is ``CodingStatus.OK``, so those failures
 previously reached no sink whatsoever. Escalation is still not this
 module's job; a journal line is not an escalation.
 """
@@ -58,6 +58,7 @@ import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
@@ -517,6 +518,14 @@ def code_digest(
 # code_digests — a batch of digests -> RunResult, with the storm threshold
 # ---------------------------------------------------------------------------
 
+class CodingStatus(StrEnum):
+    """A coded batch's run-level verdict."""
+
+    OK = "ok"
+    FAILURE = "failure"
+    """A storm: the batch's failure fraction STRICTLY exceeds 0.5."""
+
+
 @dataclass
 class RunResult:
     """Outcome of coding a batch of digests via code_digests().
@@ -524,32 +533,30 @@ class RunResult:
     ``records`` holds every successful (schema-valid) coding record;
     ``failures`` holds a ``(session, reason)`` pair for every digest that
     could not be coded — never a fabricated record. ``status`` is
-    ``"failure"`` when the batch's failure fraction STRICTLY exceeds 0.5
-    (``failed/total > 0.5``, PRD §5.3/§6.8's storm threshold); exactly 50%
-    failed is NOT a storm and stays ``"ok"``. This function never
-    escalates and never touches the codebook — that is epsilon/gamma's
-    job; it only returns the tallied result.
+    :attr:`CodingStatus.FAILURE` when the batch's failure fraction STRICTLY
+    exceeds 0.5 (``failed/total > 0.5``, PRD §5.3/§6.8's storm threshold);
+    exactly 50% failed is NOT a storm and stays :attr:`CodingStatus.OK`.
+    This function never escalates and never touches the codebook — that is
+    epsilon/gamma's job; it only returns the tallied result.
 
     ``capped`` counts how many of those failures were a usage/auth CAP
     rather than a failure of the coding — digests the CLI never actually
     looked at. It REFINES ``failed`` (a capped digest is counted in both),
     and it is deliberately a COUNT plus the ``is_cap_deferral`` predicate
-    rather than a third ``status`` value: ``census.py`` computes
-    ``saturated = dup_rate >= config.dup_rate and run_result.status !=
-    "failure"`` and selects storm batches with ``s.status == "failure"``, so
-    a new status value would silently make a capped mining batch count as
-    saturated and stop the census early.
+    rather than a third ``CodingStatus`` member: census treats anything but
+    FAILURE as a non-storm batch, so a third member would make a capped
+    mining batch count as saturated.
 
     TAINT-AND-EXCLUDE for a sub-storm capped run: a capped digest is
     labelled and left out of ``records``, but the batch's genuinely coded
-    records still merge. 2 capped of 20 stays ``status="ok"`` and returns
+    records still merge. 2 capped of 20 stays ``CodingStatus.OK`` and returns
     all 18 real records — the same contract ``evals/runner.py`` uses when it
     excludes a ``cap_exhausted:`` cell from a reported mean instead of
     scoring it 0.0. Discarding 18 records that cost real tokens because two
     digests found no headroom would be its own kind of fabrication.
     """
 
-    status: str
+    status: CodingStatus
     records: list
     failures: list
     total: int
@@ -584,7 +591,7 @@ def code_digests(
 
     That WARNING is the ONLY sink some failures ever reach. A batch whose
     failure fraction does not STRICTLY exceed 0.5 (2 of 4, say) returns
-    ``status="ok"``, so epsilon escalates nothing and, before this, those
+    ``CodingStatus.OK``, so epsilon escalates nothing and, before this, those
     failures were invisible everywhere: not the journal, not an escalation,
     nowhere. Per-digest lines also keep 38 identical ENOENTs distinguishable
     from 38 distinct model errors — a distinction epsilon's single joined
@@ -617,9 +624,9 @@ def code_digests(
     DEBUG: that restores the sub-storm blind spot above for EVERY caller,
     including the trickle, to spare a flood only one of them can produce.
 
-    ``status`` is ``"failure"`` when ``failed/total`` STRICTLY exceeds
-    0.5 — a majority-failure storm — else ``"ok"``. Never escalates,
-    never writes the codebook.
+    ``status`` is ``CodingStatus.FAILURE`` when ``failed/total`` STRICTLY
+    exceeds 0.5 — a majority-failure storm — else ``CodingStatus.OK``.
+    Never escalates, never writes the codebook.
     """
     records = []
     failures = []
@@ -656,7 +663,10 @@ def code_digests(
     total = len(digests)
     failed = len(failures)
     succeeded = len(records)
-    status = "failure" if total and (failed / total) > 0.5 else "ok"
+    status = (
+        CodingStatus.FAILURE if total and (failed / total) > 0.5
+        else CodingStatus.OK
+    )
 
     return RunResult(
         status=status, records=records, failures=failures,
@@ -682,23 +692,21 @@ def is_cap_deferral(result: RunResult) -> bool:
     storm, still exits non-zero, and still gets looked at: the deferral
     branch must not become a place for real bugs to hide.
 
-    A PREDICATE over ``RunResult``, deliberately NOT a third ``status``
-    value. ``census.py`` computes ``saturated = dup_rate >= config.dup_rate
-    and run_result.status != "failure"`` and selects storm batches with
-    ``s.status == "failure"``; adding a status value would silently make a
-    capped mining batch count as saturated and stop the census early. One
-    policy, one home, two callers (``main`` here and ``nightly.run_nightly``).
+    A PREDICATE over ``RunResult``, deliberately NOT a third
+    ``CodingStatus`` member: census treats anything but FAILURE as a
+    non-storm batch. One policy, one home, two callers (``main`` here and
+    ``nightly.run_nightly``).
 
-    Note the ``status == "failure"`` guard: a sub-storm run with a minority of
+    Note the FAILURE guard: a sub-storm run with a minority of
     caps is NOT a deferral. Those runs coded most of their digests and their
     records still merge (see ``RunResult``'s taint-and-exclude contract).
     """
-    return result.status == "failure" and result.capped * 2 > result.failed
+    return result.status == CodingStatus.FAILURE and result.capped * 2 > result.failed
 
 
 # ---------------------------------------------------------------------------
 # main(argv) — CLI: digests + codebook -> JSONL of §7.3 coding records.
-# Fail-loud: a storm (code_digests status="failure") writes ZERO records and
+# Fail-loud: a storm (CodingStatus.FAILURE) writes ZERO records and
 # returns non-zero, so epsilon can escalate and skip the merge (PRD §8.6).
 # ---------------------------------------------------------------------------
 
@@ -717,9 +725,9 @@ def main(argv: list[str] | None = None) -> int:
 
     Reads each digest file (positional args and/or every file in a
     ``--digests`` directory), loads the codebook via ``codebook.load``,
-    and calls ``code_digests``. On a run-level ``"ok"`` status, writes
+    and calls ``code_digests``. On a run-level ``CodingStatus.OK``, writes
     every successful record as a JSONL line to ``--out`` (or stdout) and
-    returns 0. On a run-level ``"failure"`` status (storm, PRD §8.6),
+    returns 0. On a run-level ``CodingStatus.FAILURE`` (storm, PRD §8.6),
     writes ZERO coding records — if ``--out`` is given, it is truncated to
     empty so a stale file from a prior successful run is never left
     looking like this run's output — prints a failure summary to stderr,
@@ -812,7 +820,7 @@ def main(argv: list[str] | None = None) -> int:
     matched = sum(len(r[_MATCHES_KEY]) for r in result.records)
     candidates = sum(len(r[_CANDIDATES_KEY]) for r in result.records)
 
-    if result.status == "failure":
+    if result.status == CodingStatus.FAILURE:
         deferred = is_cap_deferral(result)
         if deferred:
             print(

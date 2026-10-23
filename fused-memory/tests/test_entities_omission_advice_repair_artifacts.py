@@ -316,6 +316,7 @@ def test_every_current_correction_block_cites_only_dark_factory_tasks(current):
             )
 
 
+@pytest.mark.reads_git_history
 def test_phase2_names_its_task_and_the_measured_fix(phase2):
     assert phase2['task'] == {'id': PHASE2_TASK_ID, 'project_id': LOCAL_PROJECT}
     fix = phase2['fix_task']

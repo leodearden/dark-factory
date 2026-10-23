@@ -9518,6 +9518,32 @@ class GitOps:
         )
         return sha if rc == 0 else None
 
+    async def list_local_branches(self) -> frozenset[str] | None:
+        """Return every local branch name, exactly as ``resolve_branch_sha`` takes it.
+
+        ``None`` means the enumeration failed and the answer is unknown,
+        never that there are no branches.
+        """
+        try:
+            rc, stdout, stderr = await _run(
+                ['git', 'for-each-ref', '--format=%(refname:lstrip=2)', 'refs/heads/'],
+                cwd=self.project_root,
+            )
+        except Exception as exc:
+            logger.warning(
+                'list_local_branches: git failed in %s: %s', self.project_root, exc
+            )
+            return None
+        if rc != 0:
+            logger.warning(
+                'list_local_branches: unexpected rc=%s in %s: %s',
+                rc, self.project_root, stderr.strip(),
+            )
+            return None
+        return frozenset(
+            name for name in (line.strip() for line in stdout.splitlines()) if name
+        )
+
     async def resolve_queued_branch_ref(self, branch: str) -> str | None:
         """Resolve a caller-submitted *branch* to its canonical full ref, or None.
 

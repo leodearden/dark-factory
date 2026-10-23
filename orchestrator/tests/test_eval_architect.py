@@ -18,6 +18,7 @@ follows precisely.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 from pathlib import Path
@@ -4134,13 +4135,25 @@ def _one_account_gate():
     )
 
 
+def _real_cap_retry_with_no_cap_patience():
+    """The REAL ``invoke_with_cap_retry``, its public cap-wait bound set to zero.
+
+    The first cap hit exhausts the pool, so the gate, the retry loop and the
+    exhaustion path all run for real, in milliseconds rather than the
+    inherited bound.
+    """
+    from shared.cli_invoke import invoke_with_cap_retry
+
+    return functools.partial(invoke_with_cap_retry, cap_wait_sanity_secs=0.0)
+
+
 # ---------------------------------------------------------------------------
-# BOUNDED patience and a LOUD, correctly-labelled exhaustion (eval-revival φ)
+# Shared patience and a LOUD, correctly-labelled exhaustion (eval-revival φ)
 #
 # Failover is only half the contract. The other half is what happens when it
-# runs out: the campaign must never hang on the shared 14-day default, and the
-# resulting failure must land in the EXISTING cap_tainted backstop stamped as a
-# transport refusal — not as a harness crash of our own.
+# runs out: the cell inherits the shared default cap-wait patience, and when
+# that patience is exhausted the failure must land in the EXISTING cap_tainted
+# backstop stamped as a transport refusal — not as a harness crash of our own.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -4152,26 +4165,12 @@ class TestArchitectEvalCapPatience:
             'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
         )
 
-    async def test_cap_patience_is_eval_bounded_not_the_fourteen_day_default(self):
-        from shared.cli_invoke import _DEFAULT_CAP_WAIT_SANITY_SECS
+    async def test_architect_call_sets_no_cap_bound_of_its_own(self):
+        """One cap patience for every eval stage (esc-4002-1, task 7320).
 
-        from orchestrator.evals import runner
-
-        # An eval campaign takes its OWN bound, not the 14-day patient-AFK
-        # default a per-task implementer legitimately inherits.
-        #
-        # The floor was 1800 s until 2026-08-25 (esc-3634-1), when it was raised
-        # to 48 h: tainting throws away mid-cell spend that `--resume` would
-        # otherwise carry across the account switch. Since task 4002 this
-        # value also bounds the gate's park on a fully-capped pool. The floor
-        # asserted here is the 5-hour account cap the bound must be able to
-        # skate, with margin; the ceiling is still the 14-day default.
-        assert runner._EVAL_CAP_WAIT_SANITY_SECS >= 6 * 3600
-        assert runner._EVAL_CAP_WAIT_SANITY_SECS < _DEFAULT_CAP_WAIT_SANITY_SECS
-
-        # …and it actually REACHES the wrapper. A constant that is defined but
-        # never passed would leave the campaign on the 14-day default while
-        # both assertions above stayed happily green.
+        Waiting is ~free because ``--resume`` carries banked spend across the
+        account switch; omitting the kwargs is what inherits the shared default.
+        """
         wrapper = AsyncMock(return_value=_healthy_agent_result())
         with patch('orchestrator.evals.runner.invoke_with_cap_retry', wrapper):
             await _run_architect_eval_hermetic(
@@ -4181,18 +4180,14 @@ class TestArchitectEvalCapPatience:
             )
 
         assert wrapper.await_count == 1
-        assert (
-            wrapper.call_args.kwargs['cap_wait_sanity_secs']
-            == runner._EVAL_CAP_WAIT_SANITY_SECS
-        )
+        assert 'cap_wait_sanity_secs' not in wrapper.call_args.kwargs
+        assert 'max_cap_retries' not in wrapper.call_args.kwargs
 
     async def test_fully_capped_pool_fails_loud_into_cap_tainted(self):
-        from orchestrator.evals import runner
-
-        # `arch_result` (not a side_effect LIST) means EVERY attempt caps, and
-        # the patched bound trips on the first hit — so the pool is genuinely
-        # exhausted and the test still runs in milliseconds.
-        with patch.object(runner, '_EVAL_CAP_WAIT_SANITY_SECS', 0.0):
+        with patch(
+            'orchestrator.evals.runner.invoke_with_cap_retry',
+            _real_cap_retry_with_no_cap_patience(),
+        ):
             result, _mocks = await _run_architect_eval_hermetic(
                 self._cfg(),
                 produced_plan={},
@@ -4200,8 +4195,9 @@ class TestArchitectEvalCapPatience:
                 arch_result=_cap_agent_result(),
             )
 
-        # It RETURNED. That is the requirement being pinned: a fully-capped
-        # pool must FAIL, not hang a campaign waiting for a reset 14 days out.
+        # It RETURNED. That is the requirement being pinned: when the real
+        # wrapper gives up, the cell lands in the cap_tainted backstop rather
+        # than propagating the exhaustion out of the campaign.
         assert result.outcome == 'blocked'
 
         # …into the pre-existing backstop, unchanged: no scorable plan landed,
@@ -4217,10 +4213,12 @@ class TestArchitectEvalCapPatience:
         assert (record['stage'], record['cause']) == ('architect', 'cap_exhausted')
 
     async def test_cap_exhaustion_that_left_a_scorable_plan_is_not_tainted(self):
-        from orchestrator.evals import runner
         from orchestrator.evals.judge import score_plan_structure
 
-        with patch.object(runner, '_EVAL_CAP_WAIT_SANITY_SECS', 0.0):
+        with patch(
+            'orchestrator.evals.runner.invoke_with_cap_retry',
+            _real_cap_retry_with_no_cap_patience(),
+        ):
             result, mocks = await _run_architect_eval_hermetic(
                 self._cfg(),
                 produced_plan=_well_formed_plan(),
@@ -4981,16 +4979,18 @@ class TestArchitectEvalSpendSurvivesFailover:
         makes an EXCLUDED cell's spend honest too, which matters because
         exclusions are still charged to the campaign's budget.
         """
-        from orchestrator.evals import runner
-
-        with patch.object(runner, '_EVAL_CAP_WAIT_SANITY_SECS', 0.0):
-            result, _mocks = await _run_architect_eval_hermetic(
+        with patch(
+            'orchestrator.evals.runner.invoke_with_cap_retry',
+            _real_cap_retry_with_no_cap_patience(),
+        ):
+            result, mocks = await _run_architect_eval_hermetic(
                 self._cfg(),
                 produced_plan={},
                 usage_gate=_one_account_gate(),
                 arch_result=_mid_run_cap_agent_result(cost_usd=0.9),
             )
 
+        assert mocks['invoke'].await_count == 1
         assert result.outcome == 'blocked'
         assert result.metrics['cap_tainted'] is True
         assert result.metrics['cost_usd'] == pytest.approx(0.9)

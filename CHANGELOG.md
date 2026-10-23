@@ -1618,3 +1618,17 @@ emit `reservation_installed` with `reason='reserve_now'`; removed in
 `deb8f426ab` — historical event-store rows predating task 1230 may still
 contain it.)  The renamed event's pre-1230 form (`reservation_installed` +
 `data.reason='reserve_now'`) had zero in-repo consumers.
+
+### Fixed
+
+#### plan.json writers serialise on a cross-writer mutex (task 5745)
+
+Every plan.json read-modify-write now holds `TaskArtifacts.plan_mutex`: the 13 plan-tools
+mutators, the TaskArtifacts plan methods, `read_plan`'s normalization write-back, and the
+markup stamp. It is a reentrant `fcntl.flock` on a `plan.json.mutex` sidecar, keyed on the
+resolved plan path and honoured across threads and processes; the wait is bounded at 60s
+and then raises `FileMutexTimeout`, a `RuntimeError` rather than an `OSError`. The write that
+ends a read-modify-write, `write_plan(plan, mutex_held=True)`, verifies the calling thread
+holds the mutex and otherwise raises `PlanMutexNotHeld` before writing, so a forgotten lock
+fails loudly instead of losing an update. This closes the lost update task 4597 left pinned by
+`TestTheCrossWriterWindowIsKnown`, now `TestTheStampSerialisesWithEveryPlanWriter`.
