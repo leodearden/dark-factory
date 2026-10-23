@@ -186,6 +186,12 @@ which commit it was last resolved), and **three health counters** — gate
 blind, non-convergence, and systemic. Like `orchestrator status` it reads
 persisted state and needs no running orchestrator.
 
+Gate blind and systemic are printed per call site, one block for each
+`FlakeCallSite` member and for any other spelling stored in the ledger; a
+call site that has never written a row says `no rows ever written from this
+call site`, which is not the same as having no rows in the window, and
+non-convergence stays ledger-wide.
+
 It is strictly read-only: it opens no debt, files no task, resolves
 nothing and escalates nothing. It will not create a ledger DB for a
 project that has none, and it will not add the flake tables to a

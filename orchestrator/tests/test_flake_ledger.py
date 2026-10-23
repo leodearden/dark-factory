@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from _flake_golden import merge_gate_deflake_description
 from _orch_helpers import mcp_tool_envelope
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
@@ -411,6 +412,7 @@ class TestFlakeCallSite:
             'merge_gate',
             'main_probe',
             'chronic_marker',
+            'offline_lane',
         }
 
     def test_is_str_comparable(self) -> None:
@@ -421,6 +423,30 @@ class TestFlakeCallSite:
         assert FlakeCallSite.merge_gate == 'merge_gate'
         assert FlakeCallSite.main_probe == 'main_probe'
         assert FlakeCallSite.chronic_marker == 'chronic_marker'
+        assert FlakeCallSite.offline_lane == 'offline_lane'
+
+
+class TestFailureEvidence:
+    """Per-test failure evidence a suppression may carry (offline-lane PRD D6)."""
+
+    def test_evidence_kind_has_exactly_two_members(self) -> None:
+        from orchestrator.flake_ledger import EvidenceKind
+
+        assert {k.value for k in EvidenceKind} == {'failed', 'error'}
+
+    def test_is_frozen(self) -> None:
+        import dataclasses
+
+        from orchestrator.flake_ledger import EvidenceKind, FailureEvidence
+
+        e = FailureEvidence(kind=EvidenceKind.failed, first_line='AssertionError: x')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            cast(Any, e).first_line = 'other'
+
+    def test_record_dir_defaults_to_none(self) -> None:
+        from orchestrator.flake_ledger import EvidenceKind, FailureEvidence
+
+        assert FailureEvidence(kind=EvidenceKind.error, first_line='x').record_dir is None
 
 
 class TestFlakeSuppression:
@@ -481,6 +507,19 @@ class TestFlakeSuppression:
         )
         assert s.test_ids == ()
         assert s.unconfirmable_reason == 'node-ids mapped to no discovered subproject'
+
+    def test_evidence_defaults_to_none(self) -> None:
+        assert self._suppression().evidence is None
+
+    def test_an_evidence_mapping_is_held_as_given(self) -> None:
+        from orchestrator.flake_ledger import EvidenceKind, FailureEvidence
+
+        evidence = {
+            'tests/test_a.py::test_one': FailureEvidence(
+                kind=EvidenceKind.failed, first_line='AssertionError', record_dir='/r/1',
+            ),
+        }
+        assert self._suppression(evidence=evidence).evidence == evidence
 
 
 def _suppression(**overrides):
@@ -696,6 +735,79 @@ class TestFlakeSuppressionFromWire:
         assert rt.psi_cpu_some10 is None
         assert rt.unconfirmable_reason is None
 
+    @staticmethod
+    def _evidenced():
+        from orchestrator.flake_ledger import EvidenceKind, FailureEvidence
+
+        return _suppression(
+            test_ids=('a::t1', 'b::t2'),
+            evidence={
+                'a::t1': FailureEvidence(
+                    kind=EvidenceKind.failed, first_line='AssertionError: 1 != 2',
+                    record_dir='/records/p1',
+                ),
+                'b::t2': FailureEvidence(kind=EvidenceKind.error, first_line='ImportError'),
+            },
+        )
+
+    def test_evidence_round_trips_to_an_equal_suppression(self) -> None:
+        from orchestrator.flake_ledger import (
+            EvidenceKind,
+            FailureEvidence,
+            flake_suppression_from_wire,
+        )
+
+        s = self._evidenced()
+        rt = flake_suppression_from_wire(self._wire(s))
+
+        assert rt == s
+        assert rt is not None and rt.evidence is not None
+        for evidence in rt.evidence.values():
+            assert isinstance(evidence, FailureEvidence)
+            assert isinstance(evidence.kind, EvidenceKind)
+
+    def test_an_old_producer_with_no_evidence_key_rebuilds_with_none(self) -> None:
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        d = self._wire(_suppression())
+        d.pop('evidence', None)
+
+        rt = flake_suppression_from_wire(d)
+        assert rt is not None and rt.evidence is None
+
+    def test_a_newer_producers_unknown_keys_still_rebuild_with_the_evidence(self) -> None:
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        s = self._evidenced()
+        d = self._wire(s)
+        d['some_field_from_the_future'] = 1
+        d['evidence']['a::t1']['some_evidence_field_from_the_future'] = [1]
+
+        assert flake_suppression_from_wire(d) == s
+
+    @pytest.mark.parametrize(
+        'bad',
+        [
+            ['a::t1'],
+            {'a::t1': {'kind': 'failed'}},
+            {'a::t1': {'kind': 'bogus', 'first_line': 'x'}},
+        ],
+        ids=['a-list', 'missing-first-line', 'off-vocabulary-kind'],
+    )
+    def test_malformed_evidence_costs_only_the_evidence(self, caplog, bad) -> None:
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        d = self._wire(self._evidenced())
+        d['evidence'] = bad
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            rt = flake_suppression_from_wire(d)
+
+        assert rt is not None, 'an observation is never dropped for its evidence'
+        assert rt.evidence is None
+        assert rt.test_ids == ('a::t1', 'b::t2')
+        assert self._warnings(caplog)
+
     def test_the_reconstruction_is_frozen_like_the_original(self) -> None:
         """A wire-built suppression is a value too — the recorder must not be able to
         amend an observation it merely transports."""
@@ -843,6 +955,99 @@ class TestRecordFlakeOccurrence:
 
         assert db_path.exists()
         assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 1
+
+
+class TestOccurrenceEvidenceInDetail:
+    """A suppression's per-test evidence lands in that test's row's ``detail``; a row
+    with no evidence keeps today's bytes."""
+
+    A = 'tests/test_a.py::test_one'
+    B = 'tests/test_a.py::test_two'
+
+    @staticmethod
+    def _evidence():
+        from orchestrator.flake_ledger import EvidenceKind, FailureEvidence
+
+        return FailureEvidence(
+            kind=EvidenceKind.failed, first_line='AssertionError: 1 != 2', record_dir='/records/p1',
+        )
+
+    @staticmethod
+    def _details(db_path: Path) -> dict[str, str]:
+        from orchestrator.flake_ledger import read_occurrences
+
+        return {r.test_id: r.detail for r in read_occurrences(db_path)}
+
+    def test_each_row_carries_only_its_own_tests_evidence(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression(test_ids=(self.A, self.B), evidence={self.A: self._evidence()})
+        record_flake_occurrence(db_path, 'dark_factory', s, merge_sha=None, task_id=None)
+
+        details = self._details(db_path)
+        assert json.loads(details[self.A]) == {
+            'evidence': {
+                'kind': 'failed',
+                'first_line': 'AssertionError: 1 != 2',
+                'record_dir': '/records/p1',
+            },
+        }
+        assert details[self.B] == '{}'
+
+    def test_an_unconfirmable_row_carries_its_reason_and_its_evidence(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.flake_ledger import FlakeVerdict, record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression(
+            verdict=FlakeVerdict.unconfirmable,
+            test_ids=(self.A,),
+            unconfirmable_reason='could not re-run',
+            evidence={self.A: self._evidence()},
+        )
+        record_flake_occurrence(db_path, 'dark_factory', s, merge_sha=None, task_id=None)
+
+        detail = json.loads(self._details(db_path)[self.A])
+        assert detail['unconfirmable_reason'] == 'could not re-run'
+        assert detail['evidence']['first_line'] == 'AssertionError: 1 != 2'
+
+    def test_an_unconfirmable_row_without_evidence_keeps_todays_bytes(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.flake_ledger import FlakeVerdict, record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression(
+            verdict=FlakeVerdict.unconfirmable,
+            test_ids=(self.A,),
+            unconfirmable_reason='could not re-run',
+        )
+        record_flake_occurrence(db_path, 'dark_factory', s, merge_sha=None, task_id=None)
+
+        assert self._details(db_path)[self.A] == '{"unconfirmable_reason": "could not re-run"}'
+
+    @pytest.mark.parametrize(
+        'bad',
+        [
+            {'tests/test_a.py::test_one': {'kind': 'failed', 'first_line': 'x'}},
+            ['tests/test_a.py::test_one'],
+        ],
+        ids=['not-a-FailureEvidence', 'not-a-mapping'],
+    )
+    def test_malformed_evidence_still_writes_the_rows(
+        self, tmp_path: Path, caplog, bad,
+    ) -> None:
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression(test_ids=(self.A, self.B), evidence=cast(Any, bad))
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            record_flake_occurrence(db_path, 'dark_factory', s, merge_sha=None, task_id=None)
+
+        assert self._details(db_path) == {self.A: '{}', self.B: '{}'}
+        assert 'evidence' in caplog.text
 
 
 class TestRecordFlakeOccurrenceIdempotence:
@@ -1479,6 +1684,136 @@ def _debt_row(**overrides):
     return DebtRow(**fields)
 
 
+_LANE_HEAD = '1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b'
+_LANE_PASS = '20261019T120000-abc123'
+
+
+def _lane_context(**overrides):
+    """A cleared offline-lane :class:`DebtContext` with every field set."""
+    from orchestrator.flake_ledger import (
+        DebtContext,
+        DebtTrigger,
+        EvidenceKind,
+        FlakeCallSite,
+        RecentOccurrence,
+    )
+
+    kwargs: dict[str, Any] = {
+        'call_site': FlakeCallSite.offline_lane,
+        'trigger': DebtTrigger.cleared,
+        'command': 'qdrant-integration',
+        'working_directory': '/srv/dark-factory/fused-memory',
+        'reproduce': 'uv run pytest -m integration tests/test_x.py::test_y',
+        'heads': (_LANE_HEAD,),
+        'pass_ids': (_LANE_PASS,),
+        'evidence': (
+            RecentOccurrence(
+                pass_id='20261018T090000-000aaa', head='9f' * 20,
+                kind=EvidenceKind.error, first_line='ConnectionError: qdrant refused',
+            ),
+            RecentOccurrence(
+                pass_id=_LANE_PASS, head=_LANE_HEAD,
+                kind=EvidenceKind.failed, first_line='AssertionError: 3 != 4',
+            ),
+        ),
+    }
+    kwargs.update(overrides)
+    return DebtContext(**kwargs)
+
+
+def _occurrence(n: int):
+    from orchestrator.flake_ledger import EvidenceKind, RecentOccurrence
+
+    return RecentOccurrence(
+        pass_id=f'pass-{n}', head=None, kind=EvidenceKind.failed, first_line=f'line {n}',
+    )
+
+
+class TestDebtContext:
+    """The context an observation hands ``open_debt`` (offline-lane PRD D6, §5.6).
+    SYNC-ONLY CLASS."""
+
+    def test_is_frozen(self) -> None:
+        import dataclasses
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            cast(Any, _lane_context()).command = 'other'
+
+    def test_debt_trigger_has_exactly_two_members(self) -> None:
+        from orchestrator.flake_ledger import DebtTrigger
+
+        assert {t.value for t in DebtTrigger} == {'cleared', 'recovered'}
+
+    def test_only_the_call_site_and_the_trigger_are_required(self) -> None:
+        from orchestrator.flake_ledger import DebtContext, DebtTrigger, FlakeCallSite
+
+        ctx = DebtContext(
+            call_site=FlakeCallSite.merge_gate,
+            trigger=DebtTrigger.cleared,
+            evidence=(_occurrence(1),),
+        )
+        assert (ctx.command, ctx.heads, ctx.evidence) == (None, (), (_occurrence(1),))
+
+    def test_more_evidence_than_the_limit_is_refused_by_name(self) -> None:
+        from orchestrator.flake_ledger import DEBT_CONTEXT_EVIDENCE_LIMIT
+
+        assert DEBT_CONTEXT_EVIDENCE_LIMIT == 5
+        with pytest.raises(ValueError, match='5') as raised:
+            _lane_context(evidence=tuple(_occurrence(n) for n in range(6)))
+        assert '6' in str(raised.value)
+
+    def test_the_json_codec_round_trips_to_an_equal_context(self) -> None:
+        from orchestrator.flake_ledger import (
+            DebtTrigger,
+            EvidenceKind,
+            FlakeCallSite,
+            debt_context_from_json,
+            debt_context_to_json,
+        )
+
+        ctx = _lane_context()
+        rt = debt_context_from_json(debt_context_to_json(ctx))
+
+        assert rt == ctx
+        assert rt is not None
+        assert rt.call_site is FlakeCallSite.offline_lane
+        assert rt.trigger is DebtTrigger.cleared
+        assert isinstance(rt.heads, tuple) and isinstance(rt.evidence, tuple)
+        assert all(isinstance(e.kind, EvidenceKind) for e in rt.evidence)
+
+    def test_an_empty_context_decodes_to_none(self) -> None:
+        from orchestrator.flake_ledger import debt_context_from_json
+
+        assert debt_context_from_json('{}') is None
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'not json',
+            '[]',
+            '{"call_site": "offline_lane"}',
+            '{"call_site": "offline_lane", "trigger": "bogus"}',
+            '{"call_site": "bogus", "trigger": "cleared"}',
+            json.dumps({
+                'call_site': 'offline_lane',
+                'trigger': 'cleared',
+                'evidence': [
+                    {'pass_id': None, 'head': None, 'kind': 'failed', 'first_line': str(n)}
+                    for n in range(6)
+                ],
+            }),
+        ],
+        ids=['not-json', 'not-an-object', 'no-trigger', 'bad-trigger', 'bad-call-site', 'six'],
+    )
+    def test_a_malformed_context_decodes_to_none_loudly(self, caplog, text: str) -> None:
+        from orchestrator.flake_ledger import debt_context_from_json
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert debt_context_from_json(text) is None
+
+        assert caplog.records
+
+
 class TestBuildDeflakeTaskArguments:
     """``build_deflake_task_arguments`` — the ``submit_task`` argument block ζ files.
 
@@ -1520,10 +1855,10 @@ class TestBuildDeflakeTaskArguments:
             'flake_debt_opened_at': '2026-08-01T09:30:00+00:00',
         }
 
-    def test_the_first_cycle_title_is_the_original_and_later_cycles_are_distinct(self) -> None:
+    def test_every_cycle_title_names_its_cycle(self) -> None:
         """The task store folds a submission onto an existing non-cancelled task with the
-        same title, a done one included, so a re-entry's title must differ from the
-        finished owner's while the first cycle's stays as it always was."""
+        same title, a done one included, so every cycle's title names its cycle and a
+        re-entry's can never equal its finished owner's."""
         from orchestrator.flake_ledger import build_deflake_task_arguments
 
         first = build_deflake_task_arguments(_debt_row(open_count=1))['title']
@@ -1532,10 +1867,11 @@ class TestBuildDeflakeTaskArguments:
 
         test_id = _debt_row().test_id
         assert first == (
-            f'Flake debt: {test_id} — passes_in_isolation after a merge-gate red was suppressed'
+            f'Flake debt: {test_id} — passes_in_isolation after a merge-gate red was '
+            f'suppressed, cycle 1'
         )
         assert len({first, second, third}) == 3
-        assert '(cycle 2)' in second and '(cycle 3)' in third
+        assert second.endswith(', cycle 2') and third.endswith(', cycle 3')
 
     def test_block_omits_project_root(self) -> None:
         """``open_debt`` holds a ``db_path``, not a ``project_root`` (§8.3).  The
@@ -1566,19 +1902,22 @@ class TestBuildDeflakeTaskArguments:
         assert FlakeVerdict.passes_in_isolation.value in args['title']
         assert FlakeVerdict.passes_in_isolation.value in args['description']
 
+    @pytest.mark.parametrize('trigger', [None, 'cleared', 'recovered'])
     @pytest.mark.parametrize('word', REMEDY_WORDS)
-    def test_title_presupposes_no_remedy(self, word: str) -> None:
+    def test_title_presupposes_no_remedy(self, word: str, trigger: str | None) -> None:
         """§5.5's corollary, machine-checked on the field an agent reads first.
 
-        The test_id is EXCISED before scanning: a test legitimately named
-        ``test_fix_timeout`` must not make this vacuously fail on a title that is
+        The test_id and the command are EXCISED before scanning: a test legitimately
+        named ``test_fix_timeout`` must not make this vacuously fail on a title that is
         itself clean."""
         from orchestrator.flake_ledger import build_deflake_task_arguments
 
         row = _debt_row()
-        title = build_deflake_task_arguments(row)['title']
+        context = None if trigger is None else _lane_context(trigger=trigger)
+        title = build_deflake_task_arguments(row, context)['title']
 
-        assert word not in title.replace(row.test_id, '').lower()
+        scanned = title.replace(row.test_id, '').replace('qdrant-integration', '')
+        assert word not in scanned.lower()
 
     def test_description_carries_the_never_widen_constraint(self) -> None:
         """The binding constraint of §5.5, carried in the filed task rather than left
@@ -1605,6 +1944,156 @@ class TestBuildDeflakeTaskArguments:
 
         assert RESPONSIBILITY_FIX_ROOT_DEFECT in description
         assert RESPONSIBILITY_REMOVE_FROM_LEDGER in description
+
+    @staticmethod
+    def _metadata(row) -> dict:
+        return {
+            'spawn_context': 'flake_ledger_debt',
+            'flake_debt_test': row.test_id,
+            'flake_debt_open_count': row.open_count,
+            'flake_debt_opened_at': row.opened_at,
+        }
+
+    def test_with_no_context_the_text_is_the_merge_gates(self) -> None:
+        from orchestrator.flake_ledger import build_deflake_task_arguments
+
+        row = _debt_row(open_count=2)
+        args = build_deflake_task_arguments(row)
+
+        assert args['description'] == merge_gate_deflake_description(row)
+        assert args['metadata'] == self._metadata(row)
+        assert build_deflake_task_arguments(row, None) == args
+
+    def test_a_cleared_lane_context_is_worded_in_the_lanes_terms(self) -> None:
+        from orchestrator.flake_ledger import (
+            LANE_NOTHING_SUPPRESSED,
+            LANE_TEST_NOT_ON_MERGE_GATE,
+            LANE_TRIGGER_OBSERVATIONS,
+            LIVE_DEPENDENCY_ROOT_DEFECT,
+            NEVER_WIDEN_A_TIMEOUT,
+            RESPONSIBILITY_FIX_ROOT_DEFECT,
+            RESPONSIBILITY_REMOVE_FROM_LEDGER,
+            DebtTrigger,
+            build_deflake_task_arguments,
+        )
+
+        row = _debt_row(open_count=3)
+        ctx = _lane_context()
+        args = build_deflake_task_arguments(row, ctx)
+        description = args['description']
+
+        assert args['title'] == (
+            f'Flake debt: {row.test_id} — cleared on the offline lane (qdrant-integration), '
+            f'cycle 3'
+        )
+        expected = [
+            LANE_TRIGGER_OBSERVATIONS[DebtTrigger.cleared],
+            LANE_NOTHING_SUPPRESSED,
+            'qdrant-integration',
+            '/srv/dark-factory/fused-memory',
+            'uv run pytest -m integration tests/test_x.py::test_y',
+            *ctx.heads,
+            *ctx.pass_ids,
+            RESPONSIBILITY_FIX_ROOT_DEFECT,
+            RESPONSIBILITY_REMOVE_FROM_LEDGER,
+            NEVER_WIDEN_A_TIMEOUT,
+            LIVE_DEPENDENCY_ROOT_DEFECT,
+            LANE_TEST_NOT_ON_MERGE_GATE,
+        ]
+        for entry in ctx.evidence:
+            expected += [entry.pass_id, entry.kind.value, entry.first_line]
+        for text in expected:
+            assert text in description, text
+        assert 'merge landed' not in description
+        assert 'SUPPRESSED the red' not in description
+        assert args['metadata'] == {
+            **self._metadata(row),
+            'flake_debt_call_site': 'offline_lane',
+            'flake_debt_trigger': 'cleared',
+            'flake_debt_command': 'qdrant-integration',
+        }
+        assert (args['priority'], args['planning_mode']) == ('medium', True)
+
+    def test_a_recovered_lane_context_says_recovered(self) -> None:
+        from orchestrator.flake_ledger import (
+            LANE_TRIGGER_OBSERVATIONS,
+            DebtTrigger,
+            build_deflake_task_arguments,
+        )
+
+        row = _debt_row()
+        args = build_deflake_task_arguments(row, _lane_context(trigger=DebtTrigger.recovered))
+
+        assert 'recovered on the offline lane' in args['title']
+        assert LANE_TRIGGER_OBSERVATIONS[DebtTrigger.recovered] in args['description']
+        assert LANE_TRIGGER_OBSERVATIONS[DebtTrigger.cleared] not in args['description']
+        assert args['metadata']['flake_debt_trigger'] == 'recovered'
+
+    def test_a_lane_context_with_nothing_but_its_trigger_says_not_recorded(self) -> None:
+        from orchestrator.flake_ledger import (
+            DebtContext,
+            DebtTrigger,
+            FlakeCallSite,
+            build_deflake_task_arguments,
+        )
+
+        row = _debt_row()
+        args = build_deflake_task_arguments(
+            row, DebtContext(call_site=FlakeCallSite.offline_lane, trigger=DebtTrigger.cleared),
+        )
+
+        assert args['title'] == (
+            f'Flake debt: {row.test_id} — cleared on the offline lane, cycle 1'
+        )
+        assert 'flake_debt_command' not in args['metadata']
+        assert '(not recorded)' in args['description']
+        assert 'None' not in args['description']
+
+    def test_a_merge_gate_context_with_evidence_adds_an_evidence_block(self) -> None:
+        from orchestrator.flake_ledger import (
+            DebtContext,
+            DebtTrigger,
+            FlakeCallSite,
+            build_deflake_task_arguments,
+        )
+
+        row = _debt_row()
+        evidence = (_occurrence(1), _occurrence(2))
+        ctx = DebtContext(
+            call_site=FlakeCallSite.merge_gate, trigger=DebtTrigger.cleared, evidence=evidence,
+        )
+        description = build_deflake_task_arguments(row, ctx)['description']
+
+        golden = merge_gate_deflake_description(row)
+        fields_end = golden.index('\n\nWhat that verdict means')
+        assert description.startswith(golden[:fields_end])
+        assert description.endswith(golden[fields_end:])
+        for entry in evidence:
+            for text in (entry.pass_id, entry.kind.value, entry.first_line):
+                assert text in description[fields_end:-len(golden[fields_end:])], text
+
+    def test_a_merge_gate_context_without_evidence_is_the_golden(self) -> None:
+        from orchestrator.flake_ledger import (
+            DebtContext,
+            DebtTrigger,
+            FlakeCallSite,
+            build_deflake_task_arguments,
+        )
+
+        row = _debt_row()
+        ctx = DebtContext(call_site=FlakeCallSite.merge_gate, trigger=DebtTrigger.cleared)
+
+        assert build_deflake_task_arguments(row, ctx)['description'] == (
+            merge_gate_deflake_description(row)
+        )
+
+    def test_building_with_a_context_opens_no_connection(self, monkeypatch) -> None:
+        from orchestrator.flake_ledger import build_deflake_task_arguments
+
+        opened = _count_connections(monkeypatch)
+        build_deflake_task_arguments(_debt_row(), _lane_context())
+
+        assert opened == []
 
 def _task(task_id: str, status: str | None = 'deferred', combined: bool = False) -> SubmittedTask:
     """A planning-mode ``submit_task`` outcome: the task, created ``deferred``."""
@@ -2060,6 +2549,41 @@ class TestOpenDebtFilesTheDeflakeTask:
         # OF the initial filing, without which the task exists but never dispatches.
         assert client.commit_calls == [['task-901']]
         assert _owner(db_path, self.TEST_ID) == 'task-901'
+
+    async def test_a_context_shapes_the_filed_block(self, tmp_path: Path) -> None:
+        import dataclasses
+
+        from orchestrator.flake_ledger import build_deflake_task_arguments, open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient(submit_returns=_task('task-901'))
+        ctx = _lane_context()
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW, context=ctx,
+        )
+
+        assert row is not None
+        assert client.submit_calls == [
+            build_deflake_task_arguments(dataclasses.replace(row, owner_task_id=None), ctx)
+        ]
+
+    async def test_a_context_never_decides_whether_a_task_is_filed(self, tmp_path: Path) -> None:
+        """A live, open owner is kept whatever the context says: the context changes the
+        text of a filing, never whether one happens."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        client = _FakeTaskClient(statuses={'task-901': 'pending'})
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID,
+            task_client=client, now=self.NOW + timedelta(minutes=1), context=_lane_context(),
+        )
+
+        assert row is not None and row.owner_task_id == 'task-901'
+        assert client.submit_calls == []
 
     async def test_returned_row_carries_the_owner_not_a_pre_filing_snapshot(
         self, tmp_path: Path
@@ -5121,6 +5645,29 @@ class TestOneConnectionPerCall:
         assert row is not None and row.owner_task_id == 'task-901'
         assert _owner(db_path, self.TEST_ID) == 'task-901'
 
+    async def test_open_debt_with_a_context_still_opens_three_connections(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The context arrives whole, evidence included, so the builder reads nothing:
+        the owned path's bound is unchanged (offline-lane PRD open question 6)."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient(submit_returns=_task('task-901'))
+        opened = _count_connections(monkeypatch)
+        await open_debt(
+            db_path, 'dark_factory', self.TEST_ID,
+            task_client=client, now=self.NOW, context=_lane_context(),
+        )
+
+        assert len(opened) == 3, f'expected 3 connections, got {len(opened)}'
+        (block,) = client.submit_calls
+        assert block['metadata']['flake_debt_call_site'] == 'offline_lane'
+        assert block['title'] == (
+            f'Flake debt: {self.TEST_ID} — cleared on the offline lane (qdrant-integration), '
+            f'cycle 1'
+        )
+
     async def test_resolve_debt_that_stamps_nothing_opens_one_connection(
         self, tmp_path: Path, monkeypatch
     ) -> None:
@@ -5387,6 +5934,90 @@ def _all_due(db_path: Path) -> list:
     return items
 
 
+def _named_items(s) -> list:
+    """One due item per test *s* names, built through :func:`named_tests`."""
+    from orchestrator.flake_ledger import DueItem, named_tests
+
+    return [
+        DueItem(test_id, s.observed_at, s.call_site, 'a' * 40, '7001')
+        for test_id in named_tests(s)
+    ]
+
+
+class TestReadCallSitesWritten:
+    """``read_call_sites_written``: every call_site spelling the occurrence table holds.
+    SYNC-ONLY CLASS."""
+
+    def test_it_returns_the_distinct_stored_spellings(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import read_call_sites_written, record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        for n, call_site in enumerate(('merge_gate', 'offline_lane', 'merge_gate')):
+            record_flake_occurrence(
+                db_path, 'dark_factory',
+                _suppression(call_site=call_site, observed_at=f'2026-08-06T12:00:0{n}+00:00'),
+                merge_sha=None, task_id=None,
+            )
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "INSERT INTO flake_occurrence (observed_at, test_id, project_id, verdict, "
+                "call_site) VALUES ('2026-08-06T12:00:09+00:00', 't', 'p', "
+                "'unconfirmable', 'merge-gate')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert read_call_sites_written(db_path) == frozenset(
+            {'merge_gate', 'offline_lane', 'merge-gate'},
+        )
+
+    def test_an_empty_table_is_an_empty_set(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import ensure_schema, read_call_sites_written
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+
+        assert read_call_sites_written(db_path) == frozenset()
+
+    def test_an_unreadable_ledger_is_none_not_empty(self, tmp_path: Path, caplog) -> None:
+        from orchestrator.flake_ledger import read_call_sites_written
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert read_call_sites_written(_corrupt_path(tmp_path)) is None
+
+        assert caplog.records
+
+
+class TestNamedTests:
+    """``named_tests``: the debt-eligible test ids an observation names.  SYNC-ONLY."""
+
+    def test_a_bare_str_test_ids_is_one_id_and_warns_nothing(self, caplog) -> None:
+        from orchestrator.flake_ledger import named_tests
+
+        s = _suppression(test_ids=cast(Any, 'tests/test_a.py::test_one'))
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert named_tests(s) == ('tests/test_a.py::test_one',)
+
+        assert caplog.records == []
+
+    def test_the_sentinel_is_dropped(self) -> None:
+        from orchestrator.flake_ledger import UNKNOWN_TEST_ID, named_tests
+
+        s = _suppression(test_ids=(UNKNOWN_TEST_ID, 'tests/test_a.py::test_one'))
+        assert named_tests(s) == ('tests/test_a.py::test_one',)
+
+    def test_a_malformed_observation_names_nothing_and_logs(self, caplog) -> None:
+        from orchestrator.flake_ledger import named_tests
+
+        s = _suppression(test_ids=cast(Any, 17))
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert named_tests(s) == ()
+
+        assert caplog.records
+
+
 class TestDueList:
     """The due list (task 6934): what an observation owes ``open_debt``, written beside
     its occurrence rows and drained afterwards.  SYNC-ONLY CLASS."""
@@ -5420,12 +6051,12 @@ class TestDueList:
         assert len(_all_due(db_path)) == 1
 
     def test_rows_and_items_land_in_one_call(self, tmp_path: Path) -> None:
-        from orchestrator.flake_ledger import due_items_for, enqueue_debt
+        from orchestrator.flake_ledger import enqueue_debt
 
         db_path = tmp_path / 'runs.db'
         s = _suppression(test_ids=('tests/test_a.py::test_one', 'tests/test_a.py::test_two'))
         enqueue_debt(
-            db_path, 'dark_factory', due_items_for(s, head='a' * 40, observing_task_id='7001'),
+            db_path, 'dark_factory', _named_items(s),
             occurrence=s, merge_sha='a' * 40, task_id='7001', now=_DUE_NOW,
         )
 
@@ -5437,11 +6068,11 @@ class TestDueList:
     ) -> None:
         """The newly-inserted rule: an item whose row this call did NOT newly insert is a
         replay.  The lane's items-only recovery of the same key is not a replay."""
-        from orchestrator.flake_ledger import delete_due_item, due_items_for, enqueue_debt
+        from orchestrator.flake_ledger import delete_due_item, enqueue_debt
 
         db_path = tmp_path / 'runs.db'
         s = _suppression()
-        items = due_items_for(s, head='a' * 40, observing_task_id='7001')
+        items = _named_items(s)
         enqueue_debt(db_path, 'dark_factory', items, occurrence=s, now=_DUE_NOW)
         (item,) = _all_due(db_path)
         assert delete_due_item(db_path, item.id)
@@ -5453,13 +6084,11 @@ class TestDueList:
         assert len(_all_due(db_path)) == 1
 
     def test_the_sentinel_is_never_enqueued(self, tmp_path: Path) -> None:
-        from orchestrator.flake_ledger import UNKNOWN_TEST_ID, due_items_for, enqueue_debt
+        from orchestrator.flake_ledger import UNKNOWN_TEST_ID, enqueue_debt
 
         db_path = tmp_path / 'runs.db'
         s = _suppression(test_ids=(UNKNOWN_TEST_ID, 'tests/test_a.py::test_one'))
-        assert [i.test_id for i in due_items_for(s, head=None, observing_task_id=None)] == [
-            'tests/test_a.py::test_one',
-        ]
+        assert [i.test_id for i in _named_items(s)] == ['tests/test_a.py::test_one']
         enqueue_debt(db_path, 'dark_factory', [_due_item(UNKNOWN_TEST_ID)], now=_DUE_NOW)
 
         assert _all_due(db_path) == []
