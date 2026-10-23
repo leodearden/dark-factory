@@ -2206,13 +2206,25 @@ were prose.
   the default shallow merge can add and overwrite but never delete. Send
   the complete new blob — a `replace` drops every key you omit, including
   the gate markers (`task_kind`, `operational_mode`, `always_escalates`,
-  `execution_class`).
-- `description` is replace-only and capped at 5,000 characters. Breaching
-  the cap times out and the write does NOT land. Combining `append=True`
-  with `description`/`title`/`priority` is rejected outright.
-- Split `details` (append-capable) and `metadata`/`title` into separate
-  `update_task` calls — `append=True` silently drops `metadata` and
-  `title` passed in the same call.
+  `execution_class`). It also drops the stored `pending_since` anchor, even
+  one you copy into the blob (§8).
+- Four keys are the exception: a `replace` must carry `done_provenance`,
+  `defects` and `defect_test_retirements` (§8) and `deferral` (§9
+  "Deferring a task") exactly as stored, present if stored and absent if
+  not. Otherwise the call is refused and nothing is written. Send those
+  keys back exactly as you read them
+  (`sqlite_task_backend.py::_assert_passthrough_only_keys`,
+  `sqlite_task_backend.py::_assert_deferral_unchanged`).
+- `title`, `description` and `priority` are replace-only. Combining any of
+  them with `append=True` is refused with `AppendUnsupportedFieldError`
+  (task 4039), and nothing is written. `append=True` concatenates onto
+  `details`. With `metadata` and no `metadata_mode` it selects the additive
+  merge, which only grows the blob: it unions lists, keeps the stored value
+  on any scalar collision, and never removes a key. So append to `details`
+  in one call, and rotate `description` and `metadata` in a separate call
+  with `append` omitted and `metadata_mode='replace'`.
+- No column has a length cap of its own. The only size rule is the
+  whole-task threshold above.
 - Re-read the task from the store afterwards and confirm the status, the
   gate markers and the untouched columns survived.
 
