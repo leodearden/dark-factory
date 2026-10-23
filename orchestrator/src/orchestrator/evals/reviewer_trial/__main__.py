@@ -1218,7 +1218,7 @@ def campaign(
     config_path = config_path or cli_default('--config', lambda root: root / PROJECT_CONFIG_FILENAME)
 
     async def _run() -> int:
-        from orchestrator.evals.runner import campaign_usage_gate
+        from orchestrator.evals.eval_gate import campaign_usage_gate
 
         from . import campaign as reduce
         from .runner import DIFF_CAP_CHARS, run_trial

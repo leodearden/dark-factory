@@ -33,7 +33,7 @@ class _CampaignHarness:
         self.gate = make_gate_mock()
         self.factory = MagicMock(return_value=self.gate)
         monkeypatch.setattr('shared.usage_gate.UsageGate', self.factory)
-        monkeypatch.setattr('orchestrator.evals.runner.UsageGate', self.factory)
+        monkeypatch.setattr('orchestrator.evals.eval_gate.UsageGate', self.factory)
         monkeypatch.setattr(trial_cli, '_load_corpus', lambda: SimpleNamespace(diffs=[]))
         self.trial_saw = _NOT_CALLED
 
