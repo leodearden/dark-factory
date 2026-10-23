@@ -107,6 +107,10 @@ FOLLOW_UPS: Mapping[Binary, Mapping[Binary, Answer]] = MappingProxyType({
 })
 """Each conditional follow-up, and the answers the same row must give before it is asked."""
 
+DECISIVE_FOLLOW_UPS: frozenset[Binary] = frozenset({Binary.LOSS})
+"""The asked follow-ups :func:`derive` reads: a rater row whose own answers meet one's
+``FOLLOW_UPS`` needs must give it, so a skipped one is refused, never resolved UNCLEAR."""
+
 
 def _is_conflict_quote(value: object) -> bool:
     return isinstance(value, dict) and all(
@@ -183,7 +187,8 @@ class Judgement:
 
     ``unreached_follow_ups`` names each follow-up no vote carries whose
     preconditions all resolve to the answers it needs, at least one of them
-    fixed by a derived row: no rater was asked it, so it resolves UNCLEAR.
+    fixed by a derived row. A rater row meeting those needs must give a
+    decisive follow-up, so no rater reached it, and it resolves UNCLEAR.
     """
 
     key: PairKey
@@ -289,7 +294,22 @@ def _row_violation(row: Mapping[str, Any]) -> str | None:
                     f'{follow_up} {row[follow_up]!r} needs {asked_after} {needed.value!r},'
                     f' got {row.get(asked_after)!r}'
                 )
-    return _evidence_violation(row, carried) or _non_consumed_violation(row)
+    return (
+        _skipped_follow_up_violation(row) or _evidence_violation(row, carried)
+        or _non_consumed_violation(row)
+    )
+
+
+def _skipped_follow_up_violation(row: Mapping[str, Any]) -> str | None:
+    """The first decisive follow-up a rater *row*'s own answers ask that it does not give; None if none."""
+    if row['role'] not in RATER_ROLES:
+        return None
+    for follow_up in sorted(DECISIVE_FOLLOW_UPS):
+        needs = FOLLOW_UPS[follow_up]
+        if follow_up not in row and all(row.get(binary) == needed for binary, needed in needs.items()):
+            asked_by = ' and '.join(f'{binary} {needed.value!r}' for binary, needed in needs.items())
+            return f'lacks {follow_up}, which a rater row with {asked_by} must give'
+    return None
 
 
 def _evidence_violation(row: Mapping[str, Any], carried: list[Binary]) -> str | None:
