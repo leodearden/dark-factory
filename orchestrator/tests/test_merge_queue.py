@@ -16078,7 +16078,10 @@ class TestReverifyRebasedTree:
         merge_wt, req, verified, rebased_from, rebased_onto = await self._rebased_onto_drift(
             git_ops,
             config.model_copy(
-                update={'merge_verify_breadth': 'full', 'merge_gate_history_pure': True},
+                update={
+                    'merge_verify_breadth': 'full', 'merge_gate_history_pure': True,
+                    'merge_gate_history_test_command': None,
+                },
             ),
             'rvrt-same',
         )
@@ -16118,7 +16121,10 @@ class TestReverifyRebasedTree:
         merge_wt, req, _, rebased_from, rebased_onto = await self._rebased_onto_drift(
             git_ops,
             config.model_copy(
-                update={'merge_verify_breadth': 'full', 'merge_gate_history_pure': True},
+                update={
+                    'merge_verify_breadth': 'full', 'merge_gate_history_pure': True,
+                    'merge_gate_history_test_command': None,
+                },
             ),
             f'rvrt-closed-{len(verified_merge_sha)}',
         )
