@@ -12,8 +12,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import zot_agent_result
-from _fm_helpers import _init_git_repo, make_8df8_scenario
+from _curator_helpers import submit_as_one_batch, zot_agent_result
+from _fm_helpers import _init_git_repo, make_8df8_scenario, poll_until
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 from shared.async_sqlite_base import CheckpointResult
 from shared.task_metadata_wire import coerce_task_metadata
@@ -370,7 +370,7 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
     that left #1922/#1923/#1924 running in parallel.
 
     After step-46 (facade rewrite) this still goes through submit+resolve;
-    the worker writes metadata to tm.add_task inside _process_add_ticket.
+    the curator worker writes the metadata in its one tm.add_task call.
     """
     import json
 
@@ -14054,90 +14054,56 @@ async def test_transition_gate_enforce_mode_safe_open_human_actor(
 
 
 @pytest.mark.asyncio
-async def test_process_add_ticket_orphan_race_logs_warning_with_task_id(
+async def test_worker_orphan_race_logs_warning_with_task_id(
     interceptor_with_store,
     ticket_store,
     taskmaster,
     caplog,
 ):
-    """_process_add_ticket emits a WARNING when the terminal mark_resolved returns
-    False because cancel_ticket won the TOCTOU race.
+    """The worker WARNs when cancel_ticket terminalises the row while tm.add_task runs.
 
-    Setup: a racing_mark_resolved wrapper simulates cancel_ticket winning the
-    race by persisting status='cancelled' BEFORE forwarding the worker's
-    mark_resolved(status='created') call.  The worker's call therefore returns
-    False.  We assert that a WARNING record exists whose message contains both
-    the ticket_id and the distinctive task_id 'task-orphan-99' returned by
-    tm.add_task (overridden below), and that the message uses the neutral
-    'orphan-race:' label rather than the misleading '_process_add_ticket:' prefix.
-
-    RED: the WARNING message currently starts with '_process_add_ticket: orphan-race'
-    instead of the neutral 'orphan-race:' label.
+    The task is live in tasks.json but the ticket reads ``cancelled``, so the
+    WARNING names both ids under the neutral 'orphan-race:' label and the
+    worker's caller label.
     """
     import logging
 
-    # Override add_task to return a distinctive id that can't accidentally match
-    # other tokens in the log message.
-    taskmaster.add_task.return_value = {'id': 'task-orphan-99', 'title': 'New Task'}
+    async def add_task_while_the_ticket_is_cancelled(*args, **kwargs):
+        pending = await interceptor_with_store.list_tickets(
+            project_root='/project', status='pending',
+        )
+        for row in pending['rows']:
+            await interceptor_with_store.cancel_ticket(row['ticket_id'])
+        return {'id': 'task-orphan-99', 'title': 'T'}
 
-    ticket_id = await ticket_store.submit(
-        project_id='project',
-        candidate_json=json.dumps(
-            {
-                'project_root': '/project',
-                'kwargs': {'title': 'T', 'description': 'D'},
-                'metadata': None,
-            }
-        ),
-    )
+    taskmaster.add_task = AsyncMock(side_effect=add_task_while_the_ticket_is_cancelled)
 
-    original_mark_resolved = ticket_store.mark_resolved
+    def orphan_warnings() -> list[logging.LogRecord]:
+        return [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and ticket_id in r.message
+            and 'task-orphan-99' in r.message
+        ]
 
-    async def racing_mark_resolved(tid: str, *, status: str, **kwargs):
-        if tid == ticket_id and status == 'created':
-            # Simulate cancel_ticket winning the race: flip the row to
-            # 'cancelled' BEFORE the worker's mark_resolved lands.
-            await original_mark_resolved(tid, status='cancelled', reason='user_cancelled')
-        # Forward the worker's call — returns False because row is no longer pending.
-        return await original_mark_resolved(tid, status=status, **kwargs)
-
-    ticket_store.mark_resolved = racing_mark_resolved
-    try:
-        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
-            await interceptor_with_store._process_add_ticket(ticket_id)
-    finally:
-        ticket_store.mark_resolved = original_mark_resolved
-
-    # (a) WARNING record must contain both ticket_id and orphan task_id 'task-orphan-99'
-    warning_records = [
-        r
-        for r in caplog.records
-        if r.levelno == logging.WARNING and ticket_id in r.message and 'task-orphan-99' in r.message
-    ]
-    assert warning_records, (
-        f'Expected a WARNING containing ticket_id={ticket_id!r} and task_id="task-orphan-99"; '
-        f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
-    )
-
-    # (a') WARNING must use the neutral 'orphan-race:' label
-    for r in warning_records:
-        assert 'orphan-race:' in r.message, (
-            f'Expected WARNING to contain "orphan-race:" but got: {r.message!r}'
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        submitted = await interceptor_with_store.submit_task('/project', title='T', description='D')
+        ticket_id = submitted['ticket']
+        answer = await interceptor_with_store.resolve_ticket(
+            ticket_id, '/project', timeout_seconds=10.0,
+        )
+        warning_records = await poll_until(
+            orphan_warnings, message='the worker never logged the orphan-race WARNING',
         )
 
-    # (a'') WARNING must include the caller label so per-caller grep patterns work
+    assert answer == {'status': 'cancelled', 'reason': 'user_cancelled'}
     for r in warning_records:
-        assert 'caller=add_ticket' in r.message, (
-            f'Expected WARNING to contain "caller=add_ticket" but got: {r.message!r}'
-        )
-
-    # (b) Row status is 'cancelled' (cancel_ticket won the race)
+        assert 'orphan-race:' in r.message, r.message
+        assert 'caller=add_tickets_batch' in r.message, r.message
     row = await ticket_store.get(ticket_id)
-    assert row is not None
-    assert row['status'] == 'cancelled', f'Expected cancelled, got {row["status"]!r}'
-
-    # (c) tm.add_task was called once — the task is live in tasks.json
-    taskmaster.add_task.assert_called_once()
+    assert row is not None and row['status'] == 'cancelled'
+    taskmaster.add_task.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -14293,121 +14259,6 @@ async def test_persist_worker_terminal_orphan_race_emits_warning(
     for r in warning_records:
         assert 'caller=unit_test' in r.message, (
             f'Expected WARNING to contain "caller=unit_test" but got: {r.message!r}'
-        )
-
-
-@pytest.mark.asyncio
-async def test_process_add_ticket_cancelled_after_dispatch_emits_orphan_warning(
-    interceptor_with_store,
-    ticket_store,
-    caplog,
-):
-    """_process_add_ticket's CancelledError handler routes through _persist_worker_terminal
-    so orphan-race WARNINGs are emitted uniformly on the cancellation path.
-
-    Strategy: hook _dispatch_ticket_decision to pre-cancel the row (simulating
-    cancel_ticket winning the race), schedule task cancellation, and return the
-    success tuple (status='created', task_id='task-cancelled-99').  Hook
-    _curator_lock with a simple @asynccontextmanager that yields then does
-    asyncio.sleep(0); the sleep is the first suspension after the dispatch tuple
-    is unpacked, so the pending cancellation fires there — still inside
-    _process_add_ticket's try block with status='created' already set.
-
-    Robustness: the cancel is scheduled in fake_dispatch (where status/task_id
-    are known to be set) rather than in a finally clause, making the trigger
-    point explicit and independent of contextmanager cleanup ordering.
-
-    RED: the inline asyncio.shield(mark_resolved(...)) in the CancelledError
-    handler emits no WARNING, so this test fails before the fix.
-    """
-    import logging
-    from contextlib import asynccontextmanager
-
-    ticket_id = await ticket_store.submit(
-        project_id='project',
-        candidate_json=json.dumps(
-            {
-                'project_root': '/project',
-                'kwargs': {'title': 'T', 'description': 'D'},
-                'metadata': None,
-            }
-        ),
-    )
-
-    # Stub: pre-cancel the row, schedule task cancellation, then return the success
-    # tuple so that _process_add_ticket's locals reach status='created',
-    # task_id='task-cancelled-99' before the pending cancel is delivered.
-    async def fake_dispatch(**kwargs):
-        await ticket_store.mark_resolved(ticket_id, status='cancelled', reason='user_cancelled')
-        # Schedule cancellation here, while status/task_id are about to be set.
-        # The CancelledError fires at the first suspension inside fake_curator_lock
-        # (the post-yield asyncio.sleep(0)), which is still inside _process_add_ticket's
-        # try block — so the except asyncio.CancelledError handler sees status='created'.
-        task = asyncio.current_task()
-        if task is not None:
-            task.cancel()
-        return (
-            'created',
-            'task-cancelled-99',
-            None,
-            {'id': 'task-cancelled-99', 'title': 'T'},
-            None,
-        )
-
-    # Stub: yield for the body (fake_dispatch runs here), then suspend once so the
-    # pending cancellation scheduled by fake_dispatch is delivered while still inside
-    # _process_add_ticket's try block.
-    def fake_curator_lock(project_id):
-        @asynccontextmanager
-        async def _ctx():
-            yield
-            # Suspension-point invariant: this sleep is the FIRST yield after
-            # fake_dispatch's `task.cancel()`, so the pending CancelledError is
-            # delivered HERE — still inside `_process_add_ticket`'s try block with
-            # status='created' and task_id already set.  See the surrounding
-            # docstring for the full timing chain.  Do NOT reorder or remove
-            # without also auditing the cancellation-timing contract documented
-            # in the test docstring above.
-            await asyncio.sleep(0)
-
-        return _ctx()
-
-    interceptor_with_store._dispatch_ticket_decision = fake_dispatch
-    interceptor_with_store._curator_lock = fake_curator_lock
-    try:
-        with (
-            caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await interceptor_with_store._process_add_ticket(ticket_id)
-    finally:
-        del interceptor_with_store._dispatch_ticket_decision
-        del interceptor_with_store._curator_lock
-
-    # (a) WARNING must contain ticket_id and orphan task_id
-    warning_records = [
-        r
-        for r in caplog.records
-        if r.levelno == logging.WARNING
-        and ticket_id in r.message
-        and 'task-cancelled-99' in r.message
-    ]
-    assert warning_records, (
-        f'Expected a WARNING containing ticket_id={ticket_id!r} and '
-        f'"task-cancelled-99"; '
-        f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
-    )
-
-    # (b) WARNING must use the neutral 'orphan-race:' label
-    for r in warning_records:
-        assert 'orphan-race:' in r.message, (
-            f'Expected WARNING to contain "orphan-race:" but got: {r.message!r}'
-        )
-
-    # (c) WARNING must include the caller label so per-caller grep patterns work
-    for r in warning_records:
-        assert 'caller=add_ticket_cancel' in r.message, (
-            f'Expected WARNING to contain "caller=add_ticket_cancel" but got: {r.message!r}'
         )
 
 
@@ -15505,11 +15356,10 @@ async def test_dispatch_refuse_precedes_drop_even_with_stray_target(
 
 
 def _refusal_curator(decision: CuratorDecision) -> MagicMock:
-    """A curator mock returning *decision*, wired for BOTH worker paths.
+    """A curator mock whose prepared batch answers *decision* for every candidate.
 
-    Extends :func:`_mock_curator` with the prepared-batch entry points the batch
-    worker uses (``prepare_candidate`` / ``curate_batch_prepared``), so the same
-    refusal can be driven through the single and batch paths alike.
+    Extends :func:`_mock_curator` with the entry points the worker's batch path
+    uses (``prepare_candidate`` / ``curate_batch_prepared``).
     """
     from fused_memory.middleware.curator_types import PreparedCandidate
 
@@ -15593,61 +15443,12 @@ async def test_refused_ticket_creates_no_task_end_to_end(
 
 
 @pytest.mark.asyncio
-async def test_refused_ticket_creates_no_task_on_batch_path(
-    curator_interceptor, taskmaster,
-):
-    """The batch worker path must honour a refusal too. The batch dispatcher's
-    sibling-substitution guard keys on `dec.action == 'drop' and target is not
-    None`, so a refusal (which carries no batch_target_index) must pass through
-    it untouched and reach the shared chokepoint."""
-    store = curator_interceptor._ticket_store
-    candidate_json = json.dumps({
-        'project_root': '/project',
-        'kwargs': {'title': 'Convert FIX C relay-flag deletion', 'description': 'x'},
-        'metadata': None,
-    })
-    ticket = await store.submit('project', candidate_json)
-
-    refusal = _blocklisted_refusal()
-    mock_curator = _refusal_curator(refusal)
-    mock_curator.curate_batch_prepared = AsyncMock(return_value=[refusal])
-
-    with patch.object(
-        type(curator_interceptor), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ), patch.object(
-        type(curator_interceptor), '_ensure_taskmaster',
-        new=AsyncMock(return_value=taskmaster),
-    ):
-        await curator_interceptor._process_add_tickets_batch([ticket])
-
-    row = await store.get(ticket)
-    assert row is not None
-    assert row['status'] == 'refused', row
-    assert row['task_id'] is None, row
-    assert 'no task created' in (row['reason'] or ''), row
-    taskmaster.add_task.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
     curator_interceptor, taskmaster,
 ):
     """A refusal must never CASCADE. A sibling whose batch_target_index points
     at a refused candidate sees task_id=None and must fail OPEN to create —
     refusing one candidate cannot silently discard an unrelated one."""
-    store = curator_interceptor._ticket_store
-
-    def _cj(title):
-        return json.dumps({
-            'project_root': '/project',
-            'kwargs': {'title': title, 'description': 'x'},
-            'metadata': None,
-        })
-
-    t1 = await store.submit('project', _cj('Convert FIX C relay-flag deletion'))
-    t2 = await store.submit('project', _cj('Unrelated sibling that names t1 as its target'))
-
     refusal = _blocklisted_refusal()
     mock_curator = _refusal_curator(refusal)
     mock_curator.curate_batch_prepared = AsyncMock(return_value=[
@@ -15659,25 +15460,22 @@ async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
             justification='dup of batch 0',
         ),
     ])
+    curator_interceptor._curator = mock_curator
     taskmaster.add_task = AsyncMock(return_value={'id': '77', 'title': 'Unrelated sibling'})
 
-    with patch.object(
-        type(curator_interceptor), '_get_curator',
-        new=AsyncMock(return_value=mock_curator),
-    ), patch.object(
-        type(curator_interceptor), '_ensure_taskmaster',
-        new=AsyncMock(return_value=taskmaster),
-    ):
-        await curator_interceptor._process_add_tickets_batch([t1, t2])
+    ticket_ids = await submit_as_one_batch(curator_interceptor, mock_curator, [
+        {'title': 'Convert FIX C relay-flag deletion', 'description': 'x'},
+        {'title': 'Unrelated sibling that names t1 as its target', 'description': 'x'},
+    ])
+    refused, sibling = [
+        await curator_interceptor.resolve_ticket(t, '/project', timeout_seconds=10.0)
+        for t in ticket_ids
+    ]
 
-    r1 = await store.get(t1)
-    r2 = await store.get(t2)
-
-    assert r1 is not None and r1['status'] == 'refused', r1
-    assert r1['task_id'] is None, r1
+    assert refused['status'] == 'refused', refused
+    assert 'task_id' not in refused, refused
     # The sibling fails OPEN — it was never refused by any guard.
-    assert r2 is not None and r2['status'] == 'created', r2
-    assert r2['task_id'] == '77', r2
+    assert (sibling['status'], sibling.get('task_id')) == ('created', '77'), sibling
     assert taskmaster.add_task.await_count == 1
 
 
@@ -15738,41 +15536,31 @@ async def test_identical_blocklisted_duplicates_in_one_batch_create_nothing(
     create — filing the very dead-premise task the guard had just refused. Net
     effect was identical to the pre-fix bug.
     """
-    store = curator_interceptor._ticket_store
-
-    payload = json.dumps({
-        'project_root': '/project',
-        'kwargs': {
-            'title': 'Convert FIX C relay-flag deletion: search-then-delete',
-            'description': 'Metric fixc_flags_deleted_not_found is not tracked.',
-        },
-        'metadata': None,
-    })
-    # Byte-identical payloads → identical payload_hash → the dedup path.
-    t1 = await store.submit('project', payload)
-    t2 = await store.submit('project', payload)
-
     curator = _real_blocklist_curator(tmp_path)
+    curator_interceptor._curator = curator
     taskmaster.add_task = AsyncMock(return_value={'id': '99', 'title': 'x'})
+    # Byte-identical submissions → identical payload_hash → the dedup path.
+    submission = {
+        'title': 'Convert FIX C relay-flag deletion: search-then-delete',
+        'description': 'Metric fixc_flags_deleted_not_found is not tracked.',
+    }
 
-    with patch.object(
-        type(curator_interceptor), '_get_curator',
-        new=AsyncMock(return_value=curator),
-    ), patch.object(
-        type(curator_interceptor), '_ensure_taskmaster',
-        new=AsyncMock(return_value=taskmaster),
-    ):
-        await curator_interceptor._process_add_tickets_batch([t1, t2])
+    ticket_ids = await submit_as_one_batch(
+        curator_interceptor, curator, [submission, submission],
+    )
+    answers = [
+        await curator_interceptor.resolve_ticket(t, '/project', timeout_seconds=10.0)
+        for t in ticket_ids
+    ]
 
     # THE HEADLINE ASSERTION: a refused dead-premise candidate is never filed,
     # no matter how many byte-identical copies land in the same batch.
     taskmaster.add_task.assert_not_awaited()
 
-    for tid in (t1, t2):
-        row = await store.get(tid)
-        assert row is not None and row['status'] == 'refused', (tid, row)
-        assert row['task_id'] is None, (tid, row)
-        assert 'cancelled-premise-blocklist:' in (row['reason'] or ''), (tid, row)
+    for answer in answers:
+        assert answer['status'] == 'refused', answer
+        assert 'task_id' not in answer, answer
+        assert 'cancelled-premise-blocklist:' in answer['reason'], answer
 
 
 # --------------------------------------------------------------------------- #
@@ -17045,6 +16833,9 @@ class _ZotRaisingCurator(_ScoredCorpusCurator):
     async def curate(self, candidate, project_id: str, project_root: str, *, prepared=None):
         raise CuratorFailureError('no orchestrator is running', zero_output_timeout=True)
 
+    async def close(self) -> None:
+        return None
+
 
 class TestZotDuplicateSweepWithoutOrchestrator:
     """With no orchestrator the ZOT re-raises, yet the create is still swept and stamped."""
@@ -17059,15 +16850,8 @@ class TestZotDuplicateSweepWithoutOrchestrator:
             taskmaster, reconciler, event_buffer,
             config=_curator_cfg(), ticket_store=ticket_store, escalator=CuratorEscalator(),
         )
-        ticket_id = await ticket_store.submit(
-            project_id=project_id,
-            candidate_json=json.dumps({
-                'project_root': project_root,
-                'kwargs': {'title': 'Re-filed gate fix', 'description': 'same fix again'},
-                'metadata': None,
-            }),
-        )
-        return interceptor, ticket_id, project_root, project_id
+        yield interceptor, project_root, project_id
+        await interceptor.close()
 
     @staticmethod
     async def _install_curator(interceptor, project_id: str, *, prepares: bool):
@@ -17086,21 +16870,16 @@ class TestZotDuplicateSweepWithoutOrchestrator:
         assert not list((Path(project_root) / 'data' / 'escalations').glob('esc-*.json'))
 
     @pytest.mark.asyncio
-    async def test_single_ticket_path(self, setup, taskmaster, ticket_store):
-        interceptor, ticket_id, project_root, project_id = setup
-        await self._install_curator(interceptor, project_id, prepares=False)
-
-        await interceptor._process_add_ticket(ticket_id)
-
-        await self._assert_stamped_but_not_escalated(taskmaster, ticket_store, ticket_id, project_root)
-
-    @pytest.mark.asyncio
     @pytest.mark.parametrize('prepares', [False, True], ids=['backfill', 'batch-fallback'])
     async def test_batch_paths(self, setup, taskmaster, ticket_store, prepares):
-        interceptor, ticket_id, project_root, project_id = setup
+        interceptor, project_root, project_id = setup
         await self._install_curator(interceptor, project_id, prepares=prepares)
 
-        await interceptor._process_add_tickets_batch([ticket_id])
+        submitted = await interceptor.submit_task(
+            project_root, title='Re-filed gate fix', description='same fix again',
+        )
+        ticket_id = submitted['ticket']
+        await interceptor.resolve_ticket(ticket_id, project_root, timeout_seconds=10.0)
 
         await self._assert_stamped_but_not_escalated(taskmaster, ticket_store, ticket_id, project_root)
 
