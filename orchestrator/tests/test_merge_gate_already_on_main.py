@@ -233,10 +233,10 @@ async def test_in_flight_follower_of_a_carried_head_is_not_cascaded(tmp_path: Pa
             passed=True, test_output='ok', lint_output='', type_output='', summary='ok',
         )
 
+    store = _RecordingEventStore()
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
-        scene.git_ops, queue, verifier=ScriptedVerifier(head_parks),
-        event_store=_RecordingEventStore(),
+        scene.git_ops, queue, verifier=ScriptedVerifier(head_parks), event_store=store,
     )
     async with running_lane(lane) as run:
         allocator = _inject_two_host_allocator(lane, remote)
@@ -256,7 +256,14 @@ async def test_in_flight_follower_of_a_carried_head_is_not_cascaded(tmp_path: Pa
     assert head_outcome.merge_sha == head_merge_commit
     assert follower_outcome.status == 'done', follower_outcome
     remote.cancel_verify.assert_not_awaited()
-    assert remote.run_merge_verify.await_count == 1
+    follower_verifies = [awaited.args[0] for awaited in remote.run_merge_verify.await_args_list]
+    assert len(follower_verifies) == 2, follower_verifies
+    assert follower_verifies[1] == follower_outcome.merge_sha != follower_verifies[0], (
+        'the follower verifies once, then gates its rebased tree on the host it holds'
+    )
+    assert [
+        record['task_id'] for name, record in store.events if name == 'merge_reverify_gate'
+    ] == ['follower']
     assert hosts_free_after_both_landed == 2
     assert _is_ancestor(scene.repo, successor, 'main')
     assert {'follower.txt', 'carried-head.txt', 'successor.txt'} <= set(
