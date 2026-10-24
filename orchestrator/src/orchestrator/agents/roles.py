@@ -480,6 +480,8 @@ alone, and escalate. Full rule and cross-links: `docs/task-authoring.md`,
 section "In-place memory amendments are not task-agent work".
 """
 
+# fused-memory/tests/test_referent_declaration_examples.py executes the `entities=`
+# example below against the live gate; its dict is this block's only deliberate brace.
 _MEMORY_INSTRUCTIONS = """
 ## Memory
 
@@ -503,6 +505,8 @@ Parameters:
 - `category`: One of `observations_and_summaries`, `procedural_knowledge`, or `preferences_and_norms`
 - `project_id`: Use the project_id from your Agent Identity section
 - `agent_id`: Use the agent_id from your Agent Identity section
+- `entities`: The tasks the memory is about, or `[]` if you considered it and none apply. Name each declared task as `task NNN` in the content too, for example:
+  `add_memory(content="Task 3127's retry loop swallows the timeout", category="procedural_knowledge", project_id=..., agent_id=..., entities=[{'kind': 'task', 'id': 3127}])`
 
 Write immediately when you discover something — don't batch until the end.
 """ + MEMORY_AMEND_ROUTING_RULE + """
