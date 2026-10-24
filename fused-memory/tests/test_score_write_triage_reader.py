@@ -38,6 +38,13 @@ def _stats() -> types.ModuleType:
     return load_script_module(SCRIPTS / 'write_triage_stats.py', mod_name='write_triage_stats')
 
 
+@functools.cache
+def _rubric() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'write_triage_reader_rubric.py', mod_name='write_triage_reader_rubric',
+    )
+
+
 _FLAT = {'home': 'YES', 'loss': 'NO', 'conflict': 'NO'}
 _MORE = {'home': 'YES', 'loss': 'YES', 'conflict': 'NO'}
 
@@ -487,6 +494,127 @@ class TestKappa:
             for index in range(split)
         ]
         assert _by_binary(*rated)['home'] == _agreement(agreeing + split, kappa, floor_met)
+
+
+def _key(entry: str, target: str, basis: str = 'current') -> Any:
+    rubric = _rubric()
+    return rubric.PairKey(entry, target, rubric.Basis(basis))
+
+
+def _consumed(*keys: tuple[str, str, str]) -> list[tuple[Any, Any]]:
+    """(pair key, binary) consumed keys, each given as (entry, target, binary) on the current basis."""
+    return [(_key(entry, target), _rubric().Binary(binary)) for entry, target, binary in keys]
+
+
+def _judgements(*votes: dict[str, Any]) -> Any:
+    return _rubric().resolve_judgements(list(votes))
+
+
+def _primary_second(entry: str, target: str, primary: dict[str, Any],
+                    second: dict[str, Any]) -> list[dict[str, Any]]:
+    return [_vote(entry, target, rater='opus-primary', role='primary', **primary),
+            _vote(entry, target, rater='opus-second', role='second', **second)]
+
+
+_ABSTAINS = {'home': 'UNCLEAR', 'conflict': 'NO', 'unclear_reason': 'cut at the subject'}
+
+
+class TestKappaOverConsumed:
+    """kappa_over_consumed scores (pair key, binary) keys directly, so several pairs of one write count."""
+
+    def test_reports_the_same_block_as_score_reader(self) -> None:
+        kappa = _mod().kappa_over_consumed([], _judgements())
+        assert set(kappa) == {'floor', 'min_pairs', 'floor_binaries', 'by_binary'}
+        assert (kappa['floor'], kappa['min_pairs'], kappa['floor_binaries']) == (
+            0.70, 60, ['home', 'conflict', 'loss'])
+        assert kappa['by_binary'] == {
+            binary: _agreement(0, None)
+            for binary in ('home', 'loss', 'conflict', 'scope', 'action_changing', 'digest')
+        }
+
+    def test_two_pairs_of_one_write_each_count_on_their_own_consumed_binaries(self) -> None:
+        judgements = _judgements(
+            *_primary_second('W', 'T1', _KEPT, _KEPT),
+            *_primary_second('W', 'T2', _STRAY, _KEPT),
+        )
+        consumed = _consumed(('W', 'T1', 'home'), ('W', 'T1', 'conflict'), ('W', 'T2', 'home'))
+        by_binary = _mod().kappa_over_consumed(consumed, judgements)['by_binary']
+        home_kappa = _stats().cohen_kappa([('YES', 'YES'), ('NO', 'YES')])
+        assert by_binary['home'] == _agreement(2, home_kappa)
+        assert by_binary['conflict'] == _agreement(1, None)
+        assert by_binary['loss'] == _agreement(0, None)
+
+    def test_the_answer_pairs_name_each_counted_key_with_both_words(self) -> None:
+        judgements = _judgements(
+            *_primary_second('W', 'T1', _KEPT, _KEPT),
+            *_primary_second('W', 'T2', _STRAY, _KEPT),
+        )
+        consumed = _consumed(('W', 'T1', 'home'), ('W', 'T1', 'conflict'), ('W', 'T2', 'home'))
+        pairs = _mod().consumed_answer_pairs(consumed, judgements)
+        binary = _rubric().Binary
+        assert set(pairs) == set(binary)
+        assert pairs[binary.HOME] == [(_key('W', 'T1'), 'YES', 'YES'), (_key('W', 'T2'), 'NO', 'YES')]
+        assert pairs[binary.CONFLICT] == [(_key('W', 'T1'), 'NO', 'NO')]
+        assert pairs[binary.LOSS] == []
+
+    def test_a_key_counts_once_however_often_it_is_consumed(self) -> None:
+        judgements = _judgements(*_primary_second('W', 'T1', _KEPT, _KEPT))
+        consumed = _consumed(('W', 'T1', 'home'), ('W', 'T1', 'home'))
+        assert _mod().kappa_over_consumed(consumed, judgements)['by_binary']['home'] == _agreement(1, None)
+
+    @pytest.mark.parametrize('votes', [
+        pytest.param(_primary_second('W', 'T1', _ABSTAINS, _KEPT), id='primary-abstains'),
+        pytest.param(_primary_second('W', 'T1', _KEPT, _ABSTAINS), id='second-abstains'),
+        pytest.param([_vote('W', 'T1', rater='opus-primary', role='primary', **_KEPT)],
+                     id='no-second'),
+        pytest.param([_vote('W', 'T1', rater='opus-primary', role='primary', **_KEPT),
+                      _vote('W', 'T1', rater='opus-primary-b', role='primary', **_KEPT),
+                      _vote('W', 'T1', rater='opus-second', role='second', **_KEPT)],
+                     id='two-primaries'),
+        pytest.param([_vote('W', 'T1', rater='opus-primary', role='primary', **_KEPT),
+                      _vote('W', 'T1', rater='opus-third', role='third', **_KEPT)],
+                     id='third-instead-of-second'),
+        pytest.param([], id='no-judgement'),
+    ])
+    def test_a_key_without_one_decided_primary_and_second_answer_is_left_out(
+        self, votes: list[dict[str, Any]],
+    ) -> None:
+        judgements = _judgements(*votes)
+        consumed = _consumed(('W', 'T1', 'home'))
+        assert _mod().kappa_over_consumed(consumed, judgements)['by_binary']['home'] == _agreement(0, None)
+        assert _mod().consumed_answer_pairs(consumed, judgements)[_rubric().Binary.HOME] == []
+
+    def test_a_binary_one_rater_did_not_answer_is_left_out(self) -> None:
+        judgements = _judgements(*_primary_second('W', 'T1', _KEPT, _STRAY))
+        consumed = _consumed(('W', 'T1', 'loss'), ('W', 'T1', 'home'))
+        by_binary = _mod().kappa_over_consumed(consumed, judgements)['by_binary']
+        assert by_binary['loss'] == _agreement(0, None)
+        assert by_binary['home'] == _agreement(1, None)
+
+    @pytest.mark.parametrize(('agreeing', 'split', 'kappa', 'floor_met'), [
+        (60, 0, 1.0, True),
+        (59, 0, 1.0, False),
+        (40, 20, 0.4, False),
+    ])
+    def test_the_floor_needs_both_agreement_and_pairs(
+        self, agreeing: int, split: int, kappa: float, floor_met: bool,
+    ) -> None:
+        votes, keys = [], []
+        for index in range(agreeing):
+            answers = (_KEPT, _STRAY)[index % 2]
+            votes += _primary_second('W', f'A{index:03d}', answers, answers)
+            keys.append(('W', f'A{index:03d}', 'home'))
+        for index in range(split):
+            votes += _primary_second('W', f'S{index:03d}', _KEPT, _STRAY)
+            keys.append(('W', f'S{index:03d}', 'home'))
+        by_binary = _mod().kappa_over_consumed(_consumed(*keys), _judgements(*votes))['by_binary']
+        assert by_binary['home'] == _agreement(agreeing + split, kappa, floor_met)
+
+    def test_a_key_off_the_current_basis_is_refused(self) -> None:
+        judgements = _judgements(_vote('W', 'T1', basis='attach_time', **_KEPT))
+        consumed = [(_key('W', 'T1', 'attach_time'), _rubric().Binary.HOME)]
+        with pytest.raises(ValueError, match='attach_time'):
+            _mod().kappa_over_consumed(consumed, judgements)
 
 
 class TestRefusal:
