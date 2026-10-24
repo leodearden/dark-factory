@@ -100,6 +100,26 @@ def _refuse_unrecorded(
     return 1
 
 
+def _restores_mains_previous_image(
+    root: Path, base: str, new_oid: str, raises: list[metrics.Violation]
+) -> bool:
+    """True, and said out loud, when NEW's baseline undoes main's LAST baseline change.
+
+    The commit gate's carve-out, with main's history -- the merge base's -- as
+    "one commit ago". Covering entries are not consulted on this path.
+    """
+    restored = revisions.restores_previous_image(root, new_oid, history_tip=base)
+    if restored is None:
+        return False
+    _say(
+        f'{metrics.BASELINE_RELPATH} restores the value this path held before '
+        f'commit {restored}, reabsorbing {len(raises)} measure(s). Allowed -- this '
+        'is the state main was running with one baseline change ago:',
+        *(f'  {violation.message}' for violation in raises),
+    )
+    return True
+
+
 def _audit_baseline(
     root: Path, old: str, new: str, base: str | None, own: list[dict]
 ) -> int:
@@ -114,7 +134,10 @@ def _audit_baseline(
             'a first write with nothing to compare against.'
         )
         return 0
-    unrecorded = metrics.unrecorded_raises(_raises(root, base_oid, new_oid), own)
+    raises = _raises(root, base_oid, new_oid)
+    if not raises or _restores_mains_previous_image(root, base, new_oid, raises):
+        return 0
+    unrecorded = metrics.unrecorded_raises(raises, own)
     if not unrecorded:
         return 0
     return _refuse_unrecorded(old, new, base, unrecorded)
