@@ -49,6 +49,7 @@ from _worktree_registrations import registered_worktree_paths
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import (
     PROTECTED_PREFIXES,
+    EphemeralWorktreeError,
     GitOps,
     SeedLaneLock,
     WarmBaseHealth,
@@ -1606,3 +1607,103 @@ class TestEphemeralWorktreeRemoveFailureIsReported:
         assert records, f'expected a WARNING naming {p}'
         assert all(r.exc_info for r in records), 'expected the WARNING to carry exc_info'
         assert not p.exists(), 'expected remove_tree to still delete the tree'
+
+
+def _assert_lock_unheld(lock_path: Path) -> None:
+    """A second open-file-description takes LOCK_NB, as gc.sh's ``flock -n`` would."""
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _make_undeletable(tree: Path) -> Path:
+    """Give *tree* a subdirectory whose file an unprivileged rm cannot delete."""
+    ro = tree / 'ro'
+    ro.mkdir(parents=True)
+    (ro / 'f').write_text('pinned')
+    ro.chmod(0o500)
+    return ro
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root bypasses permission bits')
+class TestEphemeralWorktreeResidueKeepsLock:
+    """task 6794: a tree that survives teardown keeps its ``<name>.lock``,
+    unheld, so the residue stays visible to gc.sh's ``flock -n`` reclaim and
+    the #5584 sweep instead of becoming an unregistered, lock-less orphan."""
+
+    def test_residue_surviving_teardown_keeps_an_unheld_lock_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        repo = seed_repo(tmp_path / 'repo')
+        git_ops = GitOps(GitConfig(), repo)
+        minted: list[Path] = []
+        pinned: list[Path] = []
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_SWEEP, _head_sha(repo)) as p:
+                minted.append(p)
+                pinned.append(_make_undeletable(p / 'target'))
+
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+                asyncio.run(_body())  # must not raise
+
+            (p,) = minted
+            lock_path = p.parent / f'{p.name}.lock'
+            assert p.exists(), 'expected the undeletable tree to survive as residue'
+            assert str(p) not in registered_worktree_paths(repo)
+            assert lock_path.exists(), f'expected {lock_path} to outlive the residue'
+            _assert_lock_unheld(lock_path)
+            assert [
+                r for r in _git_ops_warnings_naming(caplog, p)
+                if str(lock_path) in r.getMessage()
+            ], 'expected a WARNING naming the residue and its retained lock'
+        finally:
+            for ro in pinned:
+                ro.chmod(0o700)
+
+    def test_failed_add_with_unremovable_residue_keeps_lock_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        targets: list[Path] = []
+        pinned: list[Path] = []
+
+        async def _fake_run(cmd, **kwargs) -> tuple[int, str, str]:
+            calls.append(list(cmd))
+            if 'worktree' in cmd and 'add' in cmd:
+                target = Path(cmd[-2])
+                targets.append(target)
+                pinned.append(_make_undeletable(target))
+                return (1, '', 'No space left on device')
+            return (0, '', '')
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                pass  # must never run
+
+        try:
+            with (
+                patch('orchestrator.git_ops._run', side_effect=_fake_run),
+                caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+                pytest.raises(EphemeralWorktreeError),
+            ):
+                asyncio.run(_body())
+
+            (target,) = targets
+            lock_path = target.parent / f'{target.name}.lock'
+            assert target.exists(), 'expected the undeletable add residue to survive'
+            assert lock_path.exists(), f'expected {lock_path} to outlive the residue'
+            _assert_lock_unheld(lock_path)
+            assert [
+                r for r in _git_ops_warnings_naming(caplog, target)
+                if str(lock_path) in r.getMessage()
+            ], 'expected a WARNING naming the residue and its retained lock'
+            assert not [c for c in calls if 'worktree' in c and 'remove' in c]
+        finally:
+            for ro in pinned:
+                ro.chmod(0o700)
