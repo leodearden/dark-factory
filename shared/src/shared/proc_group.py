@@ -306,8 +306,24 @@ _SURVIVOR_POLL_SECS = 0.1
 
 
 def _survivors_of_reaped_leader(pgid: int) -> list[ProcessGroupMember]:
-    """The running members of group *pgid*, once its leader has been reaped."""
-    return [m for m in process_group_members(pgid) if not m.terminated]
+    """The running members of group *pgid*, once its leader has been reaped.
+
+    The kernel never reallocates a pid number while any process, zombies
+    included, still uses it as a pgid: so a survivor seen in group *pgid* pins
+    it at that instant, and a process with pid == *pgid* after the leader's
+    reap proves the number was recycled, which yields [] (the group is a stranger's).
+    """
+    members = process_group_members(pgid)
+    if any(m.pid == pgid for m in members):
+        logger.warning(
+            'terminate_process_group: pid %s exists again although the leader '
+            'with that pid was reaped, so the number was recycled and group %s '
+            "is a stranger's; not signalling it",
+            pgid,
+            pgid,
+        )
+        return []
+    return [m for m in members if not m.terminated]
 
 
 async def _group_terminated_within(
