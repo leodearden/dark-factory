@@ -209,6 +209,7 @@ R9 The coder (Haiku trickle and Sonnet miner) does not receive the fourteen heur
 - **D6 Structural findings are recorded, not filed** (contract §6). The verdict's `route` decides. Today such clusters are filed whenever they recur.
 - **D7 Tickets resolve in-run, with a bound:** `resolve_ticket` per ticket, 300 s in total, before render. The remainder resolve on the next run.
 - **D8 `fixed` requires re-verification.** A back-linked task going `done` queues one verify call at `as_of_sha`, counted against the same verify cap. "Gone" sets `status: fixed` and `fixed_at_sha`. "Present" re-files with `x_supersedes_task` (contract §7, §8 1c). The codebook status is a projection reconciled from the task store on every run, never an independent copy (INV-9).
+  > Amended 2026-10-24 (task 7448): a back-linked task the entry lists in `corrected_by` (written only by a §7.3 correction naming it in `outcome_of_task`) corrected the entry's record rather than its defect, so it decides no status and queues no re-verify; and a census output lands only after the project's `census.landing_gate` passes (`scripts/legibility/landing_gate.py`).
 - **D9 Completion (a) evaluates the observed project only.** Cross-project tickets are reported, but they do not gate.
 - **D10 `scripts/legibility/invariants.py` reads `## INV-<id> \`<slug>\`` headings from a project's own design-invariants doc.** It accepts both the `INV-<n>` and the `INV-<FAMILY>-<n>` id forms. `scripts/tests/test_design_invariants_consistency.py::_HEADING_RE` is replaced by an import of it (INV-5).
 
