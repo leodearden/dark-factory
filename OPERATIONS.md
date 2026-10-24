@@ -2840,6 +2840,15 @@ systemctl --user list-timers fused-memory-memory-eval.timer
 The run's last stdout line is a JSON summary:
 `{"alarms": …, "failures": …, "filed": …, "run_stamp": …, "suppressed": …}`.
 
+**Re-filing.** While a record is pending, the runner files nothing for its
+`dedupe_fingerprint`. A regression's fingerprint and the runner-failure
+fingerprint carry no stamp, so each stays one record across runs. The storm
+aggregate's fingerprint is scoped to its run
+(`shared/src/shared/memory_eval_verdicts.py::storm_fingerprint`). So a storm
+that persists, such as a corpus migration that trips more than K metrics for
+several days, files one new aggregate per run. The watcher folds those into
+the oldest one.
+
 **Install.**
 
 ```bash

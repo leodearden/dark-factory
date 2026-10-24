@@ -662,7 +662,13 @@ check ran in. Single normative statement of the rule:
     usually share one cause. **Infrastructure first**: check fused-memory,
     Qdrant and FalkorDB health and read the run report the record names
     before triaging any single metric. Tell the human, file a DecisionRecord
-    via `write-decision`, and leave it pending.
+    via `write-decision`, and leave it pending. Unlike the other two shapes,
+    its fingerprint is scoped to its run, so a storm that persists files one
+    new aggregate per run. Fold them: keep the oldest pending aggregate as the
+    one you triage, and dismiss each later one that has the same cause with
+    `resolve_issue(..., action='close_only', resolution="Same storm as
+    <oldest esc-id>")`. Dismissing one suppresses nothing, because no later run
+    reuses its fingerprint.
   - *Runner failure* — task id `memory-eval-program`, summary `memory-eval
     runner: <n> failure(s) at <stamp> (...)`. Handle it as `infra_issue`: tell
     the human and leave it pending until a clean run. Its fingerprint carries
