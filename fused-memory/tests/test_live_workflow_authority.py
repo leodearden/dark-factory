@@ -100,3 +100,31 @@ class TestProbedScopeRule:
         )
 
         assert format_filtered_task_tree(tree).startswith(ACTIVE_TASK_TREE_HEADER + '\n')
+
+
+_LIVE_WORKFLOW_REGION_HEADER = '## Live-Workflow Authority'
+
+
+def _stage_local_live_workflow_text(prompt: str) -> str:
+    """The stage's own `## Live-Workflow Authority` prose, without the shared rules block."""
+    _, _, after = prompt.partition(_LIVE_WORKFLOW_REGION_HEADER)
+    end = after.find('\n## ')
+    region = after if end == -1 else after[:end]
+    rules = render_live_workflow_authority_rules()
+    assert region.count(rules) == 1, 'the shared rules must sit inside the region they are stripped from'
+    return region.replace(rules, '')
+
+
+@pytest.mark.parametrize(
+    'prompt', [STAGE1_SYSTEM_PROMPT, STAGE2_SYSTEM_PROMPT], ids=['stage1', 'stage2'],
+)
+class TestStageAbsenceRulesAreScopedToTheTree:
+    def test_both_absence_rules_name_the_tree(self, prompt: str) -> None:
+        stage_local = _stage_local_live_workflow_text(prompt)
+
+        assert stage_local.count(f'`{ACTIVE_TASK_TREE_HEADER}`') >= 2, (
+            "the 'NO live signal ... no live row' rule and the 'If `### Live-Workflow "
+            "Signals` is absent from the payload' rule must each be scoped to tasks the "
+            f'`{ACTIVE_TASK_TREE_HEADER}` lists; either one left unqualified lets the '
+            "model read 'never probed' as 'not live'"
+        )
