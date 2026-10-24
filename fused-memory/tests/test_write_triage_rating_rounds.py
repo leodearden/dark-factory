@@ -688,7 +688,7 @@ class TestRatingScratch:
         third = _mod().third_round
         key = rounds.key()
         assert third(rounds.scratch, key, rounds.entries(), {('e0', 'p1')}) == {
-            'pairs': 1, 'shard': 'third_00',
+            'pairs': 1, 'shards': ['third_00'],
         }
         key = rounds.key()
         assert {**key['shards']['third_00'], 'items': len(key['shards']['third_00']['items'])} == {
@@ -697,14 +697,14 @@ class TestRatingScratch:
         assert rounds.holding(('e0', 'p1', 'current'))[-1] == 'third_00'
         assert 'third_00' not in rounds.holding(('e0', 'p1', 'attach_time'))
         assert third(rounds.scratch, key, rounds.entries(), {('e1', 'p1'), ('e2', 'p1')}) == {
-            'pairs': 2, 'shard': 'third_01',
+            'pairs': 2, 'shards': ['third_01'],
         }
         assert rounds.key()['shards']['third_01']['rater'] == 'opus-third-01'
 
     def test_a_third_round_with_nothing_blocked_writes_nothing(self, rounds: _Rounds) -> None:
         key_bytes = (rounds.root / 'key.json').read_bytes()
         assert _mod().third_round(rounds.scratch, rounds.key(), rounds.entries(), set()) == {
-            'pairs': 0, 'shard': None,
+            'pairs': 0, 'shards': [],
         }
         assert (rounds.root / 'key.json').read_bytes() == key_bytes
 
@@ -727,3 +727,63 @@ class TestTheRaterContract:
         assert 'blind rater' in prompt
         assert 'Do not open any other file' in prompt
         assert 'exactly one line' in prompt
+
+
+class TestRoundsLargerThanAShard:
+    """A re-ask or third round over more than SHARD_SIZE items is dealt into shards of one rater."""
+
+    COUNT = 45
+
+    @pytest.fixture
+    def scratch(self, tmp_path: Path) -> tuple[Any, dict[Triple, Any]]:
+        rounds = _mod()
+        entries = [rounds.ShardEntry(f'e{index:02d}', 'p1', 'current', 'df', f'child {index}',
+                                     f'parent {index}') for index in range(self.COUNT)]
+        scratch = rounds.RatingScratch(tmp_path / 'scratch')
+        key = scratch.load_key()
+        scratch.add_shards(key, entries, seed=7)
+        scratch.save_key(key)
+        return scratch, {(entry.entry_id, entry.target_id, entry.basis): entry for entry in entries}
+
+    @staticmethod
+    def _rate(scratch: Any, rule: Rule) -> None:
+        key = scratch.load_key()
+        (scratch.root / 'ratings').mkdir(exist_ok=True)
+        for name, spec in key['shards'].items():
+            path = scratch.root / 'ratings' / f'{name}.jsonl'
+            if not path.exists():
+                path.write_text(''.join(
+                    json.dumps({'id': item, **rule(None), 'reason': 'r'}) + '\n'
+                    for item in spec['items']))
+
+    def test_a_large_reask_round_is_split_under_one_rater_and_round(
+        self, scratch: tuple[Any, dict[Triple, Any]],
+    ) -> None:
+        rounds, (store, entries) = _mod(), scratch
+        self._rate(store, _lacks_loss)
+        written = rounds.reask_round(store, store.load_key(), entries)
+        assert written['lines'] == 2 * self.COUNT
+        key = store.load_key()
+        reasks = {name: spec for name, spec in key['shards'].items() if name.startswith('reask_')}
+        assert sorted(reasks) == ['reask_01_primary_00', 'reask_01_primary_01',
+                                  'reask_02_second_00', 'reask_02_second_01']
+        assert written['shards'] == {name: len(spec['items']) for name, spec in reasks.items()}
+        assert all(len(spec['items']) <= rounds.SHARD_SIZE for spec in reasks.values())
+        assert {(spec['role'], spec['rater'], spec['round']) for spec in reasks.values()} == {
+            ('primary', 'opus-primary', 1), ('second', 'opus-second', 2)}
+
+    def test_a_large_third_round_is_split_under_one_new_rater(
+        self, scratch: tuple[Any, dict[Triple, Any]],
+    ) -> None:
+        rounds, (store, entries) = _mod(), scratch
+        blocked = {(entry_id, target_id) for entry_id, target_id, _ in entries}
+        assert rounds.third_round(store, store.load_key(), entries, blocked) == {
+            'pairs': self.COUNT, 'shards': ['third_00_00', 'third_00_01']}
+        key = store.load_key()
+        thirds = {name: spec for name, spec in key['shards'].items() if spec['role'] == 'third'}
+        assert sorted(thirds) == ['third_00_00', 'third_00_01']
+        assert {spec['rater'] for spec in thirds.values()} == {'opus-third-00'}
+        assert sum(len(spec['items']) for spec in thirds.values()) == self.COUNT
+        assert rounds.third_round(store, key, entries, {('e00', 'p1')}) == {
+            'pairs': 1, 'shards': ['third_01']}
+        assert store.load_key()['shards']['third_01']['rater'] == 'opus-third-01'
