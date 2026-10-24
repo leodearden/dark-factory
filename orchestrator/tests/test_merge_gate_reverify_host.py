@@ -31,8 +31,9 @@ from _merge_lane_fakes import (
     make_lane,
     merge_through_lane,
     passes,
+    running_lane,
 )
-from _orch_helpers import git_env_with_ceiling
+from _orch_helpers import git_env_with_ceiling, wait_responsive
 from _recording_event_store import _RecordingEventStore
 from df_pytest_isolation import git_redirect_env
 
@@ -442,3 +443,39 @@ async def test_the_gate_falls_back_to_local_when_the_head_host_is_unreachable(
     (laptop,) = [row for row in lane.snapshot()['hosts'] if row['name'] == host.name]
     assert laptop['quarantined'] is True, laptop
     assert 'exited 255' in laptop['reason'], laptop
+
+
+# ─── A lane cancelled mid remote gate aborts the remote verify ──────────────
+
+
+async def test_cancelling_the_lane_mid_remote_gate_aborts_the_remote_verify_while_live(
+    remote_scene: _Scene,
+) -> None:
+    """The merger awaits the gate inline, so cancelling the lane must abort the
+    remote verify through the worker's teardown chokepoint while it is still
+    live; otherwise the verify-merge is orphaned on the host (task 1757)."""
+    request = await _single(remote_scene, 'gate')
+    host = _HeadHost(
+        _host_moves_main_then_passes(functools.partial(_land_drift, remote_scene.repo)),
+        _host_hangs,
+    )
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(
+        remote_scene.git_ops, queue,
+        verifier=FakeVerifier(), clock=healthy_verify_clock(), remote_runners=[host],
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        async with running_lane(lane) as run:
+            await queue.put(request)
+            await wait_responsive(host.gate_entered.wait(), label='gate re-verify under way on the head host')
+            run.task.cancel()
+            await wait_responsive(asyncio.wait({run.task}), label='lane run() unwound')
+            live_once_unwound = host.live
+
+    assert host.cancels[:1] == [True], (
+        'the abort must precede the local cancel, or the remote verify-merge '
+        f'process is orphaned; cancels found live: {host.cancels}'
+    )
+    assert live_once_unwound is False
+    assert host.endings[1] == 'cancelled', host.endings
