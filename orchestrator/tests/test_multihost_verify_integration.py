@@ -58,7 +58,7 @@ import time
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, assert_type
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1347,7 +1347,7 @@ class _ShortSleepClock:
     honestly -- only the cadence is compressed.
     """
 
-    _CAP_SECS = 0.02
+    CAP_SECS = 0.02
 
     def now(self) -> float:
         return time.time()
@@ -1359,7 +1359,7 @@ class _ShortSleepClock:
         return None
 
     async def sleep(self, secs: float) -> None:
-        await asyncio.sleep(min(secs, self._CAP_SECS))
+        await asyncio.sleep(min(secs, self.CAP_SECS))
 
     async def wait_for_any(
         self, aws: Collection[asyncio.Future[Any]], timeout: float,
@@ -1373,6 +1373,28 @@ class _ShortSleepClock:
 
 
 _SHORT_SLEEP_CLOCK_IS_A_CLOCK_PORT: ClockPort = _ShortSleepClock()
+
+
+class TestShortSleepClockWaitsForAny:
+    """``wait_for_any`` keeps the whole timeout that ``sleep`` caps.
+
+    The ``assert_type`` pins the precise signature, which the conformance pin
+    above cannot: an ``Any``-typed method still satisfies the Protocol.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unfinished_wait_runs_its_whole_timeout_not_the_sleep_cap(self) -> None:
+        cap = _ShortSleepClock.CAP_SECS
+        forever = asyncio.create_task(asyncio.Event().wait())
+        try:
+            started = time.monotonic()
+            done = await _ShortSleepClock().wait_for_any({forever}, timeout=10 * cap)
+            assert_type(done, set[asyncio.Future[Any]])
+            assert done == set()
+            assert time.monotonic() - started > 5 * cap
+        finally:
+            forever.cancel()
+            await asyncio.gather(forever, return_exceptions=True)
 
 
 class _HostEscalationQueue:
