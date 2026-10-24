@@ -170,7 +170,7 @@ class EvalMetrics:
     # Plan-quality rubric (eval-revival θ) — the architect-eval analogues of
     # recovery_score/adversarial above. ``plan_quality`` is a rubric DISTINCT
     # from the base composite, populated ONLY for architect runs
-    # (role_under_test=='architect'); ``None`` is the C4 ``plan_quality | null``
+    # (role_under_test ARCHITECT); ``None`` is the C4 ``plan_quality | null``
     # sentinel for non-architect (implementer) runs, kept distinct from a
     # genuinely scored ``0.0``. Unlike recovery scoring (which degrades to None
     # on failure), an architect run that was actually ASKED always emits a
@@ -178,7 +178,7 @@ class EvalMetrics:
     # ``score_plan_structure`` floor if the LLM plan judge fails.
     #
     # ``None`` therefore has exactly TWO causes, disambiguated by the markers
-    # below: (1) not an architect run at all (``role_under_test != 'architect'``,
+    # below: (1) not an architect run at all (role_under_test not ARCHITECT,
     # ``cap_tainted`` False), or (2) an architect run we could NOT measure
     # because the invocation was refused at the transport layer — a 429 cap hit
     # or auth failure — which carries ``cap_tainted=True`` and an architect
