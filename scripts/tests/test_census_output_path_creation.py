@@ -33,7 +33,7 @@ from typing import Any
 
 from legibility import census as mod
 from legibility import config as config_mod
-from legibility import embeddings, unlanded
+from legibility import embeddings, landing_gate, unlanded
 from legibility_task_store_fake import FakeTaskStore
 
 _DATE = "2026-08-03"
@@ -95,6 +95,7 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
         task_store=FakeTaskStore(),
         escalate_fn=lambda **kw: None,
         status_fetcher=lambda: {"statuses": {}},
+        gate=lambda: landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
         commit=lambda **kw: unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1),
         roll_back=_never_roll_back,
         codebook_dict=_minimal_v2_codebook(),
