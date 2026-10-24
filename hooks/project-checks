@@ -17,10 +17,12 @@
 # .task/ contamination the neighbouring universal guard in hooks/pre-commit
 # exists to stop. A CLEAN merge runs pre-merge-commit rather than pre-commit
 # (a conflicted one finished with `git commit` does run pre-commit), and the
-# merge worker advances main with `git update-ref`, which runs no hooks at
-# all, so a main-only audit would never see the two raises that actually
+# merge worker advances main with `git update-ref`, which runs no commit
+# hooks, so a main-only audit would never see the two raises that actually
 # landed (0b04534c7b, 52d98220ad -- both merge commits). Catching a raise
-# where it is introduced is the only placement that bites.
+# where it is introduced is the placement that bites first;
+# hooks/reference-transaction audits the landing itself, for what a rebase
+# replay or a clean merge carried past this one.
 #
 # $2 DEFAULTS TO main, not to a `rev-parse` of the working tree, and that is
 # measured rather than stylistic. Before the branch was passed down this

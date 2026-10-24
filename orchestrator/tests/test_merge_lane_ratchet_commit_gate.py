@@ -1074,7 +1074,9 @@ class TestTheHookActuallyRunsTheGate:
 
     Both real incidents are MERGE commits onto main ("Merge task/5485 into
     main", "Merge task/5675 into main"), and main is advanced by the merge
-    worker with `git update-ref`, which runs no hooks at all. Raises are
+    worker with `git update-ref`, which runs no commit hooks (its move is
+    audited by hooks/reference-transaction, pinned in
+    test_merge_lane_ratchet_advance_gate.py). Raises are
     INTRODUCED by commits on task branches, so that is where a commit-time gate
     has to bite -- and until this task, hooks/pre-commit returned 0 on every
     branch that is not main, before project-checks was ever reached.

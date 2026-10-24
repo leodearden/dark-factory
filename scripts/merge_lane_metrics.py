@@ -112,9 +112,10 @@ class AppendOnlyViolation(RatchetError):
 
     A ``RatchetError`` subclass, so nothing that already catches one changes
     behaviour; a DISTINCT type, because the two are read differently at a
-    boundary. ``scripts/check_staged_ratchet_raise.py`` exits 1 for this (the
-    committer did something the ratchet forbids and can fix) and 2 for its
-    siblings (the gate could not do its job). Collapsing them would leave a
+    boundary. ``scripts/check_staged_ratchet_raise.py`` and
+    ``scripts/check_ratchet_advance.py`` exit 1 for this (the change did
+    something the ratchet forbids and can fix) and 2 for its siblings (the gate
+    could not do its job). Collapsing them would leave a
     caller that reasonably treats 2 as "instrument down, retry or ignore"
     waving a rewritten ledger through.
     """
@@ -623,13 +624,18 @@ RAISE_REMEDY = (
     'honest move the expensive one. Reaching FURTHER back is refused, because '
     'every image in between is a value the ratchet moved through and returning '
     'behind them re-absorbs every measure they lowered.\n'
-    'RESIDUAL, so you do not trust more than is true: `git rebase` and a CLEAN '
-    'merge -- including one the ratchet-baseline merge driver resolved -- do '
-    'not run pre-commit at all, and the merge worker advances main with `git '
-    'update-ref`, which runs no hooks. A raise introduced before this guard '
-    'existed and replayed across its introduction still reaches main '
-    'unexamined. Closing that needs a merge-lane or reference-transaction gate, '
-    'not this one. --authorize-raise is the way past.'
+    'WHERE A RAISE LANDS: `git rebase` and a CLEAN merge -- including one the '
+    'ratchet-baseline merge driver resolved -- skip pre-commit, so a raise they '
+    'carry is caught where it LANDS instead. hooks/reference-transaction runs '
+    f'{ADVANCE_GATE_RELPATH} on every move of main, the merge worker\'s `git '
+    'update-ref` included, and refuses a move whose baseline rises over the '
+    "merge base's beyond what the entry files the move adds cover. The remedy "
+    "is to record the raise on the branch, against main's baseline, with the "
+    'flags above.\n'
+    'RESIDUAL, so you do not trust more than is true: creating main afresh, git '
+    'run with core.hooksPath pointed elsewhere, a git older than 2.28, and a '
+    'move made from a checkout whose hooks/ lacks the file all reach main '
+    'unaudited. --authorize-raise is the way past.'
 )
 
 #: Emitted as the baseline's leading key, so the rule is in the file a reader
@@ -851,16 +857,17 @@ def write_baseline(
     can see it.
 
     THAT HOLE IS NOW CLOSED ELSEWHERE, and deliberately elsewhere. Closing it
-    means comparing against the copy in git HEAD, which is a dependency on git
-    this instrument does not have:
-    ``scripts/check_staged_ratchet_raise.py`` holds every git invocation that
-    reads history or the index, runs in pre-commit on every branch, and calls
-    ``compare_baseline_files`` here for the comparison itself, so there is one
-    definition of "did a measure rise" and only one file that knows what a
-    commit is. The boundary is still drawn rather than overclaimed -- the write
-    gate stops a raise being ABSORBED, the commit gate stops one being STAGED,
-    and neither sees a raise replayed by a rebase or landed by the merge
-    worker's hook-free ``update-ref``.
+    means comparing against the copy git holds, which is a dependency on git
+    this instrument does not have: ``scripts/ratchet_revisions.py`` holds every
+    git invocation that reads history or the index, and the two gates built on
+    it call ``compare_baseline_files`` here for the comparison itself, so there
+    is one definition of "did a measure rise".
+    ``scripts/check_staged_ratchet_raise.py`` runs in pre-commit on every
+    branch; ``scripts/check_ratchet_advance.py`` runs from
+    ``hooks/reference-transaction`` on every move of main, which is where a
+    raise replayed by a rebase or landed by the merge worker's ``update-ref``
+    is seen. The write gate stops a raise being ABSORBED, the commit gate one
+    being STAGED, the advance gate one LANDING.
 
     A MALFORMED destination propagates ``load_baseline``'s ``RatchetError``
     rather than being overwritten: a previous baseline you cannot read is one
@@ -1605,8 +1612,9 @@ def compare_baseline_files(previous: Path, current: Path) -> list[Violation]:
     nothing to compare and resets every frozen measure. This face compares two
     committed IMAGES instead, which is the shape a raise actually arrives in:
     a diff. It is what ``scripts/check_staged_ratchet_raise.py`` audits a staged
-    commit with -- and being two images rather than a measurement, it runs no
-    complexipy, reads no tree, and still consults no git.
+    commit with, and ``scripts/check_ratchet_advance.py`` a move of main -- and
+    being two images rather than a measurement, it runs no complexipy, reads no
+    tree, and still consults no git.
 
     Both images load through ``load_baseline``, so a missing or malformed one is
     that function's named hard failure rather than a silent empty-baseline pass.

@@ -107,8 +107,8 @@ Other top-level dirs:
 - **`dashboard/`** — web UI for task/escalation state.
 - **`scripts/`** — operator and CI helper scripts (systemd unit templates,
   watchdog, host setup).
-- **`hooks/`** — git hooks (`pre-commit`, `pre-merge-commit`, see §4-§5),
-  install via `hooks/setup.sh`.
+- **`hooks/`** — git hooks (`pre-commit`, `pre-merge-commit`,
+  `reference-transaction`, see §4-§5), install via `hooks/setup.sh`.
 
 **Where repo-wide gates live.** There are two homes, chosen by what the gate
 reads. `shared/tests/` hosts the whole-first-party-tree *source* gates: every
@@ -399,7 +399,14 @@ name (`task/<id>`, `carry/<id>`, or a name ending `-<id>`) or one an earlier com
 on the branch cites (`fix(<id>): ...` or `task <id>`) -- and its reason may not
 be blank; the commit being made cannot cite itself. The baseline itself merges through a structured 3-way driver (installed
 by `scripts/setup-host.sh` step 9), so two branches moving different code no
-longer conflict on it.
+longer conflict on it. A rebase or a clean merge skips pre-commit, so
+`hooks/reference-transaction` runs `scripts/check_ratchet_advance.py` on every
+move of `main`, the merge worker's `git update-ref` included: it refuses a move
+whose baseline rises over the merge base's beyond what the entry files the move
+adds cover. The merge lane reports that refusal as "CAS retry limit
+exhausted", with the `ratchet advance gate:` lines in the orchestrator log
+(task 6892 tracks classifying it); the remedy is to record the raise on the
+branch, against main's baseline, with the flags above.
 
 Do this **before** `merge_request`/`/merge-queue`, not after — a red
 post-merge verify blocks or reverts the merge, which is more expensive than

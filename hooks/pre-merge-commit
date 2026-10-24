@@ -2,8 +2,9 @@
 # Pre-merge-commit hook: block direct merges into main.
 #
 # All merges to main should go through the merge queue (MergeWorker in
-# merge_queue.py).  The worker uses update-ref which bypasses all hooks,
-# so this hook does NOT affect the normal orchestrator merge path.
+# merge_queue.py).  The worker uses update-ref, which runs no merge or commit
+# hooks (only hooks/reference-transaction, the ratchet's landing audit), so
+# this hook does NOT affect the normal orchestrator merge path.
 #
 # Allowed:
 #   - Merges on non-main branches (rebasing, etc.)
