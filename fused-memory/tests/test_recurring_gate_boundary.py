@@ -443,7 +443,7 @@ class TestSubmitTaskPreservedSpecimenWiring:
         parsed = _parse_tool_result(result)
         assert parsed.get('error_type') == 'PreservedSpecimenResetViolation', f'got {parsed!r}'
         mock_ti.get_tasks.assert_not_awaited()
-        mock_ti.submit_task.assert_not_called()
+        mock_ti.submit_task.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_degraded_memory_read_fails_open(self):
