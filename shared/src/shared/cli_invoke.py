@@ -2134,11 +2134,14 @@ def _to_token_count(v: int | None) -> int | None:
 
 
 def _backend_window_wait_secs(resets_at: datetime | None, hits: int, now: datetime) -> float:
-    """Seconds to wait out a non-pool backend's cap window: until *resets_at*
-    when the backend named it, else the cooldown doubling per consecutive hit."""
-    if resets_at is not None:
-        return max(0.0, (resets_at - now).total_seconds())
-    return min(_CAP_HIT_COOLDOWN_SECS * 2 ** (hits - 1), _MAX_CAP_COOLDOWN_SECS)
+    """Seconds to wait out a non-pool backend's cap window: the cooldown
+    doubling per consecutive hit, or until *resets_at* when that is later. The
+    floor holds when a named reset has already passed, so a backend that keeps
+    naming it is never redispatched back to back."""
+    backoff = min(_CAP_HIT_COOLDOWN_SECS * 2 ** (hits - 1), _MAX_CAP_COOLDOWN_SECS)
+    if resets_at is None:
+        return backoff
+    return max(backoff, (resets_at - now).total_seconds())
 
 
 def _reset_for_fresh_retry(invoke_kwargs: dict[str, Any], original_prompt: str) -> None:

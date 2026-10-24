@@ -3022,6 +3022,26 @@ class TestNonPoolBackendCapWait:
         assert not cli.calls[1].get('resume_session_id')
         self._assert_pool_untouched(gate)
 
+    async def test_passed_reset_still_backs_off_before_redispatching(self):
+        """codex rounds its reset to the minute, so the minute it names can
+        already have passed and be named again until the window reopens. Each
+        such hit waits the doubling cooldown rather than redispatching at once."""
+        gate = self._gate()
+        passed_minute = datetime.now().astimezone().replace(second=0, microsecond=0)
+        cap = _backend_cap(_codex_usage_window_text(passed_minute))
+        cli = scripted_invoke(cap, cap, make_result(output='complete'))
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep:
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='codex',
+                park_on_frozen_pool=False, prompt='hi',
+            )
+
+        assert got.success is True
+        assert [c.args[0] for c in mock_sleep.await_args_list] == [
+            _CAP_HIT_COOLDOWN_SECS, 2 * _CAP_HIT_COOLDOWN_SECS,
+        ]
+        self._assert_pool_untouched(gate)
+
     @pytest.mark.parametrize(
         ('backend', 'cap_text'),
         [
