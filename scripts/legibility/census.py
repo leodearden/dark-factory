@@ -14,13 +14,14 @@ synthesis into a dated ``plans/confusion-census-<date>.md`` report with
 the origin x manifestation matrix -> curator-path ``submit_task``
 remediation filing -> codebook update (promote/reject candidates, retire
 fixed, never delete) -> advance ``docs/legibility/census-state.json`` ->
-one scoped commit of all of it (a commit that does not land is rolled
-back to HEAD and quarantined; see ``run_census``).
+the project's landing gate over those outputs -> one scoped commit of all
+of it (a gate refusal, or a commit that does not land, is rolled back to
+HEAD and quarantined; see ``run_census``).
 ``--force`` for operator-initiated runs.
 
 Every LLM / MCP / git side effect in this module is an INJECTED seam
 (``invoke``, ``verify_fn``, ``synthesize_fn``, ``submit_fn``,
-``task_store``, ``escalate_fn``, ``status_fetcher``, ``commit``,
+``task_store``, ``escalate_fn``, ``status_fetcher``, ``gate``, ``commit``,
 ``roll_back``, ``batch_source``, ``selection_of``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
 ``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
@@ -121,6 +122,7 @@ from legibility import (  # noqa: E402
     filing_policy,
     finding_area,
     invariants,
+    landing_gate,
     prescreen,
     session_ledger,
     session_runner,
@@ -2565,6 +2567,9 @@ class CensusOutcome:
     """Where the refused outputs were quarantined and whether the checkout
     is back at HEAD. Set iff ``status == "unlanded"``."""
 
+    gate: landing_gate.GateVerdict | None = None
+    """What the landing gate said, on every run that wrote its outputs."""
+
     deferred_stage: str | None = None
     """Which headroom gate deferred this run: ``"preflight"`` (before any
     work) or ``"verify"`` (after mining, before or during verification).
@@ -2743,8 +2748,31 @@ def _defer(
     )
 
 
+@dataclass(frozen=True)
+class _Refusal:
+    """Why a census did not land: the *headline* its escalation summary
+    opens with, and the *cause* its detail opens with."""
+
+    headline: str
+    cause: str
+
+
+def _commit_refusal(landing: unlanded.CommitResult) -> _Refusal:
+    return _Refusal(
+        "legibility census commit did not land",
+        f"git commit did not land after {landing.attempts} attempt(s): {landing.stderr}",
+    )
+
+
+def _gate_refusal(verdict: landing_gate.GateVerdict) -> _Refusal:
+    cause = verdict.describe()
+    if verdict.output_tail:
+        cause += f"; its output ends:\n{verdict.output_tail}"
+    return _Refusal("legibility census refused by its landing gate", cause)
+
+
 def _unlanded(
-    landing: unlanded.CommitResult,
+    refusal: _Refusal,
     landed: CensusOutcome,
     *,
     commit_paths: list[str],
@@ -2752,21 +2780,21 @@ def _unlanded(
     escalate_fn,
     project_id: str,
 ) -> CensusOutcome:
-    """Put back a census whose commit did not land: roll back, log loudly,
-    escalate, return the outcome.
+    """Put back a census that did not land, for *refusal*'s reason: roll
+    back, log loudly, escalate, return the outcome.
 
     ONE owner of the ``"unlanded"`` shape, as ``_defer`` is of the deferral
-    shape. *landed* is the outcome the run would have returned had its
-    commit landed; the unlanded outcome is that one with every output --
-    report and dry-run payloads file alike -- rolled back (see
-    ``CensusOutcome`` for what its fields then name). The escalation is
-    best-effort for the same reason as
-    ``_defer``'s: the ERROR line is the real signal either way.
+    shape: a landing-gate refusal and a commit that did not land differ only
+    in *refusal*. *landed* is the outcome the run would have returned had it
+    landed; the unlanded outcome is that one with every output -- report and
+    dry-run payloads file alike -- rolled back (see ``CensusOutcome`` for
+    what its fields then name). The escalation is best-effort for the same
+    reason as ``_defer``'s: the ERROR line is the real signal either way.
     """
     rollback = roll_back(paths=commit_paths)
     if rollback.restored:
         summary = (
-            f"legibility census commit did not land ({project_id}): outputs "
+            f"{refusal.headline} ({project_id}): outputs "
             "rolled back, census-state NOT advanced"
         )
         state_line = (
@@ -2775,7 +2803,7 @@ def _unlanded(
         )
     else:
         summary = (
-            f"legibility census commit did not land ({project_id}): rollback "
+            f"{refusal.headline} ({project_id}): rollback "
             "INCOMPLETE, outputs still dirty in the checkout"
         )
         state_line = (
@@ -2783,7 +2811,7 @@ def _unlanded(
             "in the working tree."
         )
     detail = (
-        f"git commit did not land after {landing.attempts} attempt(s): {landing.stderr}\n\n"
+        f"{refusal.cause}\n\n"
         f"{rollback.describe()}\n\n"
         "Remediation tickets filed before the commit: "
         f"{', '.join(landed.filed_ticket_ids) or 'none'}.\n"
@@ -2793,7 +2821,7 @@ def _unlanded(
     try:
         escalate_fn(category="infra_issue", severity="info", summary=summary, detail=detail)
     except Exception as exc:  # noqa: BLE001 - best-effort; the error line above is the real signal
-        logger.warning("census: unlanded-commit escalation failed (best-effort): %s", exc)
+        logger.warning("census: unlanded-census escalation failed (best-effort): %s", exc)
     return replace(
         landed, status="unlanded", report_path=None, record_path=None, rollback=rollback,
     )
@@ -2810,6 +2838,7 @@ def run_census(
     task_store: task_store.TaskStore,
     escalate_fn,
     status_fetcher,
+    gate: Callable[[], landing_gate.GateVerdict],
     commit,
     roll_back,
     embedder: embeddings.Embedder,
@@ -2932,7 +2961,10 @@ def run_census(
     (``build_census_record``) and the
     report rendered from it -> ``codebook.dump`` -> ``advance_census_state``
     (done-count from the same *status_fetcher* snapshot, watermark from the
-    mining window) ->
+    mining window) -> *gate*, the project's landing gate
+    (``landing_gate.run_gate``) over the checkout now holding those outputs:
+    a verdict that does not pass is rolled back exactly as a commit that did
+    not land, and *commit* is never called ->
     *commit* of report + record + codebook + state -> ledger every merged
     coding's session (``session_ledger``, only once the commit has landed; a
     failed write is ``CensusOutcome.ledger_write_error``, never a crash). A
@@ -3709,6 +3741,7 @@ def run_census(
         done_count=done_count,
     )
 
+    verdict = gate()
     landed = CensusOutcome(
         status="done",
         report_path=str(report_path),
@@ -3724,21 +3757,22 @@ def run_census(
         released_entry_ids=released_entry_ids,
         skipped_deletions=merge.skipped_deletions,
         filing=filing_report,
+        gate=verdict,
     )
     commit_paths = [
         str(report_path), str(record_path), str(codebook_path), str(census_state_path),
     ]
     if dry_run_filing is not None:
         commit_paths.append(dry_run_filing.path)
+    unlanded_as = functools.partial(
+        _unlanded, landed=landed, commit_paths=commit_paths, roll_back=roll_back,
+        escalate_fn=escalate_fn, project_id=project_id,
+    )
+    if not verdict.passed:
+        return unlanded_as(_gate_refusal(verdict))
     landing = commit(paths=commit_paths, message=f"legibility census {date}")
     if not landing.ok:
-        return _unlanded(
-            landing, landed,
-            commit_paths=commit_paths,
-            roll_back=roll_back,
-            escalate_fn=escalate_fn,
-            project_id=project_id,
-        )
+        return unlanded_as(_commit_refusal(landing))
     if selection is None:
         return landed
     return _ledger_census_codings(
@@ -4717,6 +4751,7 @@ def _run_configured_census(
             task_store=task_store.McpTaskStore(url=_fused_memory_mcp_url(), post=_post_mcp_tool_call),
             escalate_fn=escalate_fn,
             status_fetcher=status_fetcher,
+            gate=functools.partial(landing_gate.run_gate, project_root, cfg.census.landing_gate),
             commit=functools.partial(unlanded.commit_only, project_root),
             roll_back=functools.partial(
                 unlanded.roll_back, project_root,
@@ -4762,6 +4797,12 @@ def _run_configured_census(
             outcome.rollback.describe() if outcome.rollback is not None
             else "no rollback was recorded"
         )
+        if outcome.gate is not None and not outcome.gate.passed:
+            print(
+                f"census: landing gate refused the census -- {outcome.gate.describe()} -- {rollback}",
+                file=sys.stderr,
+            )
+            return 1
         print(
             f"census: commit did not land -- {rollback} "
             f"filed_tickets={len(outcome.filed_ticket_ids)}",
