@@ -28,17 +28,17 @@ from fused_memory.config.schema import (
 )
 from fused_memory.middleware import scope_violation_escalator as sve_mod
 from fused_memory.middleware.curator_escalator import CuratorEscalator
-from fused_memory.middleware.curator_zot_duplicate_sweep import DuplicateFinding
-from fused_memory.middleware.done_provenance_authz import DETERMINISTIC_PROVENANCE_KINDS
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
     CuratorFailureError,
     PreparedCandidate,
     RewrittenTask,
-    TaskCurator,
     is_combine_eligible_status,
 )
+from fused_memory.middleware.curator_zot_duplicate_sweep import DuplicateFinding
+from fused_memory.middleware.done_provenance_authz import DETERMINISTIC_PROVENANCE_KINDS
+from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import (
     TaskInterceptor,
     TicketStoreNotConfiguredError,
@@ -128,7 +128,7 @@ async def test_submit_and_resolve_helper_returns_legacy_shape(
     Verifies that the helper correctly reconstructs result_json into a dict
     with the 'id' and 'title' keys that downstream assertions rely on.
     """
-    from fused_memory.middleware.task_curator import CuratorDecision
+    from fused_memory.middleware.curator_types import CuratorDecision
 
     # _mock_curator is defined later in the module; Python resolves at call-time.
     interceptor_facade._curator = _mock_curator(CuratorDecision(action='create'))
@@ -2162,11 +2162,11 @@ async def test_concurrent_add_task_produces_single_task(
     record_task was fire-and-forget and the second triage's embedding
     lookup missed the first task's vector.
     """
-    from fused_memory.middleware.task_curator import (
+    from fused_memory.middleware.curator_types import (
         CuratorDecision,
         PoolWithheld,
-        TaskCurator,
     )
+    from fused_memory.middleware.task_curator import TaskCurator
 
     # Use a real curator so the exact-match cache is exercised; stub
     # corpus + LLM so we don't spin up Qdrant.
@@ -2258,10 +2258,8 @@ async def test_pre_llm_exact_match_via_note_created(curator_enabled_config, task
     """Directly exercise TaskCurator.note_created + _pre_llm_exact_match
     without going through the interceptor.
     """
-    from fused_memory.middleware.task_curator import (
-        CandidateTask,
-        TaskCurator,
-    )
+    from fused_memory.middleware.curator_types import CandidateTask
+    from fused_memory.middleware.task_curator import TaskCurator
 
     curator = TaskCurator(config=curator_enabled_config, taskmaster=taskmaster)
 
@@ -10507,8 +10505,8 @@ class TestPathGuardOrSkip:
         helper builds a candidate via _build_candidate and passes it to
         _path_guard_check.
         """
+        from fused_memory.middleware.curator_types import CandidateTask
         from fused_memory.middleware.path_scope_guard import PathGuardVerdict
-        from fused_memory.middleware.task_curator import CandidateTask
 
         built = CandidateTask(
             title='Generic refactor',
@@ -10557,8 +10555,8 @@ class TestPathGuardOrSkip:
         """When a pre-built candidate is supplied, _build_candidate is NOT called;
         _path_guard_check is called with the supplied candidate.
         """
+        from fused_memory.middleware.curator_types import CandidateTask
         from fused_memory.middleware.path_scope_guard import PathGuardVerdict
-        from fused_memory.middleware.task_curator import CandidateTask
 
         sentinel = CandidateTask(
             title='Sentinel',
@@ -10801,10 +10799,10 @@ class TestPathGuardCheckProseOnly:
     """
 
     def test_files_to_modify_not_scanned_by_prose_check(self, interceptor, tmp_path):
+        from fused_memory.middleware.curator_types import CandidateTask
         from fused_memory.middleware.project_prefix_registry import (
             ProjectPrefixRegistry,
         )
-        from fused_memory.middleware.task_curator import CandidateTask
 
         (tmp_path / 'reify').mkdir()
         (tmp_path / 'reify' / 'crates').mkdir()
@@ -10826,10 +10824,10 @@ class TestPathGuardCheckProseOnly:
         assert verdict.outcome == 'ok'
 
     def test_title_mention_still_scanned_by_prose_check(self, interceptor, tmp_path):
+        from fused_memory.middleware.curator_types import CandidateTask
         from fused_memory.middleware.project_prefix_registry import (
             ProjectPrefixRegistry,
         )
-        from fused_memory.middleware.task_curator import CandidateTask
 
         (tmp_path / 'reify').mkdir()
         (tmp_path / 'reify' / 'crates').mkdir()
@@ -15386,7 +15384,7 @@ async def test_dispatch_drop_decision_unaffected_by_pure_gate_stamping(
 ):
     """(e) regression: a drop decision is unaffected — it never reaches the
     create block at all, so no add_task call and no metadata stamping."""
-    from fused_memory.middleware.task_curator import CandidateTask
+    from fused_memory.middleware.curator_types import CandidateTask
 
     status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
@@ -15513,7 +15511,7 @@ def _refusal_curator(decision: CuratorDecision) -> MagicMock:
     worker uses (``prepare_candidate`` / ``curate_batch_prepared``), so the same
     refusal can be driven through the single and batch paths alike.
     """
-    from fused_memory.middleware.task_curator import PreparedCandidate
+    from fused_memory.middleware.curator_types import PreparedCandidate
 
     curator = _mock_curator(decision)
 
@@ -15699,7 +15697,8 @@ def _real_blocklist_curator(tmp_path):
     """
     import yaml
 
-    from fused_memory.middleware.task_curator import PreparedCandidate, TaskCurator
+    from fused_memory.middleware.curator_types import PreparedCandidate
+    from fused_memory.middleware.task_curator import TaskCurator
 
     blocklist = tmp_path / 'e2e_blocklist.yaml'
     blocklist.write_text(

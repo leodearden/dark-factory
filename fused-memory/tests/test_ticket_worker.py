@@ -14,7 +14,7 @@ from shared.async_sqlite_base import CheckpointResult
 from test_ticket_janitor import _make_orchestrator_layout, _project_id_for
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curator_types import (
     CuratorDecision,
     PreparedCandidate,
     RewrittenTask,
@@ -568,7 +568,7 @@ async def test_worker_curator_failure_parks_the_ticket(
     - tm.add_task is NOT called
     - the ticket is awaiting_curation with defer_reason 'llm-failed'
     """
-    from fused_memory.middleware.task_curator import CuratorFailureError
+    from fused_memory.middleware.curator_types import CuratorFailureError
 
     mock_curator = MagicMock()
     _curator_exc = CuratorFailureError('boom', timed_out=False, duration_ms=100)
@@ -1490,7 +1490,7 @@ class TestDispatchTicketDecision:
         matched no guarded branch and fell through to tm.add_task — creating the
         very candidate the guard refused.
         """
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         candidate = CandidateTask(title='Refused Task')
         decision = CuratorDecision(
@@ -1534,7 +1534,7 @@ class TestDispatchTicketDecision:
         self, interceptor_with_store, taskmaster,
     ):
         """action='create' → calls tm.add_task, returns (created, '77', 'create: novel', {...})."""
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         candidate = CandidateTask(title='New Feature', description='Details here')
         decision = CuratorDecision(action='create', justification='novel')
@@ -1573,7 +1573,7 @@ class TestDispatchTicketDecision:
     async def test_dispatch_create_with_empty_justification_reason_is_bare_create(
         self, interceptor_with_store, taskmaster,
     ):
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         add_task_result = {'id': '77', 'title': 'New Feature'}
         taskmaster.add_task = AsyncMock(return_value=add_task_result)
@@ -1606,7 +1606,7 @@ class TestDispatchTicketDecision:
         self, interceptor_with_store,
     ):
         """action='drop' with target_id → returns (combined, target_id, ...)."""
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         candidate = CandidateTask(title='Dup Task')
         decision = CuratorDecision(
@@ -1637,7 +1637,7 @@ class TestDispatchTicketDecision:
         self, interceptor_with_store,
     ):
         """action='combine' → calls _execute_combine, returns (combined, target_id, ...)."""
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         candidate = CandidateTask(title='Overlap Task')
         rewritten = RewrittenTask(
@@ -2045,7 +2045,7 @@ class TestProcessAddTicketsBatch:
         and result_json carries curator_degrade_reason (surfaced from the
         fallback's exception).
         """
-        from fused_memory.middleware.task_curator import CuratorFailureError
+        from fused_memory.middleware.curator_types import CuratorFailureError
 
         t1 = await ticket_store.submit('project', self._make_candidate_json('Task Solo'))
 
@@ -2223,7 +2223,7 @@ class TestCreatePathReasonPersisted:
     async def test_zot_curator_failure_records_curator_failed_reason(
         self, interceptor_with_store, ticket_store, taskmaster,
     ):
-        from fused_memory.middleware.task_curator import CuratorFailureError
+        from fused_memory.middleware.curator_types import CuratorFailureError
 
         exc = CuratorFailureError(
             'llm down', timed_out=True, duration_ms=100, zero_output_timeout=True,
@@ -2247,7 +2247,7 @@ class TestCreatePathReasonPersisted:
     async def test_single_ticket_path_zot_curator_failure_records_reason(
         self, interceptor_with_store, ticket_store, taskmaster,
     ):
-        from fused_memory.middleware.task_curator import CuratorFailureError
+        from fused_memory.middleware.curator_types import CuratorFailureError
 
         curator = MagicMock()
         curator.curate = AsyncMock(
@@ -2439,7 +2439,7 @@ class TestCuratorUnavailableReasonPersisted:
 
     @pytest.mark.asyncio
     async def test_closed_interceptor(self, taskmaster, event_buffer):
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         interceptor = TaskInterceptor(
             taskmaster, None, event_buffer, config=_config_without_curator_startup_tasks(),
@@ -2469,7 +2469,7 @@ class TestCuratorUnavailableReasonPersisted:
         self, interceptor_with_store, taskmaster,
     ):
         """The batch path's catch-all arm hands a live curator a None decision."""
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         curator = MagicMock()
         curator.record_task = AsyncMock()

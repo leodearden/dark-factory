@@ -2297,7 +2297,7 @@ class CuratorConfig(BaseModel):
     #
     # These four are deliberately NOT re-tuned by task 5364. Nothing measured
     # how often they bind; the ``pool_truncated`` census that task installs
-    # (``task_curator.py::PoolWithheld``) IS that instrument, and tuning waits
+    # (``curator_types.py::PoolWithheld``) IS that instrument, and tuning waits
     # on what it reports rather than repeating the 2026-04 guess.
     pool_module_cap: int = Field(default=15)
     pool_embedding_cap: int = Field(default=10)
@@ -2328,7 +2328,7 @@ class CuratorConfig(BaseModel):
     idempotency_ttl_seconds: float = Field(default=600.0)
 
     # Entry payload limits, applied per pool entry AND to the candidate block
-    # (both sides route through ``task_curator.py::clip_for_prompt``, which
+    # (both sides route through ``curator_types.py::clip_for_prompt``, which
     # marks what it elided).
     #
     # Derived from the live task corpus, measured 2026-09-18 (n=5574 rows;

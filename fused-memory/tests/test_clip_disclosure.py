@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from fused_memory.middleware.task_curator import clip_for_prompt
+from fused_memory.middleware.curator_types import clip_for_prompt
 from fused_memory.utils.clip_disclosure import (
     TRUNCATION_FACTS_KEY,
     TextClip,

@@ -60,11 +60,11 @@ from typing import TYPE_CHECKING, Any
 
 from shared.project_layout import escalation_queue_dir
 
+from fused_memory.middleware.curator_types import CuratorFailureError
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     DUPLICATE_METADATA_KEY,
     DuplicateFinding,
 )
-from fused_memory.middleware.task_curator import CuratorFailureError
 from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
 
 if TYPE_CHECKING:

@@ -21,16 +21,16 @@ from shared.cli_invoke import AllAccountsCappedException
 from shared.usage_gate import PoolFrozen
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.middleware.candidate_key import normalize_title
 from fused_memory.middleware.curation_deferral import DEDUPE_SKIPPED_KEY, DeferReason
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
     CuratorFailureError,
     PreparedCandidate,
     RewrittenTask,
-    TaskCurator,
-    normalize_title,
 )
+from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
