@@ -1644,7 +1644,8 @@ def _cargo_scope_structured(cmd: VerifyCmd, crates: list[str]) -> VerifyCmd:
 # a silent wrong-tests-run, which is strictly worse. Keep this pattern
 # byte-identical; fix placement in ``_append_to_raw_pytest_invocations``
 # instead, via ``_split_at_unbalanced_close``.
-_PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
+_PYTEST_TOKEN_RE = re.compile(r'\bpytest\b')
+_PYTEST_SPAN_TERMINATORS = frozenset('&|;')
 
 
 def _split_at_unbalanced_close(segment: str) -> tuple[str, str] | None:
@@ -1708,7 +1709,7 @@ def _split_at_unbalanced_close(segment: str) -> tuple[str, str] | None:
     return segment, ''
 
 
-def _pytest_invocation_spans(raw: str) -> list[re.Match[str]]:
+def _pytest_invocation_spans(raw: str) -> list[tuple[int, int]]:
     """The ``_PYTEST_INVOCATION_RE`` matches in *raw* that are real invocations.
 
     ONE definition of "is this span an invocation", shared by the refusal
@@ -1728,8 +1729,17 @@ def _pytest_invocation_spans(raw: str) -> list[re.Match[str]]:
     from being mistaken for an unspliceable INVOCATION and refusing a rewrite
     that the command's real, perfectly clean invocation could have taken.
     """
-    unquoted = {index for index, _char in _unquoted_chars(raw)[0]}
-    return [match for match in _PYTEST_INVOCATION_RE.finditer(raw) if match.start() in unquoted]
+    chars, _unterminated = _unquoted_chars(raw)
+    unquoted = {index for index, _char in chars}
+    terminators = sorted(index for index, char in chars if char in _PYTEST_SPAN_TERMINATORS)
+    spans: list[tuple[int, int]] = []
+    for token in _PYTEST_TOKEN_RE.finditer(raw):
+        start = token.start()
+        if start not in unquoted:
+            continue
+        end = next((index for index in terminators if index > start), len(raw))
+        spans.append((start, end))
+    return spans
 
 
 def _unspliceable_pytest_spans(raw: str) -> list[str]:
@@ -1782,9 +1792,9 @@ def _unspliceable_pytest_spans(raw: str) -> list[str]:
     instead of asserting a cause it has not checked.
     """
     return [
-        match.group(0)
-        for match in _pytest_invocation_spans(raw)
-        if _split_at_unbalanced_close(match.group(0)) is None
+        raw[start:end]
+        for start, end in _pytest_invocation_spans(raw)
+        if _split_at_unbalanced_close(raw[start:end]) is None
     ]
 
 
@@ -1850,8 +1860,8 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
     # substitute the quote-interior false matches this filter drops.
     out: list[str] = []
     cursor = 0
-    for match in _pytest_invocation_spans(raw):
-        segment = match.group(0)
+    for start, end in _pytest_invocation_spans(raw):
+        segment = raw[start:end]
         split = _split_at_unbalanced_close(segment)
         # The pre-screen above already returned early for every *raw*
         # containing a refusing invocation span, so this cannot be None here.
@@ -1863,9 +1873,9 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
         body, closer = split
         stripped = body.rstrip()
         trailing = body[len(stripped) :]
-        out.append(raw[cursor : match.start()])
+        out.append(raw[cursor:start])
         out.append(f'{stripped}{suffix}{trailing}{closer}')
-        cursor = match.end()
+        cursor = end
     out.append(raw[cursor:])
     return ''.join(out)
 
@@ -1936,9 +1946,9 @@ def _raw_pytest_carries_xdist_option(raw: str) -> bool:
     already refuses the whole string for that, so answering True there cannot
     change the outcome.
     """
-    for match in _pytest_invocation_spans(raw):
+    for start, end in _pytest_invocation_spans(raw):
         try:
-            tokens = shlex.split(match.group(0))
+            tokens = shlex.split(raw[start:end])
         except ValueError:
             return True
         if any(_is_xdist_option(token) for token in tokens):
