@@ -829,6 +829,47 @@ class TestTerminateProcessGroup:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
+    @pytest.mark.parametrize(
+        ('states_by_pid_offset', 'expected_signals'),
+        [
+            pytest.param(
+                {1: 'S'},
+                [signal.SIGTERM, signal.SIGKILL],
+                id='a_running_survivor_pins_the_pgid',
+            ),
+            pytest.param({1: 'Z'}, [signal.SIGTERM], id='only_zombies_remain'),
+            pytest.param(
+                {0: 'S', 1: 'S'},
+                [signal.SIGTERM],
+                id='the_pgid_was_recycled_to_a_new_leader',
+            ),
+        ],
+    )
+    async def test_once_the_leader_is_reaped_only_a_running_survivor_that_pins_the_pgid_is_sigkilled(
+        self, tmp_path, monkeypatch, states_by_pid_offset, expected_signals
+    ):
+        """A live pid equal to the reaped leader's proves the number was recycled to a stranger."""
+        pgid = _pgid_no_guard_refuses()
+        proc_root = tmp_path / 'proc'
+        for offset, state in states_by_pid_offset.items():
+            entry = proc_root / str(pgid + offset)
+            entry.mkdir(parents=True)
+            (entry / 'stat').write_text(_synthetic_stat_line(pgid + offset, pgid, state=state))
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            'shared.proc_group.os.killpg', lambda target, sig: calls.append((target, sig))
+        )
+        fake = _ReapedOnWaitProc(pid=pgid)
+
+        await terminate_process_group(
+            cast(asyncio.subprocess.Process, fake), pgid, grace_secs=0.2
+        )
+
+        assert calls == [(pgid, sig) for sig in expected_signals]
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
     async def test_terminate_process_group_idempotent_on_already_dead_proc(self):
         """terminate_process_group is a no-op when the process has already exited.
 
@@ -994,6 +1035,18 @@ class _KillRecordingProc:
 
     def kill(self) -> None:
         self.killed = True
+
+
+class _ReapedOnWaitProc:
+    """A fake leader handle, live until ``wait()`` reaps it as dead of SIGTERM."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+
+    async def wait(self) -> int:
+        self.returncode = -signal.SIGTERM
+        return self.returncode
 
 
 def _pgid_no_guard_refuses() -> int:
