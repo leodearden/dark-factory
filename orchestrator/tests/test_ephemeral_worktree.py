@@ -57,6 +57,7 @@ from orchestrator.git_ops import (
     WorktreeKind,
 )
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_cancel import lane_lock_path
 
 # ---------------------------------------------------------------------------
 # step-1: WorktreeKind enum + E2 registration
@@ -1407,7 +1408,7 @@ def _head_sha(repo: Path) -> str:
 
 
 def _assert_no_residue(repo: Path, path: Path) -> None:
-    lock_path = path.parent / f'{path.name}.lock'
+    lock_path = lane_lock_path(path)
     assert not path.exists(), f'expected the minted tree {path} to be removed'
     assert not lock_path.exists(), f'expected the sibling lock {lock_path} to be unlinked'
     assert str(path) not in registered_worktree_paths(repo), (
@@ -1653,7 +1654,7 @@ class TestEphemeralWorktreeResidueKeepsLock:
                 asyncio.run(_body())  # must not raise
 
             (p,) = minted
-            lock_path = p.parent / f'{p.name}.lock'
+            lock_path = lane_lock_path(p)
             assert p.exists(), 'expected the undeletable tree to survive as residue'
             assert str(p) not in registered_worktree_paths(repo)
             assert lock_path.exists(), f'expected {lock_path} to outlive the residue'
@@ -1696,7 +1697,7 @@ class TestEphemeralWorktreeResidueKeepsLock:
                 asyncio.run(_body())
 
             (target,) = targets
-            lock_path = target.parent / f'{target.name}.lock'
+            lock_path = lane_lock_path(target)
             assert target.exists(), 'expected the undeletable add residue to survive'
             assert lock_path.exists(), f'expected {lock_path} to outlive the residue'
             _assert_lock_unheld(lock_path)
