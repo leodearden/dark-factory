@@ -605,6 +605,8 @@ def string_constants_in_tree(tree: ast.AST) -> dict[str, str]:
     one binding assigns a static string (see ``_static_string``).
 
     Order-independent: a value may name a constant bound later in the file.
+    Scope-blind: the census is file-wide, so a binding it cannot see (a
+    ``from m import *`` or a ``globals()`` write) leaves the name resolved.
     """
     binding_counts: Counter[str] = Counter()
     candidates: dict[str, ast.expr] = {}
