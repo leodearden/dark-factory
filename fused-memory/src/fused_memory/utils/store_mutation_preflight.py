@@ -205,6 +205,12 @@ Two placement rules, which are the non-obvious part:
     on other grounds (an empty scan, a truncated scan, a safety cap). Those are
     handled outcomes an operator can reasonably read past. A half-completed
     store mutation is not, so this refusal must not be mistakable for one.
+    The guard also emits the refusal's operator-facing record itself: a call
+    site passes its own ``logger=`` and an ``extra_detail=`` naming its
+    mechanism (see :func:`assert_store_mutation_allowed`), and must not wrap
+    the guard in an ``except StoreMutationUnavailable`` arm that logs --
+    ``tests/test_store_mutation_conformance.py`` fails any guarded script
+    that does.
 
 On this section's own history, which is why it is shaped this way: an earlier
 draft stated the rule as a universal, and a one-line grep disproved it -- the

@@ -56,6 +56,7 @@ from _store_mutation_preflight_contract import (
 )
 
 from fused_memory.models import SourceStore
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_toolcall_xml_leak.py'
 
@@ -1674,7 +1675,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
-        with pytest.raises(_mod.StoreMutationUnavailable, match=SENTINEL):
+        with pytest.raises(StoreMutationUnavailable, match=SENTINEL):
             await _mod.run(_args(apply=True), service)
 
         service.delete_memory.assert_not_awaited()
@@ -1689,7 +1690,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(_args(apply=True), service)
 
         service.scan_memory_content.assert_not_awaited()
@@ -1701,7 +1702,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
-        with caplog.at_level(logging.ERROR), pytest.raises(_mod.StoreMutationUnavailable):
+        with caplog.at_level(logging.ERROR), pytest.raises(StoreMutationUnavailable):
             await _mod.run(_args(apply=True), service)
 
         (record,) = fail_closed_records(caplog, 'sweep_toolcall_xml_leak')

@@ -143,10 +143,7 @@ from fused_memory.backends.mem0_client import (
 )
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.topic_slug import derive_topic_slug, is_valid_topic_slug
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 # This script reports through ``print``; stdout carries its machine-read
 # markdown/JSON artifact, so the diagnoses that must not land there -- the
@@ -194,7 +191,6 @@ __all__ = [
     'Rename',
     'SKIP_BUCKETS',
     'ScrollPageBudgetExhausted',
-    'StoreMutationUnavailable',
     'assert_store_mutation_allowed',
     'census_categories',
     'derive_topic_slug',
@@ -1728,25 +1724,19 @@ async def run(
     # Emitted through the logger, never ``print``: stdout is reserved for the
     # machine-read artifact rendered at the end of ``main``.
     if apply:
-        try:
-            assert_store_mutation_allowed(operation='normalize_topic_slugs --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'normalize_topic_slugs: --apply NOT started (fail-closed) -- '
-                "this process cannot write mem0's history directory, so each "
-                'rename would patch a record and then fail to journal the '
-                'change, leaving the corpus HALF-RENAMED: one claim split '
-                'across two topic values, which is strictly worse for an '
-                "exact-match get_memories_by_metadata({'topic': T}) read -- "
-                'the way consolidation clusters and the canonical-uniqueness '
-                'probe address a topic -- than either uniform state. Nothing '
-                'was scrolled and no record was renamed. Route the migration '
-                'through the fused-memory MCP server (the unsandboxed owner '
-                'of the store), or re-run from an unsandboxed operator shell. '
-                'To obtain the sweep report safely from anywhere, re-run '
-                'without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='normalize_topic_slugs --apply',
+            logger=logger,
+            extra_detail=(
+                'each rename would patch a record and then fail to journal the '
+                'change, leaving the corpus HALF-RENAMED: one claim split across '
+                'two topic values, which is strictly worse for an exact-match '
+                "get_memories_by_metadata({'topic': T}) read -- the way "
+                'consolidation clusters and the canonical-uniqueness probe '
+                'address a topic -- than either uniform state. Nothing was '
+                'scrolled and no record was renamed.'
+            ),
+        )
         # The same shape and placement as the preflight: one decision per
         # run, above the scroll, through the logger.
         if gaps:

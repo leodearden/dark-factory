@@ -36,6 +36,8 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'normalize_topic_slugs.py'
 
 
@@ -2345,7 +2347,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         service, corpus = _run_service({'dark_factory': [_crec('m1', 'a_topic')]})
 
-        with pytest.raises(_mod.StoreMutationUnavailable, match=SENTINEL):
+        with pytest.raises(StoreMutationUnavailable, match=SENTINEL):
             await run_sweep(service, projects=('dark_factory',), apply=True)
 
         assert corpus.scrolls == []
@@ -2361,7 +2363,7 @@ class TestRunApplyStoreMutationPreflight:
 
         with (
             caplog.at_level('ERROR', logger='normalize_topic_slugs'),
-            pytest.raises(_mod.StoreMutationUnavailable),
+            pytest.raises(StoreMutationUnavailable),
         ):
             await run_sweep(service, projects=('dark_factory',), apply=True)
 
@@ -2381,7 +2383,7 @@ class TestRunApplyStoreMutationPreflight:
 
         with (
             caplog.at_level('ERROR', logger='normalize_topic_slugs'),
-            pytest.raises(_mod.StoreMutationUnavailable),
+            pytest.raises(StoreMutationUnavailable),
         ):
             await run_sweep(service, projects=('dark_factory',), apply=True)
 
@@ -3120,8 +3122,11 @@ class TestNoLiveCorpusCountIsPinned:
         Checked over the parsed IMPORT statements rather than by substring,
         so the assertion cannot be satisfied — or defeated — by its own text
         appearing in the file.  This suite loads the script by path and
-        injects doubles; it imports nothing from the package, so there is no
-        seam through which a live corpus could reach an assertion.
+        injects doubles; the only thing it imports from the package is the
+        store-mutation guard's own module, for its exception type, and that
+        module reaches no backend (no Qdrant, no network, no MemoryService).
+        So there is no seam through which a live corpus could reach an
+        assertion.
         """
         tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
         imported: set[str] = set()
@@ -3131,7 +3136,12 @@ class TestNoLiveCorpusCountIsPinned:
             elif isinstance(node, ast.ImportFrom):
                 imported.add(node.module or '')
 
-        assert not [m for m in imported if m.startswith('fused_memory')], imported
+        backend_reaching = [
+            m for m in imported
+            if m.startswith('fused_memory')
+            and m != 'fused_memory.utils.store_mutation_preflight'
+        ]
+        assert not backend_reaching, imported
 
 
 # ===========================================================================
