@@ -336,6 +336,46 @@ class TestAdjudication:
         assert adjudication.max_clusters_per_run == 10
 
 
+class TestLandingGate:
+    """``census.landing_gate`` — the command run in the project's checkout
+    before a census output lands (task 7448). Absent means ungated."""
+
+    def test_block_loads_as_a_frozen_landing_gate(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {landing_gate: {argv: [a, b], timeout_secs: 60}}\n'
+        gate = mod.load_config(_write(tmp_path, text)).census.landing_gate
+        assert isinstance(gate, mod.LandingGate)
+        assert gate.argv == ('a', 'b')
+        assert gate.timeout_secs == 60
+        with pytest.raises(ValidationError):
+            gate.timeout_secs = 1
+
+    def test_timeout_defaults_to_nine_hundred_seconds(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {landing_gate: {argv: [a]}}\n'
+        gate = mod.load_config(_write(tmp_path, text)).census.landing_gate
+        assert gate is not None
+        assert gate.timeout_secs == 900
+
+    def test_no_block_is_ungated(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML + 'census: {floor_days: 5}\n'))
+        assert cfg.census.landing_gate is None
+
+    @pytest.mark.parametrize(
+        'block',
+        [
+            '{argv: []}',
+            "{argv: [a, '']}",
+            '{argv: [a], timeout_secs: 0}',
+            '{argv: [a], timeout_secs: true}',
+            "{argv: [a], timeout_secs: '60'}",
+        ],
+        ids=['empty-argv', 'empty-arg', 'zero-timeout', 'bool-timeout', 'str-timeout'],
+    )
+    def test_a_malformed_block_raises(self, tmp_path, block):
+        text = MINIMAL_YAML + f'census: {{landing_gate: {block}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+
 class TestFullConfigOverridesDefaults:
     """A fully-populated §7.4 YAML round-trips every explicit value."""
 
@@ -607,6 +647,12 @@ class TestShippedDarkFactoryConfig:
         assert cfg.census.novelty_spike.window_hours == 72
         assert cfg.census.novelty_spike.multiple == 2
         assert cfg.census.novelty_spike.baseline_days == 30
+
+    def test_shipped_config_gates_landing_on_the_tests_that_read_the_live_codebook(self):
+        gate = mod.load_config(self.SHIPPED_CONFIG_PATH).census.landing_gate
+        assert gate is not None
+        assert 'scripts/tests/test_codebook.py' in gate.argv
+        assert 'scripts/tests/test_legibility_coder.py' in gate.argv
 
     def test_shipped_config_agent_transcript_roots_set_live(self):
         # The CRITICAL Leo ask (plans/agent-transcript-archival-prd.md, task γ):
