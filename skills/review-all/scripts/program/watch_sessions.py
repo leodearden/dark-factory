@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import apply_return
 import sessions
 import state
 from sessions import SpawnedSession, Standing
@@ -40,6 +41,8 @@ from orchestrator.session_registry import (
     record_path_for_slug,
     sessions_dir,
 )
+
+APPLIED_BY = 'watch_sessions.py'
 
 
 class Exit(enum.IntEnum):
@@ -258,25 +261,57 @@ def line(home: state.Home, title: str, seen: Seen) -> str:
     return f'{title}: {_LABELS[seen.standing]}{archived}{seen.detail}'
 
 
+def apply_final(home: state.Home, session: SpawnedSession) -> bool:
+    """Apply a final session's inbox file, unless the lead already did; True when the lead must act."""
+    returns_file = home.returns_file(session.stream, session.pass_, session.item)
+    if returns_file.exists():
+        print(f'{session.title}: already applied: {returns_file.relative_to(home.root)}')
+        return False
+    inbox_file = home.inbox_file(session.stream, session.pass_, session.item)
+    unusable = apply_return.degeneracy(inbox_file)
+    if unusable is not None:
+        print(f'{session.title}: no usable return at {inbox_file}: {unusable}')
+        return True
+    outcome = apply_return.apply(inbox_file, by=APPLIED_BY)
+    apply_return.report(outcome, inbox_file)
+    return isinstance(outcome, apply_return.Refused)
+
+
+def news(home: state.Home, was: SpawnedSession, now: SpawnedSession, seen: Seen) -> list[str]:
+    """What this pass says about a session: its record once resolved, its standing once changed or archived."""
+    said = []
+    if now.record_dir != was.record_dir:
+        said.append(f'{now.title}: record {now.record_dir}')
+    if seen.standing is not was.reported or seen.archived is not None:
+        said.append(line(home, now.title, seen))
+    return said
+
+
 def watch(home: state.Home) -> Exit:
     recorded = sessions.read(home)
     if not recorded:
         print(f'no spawned session is recorded in {home.sessions_json}')
         return Exit.WATCHED
-    unresolved = any(session.record_dir is None for session in recorded.values())
+    watched = [session for session in recorded.values() if session.reported is not Standing.FINAL]
+    unresolved = any(session.record_dir is None for session in watched)
     entries = scan_registry() if unresolved else ()
     changed: list[SpawnedSession] = []
-    for was in recorded.values():
+    said = lead_acts = False
+    for was in watched:
         now, seen = observe(home, was, entries)
-        if now.record_dir != was.record_dir:
-            print(f'{now.title}: record {now.record_dir}')
-        print(line(home, now.title, seen))
+        for text in news(home, was, now, seen):
+            print(text)
+            said = True
+        if seen.standing is Standing.FINAL:
+            lead_acts = apply_final(home, now) or lead_acts
         now = replace(now, reported=seen.standing)
         if now != was:
             changed.append(now)
     if changed:
         sessions.update_watched(home, changed)
-    return Exit.WATCHED
+    if not said:
+        print('nothing new')
+    return Exit.APPLY_REFUSED if lead_acts else Exit.WATCHED
 
 
 def _parser() -> argparse.ArgumentParser:
