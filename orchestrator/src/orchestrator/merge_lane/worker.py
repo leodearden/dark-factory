@@ -2781,9 +2781,12 @@ async def _run_post_merge_verify(
 
     # γ decision 4: additive runner= param selects the verify host.
     # runner=None (default) → LOCAL-ONLY pool, byte-identical to β for every
-    # legacy caller (_do_merge, _reverify_rebased_tree, reverify_member_solo,
-    # _run_cold_shadow_verify — recovery paths stay on the trust anchor and
-    # out of slot accounting).
+    # legacy caller (_do_merge, reverify_member_solo, _run_cold_shadow_verify —
+    # recovery paths stay on the trust anchor and out of slot accounting).
+    # The gate re-verify is not one of them: the single-branch gate runs on
+    # the head's held lease host (SpeculativeMergeWorker.
+    # _gate_reverify_on_head_host), and the train's on its leased host
+    # (_leased_train_verify).
     # runner=<RemoteRunner> → pool=[runner] (no LocalRunner); warm-swap is skipped
     # (per-host persistent worktree — handled by γ's _run_inflight_verify caller).
     # The caller-owned `quarantine` set is the divergence-quarantine sink for
@@ -18874,6 +18877,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             **per_call,
         )
 
+    async def _gate_reverify_on_head_host(
+        self,
+        lease: HostLease | None,
+        git_ops: GitOps,
+        req: MergeRequest,
+        merge_wt: Path,
+        **gate_kwargs: Any,
+    ) -> MergeOutcome | None:
+        """Run a head's gate re-verify on the host the head ALREADY holds.
+
+        A remote *lease* runs it there; a local lease, a chain-adopted head
+        (whose lease adoption already released) and a lease-less passthrough
+        run it locally.  No slot is ever acquired for it: re-acquiring would
+        wait on a slot held by the next in-order entry, which finalizes only
+        after this head.
+        """
+        runner = None if lease is None or lease.is_local else lease.runner
+        return await self._lane_post_merge_verify(
+            git_ops, req, merge_wt, runner=runner, **gate_kwargs,
+        )
+
     async def _run_inflight_verify(
         self,
         item: RealMergeItem,
@@ -21790,7 +21814,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
                         merge_sha=rebased_sha,
                         keep_worktrees=set(self._owned_merge_worktrees),
-                        run_post_merge_verify=self._lane_post_merge_verify,
+                        run_post_merge_verify=functools.partial(
+                            self._gate_reverify_on_head_host, entry.lease,
+                        ),
                         event_store=self._event_store,
                     )
                     if isinstance(gate, MergeOutcome):
