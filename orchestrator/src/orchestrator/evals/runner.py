@@ -581,9 +581,9 @@ def _cell_workflow(
         assignment=assignment,
         config=orch_config,
         git_ops=GitOps(orch_config.git, orch_config.project_root),
-        scheduler=scheduler,  # type: ignore[arg-type]
+        scheduler=scheduler,
         briefing=briefing,
-        mcp=_EvalMcpStub(orch_config.fused_memory.url),  # type: ignore[arg-type]
+        mcp=_EvalMcpStub(orch_config.fused_memory.url),
         initial_plan=initial_plan,
         usage_gate=usage_gate,
     )
