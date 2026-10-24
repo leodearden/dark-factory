@@ -714,8 +714,12 @@ class TestTheV2ScriptsImportOnlyDownward:
         ('score_write_triage_reader', {
             'score_write_triage_reader', 'write_triage_reader_rubric', 'write_triage_stats',
         }),
+        ('write_triage_rating_rounds', {
+            'write_triage_rating_rounds', 'write_triage_reader_rubric',
+        }),
         ('build_write_triage_v2_soak_baseline', {
-            'build_write_triage_v2_soak_baseline', 'write_triage_reader_rubric',
+            'build_write_triage_v2_soak_baseline', 'write_triage_rating_rounds',
+            'write_triage_reader_rubric',
         }),
     ])
     def test_a_module_loads_exactly_its_downward_closure(
