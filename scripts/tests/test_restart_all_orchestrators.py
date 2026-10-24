@@ -549,6 +549,47 @@ def test_run_script_timeout_kills_the_whole_process_group(tmp_path, monkeypatch)
                 os.kill(leaked_pid, signal.SIGKILL)
 
 
+def test_run_script_until_stops_the_whole_process_group(tmp_path, monkeypatch):
+    """Mirrors tests/scripts/test_orchestrator_watchdog.py::test_boundary_run_drain_script_until_stops_the_whole_process_group."""
+    pidfile = tmp_path / "leaked.pid"
+    leaker = tmp_path / "leaker.sh"
+    leaker.write_text(PIPE_CLOSING_LEAKER_SRC)
+    monkeypatch.setattr(sys.modules[__name__], "SCRIPT", leaker)
+
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+
+    def leaked_pid_recorded():
+        try:
+            return pidfile.read_text().strip().isdigit()
+        except OSError:
+            return False
+
+    leaked_pid = None
+    try:
+        outcome = _run_script_until(
+            bin_dir, state_path, fleet_dir, "--drain",
+            condition=leaked_pid_recorded,
+            env={"LEAK_PIDFILE": str(pidfile)},
+            timeout=load_scaled_grace(10),
+        )
+
+        leaked_pid = read_leaked_pid(pidfile)
+        assert outcome.stopped_on_condition is True, outcome
+        assert wait_pid_gone(leaked_pid), (
+            f"pid {leaked_pid} -- a grandchild backgrounded by the spawned "
+            "script -- is STILL ALIVE after _run_script_until stopped on its "
+            "condition. The stop reached only the direct child. Fix: spawn via "
+            "df_pytest_isolation.run_in_new_session_until."
+        )
+    finally:
+        if leaked_pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(leaked_pid, signal.SIGKILL)
+
+
 def _decode(maybe_bytes):
     """subprocess.run's TimeoutExpired attaches partial output as bytes
     even when text=True was passed to the original call -- normalize."""
