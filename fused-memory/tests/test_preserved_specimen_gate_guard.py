@@ -1,0 +1,346 @@
+"""Unit tests for fused_memory.middleware.preserved_specimen_gate_guard (task 5456).
+
+The guard refuses, at ``submit_task``, a recon-filed escalating gate that asks
+for a deliberately preserved specimen to be moved out of ``in-progress`` —
+the shape of tasks 5080 and 5104, which asked a human to reset specimen 3105.
+
+The module does not exist until step-2, so every test imports the names it
+needs inside its body (the RED-collection idiom of
+tests/test_recurring_gate_guard.py): the file stays collectable at RED and
+each test fails on its own import.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+
+_PROJECT_ROOT = '/home/leo/src/dark-factory'
+_RECON_AGENT = 'recon-stage-task_knowledge_sync'
+_GUARD_LOGGER = 'fused_memory.middleware.preserved_specimen_gate_guard'
+
+_SPECIMEN_MEMORY_ID = '0397cf9d-0341-47f8-acdb-b78d945b9c8d'
+_SPECIMEN_EDGE_UUID = 'a8fd36a8-46db-4ca8-a21c-554c38a918ee'
+_SPECIMEN_NODE_UUID = '95719d7c-3778-4687-8b50-10ec5ad46e75'
+
+#: One live ``MemoryService.get_memories_by_metadata`` row for task 3105, in
+#: the ``{'id', 'created_at', 'metadata'}`` shape the scroll returns.
+_SPECIMEN_ROW: dict[str, Any] = {
+    'id': _SPECIMEN_MEMORY_ID,
+    'created_at': '2026-09-13T08:41:07.512331+00:00',
+    'metadata': {
+        'kind': 'investigation_outcome',
+        'task_id': '3105',
+        'actionable': False,
+        'entity_uuid': _SPECIMEN_NODE_UUID,
+        'run_id': '5f2c1e0a-7d44-4b0e-9a51-0c6b8d2e9f13',
+        'data': (
+            "Task 3105's in-progress/null-claimant/null-heartbeat state remains the "
+            'deliberately preserved SOLE live validation specimen for gate task 3546; '
+            'resetting it would destroy the evidence the soak/flip checklist reads.'
+        ),
+    },
+}
+
+#: ``get_entity('Task 3105')`` answered by the exact-name branch: task 3105's
+#: OWN node plus the edge stating its preservation.
+_OWN_NODE_ENTITY: dict[str, Any] = {
+    'nodes': [{'name': 'Task 3105', 'uuid': _SPECIMEN_NODE_UUID, 'summary': ''}],
+    'edges': [
+        {
+            'uuid': _SPECIMEN_EDGE_UUID,
+            'fact': 'Task 3105 is the sole preserved live validation specimen for gate task 3546.',
+        }
+    ],
+}
+
+_DEGRADED_ENTITY: dict[str, Any] = {
+    'nodes': [], 'edges': [], 'degraded': True, 'failed_stores': ['graphiti'],
+}
+
+#: Task 5080's real title.
+_RESET_TITLE = (
+    'Human/orchestrator action needed: reset stranded task 3105 out of in-progress '
+    '(recon Stage 2 is structurally blocked from this write)'
+)
+
+#: A short 5080-style description: it states the status and asks for nothing.
+_RESET_DESCRIPTION = (
+    'Task 3105 has been status=in-progress with claimant_run_id=null and '
+    'heartbeat_at=null since 2026-07-31, over 5 weeks stale, and carries no '
+    'Live-Workflow Signal this cycle.'
+)
+
+_ABSENT = object()
+
+
+def _reset_gate_metadata(**overrides: Any) -> dict[str, Any]:
+    """Task 5080's real routing shape plus a declared subject.
+
+    ``operational_mode`` is ABSENT, as on 5080.  An override of ``_ABSENT``
+    removes that key.
+    """
+    meta: dict[str, Any] = {'execution_class': 'operational', 'gate_subject': '3105'}
+    for key, value in overrides.items():
+        if value is _ABSENT:
+            meta.pop(key, None)
+        else:
+            meta[key] = value
+    return meta
+
+
+def _memory(
+    rows_by_task: dict[str, list[dict[str, Any]]] | None = None,
+    entity: dict[str, Any] | None = None,
+) -> AsyncMock:
+    """A fake memory service whose two corroboration reads are inspectable."""
+    rows = rows_by_task or {}
+    memory = AsyncMock()
+    memory.get_memories_by_metadata.side_effect = (
+        lambda *, project_id, filters, **_: rows.get(filters['task_id'], [])
+    )
+    memory.get_entity.return_value = entity if entity is not None else {'nodes': [], 'edges': []}
+    return memory
+
+
+def _specimen_memory() -> AsyncMock:
+    return _memory(rows_by_task={'3105': [_SPECIMEN_ROW]})
+
+
+async def _guard(
+    metadata: Any,
+    memory: AsyncMock,
+    *,
+    agent_id: str | None = _RECON_AGENT,
+    title: str = _RESET_TITLE,
+    description: str = _RESET_DESCRIPTION,
+    **kwargs: Any,
+) -> dict[str, Any] | None:
+    from fused_memory.middleware.preserved_specimen_gate_guard import (
+        preserved_specimen_gate_error,
+    )
+
+    return await preserved_specimen_gate_error(
+        metadata,
+        agent_id,
+        _PROJECT_ROOT,
+        title=title,
+        description=description,
+        memory_service=memory,
+        **kwargs,
+    )
+
+
+def _no_reads(memory: AsyncMock) -> bool:
+    return (
+        memory.get_memories_by_metadata.await_count == 0
+        and memory.get_entity.await_count == 0
+    )
+
+
+def _warned_proceeding(caplog: pytest.LogCaptureFixture, subject: str) -> bool:
+    return any(
+        record.levelno == logging.WARNING
+        and record.name == _GUARD_LOGGER
+        and subject in record.getMessage()
+        and 'proceeds' in record.getMessage()
+        for record in caplog.records
+    )
+
+
+class TestExemptions:
+    """Every short-circuit ahead of the corroboration read costs zero I/O."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('agent_id', ['claude-interactive', None])
+    async def test_non_recon_caller_is_exempt(self, agent_id):
+        memory = _specimen_memory()
+
+        assert await _guard(_reset_gate_metadata(), memory, agent_id=agent_id) is None
+        assert _no_reads(memory)
+
+    @pytest.mark.asyncio
+    async def test_code_tdd_filing_is_not_a_gate(self):
+        memory = _specimen_memory()
+
+        meta = _reset_gate_metadata(execution_class='code_tdd')
+        assert await _guard(meta, memory) is None
+        assert _no_reads(memory)
+
+    @pytest.mark.asyncio
+    async def test_gate_that_does_not_request_a_reset_is_not_enforced(self):
+        memory = _specimen_memory()
+
+        result = await _guard(
+            _reset_gate_metadata(),
+            memory,
+            title='GATE: stranded task 3105 needs a human ruling',
+        )
+        assert result is None
+        assert _no_reads(memory)
+
+
+class TestSubjectRequired:
+    """A recon reset gate must name the task it asks to move."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            pytest.param(_reset_gate_metadata(gate_subject=_ABSENT), id='no-subject'),
+            pytest.param(
+                _reset_gate_metadata(gate_subject=_ABSENT, related_task_id='3105'),
+                id='related-task-id-is-not-a-subject',
+            ),
+        ],
+    )
+    async def test_reset_gate_without_a_subject_is_refused_without_io(self, metadata):
+        memory = _specimen_memory()
+
+        err = await _guard(metadata, memory)
+
+        assert err is not None
+        assert err['error_type'] == 'ResetGateSubjectRequired'
+        assert 'gate_subject' in err['error'] + err['hint']
+        assert _no_reads(memory)
+
+
+class TestPreservedSpecimenRefused:
+    """A reset gate whose subject corroborates as a preserved specimen is refused."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'routing',
+        [
+            pytest.param({'operational_mode': _ABSENT}, id='operational-mode-absent-5080'),
+            pytest.param({'operational_mode': 'gate'}, id='operational-gate-5104'),
+            pytest.param({'operational_mode': 'llm'}, id='operational-llm'),
+            pytest.param({'execution_class': 'decision'}, id='decision'),
+        ],
+    )
+    async def test_every_escalating_gate_shape_is_enforced(self, routing):
+        memory = _specimen_memory()
+
+        err = await _guard(_reset_gate_metadata(**routing), memory)
+
+        assert err is not None
+        assert err['error_type'] == 'PreservedSpecimenResetViolation'
+        assert memory.get_memories_by_metadata.await_count == 1
+        assert memory.get_entity.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_mem0_citation_is_named_and_read_is_scoped(self):
+        from fused_memory.models.scope import resolve_project_id
+        from fused_memory.reconciliation.preservation_specimen_guard import (
+            preservation_mem0_filters,
+        )
+
+        memory = _specimen_memory()
+
+        err = await _guard(_reset_gate_metadata(), memory)
+
+        assert err is not None
+        assert err['error_type'] == 'PreservedSpecimenResetViolation'
+        assert err['gate_subject'] == '3105'
+        assert err['preservation_citation'] == _SPECIMEN_MEMORY_ID
+        memory.get_memories_by_metadata.assert_awaited_once_with(
+            project_id=resolve_project_id(_PROJECT_ROOT),
+            filters=preservation_mem0_filters('3105'),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            pytest.param(
+                _reset_gate_metadata(gate_subject=_ABSENT, stranded_task_id='3105'),
+                id='stranded-task-id-alias',
+            ),
+            pytest.param(json.dumps(_reset_gate_metadata()), id='json-string-metadata'),
+        ],
+    )
+    async def test_subject_spellings_are_honoured(self, metadata):
+        memory = _specimen_memory()
+
+        err = await _guard(metadata, memory)
+
+        assert err is not None
+        assert err['error_type'] == 'PreservedSpecimenResetViolation'
+        assert err['gate_subject'] == '3105'
+        assert err['preservation_citation'] == _SPECIMEN_MEMORY_ID
+
+    @pytest.mark.asyncio
+    async def test_graphiti_citation_when_mem0_has_none(self):
+        memory = _memory(entity=_OWN_NODE_ENTITY)
+
+        err = await _guard(_reset_gate_metadata(), memory)
+
+        assert err is not None
+        assert err['error_type'] == 'PreservedSpecimenResetViolation'
+        assert err['preservation_citation'] == _SPECIMEN_EDGE_UUID
+        assert memory.get_memories_by_metadata.await_count == 1
+        assert memory.get_entity.await_count == 1
+
+
+class TestOrdinarySubjectPasses:
+    """A reset gate for a task nobody preserved reaches the interceptor."""
+
+    @pytest.mark.asyncio
+    async def test_another_tasks_node_does_not_lend_its_citation(self):
+        """The esc-4223-1 binding: only 'Task 3105' came back for subject 5231."""
+        memory = _memory(entity=_OWN_NODE_ENTITY)
+
+        result = await _guard(_reset_gate_metadata(gate_subject='5231'), memory)
+
+        assert result is None
+        assert memory.get_entity.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_ordinary_stranded_subject_with_nothing_recorded(self):
+        memory = _specimen_memory()
+
+        result = await _guard(_reset_gate_metadata(gate_subject='3843'), memory)
+
+        assert result is None
+        assert memory.get_memories_by_metadata.await_count == 1
+        assert memory.get_entity.await_count == 1
+
+
+class TestFailsOpen:
+    """An unreadable verdict lets the submission through, and says so."""
+
+    @pytest.mark.asyncio
+    async def test_degraded_reads_fail_open_with_a_warning(self, caplog):
+        memory = _memory(entity=_DEGRADED_ENTITY)
+        memory.get_memories_by_metadata.side_effect = RuntimeError('qdrant down')
+
+        with caplog.at_level(logging.WARNING, logger=_GUARD_LOGGER):
+            result = await _guard(_reset_gate_metadata(), memory)
+
+        assert result is None
+        assert _warned_proceeding(caplog, '3105')
+
+    @pytest.mark.asyncio
+    async def test_timeout_fails_open_with_a_warning(self, caplog):
+        never = asyncio.Event()
+
+        async def _hang(**_: Any) -> list[dict[str, Any]]:
+            await never.wait()
+            return []
+
+        memory = _memory()
+        memory.get_memories_by_metadata.side_effect = _hang
+
+        with caplog.at_level(logging.WARNING, logger=_GUARD_LOGGER):
+            result = await asyncio.wait_for(
+                _guard(_reset_gate_metadata(), memory, timeout_seconds=0.05),
+                5,
+            )
+
+        assert result is None
+        assert _warned_proceeding(caplog, '3105')
