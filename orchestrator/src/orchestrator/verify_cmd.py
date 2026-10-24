@@ -1710,35 +1710,37 @@ def _split_at_unbalanced_close(segment: str) -> tuple[str, str] | None:
 
 
 def _pytest_invocation_spans(raw: str) -> list[tuple[int, int]]:
-    """The ``_PYTEST_INVOCATION_RE`` matches in *raw* that are real invocations.
+    """The ``(start, end)`` index pairs of *raw*'s real pytest invocations.
 
     ONE definition of "is this span an invocation", shared by the refusal
-    screen (``_unspliceable_pytest_spans``) and the rewrite
-    (``_append_to_raw_pytest_invocations``) so the two cannot disagree about
-    what they are looking at.
+    screen (``_unspliceable_pytest_spans``), the xdist screen
+    (``_raw_pytest_carries_xdist_option``) and the rewrite
+    (``_append_to_raw_pytest_invocations``) so they cannot disagree about
+    what they are looking at. The span rule is ``_PYTEST_TOKEN_RE``'s.
 
-    A match counts only when its ``pytest`` token STARTS at an unquoted index
-    of *raw* — ``_unquoted_chars``, the same scanner everything else in this
-    module walks. ``_PYTEST_INVOCATION_RE`` is quote-blind in both
-    directions, so it happily matches the word ``pytest`` sitting inside
-    ANOTHER command's quoted argument: ``pytest tests/ && echo "pytest
-    done"`` yields spans ``['pytest tests/ ', 'pytest done"']`` (measured),
-    where the second is ``echo``'s argument text and appending to it is pure
-    collateral damage. Excluding those keeps a suffix out of unrelated
-    arguments, and — the reason this filter exists at all — stops such a span
-    from being mistaken for an unspliceable INVOCATION and refusing a rewrite
-    that the command's real, perfectly clean invocation could have taken.
+    A ``pytest`` token is skipped for either of two SEPARATE reasons:
+
+    * It starts inside quotes, so it is another command's argument text:
+      ``pytest tests/ && echo "pytest done"`` holds the word inside
+      ``echo``'s argument (measured). Appending there is collateral damage,
+      and taking it for an invocation would refuse a rewrite that the real,
+      perfectly clean invocation could have taken.
+    * It starts before the end of a span this scan already emitted, so it is
+      an argument of THAT invocation (``pytest a pytest b``,
+      ``--rootdir=/x/pytest``). Emitting it again appends the suffix twice.
     """
     chars, _unterminated = _unquoted_chars(raw)
     unquoted = {index for index, _char in chars}
     terminators = sorted(index for index, char in chars if char in _PYTEST_SPAN_TERMINATORS)
     spans: list[tuple[int, int]] = []
+    cursor = 0
     for token in _PYTEST_TOKEN_RE.finditer(raw):
         start = token.start()
-        if start not in unquoted:
+        if start not in unquoted or start < cursor:
             continue
         end = next((index for index in terminators if index > start), len(raw))
         spans.append((start, end))
+        cursor = end
     return spans
 
 
