@@ -330,13 +330,14 @@ def _refusal_record_message(
     Every guarded script used to hand-copy this prose into its own
     ``except StoreMutationUnavailable`` arm, and the copies drifted. Only the
     marker, the diagnosis, the remedy and the ``--apply`` tail are shared; the
-    one script-specific part is *extra_detail*, spliced in after "so".
+    one script-specific part is *extra_detail*, spliced in after "so" and
+    ended here with exactly one full stop, whatever the caller wrote.
     """
+    ending = f', so {extra_detail.rstrip().rstrip(".")}.' if extra_detail else '.'
     diagnosis = (
         f'{operation}: NOT started (fail-closed) -- this process cannot write '
-        f"mem0's history directory {str(history_dir)!r}"
+        f"mem0's history directory {str(history_dir)!r}{ending}"
     )
-    diagnosis += f', so {extra_detail}' if extra_detail else '.'
     return (
         f'{diagnosis} Route this operation through the fused-memory MCP server '
         f'(the unsandboxed owner of the store), or re-run from an unsandboxed '
@@ -373,10 +374,13 @@ def assert_store_mutation_allowed(
             directory and the probe's error -- before raising. It is the
             caller's rather than this module's because, in most guarded
             scripts, that record is the only diagnosis an operator sees.
-            Omitted, nothing is logged.
+            Omitted, nothing is logged. CALLER CONTRACT: the record tells the
+            operator to re-run without ``--apply``, so pass a logger only when
+            *operation* is the ``--apply`` mode of a dry-run-by-default script.
         extra_detail: This script's own part of that record: the mechanism by
             which its mutation would split in half, plus its "nothing was X'd"
-            clause, read as a continuation after "so". CALLER CONTRACT: never
+            clause, read as a continuation after "so". Its final full stop is
+            optional; the record supplies exactly one. CALLER CONTRACT: never
             restate the shared remedy or the ``--apply`` tail, which the
             record already carries. Only the record reads it, so it requires
             *logger*.

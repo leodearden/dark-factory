@@ -238,6 +238,24 @@ class TestRefusalRecord:
         assert detail in record.getMessage()
 
     @pytest.mark.usefixtures('denied')
+    @pytest.mark.parametrize('full_stop', ['', '.', '. '])
+    def test_extra_detail_ends_its_sentence_exactly_once(self, caplog, full_stop):
+        """The caller's own punctuation never decides whether the record reads
+        as a run-on or carries a doubled full stop."""
+        detail = 'the frobnicator would split in half, and nothing was frobbed'
+
+        _refuse(
+            operation='unit-test',
+            logger=_caller_logger(),
+            extra_detail=detail + full_stop,
+        )
+
+        (record,) = fail_closed_records(caplog, _CALLER_LOGGER)
+        message = record.getMessage()
+        assert f'{detail}. ' in message
+        assert f'{detail}..' not in message
+
+    @pytest.mark.usefixtures('denied')
     def test_an_omitted_extra_detail_leaks_no_placeholder(self, caplog):
         _refuse(operation='unit-test', logger=_caller_logger(), extra_detail=None)
 
