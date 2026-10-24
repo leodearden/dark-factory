@@ -266,6 +266,7 @@ __all__ = [
     'file_landing_git_error_storm_escalation',
     'file_unattributed_landing_escalation',
     'format_unattributed_landing_detail',
+    'found_on_main_note',
     'is_valid_sha_40',
     'validate_landing_evidence',
     'validate_reported_landing',
@@ -693,6 +694,19 @@ class LandingVerdict:
     reason: LandingReason | str
     probe: dict[str, Any]
     method: LandingMethod = LandingMethod.unspecified
+
+    @property
+    def rescued_by_delivered_checks(self) -> bool:
+        """Accepted by the delivered-checks differential, NOT by effect survival.
+
+        The ONE statement of the rescue discriminant.  A rescued accept's
+        ``evidence_sha`` IS on main but its effect is ABSENT at main HEAD — the
+        task-1175 shape FIX 1' guards — so ``accepted``/``evidence_sha`` alone
+        cannot tell it from a fully-guarded accept (see
+        :func:`_delivered_checks_differential`).  Equality, not truthiness:
+        ``'no_signal'`` and ``'disabled'`` are truthy yet only reach a reject.
+        """
+        return self.accepted and self.probe.get('delivered_checks_outcome') == 'confirmed'
 
 
 #: Backward-compatible alias for the pre-rename spelling.  ``harness.py`` and
@@ -2286,6 +2300,27 @@ def format_unattributed_landing_detail(
     return summary, detail
 
 
+def found_on_main_note(note: str, verdict: LandingVerdict) -> str:
+    """*note* for a ``found_on_main`` provenance stamp, disclosing a rescue.
+
+    Unchanged unless *verdict* was rescued by the delivered-checks
+    differential; a rescued accept must never reach provenance reading as if
+    its effect were verified at main HEAD (advisory esc-4887-6).
+    """
+    if not verdict.rescued_by_delivered_checks:
+        return note
+    confirmed = ', '.join(
+        str(leg.get('name'))
+        for leg in verdict.probe.get('delivered_checks_legs') or []
+        if leg.get('verdict') == _DIFFERENTIAL_CONFIRMED
+    ) or '<unnamed>'
+    return (
+        f'{note} [accepted by the delivered-checks differential, not by effect '
+        f"survival: the evidence commit's added lines do not survive at main "
+        f'HEAD; confirmed check(s): {confirmed}]'
+    )
+
+
 def _survival_lines(probe: dict[str, Any]) -> list[str]:
     """Render the part-(b) survival MEASUREMENT that decided the verdict.
 
@@ -2529,9 +2564,10 @@ def file_unattributed_landing_escalation(
     silently stamped done (the task-1175 clobber this task closes).
     Escalate-instead-of-stamp is deliberately non-status-blocking: the
     caller leaves the task/member row pending (or flips it to pending) and
-    it is re-evaluated next tick; the caller's own open-L1 veto naturally
-    suppresses reprocessing while this L1 stays open — no separate status
-    transition happens here.  (The workflow's reported-claim caller,
+    it is re-evaluated next tick. The caller's open-L1 veto stops it re-filing,
+    but for a pending task that veto means "dispatch normally", so nothing
+    holds the task back from an agent — no status transition happens here.
+    (The workflow's reported-claim caller,
     ``TaskWorkflow._handle_already_done_report``, is the exception: it holds
     its task blocked itself, after filing.)
 

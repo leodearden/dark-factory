@@ -109,6 +109,7 @@ from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps, classify_worktree_entry
+from orchestrator.landing_reject_emission import LandingRejectRecorder, LandingRejectSite
 from orchestrator.lane_lifecycle import LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
@@ -119,6 +120,7 @@ from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
     branch_is_degenerate,
     file_unattributed_landing_escalation,
+    found_on_main_note,
     is_valid_sha_40,
     validate_landing_evidence,
 )
@@ -1676,6 +1678,17 @@ def _extract_tagger_entries(payload: Any) -> list:
     return payload if isinstance(payload, list) else []
 
 
+def _declared_delivered_checks(metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """The task's declared ``delivered_checks`` for ``validate_landing_evidence``.
+
+    Never None, which that function reads as "call site unwired".  A failed
+    metadata read yields ``[]``: the checks can only upgrade a reject, so that
+    is the fail-safe direction (the same trade as
+    ``escalation/src/escalation/git_authority.py::_evidence_verdict``).
+    """
+    return list((metadata or {}).get('delivered_checks') or [])
+
+
 def _already_landed_gate_shape(*, has_open_escalation: bool | None) -> str:
     """The ``shape`` :meth:`Harness._already_landed_dispatch_gate` emits.
 
@@ -2124,6 +2137,9 @@ class Harness:
         # exact bound each one buys — so this stays proportional to the number
         # of CURRENTLY-held tasks rather than growing over a weeks-long run.
         self._recovery_veto_tracker = RecoveryVetoStreakTracker()
+        # Released at dispatch in run(); bound and counting unit in the
+        # orchestrator/src/orchestrator/landing_reject_emission.py docstring.
+        self._landing_rejects = LandingRejectRecorder()
         # task_id -> streak at the last time we asked the escalation queue
         # whether a veto-streak alarm was already open (same memo contract as
         # _zero_progress_filed_at above: keeps has_open_l1's pending-queue
@@ -6722,23 +6738,32 @@ class Harness:
             # reverted at current main HEAD skipped it entirely and was
             # stamped done unconditionally (the task-1175 clobber,
             # reproduced inside this sweep). No escalation on reject here
-            # (unlike the dispatch-gate marker/content-equivalence paths):
-            # the evidence is already ground-truth-attributed by
-            # recovery_for, and the existing revert-to-pending / leave-
-            # blocked recovery self-heals without a human (design decision,
-            # task 2678).
+            # by design; the reject is recorded as a landing_evidence_rejected
+            # event before any revert (task 4496).
+            #
+            # The live branch tip is diagnostic only — CANDIDATE mode never
+            # reads it for the decision — but it must be captured before a
+            # revert reaps the worktree.
+            branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
             verdict = await validate_landing_evidence(
                 self.git_ops, tid, branch,
-                branch_tip_sha=None,
+                branch_tip_sha=branch_tip_sha,
                 candidate_sha=report.branch_state.sha,
+                delivered_checks=_declared_delivered_checks(metadata),
+            )
+            self._landing_rejects.observe(
+                verdict, event_store=self.event_store,
+                site=LandingRejectSite.reconcile_sweep,
+                task_id=tid, task_status=status,
             )
             if not verdict.accepted:
                 logger.warning(
-                    'Reconcile: task %s %s evidence sha %s is an ancestor '
-                    'of main but its effect is not present at current HEAD '
-                    '(post-hoc revert) — not marking done',
+                    'Reconcile: task %s %s evidence sha %s rejected by '
+                    'landing-evidence validation (reason=%s) — not marking '
+                    'done; a survival reject cannot tell a revert from a heavy '
+                    'later rewrite (see the landing_evidence_rejected event)',
                     tid, 'ON_MAIN' if on_main else 'merge-marker',
-                    report.branch_state.sha,
+                    report.branch_state.sha, verdict.reason,
                 )
                 if status == 'in-progress':
                     return await self._revert_in_progress_if_no_live_claimant(
@@ -6802,6 +6827,7 @@ class Harness:
                     if on_main
                     else 'reconcile: branch deleted but merge marker found on main'
                 )
+            note = found_on_main_note(note, verdict)
             reason = 'branch-already-on-main' if on_main else 'branch-deleted-marker-found'
             # task 2677: a prior sweep may have already had this exact
             # (task_id, reopen_at) rejected as done_evidence_stale — the
@@ -14116,18 +14142,20 @@ class Harness:
                 self.git_ops, task_id, branch,
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
+                delivered_checks=_declared_delivered_checks(metadata),
+            )
+            # 'pending' is the structural status of every gate candidate.
+            self._landing_rejects.observe(
+                verdict, event_store=self.event_store,
+                site=LandingRejectSite.already_landed_gate_ancestry,
+                task_id=task_id, task_status='pending',
             )
             if not verdict.accepted:
-                # No escalation here, deliberately — unlike the marker and
-                # content-equivalence paths below (design decision, task
-                # 2678). This branch is LIVE: a reject (no citation, a
-                # lineage mismatch, or a task-1175-shape effect-absent
-                # revert) self-heals by re-dispatch on the next tick with no
-                # human involved, and this gate is re-run on the order of
-                # every dispatch tick — escalating here would be noise, not
-                # signal. This silent-False shape also predates task 2678
-                # (it returned False here before the helper extraction too),
-                # so this is not a newly-introduced silent failure.
+                # No escalation by design (task 4496), but not silent: the
+                # reject is a transition-gated landing_evidence_rejected event
+                # (orchestrator/src/orchestrator/landing_reject_emission.py).
+                # False DISPATCHES the task, so a false effect_absent here is
+                # an agent redoing landed work — the event makes that countable.
                 return False
             if await self._delivered_checks_block(
                 task_id, metadata, site='dispatch-gate-already-on-main',
@@ -14135,7 +14163,10 @@ class Harness:
                 return False
             await self._mark_in_progress_done(
                 task_id, verdict.evidence_sha,
-                'reconcile: pre-dispatch check found branch already on main',
+                found_on_main_note(
+                    'reconcile: pre-dispatch check found branch already on main',
+                    verdict,
+                ),
                 'dispatch-gate-already-on-main',
             )
             return True
@@ -14158,6 +14189,7 @@ class Harness:
                     self.git_ops, task_id, branch,
                     branch_tip_sha=None,
                     candidate_sha=marker,
+                    delivered_checks=_declared_delivered_checks(metadata),
                 )
                 if not verdict.accepted:
                     self._file_unattributed_landing_escalation(task_id, branch, verdict)
@@ -14168,7 +14200,10 @@ class Harness:
                     return False
                 await self._mark_in_progress_done(
                     task_id, marker,
-                    'reconcile: pre-dispatch check found merge marker on main',
+                    found_on_main_note(
+                        'reconcile: pre-dispatch check found merge marker on main',
+                        verdict,
+                    ),
                     'dispatch-gate-marker-found',
                 )
                 return True
@@ -14186,6 +14221,7 @@ class Harness:
                 self.git_ops, task_id, branch,
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
+                delivered_checks=_declared_delivered_checks(metadata),
             )
             if not verdict.accepted:
                 self._file_unattributed_landing_escalation(task_id, branch, verdict)
@@ -14196,8 +14232,11 @@ class Harness:
                 return False
             await self._mark_in_progress_done(
                 task_id, verdict.evidence_sha,
-                'reconcile: pre-dispatch check found content-equivalent '
-                'landing on main (squash/rebase/manual)',
+                found_on_main_note(
+                    'reconcile: pre-dispatch check found content-equivalent '
+                    'landing on main (squash/rebase/manual)',
+                    verdict,
+                ),
                 'dispatch-gate-content-equivalent',
             )
             return True
@@ -14217,10 +14256,10 @@ class Harness:
         landing that must not be silently stamped done (the task-1175
         clobber this task closes). Escalate-instead-of-stamp is
         deliberately non-status-blocking: the task row is simply left
-        pending and re-evaluated next tick, and the open-L1 veto at the top
-        of :meth:`_already_landed_dispatch_gate` naturally suppresses
-        reprocessing while this L1 stays open — no separate status
-        transition is needed here.
+        pending and re-evaluated next tick. While this L1 is open the gate's
+        any-level veto stops it re-deriving the evidence and re-filing, but
+        that veto returns False, so the task is DISPATCHED normally to an
+        agent — nothing on the pending-dispatch path holds it back.
 
         Best-effort (a no-op when ``_escalation_queue`` is None, e.g.
         bare-Harness unit tests) and deduped via ``has_open_l1`` so repeated
@@ -14633,6 +14672,9 @@ class Harness:
         # where a resolving escalation would mis-classify a just-
         # dispatched task as an orphan and double-flip it.
         dispatched_esc_event = self._register_escalation_event(assignment.task_id)
+        # Dispatch ends the episode a landing reject was memoised
+        # for, so a reject that brings the task back re-announces.
+        self._landing_rejects.release(assignment.task_id)
         task = asyncio.create_task(
             self._run_slot(assignment, sem),
             name=f'workflow-{assignment.task_id}',

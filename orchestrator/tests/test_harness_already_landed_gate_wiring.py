@@ -31,6 +31,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _landing_evidence_helpers import differential_confirms, landing_reject_rows
 from escalation.models import Escalation
 
 from orchestrator.already_landed_tick_view import AlreadyLandedTickView
@@ -41,9 +42,12 @@ from orchestrator.config import (
 )
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import CommitEffectProbe, GitOps
 from orchestrator.harness import Harness
-from orchestrator.merge_lane.landing_evidence import LandingEvidenceVerdict
+from orchestrator.merge_lane.landing_evidence import (
+    LandingEvidenceVerdict,
+    validate_landing_evidence,
+)
 
 _HARNESS_SRC_PATH = Path(__file__).parent.parent / 'src' / 'orchestrator' / 'harness.py'
 
@@ -2658,3 +2662,122 @@ class TestAlreadyLandedGateTickView:
             branch, gate_on_existing_ref=False,
         )
         git_ops_double.resolve_branch_sha.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# task 4496 — the ancestry arm's reject is recorded, not silent.
+#
+# The arm files no escalation by design, and its False means DISPATCH — so a
+# false effect_absent here is an agent redoing landed work.  A transition-gated
+# landing_evidence_rejected row makes that rate countable.  Canonical WHY:
+# orchestrator/src/orchestrator/landing_reject_emission.py.
+# ---------------------------------------------------------------------------
+
+
+def _effect_absent(h: Harness) -> None:
+    h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)
+    h.git_ops.describe_commit_effect_in_main = AsyncMock(return_value=CommitEffectProbe(
+        present=False, diverged_paths=('src/x.py',), anchor_sha='c' * 40,
+        failure='effect_not_survived', aggregate_survival=0.4, added_lines_total=50,
+    ))
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGateAncestryRejectEmission:
+    async def test_effect_absent_reject_is_recorded_and_still_dispatches(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        _effect_absent(h)
+
+        assert await h._already_landed_dispatch_gate('42') is False
+
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        [row] = landing_reject_rows(h.event_store)
+        assert row['task_id'] == '42'
+        data = row['data']
+        assert data['site'] == 'already_landed_gate_ancestry'
+        assert data['task_status'] == 'pending'
+        assert data['reason'] == 'effect_absent'
+        assert data['citation'] == 'a' * 40
+        # is_ancestor True => in-branch citation => the branch tip is the anchor.
+        assert data['effect_check_sha'] == 'f' * 40
+        assert data['branch_tip_sha'] == 'f' * 40
+        assert data['diverged_paths'] == ['src/x.py']
+        assert data['aggregate_survival'] == 0.4
+        assert data['added_lines_total'] == 50
+
+    async def test_no_citation_reject_is_recorded(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h.git_ops.find_task_citation_commit = AsyncMock(return_value=None)
+
+        assert await h._already_landed_dispatch_gate('42') is False
+
+        [row] = landing_reject_rows(h.event_store)
+        assert row['data']['reason'] == 'no_citation'
+        assert row['data']['citation'] is None
+        assert row['data']['branch_tip_sha'] == 'f' * 40
+
+    async def test_a_reject_repeated_every_tick_is_recorded_once(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        _effect_absent(h)
+
+        assert await h._already_landed_dispatch_gate('42') is False
+        assert await h._already_landed_dispatch_gate('42') is False
+
+        assert len(landing_reject_rows(h.event_store)) == 1
+
+    async def test_an_accepted_ancestry_landing_records_nothing(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        h = _emitting_harness(mock_orch_config, tmp_path)
+
+        assert await h._already_landed_dispatch_gate('42') is True
+
+        assert landing_reject_rows(h.event_store) == []
+
+
+# ---------------------------------------------------------------------------
+# task 4496 — every gate arm passes the task's declared delivered_checks to
+# validate_landing_evidence (never None, which means "unwired"), and a stamp
+# written off a delivered-checks RESCUE discloses it in the provenance note.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGateDeliveredChecksWiring:
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_a_task_declaring_no_checks_reaches_the_validator_as_empty(
+        self, mock_orch_config, arm,
+    ) -> None:
+        h, _meta = _arm_harness(mock_orch_config, arm, metadata={})
+        spy = AsyncMock(wraps=validate_landing_evidence)
+
+        with patch('orchestrator.harness.validate_landing_evidence', spy), \
+             patch(_GATE_TARGET, AsyncMock(return_value=None)):
+            await h._already_landed_dispatch_gate('42')
+
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs.get('delivered_checks') == []
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_a_differential_rescue_stamps_and_discloses_it(
+        self, mock_orch_config, arm,
+    ) -> None:
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', differential_confirms), \
+             patch(_GATE_TARGET, AsyncMock(return_value=None)):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        mark = cast(AsyncMock, h._mark_in_progress_done)
+        mark.assert_awaited_once()
+        assert mark.await_args is not None
+        assert mark.await_args.args[1] == _ARM_EVIDENCE_SHA[arm]
+        assert 'cap-x' in mark.await_args.args[2]

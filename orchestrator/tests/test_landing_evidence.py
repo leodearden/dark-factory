@@ -43,6 +43,7 @@ from orchestrator.merge_lane.landing_evidence import (
     LandingVerdict,
     file_unattributed_landing_escalation,
     format_unattributed_landing_detail,
+    found_on_main_note,
     validate_landing_evidence,
     validate_reported_landing,
 )
@@ -1671,6 +1672,112 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         assert calls == [], 'an unwired call site must issue no check subprocesses'
         # The effect_absent diagnostics from Part A are untouched by Part B.
         assert rejected.probe['diverged_paths'] == ['shared/manifest.py']
+
+
+def _accepted(**probe: Any) -> LandingVerdict:
+    return LandingVerdict(
+        accepted=True, evidence_sha='c' * 40, reason=LandingReason.ok, probe=probe,
+    )
+
+
+def _rejected(**probe: Any) -> LandingVerdict:
+    return LandingVerdict(
+        accepted=False, evidence_sha=None, reason=LandingReason.effect_absent,
+        probe=probe,
+    )
+
+
+_RESCUE_LEGS = [
+    {'name': 'cap-x', 'kind': 'grep', 'verdict': 'made_true_by_this_commit'},
+    {'name': 'cap-y', 'kind': 'grep', 'verdict': 'no_signal'},
+]
+
+
+class TestRescuedByDeliveredChecks:
+    """A delivered-checks RESCUE must be distinguishable from a fully-guarded
+    accept (task 4496, advisory esc-4887-6).
+
+    ``accepted`` and ``evidence_sha`` read identically either way, yet a
+    rescued accept's effect is ABSENT at main HEAD — so a stamp site that
+    writes provenance off a rescue must be able to say so.
+    """
+
+    def test_rescue_is_an_accept_with_a_confirmed_differential(self) -> None:
+        verdict = _accepted(delivered_checks_outcome='confirmed')
+        assert verdict.rescued_by_delivered_checks is True
+
+    def test_a_fully_guarded_accept_is_not_a_rescue(self) -> None:
+        assert _accepted().rescued_by_delivered_checks is False
+
+    @pytest.mark.parametrize('outcome', ['no_signal', 'disabled'])
+    def test_a_reject_is_never_a_rescue(self, outcome: str) -> None:
+        verdict = _rejected(delivered_checks_outcome=outcome)
+        assert verdict.rescued_by_delivered_checks is False
+
+    def test_the_outcome_is_compared_by_equality_not_truthiness(self) -> None:
+        verdict = _accepted(delivered_checks_outcome='some_future_outcome')
+        assert verdict.rescued_by_delivered_checks is False
+
+    def test_note_is_unchanged_for_a_fully_guarded_accept(self) -> None:
+        note = 'already-landed gate: citation on main'
+        assert found_on_main_note(note, _accepted()) == note
+
+    def test_note_is_unchanged_for_a_reject(self) -> None:
+        note = 'already-landed gate: citation on main'
+        verdict = _rejected(
+            delivered_checks_outcome='no_signal', delivered_checks_legs=_RESCUE_LEGS,
+        )
+        assert found_on_main_note(note, verdict) == note
+
+    def test_note_discloses_the_confirmed_checks_of_a_rescue(self) -> None:
+        note = 'already-landed gate: citation on main'
+        verdict = _accepted(
+            delivered_checks_outcome='confirmed', delivered_checks_legs=_RESCUE_LEGS,
+        )
+
+        disclosed = found_on_main_note(note, verdict)
+
+        assert disclosed != note
+        assert disclosed.startswith(note)
+        assert 'cap-x' in disclosed
+        assert 'cap-y' not in disclosed
+
+    def test_a_rescue_whose_probe_names_no_confirmed_check_still_reads_complete(
+        self,
+    ) -> None:
+        verdict = _accepted(delivered_checks_outcome='confirmed', delivered_checks_legs=[])
+
+        disclosed = found_on_main_note('note', verdict)
+
+        assert disclosed.endswith('confirmed check(s): <unnamed>]')
+
+    @pytest.mark.asyncio
+    async def test_a_real_candidate_mode_rescue_reads_as_rescued(self) -> None:
+        sha = 'c' * 40
+        git_ops = _git_ops(
+            citation=None, is_ancestor_map={}, effect_present=False,
+            effect_probe=CommitEffectProbe(
+                present=False, diverged_paths=('src/x.py',), anchor_sha=sha,
+                failure='effect_not_survived', aggregate_survival=0.4,
+            ),
+        )
+        stub, _calls = _check_runner(
+            lambda _check, ref: (
+                DeliveredCheckResult.FAILED if ref.endswith('^1')
+                else DeliveredCheckResult.DELIVERED
+            ),
+        )
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[
+                    {'name': 'cap-x', 'kind': 'grep', 'pattern': 'P', 'expect': 'present'},
+                ],
+            )
+
+        assert verdict.accepted is True
+        assert verdict.rescued_by_delivered_checks is True
 
 
 # ---------------------------------------------------------------------------
