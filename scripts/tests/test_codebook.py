@@ -19,7 +19,8 @@ from typing import Any
 
 import pytest
 from legibility import codebook as mod
-from legibility import coder, invariants
+from legibility import coder, disposition, invariants, verdict
+from legibility_task_store_fake import FakeTaskStore
 from shared.finding_key import finding_key
 
 # ---------------------------------------------------------------------------
@@ -2784,6 +2785,91 @@ def test_live_codebook_reroutes_the_misfiled_census_verifier_sighting():
         f"re-applying the route changed something — the committed codebook has "
         f"not fully absorbed it: {merge.summary()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# task 7448 (live-file guard) — task 5687's whole outcome for
+# entry-cand-20260919-2 was its correction, so its done is never read as a fix.
+# The 2026-10-24 census read it as one and set the entry fixed (0f443e6c0e).
+# ---------------------------------------------------------------------------
+
+_T7448_RECORD_PATH = (
+    _REPO_ROOT / "docs" / "legibility" / "coding-records" / "task-7448-corrections.jsonl"
+)
+_T7448_SESSION = "task-7448-5687-outcome-is-a-correction"
+_T7448_CORRECTION_TASK = 5687
+
+
+def _t7448_refuting_verdict(project_root: str) -> verdict.Verdict:
+    return verdict.parse_verdict(
+        {
+            "verified": False,
+            "reason": "re-verified at as_of_sha: the finding is not observed",
+            "anchor": "slug:embedded-triple-quote-in-heredoc",
+            "tags": ["h13", verdict.KIND_TAG],
+            "severity": "medium",
+            "severity_reason": "r",
+            "route": "mechanical",
+        },
+        title="a confusion",
+        project_root=project_root,
+    )
+
+
+def test_live_codebook_records_task_5687_as_a_correction_and_never_projects_it_fixed():
+    """(a) The note-only correction naming task 5687 in `outcome_of_task` is
+    absorbed, and the entry stays open. (b) A done 5687 queues no re-verify.
+    (c) Even a GONE re-verify against 5687 projects no fix: this reproduces the
+    2026-10-24 re-flip over the committed codebook."""
+    # (a)
+    _, correction, entry = _assert_correction_absorbed(
+        _T7448_RECORD_PATH,
+        _T7448_SESSION,
+        _T5687_ENTRY_ID,
+        refuted_tokens=_T5687_REFUTED_TOKENS,
+        expected_status="open",
+        original_sightings=_T5687_ORIGINAL_SIGHTING,
+    )
+    rewritten = {"title", "cause", "status"} & correction.keys()
+    assert rewritten == set(), (
+        f"the {_T7448_SESSION!r} correction writes {sorted(rewritten)}; it only "
+        "records what task 5687's outcome was"
+    )
+    (root,) = {
+        row["project_root"]
+        for row in entry.get("filed_tickets") or []
+        if row.get("task_id") == _T7448_CORRECTION_TASK
+    }
+    assert correction.get("outcome_of_task") == {
+        "project_root": root, "task_id": _T7448_CORRECTION_TASK,
+    }
+
+    # (b)
+    live = mod.load(_LIVE_CODEBOOK_PATH)
+    statuses = {
+        str(row["task_id"]): "done"
+        for listed in live.get("entries") or []
+        for row in listed.get("filed_tickets") or []
+        if row.get("task_id") is not None
+    }
+    outcomes = disposition.read_outcomes(
+        live, statuses=statuses, statuses_error=None, observed_root=root, store=FakeTaskStore(),
+    )
+    assert _T5687_ENTRY_ID not in {due.entry_id for due in outcomes.due}
+
+    # (c)
+    gone = disposition.Reverification(
+        _T5687_ENTRY_ID,
+        disposition.TaskRef(root, _T7448_CORRECTION_TASK),
+        disposition.ReverifyResult.GONE,
+        found=_t7448_refuting_verdict(root),
+    )
+    projected, changes = disposition.project(
+        live, outcomes, {_T5687_ENTRY_ID: gone}, as_of_sha="c" * 40,
+    )
+    after = _live_entry(projected, _T5687_ENTRY_ID)
+    assert (after["status"], after.get("fixed_at_sha")) == ("open", None)
+    assert _T5687_ENTRY_ID not in {change.entry_id for change in changes}
 
 
 # ---------------------------------------------------------------------------
