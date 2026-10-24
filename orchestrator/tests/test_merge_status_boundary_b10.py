@@ -1,22 +1,24 @@
 """B10 of ``plans/merge-status-durable-non-landed-prd.md``'s Boundary-test sketch: cross-run lookup cost.
 
 The sibling of ``escalation/tests/test_merge_status_boundary.py`` (rows B1-B9).
-The bound, p99 < 50 ms on a store of at least 300k events and 2,500
-merge_finalized rows, is kept as written by Leo's ruling on esc-4834-2 and is
-met by task 6927's partial indexes.  It is WALL time because INV-8
-(``docs/legibility/design-invariants.md``) bounds event-loop wall time, and
-merge_status's cross-run reads run synchronously inside its async resolver.
-The timed reads are the ones the real merge_status issues for each poll,
-recorded off the store and replayed.  Git is deliberately not touched: B10 is
-scoped to the cross-run read.
+On a store of at least 300k events and 2,500 merge_finalized rows, B10 replays
+the cross-run reads the real merge_status issues for each poll, recorded off
+the store.  It asserts two bounds.  Each read's query plan SEARCHes one of task
+6927's partial ``idx_mf_*`` indexes.  The median of 200 wall-clock replays is
+under 50 ms: INV-8 (``docs/legibility/design-invariants.md``) bounds event-loop
+wall time, and merge_status's cross-run reads run synchronously inside its
+async resolver.  The PRD's B10 row records why these bounds replaced a p99
+bound.  Git is deliberately not touched: B10 is scoped to the cross-run read.
 """
 from __future__ import annotations
 
 import json
-import math
+import os
 import sqlite3
+import statistics
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -223,20 +225,26 @@ _SHAPES: Mapping[str, _Shape] = MappingProxyType({
 })
 
 
-def _nearest_rank(ordered: list[float], percentile: float) -> float:
-    return ordered[math.ceil(percentile * len(ordered)) - 1]
+def _replay(store: EventStore, reads: tuple[_Read, ...]) -> list[object]:
+    return [read.issue(store) for read in reads]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('shape', sorted(_SHAPES))
-async def test_b10_cross_run_lookup_p99_is_under_50_ms(
-    production_sized_store: _SeededStore, shape: str, tmp_path: Path,
-) -> None:
+def _replay_durations_ms(store: EventStore, reads: tuple[_Read, ...], samples: int) -> list[float]:
+    """Replays *reads* *samples* times back to back, timing each replay on the wall clock."""
+    durations_ms: list[float] = []
+    for _ in range(samples):
+        start = time.perf_counter()
+        _replay(store, reads)
+        durations_ms.append((time.perf_counter() - start) * 1000.0)
+    return durations_ms
+
+
+async def _recorded_reads(store: EventStore, shape: str, escalations: Path) -> tuple[_Read, ...]:
+    """The cross-run reads merge_status issues for *shape*'s poll over *store*, its answer checked."""
     spec = _SHAPES[shape]
-    seeded = production_sized_store
     hit = spec.last_outcome_request_id is not None
     response, reads = await _poll_recording_cross_run_reads(
-        seeded.store, tmp_path / 'escalations', {spec.key: spec.value},
+        store, escalations, {spec.key: spec.value},
     )
     assert reads, f'{shape}: merge_status issued no cross-run read: {response}'
     assert response['state'] == (MergeState.stale_record if hit else MergeState.no_record), (
@@ -246,18 +254,120 @@ async def test_b10_cross_run_lookup_p99_is_under_50_ms(
     assert (None if last is None else last['request_id']) == spec.last_outcome_request_id, (
         shape, response,
     )
+    replayed = _replay(store, reads)
+    assert any(replayed) is hit, (shape, replayed)
+    return reads
 
-    samples: list[float] = []
-    for _ in range(_SAMPLES):
-        start = time.perf_counter()
-        results = [read.issue(seeded.store) for read in reads]
-        samples.append((time.perf_counter() - start) * 1000.0)
-        assert any(results) is hit, (shape, results)
 
-    ordered = sorted(samples)
-    p99 = _nearest_rank(ordered, 0.99)
-    assert p99 < _BOUND_MS, (
-        f'{shape}: p50={_nearest_rank(ordered, 0.50):.2f} ms p99={p99:.2f} ms '
-        f'max={ordered[-1]:.2f} ms over {len(ordered)} replays of {len(reads)} read(s) '
-        f'on a store of {seeded.events} events / {seeded.merge_finalized} merge_finalized rows'
+@dataclass(frozen=True)
+class _IssuedSelect:
+    """The one SELECT a recorded read ran on the store, and the parameters it bound."""
+
+    read: _Read
+    sql: str
+    params: tuple[Any, ...]
+
+    def plan(self, conn: sqlite3.Connection) -> str:
+        return ' | '.join(
+            row[3] for row in conn.execute(f'EXPLAIN QUERY PLAN {self.sql}', self.params)
+        )
+
+
+def _selects_issued(
+    store: EventStore, reads: tuple[_Read, ...], monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_IssuedSelect, ...]:
+    """Replays each of *reads* alone, pairing it with the one SELECT it ran on *store*'s database."""
+    statements: list[tuple[str, tuple[Any, ...]]] = []
+    connect = sqlite3.connect
+
+    class Recording(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+            statements.append((sql, tuple(parameters)))
+            return super().execute(sql, parameters)
+
+    def recording(database: str | os.PathLike[str], *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if Path(database) != store.db_path:
+            return connect(database, *args, **kwargs)
+        return connect(database, *args, factory=Recording, **kwargs)
+
+    issued: list[_IssuedSelect] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, 'connect', recording)
+        for read in reads:
+            statements.clear()
+            read.issue(store)
+            selects = [
+                (sql, params) for sql, params in statements
+                if sql.lstrip().upper().startswith('SELECT')
+            ]
+            assert len(selects) == 1, (read, statements)
+            issued.append(_IssuedSelect(read, *selects[0]))
+    return tuple(issued)
+
+
+def _plans_off_a_partial_index(
+    db_path: Path, selects: Iterable[_IssuedSelect],
+) -> list[tuple[_Read, str]]:
+    """Each read whose SELECT does not SEARCH events through a partial ``idx_mf_*`` index, with its plan."""
+    with closing(sqlite3.connect(db_path)) as conn:
+        partial = {
+            name for (name,) in conn.execute(
+                "SELECT name FROM pragma_index_list('events') WHERE partial AND name GLOB 'idx_mf_*'",
+            )
+        }
+        planned = [(select.read, select.plan(conn)) for select in selects]
+    return [
+        (read, plan) for read, plan in planned
+        if not any(plan.startswith(f'SEARCH events USING INDEX {name} (') for name in partial)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('shape', sorted(_SHAPES))
+async def test_b10_cross_run_lookup_median_is_under_50_ms(
+    production_sized_store: _SeededStore, shape: str, tmp_path: Path,
+) -> None:
+    seeded = production_sized_store
+    reads = await _recorded_reads(seeded.store, shape, tmp_path / 'escalations')
+    durations_ms = _replay_durations_ms(seeded.store, reads, _SAMPLES)
+    median_ms = statistics.median(durations_ms)
+    assert median_ms < _BOUND_MS, (
+        f'{shape}: median {median_ms:.2f} ms (max {max(durations_ms):.2f} ms) of {_SAMPLES} '
+        f'wall-clock replays of {len(reads)} read(s) on a store of {seeded.events} events / '
+        f'{seeded.merge_finalized} merge_finalized rows; load average {os.getloadavg()}'
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('shape', sorted(_SHAPES))
+async def test_b10_every_cross_run_read_searches_a_partial_index(
+    production_sized_store: _SeededStore, shape: str, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeded = production_sized_store
+    reads = await _recorded_reads(seeded.store, shape, tmp_path / 'escalations')
+    selects = _selects_issued(seeded.store, reads, monkeypatch)
+    assert _plans_off_a_partial_index(seeded.store.db_path, selects) == [], shape
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('shape', 'dropped', 'served_read'), [
+    ('request_id_miss', 'idx_mf_request_id', 'latest_merge_finalized'),
+    ('request_id_miss', 'idx_mf_absorbs', 'merge_finalized_absorbing'),
+    ('request_id_miss', 'idx_mf_superseded_by', 'merge_finalized_superseded_by'),
+    ('branch_miss', 'idx_mf_branch', 'latest_merge_finalized'),
+    ('task_id_miss', 'idx_mf_task_id', 'latest_merge_finalized'),
+])
+async def test_b10_index_check_flags_the_read_whose_partial_index_is_dropped(
+    shape: str, dropped: str, served_read: str, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = EventStore(tmp_path / 'runs.db', 'run-current')
+    reads = await _recorded_reads(store, shape, tmp_path / 'escalations')
+    selects = _selects_issued(store, reads, monkeypatch)
+    assert _plans_off_a_partial_index(store.db_path, selects) == []
+    with closing(sqlite3.connect(store.db_path)) as conn:
+        conn.execute(f'DROP INDEX {dropped}')
+        conn.commit()
+    off = _plans_off_a_partial_index(store.db_path, selects)
+    assert [read.method for read, _ in off] == [served_read], off
