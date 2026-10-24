@@ -2378,3 +2378,13 @@ def test_a_correction_task_reports_that_it_corrected_the_record_and_decides_noth
     assert cell["task_status"] == "done"
     assert "corrected" in cell["outcome"]
     assert "decides no status" in cell["outcome"]
+
+
+def test_an_unobserved_correction_task_keeps_why_it_was_unobserved() -> None:
+    cb = _codebook(_corrected(_task_row(_CORRECTION_TASK)))
+
+    record = _outcome_record(cb, {})
+
+    (row,) = record["rows"]
+    assert row["outcome"] == "corrected"
+    assert row["detail"] == f"task {_CORRECTION_TASK} is not in the get_statuses snapshot"

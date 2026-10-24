@@ -1604,7 +1604,7 @@ class OutcomeReport:
         if task.ref is None:
             return RowOutcome.TICKET, task.note
         if task.corrects_record:
-            return RowOutcome.CORRECTED, None
+            return RowOutcome.CORRECTED, task.note
         if task.standing is None:
             return RowOutcome.UNOBSERVED, task.note
         governing = entry.governing
