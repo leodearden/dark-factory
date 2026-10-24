@@ -1852,6 +1852,67 @@ class TestQuotedChainOperatorSpansArePlaced:
         assert render(result) == f'pytest -k "not (slow or integration)" tests/{suffix} && true'
 
 
+class TestOneSpanPerChainSegment:
+    """A second ``pytest`` token inside one chain segment is not a second span.
+
+    The retired ``\\bpytest\\b[^&|;]*`` regex got non-overlap for free:
+    ``re.finditer``'s greedy match swallowed any later ``pytest`` token in
+    the same segment. A hand-rolled scan has to reproduce that explicitly.
+    """
+
+    @pytest.mark.parametrize(
+        ('mutate', 'suffix', 'raw', 'expected'),
+        [
+            pytest.param(mutate, suffix, raw, template.format(suffix=suffix), id=f'{label}-{case}')
+            for label, mutate, suffix in _SUBSHELL_MUTATORS
+            for case, raw, template in [
+                ('repeated-word', 'pytest a pytest b && true', 'pytest a pytest b{suffix} && true'),
+                (
+                    'word-in-a-path',
+                    'pytest tests/ --rootdir=/x/pytest && true',
+                    'pytest tests/ --rootdir=/x/pytest{suffix} && true',
+                ),
+            ]
+        ],
+    )
+    def test_a_second_pytest_token_in_one_segment_is_not_flagged_twice(
+        self, mutate, suffix, raw, expected
+    ):
+        cmd = parse_config_command(raw)
+        assert cmd.raw is not None
+
+        result = render(mutate(cmd))
+        assert result.count(suffix) == 1, f'suffix appended more than once: {result!r}'
+        assert result == expected
+        _assert_bash_parses(result, what=raw)
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            "pytest -k 'a && b tests/",
+            "pytest -k 'a tests/",
+            "pytest tests/ && pytest -k 'a b",
+            "( cd x && pytest -k 'a b )",
+        ],
+    )
+    def test_an_unterminated_command_never_reaches_the_raw_appender(self, raw):
+        """Characterization, green since the quote-aware scan landed.
+
+        Under that scan a span can end inside an open quote only by running
+        to end of string, so *raw* itself ends inside the quote. ``shlex``
+        refuses such a raw, it parses OPAQUE, and both mutators no-op on the
+        tool guard: the appender's own refusal is defence in depth.
+        """
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.OPAQUE
+        for _label, mutate, _suffix in _SUBSHELL_MUTATORS:
+            assert mutate(cmd) is cmd
+
+    def test_the_appender_refusal_contract_survives_for_an_unterminated_raw(self):
+        """The True-side twin of ``test_the_green_corpus_is_not_newly_refused``."""
+        assert _has_unspliceable_pytest_invocation("pytest -k 'a && b tests/") is True
+
+
 class TestSeparateTokenValueFlagBinding:
     """A pytest separate-token value flag (-k/-m/-p/-o/-n/...) must bind to its
 
