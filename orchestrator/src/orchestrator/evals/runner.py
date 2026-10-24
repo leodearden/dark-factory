@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from shared.eval_lane import is_eval_fixture_task_id
+from shared.usage_gate import UsageGate
 
 from orchestrator import verify
 from orchestrator.agents.briefing import BriefingAssembler
@@ -332,163 +333,44 @@ async def run_eval(
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
 ) -> EvalResult:
-    """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW.
+    """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW on its frozen plan.
 
     The cell persists into *store*; ``None`` persists into
-    :meth:`ResultStore.packaged`.
+    :meth:`ResultStore.packaged`. *worktree_path* reuses an existing worktree and
+    resumes its relocated plan, so completed steps are skipped. *memory_endpoint*
+    is threaded to ``build_eval_orch_config``, which states its contract.
 
-    When *worktree_path* is provided, the eval reuses an existing worktree
-    instead of creating a fresh one.  The relocated
-    ``.task-meta/<name>/plan.json`` (with step statuses) is used as the
-    initial plan, so the workflow naturally skips already-completed steps —
-    useful for resuming a blocked eval from the reviewer phase.
-
-    *memory_endpoint* (ε, D8) is threaded straight to
-    ``build_eval_orch_config``: left ``None``, the profile's null-sentinel
-    isolation stands; pass a ``RecordingMemorySink().url`` to capture the
-    intended memory writes instead of dropping them (see
-    ``build_eval_orch_config`` for the full contract).
-
-    *judge_config* (eval-revival ο) is the judge OFAT knob: left ``None`` the
-    result is labeled by ``config`` and is an IMPLEMENTER cell. Supplied
-    (run_ofat_stage's judge branch), it (1) threads into
-    ``build_eval_orch_config`` so ONLY the ζ completion judge's model/effort
-    derive from the candidate (the implementer ``config`` stays pinned), (2)
-    RELABELS the result to ``judge_config.name`` so the persisted JSON is keyed
-    by the judge candidate rather than the pinned implementer (which would
-    collide both judge rows), and (3) makes the cell a JUDGE cell so
-    ``select_survivors`` groups the judge candidates as their own OFAT axis.
+    *judge_config* (eval-revival ο) varies only the ζ completion judge: the
+    implementer stays pinned to *config*, and the cell is a JUDGE cell labelled
+    by the judge candidate, so ``select_survivors`` ranks judges as their own
+    axis. Without it the cell is an IMPLEMENTER cell labelled by *config*.
     """
     task = load_task(task_path)
-    task_id = task['id']
-    project_root = Path(task['project_root'])
-
-    # ο: when a judge candidate is under test, the persisted result must be keyed
-    # by the JUDGE candidate — not the pinned implementer `config`, which would
-    # collide both judge rows into one — so select_survivors ranks them as their
-    # own axis. None (every existing caller) → label is config.name, unchanged.
-    result_label = judge_config.name if judge_config is not None else config.name
-
-    logger.info(f'Starting eval: {task_id} × {config.name} (trial {trial})')
-    start_ms = int(time.monotonic() * 1000)
-
-    # 1. Create or reuse worktree
     if worktree_path is not None:
-        worktree = worktree_path
-        run_id = worktree.name
-        logger.info(f'Reusing existing worktree: {worktree}')
-    else:
-        worktree, run_id = await create_eval_worktree(
-            project_root, task_id, task['pre_task_commit'],
-            setup_commands=task.get('setup_commands'),
-        )
-    address = CellName(task_id, result_label, run_id)
-
-    # 2. Build orchestrator config for this eval
-    orch_config = build_eval_orch_config(
-        config, task, base_config, memory_endpoint=memory_endpoint,
-        judge_config=judge_config,
-    )
-
-    # 3. Build task assignment
-    task_def = task.get('task_definition', {
-        'title': task.get('name', task_id),
-        'description': task.get('name', ''),
-    })
-    modules = task.get('modules', [])
-
-    assignment = TaskAssignment(
-        task_id=task_id,
-        task=task_def,
-        modules=list(modules),
-    )
-
-    # 4. Set up workflow dependencies
-    git_ops = GitOps(orch_config.git, orch_config.project_root)
-    scheduler, _ = _build_eval_scheduler(orch_config, task_id, list(modules))
-    briefing = BriefingAssembler(orch_config)
-    mcp = _EvalMcpStub(orch_config.fused_memory.url)
-
-    # 5. Load plan — from existing worktree state or task JSON
-    if worktree_path is not None:
-        initial_plan = _resume_plan_from_worktree(worktree, task)
+        initial_plan = _resume_plan_from_worktree(worktree_path, task)
     else:
         initial_plan = task.get('plan')
     if not initial_plan:
         raise ValueError(
-            f'Task {task_id} has no embedded plan. '
+            f'Task {task["id"]} has no embedded plan. '
             f'Run --plan-only to generate one first.'
         )
-    if not worktree_path:
-        logger.info(f'Using fixed plan ({len(initial_plan.get("steps", []))} steps)')
-
-    # 5b. Usage gate for account failover (judge hits Claude API, may cap).
-    async with owned_usage_gate(
-        usage_gate, orch_config, label=f'{task_id} × {config.name}',
-    ) as gate:
-        # 6. Run the real workflow
-        workflow = build_workflow(
-            assignment=assignment,
-            config=orch_config,
-            git_ops=git_ops,
-            scheduler=scheduler,  # type: ignore[arg-type]
-            briefing=briefing,
-            mcp=mcp,  # type: ignore[arg-type]
-            initial_plan=initial_plan,
-            usage_gate=gate,
-        )
-
-        # Override worktree since we created it ourselves
-        workflow.worktree = worktree
-
-        timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
-        try:
-            # W9-γ: workflow.run() now returns a TerminalReport (TR-1); unwrap to
-            # the WorkflowOutcome this function has always propagated.
-            terminal_report = await asyncio.wait_for(
-                workflow.run(), timeout=timeout_minutes * 60,
-            )
-            outcome = terminal_report.outcome
-        except TimeoutError:
-            logger.error(
-                f'Eval {task_id} × {config.name} timed out after {timeout_minutes}m'
-            )
-            outcome = 'timeout'
-        except Exception as e:
-            logger.error(f'Eval {task_id} × {config.name} failed: {e}')
-            outcome = WorkflowOutcome.BLOCKED
-
-        wall_clock_ms = int(time.monotonic() * 1000) - start_ms
-
-        # 7. Collect metrics
-        role = RoleUnderTest.JUDGE if judge_config is not None else RoleUnderTest.IMPLEMENTER
-        try:
-            metrics = await collect_metrics(workflow, worktree, task, role=role)
-            metrics_dict = metrics.to_dict()
-        except Exception as e:
-            logger.warning(f'Metric collection failed: {e}')
-            metrics_dict = _uncollected_metrics(role, None)
-
-        result = EvalResult(
-            task_id=address.task_id,
-            config_name=address.config_name,
-            outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
-            metrics=metrics_dict,
-            worktree_path=str(worktree),
-            wall_clock_ms=wall_clock_ms,
-            run_id=address.run_id,
-            trial=trial,
-        )
-
-        # 8. Persist result
-        (store or ResultStore.packaged()).save(result)
-
-        logger.info(
-            f'Eval complete: {task_id} × {config.name} → {result.outcome} '
-            f'(total={wall_clock_ms / 1000:.1f}s, '
-            f'workflow={metrics_dict.get("workflow_duration_ms", 0) / 1000:.1f}s)'
-        )
-        return result
+    return await _run_workflow_cell(
+        task,
+        lambda: build_eval_orch_config(
+            config, task, base_config, memory_endpoint=memory_endpoint,
+            judge_config=judge_config,
+        ),
+        label=judge_config.name if judge_config is not None else config.name,
+        role=RoleUnderTest.JUDGE if judge_config is not None else RoleUnderTest.IMPLEMENTER,
+        initial_plan=initial_plan,
+        replay_framed=False,
+        worktree=worktree_path,
+        trial=trial,
+        timeout_override=timeout_override,
+        usage_gate=usage_gate,
+        store=store or ResultStore.packaged(),
+    )
 
 
 async def run_architect_eval(
@@ -568,132 +450,178 @@ async def run_end_to_end(
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
 ) -> EvalResult:
-    """Run ONE both-live end-to-end eval: architect LIVE feeding implementer LIVE.
+    """Run ONE both-live end-to-end cell: the architect plans live and feeds the live implementer.
 
-    Unlike :func:`run_eval` (frozen plan → implementer varies) and
-    :func:`run_architect_eval` (live architect → downstream frozen), this is the
-    ONLY executor where BOTH the architect and the implementer run live — the
-    matrix/confirm stages (eval-revival μ). It builds the both-live orch config
-    via ``build_eval_orch_config(impl_config, ..., architect_config=arch_config)``
-    and constructs the workflow with ``initial_plan=None`` so the workflow runs
-    its PLAN phase live (the architect plans against the fixture) and feeds that
-    plan to the live implementer — the only place the plan-style/implementer
-    coupling question exists (PRD decision 9).
-
-    The result's ``config_name`` encodes the ``(architect, implementer)`` combo
-    and it is an END_TO_END cell. Mirrors run_eval's
-    timeout / exception handling and persists into *store* (``None`` persists
-    into :meth:`ResultStore.packaged`). Its
-    architect is briefed in the replay frame, and the cell is stamped
-    ``replay_frame`` (docs/eval-replay-frame.md).
+    The matrix/confirm stages' executor (eval-revival μ): the only one where both
+    roles run live, so the only place the plan-style/implementer coupling
+    question exists (PRD decision 9). The cell is labelled
+    ``<architect>+<implementer>``, is an END_TO_END cell, and its architect is
+    briefed in the replay frame. It persists into *store* (``None``:
+    :meth:`ResultStore.packaged`).
     """
     task = load_task(task_path)
-    task_id = task['id']
-    project_root = Path(task['project_root'])
-    config_name = f'{arch_config.name}+{impl_config.name}'
-
-    logger.info(
-        f'Starting end-to-end eval: {task_id} × {config_name} (trial {trial})'
+    return await _run_workflow_cell(
+        task,
+        lambda: build_eval_orch_config(
+            impl_config, task, base_config,
+            memory_endpoint=memory_endpoint, architect_config=arch_config,
+        ),
+        label=f'{arch_config.name}+{impl_config.name}',
+        role=RoleUnderTest.END_TO_END,
+        initial_plan=None,
+        replay_framed=True,
+        worktree=None,
+        trial=trial,
+        timeout_override=timeout_override,
+        usage_gate=usage_gate,
+        store=store or ResultStore.packaged(),
     )
+
+
+async def _run_workflow_cell(
+    task: dict,
+    build_orch_config: Callable[[], OrchestratorConfig],
+    *,
+    label: str,
+    role: RoleUnderTest,
+    initial_plan: dict | None,
+    replay_framed: bool,
+    worktree: Path | None,
+    trial: int,
+    timeout_override: int | None,
+    usage_gate: InjectedGate,
+    store: ResultStore,
+) -> EvalResult:
+    """Run one workflow cell of *task* under *label* and persist it into *store*.
+
+    *worktree* is adopted (its name is the run id); ``None`` creates a fresh one.
+    The cell's address is fixed before *build_orch_config* runs, so an
+    unaddressable label fails before anything is spent. *replay_framed* briefs
+    the workflow's architect in the replay frame and stamps the cell with it
+    (docs/eval-replay-frame.md). The wall clock includes worktree setup.
+    """
+    cell = f'{task["id"]} × {label}'
+    logger.info(f'Starting eval: {cell} (trial {trial})')
     start_ms = int(time.monotonic() * 1000)
-
-    # 1. Fresh worktree at the fixture's pre_task_commit.
-    worktree, run_id = await create_eval_worktree(
-        project_root, task_id, task['pre_task_commit'],
-        setup_commands=task.get('setup_commands'),
-    )
-    address = CellName(task_id, config_name, run_id)
-
-    # 2. Both-live orch config: architect derived from arch_config, implementer
-    #    from impl_config.
-    orch_config = build_eval_orch_config(
-        impl_config, task, base_config,
-        memory_endpoint=memory_endpoint, architect_config=arch_config,
-    )
-
-    # 3. Task assignment.
-    task_def = task.get('task_definition', {
-        'title': task.get('name', task_id),
-        'description': task.get('name', ''),
-    })
-    modules = task.get('modules', [])
-    assignment = TaskAssignment(
-        task_id=task_id, task=task_def, modules=list(modules),
-    )
-
-    # 4. Workflow dependencies (mirrors run_eval).
-    git_ops = GitOps(orch_config.git, orch_config.project_root)
-    scheduler, _ = _build_eval_scheduler(orch_config, task_id, list(modules))
-    # TaskWorkflow's PLAN phase briefs the live architect through this; see
-    # docs/eval-replay-frame.md.
-    briefing = ReplayFramedBriefingAssembler(
-        orch_config, base_commit=task['pre_task_commit'],
-    )
-    mcp = _EvalMcpStub(orch_config.fused_memory.url)
-
-    async with owned_usage_gate(
-        usage_gate, orch_config, label=f'{task_id} × {config_name}',
-    ) as gate:
-        # 5. Build the workflow with initial_plan=None → the architect plans LIVE and
-        #    feeds the live implementer (the both-live path; run_eval hands a frozen
-        #    plan here instead).
-        workflow = build_workflow(
-            assignment=assignment,
-            config=orch_config,
-            git_ops=git_ops,
-            scheduler=scheduler,  # type: ignore[arg-type]
-            briefing=briefing,
-            mcp=mcp,  # type: ignore[arg-type]
-            initial_plan=None,
-            usage_gate=gate,
+    worktree, run_id = await _open_cell_worktree(task, worktree)
+    address = CellName(task['id'], label, run_id)
+    orch_config = build_orch_config()
+    replay_frame = REPLAY_FRAME_ID if replay_framed else None
+    async with owned_usage_gate(usage_gate, orch_config, label=cell) as gate:
+        workflow = _cell_workflow(
+            task, orch_config, worktree, initial_plan,
+            replay_framed=replay_framed, usage_gate=gate,
         )
-        workflow.worktree = worktree
-
-        timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
-        try:
-            terminal_report = await asyncio.wait_for(
-                workflow.run(), timeout=timeout_minutes * 60,
-            )
-            outcome = terminal_report.outcome
-        except TimeoutError:
-            logger.error(
-                f'End-to-end eval {task_id} × {config_name} timed out after '
-                f'{timeout_minutes}m'
-            )
-            outcome = 'timeout'
-        except Exception as e:
-            logger.error(f'End-to-end eval {task_id} × {config_name} failed: {e}')
-            outcome = WorkflowOutcome.BLOCKED
-
+        outcome = await _await_outcome(
+            workflow, timeout_override or task.get('timeout_minutes', 60), cell,
+        )
         wall_clock_ms = int(time.monotonic() * 1000) - start_ms
-
-        # 6. Collect metrics.
-        try:
-            metrics = await collect_metrics(
-                workflow, worktree, task,
-                role=RoleUnderTest.END_TO_END, replay_frame=REPLAY_FRAME_ID,
-            )
-            metrics_dict = metrics.to_dict()
-        except Exception as e:
-            logger.warning(f'Metric collection failed: {e}')
-            metrics_dict = _uncollected_metrics(RoleUnderTest.END_TO_END, REPLAY_FRAME_ID)
-
+        metrics = await _cell_metrics(
+            workflow, worktree, task, role=role, replay_frame=replay_frame,
+        )
         result = EvalResult(
             task_id=address.task_id,
             config_name=address.config_name,
-            outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
-            metrics=metrics_dict,
+            outcome=outcome,
+            metrics=metrics,
             worktree_path=str(worktree),
             wall_clock_ms=wall_clock_ms,
             run_id=address.run_id,
             trial=trial,
         )
-        (store or ResultStore.packaged()).save(result)
-        logger.info(
-            f'End-to-end eval complete: {task_id} × {config_name} → {result.outcome} '
-            f'({wall_clock_ms / 1000:.1f}s)'
+        store.save(result)
+    logger.info(
+        f'Eval complete: {cell} → {result.outcome} '
+        f'(total={wall_clock_ms / 1000:.1f}s, '
+        f'workflow={metrics.get("workflow_duration_ms", 0) / 1000:.1f}s)'
+    )
+    return result
+
+
+async def _open_cell_worktree(task: dict, worktree: Path | None) -> tuple[Path, str]:
+    """Adopt *worktree* (its name is the run id), or create one at the fixture's base."""
+    if worktree is not None:
+        logger.info(f'Reusing existing worktree: {worktree}')
+        return worktree, worktree.name
+    return await create_eval_worktree(
+        task['project_root'], task['id'], task['pre_task_commit'],
+        setup_commands=task.get('setup_commands'),
+    )
+
+
+def _cell_workflow(
+    task: dict,
+    orch_config: OrchestratorConfig,
+    worktree: Path,
+    initial_plan: dict | None,
+    *,
+    replay_framed: bool,
+    usage_gate: UsageGate | None,
+) -> TaskWorkflow:
+    """The real TaskWorkflow for *task*, run in *worktree* against the eval stubs.
+
+    ``initial_plan=None`` makes the workflow's architect plan live.
+    """
+    task_id = task['id']
+    modules = task.get('modules', [])
+    assignment = TaskAssignment(
+        task_id=task_id,
+        task=task.get('task_definition', {
+            'title': task.get('name', task_id),
+            'description': task.get('name', ''),
+        }),
+        modules=list(modules),
+    )
+    scheduler, _ = _build_eval_scheduler(orch_config, task_id, list(modules))
+    briefing = (
+        ReplayFramedBriefingAssembler(orch_config, base_commit=task['pre_task_commit'])
+        if replay_framed else BriefingAssembler(orch_config)
+    )
+    workflow = build_workflow(
+        assignment=assignment,
+        config=orch_config,
+        git_ops=GitOps(orch_config.git, orch_config.project_root),
+        scheduler=scheduler,  # type: ignore[arg-type]
+        briefing=briefing,
+        mcp=_EvalMcpStub(orch_config.fused_memory.url),  # type: ignore[arg-type]
+        initial_plan=initial_plan,
+        usage_gate=usage_gate,
+    )
+    workflow.worktree = worktree
+    return workflow
+
+
+async def _await_outcome(workflow: TaskWorkflow, timeout_minutes: int, cell: str) -> str:
+    """The workflow's terminal outcome; a timeout or a raise becomes the cell's outcome."""
+    try:
+        report = await asyncio.wait_for(workflow.run(), timeout=timeout_minutes * 60)
+    except TimeoutError:
+        logger.error(f'Eval {cell} timed out after {timeout_minutes}m')
+        return 'timeout'
+    except Exception as e:
+        logger.error(f'Eval {cell} failed: {e}')
+        return WorkflowOutcome.BLOCKED.value
+    outcome = report.outcome
+    return outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome)
+
+
+async def _cell_metrics(
+    workflow: TaskWorkflow,
+    worktree: Path,
+    task: dict,
+    *,
+    role: RoleUnderTest,
+    replay_frame: str | None,
+) -> dict[str, Any]:
+    """The cell's metrics; a collection that raised leaves only the stamps the executor knows."""
+    try:
+        metrics = await collect_metrics(
+            workflow, worktree, task, role=role, replay_frame=replay_frame,
         )
-        return result
+    except Exception as e:
+        logger.warning(f'Metric collection failed: {e}')
+        return {'role_under_test': role, 'replay_frame': replay_frame}
+    return metrics.to_dict()
 
 
 async def collect_metrics(
@@ -879,11 +807,6 @@ async def _git_diff_stats(worktree: Path, base_commit: str) -> tuple[int, int]:
             base_commit, exc_info=True,
         )
         return -1, -1
-
-
-def _uncollected_metrics(role: RoleUnderTest, replay_frame: str | None) -> dict[str, Any]:
-    """The metrics of a cell whose collection raised: only the stamps the executor knows."""
-    return {'role_under_test': role, 'replay_frame': replay_frame}
 
 
 def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.CancelledError]:

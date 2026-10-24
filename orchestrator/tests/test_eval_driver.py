@@ -227,9 +227,13 @@ async def test_run_eval_verify_pin_follows_project_root_not_worktree(
         raise _Sentinel
 
     monkeypatch.setattr(runner, 'build_eval_orch_config', _capture_build)
+    # run_eval checks its frozen plan before anything else, so the fixture has one.
     monkeypatch.setattr(
         runner, 'load_task',
-        lambda _p: {'id': 't', 'project_root': str(project_root)},
+        lambda _p: {
+            'id': 't', 'project_root': str(project_root),
+            'plan': {'steps': [{'id': 's1', 'status': 'pending'}]},
+        },
     )
 
     # worktree_path=wt short-circuits create_eval_worktree and binds the eval
