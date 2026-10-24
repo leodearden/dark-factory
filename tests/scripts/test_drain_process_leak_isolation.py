@@ -69,6 +69,7 @@ from df_pytest_isolation import (  # noqa: E402
     read_leaked_pid,
     run_in_new_session,
     run_in_new_session_until,
+    run_in_new_session_while_progressing,
     wait_pid_gone,
     wait_proof_grace_secs,
 )
@@ -495,7 +496,7 @@ class TestRunInNewSessionWhileProgressing:
         env['TICKS'] = str(ticks)
 
         started = time.monotonic()
-        result = df_pytest_isolation.run_in_new_session_while_progressing(
+        result = run_in_new_session_while_progressing(
             ['bash', '-c', 'for i in 1 2 3 4 5 6 7 8; do echo x >> "$TICKS"; sleep 0.5; done; echo DONE'],
             progress=_line_count(ticks), stall_timeout=3, env=env,
         )
@@ -515,7 +516,7 @@ class TestRunInNewSessionWhileProgressing:
         leaked_pid = None
         try:
             with pytest.raises(subprocess.TimeoutExpired) as exc_info:
-                df_pytest_isolation.run_in_new_session_while_progressing(
+                run_in_new_session_while_progressing(
                     ['bash', str(leaker)], progress=_pid_recorded(pidfile),
                     stall_timeout=2, env=_leaker_env(pidfile),
                 )
@@ -547,7 +548,7 @@ class TestRunInNewSessionWhileProgressing:
         leaked_pid = None
         try:
             with pytest.raises(RuntimeError, match='progress blew up'):
-                df_pytest_isolation.run_in_new_session_while_progressing(
+                run_in_new_session_while_progressing(
                     ['bash', str(leaker)], progress=progress,
                     stall_timeout=60, env=_leaker_env(pidfile),
                 )
@@ -561,7 +562,7 @@ class TestRunInNewSessionWhileProgressing:
             _reap(leaked_pid)
 
     def test_a_normal_exit_is_a_completed_process(self) -> None:
-        result = df_pytest_isolation.run_in_new_session_while_progressing(
+        result = run_in_new_session_while_progressing(
             ['bash', '-c', 'echo hi; echo boom >&2; exit 3'],
             progress=lambda: 0, stall_timeout=30,
         )

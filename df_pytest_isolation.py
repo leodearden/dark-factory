@@ -1709,6 +1709,49 @@ def run_in_new_session_until(
     return RunUntilOutcome(completed, stopped_on_condition=True)
 
 
+def run_in_new_session_while_progressing(
+    cmd: list[str],
+    *,
+    progress: Callable[[], object],
+    stall_timeout: float,
+    env: dict[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    text: bool = True,
+) -> subprocess.CompletedProcess:
+    """:func:`run_in_new_session` whose deadline counts only time WITHOUT progress.
+
+    The clock re-arms whenever *progress* returns a value unequal to its
+    previous one, so a slow child that is still advancing is never killed and
+    a stuck one is, *stall_timeout* seconds after its last change. *progress*
+    is called every ``_CONDITION_POLL_SLICE_SECS`` and must be cheap and safe
+    to call while the child runs.
+
+    Raises ``TimeoutExpired`` (``timeout == stall_timeout``, partial output
+    attached) on a stall; an exception from *progress* stops the group and
+    propagates.
+    """
+    last: object = object()
+    last_change = time.monotonic()
+
+    def stalled() -> bool:
+        nonlocal last, last_change
+        current = progress()
+        if current != last:
+            last, last_change = current, time.monotonic()
+            return False
+        return time.monotonic() - last_change >= stall_timeout
+
+    outcome = run_in_new_session_until(
+        cmd, condition=stalled, timeout=math.inf, env=env, cwd=cwd, text=text,
+    )
+    if outcome.stopped_on_condition:
+        raise subprocess.TimeoutExpired(
+            cmd, stall_timeout,
+            output=outcome.completed.stdout, stderr=outcome.completed.stderr,
+        )
+    return outcome.completed
+
+
 def _spawn_in_new_session(
     cmd: list[str],
     *,
