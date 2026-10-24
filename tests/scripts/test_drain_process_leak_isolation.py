@@ -476,6 +476,102 @@ class TestRunInNewSessionUntil:
             _reap(leaked_pid)
 
 
+def _line_count(path: Path) -> Callable[[], int]:
+    """A progress probe: how many lines *path* holds, 0 while it is absent."""
+    def progress() -> int:
+        try:
+            return len(path.read_text().splitlines())
+        except OSError:
+            return 0
+    return progress
+
+
+class TestRunInNewSessionWhileProgressing:
+    """The must-not-hang bound counts only time in which the child made no progress."""
+
+    def test_progress_re_arms_the_stall_bound(self, tmp_path: Path) -> None:
+        ticks = tmp_path / 'ticks'
+        env = dict(os.environ)
+        env['TICKS'] = str(ticks)
+
+        started = time.monotonic()
+        result = df_pytest_isolation.run_in_new_session_while_progressing(
+            ['bash', '-c', 'for i in 1 2 3 4 5 6 7 8; do echo x >> "$TICKS"; sleep 0.5; done; echo DONE'],
+            progress=_line_count(ticks), stall_timeout=3, env=env,
+        )
+        elapsed = time.monotonic() - started
+
+        assert isinstance(result, subprocess.CompletedProcess)
+        assert result.returncode == 0
+        assert result.stdout == 'DONE\n'
+        assert elapsed >= 3, (
+            f'the run took {elapsed:.1f}s, inside its own 3s stall bound, so it '
+            'never needed the bound re-armed and proves nothing about progress.'
+        )
+
+    def test_a_stalled_child_is_stopped_with_its_whole_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+                df_pytest_isolation.run_in_new_session_while_progressing(
+                    ['bash', str(leaker)], progress=_pid_recorded(pidfile),
+                    stall_timeout=2, env=_leaker_env(pidfile),
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert exc_info.value.timeout == 2
+            stdout = exc_info.value.stdout
+            text = stdout.decode(errors='replace') if isinstance(stdout, bytes) else stdout
+            assert 'MAIN_UP' in (text or ''), (
+                f'partial stdout was lost on the stall path; got {text!r}'
+            )
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the stall bound fired: the '
+                'stall path did not stop the whole process group.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_raising_progress_probe_never_leaks_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        pid_recorded = _pid_recorded(pidfile)
+
+        def progress() -> bool:
+            if pid_recorded():
+                raise RuntimeError('progress blew up')
+            return False
+
+        leaked_pid = None
+        try:
+            with pytest.raises(RuntimeError, match='progress blew up'):
+                df_pytest_isolation.run_in_new_session_while_progressing(
+                    ['bash', str(leaker)], progress=progress,
+                    stall_timeout=60, env=_leaker_env(pidfile),
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the progress probe raised: '
+                'an exception escaping the poll loop left the process group running.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_normal_exit_is_a_completed_process(self) -> None:
+        result = df_pytest_isolation.run_in_new_session_while_progressing(
+            ['bash', '-c', 'echo hi; echo boom >&2; exit 3'],
+            progress=lambda: 0, stall_timeout=30,
+        )
+
+        assert isinstance(result, subprocess.CompletedProcess)
+        assert result.returncode == 3
+        assert result.stdout == 'hi\n'
+        assert result.stderr == 'boom\n'
+
+
 class TestWaitProofGraceSecs:
     """The grace a wait-proving test hands its script is DERIVED, not typed.
 
