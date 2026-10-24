@@ -1559,8 +1559,9 @@ supply is dropped, not honoured, and the strip is logged under
 waiting to be dispatched. It is written only by the fused-memory status
 chokepoints (`sqlite_task_backend.py::stamp_pending_since`, reached from
 `add_task`, `set_task_status` and `set_status_and_stamp_audit`) on a
-`* -> pending` landing, and read by the scheduler's age term and the watchdog
-idle clock. `pending_since_backfilled` is written only by the one-shot v4 ->
+`* -> pending` landing, and read by the orchestrator scheduler's age term
+through `orchestrator/src/orchestrator/pending_age.py::read_pending_age`.
+`pending_since_backfilled` is written only by the one-shot v4 ->
 v5 migration, marking the rows it anchored from `updated_at` so that
 population stays countable.
 
@@ -2206,13 +2207,26 @@ were prose.
   the default shallow merge can add and overwrite but never delete. Send
   the complete new blob — a `replace` drops every key you omit, including
   the gate markers (`task_kind`, `operational_mode`, `always_escalates`,
-  `execution_class`).
-- `description` is replace-only and capped at 5,000 characters. Breaching
-  the cap times out and the write does NOT land. Combining `append=True`
-  with `description`/`title`/`priority` is rejected outright.
-- Split `details` (append-capable) and `metadata`/`title` into separate
-  `update_task` calls — `append=True` silently drops `metadata` and
-  `title` passed in the same call.
+  `execution_class`). It also drops the stored `pending_since` anchor, even
+  one you copy into the blob (§8).
+- Four keys are the exception: a `replace` must carry `done_provenance`,
+  `defects` and `defect_test_retirements` (§8) and `deferral` (§9
+  "Deferring a task") exactly as stored, present if stored and absent if
+  not; a stored blob that is corrupt or not a JSON object counts as
+  storing none of them. Otherwise the call is refused and nothing is
+  written. Send those keys back exactly as you read them
+  (`sqlite_task_backend.py::_assert_passthrough_only_keys`,
+  `sqlite_task_backend.py::_assert_deferral_unchanged`).
+- `title`, `description` and `priority` are replace-only. Combining any of
+  them with `append=True` is refused with `AppendUnsupportedFieldError`
+  (task 4039), and nothing is written. `append=True` concatenates onto
+  `details`. With `metadata` and no `metadata_mode` it selects the additive
+  merge, which only grows the blob: it unions lists, keeps the stored value
+  on any scalar collision, and never removes a key. So append to `details`
+  in one call, and rotate `description` and `metadata` in a separate call
+  with `append` omitted and `metadata_mode='replace'`.
+- No column has a length cap of its own. The only size guidance is the
+  whole-task threshold above, and no write is refused for exceeding it.
 - Re-read the task from the store afterwards and confirm the status, the
   gate markers and the untouched columns survived.
 
