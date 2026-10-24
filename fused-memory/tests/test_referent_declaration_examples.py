@@ -2,8 +2,9 @@
 
 Task 3675 (PRD ``plans/memory-referent-fidelity-prd.md`` leaf kappa). Several
 sites teach agents to declare a write's referents: the markdown guides, the
-review-checkpoint reflection guidance and the recon prompt fragment. Each one
-carries a hand-transcribed ``entities=`` example that must agree with the live
+review-checkpoint reflection guidance, the role memory block spliced into every
+dispatched agent and the recon prompt fragment. Each one carries a
+hand-transcribed ``entities=`` example that must agree with the live
 ``add_memory`` signature and gate. That is the INV-5 lockstep shape, and this
 repo has already seen hand-transcribed prompt text drift twice in one file. So
 the agreement is checked by a machine, here, once for every site.
@@ -49,6 +50,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from orchestrator.agents.roles import _MEMORY_INSTRUCTIONS
 from orchestrator.review_checkpoint import render_reflection_instructions
 
 from fused_memory.server.entities_gate import entities_gate
@@ -217,6 +219,7 @@ _GUARDED_SITES = (
         'review-checkpoint-reflection',
         partial(render_reflection_instructions, project_id=_GROUP_ID, review_id='REV-TEST'),
     ),
+    ('roles-memory-instructions', lambda: _MEMORY_INSTRUCTIONS),
 )
 
 
