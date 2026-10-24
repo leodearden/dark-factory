@@ -14,10 +14,17 @@ make is one claim.  Three near-copies of it had already appeared across the
 SPOT smell (`docs/code-quality.md` heuristic 11) and leaves the family free to
 drift apart one file at a time.
 
-Not every lane test is on this module yet: a file that still reads placement
-off ``worker._lane_buffers`` directly is making the same claim a second way,
-and converging it is for whichever group owns that file — this module is the
-destination, not a completed migration.
+This module stays separate from ``_orch_helpers.py`` rather than folding into
+it.  ``_orch_helpers`` is the generic, worker-agnostic helper layer (git spawn
+counting, timeout budgets); the readers here are bound to
+``SpeculativeMergeWorker`` and import ``orchestrator.merge_lane.worker``, which
+the merge-lane ratchet sweep measures per module.  Folding them in would pull
+that import, and the ratchet key that carries it, into a module every test
+family imports.
+
+Lane tests that only STUFF the buffers (``worker._lane_buffers[...].extend``)
+to build a scene still touch the private attribute; the claim this module
+owns is the READING of placement, and those files read it through here.
 """
 from __future__ import annotations
 
@@ -34,17 +41,22 @@ LANES = ('high', 'normal')
 
 
 def queued_entries(
-    worker: SpeculativeMergeWorker, lane: str = 'normal',
+    worker: SpeculativeMergeWorker, lane: str | None = 'normal',
 ) -> list[dict]:
-    """Every ``snapshot()`` entry still queued in *lane*, head-of-line first."""
+    """Every ``snapshot()`` entry still queued in *lane*, head-of-line first.
+
+    ``lane=None`` reads every lane in ``snapshot()``'s pipeline order — the
+    lane buffers in priority order, then undrained outer-queue arrivals — so a
+    requeued head reads as the LAST entry.
+    """
     return [
         entry for entry in worker.snapshot()['entries']
-        if entry['state'] == QUEUED and entry['lane'] == lane
+        if entry['state'] == QUEUED and (lane is None or entry['lane'] == lane)
     ]
 
 
 def queued_in_lane(
-    worker: SpeculativeMergeWorker, lane: str = 'normal',
+    worker: SpeculativeMergeWorker, lane: str | None = 'normal',
 ) -> list[str]:
     """Task ids queued in *lane*, in queue order.
 
@@ -59,7 +71,7 @@ def queued_in_lane(
 
 
 def queued_request_ids(
-    worker: SpeculativeMergeWorker, lane: str = 'normal',
+    worker: SpeculativeMergeWorker, lane: str | None = 'normal',
 ) -> list[str]:
     """Request ids queued in *lane*, in queue order — the IDENTITY reading.
 
