@@ -1,8 +1,10 @@
 """Tests for CLI helpers."""
 
 import asyncio
+import fcntl
 import io
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -1165,6 +1167,23 @@ def _patched_verify_merge(
         ])
 
     return _PatchedVerifyMerge(git_ops=mock_git_ops, invoke=invoke)
+
+
+def _flock_is_held(lock_path: Path) -> bool:
+    """True iff an exclusive non-blocking flock through an independent fd is denied.
+
+    flock(2) locks belong to the open file description, so this probe conflicts
+    with the CLI's own in-process holds.
+    """
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
