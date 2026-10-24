@@ -2901,6 +2901,7 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
             # baseline deleted first" -- which a gate now does see, so the
             # sentence a blocked reader most needs was the one that was false.
             metrics.COMMIT_GATE_RELPATH,
+            metrics.ADVANCE_GATE_RELPATH,
         ):
             assert fragment in metrics.RAISE_REMEDY, fragment
 
@@ -2912,6 +2913,7 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         # notice it going stale. Renaming or moving the auditor would leave a
         # blocked agent grepping for nothing, with the pin still green.
         assert (metrics.repo_root() / metrics.COMMIT_GATE_RELPATH).is_file()
+        assert (metrics.repo_root() / metrics.ADVANCE_GATE_RELPATH).is_file()
 
     def test_the_committed_baseline_bytes_state_the_mechanism(self) -> None:
         # THE SITE THAT MATTERED. Not the docstring, not the CLI -- the file a
