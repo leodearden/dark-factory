@@ -97,6 +97,7 @@ from orchestrator.lane_lifecycle import (
     LaneState,
 )
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
+from orchestrator.teardown import complete_despite_cancellation
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
@@ -3322,8 +3323,6 @@ class GitOps:
         # running probe/sweep (task 2507).
         lock_path = lane_lock_path(tmp_path)
 
-        worktree_added = False
-
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
         acquired = False
         try:
@@ -3350,93 +3349,26 @@ class GitOps:
                     f'consumer holds it (could also be a lock-fault); skipping'
                 ) from e
 
-            try:
-                rc, out, err, attempts = await self._worktree_add_with_retry(
-                    tmp_path, sha, label=f'ephemeral_worktree({kind.name})',
+            rc, out, err, attempts = await self._worktree_add_with_retry(
+                tmp_path, sha, label=f'ephemeral_worktree({kind.name})',
+            )
+            if rc != 0:
+                # A failed add can leave a directory no reaper reclaims (PROTECTED_PREFIXES).
+                await remove_tree(tmp_path, ignore_errors=True)
+                raise EphemeralWorktreeError(
+                    f'ephemeral_worktree({kind.name}): git worktree add failed '
+                    f'after {attempts} attempt(s) (rc={rc}); '
+                    f'stderr={err!r}; stdout={out!r}'
                 )
-                worktree_added = rc == 0
-                if not worktree_added:
-                    raise EphemeralWorktreeError(
-                        f'ephemeral_worktree({kind.name}): git worktree add failed '
-                        f'after {attempts} attempt(s) (rc={rc}); '
-                        f'stderr={err!r}; stdout={out!r}'
-                    )
-            except EphemeralWorktreeError:
-                # Belt-and-suspenders: a failed `git worktree add` may still have
-                # left a partial/empty directory at tmp_path (git creates the
-                # target dir early during add) — and since this prefix is
-                # PROTECTED_PREFIXES-registered, the reaper will NEVER reclaim it.
-                # Clean up here or it leaks under worktree_base permanently.
-                # Restores the pre-extraction probes' unconditional
-                # "rmtree in case ... the worktree add never ran" guarantee.
-                with contextlib.suppress(Exception):
-                    await remove_tree(tmp_path, ignore_errors=True)
-                raise
-
-            # task 2567: optionally CoW-seed the freshly-added worktree's
-            # target/ from the shared warm-lane base before the body runs,
-            # so a probe/sweep opted into warm_seed starts from a pre-built
-            # main instead of a cold from-scratch recompile. Fail-soft: any
-            # non-zero seed rc just logs and proceeds COLD — never raises,
-            # never removes the worktree. HELD_BY_CALLER because this CM
-            # holds <lane_dir>.lock (above) for its entire lifetime.
-            #
-            # task 2567 amendment: the whole gate is wrapped in a broad
-            # except so the never-raise contract is structural rather than
-            # relying on _warm_lane_base_resolvable() (catches only
-            # OSError) and _seed_warm_lane() (catches Exception) each
-            # behaving today. This runs BEFORE the `try: yield ... finally:
-            # git worktree remove --force` block below, so an unsuppressed
-            # raise here would skip that scoped cleanup entirely — leaking
-            # a registered git worktree that DD5 forbids reclaiming via a
-            # broad `git worktree prune`.
-            if worktree_added and warm_seed:
-                try:
-                    if self._warm_lane_base_resolvable() is WarmBaseHealth.OK:
-                        seed_rc = await self._seed_warm_lane(
-                            tmp_path, '--fresh-checkout',
-                            lane_lock=SeedLaneLock.HELD_BY_CALLER,
-                        )
-                        if seed_rc != 0:
-                            logger.info(
-                                'ephemeral_worktree(%s): warm seed failed (rc=%d) '
-                                'for %s — proceeding COLD (fail-soft)',
-                                kind.name, seed_rc, tmp_path,
-                            )
-                    else:
-                        logger.log(
-                            {WorktreeKind.MAIN_SWEEP: logging.INFO}.get(kind, logging.DEBUG),
-                            'ephemeral_worktree(%s): warm base not resolvable — '
-                            'skipping seed, proceeding COLD for %s', kind.name, tmp_path,
-                        )
-                except Exception:
-                    logger.warning(
-                        'ephemeral_worktree(%s): warm-seed gate raised '
-                        'unexpectedly for %s — proceeding COLD (fail-soft)',
-                        kind.name, tmp_path, exc_info=True,
-                    )
 
             try:
+                if warm_seed:
+                    await self._warm_seed_ephemeral_worktree(tmp_path, kind)
                 yield tmp_path
             finally:
-                # Scoped cleanup: remove ONLY this specific ephemeral worktree.
-                # INTENTIONALLY NO 'git worktree prune' here (DD5 guarantee) —
-                # see the docstring above / the 2097-2100 incident.
-                if worktree_added:
-                    try:
-                        await _run(
-                            ['git', 'worktree', 'remove', '--force', str(tmp_path)],
-                            cwd=self.project_root,
-                        )
-                    except Exception:
-                        logger.debug(
-                            'ephemeral_worktree(%s): worktree remove failed',
-                            kind.name, exc_info=True,
-                        )
-                with contextlib.suppress(Exception):
-                    # Belt-and-suspenders: rmtree in case git worktree remove
-                    # left an empty skeleton.
-                    await remove_tree(tmp_path, ignore_errors=True)
+                await complete_despite_cancellation(
+                    self._remove_ephemeral_worktree(tmp_path, kind),
+                )
         finally:
             # Release the advisory lock and — ONLY when this call was the
             # one that acquired it — best-effort unlink the lock file,
@@ -3459,6 +3391,57 @@ class GitOps:
                     os.unlink(lock_path)
             with contextlib.suppress(Exception):
                 os.close(lock_fd)
+
+    async def _warm_seed_ephemeral_worktree(self, path: Path, kind: WorktreeKind) -> None:
+        """CoW-seed *path*'s ``target/`` from the warm-lane base, proceeding COLD on any fault.
+
+        ``HELD_BY_CALLER``: :meth:`ephemeral_worktree` holds ``<name>.lock`` for its lifetime.
+        """
+        try:
+            if self._warm_lane_base_resolvable() is WarmBaseHealth.OK:
+                seed_rc = await self._seed_warm_lane(
+                    path, '--fresh-checkout',
+                    lane_lock=SeedLaneLock.HELD_BY_CALLER,
+                )
+                if seed_rc != 0:
+                    logger.info(
+                        'ephemeral_worktree(%s): warm seed failed (rc=%d) '
+                        'for %s — proceeding COLD (fail-soft)',
+                        kind.name, seed_rc, path,
+                    )
+            else:
+                logger.log(
+                    {WorktreeKind.MAIN_SWEEP: logging.INFO}.get(kind, logging.DEBUG),
+                    'ephemeral_worktree(%s): warm base not resolvable — '
+                    'skipping seed, proceeding COLD for %s', kind.name, path,
+                )
+        except Exception:
+            logger.warning(
+                'ephemeral_worktree(%s): warm-seed gate raised '
+                'unexpectedly for %s — proceeding COLD (fail-soft)',
+                kind.name, path, exc_info=True,
+            )
+
+    async def _remove_ephemeral_worktree(self, path: Path, kind: WorktreeKind) -> None:
+        """Scoped ``git worktree remove --force``, never a prune (DD5), then ``remove_tree``; failures are WARNINGs."""
+        try:
+            rc, _out, err = await _run(
+                ['git', 'worktree', 'remove', '--force', str(path)],
+                cwd=self.project_root,
+            )
+        except Exception:
+            logger.warning(
+                'ephemeral_worktree(%s): git worktree remove could not run for %s',
+                kind.name, path, exc_info=True,
+            )
+        else:
+            if rc != 0:
+                logger.warning(
+                    'ephemeral_worktree(%s): git worktree remove --force %s failed (rc=%d): %s',
+                    kind.name, path, rc, err.strip(),
+                )
+        finally:
+            await remove_tree(path, ignore_errors=True)
 
     def pool_in_use(self) -> bool:
         """True iff a warm or spec lane pool is configured on this host (task 2099).
