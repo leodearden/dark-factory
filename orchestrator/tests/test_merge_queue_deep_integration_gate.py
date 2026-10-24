@@ -1933,7 +1933,7 @@ def _scripted_remote_runner(scene: _GateScene, script, name='gate-runner'):
         a verdict whose SHAPE is the claim rather than its polarity — a
         ``timed_out=True`` result, say — and injecting it here rather than by
         replacing ``_run_post_merge_verify`` (the ``outcome=`` vocabulary
-        :func:`_spy_post_merge_verify` uses) is what leaves the real
+        ``_merge_deep_scene.py::_spy_post_merge_verify`` uses) is what leaves the real
         function's ``timeouts``/``enospc_retries`` bookkeeping in the loop.
         A stub in its place would be asserting the test's own arithmetic.
     """
