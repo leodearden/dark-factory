@@ -544,7 +544,8 @@ class TestB3BackendWindowCapLeavesAccountAvailable:
         assert result.success is True
         assert mock_sleep.await_count == 1
         assert [c['oauth_token'] for c in cli.calls] == ['fake-token-acct-0'] * 2
-        assert gate._accounts[0].phase == AccountPhase.AVAILABLE
+        assert gate.capped_account_names == ()
+        assert gate.active_account_name == 'acct-0'
 
 
 # ---------------------------------------------------------------------------

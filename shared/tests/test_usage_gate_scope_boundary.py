@@ -359,7 +359,6 @@ class TestB8NonClaudeBackendBypass:
 
     async def test_b8_codex_cap_waits_on_the_same_account_without_scope(self):
         gate = make_gate(['a', 'b'])
-        a, b = gate._accounts
         invoke_fn = scripted_invoke(
             AgentResult(success=False, output='Error: usage limit reached'), ok_result(),
         )
@@ -373,12 +372,11 @@ class TestB8NonClaudeBackendBypass:
 
         # No scope state written anywhere -- backend != 'claude' derives
         # scope None even though the model IS a scoped-cap model.
-        assert a.scope_caps == {}
-        assert b.scope_caps == {}
         assert gate.scope_status() == {}
-        # The codex cap was waited out and retried on A, which stays AVAILABLE.
+        # The codex cap was waited out and retried on A, which stays uncapped.
         assert mock_sleep.await_count == 1
-        assert a.phase == AccountPhase.AVAILABLE
+        assert gate.capped_account_names == ()
+        assert gate.active_account_name == 'a'
         assert got.account_name == 'a'
 
         # T1 reconnect contract shapes preserved (mirrors TestInvokeFnParameter).

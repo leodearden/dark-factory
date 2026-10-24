@@ -553,7 +553,6 @@ class TestCliThreadsScope:
 
     async def test_non_claude_failure_caps_neither_scope_nor_account(self):
         gate = make_gate(['a'])
-        acct = gate._accounts[0]
         invoke_fn = AsyncMock(side_effect=_fake_cap_invoke)
 
         got = await invoke_with_cap_retry(
@@ -571,5 +570,6 @@ class TestCliThreadsScope:
         # one dispatch: neither the scope nor the Claude account is capped.
         assert got.success is False
         assert invoke_fn.await_count == 1
-        assert acct.scope_caps == {}
-        assert acct.phase == AccountPhase.AVAILABLE
+        assert gate.scope_status() == {}
+        assert gate.capped_account_names == ()
+        assert gate.active_account_name == 'a'
