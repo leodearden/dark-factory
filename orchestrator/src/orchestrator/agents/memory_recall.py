@@ -395,13 +395,28 @@ def render_entity_block(payload: Mapping[str, Any], expected_name: str) -> str:
         )
         return ''
 
-    summary = node.get('summary')
-    heading = f'**{expected_name}**'
-    if isinstance(summary, str) and summary.strip():
-        heading += f' — {summary.strip()}'
+    raw_summary = node.get('summary')
+    summary = raw_summary.strip() if isinstance(raw_summary, str) else ''
+    heading = f'**{expected_name}** — {summary}' if summary else f'**{expected_name}**'
+    distinct = _distinct_facts(_edge_facts(payload.get('edges')), summary)
+    return '\n'.join([heading, *(edge.bullet() for edge in distinct)])
 
-    lines = [heading]
-    edges = payload.get('edges')
+
+@dataclass(frozen=True)
+class _EdgeFact:
+    """One ``get_entity`` edge with a non-blank fact; ``valid_at`` is set only when usably dated."""
+
+    fact: str
+    valid_at: str | None
+
+    def bullet(self) -> str:
+        dated = f' ({self.valid_at[:10]})' if self.valid_at else ''
+        return f'- {self.fact}{dated}'
+
+
+def _edge_facts(edges: Any) -> list[_EdgeFact]:
+    """The reply's renderable edges, in reply order; a non-list *edges* has none."""
+    parsed: list[_EdgeFact] = []
     for edge in edges if isinstance(edges, list) else []:
         if not isinstance(edge, dict):
             continue
@@ -410,9 +425,21 @@ def render_entity_block(payload: Mapping[str, Any], expected_name: str) -> str:
             continue
         temporal = edge.get('temporal')
         valid_at = temporal.get('valid_at') if isinstance(temporal, dict) else None
-        dated = f' ({valid_at[:10]})' if isinstance(valid_at, str) and len(valid_at) >= 10 else ''
-        lines.append(f'- {fact.strip()}{dated}')
-    return '\n'.join(lines)
+        dated = isinstance(valid_at, str) and len(valid_at) >= 10
+        parsed.append(_EdgeFact(fact.strip(), valid_at if dated else None))
+    return parsed
+
+
+def _distinct_facts(facts: Sequence[_EdgeFact], summary: str) -> list[_EdgeFact]:
+    """*facts* minus each one *summary* already contains or an earlier edge already carried."""
+    seen: set[str] = set()
+    distinct: list[_EdgeFact] = []
+    for edge in facts:
+        if edge.fact in summary or edge.fact in seen:
+            continue
+        seen.add(edge.fact)
+        distinct.append(edge)
+    return distinct
 
 
 class MemoryFailure(Enum):
