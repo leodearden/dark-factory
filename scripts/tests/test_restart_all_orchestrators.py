@@ -417,6 +417,56 @@ def _assert_poll_ledger(polls, *, at_least, verdict, unit, too_few, context):
     )
 
 
+def _run_drain_until_polled(bin_dir, state_path, fleet_dir, trace_path, *, verdict, env):
+    """Run --drain until UNIT_R has polled *verdict* twice; return
+    (completed, polls).
+
+    Two polls prove the gate's wait loop read, slept and re-read without
+    proceeding. The gate anchors its busy and unknown graces just after poll
+    1, so a caller's grace need only outlast one poll, not this deadline,
+    which is a must-not-hang bound. Owns ORCH_DRAIN_POLL_TRACE_FILE.
+    """
+    polls_needed = 2
+    deadline = load_scaled_grace(20)
+
+    def polled_enough():
+        polls_so_far = read_drain_poll_trace(trace_path, complete_only=True)
+        return polls_so_far.count((verdict, UNIT_R)) >= polls_needed
+
+    try:
+        outcome = _run_script_until(
+            bin_dir, state_path, fleet_dir, "--drain",
+            condition=polled_enough,
+            env={**env, "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path)},
+            timeout=deadline,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f"{UNIT_R} never polled {verdict} {polls_needed} times inside the "
+            f"{exc.timeout}s must-not-hang deadline; "
+            f"ledger={read_drain_poll_trace(trace_path, complete_only=True)!r} "
+            f"stdout={_decode(exc.stdout)!r}"
+        )
+
+    polls = read_drain_poll_trace(trace_path)
+    completed = outcome.completed
+    context = f"stdout={completed.stdout!r} stderr={completed.stderr!r}"
+    assert outcome.stopped_on_condition is True, (
+        f"the script exited on its own before {UNIT_R} polled {verdict} "
+        f"{polls_needed} times, i.e. it stopped waiting (force-fired, proceeded "
+        f"or restarted) instead of still polling; ledger={polls!r} {context}"
+    )
+    _assert_poll_ledger(
+        polls, at_least=polls_needed, verdict=verdict, unit=UNIT_R,
+        too_few=(
+            f"the run was stopped before {UNIT_R} polled {verdict} "
+            f"{polls_needed} times."
+        ),
+        context=context,
+    )
+    return completed, polls
+
+
 def test_fleet_dir_is_redirected_away_from_the_live_checkout(
     _df_fleet_dir_redirect, tmp_path_factory,
 ):
