@@ -302,6 +302,49 @@ def unsafe_pgid_reason(pgid: int, proc_pid: int | None = None) -> str | None:
     return None
 
 
+_SURVIVOR_POLL_SECS = 0.1
+
+
+def _survivors_of_reaped_leader(pgid: int) -> list[ProcessGroupMember]:
+    """The running members of group *pgid*, once its leader has been reaped."""
+    return [m for m in process_group_members(pgid) if not m.terminated]
+
+
+async def _group_terminated_within(
+    proc: asyncio.subprocess.Process, pgid: int, timeout: float
+) -> bool:
+    """True iff *proc* exits and every member of *pgid* terminates within *timeout*."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    try:
+        await asyncio.wait_for(proc.wait(), timeout)
+    except TimeoutError:
+        return False
+    while await asyncio.to_thread(_survivors_of_reaped_leader, pgid):
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(_SURVIVOR_POLL_SECS)
+    return True
+
+
+async def _sigkill_remaining(proc: asyncio.subprocess.Process, pgid: int) -> bool:
+    """SIGKILL whatever still runs in group *pgid*; True iff a SIGKILL was dispatched."""
+    if proc.returncode is None:
+        return sigkill_process_group(proc, pgid) is not SigkillDispatch.NOT_SIGNALLED
+    survivors = await asyncio.to_thread(_survivors_of_reaped_leader, pgid)
+    if not survivors:
+        return False
+    with contextlib.suppress(OSError):
+        os.killpg(pgid, signal.SIGKILL)
+    logger.debug(
+        'terminate_process_group: SIGKILLed group %s, whose reaped leader left '
+        'running: %s',
+        pgid,
+        ', '.join(f'pid={m.pid} comm={m.comm}' for m in survivors),
+    )
+    return True
+
+
 async def terminate_process_group(
     proc: asyncio.subprocess.Process,
     pgid: int,
@@ -317,20 +360,24 @@ async def terminate_process_group(
 
     Behaviour:
     1. If *proc* has already been reaped (``returncode is not None``), return
-       immediately.  The group is already gone with the leader.
+       immediately without signalling: its pid may be recycled, so surviving
+       members are deliberately forgone, as in :func:`sigkill_process_group`.
     2. Sanity-check *pgid* via :func:`unsafe_pgid_reason`.  If unsafe, log
        and return without signalling.
     3. ``os.killpg(pgid, SIGTERM)``.  Wait up to *grace_secs* for *proc* to
-       exit.
-    4. If *proc* is still alive, ``os.killpg(pgid, SIGKILL)`` and wait
+       exit AND every member of the group to terminate: the leader exiting
+       is not enough.
+    4. If anything still runs, SIGKILL it: through :func:`sigkill_process_group`
+       while the leader is unreaped, and once it is reaped only while a running
+       survivor pins the pgid (:func:`_survivors_of_reaped_leader`).  Then wait
        another *grace_secs*.
 
-    All ``killpg`` calls are wrapped in ``contextlib.suppress(ProcessLookupError,
-    OSError)`` because the group may vanish between our liveness check and
-    the signal dispatch.
+    No ``killpg`` failure propagates, because the group may vanish between our
+    liveness check and the signal dispatch.
     """
     if proc.returncode is not None:
-        # Already reaped — the entire group has exited along with the leader.
+        # Reaped before we were called: its pid may be recycled, so survivors
+        # are deliberately forgone (see sigkill_process_group).
         return
 
     reason = unsafe_pgid_reason(pgid, proc.pid)
@@ -344,17 +391,10 @@ async def terminate_process_group(
 
     with contextlib.suppress(ProcessLookupError, OSError):
         os.killpg(pgid, signal.SIGTERM)
-
-    try:
-        await asyncio.wait_for(proc.wait(), grace_secs)
-    except TimeoutError:
-        # Re-check liveness before escalating.
-        if proc.returncode is not None:
-            return
-        with contextlib.suppress(ProcessLookupError, OSError):
-            os.killpg(pgid, signal.SIGKILL)
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(proc.wait(), grace_secs)
+    if await _group_terminated_within(proc, pgid, grace_secs):
+        return
+    if await _sigkill_remaining(proc, pgid):
+        await _group_terminated_within(proc, pgid, grace_secs)
 
 
 class SigkillDispatch(Enum):
@@ -375,9 +415,8 @@ def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> Sigkil
     *proc* — see the module docstring's "Why the caller captures pgid".  The
     caller owns ``await proc.wait()``.
 
-    Immediate SIGKILL rather than :func:`terminate_process_group`'s SIGTERM
-    stage: that helper stops escalating once the LEADER exits, so a grandchild
-    that ignores SIGTERM would survive.
+    No SIGTERM grace, unlike :func:`terminate_process_group`: for a caller
+    that wants the group dead now and reaps it itself.
 
     An already-reaped *proc* gets no signal (its pid may be recycled), so any
     grandchildren still running are deliberately forgone: refusing to kill a
