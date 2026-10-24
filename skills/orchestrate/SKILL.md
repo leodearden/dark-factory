@@ -558,10 +558,11 @@ If the block was caused by missing architectural context, write it to memory so 
 
 ```
 add_memory(
-  content="<the decision or convention that was missing>",
+  content="Task 3127 was blocked on <the decision or convention that was missing>",
   category="decisions_and_rationale",  # or "preferences_and_norms" for conventions
   project_id="<target project_id from TARGET_CONFIG>",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[{'kind': 'task', 'id': 3127}]  # the blocked task; [] if the decision concerns none
 )
 ```
 
