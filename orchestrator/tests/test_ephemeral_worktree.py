@@ -28,6 +28,7 @@ Test coverage:
            LOCK_NB-denied acquire raises EphemeralWorktreeError BEFORE any
            `git worktree add`, the CM body never runs, and a pre-existing
            foreign-held lock file is never unlinked)
+  task 6794: TestEphemeralWorktreeCancellationSafeCleanup, TestEphemeralWorktreeRemoveFailureIsReported, TestEphemeralWorktreeResidueKeepsLock
 """
 from __future__ import annotations
 

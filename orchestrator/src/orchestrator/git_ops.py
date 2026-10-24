@@ -3235,11 +3235,12 @@ class GitOps:
         NON-retryable add failure (ENOSPC) is not retried at all — see (c) under
         ``Raises`` below.
 
-        On exit — normal return OR an exception raised in the ``async
-        with`` body — cleanup ALWAYS runs: scoped ``git worktree remove
-        --force <path>`` + an unconditional ``remove_tree(path,
-        ignore_errors=True)`` belt-and-suspenders in case ``remove`` left an
-        empty skeleton.  This method NEVER issues ``git worktree prune``
+        On exit — normal return, a body exception, OR a cancellation (even
+        one delivered during the warm seed or cleanup) — cleanup ALWAYS runs
+        to completion via teardown.py::complete_despite_cancellation, which
+        re-raises the cancellation afterwards: scoped ``git worktree remove
+        --force <path>`` (a failure is a WARNING), then ``remove_tree(path,
+        ignore_errors=True)``.  This method NEVER issues ``git worktree prune``
         (DD5 — the comment-only invariant that failed in the 2026-07-04
         warm-lane broad-prune registration-wipe incident, df 2097-2100): a
         broad prune would deregister ANY concurrently-active sibling
@@ -3267,10 +3268,7 @@ class GitOps:
                 seed-then-retain-cold-on-fault contract). The whole gate
                 (base-health check + seed call) is also wrapped in a
                 broad ``except Exception`` so this holds even if an
-                unexpected exception escapes those helpers — the gate
-                runs before the ``git worktree remove --force`` cleanup
-                below, so an unsuppressed raise here would leak the
-                registered worktree instead of degrading to cold. A
+                unexpected exception escapes those helpers. A
                 non-resolvable base (ABSENT/INDETERMINATE) skips the seed
                 subprocess, logged at INFO for a ``MAIN_SWEEP`` (its warm/cold
                 mode is a verdict input) and DEBUG for a hot-path
@@ -3293,11 +3291,11 @@ class GitOps:
                 cases the caller's ``async with`` body never runs.
                 For (b) and (c), because the add never succeeded, no cleanup ``git
                 worktree remove`` is issued (there is nothing registered to
-                remove) — but a belt-and-suspenders ``remove_tree`` of
-                *tmp_path* still runs before the exception propagates, in
-                case a failed add left a partial/empty directory behind
-                (this prefix is :data:`PROTECTED_PREFIXES`-registered, so
-                the reaper would never reclaim a leaked directory itself).
+                remove) — but a ``remove_tree`` of *tmp_path* runs before
+                the exception propagates, in case a failed add left a
+                partial directory behind (this prefix is
+                :data:`PROTECTED_PREFIXES`-registered, so the reaper would
+                never reclaim a leaked directory itself).
 
         Note:
             Acquires an exclusive, non-blocking ``fcntl.flock`` on a
@@ -3309,8 +3307,12 @@ class GitOps:
             contender, so a live probe/sweep here is correctly seen as a
             "live consumer" by gc.sh and preserved rather than force-
             removed mid-verify. The lock file is unlinked on exit ONLY
-            when this call was the one that acquired it (never a foreign
-            holder's lock) — see the ``EphemeralWorktreeError`` case above.
+            when this call acquired it (never a foreign holder's lock — see
+            the ``EphemeralWorktreeError`` case above) AND *tmp_path* is
+            confirmed absent (teardown.py::path_confirmed_absent): residue
+            keeps an unheld ``<name>.lock``, visible to gc.sh's ``flock -n``
+            and the #5584 reclaim.  A cancelled ``git worktree add`` is not
+            torn down in-process.
         """
         base = self.worktree_base
         base.mkdir(parents=True, exist_ok=True)
