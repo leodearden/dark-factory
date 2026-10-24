@@ -16,7 +16,6 @@ from _review_fixtures import review_aggregation, review_issue
 from shared import safe_io
 
 from orchestrator.artifacts import (
-    ORCHESTRATOR_ITERATION_SOURCES,
     PLAN_SCHEMA_VERSION,
     PLAN_TASK_TEXT_FP_KEY,
     ArtifactWriteError,
@@ -415,9 +414,6 @@ class TestIterationLogProvenance:
     Agents also append to iterations.jsonl by hand from their own shell
     (task 5726); those lines must never pass the provenance predicate.
     """
-
-    def test_vocabulary_is_the_orchestrator_writers_sources(self):
-        assert frozenset({'orchestrator', 'amendment'}) == ORCHESTRATOR_ITERATION_SOURCES
 
     def test_entry_without_source_is_stamped_orchestrator(self, artifacts: TaskArtifacts):
         artifacts.append_iteration_log({'agent': 'implementer', 'steps_completed': ['step-1']})

@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -728,9 +727,9 @@ def _append_agent_line(artifacts: TaskArtifacts, entry: dict) -> None:
         log.write(json.dumps(entry) + '\n')
 
 
-_AGENT_LINES_NAMING_STEP_2: list = [
+_AGENT_LINES_NAMING_STEP_2 = [
     pytest.param(
-        lambda _commit: {
+        {
             'iteration': 2,
             'agent': 'implementer',
             'steps_completed': ['step-2'],
@@ -741,10 +740,9 @@ _AGENT_LINES_NAMING_STEP_2: list = [
         id='omits-committed-5588',
     ),
     pytest.param(
-        lambda commit: {
+        {
             'agent': 'implementer',
             'steps_completed': ['step-2'],
-            'commit': commit,
             'committed': True,
             'source': 'agent',
             'timestamp': '2026-08-06T04:25:00',
@@ -752,19 +750,16 @@ _AGENT_LINES_NAMING_STEP_2: list = [
         id='committed-true-source-agent-3713',
     ),
     pytest.param(
-        lambda commit: {
+        {
             'agent': 'implementer',
             'steps_completed': ['step-2'],
-            'commit': commit,
             'committed': True,
             'source': 'post-escalation-resume',
         },
         id='post-escalation-resume-3668',
     ),
     pytest.param(
-        lambda _commit: {
-            'agent': 'claude-task-3088-implementer', 'steps_completed': ['step-2'],
-        },
+        {'agent': 'claude-task-3088-implementer', 'steps_completed': ['step-2']},
         id='role-named-agent-3088',
     ),
 ]
@@ -774,7 +769,7 @@ _AGENT_LINES_NAMING_STEP_2: list = [
 class TestRederiveIgnoresAgentAuthoredEntries:
     @pytest.mark.parametrize('agent_line', _AGENT_LINES_NAMING_STEP_2)
     async def test_agent_authored_entry_naming_unlanded_step_is_not_rederived(
-        self, config, git_ops, task_assignment, agent_line: Callable[[str], dict],
+        self, config, git_ops, task_assignment, agent_line: dict,
     ):
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -793,7 +788,8 @@ class TestRederiveIgnoresAgentAuthoredEntries:
             'agent': 'implementer', 'steps_completed': ['step-1'],
             'commit': step_commit, 'committed': True,
         })
-        _append_agent_line(artifacts, agent_line(step_commit))
+        claimed_commit = {'commit': step_commit} if agent_line.get('committed') is True else {}
+        _append_agent_line(artifacts, agent_line | claimed_commit)
 
         result = await workflow._rederive_step_status_from_branch_state()
 
