@@ -387,6 +387,36 @@ class TestCountDoneInWindow:
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'orchestrator.digest']
         assert not warnings, f"Relative path with existing DB must not WARNING; got: {[r.message for r in warnings]}"
 
+    def test_query_form_counts_on_an_open_connection(self, tmp_path: Path) -> None:
+        """The connection-taking form counts what the fail-open form counts and
+        leaves the connection it was handed open."""
+        db_path = tmp_path / 'events.db'
+        _seed_events_db_direct(db_path)
+        window = ('2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00')
+
+        conn = sqlite3.connect(db_path)
+        try:
+            count = digest.query_count_done_in_window(conn, *window)
+            assert count == 2
+            assert count == digest.count_done_in_window(db_path, *window)
+            assert conn.execute('SELECT 1').fetchone() == (1,)
+        finally:
+            conn.close()
+
+    def test_query_form_raises_on_a_schema_less_db(self, tmp_path: Path) -> None:
+        """A missing events table raises instead of reading as zero done."""
+        db_path = tmp_path / 'schema-less.db'
+        sqlite3.connect(str(db_path)).close()
+
+        conn = sqlite3.connect(db_path)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match='no such table'):
+                digest.query_count_done_in_window(
+                    conn, '2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00',
+                )
+        finally:
+            conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Merge-disposition counts from EventStore (task 2384 γ, boundary row 7)
@@ -1191,6 +1221,66 @@ class TestModelRoleRollupCore:
             db_path, '2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00',
         )
         assert rollup.rows == []
+
+    def test_query_form_equals_the_fail_open_wrapper(self, tmp_path: Path) -> None:
+        """On a readable store the connection-taking form and the fail-open
+        form return the same rollup, turn-cap saturation included."""
+        db_path = tmp_path / 'runs.db'
+        _seed_rollup_runs_db(db_path)
+        run_id = 'run-test'
+        window = ('2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00')
+        _insert_task_result(db_path, run_id=run_id, task_id='t1', outcome='done')
+        _insert_invocation(
+            db_path, run_id=run_id, task_id='t1', model='sonnet', role='implementer',
+            cost_usd=2.0, capped=False, completed_at='2026-05-10T08:00:00+00:00',
+        )
+        _insert_event(
+            db_path, run_id=run_id, task_id='t1', event_type='routing_decision',
+            role='implementer', data={'max_turns': 30}, timestamp='2026-05-10T07:59:00+00:00',
+        )
+        _insert_event(
+            db_path, run_id=run_id, task_id='t1', event_type='invocation_end',
+            role='implementer', data={'turns': 30}, timestamp='2026-05-10T08:00:00+00:00',
+        )
+
+        conn = sqlite3.connect(db_path)
+        try:
+            rollup = digest.query_model_role_rollup(conn, *window)
+        finally:
+            conn.close()
+
+        assert rollup.rows
+        assert rollup.turn_cap_saturation
+        assert rollup == digest.model_role_rollup(db_path, *window)
+
+    @pytest.mark.parametrize('table', ['events', 'invocations', 'task_results'])
+    def test_query_form_raises_on_a_missing_table(self, tmp_path: Path, table: str) -> None:
+        """Each table the rollup reads is required: dropping any one raises
+        naming it, rather than yielding an empty or partial rollup."""
+        db_path = tmp_path / 'runs.db'
+        _seed_rollup_runs_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(f'DROP TABLE {table}')
+            conn.commit()
+            with pytest.raises(sqlite3.OperationalError, match=table):
+                digest.query_model_role_rollup(
+                    conn, '2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00',
+                )
+        finally:
+            conn.close()
+
+    def test_schema_less_db_still_returns_an_empty_rollup(self, tmp_path: Path) -> None:
+        """The path-taking form keeps failing open on a store with no tables."""
+        db_path = tmp_path / 'schema-less.db'
+        sqlite3.connect(str(db_path)).close()
+
+        rollup = digest.model_role_rollup(
+            db_path, '2026-05-10T00:00:00+00:00', '2026-05-10T23:59:59+00:00',
+        )
+
+        assert rollup == digest.ModelRoleRollup()
 
 
 class TestModelRoleRollupTurnCapSaturation:
