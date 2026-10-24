@@ -71,7 +71,8 @@ SCHEMA_VERSION = 1
 # 3: LeaseHolder.record_slug and DecisionRecord.record_slug (task 4237).
 # 4: SessionRecord.self_exit (task 7179).
 # 5: SessionRecord.exit_request and exit_requested_at (task 7193).
-SCHEMA_MINOR = 5
+# 6: SessionRecord.claude_launch_session_id (task 6069).
+SCHEMA_MINOR = 6
 """Additive-extension counter for this module's contract (Fleet Cockpit C1,
 plans/fleet-cockpit-prd.md §6.1). A CODE-LEVEL signal only -- never persisted
 per-record. Bump this when a new backward-compatible (optional/defaulted)
@@ -290,7 +291,7 @@ def _coerce_owner_pid(value: Any) -> int | None:
 
 
 def _coerce_session_id(value: Any) -> str | None:
-    """Read ``claude_session_id`` from a record body, tolerating junk.
+    """Read a stored Claude Code session id from a record body, tolerating junk.
 
     Mirrors ``_coerce_owner_pid``: anything that is not a ``str`` reads as
     None ("no session id bound") instead of surviving to the hook trio's
@@ -369,6 +370,13 @@ class SessionRecord:
         from a nested claude that merely inherited CLAUDE_SPAWN_SESSION_ID.
         A non-str or whitespace-only value in a record body reads back as
         None instead of surviving unchanged (see ``_coerce_session_id``).
+    claude_launch_session_id: the Claude Code ``session_id`` this record was
+        FIRST bound to, stamped once by ``session_hooks._bind_claude_session_id``
+        and never re-bound, so it still names the launch transcript after a
+        ``/clear`` or compaction re-mint moves ``claude_session_id``. None for
+        an unbound record or one bound before this field existed; junk reads
+        None (see ``_coerce_session_id``). Consumer:
+        ``scripts/legibility/check_transcript_persistence.py::find_matching_transcript``.
     claude_owner_pid: pid of the ``claude`` PROCESS that bound
         ``claude_session_id``, stamped at the same moment, or None for a
         record bound before this field existed (or where the pid could not
@@ -411,6 +419,7 @@ class SessionRecord:
     display: Display | None = field(default=None, kw_only=True)
     question: Question | None = field(default=None, kw_only=True)
     claude_session_id: str | None = field(default=None, kw_only=True)
+    claude_launch_session_id: str | None = field(default=None, kw_only=True)
     claude_owner_pid: int | None = field(default=None, kw_only=True)
     self_exit: bool = field(default=False, kw_only=True)
     exit_request: ExitRequest | None = field(default=None, kw_only=True)
@@ -439,6 +448,7 @@ class SessionRecord:
             'display': self.display.to_dict() if self.display is not None else None,
             'question': self.question.to_dict() if self.question is not None else None,
             'claude_session_id': self.claude_session_id,
+            'claude_launch_session_id': self.claude_launch_session_id,
             'claude_owner_pid': self.claude_owner_pid,
             'self_exit': self.self_exit,
             'exit_request': self.exit_request.to_dict() if self.exit_request is not None else None,
@@ -471,6 +481,7 @@ class SessionRecord:
             display=Display.from_dict(display_data) if isinstance(display_data, dict) else None,
             question=Question.from_dict(question_data) if isinstance(question_data, dict) else None,
             claude_session_id=_coerce_session_id(data.get('claude_session_id')),
+            claude_launch_session_id=_coerce_session_id(data.get('claude_launch_session_id')),
             claude_owner_pid=_coerce_owner_pid(data.get('claude_owner_pid')),
             self_exit=data.get('self_exit') is True,
             exit_request=_coerce_exit_request(data.get('exit_request')),
