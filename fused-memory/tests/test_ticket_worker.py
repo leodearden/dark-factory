@@ -2571,10 +2571,11 @@ class TestCuratorWorkerBatchDrain:
     async def test_remove_tasks_queued_behind_a_batch_sees_only_terminal_tickets(
         self, make_batch_interceptor, ticket_store, taskmaster,
     ):
-        """A remove_tasks that waits on an in-flight batch runs only after its tickets are persisted.
+        """A remove_tasks queued behind an in-flight batch reaches the backend only after the persist.
 
-        The batch creates task 42; the removal of 42 is queued while the
-        batch is still being curated, and the removal reads the ticket row.
+        The batch creates task 42; the removal of 42 starts while the batch
+        is still being curated. The persist finishing first means the lock
+        spans the persist, not only the curate call and the dispatch.
         """
         batch_entered = asyncio.Event()
         release_batch = asyncio.Event()
@@ -2591,13 +2592,19 @@ class TestCuratorWorkerBatchDrain:
 
         submitted = await interceptor.submit_task('/project', title='Doomed Task', description='d')
         ticket_id = submitted['ticket']
-        statuses_seen_by_removal: list[str] = []
+        sequence: list[str] = []
+        persist = ticket_store.mark_resolved
+
+        async def recording_persist(*args, **kwargs) -> bool:
+            resolved = await persist(*args, **kwargs)
+            sequence.append('ticket persisted')
+            return resolved
 
         async def recording_remove_tasks(ids, project_root, tag):
-            row = await ticket_store.get(ticket_id)
-            statuses_seen_by_removal.append(row['status'])
+            sequence.append('backend removal')
             return {'success': True}
 
+        ticket_store.mark_resolved = recording_persist
         taskmaster.remove_tasks = AsyncMock(side_effect=recording_remove_tasks)
         removal_started = asyncio.Event()
 
@@ -2610,9 +2617,6 @@ class TestCuratorWorkerBatchDrain:
             await poll_until(batch_entered.is_set, message='worker never entered curate_batch')
             removal = asyncio.create_task(remove_behind_the_batch())
             await poll_until(removal_started.is_set, message='remove_tasks never started')
-            assert taskmaster.remove_tasks.await_count == 0, (
-                'remove_tasks reached the backend while the batch was still being curated'
-            )
             release_batch.set()
             removed = await removal
         finally:
@@ -2622,9 +2626,9 @@ class TestCuratorWorkerBatchDrain:
                 with contextlib.suppress(asyncio.CancelledError):
                     await removal
 
+        assert sequence == ['ticket persisted', 'backend removal']
         answer = await interceptor.resolve_ticket(ticket_id, '/project', timeout_seconds=10.0)
         assert removed == {'success': True}
-        assert statuses_seen_by_removal == ['created']
         assert (answer['status'], answer.get('task_id')) == ('created', '42')
 
     @pytest.mark.asyncio
