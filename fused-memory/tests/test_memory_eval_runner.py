@@ -36,7 +36,6 @@ COMMITTED_CONFIG = _FM_ROOT / 'config' / 'memory-eval.yaml'
 _ALPHA_FIXTURES = _FM_ROOT.parent / 'shared' / 'tests' / 'fixtures' / 'memory_eval'
 _E1 = 'e1-retrieval-health'
 _STAMP = '20260801T031500Z'
-_REQUIRED_KEYS = ('storm_alarm_limit', 'min_samples', 'baseline_window', 'runs_per_quarter')
 
 
 @functools.cache
@@ -65,7 +64,7 @@ class TestRunnerConfig:
         assert limits.baseline_window == config.baseline_window
         assert limits.false_alarm_budget == config.false_alarm_budget
 
-    @pytest.mark.parametrize('key', _REQUIRED_KEYS)
+    @pytest.mark.parametrize('key', tuple(_mod().RunnerConfig.model_fields))
     def test_a_missing_declaration_is_refused(self, tmp_path, key):
         with pytest.raises(ValueError):
             _mod().load_runner_config(_write_config(tmp_path, **{key: None}))
@@ -118,6 +117,23 @@ class TestPreflightExits:
         config = _write_config(tmp_path, storm_alarm_limit=None)
         assert self._run(tmp_path, tmp_path / 'queue', config) == 2
         assert str(config) in capsys.readouterr().err
+        assert self._no_artifacts(tmp_path)
+
+    @pytest.mark.parametrize('content', [
+        pytest.param('reconciliation: [unclosed\n', id='unparseable'),
+        pytest.param('reconciliation: 5\n', id='invalid'),
+    ])
+    def test_a_bad_fused_memory_config_exits_2_naming_config_path(
+        self, tmp_path, monkeypatch, capsys, content,
+    ):
+        bad = tmp_path / 'config.yaml'
+        bad.write_text(content, encoding='utf-8')
+        monkeypatch.setenv('CONFIG_PATH', str(bad))
+        code = _mod().main([
+            '--config', str(COMMITTED_CONFIG), '--artifact-root', str(tmp_path / 'artifacts'),
+        ])
+        assert code == 2
+        assert f'CONFIG_PATH={bad}' in capsys.readouterr().err
         assert self._no_artifacts(tmp_path)
 
 
@@ -673,6 +689,38 @@ class TestMain:
         (only,) = _pending(EscalationQueue(queue_dir))
         assert only.task_id == _PROGRAM_TASK
         assert 'runner' in only.evidence[0]['observation']
+
+    def test_a_crash_before_any_artifact_cites_the_journal_not_unwritten_paths(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _FIRST)
+        root = tmp_path / 'root-is-a-file'
+        root.write_text('not a directory', encoding='utf-8')
+        queue_dir = _seeded_queue_dir(tmp_path)
+        _main(root, queue_dir, [])
+        (only,) = _pending(EscalationQueue(queue_dir))
+        journal = _mod().JOURNAL_COMMAND
+        for unwritten in (root / f'run-report-{_FIRST}.txt', root / f'verdicts-{_FIRST}.json'):
+            assert str(unwritten) not in only.summary + only.detail
+        assert 'run report: not written' in only.detail
+        assert 'verdicts: not written' in only.detail
+        assert journal in only.summary
+        assert [entry['ref'] for entry in only.evidence] == [journal]
+
+    def test_a_crash_after_the_verdicts_landed_cites_them_and_not_the_missing_report(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _FIRST)
+        root = tmp_path / 'root'
+        (root / 'verdicts-current.json').mkdir(parents=True)
+        queue_dir = _seeded_queue_dir(tmp_path)
+        assert _main(root, queue_dir, []) == 1
+        (only,) = _pending(EscalationQueue(queue_dir))
+        stamped = root / f'verdicts-{_FIRST}.json'
+        assert stamped.is_file()
+        assert f'verdicts: {stamped}' in only.detail
+        assert 'run report: not written' in only.detail
+        assert str(root / f'run-report-{_FIRST}.txt') not in only.summary + only.detail
 
     def test_a_rerun_at_the_pinned_stamp_files_nothing_and_rewrites_identical_verdicts(
         self, tmp_path, fake_script, monkeypatch,

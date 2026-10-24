@@ -68,6 +68,7 @@ from shared.memory_eval_verdicts import (
     verdict_entries,
 )
 
+from fused_memory.config.schema import DEFAULT_CONFIG_PATH as FUSED_MEMORY_DEFAULT_CONFIG_PATH
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.utils.target_store_preflight import TargetStoreMissing, assert_queue_dir_populated
 
@@ -297,16 +298,21 @@ _REMEDIATION: dict[str, str] = {
 }
 
 
+JOURNAL_COMMAND = 'journalctl --user -u fused-memory-memory-eval.service'
+
+
 def eval_task_id(eval_id: str) -> str:
     return f'memory-eval-{eval_id}'
 
 
 @dataclass(frozen=True)
 class FilingContext:
+    """The run every filing cites; an artifact path is None when the run crashed before writing it."""
+
     run_stamp: str
     project_id: str
-    run_report_path: Path
-    verdicts_path: Path
+    run_report_path: Path | None
+    verdicts_path: Path | None
 
     @property
     def measured_at(self) -> str:
@@ -351,6 +357,17 @@ def file_once(queue: EscalationQueue, filing: Filing, *, project_id: str) -> str
     ))
 
 
+def _look_at(path: Path | None) -> str:
+    return str(path) if path is not None else JOURNAL_COMMAND
+
+
+def _artifact_lines(context: FilingContext) -> list[str]:
+    return [
+        f'{label}: {path}' if path is not None else f'{label}: not written; see {JOURNAL_COMMAND}'
+        for label, path in (('run report', context.run_report_path), ('verdicts', context.verdicts_path))
+    ]
+
+
 def _num(value: float | None) -> str:
     return 'n/a' if value is None else f'{value:g}'
 
@@ -389,8 +406,7 @@ def alarm_filing(run: EvalRun, entry: VerdictEntry, context: FilingContext) -> F
         f'limits artifact: {run.limits_path}',
         f'M1 metrics: {run.metrics_path}',
         f'M1 report: {run.report_path}',
-        f'run report: {context.run_report_path}',
-        f'verdicts: {context.verdicts_path}',
+        *_artifact_lines(context),
         _REMEDIATION[entry.rule_kind],
     ]
     return Filing(
@@ -418,8 +434,7 @@ def storm_filing(
         f'{storm.alarm_count} alarm(s) in run {context.run_stamp} exceed storm_alarm_limit '
         f'K={storm.alarm_limit}; per-metric escalations were collapsed into this one.',
         *(f'- {e.eval_id} {_subject(e)}: value {_num(e.value)}' for e in alarm_entries),
-        f'run report: {context.run_report_path}',
-        f'verdicts: {context.verdicts_path}',
+        *_artifact_lines(context),
         'Remediation: this many alarms at once usually share one cause (a store outage, a '
         'corpus migration, a probe change). Find that cause from the run report first.',
     ]
@@ -428,13 +443,13 @@ def storm_filing(
         fingerprint=storm.aggregate_fingerprint,
         summary=(
             f'memory-eval storm at {context.run_stamp}: {storm.alarm_count} alarms exceed '
-            f'K={storm.alarm_limit}; see {context.run_report_path}'
+            f'K={storm.alarm_limit}; see {_look_at(context.run_report_path)}'
         ),
         detail='\n'.join(detail),
         evidence=(EvidenceEntry(
             observation=f'{storm.alarm_count} alarm entries > storm_alarm_limit {storm.alarm_limit}',
             measured_at=context.measured_at,
-            ref=str(context.verdicts_path),
+            ref=_look_at(context.verdicts_path),
         ),),
     )
 
@@ -448,25 +463,24 @@ def failure_filing(failures: Sequence[RunnerFailureRecord], context: FilingConte
     scopes = ', '.join(failure.scope for failure in failures)
     detail = [
         *(f'- {_failure_observation(f)}\n  {f.message}' for f in failures),
-        f'run report: {context.run_report_path}',
-        f'verdicts: {context.verdicts_path}',
+        *_artifact_lines(context),
         'Remediation: the named evals did not produce or judge a series this run, so they '
-        'carry no verdict. Fix the cause in the journal (journalctl --user -u '
-        'fused-memory-memory-eval.service); this stays open across runs until resolved.',
+        f'carry no verdict. Fix the cause in the journal ({JOURNAL_COMMAND}); this stays '
+        'open across runs until resolved.',
     ]
     return Filing(
         task_id=PROGRAM_TASK_ID,
         fingerprint=RUNNER_FAILURE_FINGERPRINT,
         summary=(
             f'memory-eval runner: {len(failures)} failure(s) at {context.run_stamp} '
-            f'({scopes}); see {context.run_report_path}'
+            f'({scopes}); see {_look_at(context.run_report_path)}'
         ),
         detail='\n'.join(detail),
         evidence=tuple(
             EvidenceEntry(
                 observation=_failure_observation(failure),
                 measured_at=context.measured_at,
-                ref=str(context.run_report_path),
+                ref=_look_at(context.run_report_path),
             )
             for failure in failures
         ),
@@ -637,6 +651,10 @@ def run_program(
     return RunOutcome(artifact=artifact, filing=filing, verdicts_path=stamped, run_report_path=report)
 
 
+def _if_written(path: Path) -> Path | None:
+    return path if path.is_file() else None
+
+
 def _file_runner_crash(
     queue: EscalationQueue, exc: Exception, config: RunnerConfig, root: Path, stamp: str,
 ) -> FilingOutcome:
@@ -646,7 +664,8 @@ def _file_runner_crash(
     )
     context = FilingContext(
         run_stamp=stamp, project_id=config.project_id,
-        run_report_path=run_report_path(root, stamp), verdicts_path=verdicts_path(root, stamp),
+        run_report_path=_if_written(run_report_path(root, stamp)),
+        verdicts_path=_if_written(verdicts_path(root, stamp)),
     )
     filing = failure_filing([failure], context)
     try:
@@ -677,7 +696,11 @@ def _preflight(args: argparse.Namespace) -> tuple[RunnerConfig, EscalationQueue,
         config = load_runner_config(args.config)
     except RunnerConfigError as exc:
         raise _PreflightRefused(f'config refused: {exc}') from exc
-    queue_dir = args.queue_dir if args.queue_dir is not None else _default_queue_dir()
+    try:
+        queue_dir = args.queue_dir if args.queue_dir is not None else _default_queue_dir()
+    except (RuntimeError, ValidationError) as exc:
+        config_path = Path(os.environ.get('CONFIG_PATH', FUSED_MEMORY_DEFAULT_CONFIG_PATH)).absolute()
+        raise _PreflightRefused(f'fused-memory config refused (CONFIG_PATH={config_path}): {exc}') from exc
     try:
         assert_queue_dir_populated(queue_dir, operation='memory_eval_runner')
     except TargetStoreMissing as exc:
