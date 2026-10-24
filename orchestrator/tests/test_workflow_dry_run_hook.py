@@ -64,7 +64,7 @@ class _Scheduler:
     ):
         return BlastRadiusResult(applied=False)
 
-    async def dispatch_tool(self, name, arguments, *, timeout=30.0):
+    async def dispatch_tool(self, name: str, arguments: dict, *, timeout: float = 30.0) -> dict:
         return {}
 
     async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:

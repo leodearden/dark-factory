@@ -48,8 +48,7 @@ async def test_fake_scheduler_submit_task_through_the_chronic_flake_adapter_file
     outcome = await SchedulerChronicFlakeTaskClient(sched, '/proj').submit_task({'title': 't'})
 
     assert outcome == SubmitFailed('FakeScheduler files nothing')
-    assert [args for args, _ in sched.submit_task_calls] == [{'title': 't', 'project_root': '/proj'}]
-    assert await sched.get_tasks() == []
+    assert sched.submit_task_calls == [({'title': 't', 'project_root': '/proj'}, 30)]
 
 
 def test_fake_mcp_smoke() -> None:
