@@ -1090,80 +1090,25 @@ def test_verify_merge_clean_error_contract(tmp_path, monkeypatch, bad_case):
 
 
 def test_verify_merge_uses_acquire_host_verify_worktree(tmp_path, monkeypatch):
-    """verify-merge must call acquire_host_verify_worktree, NOT _create_merge_worktree.
-
-    Step-7 (RED): the subcommand currently calls _create_merge_worktree;
-    _create_merge_worktree.assert_not_called() fails until step-8 swaps it.
-    """
-    from unittest.mock import AsyncMock, MagicMock
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-
-    # --- Build mock GitOps instance ---
-    fake_worktree_base = tmp_path / '.worktrees'
-    fake_worktree_base.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    # Knob is ON below, so the CLI span references the shared lane lock
-    # (lane_lock_path(persistent_merge_worktree_path)) in both the pre-flight
-    # contention gate and _run()'s build-scoped hold (task 2830). Point it at a
-    # real path so acquire_merge_verify_flock can open the lock file (mirrors the
-    # sibling knob-ON pins test_verify_merge_holds_lane_lock_during_warm_run /
-    # test_verify_merge_lane_actor_contention_emits_distinguished_result).
-    mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    # _create_merge_worktree is a spy: return a valid 2-tuple so the old code
-    # path doesn't crash today, but we assert it's NOT called after step-8.
-    mock_git_ops._create_merge_worktree = AsyncMock(return_value=(fake_wt, sha))
-
-    # Patch GitOps class so instantiation returns our mock
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Config with persistent_merge_worktree=True ---
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    git_cfg = GitConfig(persistent_merge_worktree=True)
-    fake_config = OrchestratorConfig(project_root=tmp_path, git=git_cfg)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    # --- Patch verify_runner helpers ---
-    known_json = '{"passed": true, "results": []}'
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.spec_from_json',
-        lambda s: MagicMock(),
-    )
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.run_merge_verify_on_worktree',
-        AsyncMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.result_to_json',
-        lambda r: known_json,
+    """verify-merge must call acquire_host_verify_worktree, NOT _create_merge_worktree."""
+    patched = _patched_verify_merge(tmp_path, monkeypatch, persistent=True)
+    git_ops = patched.git_ops
+    git_ops._create_merge_worktree = AsyncMock(
+        return_value=(tmp_path / '_merge-verify', _VERIFY_MERGE_SHA),
     )
 
-    # --- Dummy config file to satisfy click.Path(exists=True) ---
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-    ])
+    r = patched.invoke()
 
     assert r.exit_code == 0, (
         f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
     )
-    assert known_json in r.output, (
+    assert _VERIFY_MERGE_RESULT_JSON in r.output, (
         f'stdout must contain the known JSON; got: {r.output!r}'
     )
 
     # Core assertion: acquire_host_verify_worktree called; _create_merge_worktree NOT
-    mock_git_ops.acquire_host_verify_worktree.assert_awaited_once_with(sha)
-    mock_git_ops._create_merge_worktree.assert_not_called()
+    git_ops.acquire_host_verify_worktree.assert_awaited_once_with(_VERIFY_MERGE_SHA)
+    git_ops._create_merge_worktree.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1419,63 +1364,29 @@ def test_verify_merge_flock_held_during_warm_run_and_released_after(tmp_path, mo
 
 def test_verify_merge_knob_off_no_flock_back_compat(tmp_path, monkeypatch):
     """Knob OFF: no lock is taken and no holder-pgid file is created (back-compat)."""
-    from unittest.mock import AsyncMock, MagicMock
-
     from orchestrator.verify_cancel import (
         lane_lock_path,
         merge_verify_lock_path,
         read_lock_holder_pgid,
     )
 
-    known_json = '{"passed": true, "results": []}'
-    fake_worktree_base = tmp_path / '.worktrees'
-    fake_worktree_base.mkdir()
+    patched = _patched_verify_merge(tmp_path, monkeypatch)
+    git_ops = patched.git_ops
+    worktree_base = git_ops.worktree_base
 
-    # --- Mock GitOps ---
-    fake_wt = tmp_path / '_merge-verify'
-    fake_wt.mkdir()
-    mock_git_ops = MagicMock()
-    mock_git_ops.worktree_base = fake_worktree_base
-    mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
-    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
-    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
-    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
-
-    # --- Mock config: knob OFF ---
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    git_cfg = GitConfig(persistent_merge_worktree=False)
-    fake_config = OrchestratorConfig(project_root=tmp_path, git=git_cfg)
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
-
-    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
-    monkeypatch.setattr(
-        'orchestrator.verify_runner.run_merge_verify_on_worktree',
-        AsyncMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
-
-    cfg_file = tmp_path / 'config.yaml'
-    cfg_file.write_text('')
-
-    sha = 'abc1234567890abc1234567890abc1234567890ab'
-    r = CliRunner().invoke(main, [
-        'verify-merge',
-        '--sha', sha,
-        '--spec', '{}',
-        '--config', str(cfg_file),
-    ])
+    r = patched.invoke()
 
     assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
-    assert known_json in r.output
+    assert _VERIFY_MERGE_RESULT_JSON in r.output
 
-    mock_git_ops.acquire_host_verify_worktree.assert_awaited_once_with(sha)
-    assert read_lock_holder_pgid(fake_worktree_base) is None, (
+    git_ops.acquire_host_verify_worktree.assert_awaited_once_with(_VERIFY_MERGE_SHA)
+    assert read_lock_holder_pgid(worktree_base) is None, (
         'no holder-pgid file should be created when the knob is off'
     )
-    assert not merge_verify_lock_path(fake_worktree_base).exists(), (
+    assert not merge_verify_lock_path(worktree_base).exists(), (
         'no .merge_verify.lock file should be created when the knob is off'
     )
-    assert not lane_lock_path(mock_git_ops.persistent_merge_worktree_path).exists(), (
+    assert not lane_lock_path(git_ops.persistent_merge_worktree_path).exists(), (
         'no shared <lane_dir>.lock (_merge-verify.lock) should be created when '
         'the knob is off (task 2830)'
     )
