@@ -71,10 +71,11 @@ class Role(StrEnum):
     PRIMARY = 'primary'
     SECOND = 'second'
     THIRD = 'third'
+    CROSS_FAMILY = 'cross_family'
     DERIVED = 'derived'
 
 
-RATER_ROLES = frozenset({Role.PRIMARY, Role.SECOND, Role.THIRD})
+RATER_ROLES = frozenset({Role.PRIMARY, Role.SECOND, Role.THIRD, Role.CROSS_FAMILY})
 """The roles of a row a rater answered; only these rows carry evidence or non_consumed answers."""
 
 

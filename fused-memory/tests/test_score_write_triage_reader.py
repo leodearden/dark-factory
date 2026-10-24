@@ -856,6 +856,14 @@ class TestTheV2ScriptsImportOnlyDownward:
             'calibrate_write_triage', 'eval_write_triage_retrieval', 'score_write_triage_pairs',
             'write_triage_judge_wording',
         }),
+        ('rate_write_triage_cross_family', {
+            'rate_write_triage_cross_family', 'build_write_triage_eval_set',
+            'write_triage_rating_rounds', 'write_triage_reader_rubric', 'score_write_triage_reader',
+            'write_triage_stats', 'run_write_triage_population_arms',
+            'freeze_write_triage_population', 'calibrate_write_triage',
+            'eval_write_triage_retrieval', 'score_write_triage_pairs',
+            'write_triage_judge_wording',
+        }),
     ])
     def test_a_module_loads_exactly_its_downward_closure(
         self, stem: str, closure: set[str],

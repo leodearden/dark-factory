@@ -308,10 +308,17 @@ class _Rounds:
         return cls(_Inputs.read(args.snapshot, args.live_slates), scratch, scratch.load_key())
 
     def finished(self) -> _rounds.Rated:
-        """The effective lines, refused while any awaits a re-ask or any pair lacks a rater."""
+        """The effective Opus lines, refused while any awaits a re-ask or any pair lacks a rater.
+
+        A cross-family line is refused too: it is compared with the Opus labels, never mixed in.
+        """
         entries = self.inputs.entries()
         rated = self.scratch.ratings(self.key, entries)
         _rounds.refuse_unfinished(rated, entries)
+        foreign = sorted({row['batch'] for row in rated.rows
+                          if row['role'] == _rubric.Role.CROSS_FAMILY})
+        if foreign:
+            raise ValueError(f'cross_family rows do not belong in the Opus corpus; shards {foreign}')
         return rated
 
 
