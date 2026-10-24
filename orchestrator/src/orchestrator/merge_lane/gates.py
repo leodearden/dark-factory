@@ -3499,8 +3499,8 @@ async def _reverify_rebased_tree(
        with no verify.  Disjointness alone is NOT sufficient: see that
        function's docstring for the two premises.
     2. Otherwise (an overlap, an unknown overlap, or untrusted disjointness):
-       delegate to *run_post_merge_verify* against the rebased *merge_wt*,
-       forwarding *event_store* so the re-verify writes its ``merge_verify``
+       delegate to *run_post_merge_verify* against the rebased *merge_wt*;
+       the worker's handles it carries write the re-verify's ``merge_verify``
        row.  ``None`` from it → ``GateClearance.reverified``; a
        ``MergeOutcome`` → verification failed or the disk guard fired, and
        *merge_wt* has already been cleaned up.
@@ -3527,11 +3527,12 @@ async def _reverify_rebased_tree(
         verbatim to ``_run_post_merge_verify``.  Default ``None`` produces
         legacy single-keep behaviour (only ``merge_wt`` is protected).
     run_post_merge_verify:
-        The worker's ``_run_post_merge_verify``, which this gate delegates the
-        re-verify to when it fires, and the declared history leg to, as
+        The worker's verify callable, carrying the worker's handles, its
+        event store included.  This gate delegates the re-verify to it when
+        it fires, and the declared history leg to it, as
         ``history_leg_command``, on a same tree.
     event_store:
-        Receives the decision row, and is forwarded to the re-verify.
+        Receives the decision row only.
     """
     decision = await _decide_reverify_gate(
         git_ops, req,
@@ -3552,7 +3553,6 @@ async def _reverify_rebased_tree(
         max_enospc=max_enospc,
         merge_sha=merge_sha,
         keep_worktrees=keep_worktrees,
-        event_store=event_store,
         history_leg_command=decision.history_leg_command,
     )
     if failure is not None:

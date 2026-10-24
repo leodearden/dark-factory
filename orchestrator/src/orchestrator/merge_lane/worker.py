@@ -1095,9 +1095,10 @@ class _DryRunInvestigationHandles:
     itself (the harness owns all of them); this bundles them into one
     optional, default-``None`` param so ``_run_post_merge_verify`` stays a
     pure git engine (mirrors the ``train_callback_factory`` opaque-injection
-    pattern — the worker never imports the scheduler).  Only the production
-    ``SpeculativeMergeWorker._run_inflight_verify`` call site passes a live
-    instance; the solo-reverify and train module-level callers pass nothing,
+    pattern — the worker never imports the scheduler).  Only
+    ``SpeculativeMergeWorker._lane_post_merge_verify`` (the in-flight verify
+    and the single-branch gate re-verify) passes a live instance; the
+    solo-reverify and train module-level callers pass nothing,
     so their spawns automatically no-op.
 
     ``background_tasks`` is the SAME ``set`` instance the worker stores at
@@ -1224,12 +1225,12 @@ class _MainHealthProbeHandles:
     and is drained by the worker's existing shutdown drain
     (``SpeculativeMergeWorker.stop``).
 
-    Only the production ``SpeculativeMergeWorker._run_inflight_verify`` call
-    site passes a live instance (task 2564 step-16).  The solo-reverify,
-    train, and merge_gates module-level callers — and any bare test
-    caller — pass ``None`` (the default), so ``_run_post_merge_verify`` keeps
-    running the main-health probe SYNCHRONOUSLY exactly as it did before
-    this task.
+    Only ``SpeculativeMergeWorker._lane_post_merge_verify``, which serves the
+    in-flight verify and the single-branch gate re-verify, passes a live
+    instance (task 2564 step-16, task 6278).  The solo-reverify and train
+    callers — and any bare test caller — pass ``None`` (the default), so
+    ``_run_post_merge_verify`` keeps running the main-health probe
+    SYNCHRONOUSLY exactly as it did before task 2564.
 
     ``auto_heal`` (task 2564 step-22) is an optional callback threaded
     through to :func:`_run_deferred_main_health_probe`: when a confirmed,
@@ -2556,7 +2557,8 @@ async def _run_post_merge_verify(
             quarantined, but the queue is NOT halted and the escalation is L1
             blocking rather than born-at-L2 (task 2886 amendment — bound the
             halt blast radius; DriftDetector Invariant 5).  Only the
-            production ``SpeculativeMergeWorker._run_inflight_verify`` and
+            production ``SpeculativeMergeWorker._lane_post_merge_verify``
+            (the in-flight verify and the single-branch gate re-verify) and
             ``_leased_train_verify`` call sites pass the worker's
             ``operator_halt``; every other (module-level or test) caller
             omits it (default ``None`` → no halt), keeping them
@@ -2568,18 +2570,19 @@ async def _run_post_merge_verify(
         dry_run_handles: Opaque bundle of scheduler/mcp/usage_gate/cost_store
             (task η, AFK coverage gap).  ``None`` (default) keeps the
             solo-reverify and train module-level callers byte-identical (no
-            spawn).  Only the production ``SpeculativeMergeWorker`` call site
-            passes a live bundle, at which point a MERGE_VERIFY_RED outcome
+            spawn).  Only ``SpeculativeMergeWorker._lane_post_merge_verify``,
+            which serves the in-flight verify and the single-branch gate
+            re-verify, passes a live bundle, at which point a MERGE_VERIFY_RED outcome
             (generic task-fault or unscoped-typecheck-FAILED) fires a
             fire-and-forget dry-run investigation via
             :func:`_spawn_merge_verify_dry_run`.
         main_health_probe_handles: Opaque bundle carrying the worker's
             ``background_tasks`` set (task 2564, reify 5067 merge-slot-stall
-            fix).  ``None`` (default) keeps the solo-reverify, train,
-            merge_gates module-level callers, and any other caller running
-            the main-health probe SYNCHRONOUSLY exactly as before this task.
-            Only the production
-            ``SpeculativeMergeWorker._run_inflight_verify`` call site passes
+            fix).  ``None`` (default) keeps the solo-reverify and train
+            callers, and any other caller, running the main-health probe
+            SYNCHRONOUSLY exactly as before task 2564.  Only
+            ``SpeculativeMergeWorker._lane_post_merge_verify``, which serves
+            the in-flight verify and the single-branch gate re-verify, passes
             a live bundle, at which point a main-health-eligible failure
             SKIPS the synchronous ``_classify_main_health_red`` probe,
             returns the provisional task-fault outcome immediately, and
@@ -3505,8 +3508,9 @@ async def _run_post_merge_verify(
         # merge_wt is already cleaned up; the probe builds its own _mainprobe-
         # worktree and always cleans it in a finally block.
         #
-        # DEFERRED mode (main_health_probe_handles is not None — only the
-        # production SpeculativeMergeWorker._run_inflight_verify call site):
+        # DEFERRED mode (main_health_probe_handles is not None — only
+        # SpeculativeMergeWorker._lane_post_merge_verify, which serves the
+        # in-flight verify and the single-branch gate re-verify):
         # SKIP the synchronous probe entirely.  It can run for minutes
         # (bounded only by the cold verify timeout) and would otherwise hold
         # the caller's verify_task — hence the merge slot / host lease — for
@@ -9596,8 +9600,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # merge-verify dry-run investigation spawn.  The worker holds none of
         # these itself in any other capacity — they exist solely to be
         # bundled into self._dry_run_handles below and threaded opaquely into
-        # _run_post_merge_verify at the production _run_inflight_verify call
-        # site (mirrors the train_callback_factory opaque-injection pattern
+        # _run_post_merge_verify by _lane_post_merge_verify
+        # (mirrors the train_callback_factory opaque-injection pattern
         # above: the worker never imports the scheduler).  All four default
         # to None so every existing bare git_ops+queue test constructor stays
         # byte-identical.
@@ -18843,6 +18847,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._contended_lease_first_defer_at.pop(task_id, None)
         self._contended_lease_last_defer_at.pop(task_id, None)
 
+    def _lane_post_merge_verify(
+        self, git_ops: GitOps, req: MergeRequest, merge_wt: Path, **per_call: Any,
+    ) -> Coroutine[Any, Any, MergeOutcome | None]:
+        """The single place that decides which lane handles a single-branch merge verify inherits."""
+        return _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            max_narrowed=self.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
+            narrowed_retries=self._post_merge_verify_narrowed_retries,
+            event_store=self._event_store,
+            quarantine=self._runner_quarantine,
+            escalation_queue=self._escalation_queue,
+            # task 2886 fix 3 (PRD §3.4 / decision 4): thread the synchronous
+            # all-lane halt so a CONCLUDED cross-check divergence stops the
+            # queue the instant it is detected — BEFORE any further adoption —
+            # instead of trailing it via the async escalation gate (incident
+            # 83336a32 halted +3s too late).  Cross-check stays a trailing
+            # detector; the halt is synchronous only to precede further lands.
+            halt_hook=self.operator_halt,
+            dry_run_handles=self._dry_run_handles,
+            main_health_probe_handles=_MainHealthProbeHandles(
+                background_tasks=self._background_tasks,
+                auto_heal=self._auto_heal_main_health_deferred,
+            ),
+            verifier=self._verifier,
+            **per_call,
+        )
+
     async def _run_inflight_verify(
         self,
         item: RealMergeItem,
@@ -19234,40 +19265,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if entry_slot is not None:
                 entry_slot.publish_verify_base(verify_base)
 
-            verify_task = asyncio.ensure_future(_run_post_merge_verify(
+            verify_task = asyncio.ensure_future(self._lane_post_merge_verify(
                 self._git_ops, req, merge_wt,
                 timeouts=self._post_merge_verify_timeouts,
                 enospc_retries=self._post_merge_verify_enospc_retries,
                 max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                 max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-                max_narrowed=self.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
-                narrowed_retries=self._post_merge_verify_narrowed_retries,
-                event_store=self._event_store,
                 merge_sha=merge_commit,
                 on_result=_warm_capture.append if _is_warm_path else None,
                 shadow_baseline_sink=_attempt0_shadow if _is_warm_path else None,
-                quarantine=self._runner_quarantine,
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
-                escalation_queue=self._escalation_queue,
-                # task 2886 fix 3 (PRD §3.4 / decision 4): thread the synchronous
-                # all-lane halt so a CONCLUDED cross-check divergence stops the
-                # queue the instant it is detected — BEFORE any further adoption —
-                # instead of trailing it via the async escalation gate (incident
-                # 83336a32 halted +3s too late).  Cross-check stays a trailing
-                # detector; the halt is synchronous only to precede further lands.
-                halt_hook=self.operator_halt,
-                dry_run_handles=self._dry_run_handles,
-                main_health_probe_handles=_MainHealthProbeHandles(
-                    background_tasks=self._background_tasks,
-                    auto_heal=self._auto_heal_main_health_deferred,
-                ),
                 depth=depth,
                 speculative=item.speculative,
                 chain_items=chain_items,
                 chain_build_ms=chain_build_ms,
                 merge_base_sha=verify_base.merge_base_sha,
-                main_sha=verify_base.main_sha, verifier=self._verifier,
+                main_sha=verify_base.main_sha,
             ))
             # task 2420 (DEFECT 1, split from 2357; extends #1728), revised by
             # task 4579: no-progress budget seed.  Content-mtime is sampled
@@ -21776,7 +21790,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
                         merge_sha=rebased_sha,
                         keep_worktrees=set(self._owned_merge_worktrees),
-                        run_post_merge_verify=_run_post_merge_verify,
+                        run_post_merge_verify=self._lane_post_merge_verify,
                         event_store=self._event_store,
                     )
                     if isinstance(gate, MergeOutcome):

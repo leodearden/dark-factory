@@ -174,8 +174,9 @@ async def test_head_whose_main_moved_by_an_unrelated_commit_still_goes_through_t
     outcome = await merge_through_lane(lane, queue, request)
 
     assert outcome.status == 'done', outcome
-    [merge_commit] = verify.heads
+    merge_commit = verify.heads[0]
     assert outcome.merge_sha != merge_commit
+    assert verify.heads[1] == outcome.merge_sha
     assert outcome.merge_sha == _git(scene.repo, 'rev-parse', 'main')
     assert 'gate_retry' in _attempt_outcomes(store, 'drifted')
 
@@ -208,8 +209,9 @@ async def test_ancestry_probe_error_falls_through_to_the_gate(tmp_path: Path) ->
     outcome = await merge_through_lane(lane, queue, request)
 
     assert outcome.status == 'done', outcome
-    [merge_commit] = verify.heads
+    merge_commit = verify.heads[0]
     assert outcome.merge_sha != merge_commit
+    assert verify.heads[1] == outcome.merge_sha
     assert 'gate_retry' in _attempt_outcomes(store, 'probe-error')
 
 
