@@ -71,6 +71,10 @@ from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+from fused_memory.reconciliation.overreach_flags import (
+    acknowledge_overreach_flags,
+    fetch_overreach_flags,
+)
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
 from fused_memory.reconciliation.scope_freshness import (
@@ -123,6 +127,7 @@ from fused_memory.services.orchestrator_detector import (
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+    from fused_memory.services.overreach_shadow import OverreachFlagPage
 
 try:
     from escalation.dedupe import (  # type: ignore[import-untyped]
@@ -1307,6 +1312,7 @@ class ReconciliationHarness:
         graphiti_queue_health: dict | None = None,
         index_health: dict | None = None,
         status_correction_reconciliation: dict | None = None,
+        overreach_flags: OverreachFlagPage | None = None,
     ) -> None:
         """Apply tier limits and mode-specific attributes to MemoryConsolidator.
 
@@ -1326,6 +1332,8 @@ class ReconciliationHarness:
         status_correction_reconciliation: _reconcile_status_correction record
             (task 1938; available only in full-cycle passes; None in
             remediation passes).
+        overreach_flags: fetch_overreach_flags page (task 6137; available only
+            in full-cycle passes; None in remediation passes).
         """
         stage.episode_limit = tier.episode_limit
         stage.memory_limit = tier.memory_limit
@@ -1338,6 +1346,7 @@ class ReconciliationHarness:
         stage.graphiti_queue_health = graphiti_queue_health
         stage.index_health = index_health
         stage.status_correction_reconciliation = status_correction_reconciliation
+        stage.overreach_flags = overreach_flags
 
     @staticmethod
     def _configure_task_sync(
@@ -3775,6 +3784,8 @@ class ReconciliationHarness:
         # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
         graphiti_queue_health = await self._check_graphiti_queue_health(scope.project_id)
 
+        overreach_flags = await fetch_overreach_flags(self.memory.overreach_shadow, scope.project_id)
+
         # Check FalkorDB index provisioning and escalate on drift (task 3709 / PRD δ).
         # This is the recon-cadence half of Q3; the startup sweep calls the SAME
         # detector.  Kept here, outside the _active_runs.track block below, so a
@@ -3892,6 +3903,7 @@ class ReconciliationHarness:
                             graphiti_queue_health=graphiti_queue_health,
                             index_health=index_health,
                             status_correction_reconciliation=status_correction_reconciliation,
+                            overreach_flags=overreach_flags,
                         )
 
                     # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
@@ -3943,6 +3955,7 @@ class ReconciliationHarness:
                     'last_task_change_timestamp': completed_at,
                 })
                 await self.journal.update_watermark(watermark)
+                await acknowledge_overreach_flags(self.memory.overreach_shadow, overreach_flags)
 
                 run.completed_at = datetime.now(UTC)
                 run.status = RunStatus.completed
