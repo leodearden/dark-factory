@@ -505,3 +505,52 @@ class TestSurvivorGateOverLegacyCells:
             'implementer': ['claude-sonnet-max'],
             'architect': ['architect-opus-high'],
         }
+
+
+# ---------------------------------------------------------------------------
+# task 6738 — role readers read an enum-valued role (a cell from the new
+# producers, or any cell after load) exactly as they read its string value.
+# ---------------------------------------------------------------------------
+
+class TestRoleReadersAcceptTheEnum:
+    def test_enum_roles_select_what_their_values_select(self):
+        from orchestrator.evals.metrics import RoleUnderTest
+        from orchestrator.evals.report import select_survivors
+
+        report = _report([
+            _row('impl-a', 'implementer', 0.9),
+            _row('impl-b', RoleUnderTest.IMPLEMENTER, 0.7),
+            _row('impl-c', 'implementer', 0.5),
+            _row('arch-a', RoleUnderTest.ARCHITECT, 0.4, plan_quality=0.8),
+            _row('arch-b', 'architect', 0.3, plan_quality=0.6),
+        ])
+
+        by_enum = select_survivors(
+            report, top_k=2, roles=(RoleUnderTest.IMPLEMENTER, RoleUnderTest.ARCHITECT),
+        )
+        by_value = select_survivors(report, top_k=2, roles=['implementer', 'architect'])
+
+        assert by_enum == by_value == {
+            'implementer': ['impl-a', 'impl-b'],
+            'architect': ['arch-a', 'arch-b'],
+        }
+
+    def test_select_judge_results_keeps_only_judge_cells(self):
+        from orchestrator.evals.judge_pilot import select_judge_results
+        from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
+        from orchestrator.evals.results import EvalResult
+
+        def cell(config: str, role: RoleUnderTest) -> EvalResult:
+            return EvalResult(
+                task_id='df_task_1', config_name=config, outcome='done',
+                metrics=EvalMetrics(role_under_test=role).to_dict(), worktree_path='/fake/wt',
+            )
+
+        judge = cell('judge-haiku', RoleUnderTest.JUDGE)
+        cells = [
+            cell('claude-sonnet-max', RoleUnderTest.IMPLEMENTER),
+            judge,
+            cell('architect-opus-max+claude-sonnet-max', RoleUnderTest.END_TO_END),
+        ]
+
+        assert select_judge_results(cells) == [judge]
