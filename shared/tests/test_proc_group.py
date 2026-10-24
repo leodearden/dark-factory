@@ -187,6 +187,18 @@ def _kill_group(pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
+def _sigkill_running_members(pgid: int) -> None:
+    """Best-effort SIGKILL, by pid, of each running member of group *pgid* (test cleanup).
+
+    For a group whose leader may already be reaped, where ``_kill_group``'s
+    precondition does not hold: only pids seen in the group are signalled.
+    """
+    for member in process_group_members(pgid):
+        if not member.terminated:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(member.pid, signal.SIGKILL)
+
+
 @pytest.fixture
 def unreaped_zombie_pgid():
     """Yield the pgid of a one-member group whose only member is an unreaped zombie.
@@ -730,6 +742,90 @@ class TestTerminateProcessGroup:
                 await proc.wait()
 
         await _await_group_terminated(pgid)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(30)
+    @pytest.mark.parametrize(
+        'survivor_cmd',
+        [
+            pytest.param(
+                "(trap '' TERM; echo ready; exec sleep 30) & wait",
+                id='survivor_holds_the_pipe',
+            ),
+            pytest.param(
+                "(trap '' TERM; echo ready; exec sleep 30 >/dev/null 2>&1) & wait",
+                id='survivor_released_the_pipe',
+            ),
+        ],
+    )
+    async def test_a_member_that_ignores_sigterm_is_sigkilled_after_the_leader_exits(
+        self, survivor_cmd
+    ):
+        """The escalation follows the group, not the leader.
+
+        A survivor holding the stdout pipe keeps ``proc.wait()`` pending past
+        the grace; one that released it lets ``proc.wait()`` return at once.
+        """
+        proc = await asyncio.create_subprocess_shell(
+            survivor_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = proc.pid
+        try:
+            await _await_shell_ready(proc, what='survivor SIGTERM trap installed')
+            await _await_group_membership(pgid, total=2, comm='sleep', comm_count=1)
+
+            await terminate_process_group(proc, pgid, grace_secs=0.5)
+
+            assert proc.returncode == -signal.SIGTERM, (
+                f'the leader must die of the SIGTERM itself, got {proc.returncode}'
+            )
+            await _await_group_terminated(pgid)
+        finally:
+            _sigkill_running_members(pgid)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), 5)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
+    async def test_a_group_that_dies_on_sigterm_gets_no_sigkill_and_no_grace_wait(
+        self, monkeypatch
+    ):
+        proc = await asyncio.create_subprocess_shell(
+            'sleep 60 & sleep 60 & echo ready; wait',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = proc.pid
+        real_killpg = os.killpg
+        calls: list[tuple[int, int]] = []
+
+        def recording_killpg(target: int, sig: int) -> None:
+            calls.append((target, sig))
+            real_killpg(target, sig)
+
+        try:
+            await _await_shell_ready(proc, what='both background jobs forked')
+            await _await_group_membership(pgid, total=3, comm='sleep', comm_count=2)
+            monkeypatch.setattr('shared.proc_group.os.killpg', recording_killpg)
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+
+            await terminate_process_group(proc, pgid, grace_secs=30.0)
+
+            elapsed = loop.time() - started
+            assert elapsed < 30.0, f'a group dead on SIGTERM cost the grace: {elapsed:.2f}s'
+            assert signal.SIGKILL not in [sig for _, sig in calls], (
+                f'a group dead on SIGTERM must not be SIGKILLed; killpg calls: {calls}'
+            )
+            await _await_group_terminated(pgid)
+        finally:
+            _sigkill_running_members(pgid)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), 5)
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
