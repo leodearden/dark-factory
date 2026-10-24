@@ -162,6 +162,12 @@ class TestSoakWrites:
     def test_keeps_a_full_recon_write(self) -> None:
         assert [w.memory_id for w in _writes([_journal('x', source='full_recon')])] == ['m-x']
 
+    def test_keeps_a_triage_attach_whose_journal_carries_the_keys_triage_wrote(self) -> None:
+        journaled = _journal('i1', metadata={'kind': 'sighting', 'parent_id': 'P', 'topic': 't'})
+        [write] = _writes([journaled], [_attach('i1', 'restated', 'P')])
+        assert write.metadata == {'category': 'procedural_knowledge', 'topic': 't'}
+        assert (write.production_outcome, write.production_target) == ('restated', 'P')
+
     def test_drops_a_caller_owned_attach(self) -> None:
         assert _writes([_journal('x')], [_attach('x', 'amended', 'P', triage_sig=False)]) == []
 
@@ -313,7 +319,7 @@ class TestTheWriteTimeSlate:
     def test_a_hoisted_canonical_missing_from_the_table_has_no_text(self, history: Any) -> None:
         points = [point for point in _slate_points() if point[0] != 'P']
         assert _slate(history, k=4, points=points)['targets'] == {
-            'P': {'content': None, 'created_at': None, 'edited_after_write': False},
+            'P': {'content': None, 'created_at': None, 'edited_after_write': True},
         }
 
     def test_the_row_is_snapshot_shaped_so_the_arms_selector_reads_it(self, history: Any) -> None:
