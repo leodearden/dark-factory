@@ -101,14 +101,13 @@ class _Scene:
 
 
 def _scene(tmp_path: Path, **overrides: Any) -> _Scene:
-    """A whole-tree gate that never takes the same-tree arm, so a moved main
-    always re-verifies."""
+    """A whole-tree gate that, unless *overrides* say otherwise, never takes
+    the same-tree arm, so a moved main always re-verifies."""
     repo = seed_repo(tmp_path / 'repo', _SEED)
-    config = lane_scene_config(
-        repo, _GIT,
-        merge_verify_breadth='full', merge_verify_min_free_disk_bytes=0,
-        merge_gate_history_pure=False, **overrides,
-    )
+    config = lane_scene_config(repo, _GIT, **{
+        'merge_verify_breadth': 'full', 'merge_verify_min_free_disk_bytes': 0,
+        'merge_gate_history_pure': False, **overrides,
+    })
     return _Scene(repo=repo, git_ops=GitOps(_GIT, repo), config=config)
 
 
@@ -128,10 +127,7 @@ def remote_scene(tmp_path: Path) -> _Scene:
     return _remote_scene(tmp_path, verify_cross_check_remote_green=False)
 
 
-async def _single(scene: _Scene, name: str) -> MergeRequest:
-    worktree = (await scene.git_ops.create_worktree(name)).path
-    (worktree / f'{name}.txt').write_text(f'{name}\n')
-    await scene.git_ops.commit(worktree, f'{name}: own work')
+def _request(scene: _Scene, name: str, worktree: Path) -> MergeRequest:
     return MergeRequest(
         task_id=name,
         branch=QueuedBranch.parse(name, _GIT.branch_prefix),
@@ -142,6 +138,13 @@ async def _single(scene: _Scene, name: str) -> MergeRequest:
         config=scene.config,
         result=asyncio.get_running_loop().create_future(),
     )
+
+
+async def _single(scene: _Scene, name: str) -> MergeRequest:
+    worktree = (await scene.git_ops.create_worktree(name)).path
+    (worktree / f'{name}.txt').write_text(f'{name}\n')
+    await scene.git_ops.commit(worktree, f'{name}: own work')
+    return _request(scene, name, worktree)
 
 
 class _MovesMainOnFirstCall(FakeVerifier):
@@ -343,3 +346,54 @@ async def test_a_remote_gate_keeps_the_local_cross_check(tmp_path: Path) -> None
         for name, event in store.events if name == 'verdict_parity_ok'
     ]
     assert parity == [(host.calls[0], 'laptop'), (scene.main_sha(), 'laptop')]
+
+
+# ─── A declared history leg stays local whatever the head holds ─────────────
+
+
+def _commit_file(worktree: Path, name: str) -> str:
+    (worktree / name).write_text(f'{name}\n')
+    _git(worktree, 'add', '--', name)
+    _git(worktree, 'commit', '-m', f'add {name}')
+    return _git(worktree, 'rev-parse', 'HEAD')
+
+
+async def test_a_same_tree_history_leg_stays_local_on_a_remote_lease_head(
+    tmp_path: Path,
+) -> None:
+    """Main gains the head's patch under the follower's verify, so the rebased
+    follower carries the tree it verified: the gate runs only the declared
+    history leg, whose runner is local-only."""
+    leg_head = tmp_path / 'leg-head'
+    scene = _remote_scene(
+        tmp_path, verify_cross_check_remote_green=False,
+        merge_gate_history_pure=True,
+        merge_gate_history_test_command=f'git rev-parse HEAD > {leg_head}',
+    )
+    head_wt = (await scene.git_ops.create_worktree('head')).path
+    head_commit = _commit_file(head_wt, 'head.txt')
+    follower_wt = (await scene.git_ops.create_worktree('follower')).path
+    _git(follower_wt, 'merge', '--ff-only', head_commit)
+    _commit_file(follower_wt, 'follower.txt')
+    follower = _request(scene, 'follower', follower_wt)
+    lands_the_heads_patch = functools.partial(
+        _git_until_it_takes, scene.repo, 'cherry-pick', '-x', head_commit,
+    )
+    host = _HeadHost(_host_moves_main_then_passes(lands_the_heads_patch))
+    store = _RecordingEventStore()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(
+        scene.git_ops, queue,
+        verifier=FakeVerifier(), clock=healthy_verify_clock(), event_store=store,
+        remote_runners=[host],
+    )
+
+    outcome = await merge_through_lane(lane, queue, follower)
+
+    assert outcome.status == 'done', outcome
+    landed = scene.main_sha()
+    [gate] = [event['data'] for name, event in store.events if name == 'merge_reverify_gate']
+    assert gate['reason'] == 'same_tree_history_leg', gate
+    assert host.calls == [gate['verified_merge_sha']]
+    assert leg_head.read_text().strip() == landed
+    assert [row['runner'] for row in _rows(store, 'merge_verify', landed)] == ['history-leg']
