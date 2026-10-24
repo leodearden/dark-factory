@@ -40,7 +40,6 @@ for the full design rationale (batch prompt, schema, topo-sort dispatch, fallbac
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -79,7 +78,7 @@ from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
 from fused_memory.middleware.cancelled_premise_blocklist import (
     match_candidate as match_blocklisted_premise,
 )
-from fused_memory.middleware.candidate_key import compute_candidate_key, normalize_title
+from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.middleware.curation_deferral import (
     POOL_UNAVAILABLE_ERRORS,
     DeferReason,
@@ -806,33 +805,6 @@ class TaskCurator:
     _RECENT_CREATES_TTL_SECS = 600.0  # 10 min — long enough to catch
     # concurrent triages but short enough that stale entries don't pin
     # memory after a task is removed.
-
-    @staticmethod
-    def _intra_batch_key(title: str, description: str) -> str:
-        """Stable 16-char hash over normalised (title, description).
-
-        Used by the planning_mode / curator batch pipeline to identify
-        near-identical entries inside a single LLM-generated batch (the
-        canonical bulk-creation path now that expand_task / parse_prd are
-        gone).
-
-        Normalisation delegates to
-        ``candidate_key.py::normalize_title`` — lowercase, strip, and collapse
-        internal whitespace — making the key case- and whitespace-insensitive.
-
-        Does NOT include files_to_modify because Taskmaster-generated
-        subtasks frequently omit that field, so including it would produce
-        false negatives for otherwise-identical tasks.
-        """
-        h = hashlib.sha256()
-        h.update(normalize_title(title).encode())
-        h.update(b'|')
-        h.update(normalize_title(description).encode())
-        # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
-        # Any change to length or algorithm must be mirrored there and at the other
-        # mirror sites: curator_types.py::CandidateTask.payload_hash and
-        # task_curator.py::TaskCurator._normalize_key.
-        return h.hexdigest()[:16]
 
     @staticmethod
     def _normalize_key(candidate: CandidateTask) -> str | None:
