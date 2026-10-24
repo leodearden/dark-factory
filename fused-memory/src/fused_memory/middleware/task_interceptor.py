@@ -635,25 +635,19 @@ class TaskInterceptor:
         # write inside the worker). Held only across the fast Taskmaster
         # stdio call. Every mutation takes this lock.
         #
-        # ``_curator_locks`` (long, curator-family) serialises the
-        # remove_task flow so concurrent candidates can't both
-        # decide "create" for a duplicate. Held across ``curator.curate()``
-        # (an LLM round-trip, 25-35s tail) plus the synchronous
-        # ``note_created`` + awaited ``record_task`` so the NEXT waiter on
-        # the curator lock sees the new entry on its pre-LLM check (R3).
+        # ``_curator_locks`` (long, curator-family) serialises curator
+        # decisions within a project so concurrent candidates can't both
+        # decide "create" for a duplicate (R3). The worker holds it across
+        # each whole batch, an LLM round-trip included, and ``remove_tasks``
+        # takes it too; ``_curator_lock``'s docstring states the span.
         #
-        # NOTE: add_task's *queueing* is now provided by per-project ticket
+        # NOTE: add_task's *queueing* is provided by per-project ticket
         # queues and workers (_curator_worker) — one asyncio.Queue and one
         # asyncio.Task per project_id — so a slow curator round-trip on
-        # project A does not delay submissions on project B.  The worker
-        # STILL acquires ``_curator_lock(project_id)`` around curator.curate()
-        # through note_created + record_task to preserve R3: remove_task
-        # still enters _curator_lock directly, and without this
-        # acquisition its curate() call could race against the worker's
-        # on a stale pre-note_created snapshot and both decide "create" for
-        # the same candidate.  Within a project, the lock provides
-        # single-threaded curator execution; across projects, the per-project
-        # queue+worker+lock architecture preserves fairness.
+        # project A does not delay submissions on project B.  Within a
+        # project, the lock provides single-threaded curator execution;
+        # across projects, the per-project queue+worker+lock architecture
+        # preserves fairness.
         #
         # Lock ordering is always curator_lock BEFORE write_lock to avoid
         # deadlock. Write-only ops take just write_lock, so a long curator
@@ -3708,20 +3702,27 @@ class TaskInterceptor:
     def _curator_lock(self, project_id: str) -> asyncio.Lock:
         """Per-project lock for curator-family operations.
 
-        Long-held; covers ``curator.curate()`` (LLM round-trip) plus the
-        post-write ``note_created``/``record_task`` steps so the next waiter
-        on this lock sees the new entry on its pre-LLM check.
-
-        Taken by: ``remove_task`` (conservative: protects concurrent
-        combine-target integrity) AND by ``_process_add_ticket`` (the add_task
-        worker path) so curator decisions are mutually exclusive within a
-        project.  Lock order: curator_lock BEFORE write_lock. Short writes
+        Taken by ``remove_tasks`` (curator_lock, then write_lock) and by the
+        worker's batch path, :meth:`_process_add_tickets_batch_prepared`, so
+        curator decisions are mutually exclusive within a project.  Lock
+        order: curator_lock BEFORE write_lock.  Short writes
         (set_task_status etc.) never take this lock and so are not blocked
         by an in-flight curator decision.
 
-        NOTE: Routing ``remove_task`` through the per-project worker queue is
-        a planned follow-up; until then the worker must acquire this lock to
-        preserve R3.
+        On the batch path the span is the contract.  The R4 idempotency
+        check, the curate call (an LLM round-trip) and, per ticket, the
+        dispatch, :meth:`_persist_worker_outcome`, the ``task_created``
+        journal event and the waiter signal all run inside the lock.  So a
+        ``remove_tasks`` never observes a created task whose ticket still
+        reads ``pending``.
+
+        A cancellation between ``tm.add_task`` and the persist is
+        deliberately not shielded.  The restart sweep marks the ticket
+        ``failed/server_restart``, and a re-submit collides on the
+        ``candidate_key`` partial UNIQUE index, which
+        :meth:`_dispatch_ticket_decision` resolves ``combined``.  The
+        rationale is decision 9 of
+        ``plans/review-all-s11-curator-pipeline-prd.md``.
         """
         lock = self._curator_locks.get(project_id)
         if lock is None:
