@@ -230,7 +230,7 @@ class TestLanded:
 
 
 def _drifted_runs_db(path: Path) -> Path:
-    """Every table the probe looks for, none of the columns the digest's queries read."""
+    """Every table the digest's queries read, none of the columns they read."""
     conn = sqlite3.connect(path)
     conn.executescript('CREATE TABLE events (id INTEGER); CREATE TABLE invocations (id INTEGER); '
                        'CREATE TABLE task_results (id INTEGER);')
