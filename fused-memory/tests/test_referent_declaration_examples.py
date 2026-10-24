@@ -210,7 +210,12 @@ def _read_repo_doc(relative: str) -> str:
     return path.read_text()
 
 
-_GUARDED_DOCS = ('CLAUDE.md', '.claude/commands/memory.md', 'skills/reflect/SKILL.md')
+_GUARDED_DOCS = (
+    'CLAUDE.md',
+    '.claude/commands/memory.md',
+    'skills/reflect/SKILL.md',
+    'skills/orchestrate/SKILL.md',
+)
 
 _GUARDED_SITES = (
     ('recon-prompt-fragment', render_referent_declaration_guidance),
