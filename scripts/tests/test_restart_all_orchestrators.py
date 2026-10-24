@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -46,6 +47,7 @@ from df_pytest_isolation import (
     read_leaked_pid,
     run_in_new_session,
     run_in_new_session_until,
+    run_in_new_session_while_progressing,
     synthetic_unit,
     wait_pid_gone,
     wait_proof_grace_secs,
@@ -95,6 +97,7 @@ does under --value: the sweep reads it to address its drain request.
 import json
 import os
 import sys
+import tempfile
 import time
 
 STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
@@ -106,8 +109,17 @@ def _load():
 
 
 def _save(state):
-    with open(STATE_PATH, "w") as f:
-        json.dump(state, f)
+    fd, tmp_name = tempfile.mkstemp(dir=os.path.dirname(STATE_PATH) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp_name, STATE_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _observe_lease(args):
@@ -391,6 +403,53 @@ def _run_script_until(
     """
     cmd, full_env = _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env)
     return run_in_new_session_until(cmd, condition=condition, env=full_env, timeout=timeout)
+
+
+class _SweepProgress(NamedTuple):
+    verdicts_seen: frozenset[tuple[str, str]]
+    systemctl_calls: int
+
+
+def _sweep_progress(state_path, trace_path) -> _SweepProgress:
+    """How far a sweep has got: every DISTINCT gate verdict it has recorded,
+    and how many systemctl commands it has issued. Distinct, not the ledger's
+    length: a gate re-polling the verdict it already had is waiting, not
+    advancing."""
+    return _SweepProgress(
+        frozenset(read_drain_poll_trace(trace_path, complete_only=True)),
+        len(_load_state(state_path)["calls"]),
+    )
+
+
+# Bounds time WITHOUT progress; a correct sweep's longest such stretch is the awaited unit's polls.
+_SWEEP_STALL_TIMEOUT_SECS = 15
+
+
+def _run_sweep_while_progressing(
+    bin_dir, state_path, fleet_dir, trace_path, *extra_args, env,
+    stall_timeout=_SWEEP_STALL_TIMEOUT_SECS,
+):
+    """`_run_script`, stopped as stalled once `_sweep_progress` has not
+    changed for *stall_timeout* seconds, however long the whole sweep takes.
+
+    On a stall the TimeoutExpired carries the last progress, the ledger and
+    the partial output as notes.
+    """
+    assert env.get("ORCH_DRAIN_POLL_TRACE_FILE") == str(trace_path), (
+        "the progress probe reads the ledger at trace_path, so the script must write it there"
+    )
+    cmd, full_env = _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env)
+    try:
+        return run_in_new_session_while_progressing(
+            cmd, progress=lambda: _sweep_progress(state_path, trace_path),
+            stall_timeout=stall_timeout, env=full_env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        exc.add_note(f"last progress={_sweep_progress(state_path, trace_path)!r}")
+        exc.add_note(f"ledger={read_drain_poll_trace(trace_path, complete_only=True)!r}")
+        exc.add_note(f"stdout={_decode(exc.stdout)!r}")
+        exc.add_note(f"stderr={_decode(exc.stderr)!r}")
+        raise
 
 
 def _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env):
@@ -2335,9 +2394,8 @@ def _assert_only_the_awaited_unit_is_halted(tmp_path, *, spawn_latency_secs=None
             [_Rewrite(after="verifying", to=_hb_drain([]), polls=awaited_polls)],
         ),
     ):
-        result = _run_script(
-            bin_dir, state_path, fleet_dir, "--drain", env=env,
-            timeout=_DRAIN_SPAWN_TIMEOUT_SECS,
+        result = _run_sweep_while_progressing(
+            bin_dir, state_path, fleet_dir, trace_path, "--drain", env=env,
         )
 
     polls = read_drain_poll_trace(trace_path)
