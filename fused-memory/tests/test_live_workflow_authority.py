@@ -9,6 +9,7 @@ identifiers an agent must act on, never the prose wording.
 from __future__ import annotations
 
 import pytest
+from _live_workflow_region import live_workflow_region
 
 from fused_memory.reconciliation.live_workflow_section import (
     CLAIMANT_FIELD,
@@ -102,14 +103,9 @@ class TestProbedScopeRule:
         assert format_filtered_task_tree(tree).startswith(ACTIVE_TASK_TREE_HEADER + '\n')
 
 
-_LIVE_WORKFLOW_REGION_HEADER = '## Live-Workflow Authority'
-
-
 def _stage_local_live_workflow_text(prompt: str) -> str:
     """The stage's own `## Live-Workflow Authority` prose, without the shared rules block."""
-    _, _, after = prompt.partition(_LIVE_WORKFLOW_REGION_HEADER)
-    end = after.find('\n## ')
-    region = after if end == -1 else after[:end]
+    region = live_workflow_region(prompt)
     rules = render_live_workflow_authority_rules()
     assert region.count(rules) == 1, 'the shared rules must sit inside the region they are stripped from'
     return region.replace(rules, '')
