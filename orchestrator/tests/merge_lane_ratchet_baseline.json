@@ -61,7 +61,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1472, "function_local_imports": 4, "lines": 16177, "prose_lines": 9347, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1468, "function_local_imports": 4, "lines": 16154, "prose_lines": 9312, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 39, "function_local_imports": 1, "lines": 660, "prose_lines": 299, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 0, "function_local_imports": 0, "lines": 96, "prose_lines": 21, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/coalesce_unwind.py": {"cognitive": 9, "function_local_imports": 0, "lines": 100, "prose_lines": 22, "reexport_names": 0},
@@ -149,6 +149,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_release_lane_flock": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_release_orphaned_lane_flock": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_relocate_foreign_meta_root": 2,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_remove_ephemeral_worktree": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_rename_branch_aside": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_repair_orphaned_reuse_lane": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_reseed_verified_clean": 4,
@@ -186,6 +187,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_warm_lane_disk_admission_blocked": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_warm_lane_script_candidates": 0,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_warm_lane_soft_pressure_defer": 2,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_warm_seed_ephemeral_worktree": 5,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_worktree_add_with_retry": 10,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_worktree_dirty": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_worktree_head_readable": 0,
@@ -207,7 +209,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::describe_commit_effect_in_main": 7,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::detach_lane_checkout": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::disable_shared_repo_auto_maintenance": 3,
-    "orchestrator/src/orchestrator/git_ops.py::GitOps::ephemeral_worktree": 17,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::ephemeral_worktree": 6,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::find_equivalent_commit": 28,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::find_inflight_merge_worktree": 8,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::find_merge_marker": 2,

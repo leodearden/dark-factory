@@ -277,21 +277,22 @@ def find_matching_transcript(
     Matching is PER-SESSION to defeat the same-cwd confound (sibling
     headless-agent transcripts share the encoded-cwd dir), in one of three
     tiers:
-      - EXACT (bound id, per :func:`_bound_session_id`):
-        ``<expected_dir>/<id>.jsonl`` is the transcript, or there is none.
-        Authoritative, with NO fallback — a same-prompt re-spawn, an in-window
-        sibling, or a later session that quotes the prompt would otherwise mask
-        a genuine loss. The accepted cost: ``/clear`` re-mints the id and the
-        registry re-binds to it, so a session that exits before writing under
-        the new id is reported missing although its launch transcript survives.
+      - EXACT (bound ids, per :func:`_bound_session_ids`): the first
+        ``<expected_dir>/<id>.jsonl`` that exists for the current or the launch
+        id is the transcript, or there is none. Authoritative, with NO
+        fallback — a same-prompt re-spawn, an in-window sibling, or a later
+        session that quotes the prompt would otherwise mask a genuine loss. A
+        ``/clear`` or compaction re-mint moves ``claude_session_id``, but
+        ``claude_launch_session_id`` still names the launch file; a record
+        bound before that field existed is matched on its current id alone.
       - STRONG (unbound, usable prompt): :func:`_match_prompt_prefix`.
       - WEAK (unbound, prompt too short/empty): :func:`_match_mtime_window`,
         never reached for a usable prompt.
     """
     session_dir = Path(projects_root) / inventory.encode_cwd(record.cwd)
-    bound_id = _bound_session_id(record)
-    if bound_id is not None:
-        return _bound_transcript(session_dir, bound_id)
+    bound_ids = _bound_session_ids(record)
+    if bound_ids:
+        return _bound_transcript(session_dir, bound_ids)
     if not session_dir.is_dir():
         return None
     candidates = sorted(session_dir.glob('*.jsonl'))
@@ -301,31 +302,38 @@ def find_matching_transcript(
     return _match_mtime_window(record.start_ts, candidates, now=now, skew=skew)
 
 
-def _bound_session_id(record: session_registry.SessionRecord) -> str | None:
-    """Return *record*'s bound Claude Code session id, or None to match it as unbound.
+def _bound_session_ids(record: session_registry.SessionRecord) -> tuple[str, ...]:
+    """Return *record*'s usable bound Claude Code session ids, current then launch; empty means unbound.
 
-    The id becomes a filename inside the expected dir, so one that is not a
+    Each id becomes a filename inside the expected dir, so one that is not a
     single path component (a hand-edited ``../x`` or an absolute path) could
     resolve to an unrelated file elsewhere and hide a real loss. Such an id
-    is rejected loudly rather than trusted.
+    is rejected loudly and ignored; the record's other id still counts.
     """
-    session_id = record.claude_session_id
-    if not session_id:
-        return None
-    if Path(session_id).name != session_id:
-        logger.warning(
-            '%s: claude_session_id %r is not a single path component; '
-            'matching the record as unbound',
-            record.session_slug, session_id,
-        )
-        return None
-    return session_id
+    usable: list[str] = []
+    for field_name, session_id in (
+        ('claude_session_id', record.claude_session_id),
+        ('claude_launch_session_id', record.claude_launch_session_id),
+    ):
+        if not session_id:
+            continue
+        if Path(session_id).name != session_id:
+            logger.warning(
+                '%s: %s %r is not a single path component; ignoring it',
+                record.session_slug, field_name, session_id,
+            )
+            continue
+        usable.append(session_id)
+    return tuple(dict.fromkeys(usable))
 
 
-def _bound_transcript(session_dir: Path, claude_session_id: str) -> Path | None:
-    """Return ``session_dir/<claude_session_id>.jsonl`` if that file exists, else None."""
-    path = session_dir / f'{claude_session_id}.jsonl'
-    return path if path.is_file() else None
+def _bound_transcript(session_dir: Path, session_ids: Sequence[str]) -> Path | None:
+    """Return the first ``session_dir/<id>.jsonl`` among *session_ids* that is a file, else None."""
+    for session_id in session_ids:
+        path = session_dir / f'{session_id}.jsonl'
+        if path.is_file():
+            return path
+    return None
 
 
 def _match_prompt_prefix(prefix: str, candidates: Sequence[Path]) -> Path | None:
@@ -394,8 +402,8 @@ class MissingTranscript:
     a follow-up probe) can locate the lost session: its registry slug, real
     ``cwd``, prompt prefix, ``start_ts``, exit code, and the encoded
     ``~/.claude/projects/<enc>`` dir the transcript should have lived in. The
-    bound Claude Code session id, when present, names the exact file that was
-    expected: ``<expected_dir>/<id>.jsonl``.
+    bound Claude Code session ids (current and launch), when present, name the
+    exact files that were expected: ``<expected_dir>/<id>.jsonl``.
     """
 
     session_slug: str
@@ -405,6 +413,7 @@ class MissingTranscript:
     exit_code: int | None
     expected_dir: Path
     claude_session_id: str | None = None
+    claude_launch_session_id: str | None = None
 
 
 def find_missing_transcripts(
@@ -444,6 +453,7 @@ def find_missing_transcripts(
                 exit_code=record.exit_code,
                 expected_dir=projects_root / inventory.encode_cwd(record.cwd),
                 claude_session_id=record.claude_session_id,
+                claude_launch_session_id=record.claude_launch_session_id,
             )
         )
     return findings
@@ -527,7 +537,8 @@ def _build_escalation_arguments(
     labels the detector as the source since it is a timer-driven probe, not a
     Taskmaster task. The ``summary`` names the count of lost sessions; the
     ``detail`` names each finding's slug and real ``cwd`` (plus expected dir,
-    ``start_ts``, exit code, ``claude_session_id``, and prompt prefix) so a
+    ``start_ts``, exit code, ``claude_session_id``,
+    ``claude_launch_session_id``, and prompt prefix) so a
     human can locate every lost session. When *force_persistence_ok* is not
     ``None`` (the preventer guard was evaluated), its verdict is appended — a
     MISSING preventer strengthens the diagnosis (the known regression cause is
@@ -543,7 +554,7 @@ def _build_escalation_arguments(
         f'{cfg.project_id!r} produced no plausibly-matching transcript under '
         f'~/.claude/projects — the "session ran, no transcript" regression. '
         f'Per-session (slug / cwd / start_ts / exit_code / expected_dir / '
-        f'claude_session_id / prompt):',
+        f'claude_session_id / claude_launch_session_id / prompt):',
     ]
     for finding in findings:
         detail_lines.append(
@@ -551,19 +562,17 @@ def _build_escalation_arguments(
             f'start_ts={finding.start_ts}  exit_code={finding.exit_code}  '
             f'expected_dir={finding.expected_dir}  '
             f'claude_session_id={finding.claude_session_id}  '
+            f'claude_launch_session_id={finding.claude_launch_session_id}  '
             f'prompt={finding.prompt_prefix!r}'
         )
     detail_lines.append(
-        'NOTE: a record with a bound claude_session_id is matched exactly — '
-        '<expected_dir>/<claude_session_id>.jsonl must exist. An unbound record '
-        'falls back to prompt-prefix containment (whitespace-normalized) in a '
-        'transcript first user turn under expected_dir, with a slash-command '
-        'expansion de-expanded to its typed form, or to a file-mtime window when '
-        'the prompt is too short to match. Known false-positive class: /clear '
-        're-mints the session id and the registry re-binds to it, so a session '
-        'that exited before writing under the new id is listed here although '
-        'its launch transcript (first user turn = the prompt) may still be in '
-        'expected_dir. Inspect expected_dir before acting.'
+        'NOTE: a record with a bound claude_session_id and/or '
+        'claude_launch_session_id is matched exactly — <expected_dir>/<id>.jsonl '
+        'must exist for at least one of them. An unbound record falls back to '
+        'prompt-prefix containment (whitespace-normalized) in a transcript first '
+        'user turn under expected_dir, with a slash-command expansion '
+        'de-expanded to its typed form, or to a file-mtime window when the '
+        'prompt is too short to match. Inspect expected_dir before acting.'
     )
     if force_persistence_ok is not None:
         verdict = 'present' if force_persistence_ok else 'MISSING'
