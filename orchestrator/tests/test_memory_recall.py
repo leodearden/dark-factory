@@ -847,6 +847,47 @@ class TestRenderEntityBlock:
             '- Task 3609 is related to task 3212.',
         ]
 
+    def test_a_summary_equal_to_the_joined_facts_renders_each_fact_once(self):
+        facts = [
+            'Task 3609 project-scopes the briefing context block.',
+            'Task 3609 landed as commit abc123.',
+            'Task 3609 is related to task 3212.',
+        ]
+        summary = '\n'.join(facts)
+        payload = {
+            'nodes': [_node('Task 3609', summary)],
+            'edges': [_edge(fact) for fact in facts] + [_edge(facts[1])],
+        }
+
+        rendered = render_entity_block(payload, 'Task 3609')
+
+        assert [rendered.count(fact) for fact in facts] == [1, 1, 1], rendered
+        assert not [line for line in rendered.splitlines() if line.startswith('- ')]
+        assert rendered == '**Task 3609** — ' + summary
+
+    def test_an_edge_the_summary_does_not_contain_still_renders(self):
+        held = 'Task 3609 landed as commit abc123.'
+        payload = {
+            'nodes': [_node('Task 3609', held)],
+            'edges': [_edge(held), _edge('Task 3609 is related to task 3212.')],
+        }
+
+        assert render_entity_block(payload, 'Task 3609').splitlines() == [
+            f'**Task 3609** — {held}',
+            '- Task 3609 is related to task 3212.',
+        ]
+
+    def test_a_fact_carried_by_two_edges_renders_once(self):
+        fact = 'Task 3609 is related to task 3212.'
+        payload = {
+            'nodes': [_node('Task 3609')],
+            'edges': [_edge(fact), _edge(fact, valid_at='2026-09-14T07:58:01+00:00')],
+        }
+
+        lines = render_entity_block(payload, 'Task 3609').splitlines()
+
+        assert len([line for line in lines if fact in line]) == 1, lines
+
     def test_a_fuzzy_neighbour_renders_nothing(self):
         payload = {
             'nodes': [_node('Task 3212', 'A DIFFERENT TASK ENTIRELY.')],
