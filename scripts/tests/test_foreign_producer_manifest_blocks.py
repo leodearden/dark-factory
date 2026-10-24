@@ -10,7 +10,9 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 from audit_delivered_checks import load_manifest_checks
+from committed_git_repo import committed_repo
 from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
 
@@ -124,13 +126,30 @@ def live_manifest_rows():
     return load_manifest_checks(checkout_root_or_skip(), {})[0]
 
 
+def _audit_rows_of(rows, relpath, label):
+    return [
+        (row.task_id, row.name)
+        for row in rows
+        if row.manifest == relpath and row.task_label == label
+    ]
+
+
+def _bound_locally(sidecar: Path, label: str) -> str:
+    """*sidecar*'s text with block *label* bound to a local task_id instead."""
+    doc = yaml.safe_load(sidecar.read_text(encoding="utf-8"))
+    (block,) = [task for task in doc["tasks"] if task["label"] == label]
+    block.pop("external_task_id", None)
+    block["task_id"] = 1
+    return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
+
+
 @pytest.mark.parametrize(
     "relpath,label,external_task_id",
     _EXTERNAL_REGISTRY_BLOCKS,
     ids=_BLOCK_IDS,
 )
 def test_live_foreign_producer_block_contributes_no_audit_row(
-        live_manifest_rows, relpath, label, external_task_id):
+        live_manifest_rows, tmp_path, relpath, label, external_task_id):
     """A foreign-bound block yields no row for this project's audits.
 
     The audits join a sidecar block to this project's task store by its
@@ -140,12 +159,24 @@ def test_live_foreign_producer_block_contributes_no_audit_row(
     passed reify's, and ρ1–ρ3 misjoined to unrelated DF 7334–7336, where
     their grep and path checks read as false broken / vacuous / unwired
     live gates.
+
+    NON-VACUITY: the same audit is first run over a copy of the sidecar with
+    this block bound locally. A block whose checks are all manual yields no
+    row even then, so this case could not fail for it: it SKIPS, and its
+    binding stays pinned by the declaration test above.
     """
-    leaked = [
-        (row.task_id, row.name)
-        for row in live_manifest_rows
-        if row.manifest == relpath and row.task_label == label
-    ]
+    root = checkout_root_or_skip()
+    counterfactual = committed_repo(
+        tmp_path / "bound-locally",
+        {relpath: _bound_locally(Path(root) / relpath, label)},
+    )
+    if not _audit_rows_of(load_manifest_checks(counterfactual, {})[0], relpath, label):
+        pytest.skip(
+            f"{label} has no check the audit reads, so even a local task_id "
+            f"would yield no audit row"
+        )
+
+    leaked = _audit_rows_of(live_manifest_rows, relpath, label)
     assert not leaked, (
         f"{relpath} label {label} (producer {external_task_id}) leaked "
         f"{len(leaked)} audit row(s) {leaked}: its foreign producer is being "
