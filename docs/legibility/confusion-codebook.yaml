@@ -20963,7 +20963,7 @@ entries:
 - id: entry-cand-20260919-2
   title: Python heredoc edit script pastes a docstring INCLUDING its own closing triple-quote, ending the script's own literal early and leaving the tail as bare code (SyntaxError)
   severity: medium
-  status: fixed
+  status: open
   origin_phase: implement
   manifested_phase: implement
   sightings:
@@ -21050,7 +21050,6 @@ entries:
     task_id: 5687
     resolution: created
     step: curator
-  fixed_at_sha: cd48063adec0e9f824e16e9577d1609b854a7e18
 - id: entry-cand-20260919-3
   title: fused-memory MCP calls fail within a second with the harness's `Unable to connect` while fused-memory.service restarts with port 8002 unbound -- not a backing-store timeout and not worktree-specific
   severity: medium
