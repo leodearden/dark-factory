@@ -480,7 +480,7 @@ def lane_for_task_metadata(metadata: dict | None) -> Literal['normal', 'high']:
     the default 'normal' lane.
     """
     value = (metadata or {}).get('merge_lane', '')
-    return normalize_lane(value or '')  # type: ignore[return-value]
+    return normalize_lane(value or '')
 
 
 _FIX_BRIEF_TITLE_MAX = 100

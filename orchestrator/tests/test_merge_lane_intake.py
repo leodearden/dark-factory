@@ -81,7 +81,7 @@ class MergeWorktrees:
         self.cleaned: list[Path] = []
         self.guarded_removals: list[tuple[Path, str]] = []
 
-    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:  # noqa: ARG002
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:
         return self.worktree
 
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None:
@@ -102,7 +102,7 @@ class RivalWinsTheScan(MergeWorktrees):
         super().__init__(None)
         self.rival_submits = rival_submits
 
-    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:  # noqa: ARG002
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:
         await self.rival_submits()
         return None
 
@@ -110,7 +110,7 @@ class RivalWinsTheScan(MergeWorktrees):
 class ClosedQueue(asyncio.Queue):
     """A queue that refuses every request, as a closed queue would."""
 
-    async def put(self, item: Any) -> None:  # noqa: ARG002
+    async def put(self, item: Any) -> None:
         raise RuntimeError('queue closed')
 
 

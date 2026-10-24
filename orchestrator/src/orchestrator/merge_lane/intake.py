@@ -14,7 +14,7 @@ import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
@@ -44,12 +44,12 @@ logger = logging.getLogger('orchestrator.merge_lane')
 # server's merge_request handler to build the {error, code, …} envelope.
 _C3_DUPLICATE_IN_VERIFY_CODE = 'duplicate_in_verify'
 
-MERGE_LANES: tuple[str, ...] = ('high', 'normal')
+MERGE_LANES: tuple[Literal['high', 'normal'], ...] = ('high', 'normal')
 """Priority-ordered lane names (high first).  ``MergeIntake`` drains and picks
 requests in this order: the first non-halted non-empty lane wins."""
 
 
-def normalize_lane(lane: str) -> str:
+def normalize_lane(lane: str) -> Literal['high', 'normal']:
     """Map an unrecognised lane value to 'normal' (defensive; prevents starvation)."""
     return lane if lane in MERGE_LANES else 'normal'
 
