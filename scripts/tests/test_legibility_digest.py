@@ -34,15 +34,19 @@ from legibility import inventory as inventory_mod
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
     CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD,
+    HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT,
     NON_HUMAN_ORIGIN_IDS,
     NON_HUMAN_ORIGIN_TURNS,
     TASK_NOTIFICATION_TEXT,
     TRICKLE_CODER_PREAMBLE,
     UNKNOWN_PROVENANCE_TEXT,
+    WATCHER_ROTATION_PROMPT,
     briefing_text,
     coder_judgment,
     json_fenced,
     merger_prompt,
+    pre_5356_replan_prompt,
+    prior_round_adjudicator_prompt,
     recon_run_review_text,
     steward_continuation_prompt,
     with_origin,
@@ -2033,6 +2037,20 @@ def _sdk_prompt(text):
     return rec
 
 
+_BLOCKED_LITERAL = 'BLOCKED: merge gate refused the branch'
+
+INJECTED_PROSE_PROMPTS = (
+    pytest.param(
+        prior_round_adjudicator_prompt(description=_BLOCKED_LITERAL),
+        id='prior_round_adjudicator',
+    ),
+    pytest.param(pre_5356_replan_prompt(_BLOCKED_LITERAL), id='pre_5356_replan'),
+    pytest.param(WATCHER_ROTATION_PROMPT, id='watcher_rotation'),
+)
+"""The generation-7 harness prose prompts. Two carry a df_guard literal in
+their review free text, which must not count as this session's signal."""
+
+
 class TestHarnessInjectedTurnFilter:
     def test_briefing_shaped_turn_is_excluded_by_content(self):
         records = [_user_text(briefing_text())]
@@ -2275,6 +2293,38 @@ class TestHarnessInjectedTurnFilter:
         assert '## User Corrections' not in digest
         assert meta['n_user_turns'] == 0
         assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
+
+    @pytest.mark.parametrize('prompt', INJECTED_PROSE_PROMPTS)
+    def test_injected_prose_prompt_is_excluded_from_iter_user_turns(self, prompt):
+        # The 16e1a37b / 2880c011 / 4aaf48b0 shape: the injected prompt is
+        # the session's first user record.
+        records = [_sdk_prompt(prompt), _user_text('please fix the bug')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [(1, 'please fix the bug')]
+
+    @pytest.mark.parametrize('prompt', INJECTED_PROSE_PROMPTS)
+    def test_render_digest_injected_prose_prompt_session_has_no_gold_section(self, prompt):
+        digest = mod.render_digest(
+            [_with_session_meta(_sdk_prompt(prompt))], agent_class='orchestrated-task',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Corrections' not in digest
+        assert meta['n_user_turns'] == 0
+        assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
+
+    @pytest.mark.parametrize(
+        'text', HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT,
+        ids=['adjudicator', 'replan', 'watcher'],
+    )
+    def test_human_turn_naming_an_injected_prompt_stays_gold(self, text):
+        turns = mod.iter_user_turns([_user_text(text)])
+
+        assert [t['text'] for t in turns] == [text]
 
     def test_usage_limit_mentioned_in_passing_is_not_excluded(self):
         # Must NOT regress: a genuine human turn that merely MENTIONS a
