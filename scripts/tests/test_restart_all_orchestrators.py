@@ -43,6 +43,7 @@ from df_pytest_isolation import (
     read_drain_poll_trace,
     read_leaked_pid,
     run_in_new_session,
+    run_in_new_session_until,
     synthetic_unit,
     wait_pid_gone,
     wait_proof_grace_secs,
@@ -356,17 +357,38 @@ def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=2
     reparented to systemd --user. `_decode` below still applies -- the re-raised
     TimeoutExpired carries the partial output the timeout tests assert on.
     """
+    cmd, full_env = _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env)
+    return run_in_new_session(cmd, env=full_env, timeout=timeout)
+
+
+def _run_script_until(
+    bin_dir, state_path, fleet_dir, *extra_args, condition, timeout, env=None
+):
+    """`_run_script`, stopped as soon as *condition* holds.
+
+    Returns df_pytest_isolation.run_in_new_session_until's RunUntilOutcome.
+    ``timeout`` is a must-not-hang deadline, paid only when *condition* never
+    holds.
+    """
+    cmd, full_env = _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env)
+    return run_in_new_session_until(cmd, condition=condition, env=full_env, timeout=timeout)
+
+
+def _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env):
+    """The argv and env both spawn wrappers run the script with: the fake
+    systemctl prepended onto PATH, its state file and the fleet dir pointed
+    into the test's tmpdir, then *env* on top.
+
+    SCRIPT is read HERE, at call time, which is what lets the containment
+    tests redirect it at a synthetic leaker.
+    """
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
     full_env["ORCH_FLEET_DIR"] = str(fleet_dir)
     if env:
         full_env.update(env)
-    return run_in_new_session(
-        ["bash", str(SCRIPT), *extra_args],
-        env=full_env,
-        timeout=timeout,
-    )
+    return ["bash", str(SCRIPT), *extra_args], full_env
 
 
 def _load_state(state_path):
@@ -393,6 +415,56 @@ def _assert_poll_ledger(polls, *, at_least, verdict, unit, too_few, context):
         f"write in restart-all-orchestrators.sh, NOT at any timeout. "
         f"ledger={polls!r} {context}"
     )
+
+
+def _run_drain_until_polled(bin_dir, state_path, fleet_dir, trace_path, *, verdict, env):
+    """Run --drain until UNIT_R has polled *verdict* twice; return
+    (completed, polls).
+
+    Two polls prove the gate's wait loop read, slept and re-read without
+    proceeding. The gate anchors its busy and unknown graces just after poll
+    1, so a caller's grace need only outlast one poll, not this deadline,
+    which is a must-not-hang bound. Owns ORCH_DRAIN_POLL_TRACE_FILE.
+    """
+    polls_needed = 2
+    deadline = load_scaled_grace(20)
+
+    def polled_enough():
+        polls_so_far = read_drain_poll_trace(trace_path, complete_only=True)
+        return polls_so_far.count((verdict, UNIT_R)) >= polls_needed
+
+    try:
+        outcome = _run_script_until(
+            bin_dir, state_path, fleet_dir, "--drain",
+            condition=polled_enough,
+            env={**env, "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path)},
+            timeout=deadline,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f"{UNIT_R} never polled {verdict} {polls_needed} times inside the "
+            f"{exc.timeout}s must-not-hang deadline; "
+            f"ledger={read_drain_poll_trace(trace_path, complete_only=True)!r} "
+            f"stdout={_decode(exc.stdout)!r} stderr={_decode(exc.stderr)!r}"
+        )
+
+    polls = read_drain_poll_trace(trace_path)
+    completed = outcome.completed
+    context = f"stdout={completed.stdout!r} stderr={completed.stderr!r}"
+    assert outcome.stopped_on_condition is True, (
+        f"the script exited on its own before {UNIT_R} polled {verdict} "
+        f"{polls_needed} times, i.e. it stopped waiting (force-fired, proceeded "
+        f"or restarted) instead of still polling; ledger={polls!r} {context}"
+    )
+    _assert_poll_ledger(
+        polls, at_least=polls_needed, verdict=verdict, unit=UNIT_R,
+        too_few=(
+            f"the run was stopped before {UNIT_R} polled {verdict} "
+            f"{polls_needed} times."
+        ),
+        context=context,
+    )
+    return completed, polls
 
 
 def test_fleet_dir_is_redirected_away_from_the_live_checkout(
@@ -549,6 +621,47 @@ def test_run_script_timeout_kills_the_whole_process_group(tmp_path, monkeypatch)
                 os.kill(leaked_pid, signal.SIGKILL)
 
 
+def test_run_script_until_stops_the_whole_process_group(tmp_path, monkeypatch):
+    """Mirrors tests/scripts/test_orchestrator_watchdog.py::test_boundary_run_drain_script_until_stops_the_whole_process_group."""
+    pidfile = tmp_path / "leaked.pid"
+    leaker = tmp_path / "leaker.sh"
+    leaker.write_text(PIPE_CLOSING_LEAKER_SRC)
+    monkeypatch.setattr(sys.modules[__name__], "SCRIPT", leaker)
+
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+
+    def leaked_pid_recorded():
+        try:
+            return pidfile.read_text().strip().isdigit()
+        except OSError:
+            return False
+
+    leaked_pid = None
+    try:
+        outcome = _run_script_until(
+            bin_dir, state_path, fleet_dir, "--drain",
+            condition=leaked_pid_recorded,
+            env={"LEAK_PIDFILE": str(pidfile)},
+            timeout=load_scaled_grace(10),
+        )
+
+        leaked_pid = read_leaked_pid(pidfile)
+        assert outcome.stopped_on_condition is True, outcome
+        assert wait_pid_gone(leaked_pid), (
+            f"pid {leaked_pid} -- a grandchild backgrounded by the spawned "
+            "script -- is STILL ALIVE after _run_script_until stopped on its "
+            "condition. The stop reached only the direct child. Fix: spawn via "
+            "df_pytest_isolation.run_in_new_session_until."
+        )
+    finally:
+        if leaked_pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(leaked_pid, signal.SIGKILL)
+
+
 def _decode(maybe_bytes):
     """subprocess.run's TimeoutExpired attaches partial output as bytes
     even when text=True was passed to the original call -- normalize."""
@@ -594,81 +707,33 @@ def test_force_restarts_busy_unit_when_grace_is_zero(tmp_path):
 
 
 def test_defer_withholds_restart_while_busy(tmp_path):
-    """DEFER: a busy unit with a large grace is NOT restarted before the
-    test's own short subprocess timeout fires -- proving the script is
-    still polling, not that it happened to finish quickly."""
+    """DEFER: a busy unit is withheld from restart while the gate is still
+    provably polling it. The run is stopped on the poll ledger once UNIT_R has
+    polled busy twice, not by a wall-clock kill."""
     fleet_dir = tmp_path / "fleet"
     bin_dir, state_path = _make_fake_systemctl(
         tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
     )
     _write_heartbeat(fleet_dir, UNIT_R, merge_idle=False, ts_epoch=time.time())
+    trace_path = tmp_path / "drain-poll-trace.tsv"
 
-    # ONE binding feeding BOTH the grace and the timeout, so they cannot drift:
-    # the grace must outlast the timeout (or the script force-fires mid-test and
-    # the assertion below fails), and must stay small enough that a poller which
-    # escapes the kill self-terminates in seconds rather than 27.8h (task 3798).
-    # That design is what makes the load-scaling below a ONE-line change:
-    # wait_proof_grace_secs derives from this same (now scaled) binding, so the
-    # grace-outlasts-timeout invariant holds automatically at every load -- at
-    # base 3 the grace is the 30s floor, at the 22 cap it is 88, always >= 4x.
-    #
-    # BASE 3 IS PRESERVED DELIBERATELY, not widened (task 4890): load_scaled_grace
-    # floors at its base, so an unloaded run is byte-identical and this test still
-    # takes ~3s there. The cap is WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS because the
-    # grace DERIVED from this binding must stay inside
-    # LEAK_SELF_TERMINATION_CEILING_SECS -- see that constant's derivation.
-    #
-    # THE MEASURED MECHANISM (task 4218): a flat 3s had to cover bash start +
-    # script parse + the fake systemctl's python3 (list-units) + drain_check.py's
-    # own python3 before the defer `echo` in restart-all-orchestrators.sh is even
-    # reached. The one observed failure's stdout ended exactly at the preceding
-    # "Restarting 1 orchestrator unit(s)" line, which is the signature of the
-    # budget expiring before that echo. The MIRROR test in
-    # tests/scripts/test_orchestrator_watchdog.py::
-    # test_boundary4_defers_busy_unit_while_others_proceed hit the same wall
-    # at 8s and then 20s, and now stops on the drain poll ledger instead of a
-    # wall-clock kill (task 4207). Freshness is NOT the mechanism: `classify`
-    # needs now - ts_epoch > 120 for stale, unreachable inside a 3s budget.
-    spawn_timeout = load_scaled_grace(3, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
-
-    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
-        _run_script(
-            bin_dir, state_path, fleet_dir, "--drain",
-            env={
-                "RESTART_VERIFY_TIMEOUT": "5",
-                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
-                    wait_proof_grace_secs(spawn_timeout)
-                ),
-                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
-            },
-            timeout=spawn_timeout,
-        )
-
-    stdout = _decode(exc_info.value.stdout)
-    # Interpolated, never a second copy of the literal: a hardcoded unit name
-    # here is how the task-3799 rename would silently half-land -- the defer
-    # assertion would just stop matching the name the fixture actually used.
-    assert f"deferring restart of {UNIT_R}: mid-merge" in stdout, (
-        f"expected a stable defer-prefix line; got stdout={stdout!r} "
-        f"stderr={_decode(exc_info.value.stderr)!r} "
-        f"(spawn_timeout={spawn_timeout}s, load-scaled from base 3). "
-        f"TWO mechanisms produce this, and their stdout is byte-identical, so "
-        f"check both before touching a number: (1) the budget expired before "
-        f"the defer `echo` was reached -- stdout ending at the preceding "
-        f"'Restarting N orchestrator unit(s)' line is the tell, and the "
-        f"remedy is the load scaling already applied here, so log the RESOLVED "
-        f"budget above and check whether it hit the cap rather than widening "
-        f"the base; (2) restart-all-orchestrators.sh coerces ANY non-zero exit "
-        f"of drain_check.py to raw=\"absent\", after which drain_await_fresh "
-        f"polls SILENTLY for up to ORCH_DRAIN_UNKNOWN_GRACE_SECS (default 120, "
-        f"deliberately left unset by this test) and prints nothing at all. "
-        f"Do NOT pin that grace to disambiguate -- it trades a silent stall "
-        f"for an equally confusing spurious restart."
+    completed, polls = _run_drain_until_polled(
+        bin_dir, state_path, fleet_dir, trace_path,
+        verdict="busy",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
+                wait_proof_grace_secs(WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
+            ),
+        },
     )
-    state = _load_state(state_path)
-    assert ["--user", "restart", UNIT_R] not in state["calls"], (
-        f"restart must NOT have been recorded yet; got calls={state['calls']!r}"
-    )
+
+    calls = _load_state(state_path)["calls"]
+    context = f"ledger={polls!r} stdout={completed.stdout!r} calls={calls!r}"
+    assert f"deferring restart of {UNIT_R}: mid-merge" in completed.stdout, context
+    assert "force-restarting" not in completed.stdout.lower(), context
+    assert ["--user", "restart", UNIT_R] not in calls, context
 
 
 def test_idle_unit_restarts_transparently_with_no_defer_line(tmp_path):
@@ -822,13 +887,14 @@ def test_absent_heartbeat_polls_through_a_nonzero_grace_then_restarts(tmp_path):
     """ABSENT + BOUNDED: the unknown grace TERMINATES, and the restart follows.
 
     The complement of test_unknown_grace_withholds_restart_while_absent below,
-    which proves the wait is REAL by being killed inside it and so can never
-    observe its end. Nothing else covers that end: the only other top-level
-    absent elapse test uses a grace of 0, where drain_await_fresh breaks on
-    its FIRST elapsed-check and the loop never sleeps. Here the grace is a
-    small NONZERO 3s and the run COMPLETES -- >= 2 ledger polls catch the loop
-    iterating, the proceed line shows the grace elapsed, and the restart shows
-    the gate opened anyway (I4 fail-toward-convergence).
+    which proves the wait is REAL by being stopped inside it on its poll
+    ledger and so can never observe its end. Nothing else covers that end:
+    the only other top-level absent elapse test uses a grace of 0, where
+    drain_await_fresh breaks on its FIRST elapsed-check and the loop never
+    sleeps. Here the grace is a small NONZERO 3s and the run COMPLETES -- >= 2
+    ledger polls catch the loop iterating, the proceed line shows the grace
+    elapsed, and the restart shows the gate opened anyway (I4
+    fail-toward-convergence).
     """
     fleet_dir = tmp_path / "fleet"
     trace_path = tmp_path / "drain-poll-trace.tsv"
@@ -1077,110 +1143,31 @@ def test_stale_heartbeat_restarts_after_zero_grace(tmp_path):
 
 def test_unknown_grace_withholds_restart_while_absent(tmp_path):
     """Proves the unknown-grace wait is a REAL bounded wait, not an instant
-    fail-open: an absent heartbeat with a large ORCH_DRAIN_UNKNOWN_GRACE_SECS
-    is NOT restarted before the test's own short subprocess timeout fires,
-    AND the script is caught POLLING while it withholds that restart. This is
-    the opposite fail-direction from the busy/defer path (which protects an
-    in-flight merge), but unknown status still gets a bounded grace rather
-    than restarting on the very first check.
-
-    The negative assertion alone proves nothing -- a subprocess killed before
-    it ever reached the gate satisfies it just as well -- and neither does one
-    poll, which is exactly what an instant fail-open (check once, return)
-    produces. TWO polls prove `drain_await_fresh`'s `while` body ran: sleep
-    ORCH_DRAIN_POLL_INTERVAL_SECS, then re-poll. The ledger witnesses that
-    LOAD-INDEPENDENTLY -- it counts what the script did, not how long the
-    test's own clock happened to run.
-    """
+    fail-open. Two absent polls prove `drain_await_fresh`'s loop slept and
+    re-polled; one poll is exactly what a fail-open produces."""
     fleet_dir = tmp_path / "fleet"
-    trace_path = tmp_path / "drain-poll-trace.tsv"
     bin_dir, state_path = _make_fake_systemctl(
         tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
     )
     # No heartbeat file written for UNIT_R at all.
+    trace_path = tmp_path / "drain-poll-trace.tsv"
 
-    # ONE binding feeding BOTH the grace and the timeout -- see
-    # test_defer_withholds_restart_while_busy above. This is the test named in
-    # every sampled orphan's PYTEST_CURRENT_TEST (task 3798).
-    #
-    # Load-scaled for the same measured reason as that sibling, and it matters
-    # MORE here (task 4890 amendment). This test's only behavioural assertion
-    # is NEGATIVE, so a flat 3s budget that expires before the script even
-    # reaches the drain gate makes it pass VACUOUSLY -- proving nothing about
-    # the bounded wait it is named for, and proving nothing SILENTLY, which is
-    # a worse outcome than the flake fixed next door. Base 3 is preserved, not
-    # widened, so an unloaded run stays byte-identical; the cap is
-    # WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS because the grace derived from this
-    # same binding must stay inside LEAK_SELF_TERMINATION_CEILING_SECS.
-    spawn_timeout = load_scaled_grace(3, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
+    completed, polls = _run_drain_until_polled(
+        bin_dir, state_path, fleet_dir, trace_path,
+        verdict="absent",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            "ORCH_DRAIN_UNKNOWN_GRACE_SECS": str(
+                wait_proof_grace_secs(WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
+            ),
+        },
+    )
 
-    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
-        _run_script(
-            bin_dir, state_path, fleet_dir, "--drain",
-            env={
-                "RESTART_VERIFY_TIMEOUT": "5",
-                "ORCH_DRAIN_UNKNOWN_GRACE_SECS": str(
-                    wait_proof_grace_secs(spawn_timeout)
-                ),
-                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
-                "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
-            },
-            timeout=spawn_timeout,
-        )
-
-    stdout = _decode(exc_info.value.stdout)
-    # NON-VACUITY, part 1 of 2: the DOORSTEP. Without it the negative
-    # assertion below is satisfied just as well by a subprocess killed before
-    # it ever entered the wait (task 4890 amendment). There is no drain line
-    # to assert on and that is by contract, not oversight:
-    # restart-all-orchestrators.sh's `drain_await_fresh` "prints nothing to
-    # stdout" while it polls, and the one line the absent path ever emits --
-    # "proceeding with restart of <unit>: heartbeat absent after Ns grace" --
-    # is printed when the grace ELAPSES, which must never happen here. So the
-    # strongest witness AVAILABLE ON STDOUT is the last line before the gate:
-    # it is echoed immediately ahead of the per-unit loop that calls
-    # `drain_gate`, so reaching it proves the subprocess cleared bash start,
-    # script parse and the fake systemctl's `list-units`.
-    assert f"Restarting 1 orchestrator unit(s): {UNIT_R}" in stdout, (
-        f"the script was killed before it reached the per-unit drain gate, so "
-        f"the no-restart assertion below would hold VACUOUSLY. Raise nothing "
-        f"by hand: spawn_timeout={spawn_timeout}s is already load-scaled from "
-        f"base 3, so check whether it hit the "
-        f"WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS cap before touching a number. "
-        f"stdout={stdout!r} stderr={_decode(exc_info.value.stderr)!r}"
-    )
-    # NON-VACUITY, part 2 of 2: INSIDE the gate (task 4486). The doorstep
-    # witness above is silent about everything past it -- a python3 spawn, a
-    # poll interval, another spawn -- so a kill landing there still proves no
-    # bounded wait. The ledger closes that window; >= 2 rather than 1 is
-    # argued in the docstring.
-    # HEADROOM, measured here over 3 runs at loadavg 579 on 32 cores (factor
-    # 18.1, so the budget sat at the 22s cap): poll 2 landed at 1.6 / 2.4 /
-    # 3.9s. Only the spawns scale with load -- ~1.0s of that is the fixed
-    # ORCH_DRAIN_POLL_INTERVAL_SECS below. So the thin end is a burst
-    # load_scaled_grace's 1-minute loadavg has not registered yet: factor 1.0
-    # budgets 3.0s, which the 3.9s run above would have missed.
-    _assert_poll_ledger(
-        read_drain_poll_trace(trace_path),
-        at_least=2, verdict="absent", unit=UNIT_R,
-        too_few=(
-            f"the script was killed without polling the drain gate twice, so "
-            f"'a REAL bounded wait, not an instant fail-open' is UNPROVEN: "
-            f"one poll (or none) is exactly what a fail-open produces. Raise "
-            f"nothing by hand -- spawn_timeout={spawn_timeout}s is already "
-            f"load-scaled from base 3, so check whether it hit the "
-            f"WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS "
-            f"(={WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS}s) cap first."
-        ),
-        context=(
-            f"stdout={stdout!r} stderr={_decode(exc_info.value.stderr)!r}"
-        ),
-    )
-    state = _load_state(state_path)
-    assert ["--user", "restart", UNIT_R] not in state["calls"], (
-        f"restart must NOT have been recorded yet; got calls={state['calls']!r} "
-        f"stdout={stdout!r}"
-    )
+    calls = _load_state(state_path)["calls"]
+    context = f"ledger={polls!r} stdout={completed.stdout!r} calls={calls!r}"
+    assert "proceeding with restart" not in completed.stdout, context
+    assert ["--user", "restart", UNIT_R] not in calls, context
 
 
 # ---------------------------------------------------------------------------
@@ -1208,7 +1195,7 @@ _HB_STALE = {"merge_idle": True, "ts_epoch": time.time() - 99999}
 # (reviewer_comprehensive #1).
 _DRAIN_POLL_INTERVAL_SECS = 1
 # ONE binding feeding both the grace and the timeout -- see
-# test_defer_withholds_restart_while_busy. Here the grace is a
+# df_pytest_isolation.py::wait_proof_grace_secs. Here the grace is a
 # MUST-NEVER-BE-REACHED bound rather than a wait-proving one: if the
 # in-loop resume regresses, the run silently consumes the spawn timeout
 # instead of force-firing early and looking like a pass.
@@ -1508,7 +1495,7 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
     (mutant MB) demonstrates via `_run_script`'s own timeout.
     """
     # ONE binding feeding both the grace and the timeout -- see
-    # test_defer_withholds_restart_while_busy. Deliberately unreachable here:
+    # df_pytest_isolation.py::wait_proof_grace_secs. Deliberately unreachable here:
     # the point is that the run finishes long before this busy grace would.
     spawn_timeout = 15
 
@@ -1573,7 +1560,7 @@ def test_unit_that_stops_heartbeating_mid_defer_proceeds_after_a_nonzero_grace_e
     sleep-and-recheck cycle before the grace elapses.
     """
     # ONE binding feeding both the grace and the timeout -- see
-    # test_defer_withholds_restart_while_busy. Deliberately unreachable here.
+    # df_pytest_isolation.py::wait_proof_grace_secs. Deliberately unreachable here.
     spawn_timeout = 15
     unknown_grace = 3
 
@@ -1651,7 +1638,7 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(
     """
     # ORCH_DRAIN_UNKNOWN_GRACE_SECS is the must-never-elapse bound here (the
     # unit drains on its own a few polls into it); ONE binding still feeds it
-    # from spawn_timeout, per test_defer_withholds_restart_while_busy.
+    # from spawn_timeout, per df_pytest_isolation.py::wait_proof_grace_secs.
     spawn_timeout = 20
     outlasting = _polls_outlasting(_SHORT_FORCE_FIRE_SECS)
 

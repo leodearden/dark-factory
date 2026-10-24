@@ -93,10 +93,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
     LedgerUnavailable,
     write_entity_standing_decision,
 )
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 from fused_memory.utils.validation import is_full_uuid
 
 logger = logging.getLogger(__name__)
@@ -980,22 +977,15 @@ def main(argv: list[str] | None = None) -> int:
     # run-wide environment denial cannot be swallowed by that function's
     # per-record error handling and re-reported as N stamp failures.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(
-                operation='backfill_entity_standing_decision --apply'
-            )
-        except StoreMutationUnavailable:
-            logger.error(
-                'backfill_entity_standing_decision: --apply NOT started '
-                "(fail-closed) — this process cannot write mem0's history "
-                'directory, so a stamp would patch a record and then fail to '
-                'record the change. Nothing was scrolled, no ledger row was '
-                'written and no record was stamped. Re-run from the '
-                'fused-memory MCP server host (the unsandboxed owner of the '
-                'store). To obtain the report safely from anywhere, re-run '
-                'without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='backfill_entity_standing_decision --apply',
+            logger=logger,
+            extra_detail=(
+                'a stamp would patch a record and then fail to record the change. '
+                'Nothing was scrolled, no ledger row was written and no record was '
+                'stamped.'
+            ),
+        )
 
     async def _run_live() -> dict[str, Any]:
         # Deferred so importing this module — which the tests do, by path —
