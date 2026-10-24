@@ -263,15 +263,17 @@ class TestQueryFailureAfterTheProbe:
         assert measurement.status == 'unreadable'
         assert digest.logger.handlers == handlers
 
-    def test_with_logging_disabled_a_read_it_cannot_vouch_for_is_unreadable(self, df):
+    def test_with_logging_disabled_a_clean_read_is_ok_and_a_failed_one_unreadable(self, df, tmp_path):
         logging.disable(logging.CRITICAL)
         try:
-            measurement = mod.landed(mod.runs_db_path(df), WINDOW, now=NOW)
+            clean = mod.landed(mod.runs_db_path(df), WINDOW, now=NOW)
+            failed = mod.landed(_drifted_runs_db(tmp_path / 'runs.db'), WINDOW, now=NOW)
         finally:
             logging.disable(logging.NOTSET)
 
-        assert measurement.status == 'unreadable'
-        assert 'logging' in measurement.shortfalls[0].reason
+        assert (clean.status, clean.value) == ('ok', 3)
+        assert failed.status == 'unreadable'
+        assert 'no such column' in failed.shortfalls[0].reason
 
     def test_a_clean_read_is_still_ok(self, df):
         assert mod.landed(mod.runs_db_path(df), WINDOW, now=NOW).status == 'ok'
@@ -363,6 +365,21 @@ class TestSpendAndCapHits:
         measurement = mod.spend_and_cap_hits(tmp_path / 'runs.db', WINDOW, now=NOW)
 
         assert (measurement.value, measurement.status) == ((), 'source_missing')
+
+    @pytest.mark.parametrize('table', ['events', 'invocations', 'task_results'])
+    def test_a_runs_db_missing_a_table_the_rollup_reads_is_unreadable_naming_it(self, tmp_path, table):
+        runs_db = _build_runs_db(tmp_path / 'runs.db')
+        conn = sqlite3.connect(runs_db)
+        try:
+            conn.execute(f'DROP TABLE {table}')
+            conn.commit()
+        finally:
+            conn.close()
+
+        measurement = mod.spend_and_cap_hits(runs_db, WINDOW, now=NOW)
+
+        assert (measurement.value, measurement.status) == ((), 'unreadable')
+        assert table in measurement.shortfalls[0].reason
 
 
 class TestAutonomousCloses:
