@@ -43,6 +43,7 @@ from df_pytest_isolation import (
     read_drain_poll_trace,
     read_leaked_pid,
     run_in_new_session,
+    run_in_new_session_until,
     synthetic_unit,
     wait_pid_gone,
     wait_proof_grace_secs,
@@ -356,17 +357,38 @@ def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=2
     reparented to systemd --user. `_decode` below still applies -- the re-raised
     TimeoutExpired carries the partial output the timeout tests assert on.
     """
+    cmd, full_env = _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env)
+    return run_in_new_session(cmd, env=full_env, timeout=timeout)
+
+
+def _run_script_until(
+    bin_dir, state_path, fleet_dir, *extra_args, condition, timeout, env=None
+):
+    """`_run_script`, stopped as soon as *condition* holds.
+
+    Returns df_pytest_isolation.run_in_new_session_until's RunUntilOutcome.
+    ``timeout`` is a must-not-hang deadline, paid only when *condition* never
+    holds.
+    """
+    cmd, full_env = _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env)
+    return run_in_new_session_until(cmd, condition=condition, env=full_env, timeout=timeout)
+
+
+def _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env):
+    """The argv and env both spawn wrappers run the script with: the fake
+    systemctl prepended onto PATH, its state file and the fleet dir pointed
+    into the test's tmpdir, then *env* on top.
+
+    SCRIPT is read HERE, at call time, which is what lets the containment
+    tests redirect it at a synthetic leaker.
+    """
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
     full_env["ORCH_FLEET_DIR"] = str(fleet_dir)
     if env:
         full_env.update(env)
-    return run_in_new_session(
-        ["bash", str(SCRIPT), *extra_args],
-        env=full_env,
-        timeout=timeout,
-    )
+    return ["bash", str(SCRIPT), *extra_args], full_env
 
 
 def _load_state(state_path):
