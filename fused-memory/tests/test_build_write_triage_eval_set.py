@@ -525,3 +525,174 @@ def _sha256(path: Path) -> str:
     import hashlib
 
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _split_row(entry: str, source: str, project: str, created_at: str) -> dict[str, Any]:
+    return {'entry_id': entry, 'source': source, 'project': project,
+            'category': 'procedural_knowledge', 'created_at': created_at,
+            'stratum': f'{source}-{project}', 'production_outcome': 'stored',
+            'production_target': None,
+            'targets': [{'target_id': f'{entry}-t', 'rank': 1, 'cosine': 0.7,
+                         'edited_after_write': None}]}
+
+
+def _split_verdicts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [_vote(row['entry_id'], f'{row["entry_id"]}-t', role, **KEPT)
+            for row in rows for role in ('primary', 'second')]
+
+
+def _day(day: int, hour: int) -> str:
+    return f'2026-10-{day:02d}T{hour:02d}:30:00+00:00'
+
+
+def _split_writes() -> list[dict[str, Any]]:
+    """40 offline writes, 50 held-out live writes, and 60 other live writes a day from 10-12 to 10-18."""
+    rows = [_split_row(f'off-{index:03d}', 'offline', 'dark_factory', _day(1 + index % 4, 3))
+            for index in range(40)]
+    rows += [_split_row(f'scp-{index:03d}', 'live', 'solar_challenge_platform',
+                        _day(12 + index % 7, 5)) for index in range(50)]
+    rows += [_split_row(f'live-{day}-{index:02d}', 'live', ('reify', 'solar_challenge')[index % 2],
+                        _day(day, index % 24)) for day in range(12, 19) for index in range(60)]
+    return sorted(rows, key=lambda row: row['entry_id'])
+
+
+def _ids(split: dict[str, Any], name: str) -> set[str]:
+    return set(split['splits'][name])
+
+
+class TestTheSplit:
+    def _frozen(self, rows: list[dict[str, Any]] | None = None) -> tuple[Any, list[Any], list[Any]]:
+        writes = rows or _split_writes()
+        verdicts = _split_verdicts(writes)
+        return _mod().freeze_split(writes, verdicts), writes, verdicts
+
+    def test_the_constants(self) -> None:
+        assert _mod().HELD_OUT_PROJECT == 'solar_challenge_platform'
+        assert _mod().TEST_TARGET_WRITES == 300
+
+    def test_test_holds_the_held_out_project_and_every_live_write_after_the_cutoff(self) -> None:
+        split, writes, _ = self._frozen()
+        by_id = {row['entry_id']: row for row in writes}
+        assert split['held_out_project'] == 'solar_challenge_platform'
+        assert split['cutoff'] == '2026-10-15T00:00:00+00:00'
+        expected = {row['entry_id'] for row in writes if row['source'] == 'live' and (
+            row['project'] == 'solar_challenge_platform' or row['created_at'] >= '2026-10-15')}
+        assert _ids(split, 'test') == expected
+        assert len(expected) == 50 + 4 * 60
+        assert all(by_id[entry]['source'] == 'live' for entry in _ids(split, 'test'))
+
+    def test_a_tie_between_two_midnights_goes_to_the_later_one(self) -> None:
+        rows = [_split_row('first', 'live', 'reify', _day(15, 23))]
+        rows += [_split_row(f'a{index:03d}', 'live', 'reify', _day(16, 6)) for index in range(40)]
+        rows += [_split_row(f'b{index:03d}', 'live', 'reify', _day(17, 6)) for index in range(280)]
+        split, _, _ = self._frozen(rows)
+        assert split['cutoff'] == '2026-10-17T00:00:00+00:00'
+        assert len(_ids(split, 'test')) == 280
+
+    def test_tuning_is_dev_and_train_halves_in_seeded_hash_order(self) -> None:
+        import hashlib
+
+        split, writes, _ = self._frozen()
+        tuning = sorted((row['entry_id'] for row in writes if row['entry_id'] not in _ids(split, 'test')),
+                        key=lambda entry: hashlib.sha256(f'7160:{entry}'.encode()).hexdigest())
+        half = len(tuning) // 2
+        assert _ids(split, 'dev') == set(tuning[:half])
+        assert _ids(split, 'train') == set(tuning[half:])
+
+    def test_the_splits_are_disjoint_and_cover_every_write(self) -> None:
+        split, writes, _ = self._frozen()
+        names = ('test', 'dev', 'train')
+        assert sum(len(split['splits'][name]) for name in names) == len(writes)
+        assert set().union(*(_ids(split, name) for name in names)) == {
+            row['entry_id'] for row in writes}
+        assert all(split['splits'][name] == sorted(split['splits'][name]) for name in names)
+
+    def test_counts_each_split_by_source_and_project(self) -> None:
+        split, _, _ = self._frozen()
+        assert split['counts']['test'] == {'live': {'reify': 120, 'solar_challenge': 120,
+                                                    'solar_challenge_platform': 50}}
+        assert sum(sum(by_project.values()) for name in ('dev', 'train')
+                   for by_project in split['counts'][name].values()) == 40 + 3 * 60
+
+    def test_is_deterministic_and_label_blind(self) -> None:
+        split, writes, verdicts = self._frozen()
+        assert _mod().freeze_split(writes, verdicts) == split
+        relabelled = [
+            {**{key: value for key, value in row.items() if key != 'loss'},
+             'home': 'NO', 'conflict': 'NO'} if row['role'] == 'primary' else row
+            for row in verdicts
+        ]
+        again = _mod().freeze_split(writes, relabelled)
+        assert (again['splits'], again['cutoff'], again['counts']) == (
+            split['splits'], split['cutoff'], split['counts'])
+
+    def test_carries_its_rule_and_the_digests_it_froze(self) -> None:
+        import hashlib
+
+        split, writes, verdicts = self._frozen()
+        assert 'solar_challenge_platform' in split['rule'] and '300' in split['rule']
+
+        def body(rows: list[dict[str, Any]]) -> bytes:
+            return ''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows).encode()
+
+        test = _ids(split, 'test')
+        assert split['writes_sha256'] == hashlib.sha256(body(writes)).hexdigest()
+        assert split['verdicts_sha256'] == hashlib.sha256(body(verdicts)).hexdigest()
+        assert split['test_sha256'] == hashlib.sha256(
+            body([row for row in writes if row['entry_id'] in test])
+            + body([row for row in verdicts if row['entry_id'] in test])).hexdigest()
+
+    def test_verify_passes_the_frozen_inputs_and_tolerates_a_tuning_relabel(self) -> None:
+        split, writes, verdicts = self._frozen()
+        _mod().verify_split(split, writes, verdicts)
+        tuning = next(iter(_ids(split, 'train')))
+        edited = [{**row, 'reason': 'refined'} if row['entry_id'] == tuning else row
+                  for row in verdicts]
+        _mod().verify_split(split, writes, edited)
+
+    def test_verify_refuses_a_verdict_edit_on_a_test_pair(self) -> None:
+        split, writes, verdicts = self._frozen()
+        test = next(iter(_ids(split, 'test')))
+        edited = [{**row, 'reason': 'refined'} if row['entry_id'] == test else row
+                  for row in verdicts]
+        with pytest.raises(ValueError, match='test_sha256'):
+            _mod().verify_split(split, writes, edited)
+
+    def test_verify_refuses_moved_ids(self) -> None:
+        split, writes, verdicts = self._frozen()
+        moved = [{**row, 'created_at': _day(18, 1)} if row['entry_id'] == 'live-12-00' else row
+                 for row in writes]
+        with pytest.raises(ValueError, match='live-12-00'):
+            _mod().verify_split(split, moved, verdicts)
+
+    def test_tuning_writes_never_yield_a_test_write(self) -> None:
+        split, writes, _ = self._frozen()
+        tuning = [row['entry_id'] for row in _mod().tuning_writes(writes, split)]
+        assert set(tuning) == _ids(split, 'dev') | _ids(split, 'train')
+        assert not set(tuning) & _ids(split, 'test')
+
+
+class TestTheSplitCommand:
+    def _committed(self, root: Path) -> Path:
+        out = root / 'calibration'
+        out.mkdir()
+        writes = _split_writes()
+        for name, rows in (('writes', writes), ('verdicts', _split_verdicts(writes))):
+            (out / f'write_triage_eval_set_v2_{name}.jsonl').write_text(
+                ''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows))
+        return out
+
+    def test_writes_the_split_and_refuses_to_overwrite_it_without_refreeze(
+        self, tmp_path: Path,
+    ) -> None:
+        out = self._committed(tmp_path)
+        path = out / 'write_triage_eval_set_v2_split.json'
+        assert _mod().main(['split', '--eval-dir', str(out)]) == 0
+        frozen = json.loads(path.read_text())
+        assert frozen['cutoff'] == '2026-10-15T00:00:00+00:00'
+        path.write_text('{}')
+        with pytest.raises(SystemExit):
+            _mod().main(['split', '--eval-dir', str(out)])
+        assert path.read_text() == '{}'
+        assert _mod().main(['split', '--eval-dir', str(out), '--refreeze']) == 0
+        assert json.loads(path.read_text()) == frozen
