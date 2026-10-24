@@ -138,7 +138,7 @@ def test_enforcement_still_fails_when_the_frame_no_longer_names_the_mock(monkeyp
     drain_async_mock_coroutines()
 
     async def drifted_execute_mock_call(mock, /, *args, **kwargs):
-        return None  # pragma: no cover
+        return None
 
     monkeypatch.setattr(AsyncMockMixin, '_execute_mock_call', drifted_execute_mock_call)
     track_async_mock_coroutines()
