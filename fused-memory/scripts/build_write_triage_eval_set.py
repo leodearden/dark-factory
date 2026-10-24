@@ -27,6 +27,10 @@ the main checkout's frozen population), ``--live-slates`` and ``--scratch``:
   new third rater.
 - ``assemble``: write ``write_triage_eval_set_v2_{writes.jsonl,verdicts.jsonl,summary.json}``
   into ``--out-dir``, refusing while any pair is not fully labelled.
+
+``split --eval-dir DIR`` freezes the assembled set's held-out split
+(:func:`freeze_split`) into ``write_triage_eval_set_v2_split.json`` beside it,
+and refuses to overwrite a frozen split without ``--refreeze``.
 """
 from __future__ import annotations
 
@@ -35,8 +39,9 @@ import hashlib
 import json
 import sys
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -78,6 +83,18 @@ DEFAULT_LIVE_SLATES = _CALIBRATION / f'{OUT_STEM}_live_slates.jsonl'
 DEFAULT_SCRATCH = _CALIBRATION / f'{OUT_STEM}_rounds'
 _SCRATCH_IGNORED = ('shards/', 'texts.json', 'rater_prompt.md')
 """The scratch files re-rendered from the inputs; the key and the ratings are committed."""
+
+HELD_OUT_PROJECT = 'solar_challenge_platform'
+TEST_TARGET_WRITES = 300
+SPLIT_SEED = '7160'
+SPLITS = ('test', 'dev', 'train')
+SPLIT_RULE = (
+    f'test: every live write of {HELD_OUT_PROJECT}, and every other live write created at or'
+    ' after the UTC midnight inside the live window whose test split is closest to'
+    f' {TEST_TARGET_WRITES} writes, a tie going to the later midnight. tuning: every other'
+    f" write, ordered by sha256('{SPLIT_SEED}:<entry_id>'); dev is its first half, rounded"
+    ' down, and train the rest. Verdicts are never read to decide membership.'
+)
 
 
 @dataclass(frozen=True)
@@ -349,12 +366,135 @@ def _verdict_order(row: Mapping[str, Any]) -> tuple[str, str, str, str]:
     return (row['entry_id'], row['target_id'], row['basis'], row['rater'])
 
 
+def _jsonl_body(rows: Iterable[Mapping[str, Any]]) -> str:
+    """The committed JSONL form: one sort_keys JSON object per line."""
+    return ''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows)
+
+
 def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
-    path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows))
+    path.write_text(_jsonl_body(rows))
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _sha256(body: str) -> str:
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def freeze_split(
+    writes: Iterable[Mapping[str, Any]], verdicts: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """The held-out split of the eval set by :data:`SPLIT_RULE`, with the digests it froze.
+
+    Membership reads only entry ids, sources, projects and created_at; the
+    verdicts enter only ``test_sha256`` and ``verdicts_sha256``.
+    """
+    rows, verdict_rows = list(writes), list(verdicts)
+    cutoff = _cutoff(rows)
+    test = sorted(row['entry_id'] for row in rows if _in_test(row, cutoff))
+    held = set(test)
+    tuning = sorted((row['entry_id'] for row in rows if row['entry_id'] not in held),
+                    key=lambda entry_id: _sha256(f'{SPLIT_SEED}:{entry_id}'))
+    half = len(tuning) // 2
+    splits = {'test': test, 'dev': sorted(tuning[:half]), 'train': sorted(tuning[half:])}
+    return {
+        'rule': SPLIT_RULE,
+        'held_out_project': HELD_OUT_PROJECT,
+        'test_target_writes': TEST_TARGET_WRITES,
+        'cutoff': cutoff.isoformat(),
+        'counts': {name: _split_counts(rows, set(ids)) for name, ids in splits.items()},
+        'splits': splits,
+        'test_sha256': _sha256(
+            _jsonl_body(row for row in rows if row['entry_id'] in held)
+            + _jsonl_body(row for row in verdict_rows if row['entry_id'] in held)),
+        'writes_sha256': _sha256(_jsonl_body(rows)),
+        'verdicts_sha256': _sha256(_jsonl_body(verdict_rows)),
+    }
+
+
+def _instant(row: Mapping[str, Any]) -> datetime:
+    instant = _freeze.parse_created_at(row['created_at'])
+    if instant is None:
+        raise ValueError(f'write {row["entry_id"]}: created_at {row["created_at"]!r} is not an aware instant')
+    return instant
+
+
+def _cutoff(rows: Sequence[Mapping[str, Any]]) -> datetime:
+    """The UTC midnight inside the live window whose test split is nearest the target; ties go later."""
+    live = [row for row in rows if row['source'] == SOURCE_LIVE]
+    instants = [_instant(row) for row in live]
+    if not instants:
+        raise ValueError('the eval set holds no live write to split on')
+    midnight = min(instants).astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    midnights = []
+    while (midnight := midnight + timedelta(days=1)) <= max(instants):
+        midnights.append(midnight)
+    if not midnights:
+        raise ValueError('no UTC midnight falls inside the live window')
+    return min(midnights, key=lambda cut: (
+        abs(sum(_in_test(row, cut) for row in live) - TEST_TARGET_WRITES), -cut.timestamp()))
+
+
+def _in_test(row: Mapping[str, Any], cutoff: datetime) -> bool:
+    return row['source'] == SOURCE_LIVE and (
+        row['project'] == HELD_OUT_PROJECT or _instant(row) >= cutoff)
+
+
+def _split_counts(rows: Iterable[Mapping[str, Any]], ids: set[str]) -> dict[str, dict[str, int]]:
+    counts: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    for row in rows:
+        if row['entry_id'] in ids:
+            counts[row['source']][row['project']] += 1
+    return {source: dict(sorted(by_project.items())) for source, by_project in sorted(counts.items())}
+
+
+def verify_split(
+    split: Mapping[str, Any], writes: Iterable[Mapping[str, Any]],
+    verdicts: Iterable[Mapping[str, Any]],
+) -> None:
+    """Refuse when *writes* and *verdicts* no longer give the frozen *split*.
+
+    A write that moved, appeared or vanished is named; a changed test write or
+    test verdict is named by ``test_sha256``. Tuning verdicts may be refined.
+    """
+    again = freeze_split(writes, verdicts)
+    moved = sorted({entry_id for name in SPLITS
+                    for entry_id in set(split['splits'][name]) ^ set(again['splits'][name])})
+    if moved:
+        raise ValueError(f'writes moved between splits, appeared or vanished: {moved}')
+    if again['test_sha256'] != split['test_sha256']:
+        raise ValueError(f'test_sha256 drifted from {split["test_sha256"]} to'
+                         f' {again["test_sha256"]}: a test write or verdict changed')
+
+
+def tuning_writes(
+    writes: Iterable[Mapping[str, Any]], split: Mapping[str, Any],
+) -> Iterator[Mapping[str, Any]]:
+    """The writes of the dev and train splits; a test write is never yielded."""
+    tuning = set(split['splits']['dev']) | set(split['splits']['train'])
+    return (row for row in writes if row['entry_id'] in tuning)
+
+
+def _split_path(eval_dir: Path) -> Path:
+    return eval_dir / f'{OUT_STEM}_split.json'
+
+
+def _split_command(args: argparse.Namespace) -> dict[str, Any]:
+    writes = _read_jsonl(args.eval_dir / f'{OUT_STEM}_writes.jsonl')
+    verdicts = _read_jsonl(args.eval_dir / f'{OUT_STEM}_verdicts.jsonl')
+    split = freeze_split(writes, verdicts)
+    _split_path(args.eval_dir).write_text(json.dumps(split, indent=2, sort_keys=True) + '\n')
+    return {'cutoff': split['cutoff'], 'counts': split['counts']}
 
 
 def _refuse_inside_read_only(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Refuse a scratch or output directory inside the snapshot's directory or the soak bundle."""
+    if args.command == 'split':
+        if _split_path(args.eval_dir).exists() and not args.refreeze:
+            parser.error(f'{_split_path(args.eval_dir)} is frozen; pass --refreeze to replace it')
+        return
     snapshot_dir = args.snapshot.resolve().parent
     read_only = (snapshot_dir, snapshot_dir.parent / SOAK_BUNDLE_NAME)
     for option, path in (('--scratch', args.scratch), ('--out-dir', getattr(args, 'out_dir', None))):
@@ -368,14 +508,15 @@ def _refuse_inside_read_only(parser: argparse.ArgumentParser, args: argparse.Nam
 
 _COMMANDS: Mapping[str, Callable[[argparse.Namespace], dict[str, Any]]] = {
     'shards': _shards_command, 'reask': _reask_command, 'third': _third_command,
-    'assemble': _assemble_command,
+    'assemble': _assemble_command, 'split': _split_command,
 }
+_ROUND_COMMANDS = ('shards', 'reask', 'third', 'assemble')
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in _COMMANDS:
+    for name in _ROUND_COMMANDS:
         command = commands.add_parser(name)
         command.add_argument('--snapshot', type=Path, required=True, metavar='PATH',
                              help="the frozen population's snapshot.json (read-only)")
@@ -385,6 +526,11 @@ def _build_parser() -> argparse.ArgumentParser:
     commands.choices['shards'].add_argument('--seed', type=int, default=7160)
     commands.choices['assemble'].add_argument('--out-dir', type=Path, default=_CALIBRATION,
                                               metavar='DIR')
+    split = commands.add_parser('split')
+    split.add_argument('--eval-dir', type=Path, default=_CALIBRATION, metavar='DIR',
+                       help='the directory holding the assembled writes and verdicts')
+    split.add_argument('--refreeze', action='store_true',
+                       help='replace an already frozen split')
     return parser
 
 
