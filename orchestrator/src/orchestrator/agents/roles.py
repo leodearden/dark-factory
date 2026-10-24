@@ -481,7 +481,7 @@ section "In-place memory amendments are not task-agent work".
 """
 
 # fused-memory/tests/test_referent_declaration_examples.py executes the `entities=`
-# example below against the live gate; its dict is this block's only deliberate brace.
+# example below against the live gate.
 _MEMORY_INSTRUCTIONS = """
 ## Memory
 
