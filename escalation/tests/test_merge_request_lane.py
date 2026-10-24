@@ -432,12 +432,12 @@ class TestSubmitResponseEchoesTheResolvedLane:
         assert result.get('lane_source') == 'default', result
 
     @pytest.mark.parametrize(
-        'fault',
-        [{'scheduler_raises': True}, {'no_scheduler': True}],
+        ('scheduler_raises', 'no_scheduler'),
+        [(True, False), (False, True)],
         ids=['scheduler_raises', 'no_scheduler'],
     )
     async def test_failed_metadata_read_reports_unavailable_not_default(
-        self, tmp_path: Path, fault: dict[str, bool]
+        self, tmp_path: Path, scheduler_raises: bool, no_scheduler: bool
     ):
         """A degraded task store must not read as "nothing asked at all".
 
@@ -447,7 +447,10 @@ class TestSubmitResponseEchoesTheResolvedLane:
         scheduler raises, so a scheduler-less deployment reports
         ``'unavailable'`` on every submission that passes no ``lane``.
         """
-        result = await _submit_nonblocking(tmp_path, _make_harness(**fault))
+        harness = _make_harness(
+            scheduler_raises=scheduler_raises, no_scheduler=no_scheduler
+        )
+        result = await _submit_nonblocking(tmp_path, harness)
         assert result.get('status') == 'queued', result
         assert result.get('lane') == 'normal', result
         assert result.get('lane_source') == 'unavailable', result
