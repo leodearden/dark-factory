@@ -579,6 +579,12 @@ LEGACY_LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises
 #: RESOLVES, which a bare string literal in the prose left unchecked.
 COMMIT_GATE_RELPATH = 'scripts/check_staged_ratchet_raise.py'
 
+#: The landing-time auditor ``hooks/reference-transaction`` runs on every move of
+#: main, named here for the same reasons as ``COMMIT_GATE_RELPATH``: the remedy
+#: sends a blocked reader to it, and a constant is what lets a test assert the
+#: path RESOLVES.
+ADVANCE_GATE_RELPATH = 'scripts/check_ratchet_advance.py'
+
 #: THE ONE COPY of what to do when a measure rose. Composed into every site
 #: that tells an agent it may not raise -- ``BASELINE_README`` (and so the
 #: committed bytes a blocked reader opens), ``main()``'s ``--check`` trailer,
