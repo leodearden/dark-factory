@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 from audit_delivered_checks import load_manifest_checks, structural_findings
+from committed_git_repo import committed_repo
 from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
 from shared.delivered_check_polarity import (
@@ -163,19 +164,8 @@ def _kappa_check():
     return check
 
 
-def _committed_repo(root: Path, rel_paths) -> str:
-    def git(*args: str) -> None:
-        subprocess.run(["git", *args], check=True, capture_output=True, timeout=30)
-
-    git("init", "-b", "main", str(root))
-    for rel in rel_paths:
-        target = root / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("#!/bin/sh\n", encoding="utf-8")
-    git("-C", str(root), "add", "-A")
-    git("-C", str(root), "-c", "user.email=t@e", "-c", "user.name=t",
-        "-c", "commit.gpgsign=false", "commit", "-m", "seed")
-    return str(root)
+def _reify_tree_holding(tmp_path: Path, scripts) -> str:
+    return committed_repo(tmp_path / "reify", dict.fromkeys(scripts, "#!/bin/sh\n"))
 
 
 @pytest.mark.parametrize(
@@ -267,7 +257,7 @@ def test_audit_structural_section_names_no_reanchored_grep_capability():
 def test_kappa_gate_holds_while_any_relocated_script_survives(tmp_path, survivor):
     """Every one of κ's seven deletions is gated, so the gate cannot pass early."""
     check = _kappa_check()
-    repo = _committed_repo(tmp_path / "reify", [*_CONTRACT_PRIMITIVES, survivor])
+    repo = _reify_tree_holding(tmp_path, [*_CONTRACT_PRIMITIVES, survivor])
 
     outcome = evaluate_path_at_tree(
         list(check.paths), expect=check.expect, repo_root=repo, ref="HEAD",
@@ -281,7 +271,7 @@ def test_kappa_gate_holds_while_any_relocated_script_survives(tmp_path, survivor
 def test_kappa_gate_opens_once_only_the_contract_primitives_remain(tmp_path):
     """No retained contract primitive is in the gate, so κ can actually finish."""
     check = _kappa_check()
-    repo = _committed_repo(tmp_path / "reify", _CONTRACT_PRIMITIVES)
+    repo = _reify_tree_holding(tmp_path, _CONTRACT_PRIMITIVES)
 
     outcome = evaluate_path_at_tree(
         list(check.paths), expect=check.expect, repo_root=repo, ref="HEAD",
