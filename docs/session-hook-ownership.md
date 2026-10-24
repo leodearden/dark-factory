@@ -176,6 +176,12 @@ to the spawner's record. The withhold decision and the body written derive
 from the same snapshot, so they cannot disagree. Status, question and binding
 land in one `write_record`.
 
+On a Stop owner event (`may_bind` true and not withheld) the self-exit
+evaluation's `exit_request` stamp lands in that same write. A withheld or
+unproven event stamps nothing. The only second write is the error path: a
+failed signal stamps `kill_failed` after it. The preconditions are
+`plans/review-all-program-tooling-prd.md` §4 H5's.
+
 Every lane goes through one shared withhold, refresh, bind, question and
 write block: adopt, fork, hand-launched, and the unreadable fault. The
 unreadable lane differs only in where its snapshot comes from: it re-reads
@@ -191,8 +197,9 @@ registry caller and belongs in its own change.
 
 Code: `orchestrator/src/orchestrator/session_hooks.py::_RecordSnapshot`,
 `::_read_record_snapshot`, `::_HookSlugResolution`, `::_resolve_hook_slug`,
-`::run_session_start`, `::_run_status_refresh_and_retitle`. Introduced by
-task 4662.
+`::run_session_start`, `::_run_status_refresh_and_retitle`;
+`orchestrator/src/orchestrator/session_self_exit.py::SelfExit`. Introduced by
+task 4662; the self-exit stamp by task 7193.
 
 ## Forked-inheritor identity
 

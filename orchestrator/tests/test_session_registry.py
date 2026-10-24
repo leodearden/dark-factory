@@ -78,6 +78,14 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
         'claude_session_id': 'uuid-claude-abc123',
         'claude_owner_pid': 424242,
         'self_exit': True,
+        'exit_request': sr.ExitRequest(
+            state=sr.ExitRequestState.ATTEMPTED,
+            reason=None,
+            pid=424242,
+            at='2026-07-07T00:00:00+00:00',
+            marker_session_id='uuid-claude-abc123',
+        ),
+        'exit_requested_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
@@ -9204,6 +9212,21 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
             'which silently disables every hook.'
         ),
     ),
+    _BareShellEntrypoint(
+        name='session_self_exit.py (tier-2: import with PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_self_exit.py',
+        pythonpath=(_SR_PKG_ROOT_ENTRY,),
+        shape=_EntrypointShape.IMPORT,
+        argv=(),
+        probe='from shared import safe_io',
+        callers=(
+            'session_hooks.py imports this module at module scope, and '
+            'skills/spawn/hooks/stop.sh (with its session-start/notification '
+            'siblings) runs session_hooks.py by absolute path with '
+            'PYTHONPATH=orchestrator/src and no venv. A non-stdlib import here makes '
+            'session_hooks.py unimportable, which silently disables every hook.'
+        ),
+    ),
 )
 
 #: Mutation matrix: ``(entrypoint filename, import injected at module scope)``.
@@ -9242,6 +9265,8 @@ _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
     ('session_hooks.py', 'import pydantic'),
     ('session_ownership_probes.py', 'from shared import safe_io'),
     ('session_ownership_probes.py', 'import pydantic'),
+    ('session_self_exit.py', 'from shared import safe_io'),
+    ('session_self_exit.py', 'import pydantic'),
 )
 
 
@@ -9584,7 +9609,7 @@ class TestStdlibOnlySelfContainment:
     different contracts in this repo, and only the first is what these rows pin:
 
     (a) bare-shell executability — ``session_registry``, ``session_hooks``,
-        ``session_ownership_probes``;
+        ``session_ownership_probes``, ``session_self_exit``;
     (b) layering / cycle avoidance — ``routing``, ``stop_instruction``,
         ``fm_retry``, ``agents/triage``, ``fused_memory/config``/``schema``,
         where importing an intra-package sibling is perfectly fine;
