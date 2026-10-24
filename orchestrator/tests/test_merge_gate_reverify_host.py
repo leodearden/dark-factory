@@ -147,21 +147,31 @@ async def _single(scene: _Scene, name: str) -> MergeRequest:
     return _request(scene, name, worktree)
 
 
-class _MovesMainOnFirstCall(FakeVerifier):
-    """A ``FakeVerifier`` that lands unrelated drift on main from inside its
-    first call. ``heads`` keeps the HEAD each call was handed, sampled when
-    the call starts."""
+class _SamplesHeads(FakeVerifier):
+    """A ``FakeVerifier`` whose ``heads`` keeps the HEAD each call was handed,
+    sampled when the call starts."""
 
-    def __init__(self, repo: Path, *, sequence: Iterable[VerifyScript] = ()) -> None:
+    def __init__(self, *, sequence: Iterable[VerifyScript] = ()) -> None:
         super().__init__(sequence=sequence)
-        self._repo = repo
         self.heads: list[str] = []
 
     def next_script(self, task_id: str | None) -> VerifyScript:
         self.heads.append(_git(self.verify_calls[-1].worktree, 'rev-parse', 'HEAD'))
+        return super().next_script(task_id)
+
+
+class _MovesMainOnFirstCall(_SamplesHeads):
+    """A ``_SamplesHeads`` that lands unrelated drift on main from inside its first call."""
+
+    def __init__(self, repo: Path, *, sequence: Iterable[VerifyScript] = ()) -> None:
+        super().__init__(sequence=sequence)
+        self._repo = repo
+
+    def next_script(self, task_id: str | None) -> VerifyScript:
+        script = super().next_script(task_id)
         if len(self.heads) == 1:
             _land_drift(self._repo)
-        return super().next_script(task_id)
+        return script
 
 
 _HostScript = Callable[['_HeadHost'], Awaitable[VerifyResult]]
@@ -397,3 +407,38 @@ async def test_a_same_tree_history_leg_stays_local_on_a_remote_lease_head(
     assert host.calls == [gate['verified_merge_sha']]
     assert leg_head.read_text().strip() == landed
     assert [row['runner'] for row in _rows(store, 'merge_verify', landed)] == ['history-leg']
+
+
+# ─── An unreachable head host moves the gate to local ───────────────────────
+
+
+async def test_the_gate_falls_back_to_local_when_the_head_host_is_unreachable(
+    remote_scene: _Scene,
+) -> None:
+    """A transport fault at gate time never strands or blocks the item: the
+    host is benched for reprobe and the same gate re-verify re-runs on local."""
+    request = await _single(remote_scene, 'gate')
+    host = _HeadHost(
+        _host_moves_main_then_passes(functools.partial(_land_drift, remote_scene.repo)),
+        _host_unreachable,
+    )
+    verifier = _SamplesHeads()
+    store = _RecordingEventStore()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(
+        remote_scene.git_ops, queue,
+        verifier=verifier, clock=healthy_verify_clock(), event_store=store,
+        remote_runners=[host],
+    )
+
+    outcome = await merge_through_lane(lane, queue, request)
+
+    assert outcome.status == 'done', outcome
+    landed = remote_scene.main_sha()
+    on_main = _git(remote_scene.repo, 'ls-tree', '--name-only', 'main').splitlines()
+    assert {'drift.txt', 'gate.txt'} <= set(on_main), on_main
+    assert verifier.heads == [landed]
+    assert [row['runner'] for row in _rows(store, 'merge_verify', landed)] == ['local']
+    (laptop,) = [row for row in lane.snapshot()['hosts'] if row['name'] == host.name]
+    assert laptop['quarantined'] is True, laptop
+    assert 'exited 255' in laptop['reason'], laptop
