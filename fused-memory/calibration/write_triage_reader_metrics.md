@@ -93,7 +93,8 @@ left out.
   A rater whose line breaks the contract, or whose quote or span is not found,
   is asked the item again (the `reask` subcommand of
   `fused-memory/scripts/build_write_triage_v2_soak_baseline.py`, via
-  `::rating_problems`), and the later round's line supersedes the earlier one.
+  `fused-memory/scripts/write_triage_rating_rounds.py::rating_problems`), and
+  the later round's line supersedes the earlier one.
   `third` and `assemble` refuse while any such line is left.
 - Agreement is Cohen's kappa per binary between the primary and the second
   rater, over consumed answers only. An answer is consumed when both raters
@@ -209,8 +210,8 @@ record marked). The window opens when the last of them is live, runs at least
    their nearest earlier records for M3; and the M6 census of children whose
    parent was edited after attach. Record each stratum's population in a
    strata file.
-3. Build shards as `fused-memory/scripts/build_write_triage_v2_soak_baseline.py`
-   does: the brief verbatim, texts capped at 4,000 characters, no digest,
+3. Build shards with `fused-memory/scripts/write_triage_rating_rounds.py`, as
+   the soak builder does: the brief verbatim, texts capped at 4,000 characters, no digest,
    opaque item ids, a separate key, and a record of the texts each rater saw.
 4. Rate per §4: two blind Opus raters on every item. Validate every line, and
    re-ask each rater whose line breaks the row contract or whose evidence is
