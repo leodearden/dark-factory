@@ -38,6 +38,7 @@ thing to the record as it did to the decision the record reports on.
 
 from __future__ import annotations
 
+import bisect
 import posixpath
 import re
 import shlex
@@ -1722,14 +1723,15 @@ def _pytest_invocation_spans(raw: str) -> list[tuple[int, int]]:
     """
     chars, _unterminated = _unquoted_chars(raw)
     unquoted = {index for index, _char in chars}
-    terminators = sorted(index for index, char in chars if char in _PYTEST_SPAN_TERMINATORS)
+    span_ends = [index for index, char in chars if char in _PYTEST_SPAN_TERMINATORS]
+    span_ends.append(len(raw))
     spans: list[tuple[int, int]] = []
     cursor = 0
     for token in _PYTEST_TOKEN_RE.finditer(raw):
         start = token.start()
         if start not in unquoted or start < cursor:
             continue
-        end = next((index for index in terminators if index > start), len(raw))
+        end = span_ends[bisect.bisect_right(span_ends, start)]
         spans.append((start, end))
         cursor = end
     return spans
