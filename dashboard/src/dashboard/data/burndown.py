@@ -59,8 +59,7 @@ logger = logging.getLogger(__name__)
 # acquire_snapshot never spends it.
 _SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIMEOUT
 
-# The wall-clock-aligned tick on which dashboard/src/dashboard/loops.py::_burndown_loop
-# (and ::_metrics_loop) sample; loops.py imports it from here.
+# Wall-clock-aligned sampling tick for the burndown (and metrics) collectors.
 SAMPLE_INTERVAL_SECONDS = 600
 
 # Whole-operation backstop for ONE root's snapshot acquisition, enforced by
