@@ -1,11 +1,13 @@
 """Tests for scripts/legibility/landing_gate.py: a project's landing-gate
 command, run in its checkout, says whether a census output may land there
-(task 7448). Real subprocesses through ``sys.executable -c``, ``tmp_path`` as
-the checkout."""
+(task 7448). Real subprocesses through ``sys.executable -c``, a one-commit git
+repo under ``tmp_path`` as the checkout."""
 from __future__ import annotations
 
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -14,12 +16,42 @@ from legibility import config, landing_gate
 GateStatus = landing_gate.GateStatus
 
 
+@pytest.fixture
+def checkout(tmp_path: Path) -> Path:
+    git = ["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.hooksPath=/dev/null"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    return tmp_path
+
+
+def _head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
 def _spec(code: str, *, timeout_secs: int = 60) -> config.LandingGate:
     return config.LandingGate(argv=(sys.executable, "-c", code), timeout_secs=timeout_secs)
 
 
-def test_a_command_that_exits_zero_passes(tmp_path: Path) -> None:
-    verdict = landing_gate.run_gate(tmp_path, _spec("pass"))
+def _heads(*shas: str) -> Callable[[Path | str], str]:
+    """A HEAD reader that answers *shas* in turn, one per read."""
+    answers = iter(shas)
+    return lambda repo: next(answers)
+
+
+class _CountingRunner:
+    def __init__(self, returncode: int = 0) -> None:
+        self.calls = 0
+        self.returncode = returncode
+
+    def __call__(self, argv, **kwargs) -> subprocess.CompletedProcess[str]:
+        self.calls += 1
+        return subprocess.CompletedProcess(argv, self.returncode, "", "")
+
+
+def test_a_command_that_exits_zero_passes(checkout: Path) -> None:
+    verdict = landing_gate.run_gate(checkout, _spec("pass"))
 
     assert verdict.status is GateStatus.PASSED
     assert verdict.passed is True
@@ -27,10 +59,10 @@ def test_a_command_that_exits_zero_passes(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("stream", ["stdout", "stderr"])
-def test_a_command_that_exits_non_zero_fails_with_its_output(tmp_path: Path, stream: str) -> None:
+def test_a_command_that_exits_non_zero_fails_with_its_output(checkout: Path, stream: str) -> None:
     code = f"import sys; print('boom', file=sys.{stream}); sys.exit(1)"
 
-    verdict = landing_gate.run_gate(tmp_path, _spec(code))
+    verdict = landing_gate.run_gate(checkout, _spec(code))
 
     assert verdict.status is GateStatus.FAILED
     assert verdict.passed is False
@@ -38,15 +70,15 @@ def test_a_command_that_exits_non_zero_fails_with_its_output(tmp_path: Path, str
     assert "boom" in verdict.output_tail
 
 
-def test_the_command_runs_in_the_checkout(tmp_path: Path) -> None:
-    verdict = landing_gate.run_gate(tmp_path, _spec("import os; print(os.getcwd())"))
+def test_the_command_runs_in_the_checkout(checkout: Path) -> None:
+    verdict = landing_gate.run_gate(checkout, _spec("import os; print(os.getcwd())"))
 
     assert verdict.passed is True
-    assert verdict.output_tail.strip() == str(tmp_path.resolve())
+    assert verdict.output_tail.strip() == str(checkout.resolve())
 
 
-def test_a_command_that_outruns_its_timeout_did_not_run(tmp_path: Path) -> None:
-    verdict = landing_gate.run_gate(tmp_path, _spec("import time; time.sleep(5)", timeout_secs=1))
+def test_a_command_that_outruns_its_timeout_did_not_run(checkout: Path) -> None:
+    verdict = landing_gate.run_gate(checkout, _spec("import time; time.sleep(5)", timeout_secs=1))
 
     assert verdict.status is GateStatus.DID_NOT_RUN
     assert verdict.passed is False
@@ -54,21 +86,21 @@ def test_a_command_that_outruns_its_timeout_did_not_run(tmp_path: Path) -> None:
     assert "timed out" in verdict.describe()
 
 
-def test_a_timeout_keeps_the_output_written_before_it(tmp_path: Path) -> None:
+def test_a_timeout_keeps_the_output_written_before_it(checkout: Path) -> None:
     def timing_out(argv, **kwargs):
         raise subprocess.TimeoutExpired(argv, kwargs["timeout"], output=b"collected 3", stderr=b"still running")
 
-    verdict = landing_gate.run_gate(tmp_path, _spec("pass"), runner=timing_out)
+    verdict = landing_gate.run_gate(checkout, _spec("pass"), runner=timing_out)
 
     assert verdict.status is GateStatus.DID_NOT_RUN
     assert "collected 3" in verdict.output_tail
     assert "still running" in verdict.output_tail
 
 
-def test_a_command_that_cannot_be_launched_did_not_run(tmp_path: Path) -> None:
-    spec = config.LandingGate(argv=(str(tmp_path / "no-such-executable"),))
+def test_a_command_that_cannot_be_launched_did_not_run(checkout: Path) -> None:
+    spec = config.LandingGate(argv=(str(checkout / "no-such-executable"),))
 
-    verdict = landing_gate.run_gate(tmp_path, spec)
+    verdict = landing_gate.run_gate(checkout, spec)
 
     assert verdict.status is GateStatus.DID_NOT_RUN
     assert verdict.passed is False
@@ -76,30 +108,129 @@ def test_a_command_that_cannot_be_launched_did_not_run(tmp_path: Path) -> None:
     assert "could not be run" in verdict.describe()
 
 
-def test_no_gate_configured_is_ungated_and_launches_nothing(tmp_path: Path) -> None:
+def test_no_gate_configured_is_ungated_and_launches_nothing(checkout: Path) -> None:
     def poison(*args, **kwargs):
         raise AssertionError("an ungated landing launched a command")
 
-    verdict = landing_gate.run_gate(tmp_path, None, runner=poison)
+    verdict = landing_gate.run_gate(checkout, None, runner=poison)
 
     assert verdict.status is GateStatus.UNGATED
     assert verdict.passed is True
 
 
-def test_long_output_keeps_only_its_end(tmp_path: Path) -> None:
+def test_long_output_keeps_only_its_end(checkout: Path) -> None:
     size = landing_gate.OUTPUT_TAIL_CHARS * 3
     code = f"import sys; sys.stdout.write('a' * {size} + 'THE-END'); sys.exit(1)"
 
-    verdict = landing_gate.run_gate(tmp_path, _spec(code))
+    verdict = landing_gate.run_gate(checkout, _spec(code))
 
     assert len(verdict.output_tail) <= landing_gate.OUTPUT_TAIL_CHARS
     assert verdict.output_tail.endswith("THE-END")
 
 
-def test_a_failed_verdict_describes_its_command_and_exit_code(tmp_path: Path) -> None:
+def test_a_failed_verdict_describes_its_command_and_exit_code(checkout: Path) -> None:
     spec = _spec("import sys; sys.exit(3)")
 
-    described = landing_gate.run_gate(tmp_path, spec).describe()
+    described = landing_gate.run_gate(checkout, spec).describe()
 
     assert "exited 3" in described
     assert sys.executable in described
+
+
+def _running(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+def test_a_timeout_kills_every_process_the_command_started(checkout: Path, tmp_path_factory) -> None:
+    pidfile = tmp_path_factory.mktemp("grandchild") / "pid"
+    grandchild = f"import os, pathlib, time; pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    code = (
+        "import pathlib, subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}]); "
+        f"[time.sleep(0.05) for _ in iter(lambda: pathlib.Path({str(pidfile)!r}).exists(), True)]; "
+        "time.sleep(60)"
+    )
+
+    verdict = landing_gate.run_gate(checkout, _spec(code, timeout_secs=3))
+
+    assert verdict.status is GateStatus.DID_NOT_RUN
+    pid = int(pidfile.read_text())
+    try:
+        deadline = time.monotonic() + 5
+        while _running(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _running(pid)
+    finally:
+        if _running(pid):
+            subprocess.run(["kill", "-9", str(pid)], check=False)
+
+
+def test_output_that_is_not_utf_8_still_fails_with_its_output(checkout: Path) -> None:
+    code = "import sys; sys.stdout.buffer.write(b'\\xff\\xfe boom'); sys.exit(1)"
+
+    verdict = landing_gate.run_gate(checkout, _spec(code))
+
+    assert verdict.status is GateStatus.FAILED
+    assert verdict.returncode == 1
+    assert "boom" in verdict.output_tail
+
+
+def test_a_verdict_names_the_head_it_ran_at(checkout: Path) -> None:
+    verdict = landing_gate.run_gate(checkout, _spec("pass"))
+
+    assert verdict.head == _head(checkout)
+
+
+def test_a_head_that_moves_during_a_run_runs_the_command_again(checkout: Path) -> None:
+    runner = _CountingRunner()
+
+    verdict = landing_gate.run_gate(checkout, _spec("pass"), runner=runner, head_of=_heads("a", "b", "b", "b"))
+
+    assert runner.calls == 2
+    assert verdict.status is GateStatus.PASSED
+    assert verdict.head == "b"
+
+
+def test_a_head_that_moves_during_every_run_refuses_the_landing(checkout: Path) -> None:
+    runner = _CountingRunner()
+    shas = [str(read) for read in range(2 * landing_gate.GATE_ATTEMPTS)]
+
+    verdict = landing_gate.run_gate(checkout, _spec("pass"), runner=runner, head_of=_heads(*shas))
+
+    assert runner.calls == landing_gate.GATE_ATTEMPTS
+    assert verdict.status is GateStatus.HEAD_MOVED
+    assert verdict.passed is False
+    assert verdict.head is None
+    assert "HEAD moved" in verdict.describe()
+
+
+def test_a_run_that_did_not_finish_is_not_run_again_when_head_moves(checkout: Path) -> None:
+    calls = []
+
+    def timing_out(argv, **kwargs):
+        calls.append(argv)
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    verdict = landing_gate.run_gate(checkout, _spec("pass"), runner=timing_out, head_of=_heads("a", "b"))
+
+    assert len(calls) == 1
+    assert verdict.status is GateStatus.DID_NOT_RUN
+    assert "timed out" in verdict.describe()
+
+
+def test_a_head_that_cannot_be_read_did_not_run_and_launches_nothing(tmp_path: Path) -> None:
+    runner = _CountingRunner()
+
+    def unreadable(repo):
+        raise RuntimeError("git rev-parse HEAD failed")
+
+    verdict = landing_gate.run_gate(tmp_path, _spec("pass"), runner=runner, head_of=unreadable)
+
+    assert runner.calls == 0
+    assert verdict.status is GateStatus.DID_NOT_RUN
+    assert "could not read HEAD" in verdict.describe()

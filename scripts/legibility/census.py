@@ -2962,7 +2962,9 @@ def run_census(
     report rendered from it -> ``codebook.dump`` -> ``advance_census_state``
     (done-count from the same *status_fetcher* snapshot, watermark from the
     mining window) -> *gate*, the project's landing gate
-    (``landing_gate.run_gate``) over the checkout now holding those outputs:
+    (``landing_gate.run_gate``) over the checkout now holding those outputs,
+    at a HEAD that held still while it ran (it re-runs a bounded number of
+    times while the merge worker moves HEAD, then refuses):
     a verdict that does not pass is rolled back exactly as a commit that did
     not land, and *commit* is never called ->
     *commit* of report + record + codebook + state -> ledger every merged
