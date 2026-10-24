@@ -457,7 +457,7 @@ class RatingScratch:
 def reask_round(
     scratch: RatingScratch, key: dict[str, Any], entries: Mapping[Triple, ShardEntry],
 ) -> dict[str, Any]:
-    """Shard every line to ask again, one shard per rater in a new round each; saves the key.
+    """Shard every line to ask again, each rater's in a new round of its own; saves the key.
 
     Returns the lines written and each new shard's size.
     """
@@ -468,10 +468,10 @@ def reask_round(
     written = {}
     for round_, (rater, lines) in enumerate(sorted(reask_by_rater.items()), start=last_round + 1):
         role = lines[0].row['role']
-        name = f'reask_{round_:02d}_{role}'
-        scratch.write_shard(key, name, [entries[_keyed_order(line.row)] for line in lines],
-                            role=role, rater=rater, round=round_)
-        written[name] = len(lines)
+        members = [entries[_keyed_order(line.row)] for line in lines]
+        for name, dealt in _dealt(members, f'reask_{round_:02d}_{role}'):
+            scratch.write_shard(key, name, dealt, role=role, rater=rater, round=round_)
+            written[name] = len(dealt)
     if written:
         scratch.save_key(key)
     return {'lines': sum(written.values()), 'shards': written}
@@ -483,18 +483,29 @@ def third_round(
 ) -> dict[str, Any]:
     """Shard the current-basis texts of the *blocked* (entry, target) pairs for a new third rater.
 
-    Saves the key when a shard is written. Returns the pairs sharded and the shard's name, or None.
+    Saves the key when a shard is written. Returns the pairs sharded and the new shards' names.
     """
     pairs = set(blocked)
-    index = sum(spec['role'] == Role.THIRD for spec in key['shards'].values())
-    name = f'third_{index:02d}'
+    index = len({spec['rater'] for spec in key['shards'].values() if spec['role'] == Role.THIRD})
+    rater = f'{RATER_MODELS[Role.THIRD]}-third-{index:02d}'
     members = [entry for (entry_id, target_id, basis), entry in sorted(entries.items())
                if basis == Basis.CURRENT and (entry_id, target_id) in pairs]
-    if members:
-        scratch.write_shard(key, name, members, role=Role.THIRD,
-                            rater=f'{RATER_MODELS[Role.THIRD]}-third-{index:02d}', round=0)
+    names = []
+    for name, dealt in _dealt(members, f'third_{index:02d}'):
+        scratch.write_shard(key, name, dealt, role=Role.THIRD, rater=rater, round=0)
+        names.append(name)
+    if names:
         scratch.save_key(key)
-    return {'pairs': len(members), 'shard': name if members else None}
+    return {'pairs': len(members), 'shards': names}
+
+
+def _dealt(members: Sequence[ShardEntry], name: str) -> list[tuple[str, list[ShardEntry]]]:
+    """*members* dealt into shards of at most :data:`SHARD_SIZE`: one named *name*, or several
+    named ``<name>_<NN>``."""
+    count = math.ceil(len(members) / SHARD_SIZE)
+    if count <= 1:
+        return [(name, list(members))] if members else []
+    return [(f'{name}_{index:02d}', list(members[index::count])) for index in range(count)]
 
 
 def refuse_unfinished(rated: Rated, entries: Iterable[Triple]) -> None:

@@ -430,20 +430,19 @@ class TestTheRounds:
         tied, open_pair = ('o1', 'a'), ('l2', 'Q')
         evalset.rate({('primary', tied): _conflict_yes, ('second', tied): _conflict_no,
                       ('primary', open_pair): _conflict_unclear,
-                      ('second', open_pair): _home_unclear,
-                      ('third', tied): _conflict_unclear, ('third', open_pair): _kept})
+                      ('second', open_pair): _home_unclear})
         assert evalset.run('third') == 0
         key = evalset.key()
         assert {_triple(key['items'][item])[:2] for item in key['shards']['third_00']['items']} == {
             tied, open_pair}
         assert key['shards']['third_00']['rater'] == 'opus-third-00'
-        evalset.rate({('third', tied): _kept})
+        evalset.rate({('third', tied): _conflict_unclear})
         assert evalset.run('third') == 0
         key = evalset.key()
         assert {_triple(key['items'][item])[:2] for item in key['shards']['third_01']['items']} == {
             tied}
         assert key['shards']['third_01']['rater'] == 'opus-third-01'
-        evalset.rate()
+        evalset.rate({('third', tied): _kept})
         shard_files = evalset.shard_files()
         assert evalset.run('third') == 0
         assert evalset.shard_files() == shard_files
