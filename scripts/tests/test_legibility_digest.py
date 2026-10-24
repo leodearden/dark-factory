@@ -1057,6 +1057,21 @@ class TestTrickleCoderSessionDigest:
 
         assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 6
 
+    def test_frontmatter_instrument_version_is_at_or_past_the_injected_prose_prompt_generation(
+        self,
+    ):
+        """A version floor only. Generation 7 is the first whose gold section
+        excludes the prior-round adjudicator, escalation-watcher rotation and
+        pre-5356 replan prompts. The exclusion itself is pinned by
+        TestHarnessInjectedTurnFilter.test_render_digest_injected_prose_prompt_session_has_no_gold_section."""
+        digest = mod.render_digest(
+            [_with_session_meta(_user_text('please fix the bug'))], agent_class='interactive',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 7
+
 
 # ---------------------------------------------------------------------------
 # find_retry_loops — same tool name + canonical (sort_keys) input signature
