@@ -1224,7 +1224,8 @@ class TestModelRoleRollupCore:
 
     def test_query_form_equals_the_fail_open_wrapper(self, tmp_path: Path) -> None:
         """On a readable store the connection-taking form and the fail-open
-        form return the same rollup, turn-cap saturation included."""
+        form return the same rollup, turn-cap saturation included, and the
+        connection-taking form leaves the connection it was handed open."""
         db_path = tmp_path / 'runs.db'
         _seed_rollup_runs_db(db_path)
         run_id = 'run-test'
@@ -1246,6 +1247,7 @@ class TestModelRoleRollupCore:
         conn = sqlite3.connect(db_path)
         try:
             rollup = digest.query_model_role_rollup(conn, *window)
+            assert conn.execute('SELECT 1').fetchone() == (1,)
         finally:
             conn.close()
 

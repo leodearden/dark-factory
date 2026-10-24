@@ -238,11 +238,11 @@ def _drifted_runs_db(path: Path) -> Path:
     return path
 
 
-class TestQueryFailureAfterTheProbe:
+class TestQueryFailureIsUnreadableNotZero:
     """The digest's readers answer a failed query with the zero of a quiet night; the page must not."""
 
     @pytest.mark.parametrize('measure', [mod.landed, mod.spend_and_cap_hits], ids=['landed', 'spend'])
-    def test_a_query_that_fails_once_the_probe_passed_is_unreadable_not_zero(self, tmp_path, measure):
+    def test_a_query_over_drifted_columns_is_unreadable_not_zero(self, tmp_path, measure):
         runs_db = _drifted_runs_db(tmp_path / 'runs.db')
 
         measurement = measure(runs_db, WINDOW, now=NOW)
@@ -250,18 +250,6 @@ class TestQueryFailureAfterTheProbe:
         assert measurement.status == 'unreadable'
         assert 'no such column' in measurement.shortfalls[0].reason
         assert measurement.shortfalls[0].path == str(runs_db)
-
-    def test_a_failure_is_seen_whatever_level_the_digest_logger_is_set_to(self, tmp_path):
-        runs_db = _drifted_runs_db(tmp_path / 'runs.db')
-        level, handlers = digest.logger.level, list(digest.logger.handlers)
-        digest.logger.setLevel('CRITICAL')
-        try:
-            measurement = mod.landed(runs_db, WINDOW, now=NOW)
-        finally:
-            digest.logger.setLevel(level)
-
-        assert measurement.status == 'unreadable'
-        assert digest.logger.handlers == handlers
 
     def test_with_logging_disabled_a_clean_read_is_ok_and_a_failed_one_unreadable(self, df, tmp_path):
         logging.disable(logging.CRITICAL)
