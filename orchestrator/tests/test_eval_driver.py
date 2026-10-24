@@ -46,7 +46,7 @@ from _campaign_gate_helpers import (
 )
 
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.metrics import RoleUnderTest
+from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
 from orchestrator.evals.results import EvalResult, ResultStore
 from orchestrator.workflow import WorkflowOutcome
 
@@ -58,6 +58,24 @@ def _impl_cfg() -> EvalConfig:
 def _arch_cfg() -> EvalConfig:
     # model!='opus' and effort!='high' so both diverge from the hardcoded pin.
     return EvalConfig('architect-sonnet-max', 'claude', 'sonnet', 'max', role=RoleUnderTest.ARCHITECT)
+
+
+def _judge_cfg() -> EvalConfig:
+    return EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role=RoleUnderTest.JUDGE)
+
+
+def _fake_collect_metrics(collect_side_effect: BaseException | None) -> AsyncMock:
+    """A collect_metrics stand-in that honours its role/replay_frame keywords."""
+
+    async def fake_collect(_wf, _wt, _task, *, role, replay_frame=None):
+        if collect_side_effect is not None:
+            raise collect_side_effect
+        return EvalMetrics(
+            composite_score=0.9, tests_pass=True,
+            role_under_test=role, replay_frame=replay_frame,
+        )
+
+    return AsyncMock(side_effect=fake_collect)
 
 
 # ---------------------------------------------------------------------------
@@ -430,9 +448,7 @@ async def _run_eval_hermetic(
         captured['build_workflow'] = kwargs
         return fake_wf
 
-    metrics_obj = MagicMock()
-    metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
-    mock_collect = AsyncMock(return_value=metrics_obj, side_effect=collect_side_effect)
+    mock_collect = _fake_collect_metrics(collect_side_effect)
     mock_store = MagicMock(spec=ResultStore)
     mock_build_gate = AsyncMock(return_value=gate)
 
@@ -447,6 +463,7 @@ async def _run_eval_hermetic(
     captured['build_gate'] = mock_build_gate
     captured['wf'] = fake_wf
     captured['save'] = mock_store.save
+    captured['collect'] = mock_collect
 
     extra: dict[str, Any] = (
         {} if injected_gate is _NO_INJECTED_GATE else {'usage_gate': injected_gate}
@@ -491,10 +508,10 @@ class TestRunEvalJudgeConfig:
         )
 
         # judge_config defaults None → label is the implementer config name, the
-        # judge stays the sonnet incumbent, and no role_under_test='judge' stamp.
+        # judge stays the sonnet incumbent, and the cell is an implementer cell.
         assert result.config_name == 'claude-sonnet-max'
         assert captured['build_workflow']['config'].models.judge == 'sonnet'
-        assert result.metrics.get('role_under_test') != 'judge'
+        assert result.metrics.get('role_under_test') == RoleUnderTest.IMPLEMENTER
 
 
 # ---------------------------------------------------------------------------
@@ -561,9 +578,7 @@ async def _run_end_to_end_hermetic(
         captured['build_workflow'] = kwargs
         return fake_wf
 
-    metrics_obj = MagicMock()
-    metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
-    mock_collect = AsyncMock(return_value=metrics_obj, side_effect=collect_side_effect)
+    mock_collect = _fake_collect_metrics(collect_side_effect)
     mock_store = MagicMock(spec=ResultStore)
     mock_build_gate = AsyncMock(return_value=gate)
 
@@ -696,6 +711,94 @@ class TestEndToEndCarriesReplayFrame:
             captured['build_workflow']['briefing'], ReplayFramedBriefingAssembler,
         )
         assert result.metrics.get('replay_frame') is None
+
+
+# ---------------------------------------------------------------------------
+# task 6738 — each executor hands its role (and the replay frame, when framed)
+# to collect_metrics, which sets them on the EvalMetrics dataclass; a cell whose
+# collection raised still carries the stamps the executor knows.
+# ---------------------------------------------------------------------------
+
+async def _role_cell_implementer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw):
+    result, captured = await _run_eval_hermetic(
+        _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch, **kw,
+    )
+    return result, captured
+
+
+async def _role_cell_judge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw):
+    result, captured = await _run_eval_hermetic(
+        _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+        judge_config=_judge_cfg(), **kw,
+    )
+    return result, captured
+
+
+async def _role_cell_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw):
+    result, captured, mocks = await _run_end_to_end_hermetic(
+        _arch_cfg(), _impl_cfg(), _base_config(tmp_path), _e2e_task(tmp_path),
+        monkeypatch, **kw,
+    )
+    return result, {**captured, **mocks}
+
+
+def _role_cells():
+    from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+    return [
+        pytest.param(_role_cell_implementer, RoleUnderTest.IMPLEMENTER, None, id='implementer'),
+        pytest.param(_role_cell_judge, RoleUnderTest.JUDGE, None, id='judge'),
+        pytest.param(
+            _role_cell_end_to_end, RoleUnderTest.END_TO_END, REPLAY_FRAME_ID,
+            id='end_to_end',
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+class TestExecutorsStampTheirRole:
+    async def test_run_eval_cell_is_an_implementer_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _result, captured = await _role_cell_implementer(tmp_path, monkeypatch)
+
+        captured['collect'].assert_awaited_once()
+        assert captured['collect'].await_args.kwargs['role'] is RoleUnderTest.IMPLEMENTER
+        persisted = captured['save'].call_args.args[0]
+        assert persisted.metrics['role_under_test'] == RoleUnderTest.IMPLEMENTER
+
+    async def test_judge_cell_hands_the_judge_role_to_collection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        result, captured = await _role_cell_judge(tmp_path, monkeypatch)
+
+        assert captured['collect'].await_args.kwargs['role'] is RoleUnderTest.JUDGE
+        assert result.config_name == 'judge-haiku'
+        assert result.metrics['role_under_test'] == 'judge'
+
+    async def test_end_to_end_cell_hands_role_and_frame_to_collection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+        _result, captured = await _role_cell_end_to_end(tmp_path, monkeypatch)
+
+        kwargs = captured['collect'].await_args.kwargs
+        assert kwargs['role'] is RoleUnderTest.END_TO_END
+        assert kwargs['replay_frame'] == REPLAY_FRAME_ID
+
+    @pytest.mark.parametrize(('drive', 'role', 'frame'), _role_cells())
+    async def test_role_survives_a_failed_collection(
+        self, drive, role: RoleUnderTest, frame: str | None,
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _result, captured = await drive(
+            tmp_path, monkeypatch, collect_side_effect=RuntimeError('x'),
+        )
+
+        persisted = captured['save'].call_args.args[0]
+        assert persisted.metrics['role_under_test'] == role
+        assert persisted.metrics.get('replay_frame') == frame
 
 
 # ---------------------------------------------------------------------------

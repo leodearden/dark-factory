@@ -21,6 +21,7 @@ import orchestrator.evals.results as results_module
 from orchestrator.evals import runner
 from orchestrator.evals.architect_eval import ArchitectEvalDeps
 from orchestrator.evals.configs import EvalConfig
+from orchestrator.evals.metrics import EvalMetrics
 from orchestrator.evals.results import (
     CellName,
     EvalResult,
@@ -427,6 +428,12 @@ async def _fake_create_wt(*_a, **_k):
     return Path('/fake/wt'), 'run-b1'
 
 
+async def _fake_collect(_wf, _wt, _task, *, role, replay_frame=None):
+    return EvalMetrics(
+        composite_score=0.9, tests_pass=True, role_under_test=role, replay_frame=replay_frame,
+    )
+
+
 @pytest.mark.asyncio
 async def test_b1_an_executor_cell_reads_back_through_the_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -434,11 +441,9 @@ async def test_b1_an_executor_cell_reads_back_through_the_store(
     store = ResultStore(tmp_path / 'results')
     workflow = MagicMock()
     workflow.run = AsyncMock(return_value=SimpleNamespace(outcome=WorkflowOutcome.DONE))
-    metrics = MagicMock()
-    metrics.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
     monkeypatch.setattr(runner, 'create_eval_worktree', _fake_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', lambda **_kw: workflow)
-    monkeypatch.setattr(runner, 'collect_metrics', AsyncMock(return_value=metrics))
+    monkeypatch.setattr(runner, 'collect_metrics', AsyncMock(side_effect=_fake_collect))
     monkeypatch.setattr(runner, 'load_task', lambda _p: _executor_task(tmp_path))
 
     result = await runner.run_eval(
