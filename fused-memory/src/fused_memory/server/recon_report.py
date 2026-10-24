@@ -16,8 +16,9 @@ import inspect
 import json
 import logging
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal
 
 from graphiti_core.errors import EdgeNotFoundError
@@ -752,7 +753,13 @@ class ReconReportState:
         self._ttl_seconds = ttl_seconds
         self._clock_fn = clock
         self._reaper_interval = reaper_interval
-        self._state: dict[tuple[str, str], _ReportEntry] = {}
+        # Resident entries.  _state is a READ-ONLY view so that no caller can
+        # add an entry without registering it in _run_entries: entries enter
+        # only through _install_entry, and leave only by tick()'s eviction.
+        self._resident_entries: dict[tuple[str, str], _ReportEntry] = {}
+        self._state: Mapping[tuple[str, str], _ReportEntry] = MappingProxyType(
+            self._resident_entries
+        )
         self._active: dict[str, str] = {}  # run_id → current stage
         # Run-level O(1) indices so add_finding / _resolve_finding avoid scanning
         # all entries across every live run_id.  Populated on the miss path of
@@ -2193,8 +2200,9 @@ class ReconReportState:
 
     def _install_entry(self, entry: _ReportEntry) -> None:
         """Make *entry* resident and its run's registered entry for its stage —
-        the only writer of ``_state``, so every resident entry is registered."""
-        self._state[(entry.run_id, entry.stage)] = entry
+        the only way into the read-only ``_state``, so every resident entry is
+        registered."""
+        self._resident_entries[(entry.run_id, entry.stage)] = entry
         self._run_entries.setdefault(entry.run_id, {})[entry.stage] = entry
 
     def _resolve_entry(self, run_id: str) -> _ReportEntry | None:
@@ -3362,7 +3370,7 @@ class ReconReportState:
         evicted_run_ids: set[str] = set()
         for key in to_evict:
             rid, stage = key
-            del self._state[key]
+            del self._resident_entries[key]
             evicted_run_ids.add(rid)
             # Remove _active pointer only if it still points at this stage
             if self._active.get(rid) == stage:
