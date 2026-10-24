@@ -14,15 +14,12 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
-import importlib.util
 import json
 import os
 import re
 import shlex
 import subprocess
-import sys
 import time
-import types
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,7 +34,13 @@ from review_all_program_cli import (
     load_program_module,
     wait_until_blocked_on,
 )
-from review_all_program_fixture import FIXTURE_DIR, PROGRAM_DIR, REPO_ROOT, running_fake_store
+from review_all_program_fixture import (
+    FIXTURE_DIR,
+    PROGRAM_DIR,
+    REPO_ROOT,
+    load_session_registry,
+    running_fake_store,
+)
 from review_all_program_seeded_run import StoreCopy
 
 SCRIPT = 'gen_brief.py'
@@ -485,20 +488,6 @@ def test_a_store_without_include_rows_is_refused_naming_it(tmp_path: Path) -> No
 
 S1_TITLE = 'prd:fixture S1'
 SPAWN_SCRIPT = REPO_ROOT / 'skills' / 'spawn' / 'spawn-claude.sh'
-SESSION_REGISTRY_PATH = REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'session_registry.py'
-
-
-def session_registry() -> types.ModuleType:
-    """This checkout's ``orchestrator/session_registry.py``, loaded by path."""
-    name = 'review_all_gen_brief_session_registry'
-    if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(name, SESSION_REGISTRY_PATH)
-        assert spec is not None and spec.loader is not None, SESSION_REGISTRY_PATH
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    return sys.modules[name]
-
 
 def sessions_json(run: BriefRun) -> dict[str, Any]:
     return json.loads((run.home / 'sessions.json').read_text(encoding='utf-8'))
@@ -528,7 +517,7 @@ def test_a_spawned_author_brief_records_the_session_and_prints_one_pointer_promp
     assert SPAWN_SCRIPT.is_file()
     text = brief_path.read_text(encoding='utf-8')
     spawn = '\n'.join(section(text, _section_heading('SPAWN')))
-    registry = session_registry()
+    registry = load_session_registry()
     for outcome in (registry.ResultOutcome.IN_PROGRESS, *registry.TERMINAL_RESULT_OUTCOMES):
         assert f'`{outcome}`' in spawn, outcome
     assert str(run.home / 'inbox' / 'S1.author.json') in spawn
