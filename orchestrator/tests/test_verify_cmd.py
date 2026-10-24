@@ -1428,14 +1428,16 @@ _PAREN_PRESERVING_PARAMS = [
 
 # (case_label, raw, corrupt_prefix, expected_template) — raw-retained pytest
 # chains (`cmd.raw is not None`, asserted per case rather than assumed) whose
-# chain operator `&&`/`|`/`;` sits INSIDE a quoted `-k`/`--deselect` argument.
+# chain operator `&&`/`|`/`;` sits INSIDE a quoted `-k`/`--deselect` argument,
+# or is backslash-escaped (`x\;y`), the third POSIX quoting form.
 #
-# `corrupt_prefix` is the measured splice point of the task-3650 quote-blind
-# span (rstripped). `corrupt_prefix + suffix` is the exact corrupt substring
-# that scanner produced (`pytest -k 'a -p no:xdist -o addopts=''` / `pytest -k
-# 'a -n 4`), so the negative assertion below names the real defect rather
-# than a generic "flags appeared somewhere". `{suffix}` in `expected_template`
-# is substituted per mutator, exactly as `_PAREN_PRESERVING_CASES` does.
+# `corrupt_prefix` is the measured splice point of the retired quote-blind
+# `\bpytest\b[^&|;]*` span (rstripped). `corrupt_prefix + suffix` is the exact
+# corrupt substring that scanner produced (`pytest -k 'a -n 4`, or
+# `pytest --deselect x\ -n 4;y`), so the negative assertion below names the
+# real defect rather than a generic "flags appeared somewhere". `{suffix}` in
+# `expected_template` is substituted per mutator, as `_PAREN_PRESERVING_CASES`
+# does.
 _QUOTED_CHAIN_OPERATOR_CASES = [
     (
         'quoted-and-single',
@@ -1478,6 +1480,12 @@ _QUOTED_CHAIN_OPERATOR_CASES = [
         "pytest -k 'a && b' t1/ && pytest t2/",
         "pytest -k 'a",
         "pytest -k 'a && b' t1/{suffix} && pytest t2/{suffix}",
+    ),
+    (
+        'escaped-semicolon',
+        'pytest --deselect x\\;y tests/ && true',
+        'pytest --deselect x\\',
+        'pytest --deselect x\\;y tests/{suffix} && true',
     ),
 ]
 
@@ -1620,8 +1628,8 @@ class TestSubshellClauseIntegrity:
             _assert_bash_parses(segment.command, what=f'segment {segment.label!r}')
 
     # GROUP B — differentiator guards for the rejected alternative fix
-    # (widening the task-3650-era span regex's excluded character class to
-    # `[^&|;)]*`). `bash -n` alone cannot distinguish the two candidate
+    # (widening the retired quote-blind `\bpytest\b[^&|;]*` span's excluded
+    # character class to `[^&|;)]*`). `bash -n` alone cannot distinguish the two candidate
     # fixes on the keyword-expression and command-substitution cases below:
     # the widened-class output ALSO exits 0 while having spliced the
     # recovery flags into the middle of a `-k` keyword expression or a
