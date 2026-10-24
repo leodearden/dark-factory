@@ -153,7 +153,7 @@ class CandidateTask:
         h.update((self.execution_class or '').encode())
         # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
         # Any change to length or algorithm must be mirrored there and at the
-        # task_curator.py mirror sites (_intra_batch_key, _normalize_key).
+        # other mirror site, candidate_key.py::compute_candidate_key.
         return h.hexdigest()[:16]
 
     @classmethod

@@ -5,7 +5,9 @@ A plain module rather than conftest.py, for the reason ``_fm_helpers.py`` gives.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import asyncio
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from shared.cli_invoke import AgentResult
@@ -20,6 +22,7 @@ from fused_memory.middleware.curator_types import (
     empty_pool_sizes,
     is_combine_eligible_status,
 )
+from fused_memory.middleware.task_interceptor import TaskInterceptor
 
 
 def make_config() -> FusedMemoryConfig:
@@ -102,3 +105,50 @@ def curator_returning(*decisions: CuratorDecision) -> MagicMock:
     curator.reembed_task = AsyncMock(return_value=None)
     curator.close = AsyncMock()
     return curator
+
+
+def hold_first_prepare(curator: Any) -> asyncio.Event:
+    """Make *curator*'s next ``prepare_candidate`` call wait for the returned event.
+
+    Every later call delegates straight to the original.
+    """
+    original = curator.prepare_candidate
+    release = asyncio.Event()
+    held = True
+
+    async def prepare_candidate(*args: Any, **kwargs: Any) -> Any:
+        nonlocal held
+        if held:
+            held = False
+            await release.wait()
+        return await original(*args, **kwargs)
+
+    curator.prepare_candidate = prepare_candidate
+    return release
+
+
+async def submit_as_one_batch(
+    interceptor: TaskInterceptor,
+    curator: Any,
+    submissions: Sequence[Mapping[str, Any]],
+    *,
+    project_root: str = '/project',
+) -> list[str]:
+    """Submit every entry of *submissions* so the curator worker judges them in one batch.
+
+    The worker drains its queue only after the first ticket's prepare step
+    returns, and that step is held until every submission is queued. The
+    first submission must therefore carry a title, so that its prepare step
+    reaches ``curator.prepare_candidate``. Returns the ticket ids in
+    submission order.
+    """
+    release = hold_first_prepare(curator)
+    ticket_ids: list[str] = []
+    try:
+        for submission in submissions:
+            response = await interceptor.submit_task(project_root, **submission)
+            assert 'ticket' in response, f'submit_task returned no ticket: {response!r}'
+            ticket_ids.append(response['ticket'])
+    finally:
+        release.set()
+    return ticket_ids
