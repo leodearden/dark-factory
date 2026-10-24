@@ -426,7 +426,8 @@ def _bind_claude_session_id(
     *allow_rebind* lets SessionStart re-bind when ``_is_owner_only_session_start``
     holds, because ``/clear`` re-mints the id inside the owning process; never on
     Notification/Stop. ``claude_owner_pid`` comes from *probes* and is None when
-    unresolvable. Returns whether *record* was mutated. See
+    unresolvable. The first bind also stamps ``claude_launch_session_id``,
+    which no rebind touches. Returns whether *record* was mutated. See
     ``docs/session-hook-ownership.md`` §Owner or inheritor.
     """
     hook_session_id = _hook_session_id(hook_input)
@@ -437,6 +438,8 @@ def _bind_claude_session_id(
         return False
     if bound and not allow_rebind:
         return False
+    if not bound and record.claude_launch_session_id is None:
+        record.claude_launch_session_id = hook_session_id
     record.claude_session_id = hook_session_id
     # The pid later tells a re-mint inside the owner from a nested claude;
     # None, when unresolvable, reads back as "cannot prove ownership".
