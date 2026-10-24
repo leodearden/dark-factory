@@ -4004,11 +4004,12 @@ class TaskInterceptor:
         mid-flight, the task may be written to ``tasks.json`` but the ticket
         row stays ``pending`` (the worker was interrupted before
         ``mark_resolved``).  On the next ``start()``, that ticket is marked
-        ``failed/server_restart`` — a caller that retries without passing
-        ``escalation_id`` + ``suggestion_hash`` metadata may therefore create a
-        duplicate.  Callers in contexts where duplication is unacceptable
-        should supply idempotency metadata so the R4 gate short-circuits the
-        retry.
+        ``failed/server_restart``.  A re-submit with the same title and files
+        then collides on the ``candidate_key`` index and resolves
+        ``combined`` (decision 9 of
+        ``plans/review-all-s11-curator-pipeline-prd.md``).  A retry that
+        changes either is not caught there: supply ``escalation_id`` +
+        ``suggestion_hash`` metadata so the R4 gate short-circuits it.
         """
         if self._closed:
             return {
@@ -4789,8 +4790,8 @@ class TaskInterceptor:
                     # prepare_candidate already swallows corpus-build failure
                     # to an empty pool; an exception here is unexpected.
                     # Continue with prepared=None — dispatch falls through
-                    # to a per-ticket curate() call inside the prepared
-                    # variant of _process_add_tickets_batch.
+                    # to a per-ticket curate() call inside
+                    # _process_add_tickets_batch_prepared.
                     logger.exception(
                         '_prepare_ticket: curator.prepare_candidate failed for ticket %s',
                         ticket_id,
@@ -4827,11 +4828,10 @@ class TaskInterceptor:
         Does NOT persist, signal, journal, or commit — the caller does, via
         :meth:`_persist_worker_outcome`.
 
-        The single dispatch chokepoint: the worker's batch path
-        (``_process_add_tickets_batch_prepared``) and the single-ticket
-        ``_process_add_ticket`` both reach it, so a branch added here is
-        inherited by both. A create that no curator verdict judged is stamped
-        ``metadata.dedupe_skipped`` here (:func:`_dedupe_skipped_reason`).
+        The one dispatch chokepoint, reached from the worker's batch path,
+        :meth:`_process_add_tickets_batch_prepared`. A create that no curator
+        verdict judged is stamped ``metadata.dedupe_skipped`` here
+        (:func:`_dedupe_skipped_reason`).
         """
         if decision is not None and decision.action == 'refuse':
             # Deterministic refusal (cancelled-premise blocklist / recon premise
@@ -4937,9 +4937,7 @@ class TaskInterceptor:
         if decision is not None and decision.action == 'route_deterministic':
             # Operational-ask registry match (filing-policy gate): stamp
             # metadata as a deterministic PURE-GATE and fall through to the
-            # ordinary create path below — this covers both the single
-            # (_process_add_ticket) and batch (_process_add_tickets_batch_prepared)
-            # dispatch callers, which both converge here.
+            # ordinary create path below.
             metadata = self._inject_deterministic_pure_gate(metadata)
 
         # ── Create task ───────────────────────────────────────────────
@@ -5224,10 +5222,11 @@ class TaskInterceptor:
         still happened, so the task it minted or folded into is real.
 
         Args:
-            caller: Short label identifying which worker path invoked this
-                helper (e.g. ``'add_ticket'``, ``'add_ticket_cancel'``,
-                ``'add_tickets_batch'``).  Included in the orphan-race WARNING
-                so production logs remain greppable per-caller.
+            caller: Short label identifying which worker step invoked this
+                helper (``'add_tickets_batch'`` or
+                ``'add_tickets_batch_idempotency'``).  Included in the
+                orphan-race WARNING so production logs remain greppable
+                per-caller.
 
         Returns:
             The ``bool`` returned by ``mark_resolved`` (``True`` if the row was
@@ -5265,241 +5264,6 @@ class TaskInterceptor:
             path='curator',
         )
         return resolved
-
-    async def _process_add_ticket(self, ticket_id: str) -> None:
-        """Run the full curator + write pipeline for a single ticket.
-
-        The single-ticket twin of :meth:`_process_add_tickets_batch_prepared`,
-        which is what the worker runs; it persists outcomes the same way, via
-        :meth:`_persist_worker_outcome`, and the result is read back by
-        ``resolve_ticket``.
-
-        Status values written:
-        - ``created``  — task was created via ``tm.add_task``
-        - ``combined`` — candidate was folded into an existing task (drop/combine/idempotency)
-        - ``awaiting_curation`` — the curator deferred; the ticket is parked, nothing created
-        - ``failed``   — an unrecoverable error occurred
-
-        Decision order: R4 idempotency check → curator decision (drop /
-        combine / create) → atomic write under ``_write_lock``.  On any
-        unhandled exception in the write section, ticket is marked ``failed``
-        and no ``task_created`` journal event is emitted.
-        """
-        if self._ticket_store is None:
-            return
-
-        row = await self._ticket_store.get(ticket_id)
-        if row is None:
-            logger.warning('_process_add_ticket: ticket %s not found in store', ticket_id)
-            return
-        if row['status'] != 'pending':
-            logger.warning(
-                '_process_add_ticket: ticket %s already terminal (%s), skipping',
-                ticket_id,
-                row['status'],
-            )
-            return
-
-        try:
-            blob = json.loads(row['candidate_json'])
-        except Exception:
-            logger.exception('_process_add_ticket: bad candidate_json for %s', ticket_id)
-            await self._ticket_store.mark_resolved(
-                ticket_id,
-                status='failed',
-                reason='bad_candidate_json',
-            )
-            self._signal_ticket_event(ticket_id)
-            return
-
-        project_root: str = blob['project_root']
-        kwargs: dict = dict(blob.get('kwargs', {}))
-        metadata = blob.get('metadata')
-        project_id = resolve_project_id(project_root)
-        attribution = CreationAttribution.from_blob_value(blob.get('creation_attribution'))
-
-        # Rebuild candidate for curator
-        kwargs_for_candidate = dict(kwargs)
-        if metadata is not None:
-            kwargs_for_candidate['metadata'] = metadata
-        candidate = self._build_candidate(kwargs_for_candidate)
-
-        status = 'failed'
-        task_id: str | None = None
-        reason: str | None = None
-        result_dict: dict | None = None
-        curator_degrade_reason: str | None = None
-        decision: CuratorDecision | None = None
-
-        try:
-            # ── R3 invariant: serialise curator+write within this project ─
-            # The worker runs per-project, but remove_task still takes
-            # _curator_lock in its own path.  Lock ordering:
-            # curator_lock (outer) → write_lock (inner), matching remove_task.
-            async with self._curator_lock(project_id):
-                # ── R4: escalation-level idempotency ─────────────────────────
-                # Short-circuits curator when (escalation_id, suggestion_hash) in
-                # metadata matches a non-cancelled existing task — avoids duplicate
-                # tasks when reconciliation retries an escalation suggestion.
-                # _idem_check_failed is intentionally unused today: both hit=None,
-                # check_failed=True and hit=None, check_failed=False fall through to
-                # the curator gate — the tuple is retained for future observability/metrics.
-                idempotency_hit, _idem_check_failed = (
-                    await self._check_escalation_idempotency(
-                        project_root=project_root,
-                        metadata=metadata,
-                    )
-                )
-                if idempotency_hit is not None:
-                    existing_task_id = str(idempotency_hit.get('id', ''))
-                    await self._persist_worker_terminal(
-                        ticket_id,
-                        status='combined',
-                        task_id=existing_task_id or None,
-                        reason='idempotency_hit',
-                        result_dict=idempotency_hit,
-                        caller='add_ticket_idempotency',
-                        project_root=project_root,
-                        attribution=attribution,
-                    )
-                    self._signal_ticket_event(ticket_id)
-                    return
-                # check_failed=True means get_tasks raised; fall through to
-                # the curator gate so the ticket is not lost (loud bypass —
-                # WARNING already emitted inside _check_escalation_idempotency).
-
-                # ── Curator gate ─────────────────────────────────────────────
-                curator = await self._get_curator()
-                if curator is not None and candidate is not None:
-                    try:
-                        decision = await curator.curate(candidate, project_id, project_root)
-                    except CuratorFailureError as exc:
-                        decision, curator_degrade_reason = _decision_after_curator_failure(
-                            ticket_id, exc,
-                        )
-
-                status, task_id, reason, result_dict, _ = await self._dispatch_ticket_decision(
-                    ticket_id=ticket_id,
-                    project_root=project_root,
-                    project_id=project_id,
-                    candidate=candidate,
-                    decision=decision,
-                    kwargs=kwargs,
-                    metadata=metadata,
-                    curator=curator,
-                    curator_degrade_reason=curator_degrade_reason,
-                )
-
-        except asyncio.CancelledError:
-            # Worker task cancelled (close() path) while inside _process_add_ticket.
-            # Ensure the ticket reaches a terminal state even if mark_resolved wasn't
-            # reached yet — cancellation may have interrupted the flow AFTER
-            # tm.add_task already mutated tasks.json (status latched to 'created').
-            # _persist_worker_terminal wraps mark_resolved in asyncio.shield internally
-            # and emits the orphan-race WARNING when status='created' and task_id is
-            # non-None (race detected), giving uniform observability across all three
-            # worker terminal-write paths.
-            logger.debug(
-                '_process_add_ticket: cancelled for ticket %s; persisting status=%s',
-                ticket_id,
-                status,
-            )
-            try:
-                await self._persist_worker_outcome(
-                    ticket_id,
-                    decision=decision,
-                    status=status,
-                    task_id=task_id,
-                    reason=reason
-                    if reason
-                    else ('cancelled_during_write' if status != 'created' else None),
-                    result_dict=result_dict,
-                    caller='add_ticket_cancel',
-                    project_root=project_root,
-                    attribution=attribution,
-                )
-                self._signal_ticket_event(ticket_id)
-            except Exception:
-                logger.exception(
-                    '_process_add_ticket: mark_resolved failed after cancellation '
-                    'for ticket %s; ticket remains pending and will be cleaned up '
-                    'by flush_pending_on_startup on next restart',
-                    ticket_id,
-                )
-            raise
-
-        except Exception as exc:
-            logger.exception(
-                '_process_add_ticket: unexpected error for ticket %s',
-                ticket_id,
-            )
-            if status == 'created':
-                # Failure happened after tm.add_task succeeded — preserve the
-                # 'created' resolution; demote the error to a warning so the
-                # facade and callers can surface it without losing the task.
-                logger.warning(
-                    '_process_add_ticket: post-create error for ticket %s, task %s: %s',
-                    ticket_id,
-                    task_id,
-                    exc,
-                )
-                if result_dict is None:
-                    result_dict = {}
-                result_dict.setdefault('post_create_warnings', []).append(
-                    {'stage': 'post_create', 'error': str(exc)}
-                )
-            else:
-                reason = str(exc)
-                status = 'failed'
-                result_dict = None
-
-        # ── Persist terminal state ────────────────────────────────────────
-        # Shield from cancellation so that a close()-triggered CancelledError
-        # that arrives here (after the try/except block) does not prevent the
-        # ticket from reaching a terminal state.
-        await self._persist_worker_outcome(
-            ticket_id,
-            decision=decision,
-            status=status,
-            task_id=task_id,
-            reason=reason,
-            result_dict=result_dict,
-            caller='add_ticket',
-            project_root=project_root,
-            attribution=attribution,
-        )
-
-        # ── Emit journal event and schedule commit (create path only) ────
-        if status == 'created' and task_id:
-            event = self._make_event(
-                EventType.task_created,
-                project_root,
-                {'operation': 'add_task', 'task_id': task_id},
-            )
-            await self._journal(event)
-
-        self._signal_ticket_event(ticket_id)
-
-    async def _process_add_tickets_batch(self, ticket_ids: list[str]) -> None:
-        """Thin wrapper: prepare each ticket and delegate to the prepared variant.
-
-        Preserves the historical entry point used by tests that drove batches
-        via raw ticket IDs (the worker now calls
-        :meth:`_process_add_tickets_batch_prepared` directly so it can
-        accumulate prepared bundles under the soft token threshold).  Tickets
-        that ``_prepare_ticket`` rejects (missing/terminal/bad-json) are
-        dropped here; the prepare step already wrote the failure terminal
-        and signalled waiters.
-        """
-        if not ticket_ids:
-            return
-        prepared: list[_PreparedTicket] = []
-        for tid in ticket_ids:
-            p = await self._prepare_ticket(tid)
-            if p is not None:
-                prepared.append(p)
-        if prepared:
-            await self._process_add_tickets_batch_prepared(prepared)
 
     async def _process_add_tickets_batch_prepared(
         self,
