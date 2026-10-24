@@ -426,3 +426,85 @@ class TestTheAdvanceAuditor:
         assert result.returncode == 2, result.stdout + result.stderr
         assert 'no-such-branch' in result.stderr
         assert 'Traceback' not in result.stderr
+
+
+class TestTheAdvanceHonoursTheRestoreCarveOut:
+    """Undoing main's LAST baseline change is not a new raise, at a landing too.
+
+    At a move of main, "the state this repository held one commit ago" is
+    main's history, so the carve-out reads it from the merge base: NEW's
+    baseline may be the image the path held immediately before the merge base's
+    last baseline change, and nothing older.
+    """
+
+    @staticmethod
+    def _main_with_a_lowering(tmp_path: Path) -> tuple[RatchetRepo, str]:
+        """main's a.py `cognitive` walks 125 -> 129 -> 120; the commit that recorded 129.
+
+        The last change LOWERS, as the real revert 3e7d55ce47 did, so restoring
+        the previous image is a raise and the carve-out is what decides it.
+        """
+        repo = RatchetRepo.seeded(tmp_path, report=_a_py_cognitive(125))
+        previous = _commit(repo, 'raise a.py on main', baseline=_a_py_cognitive(129))
+        _commit(repo, 'lower a.py on main', baseline=_a_py_cognitive(120))
+        return repo, previous
+
+    def test_restoring_mains_previous_image_is_allowed_and_named(
+        self, tmp_path: Path
+    ) -> None:
+        repo, previous = self._main_with_a_lowering(tmp_path)
+        _fork(repo)
+        _commit(repo, "undo main's last baseline change", baseline=_a_py_cognitive(129))
+        old, new = _land(repo, _TASK_BRANCH)
+
+        result = _advance(repo, old, new)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert previous in result.stdout
+        assert 'cognitive rose 120 -> 129 for a.py' in result.stdout
+
+    def test_restoring_an_image_two_changes_back_is_refused(self, tmp_path: Path) -> None:
+        repo, _previous = self._main_with_a_lowering(tmp_path)
+        _fork(repo)
+        _commit(repo, 'reach past the previous image', baseline=_a_py_cognitive(125))
+        old, new = _land(repo, _TASK_BRANCH)
+
+        result = _advance(repo, old, new)
+
+        assert result.returncode == 1, result.stdout + result.stderr
+
+    def test_a_blob_one_byte_off_the_previous_image_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        repo, _previous = self._main_with_a_lowering(tmp_path)
+        _fork(repo)
+        repo.write_baseline_text(metrics.render_baseline(_a_py_cognitive(129)) + '\n')
+        repo.commit_all('restore the previous measures under other bytes')
+        old, new = _land(repo, _TASK_BRANCH)
+
+        result = _advance(repo, old, new)
+
+        assert result.returncode == 1, result.stdout + result.stderr
+
+    def test_a_restore_main_has_moved_past_is_bounded_like_a_raise(
+        self, tmp_path: Path
+    ) -> None:
+        # The branch's commit restores the previous image while the lowering is
+        # main's last change, which the commit gate allows. main then lowers b.py,
+        # so the landing composes a.py 129 with b.py 25: an image main never held.
+        repo, _previous = self._main_with_a_lowering(tmp_path)
+        _fork(repo)
+        _commit(repo, "undo main's last baseline change", baseline=_a_py_cognitive(129))
+        repo.git('switch', '--quiet', 'main')
+        moved_on = _a_py_cognitive(120)
+        moved_on['files']['b.py']['cognitive'] = 25
+        _commit(repo, 'lower b.py on main', baseline=moved_on)
+        composed = _a_py_cognitive(129)
+        composed['files']['b.py']['cognitive'] = 25
+        old, new = _land(repo, _TASK_BRANCH, composed=composed)
+
+        result = _advance(repo, old, new)
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'cognitive rose 120 -> 129 for a.py' in result.stderr
+        assert _how_to_lines(result.stderr, old), result.stderr
