@@ -513,18 +513,15 @@ class TestCandidateTaskExecutionClass:
 
 
 class TestHashShapeContract16:
-    """Shape-contract regression guard for the two curator sha256 mirror sites
-    (``curator_types.py::CandidateTask.payload_hash`` and
-    ``task_curator.py::TaskCurator._normalize_key``) that lack an existing
-    16-char length assertion.
+    """Shape-contract regression guard for the fused-memory sha256 mirror sites:
+    ``curator_types.py::CandidateTask.payload_hash``, and
+    ``TaskCurator._normalize_key``, which delegates to
+    ``candidate_key.py::compute_candidate_key``.
 
     The canonical 16-char sha256-hex shape is owned by
     ``orchestrator.agents.triage.sha256_16`` — see the docstring there for the full
-    enumeration of mirror sites.  The third curator mirror site,
-    ``TaskCurator._intra_batch_key``, is already guarded by
-    ``TestIntraBatchKey.test_returns_16_hex_chars`` (line ~1868); do not add duplicate
-    coverage here.  Anyone adding a fourth mirror site should add a corresponding
-    assertion to that test or this class.
+    enumeration of mirror sites.  Anyone adding a new mirror site should add a
+    corresponding assertion to this class.
 
     These tests do NOT introspect docstrings — they verify actual hash output length,
     mirroring the ``TestSha256_16.test_length_is_16`` pattern in
@@ -5544,8 +5541,9 @@ class TestCurateBatchBatchTargetIndexRemap:
     a within-batch ``batch_target_index`` emitted by the LLM is in
     *unique-space* (positions 0..K-1).  The merge site must remap it to
     *original-space* (positions in the full ``candidates`` list) before
-    returning, because ``_process_add_tickets_batch`` keys
-    ``resolved_task_ids`` by original-space index.
+    returning, because the consumer,
+    ``TaskInterceptor._process_add_tickets_batch_prepared``, reads
+    ``batch_target_index`` positionally over the curatable slice it passed in.
     """
 
     @pytest.mark.asyncio
@@ -5718,70 +5716,6 @@ class TestCurateBatchCacheCheck:
         assert result[0].justification == 'c1-cached'
         assert result[1].justification == 'new-from-llm'
         assert result[2].justification == 'c2-cached'
-
-
-# ─────────────────────────────────────────────────────────────────────
-# TaskCurator._intra_batch_key (step-1: tests written before impl)
-# ─────────────────────────────────────────────────────────────────────
-
-
-class TestIntraBatchKey:
-    """Unit tests for the intra-batch dedup key helper.
-
-    These tests are written before the implementation exists (TDD step-1);
-    they must FAIL until _intra_batch_key is added in step-2.
-    """
-
-    def test_identical_inputs_produce_same_key(self):
-        """(a) identical inputs → identical keys."""
-        k1 = TaskCurator._intra_batch_key('Fix the parser', 'The parser is broken')
-        k2 = TaskCurator._intra_batch_key('Fix the parser', 'The parser is broken')
-        assert k1 == k2
-
-    def test_title_case_normalised(self):
-        """(b) case difference on title is normalised away."""
-        k1 = TaskCurator._intra_batch_key('Fix Bug', 'same description')
-        k2 = TaskCurator._intra_batch_key('fix bug', 'same description')
-        assert k1 == k2
-
-    def test_whitespace_drift_normalised(self):
-        """(c) leading/trailing and internal whitespace collapse to same key."""
-        k1 = TaskCurator._intra_batch_key('  Fix   bug ', 'desc')
-        k2 = TaskCurator._intra_batch_key('fix bug', 'desc')
-        assert k1 == k2
-
-    def test_description_whitespace_normalised(self):
-        """(c) description whitespace drift also normalised."""
-        k1 = TaskCurator._intra_batch_key('title', '  do   something ')
-        k2 = TaskCurator._intra_batch_key('title', 'do something')
-        assert k1 == k2
-
-    def test_different_description_yields_different_key(self):
-        """(d) same title but different description → different keys."""
-        k1 = TaskCurator._intra_batch_key('Fix parser', 'in module A')
-        k2 = TaskCurator._intra_batch_key('Fix parser', 'in module B')
-        assert k1 != k2
-
-    def test_empty_description_does_not_raise(self):
-        """(e) empty description is handled without raising."""
-        k = TaskCurator._intra_batch_key('Some title', '')
-        assert isinstance(k, str)
-
-    def test_none_description_does_not_raise(self):
-        """(e) None description is handled without raising."""
-        k = TaskCurator._intra_batch_key('Some title', None)  # type: ignore[arg-type]
-        assert isinstance(k, str)
-
-    def test_returns_16_hex_chars(self):
-        """(f) returns a stable 16-character hex string."""
-        k = TaskCurator._intra_batch_key('hello', 'world')
-        assert len(k) == 16
-        assert all(c in '0123456789abcdef' for c in k)
-
-    def test_empty_title_and_description(self):
-        """(e) both empty — no raise, returns 16-char string."""
-        k = TaskCurator._intra_batch_key('', '')
-        assert len(k) == 16
 
 
 # ─────────────────────────────────────────────────────────────────────
