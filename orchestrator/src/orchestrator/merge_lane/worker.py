@@ -18895,15 +18895,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         wait on a slot held by the next in-order entry, which finalizes only
         after this head.  The history leg's runner is local-only, so a
         declared *history_leg_command* runs on local whatever the head holds.
+
+        A remote that turns out unreachable is benched through the
+        ``on_unavailable`` chokepoint and the gate re-runs on local, leaseless,
+        never blocking the item; its restart-drain deadline restarts with it.
         """
-        remote = (
-            lease.runner
-            if lease is not None and not lease.is_local and history_leg_command is None
-            else None
-        )
+        if lease is not None and not lease.is_local and history_leg_command is None:
+            try:
+                return await self._lane_post_merge_verify(
+                    git_ops, req, merge_wt, runner=lease.runner, **gate_kwargs,
+                )
+            except RunnerUnavailable as exc:
+                logger.warning(
+                    'Task %s: verify host %s unavailable (%s: %s); re-running '
+                    'the gate re-verify on local',
+                    req.task_id, lease.name, exc.kind, exc,
+                )
+                self.bench_unavailable_runner(lease.name, exc)
+                self._note_verify_started(req.request_id)
         return await self._lane_post_merge_verify(
-            git_ops, req, merge_wt,
-            runner=remote, history_leg_command=history_leg_command, **gate_kwargs,
+            git_ops, req, merge_wt, history_leg_command=history_leg_command, **gate_kwargs,
         )
 
     async def _run_inflight_verify(
