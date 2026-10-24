@@ -830,13 +830,15 @@ def _answer(follow_up: FollowUp, rows: Iterable[Mapping[str, Any]]) -> Answer | 
 class TaskOutcome:
     """One back-linked task as this run read it. *ref* None is a ticket that
     names no task; a *ref* with *standing* None was not observed, and *note*
-    says why."""
+    says why. *corrects_record* marks a task the entry lists in
+    ``corrected_by``: it corrected the entry's record, not its defect."""
 
     ref: TaskRef | None
     ticket: str | None
     status: str | None
     standing: Standing | None
     note: str | None = None
+    corrects_record: bool = False
 
 
 @dataclass(frozen=True)
@@ -860,9 +862,15 @@ class EntryOutcome:
         the live task, and so may a linked task this run did not observe."""
         if self.awaiting:
             return f"ticket {self.awaiting[-1]} awaits the curator and may become the live task"
-        if any(task.ref is not None and task.standing is None for task in self.tasks):
+        if any(task.ref is not None and task.standing is None for task in self._deciding):
             return "another linked task was not observed"
         return None
+
+    @property
+    def _deciding(self) -> tuple[TaskOutcome, ...]:
+        """The tasks whose standing may decide the entry: every one but those
+        that only corrected its record."""
+        return tuple(task for task in self.tasks if not task.corrects_record)
 
     @property
     def governing(self) -> TaskOutcome | None:
@@ -873,7 +881,7 @@ class EntryOutcome:
             return None
         ranked = [
             (_rank(task.standing, task.ref.task_id), task)
-            for task in self.tasks
+            for task in self._deciding
             if task.standing is not None and task.ref is not None
         ]
         return min(ranked, key=lambda each: each[0])[1] if ranked else None
@@ -964,8 +972,23 @@ def _ticket_only(row: Mapping[str, Any]) -> TaskOutcome:
     return TaskOutcome(None, row.get("ticket"), None, None, note)
 
 
+def _corrections_of(entry: Mapping[str, Any]) -> frozenset[TaskRef]:
+    """The tasks *entry*'s ``corrected_by`` names: each one's whole outcome for
+    the entry was a correction of its record (codebook.py's corrections op,
+    ``outcome_of_task``). A malformed item names nothing; validate() rejects
+    it at rest."""
+    return frozenset(
+        TaskRef(item["project_root"], item["task_id"])
+        for item in entry.get("corrected_by") or []
+        if isinstance(item, Mapping)
+        and _is_text(item.get("project_root"))
+        and type(item.get("task_id")) is int
+    )
+
+
 def _entry_outcome(entry: Mapping[str, Any], read: Callable[[TaskRef, str | None], TaskOutcome]) -> EntryOutcome:
     rows = entry.get("filed_tickets") or []
+    corrections = _corrections_of(entry)
     tasks: list[TaskOutcome] = []
     seen: set[TaskRef] = set()
     for row in rows:
@@ -975,7 +998,7 @@ def _entry_outcome(entry: Mapping[str, Any], read: Callable[[TaskRef, str | None
         ref = TaskRef(row["project_root"], row["task_id"])
         if ref not in seen:
             seen.add(ref)
-            tasks.append(read(ref, row.get("ticket")))
+            tasks.append(replace(read(ref, row.get("ticket")), corrects_record=ref in corrections))
     awaiting = tuple(row["ticket"] for row in rows if _awaits_curator(row))
     outcome = EntryOutcome(entry["id"], entry.get("finding_key"), entry["status"], tuple(tasks), awaiting)
     governing = outcome.governing
@@ -1138,7 +1161,8 @@ def _projection(
 ) -> _Projected | None:
     """The one statement of how a task's outcome sets its entry's status
     (INV-9); None leaves the entry as it is. Only a re-verify that found the
-    finding gone at *as_of_sha* fixes it (INV-3)."""
+    finding gone at *as_of_sha* fixes it (INV-3), and a task the entry records
+    as its correction decides nothing (:attr:`EntryOutcome.governing`)."""
     governing = outcome.governing
     status = entry["status"]
     if status == _RETIRED_STATUS or governing is None or governing.ref is None:
@@ -1539,6 +1563,7 @@ class RowOutcome(enum.StrEnum):
     HELD = "held"
     UNOBSERVED = "unobserved"
     TICKET = "ticket"
+    CORRECTED = "corrected"
 
 
 _STANDING_OUTCOME = {Standing.FILED: RowOutcome.LIVE, Standing.ACCEPTED: RowOutcome.ACCEPTED}
@@ -1578,6 +1603,8 @@ class OutcomeReport:
     def _outcome(self, entry: EntryOutcome, task: TaskOutcome) -> tuple[RowOutcome, str | int | None]:
         if task.ref is None:
             return RowOutcome.TICKET, task.note
+        if task.corrects_record:
+            return RowOutcome.CORRECTED, None
         if task.standing is None:
             return RowOutcome.UNOBSERVED, task.note
         governing = entry.governing
@@ -1651,6 +1678,7 @@ _OUTCOME_CELLS = {
     RowOutcome.HELD: "{task_status} (not acted on: {detail})",
     RowOutcome.UNOBSERVED: "unobserved ({detail})",
     RowOutcome.TICKET: "ticket {detail}",
+    RowOutcome.CORRECTED: "corrected the entry's record, not its defect (decides no status)",
 }
 
 
