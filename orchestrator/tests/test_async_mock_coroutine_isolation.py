@@ -125,9 +125,26 @@ def test_an_orphan_created_outside_any_test_phase_is_attributed_to_none(monkeypa
 
 
 def test_enforcement_fails_naming_the_mock_and_still_closes_the_orphan():
+    drain_async_mock_coroutines()
     coro = AsyncMock(name='planted_notifier')('task-1')
 
     with pytest.raises(pytest.fail.Exception, match='planted_notifier'):
+        fail_on_orphaned_async_mock_calls()
+
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+def test_enforcement_still_fails_when_the_frame_no_longer_names_the_mock(monkeypatch, request):
+    drain_async_mock_coroutines()
+
+    async def drifted_execute_mock_call(mock, /, *args, **kwargs):
+        return None  # pragma: no cover
+
+    monkeypatch.setattr(AsyncMockMixin, '_execute_mock_call', drifted_execute_mock_call)
+    track_async_mock_coroutines()
+    coro = AsyncMock(name='drifted_notifier')()
+
+    with pytest.raises(pytest.fail.Exception, match=request.node.name):
         fail_on_orphaned_async_mock_calls()
 
     assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED

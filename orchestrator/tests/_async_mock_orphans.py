@@ -137,11 +137,16 @@ def _orphaned_calls_message(orphans: tuple[OrphanedAsyncMockCall, ...]) -> str:
     )
 
 
+_UNRECOVERABLE_MOCK_NAME = '<mock not recoverable: _execute_mock_call frame has no self>'
+
+
 def _calling_mock_name(coroutine: types.CoroutineType[Any, Any, Any]) -> str | None:
     """Name the mock whose call created *coroutine*: ``_execute_mock_call``'s ``self``.
 
-    None when another thread finished the coroutine since its state was read,
-    which leaves no frame to read ``self`` from.  The frame must be read before
+    None only when another thread finished the coroutine since its state was
+    read, which leaves no frame and no orphan.  A live frame without ``self``
+    means unittest.mock has drifted, so the orphan is reported under a
+    placeholder rather than dropped.  The frame must be read before
     ``close()``, which discards it.
     """
     frame = coroutine.cr_frame
@@ -149,5 +154,5 @@ def _calling_mock_name(coroutine: types.CoroutineType[Any, Any, Any]) -> str | N
         return None
     mock = frame.f_locals.get('self')
     if mock is None:
-        return None
+        return _UNRECOVERABLE_MOCK_NAME
     return mock._extract_mock_name()
