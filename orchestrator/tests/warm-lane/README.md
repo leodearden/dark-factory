@@ -295,18 +295,22 @@ Any task or PRD reference trailing the subject line is verbatim.
 `END-TO-END INTEGRATION GATE`. `test_helpers.sh` carries none of the three; its
 header rewrite is Delta 2.
 
-Every other reify path in a comment or in output is **left verbatim**: the
-`# shellcheck source=tests/infra/test_helpers.sh` directive in all eight, the
-seven `=== scripts/<x>.sh hermetic tests (task N) ===` banners, the
+The port left every other reify path in a comment or in output **verbatim**:
+the `# shellcheck source=tests/infra/test_helpers.sh` directive in all eight,
+the seven `=== scripts/<x>.sh hermetic tests (task N) ===` banners, the
 `scripts/warm-lane-*.sh` names in `test_warm_lane_sizing_lifecycle.sh`'s
 capture-variable list, and the `tests/infra/…` and `scripts/…`
 cross-references in headers and bodies. They are not drift. Re-pointing them
-on a re-sync would only grow every file's diff against reify.
+on a re-sync would only grow every file's diff against reify. A later
+dark-factory-native edit may still reword such a comment for its own reasons,
+and that hunk belongs to the edit, not to the port: commit `56a78879c7`
+rewrote `test_warm_lane_gc_sweep.sh`'s G6 comment, dropping its
+`scripts/warm-lane-gc-sweep.sh:` reference.
 
 The remaining header-block differences belong to other entries. The
 `# shellcheck source=…/lib_warm_lane_paths.sh` directive rides with Delta 1's
-`source` line, the excised block-list entries are Deltas 3–6, and the K1–K6
-index line is Delta 7. Header entries that describe dark-factory-native
+`source` line, the excised block-list entries are Deltas 3, 5 and 6, and the
+K1–K6 index line is Delta 7. Header entries that describe dark-factory-native
 additions travel with those additions.
 
 ### Not a delta — α's provision Deltas 1–2 needed no test-side change
