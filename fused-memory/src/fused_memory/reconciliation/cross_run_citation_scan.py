@@ -103,9 +103,9 @@ async def scan_cross_run_citations(
     resolve = make_memory_resolver(memory_service, project_id)
     outcomes = await _resolve_within_budget(citations, resolve, max_ids)
     dangling = tuple(
-        DanglingCitation(c.run_id, c.finding_id, c.memory_id, SUPPORTED_STORE)
+        record
         for c, outcome in zip(citations, outcomes, strict=True)
-        if outcome == _MISSING
+        if outcome == _MISSING and (record := _addressable_record(c)) is not None
     )
     counts = Counter(outcomes)
     return CrossRunCitationScan(
@@ -163,6 +163,16 @@ def _concrete_mem0_ids(finding: dict[str, Any]) -> Iterator[str]:
         memory_id = entry.get('memory_id')
         if isinstance(memory_id, str) and is_concrete_memory_id(memory_id):
             yield memory_id
+
+
+def _addressable_record(citation: _Citation) -> DanglingCitation | None:
+    try:
+        return DanglingCitation(
+            citation.run_id, citation.finding_id, citation.memory_id, SUPPORTED_STORE,
+        )
+    except ValueError as exc:
+        logger.warning('cross-run citation scan: skipping unaddressable %r: %s', citation, exc)
+        return None
 
 
 async def _resolve_within_budget(

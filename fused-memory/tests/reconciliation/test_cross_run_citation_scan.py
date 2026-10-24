@@ -191,6 +191,25 @@ class TestDetection:
         assert scan.citations_verified == 0
 
     @pytest.mark.asyncio
+    async def test_finding_id_the_record_rejects_is_skipped_not_raised(
+        self, tmp_path: Any,
+    ) -> None:
+        journal = await build_journal_with_closed_run(
+            tmp_path, run_id=RUN_A, project_id=P,
+            findings=[
+                _finding('   ', _citation(ABSENT_2)),
+                _finding(FINDING_1, _citation(ABSENT_1)),
+            ],
+        )
+        try:
+            scan = await scan_cross_run_citations(journal, FakeMemoryLookup(), project_id=P)
+        finally:
+            await journal.close()
+
+        assert scan.scan_failed is False
+        assert scan.dangling == (DanglingCitation(RUN_A, FINDING_1, ABSENT_1, 'mem0'),)
+
+    @pytest.mark.asyncio
     async def test_finding_without_finding_id_is_skipped(self, tmp_path: Any) -> None:
         journal = await build_journal_with_closed_run(
             tmp_path, run_id=RUN_A, project_id=P,
