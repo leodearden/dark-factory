@@ -1,4 +1,5 @@
-"""What the merge-lane ratchet suites share: the instrument and the one seed report.
+"""What the merge-lane ratchet suites share: the instrument, the one seed report,
+and the throwaway repo the git-driving suites build history in.
 
 The ``scripts/`` modules are imported HERE, once, so no suite carries its own
 ``sys.path`` bootstrap; orchestrator/pyproject.toml's [tool.pyright] extraPaths
@@ -6,13 +7,20 @@ already carries "../scripts", so this needs no type-checker config.
 
 ``synthetic_report`` is the ONE seed every suite measures against. A second
 declaration would drift, and the suites would then disagree about what a raise
-looks like. A helper lives here only when more than one suite uses it;
+looks like. ``RatchetRepo`` and the record builders are here for the same
+reason: the commit-time and the advance-time gate suites both build real
+history, and a second throwaway-repo class would re-declare the esc-3072-3
+bootstrap. A helper lives here only when more than one ratchet suite uses it;
 ``_orch_helpers`` is the home for what the whole test tree shares.
 """
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
+from typing import Self
+
+from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
 _SCRIPTS = Path(__file__).parents[2] / 'scripts'
 if str(_SCRIPTS) not in sys.path:
@@ -21,7 +29,15 @@ if str(_SCRIPTS) not in sys.path:
 import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
 import source_measures  # type: ignore[import-not-found]  # noqa: E402
 
-__all__ = ['blank_file_entry', 'metrics', 'source_measures', 'synthetic_report']
+__all__ = [
+    'RatchetRepo',
+    'a_py_cognitive_raise',
+    'blank_file_entry',
+    'metrics',
+    'record',
+    'source_measures',
+    'synthetic_report',
+]
 
 
 def synthetic_report() -> dict:
@@ -83,3 +99,126 @@ def blank_file_entry(**overrides: int) -> dict:
     }
     entry.update(overrides)
     return entry
+
+
+class RatchetRepo:
+    """A throwaway repo carrying the ratchet artifacts at their real paths.
+
+    Every git invocation goes through :meth:`git`, so ``cwd`` and the ceiling
+    environment are established in exactly one place and no case builder can
+    shell out unguarded (esc-3072-3).
+    """
+
+    def __init__(self, root: Path) -> None:
+        # FIRST, before any subprocess: a rejected root must write nothing.
+        assert_isolated_git_repo(root)
+        self.root = root
+        self.env = git_env_with_ceiling(root)
+
+    @staticmethod
+    def _init_main(tmp_path: Path) -> Path:
+        """``git init -b main`` in a fresh ``tmp_path/repo``; the new root."""
+        root = tmp_path / 'repo'
+        root.mkdir()
+        # The pre-flight cannot precede `git init` -- it refuses any directory
+        # that is not ALREADY a repo root, which is what this call creates. The
+        # ceiling is applied to the bootstrap on its own, and `git init` only
+        # ever writes into its own cwd.
+        bootstrap = subprocess.run(
+            ['git', 'init', '-b', 'main'],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            env=git_env_with_ceiling(root),
+            check=False,
+        )
+        assert bootstrap.returncode == 0, bootstrap.stderr
+        return root
+
+    @classmethod
+    def seeded(cls, tmp_path: Path, report: dict | None = None) -> Self:
+        """``git init`` plus one commit on main carrying a baseline and no entry.
+
+        HEAD is left on main, with hooks pinned off.
+        """
+        repo = cls(cls._init_main(tmp_path))
+        repo.git('config', 'user.name', 'ratchet gate test')
+        repo.git('config', 'user.email', 'ratchet@example.invalid')
+        # Pinned explicitly so an operator's GLOBAL core.hooksPath cannot reach
+        # into a throwaway repo and run real hooks over it.
+        repo.git('config', 'core.hooksPath', str(repo.root / '.git' / 'hooks'))
+        repo.write_baseline(report if report is not None else synthetic_report())
+        repo.commit_all('seed the ratchet artifacts')
+        return repo
+
+    @classmethod
+    def unborn(cls, tmp_path: Path) -> Self:
+        """An initialized repo with NO commit yet -- HEAD names nothing."""
+        return cls(cls._init_main(tmp_path))
+
+    def git(self, *args: str, check: bool = True) -> str:
+        proc = subprocess.run(
+            ['git', *args],
+            cwd=str(self.root),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            check=False,
+        )
+        if check:
+            assert proc.returncode == 0, (
+                f'git {" ".join(args)} failed (rc={proc.returncode}): '
+                f'{proc.stderr.strip()}'
+            )
+        return proc.stdout.strip()
+
+    def commit_all(self, message: str) -> str:
+        self.git('add', '-A')
+        self.git('commit', '-m', message)
+        return self.git('rev-parse', 'HEAD')
+
+    def write_file(self, relpath: str, text: str) -> Path:
+        target = self.root / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding='utf-8')
+        return target
+
+    def write_baseline(self, report: dict) -> Path:
+        return self.write_file(metrics.BASELINE_RELPATH, metrics.render_baseline(report))
+
+    def write_baseline_text(self, text: str) -> Path:
+        """Raw bytes, for a blob ``render_baseline`` would never produce."""
+        return self.write_file(metrics.BASELINE_RELPATH, text)
+
+    def write_entry(self, record: dict) -> str:
+        """Record *record* as the writer does; its path, repo-relative."""
+        written = metrics.append_authorization(self.root / metrics.LEDGER_DIR_RELPATH, record)
+        return written.relative_to(self.root).as_posix()
+
+    def stage(self, *relpaths: str) -> None:
+        self.git('add', '--', *relpaths)
+
+
+def record(raises: list[metrics.Violation], task_id: str = '5722') -> dict:
+    """The ledger record `--authorize-raise <task_id>` appends for *raises*."""
+    return metrics.authorization_record(
+        metrics.RaiseAuthorization(task_id=task_id, reason=f'net-additive {task_id}'),
+        raises,
+    )
+
+
+def a_py_cognitive_raise(was: int, now: int, task_id: str) -> dict:
+    """The record `--authorize-raise` appends when a.py's `cognitive` rises *was* -> *now*."""
+    b_py_cognitive = synthetic_report()['files']['b.py']['cognitive']
+    return record(
+        [
+            metrics.Violation.rose('cognitive', 'a.py', was, now),
+            metrics.Violation.rose(
+                'total:cognitive',
+                metrics.CLUSTER_TOTAL_KEY,
+                was + b_py_cognitive,
+                now + b_py_cognitive,
+            ),
+        ],
+        task_id,
+    )

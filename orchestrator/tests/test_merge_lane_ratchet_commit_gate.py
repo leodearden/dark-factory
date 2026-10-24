@@ -43,8 +43,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from _merge_lane_ratchet_fixtures import metrics, synthetic_report
-from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
+from _merge_lane_ratchet_fixtures import (
+    RatchetRepo,
+    a_py_cognitive_raise,
+    metrics,
+    record,
+    synthetic_report,
+)
 
 from orchestrator.agents.roles import MERGER
 
@@ -78,7 +83,7 @@ def _with_a_py(measure: str, value: int) -> dict:
     return _report_with(lambda report: report['files']['a.py'].__setitem__(measure, value))
 
 
-#: The branch ``_Repo.seeded`` leaves HEAD on, and the task ``_record`` defaults to.
+#: The branch ``_Repo.seeded`` leaves HEAD on, and the task ``record`` defaults to.
 _TASK_BRANCH = 'task/5722'
 
 #: The branch ``_Repo.mid_merge`` merges main into; ``5792`` is the merge's own task.
@@ -92,69 +97,20 @@ class _Baseline(enum.Enum):
     REMOVED = enum.auto()
 
 
-class _Repo:
-    """A throwaway repo carrying the two ratchet artifacts at their real paths.
-
-    Every git invocation goes through :meth:`git`, so ``cwd`` and the ceiling
-    environment are established in exactly one place and no case builder can
-    shell out unguarded (esc-3072-3).
-    """
-
-    def __init__(self, root: Path) -> None:
-        # FIRST, before any subprocess: a rejected root must write nothing.
-        assert_isolated_git_repo(root)
-        self.root = root
-        self.env = git_env_with_ceiling(root)
+class _Repo(RatchetRepo):
+    """The shared throwaway repo, plus the commit-time gate's own moves."""
 
     @classmethod
     def seeded(cls, tmp_path: Path, report: dict | None = None) -> _Repo:
-        """``git init`` plus one commit carrying a baseline and no ledger entry.
+        """``RatchetRepo.seeded``, with HEAD then moved to ``_TASK_BRANCH``.
 
-        HEAD is left on ``_TASK_BRANCH``, a branch of main at that commit: the
-        gate admits a new entry only for the task its branch works on, and
-        ``_record``'s default task is that branch's.
+        ``_TASK_BRANCH`` is a branch of main at the seed commit: the gate admits
+        a new entry only for the task its branch works on, and ``record``'s
+        default task is that branch's.
         """
-        root = tmp_path / 'repo'
-        root.mkdir()
-        # The pre-flight cannot precede `git init` -- it refuses any directory
-        # that is not ALREADY a repo root, which is what this call creates. The
-        # ceiling is applied to the bootstrap on its own, and `git init` only
-        # ever writes into its own cwd.
-        bootstrap = subprocess.run(
-            ['git', 'init', '-b', 'main'],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            env=git_env_with_ceiling(root),
-            check=False,
-        )
-        assert bootstrap.returncode == 0, bootstrap.stderr
-        repo = cls(root)
-        repo.git('config', 'user.name', 'ratchet gate test')
-        repo.git('config', 'user.email', 'ratchet@example.invalid')
-        # Pinned explicitly so an operator's GLOBAL core.hooksPath cannot reach
-        # into a throwaway repo and run real hooks over it.
-        repo.git('config', 'core.hooksPath', str(root / '.git' / 'hooks'))
-        repo.write_baseline(report if report is not None else synthetic_report())
-        repo.commit_all('seed the ratchet artifacts')
+        repo = super().seeded(tmp_path, report)
         repo.git('switch', '--quiet', '-c', _TASK_BRANCH)
         return repo
-
-    @classmethod
-    def unborn(cls, tmp_path: Path) -> _Repo:
-        """An initialized repo with NO commit yet -- HEAD names nothing."""
-        root = tmp_path / 'repo'
-        root.mkdir()
-        bootstrap = subprocess.run(
-            ['git', 'init', '-b', 'main'],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            env=git_env_with_ceiling(root),
-            check=False,
-        )
-        assert bootstrap.returncode == 0, bootstrap.stderr
-        return cls(root)
 
     @classmethod
     def mid_merge(
@@ -206,7 +162,7 @@ class _Repo:
         self.git('merge', 'main', check=False)
         merge_head = self.git('rev-parse', '-q', '--verify', 'MERGE_HEAD', check=False)
         assert merge_head, '`git merge main` did not stop on the sentinel conflict'
-        self._write('conflict.txt', 'resolved\n')
+        self.write_file('conflict.txt', 'resolved\n')
         self.stage('conflict.txt')
 
     def _commit_side(
@@ -216,54 +172,12 @@ class _Repo:
             self.git('rm', '--quiet', '--', metrics.BASELINE_RELPATH)
         elif baseline is not None:
             self.write_baseline(baseline)
-        for record in entries:
-            self.write_entry(record)
+        for entry in entries:
+            self.write_entry(entry)
         # UNIQUE PER COMMIT: a sentinel main rewrote unchanged since the merge
         # base would merge cleanly, and a second round would never stop.
-        self._write('conflict.txt', f'{side} on {self.git("rev-parse", "HEAD")}\n')
+        self.write_file('conflict.txt', f'{side} on {self.git("rev-parse", "HEAD")}\n')
         self.commit_all(f'{side}: move the ratchet artifacts')
-
-    def git(self, *args: str, check: bool = True) -> str:
-        proc = subprocess.run(
-            ['git', *args],
-            cwd=str(self.root),
-            capture_output=True,
-            text=True,
-            env=self.env,
-            check=False,
-        )
-        if check:
-            assert proc.returncode == 0, (
-                f'git {" ".join(args)} failed (rc={proc.returncode}): '
-                f'{proc.stderr.strip()}'
-            )
-        return proc.stdout.strip()
-
-    def commit_all(self, message: str) -> str:
-        self.git('add', '-A')
-        self.git('commit', '-m', message)
-        return self.git('rev-parse', 'HEAD')
-
-    def _write(self, relpath: str, text: str) -> Path:
-        target = self.root / relpath
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding='utf-8')
-        return target
-
-    def write_baseline(self, report: dict) -> Path:
-        return self._write(metrics.BASELINE_RELPATH, metrics.render_baseline(report))
-
-    def write_baseline_text(self, text: str) -> Path:
-        """Raw bytes, for a blob ``render_baseline`` would never produce."""
-        return self._write(metrics.BASELINE_RELPATH, text)
-
-    def write_entry(self, record: dict) -> str:
-        """Record *record* as the writer does; its path, repo-relative."""
-        written = metrics.append_authorization(self.root / metrics.LEDGER_DIR_RELPATH, record)
-        return written.relative_to(self.root).as_posix()
-
-    def stage(self, *relpaths: str) -> None:
-        self.git('add', '--', *relpaths)
 
     def attempt_commit(self, message: str) -> subprocess.CompletedProcess[str]:
         """A real `git commit`, hooks and all, whose outcome is the assertion."""
@@ -285,30 +199,6 @@ class _Repo:
             env=self.env,
             check=False,
         )
-
-
-def _record(raises: list[metrics.Violation], task_id: str = '5722') -> dict:
-    return metrics.authorization_record(
-        metrics.RaiseAuthorization(task_id=task_id, reason=f'net-additive {task_id}'),
-        raises,
-    )
-
-
-def _a_py_cognitive_raise(was: int, now: int, task_id: str) -> dict:
-    """The record `--authorize-raise` appends when a.py's `cognitive` rises *was* -> *now*."""
-    b_py_cognitive = synthetic_report()['files']['b.py']['cognitive']
-    return _record(
-        [
-            metrics.Violation.rose('cognitive', 'a.py', was, now),
-            metrics.Violation.rose(
-                'total:cognitive',
-                metrics.CLUSTER_TOTAL_KEY,
-                was + b_py_cognitive,
-                now + b_py_cognitive,
-            ),
-        ],
-        task_id,
-    )
 
 
 class TestTheStagedDiffIsAudited:
@@ -378,7 +268,7 @@ class TestTheStagedDiffIsAudited:
     ) -> None:
         repo = _Repo.seeded(tmp_path)
         repo.write_baseline(_report_with(_raise_cognitive))
-        repo.write_entry(_a_py_cognitive_raise(120, 125, '5722'))
+        repo.write_entry(a_py_cognitive_raise(120, 125, '5722'))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -416,7 +306,7 @@ class TestTheStagedDiffIsAudited:
         repo.write_baseline(_report_with(_raise_cognitive))
         # Right measure, right key, a SMALLER rise -- the shape a hand-written or
         # copied-forward entry actually has.
-        repo.write_entry(_record([metrics.Violation.rose('cognitive', 'a.py', 120, 123)]))
+        repo.write_entry(record([metrics.Violation.rose('cognitive', 'a.py', 120, 123)]))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -437,7 +327,7 @@ class TestTheStagedDiffIsAudited:
         # to `unrecorded_raises` would turn the directory into the standing
         # permission list its own README forbids with all of them still green.
         repo = _Repo.seeded(tmp_path)
-        repo.write_entry(_a_py_cognitive_raise(120, 125, '5722'))
+        repo.write_entry(a_py_cognitive_raise(120, 125, '5722'))
         repo.commit_all('record a raise in a commit that does not take it')
 
         repo.write_baseline(_report_with(_raise_cognitive))
@@ -699,14 +589,14 @@ class TestLedgerIsAppendOnlyAtTheGate:
     def _with_history(tmp_path: Path) -> tuple[_Repo, str]:
         repo = _Repo.seeded(tmp_path)
         history = repo.write_entry(
-            _record([metrics.Violation.rose('lines', 'a.py', 990, 1000)], '5485')
+            record([metrics.Violation.rose('lines', 'a.py', 990, 1000)], '5485')
         )
         repo.commit_all('record a historical raise')
         return repo, history
 
     def test_adding_an_entry_alone_is_clean(self, tmp_path: Path) -> None:
         repo, _history = self._with_history(tmp_path)
-        repo.write_entry(_record([], '5722'))
+        repo.write_entry(record([], '5722'))
         repo.stage(metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -757,7 +647,7 @@ class TestLedgerIsAppendOnlyAtTheGate:
         repo, history = self._with_history(tmp_path)
         repo.git('rm', '--quiet', '--', history)
         repo.write_baseline(_report_with(_raise_cognitive))
-        repo.write_entry(_a_py_cognitive_raise(120, 125, '5722'))
+        repo.write_entry(a_py_cognitive_raise(120, 125, '5722'))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -770,7 +660,7 @@ class TestLedgerIsAppendOnlyAtTheGate:
         [
             pytest.param('{"measures": ', 'not valid JSON', id='truncated'),
             pytest.param(
-                metrics.render_entry(_record([], '5722')), 'not named for its content',
+                metrics.render_entry(record([], '5722')), 'not named for its content',
                 id='misnamed',
             ),
         ],
@@ -831,7 +721,7 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
     ) -> None:
         # THE POINT OF ONE FILE PER ENTRY: two concurrent authorizations used
         # to conflict at the array's tail every time.
-        ours_own, theirs_own = _record([], '5722'), _record([], '3620')
+        ours_own, theirs_own = record([], '5722'), record([], '3620')
         repo = _Repo.mid_merge(
             tmp_path, ours_entries=(ours_own,), theirs_entries=(theirs_own,)
         )
@@ -846,7 +736,7 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
         )} == {'5722', '3620'}
 
     def test_a_branch_can_merge_main_again(self, tmp_path: Path) -> None:
-        ours_own, theirs_own = _record([], '5722'), _record([], '3620')
+        ours_own, theirs_own = record([], '5722'), record([], '3620')
         repo = _Repo.mid_merge(
             tmp_path, ours_entries=(ours_own,), theirs_entries=(theirs_own,)
         )
@@ -854,7 +744,7 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
         assert first_round.returncode == 0, first_round.stdout + first_round.stderr
         repo.commit_all('merge main')
 
-        repo.merge_main(theirs_entries=(_record([], '3790'),))
+        repo.merge_main(theirs_entries=(record([], '3790'),))
 
         result = repo.gate()
         assert result.returncode == 0, result.stdout + result.stderr
@@ -863,7 +753,7 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
         # NOTHING DIFFERS FROM HEAD, which is why a HEAD-only filter never
         # audited this: the resolution kept HEAD's ledger and silently dropped
         # the entry main recorded.
-        repo = _Repo.mid_merge(tmp_path, theirs_entries=(_record([], '3620'),))
+        repo = _Repo.mid_merge(tmp_path, theirs_entries=(record([], '3620'),))
         repo.git('rm', '--quiet', '-r', '-f', '--', metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -880,7 +770,7 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
         repo = _Repo.mid_merge(
             tmp_path,
             theirs=_with_a_py('cognitive', 125),
-            theirs_entries=(_a_py_cognitive_raise(125, 129, '3620'),),
+            theirs_entries=(a_py_cognitive_raise(125, 129, '3620'),),
         )
         repo.write_baseline(_with_a_py('cognitive', 129))
         repo.stage(metrics.BASELINE_RELPATH)
@@ -959,7 +849,7 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
     ) -> None:
         repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py('cognitive', 125))
         repo.write_baseline(_with_a_py('cognitive', 129))
-        repo.write_entry(_a_py_cognitive_raise(125, 129, '5792'))
+        repo.write_entry(a_py_cognitive_raise(125, 129, '5792'))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -1016,8 +906,8 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
             tmp_path,
             ours=_with_a_py('cognitive', 125),
             theirs=_with_a_py('cognitive', 123),
-            ours_entries=(_a_py_cognitive_raise(120, 125, '5722'),),
-            theirs_entries=(_a_py_cognitive_raise(120, 123, '3620'),),
+            ours_entries=(a_py_cognitive_raise(120, 125, '5722'),),
+            theirs_entries=(a_py_cognitive_raise(120, 123, '3620'),),
         )
         repo.write_baseline(_with_a_py('cognitive', 128))
         repo.stage(metrics.BASELINE_RELPATH)
@@ -1034,7 +924,7 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         assert refused.returncode == 1, refused.stdout + refused.stderr
         assert 'rose 128 -> 129' in refused.stderr
 
-        repo.write_entry(_a_py_cognitive_raise(128, 129, '5792'))
+        repo.write_entry(a_py_cognitive_raise(128, 129, '5792'))
         repo.stage(metrics.LEDGER_DIR_RELPATH)
 
         authorized = repo.gate()
@@ -1051,8 +941,8 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
             tmp_path,
             ours=_with_a_py('cognitive', 125),
             theirs=_with_a_py('cognitive', 123),
-            ours_entries=(_a_py_cognitive_raise(120, 125, '5722'),),
-            theirs_entries=(_a_py_cognitive_raise(120, 123, '3620'),),
+            ours_entries=(a_py_cognitive_raise(120, 125, '5722'),),
+            theirs_entries=(a_py_cognitive_raise(120, 123, '3620'),),
         )
         repo.write_baseline(_with_a_py('cognitive', 129))
         repo.stage(metrics.BASELINE_RELPATH)
@@ -1212,7 +1102,7 @@ class TestTheHookActuallyRunsTheGate:
     ) -> None:
         repo = _hook_repo(tmp_path)
         repo.write_baseline(_report_with(_raise_cognitive))
-        repo.write_entry(_a_py_cognitive_raise(120, 125, '5722'))
+        repo.write_entry(a_py_cognitive_raise(120, 125, '5722'))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
         result = repo.attempt_commit('authorize a net-additive raise')
@@ -1514,9 +1404,9 @@ class TestTheLedgerSplitCommit:
     @staticmethod
     def _history() -> tuple[dict, dict, dict]:
         return (
-            _a_py_cognitive_raise(110, 115, '5485'),
-            _a_py_cognitive_raise(115, 120, '5675'),
-            _record([], '3620'),
+            a_py_cognitive_raise(110, 115, '5485'),
+            a_py_cognitive_raise(115, 120, '5675'),
+            record([], '3620'),
         )
 
     def test_an_exact_split_passes(self, tmp_path: Path) -> None:
@@ -1566,7 +1456,7 @@ class TestTheLedgerSplitCommit:
     ) -> None:
         repo = self._with_array(tmp_path, *self._history())
         self._split(repo)
-        fresh = repo.write_entry(_a_py_cognitive_raise(120, 125, '7298'))
+        fresh = repo.write_entry(a_py_cognitive_raise(120, 125, '7298'))
         repo.write_baseline(_report_with(_raise_cognitive))
         repo.git('add', '-A')
 
@@ -1580,8 +1470,8 @@ class TestTheLedgerSplitCommit:
         # rebased array carries one entry more.
         first, second, third = self._history()
         repo = self._with_array(tmp_path, first, second, third)
-        for record in (first, second):
-            metrics.append_authorization(repo.root / metrics.LEDGER_DIR_RELPATH, record)
+        for entry in (first, second):
+            metrics.append_authorization(repo.root / metrics.LEDGER_DIR_RELPATH, entry)
 
         split = self._split(repo)
         repo.git('add', '-A')
@@ -1688,7 +1578,7 @@ class TestANewEntryIsAttributedToTheBranchsTask:
     @staticmethod
     def _raise_recorded_for(repo: _Repo, task_id: str) -> None:
         repo.write_baseline(_report_with(_raise_cognitive))
-        repo.write_entry(_a_py_cognitive_raise(120, 125, task_id))
+        repo.write_entry(a_py_cognitive_raise(120, 125, task_id))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
     @staticmethod
@@ -1785,7 +1675,7 @@ class TestANewEntryIsAttributedToTheBranchsTask:
         # right, its attribution empty.
         repo = _Repo.seeded(tmp_path)
         repo.write_baseline(_report_with(_raise_cognitive))
-        repo.write_entry({**_a_py_cognitive_raise(120, 125, '5722'), field: value})
+        repo.write_entry({**a_py_cognitive_raise(120, 125, '5722'), field: value})
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -1804,7 +1694,7 @@ class TestANewEntryIsAttributedToTheBranchsTask:
 
     def test_an_entry_recorded_without_a_raise_is_checked_too(self, tmp_path: Path) -> None:
         repo = _Repo.seeded(tmp_path)
-        repo.write_entry(_record([], '9999'))
+        repo.write_entry(record([], '9999'))
         repo.stage(metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
