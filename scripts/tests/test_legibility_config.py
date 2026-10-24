@@ -654,6 +654,16 @@ class TestShippedDarkFactoryConfig:
         assert 'scripts/tests/test_codebook.py' in gate.argv
         assert 'scripts/tests/test_legibility_coder.py' in gate.argv
 
+    def test_shipped_config_landing_gate_names_only_test_files_that_exist(self):
+        # The gate fails closed: a renamed gated test makes pytest exit 4 and
+        # quarantines every dark_factory census, so the rename must go red here.
+        repo_root = Path(__file__).resolve().parents[2]
+        gate = mod.load_config(self.SHIPPED_CONFIG_PATH).census.landing_gate
+        assert gate is not None
+        test_paths = [arg for arg in gate.argv if arg.startswith('scripts/tests/')]
+        assert test_paths
+        assert [path for path in test_paths if not (repo_root / path).is_file()] == []
+
     def test_shipped_config_agent_transcript_roots_set_live(self):
         # The CRITICAL Leo ask (plans/agent-transcript-archival-prd.md, task γ):
         # the shipped config ships the fleet archive root SET (live), not empty,
