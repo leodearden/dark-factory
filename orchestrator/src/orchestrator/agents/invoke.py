@@ -165,7 +165,7 @@ async def invoke_agent(
     cost), is forwarded to the parser's cost estimator in place of the
     packaged default price table; see ``_estimate_cost``.
     The codex backend maps *allowed_tools* / *disallowed_tools* onto its
-    sandbox (see ``_codex_sandbox_mode``).
+    sandbox (see ``codex_exec_argv``).
     """
     if backend == 'claude':
         return await _invoke_claude_with_sandbox(
@@ -461,6 +461,41 @@ def _codex_mcp_override_args(mcp_config: dict | None) -> list[str]:
     return [arg for override in overrides for arg in ('-c', override)]
 
 
+def codex_exec_argv(
+    model: str,
+    *,
+    effort: str | None = None,
+    mcp_config: dict | None = None,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
+) -> list[str]:
+    """The ``codex exec`` argv for one invocation, before any sandbox wrap; it ends in ``-``, so the prompt goes on stdin.
+
+    The tool lists only pick the confinement (see ``_codex_sandbox_mode``), and
+    every spec that axis cannot honour is logged as dropped. MCP servers ride
+    as ``-c`` overrides (see ``_codex_mcp_override_args``), which raises
+    ValueError for a server name codex cannot carry.
+    """
+    dropped_specs = _codex_inexpressible_tool_specs(allowed_tools, disallowed_tools)
+    if dropped_specs:
+        logger.warning(
+            'codex backend: dropped tool spec(s) not expressible on codex\'s '
+            'sandbox axis (no per-tool allowlist): %s',
+            ', '.join(dropped_specs),
+        )
+    sandbox_mode = _codex_sandbox_mode(allowed_tools, disallowed_tools)
+    confinement = (
+        ['-s', sandbox_mode] if sandbox_mode
+        else ['--dangerously-bypass-approvals-and-sandbox']
+    )
+    argv = ['codex', 'exec', '-m', model, '--json', *confinement]
+    if effort:
+        argv.extend(['-c', f'model_reasoning_effort={effort}'])
+    argv.extend(_codex_mcp_override_args(mcp_config))
+    argv.append('-')
+    return argv
+
+
 async def _invoke_codex(
     prompt: str,
     system_prompt: str,
@@ -480,7 +515,7 @@ async def _invoke_codex(
     """Invoke OpenAI Codex CLI.
 
     The sandbox-bypass flag survives only for roles that legitimately write;
-    a role that cannot runs ``-s read-only`` (see ``_codex_sandbox_mode``).
+    a role that cannot runs ``-s read-only`` (see ``codex_exec_argv``).
 
     No instruction file (AGENTS.md) is ever written into the worktree —
     system_prompt and prompt are folded together and delivered entirely via
@@ -491,7 +526,7 @@ async def _invoke_codex(
     disk at all, no staging command run against this worktree — including
     the single-implementer-commit path's `git add -A -- . :!.claude`
     (git_ops.py:5320) — can ever pick it up. MCP servers likewise arrive as
-    ``-c`` overrides (see ``_codex_mcp_override_args``), so nothing at all is
+    ``-c`` overrides (see ``codex_exec_argv``), so nothing at all is
     written into *cwd*. CODEX_HOME is deliberately left alone: a temp home
     silently drops the ChatGPT login for OPENAI_API_KEY.
 
@@ -514,27 +549,10 @@ async def _invoke_codex(
         'the wall-clock watchdog (timeout_seconds=%r) is enforced',
         max_turns, max_budget_usd, timeout_seconds,
     )
-    dropped_specs = _codex_inexpressible_tool_specs(allowed_tools, disallowed_tools)
-    if dropped_specs:
-        logger.warning(
-            'codex backend: dropped tool spec(s) not expressible on codex\'s '
-            'sandbox axis (no per-tool allowlist): %s',
-            ', '.join(dropped_specs),
-        )
-    sandbox_mode = _codex_sandbox_mode(allowed_tools, disallowed_tools)
-    confinement = (
-        ['-s', sandbox_mode] if sandbox_mode
-        else ['--dangerously-bypass-approvals-and-sandbox']
+    cmd = codex_exec_argv(
+        model, effort=effort, mcp_config=mcp_config,
+        allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
     )
-    cmd = ['codex', 'exec', '-m', model, '--json', *confinement]
-
-    if effort:
-        cmd.extend(['-c', f'model_reasoning_effort={effort}'])
-
-    cmd.extend(_codex_mcp_override_args(mcp_config))
-
-    # '-' tells codex exec to read the prompt from stdin instead of argv.
-    cmd.append('-')
     codex_input = f'{system_prompt}\n\n{prompt}'.encode()
 
     cmd, env = _sandbox_spawn(cmd, os.environ, cwd, sandbox_modules, sandbox_extras)

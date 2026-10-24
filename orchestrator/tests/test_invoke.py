@@ -23,8 +23,6 @@ from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
 from orchestrator.agents.invoke import (
-    _codex_mcp_override_args,
-    _codex_sandbox_mode,
     _invoke_claude_with_sandbox,
     _invoke_codex,
     _invoke_gemini,
@@ -33,6 +31,7 @@ from orchestrator.agents.invoke import (
     _parse_gemini_output,
     _run_subprocess_local,
     _SubprocessResult,
+    codex_exec_argv,
     invoke_agent,
     invoke_with_cap_retry,
 )
@@ -698,7 +697,7 @@ class TestInvokeAgentForwardsMaxTurnsToCodex:
 @pytest.mark.asyncio
 class TestInvokeAgentForwardsToolListsToCodex:
     """invoke_agent must hand the role's tool lists to the codex path, or
-    `_codex_sandbox_mode` never sees them and every role runs the bypass."""
+    `codex_exec_argv` never sees them and every role runs the bypass."""
 
     async def test_tool_lists_forwarded(self, tmp_path):
         dummy_result = AgentResult(success=True, output='')
@@ -715,70 +714,46 @@ class TestInvokeAgentForwardsToolListsToCodex:
         assert mock_invoke_codex.call_args.kwargs.get('disallowed_tools') == ['Edit', 'Write']
 
 
-class TestCodexSandboxMode:
+_CODEX_READ_ONLY = ['-s', 'read-only']
+_CODEX_BYPASS = ['--dangerously-bypass-approvals-and-sandbox']
+
+
+def _codex_confinement(allowed_tools, disallowed_tools) -> list[str]:
+    """The confinement flags `codex_exec_argv` puts between `--json` and the stdin marker."""
+    argv = codex_exec_argv('gpt-6-astra', allowed_tools=allowed_tools, disallowed_tools=disallowed_tools)
+    return argv[argv.index('--json') + 1:argv.index('-')]
+
+
+class TestCodexConfinement:
     """A role's tool lists collapse onto codex's one confinement lever: a
-    role that cannot write runs 'read-only'; anything else keeps the bypass
-    (None). The real role constants are used so a role edit cannot desync."""
+    role that cannot write runs `-s read-only`; anything else keeps the
+    bypass. The real role constants are used so a role edit cannot desync."""
 
     @pytest.mark.parametrize('role', [REVIEWER_COMPREHENSIVE, ARCHITECT], ids=['reviewer', 'architect'])
     def test_role_denied_edit_and_write_is_read_only(self, role) -> None:
-        assert _codex_sandbox_mode(role.allowed_tools, role.disallowed_tools) == 'read-only'
+        assert _codex_confinement(role.allowed_tools, role.disallowed_tools) == _CODEX_READ_ONLY
 
     def test_implementer_keeps_the_bypass(self) -> None:
-        assert _codex_sandbox_mode(IMPLEMENTER.allowed_tools, IMPLEMENTER.disallowed_tools) is None
+        assert _codex_confinement(IMPLEMENTER.allowed_tools, IMPLEMENTER.disallowed_tools) == _CODEX_BYPASS
 
     def test_wildcard_disallow_is_read_only(self) -> None:
-        assert _codex_sandbox_mode(None, ['*']) == 'read-only'
+        assert _codex_confinement(None, ['*']) == _CODEX_READ_ONLY
 
     def test_allowlist_naming_neither_edit_nor_write_is_read_only(self) -> None:
-        assert _codex_sandbox_mode(['Read', 'Bash'], []) == 'read-only'
+        assert _codex_confinement(['Read', 'Bash'], []) == _CODEX_READ_ONLY
 
     @pytest.mark.parametrize(
         ('allowed', 'disallowed'), [(None, None), ([], []), (None, []), ([], None)],
     )
     def test_unrestricted_caller_keeps_the_bypass(self, allowed, disallowed) -> None:
-        assert _codex_sandbox_mode(allowed, disallowed) is None
+        assert _codex_confinement(allowed, disallowed) == _CODEX_BYPASS
+
+    def test_unrestricted_caller_argv_is_unchanged(self) -> None:
+        assert codex_exec_argv('gpt-6-astra') == [
+            'codex', 'exec', '-m', 'gpt-6-astra', '--json', *_CODEX_BYPASS, '-',
+        ]
 
 
-_CODEX_BYPASS_FLAG = '--dangerously-bypass-approvals-and-sandbox'
-
-
-async def _codex_argv(tmp_path: Path, allowed_tools, disallowed_tools) -> list[str]:
-    """The argv `_invoke_codex` hands its subprocess runner for these tool lists."""
-    empty = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=1)
-    with patch('orchestrator.agents.invoke._run_subprocess_local',
-               new_callable=AsyncMock, return_value=empty) as run:
-        await _invoke_codex(
-            prompt='p', system_prompt='s', cwd=tmp_path, model='gpt-6-astra',
-            max_budget_usd=1.0, mcp_config=None, sandbox_modules=None, effort=None,
-            allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
-        )
-    return run.call_args.args[0]
-
-
-@pytest.mark.asyncio
-class TestCodexSandboxArgv:
-    """The sandbox flag on codex's argv follows the role: a role that cannot
-    write runs `-s read-only`; only a writing role keeps the bypass."""
-
-    async def test_reviewer_runs_read_only_without_the_bypass(self, tmp_path) -> None:
-        argv = await _codex_argv(
-            tmp_path, REVIEWER_COMPREHENSIVE.allowed_tools, REVIEWER_COMPREHENSIVE.disallowed_tools,
-        )
-        assert ['-s', 'read-only'] in [argv[i:i + 2] for i in range(len(argv) - 1)]
-        assert _CODEX_BYPASS_FLAG not in argv
-
-    async def test_implementer_keeps_the_bypass(self, tmp_path) -> None:
-        argv = await _codex_argv(tmp_path, IMPLEMENTER.allowed_tools, IMPLEMENTER.disallowed_tools)
-        assert _CODEX_BYPASS_FLAG in argv
-        assert '-s' not in argv
-
-    async def test_unrestricted_caller_argv_is_unchanged(self, tmp_path) -> None:
-        argv = await _codex_argv(tmp_path, None, None)
-        assert argv == ['codex', 'exec', '-m', 'gpt-6-astra', '--json', _CODEX_BYPASS_FLAG, '-']
-
-
-@pytest.mark.asyncio
 class TestCodexDroppedToolSpecWarning:
     """codex has no per-tool allowlist, so every spec finer than "may write"
     is lost; that loss is logged once, never dropped silently (the
@@ -791,10 +766,12 @@ class TestCodexDroppedToolSpecWarning:
             if r.name == 'orchestrator.agents.invoke' and r.levelno == logging.WARNING
         ]
 
-    async def test_reviewer_lists_log_one_warning_naming_only_the_lost_specs(self, tmp_path, caplog) -> None:
+    def test_reviewer_lists_log_one_warning_naming_only_the_lost_specs(self, caplog) -> None:
         caplog.set_level(logging.WARNING, logger='orchestrator.agents.invoke')
-        await _codex_argv(
-            tmp_path, REVIEWER_COMPREHENSIVE.allowed_tools, REVIEWER_COMPREHENSIVE.disallowed_tools,
+        codex_exec_argv(
+            'gpt-6-astra',
+            allowed_tools=REVIEWER_COMPREHENSIVE.allowed_tools,
+            disallowed_tools=REVIEWER_COMPREHENSIVE.disallowed_tools,
         )
 
         warnings = self._invoke_warnings(caplog)
@@ -805,9 +782,9 @@ class TestCodexDroppedToolSpecWarning:
         for honoured in ('Read', 'Glob', 'Grep', 'Edit', 'Write'):
             assert not re.search(rf'\b{honoured}\b', message), honoured
 
-    async def test_unrestricted_caller_logs_no_warning(self, tmp_path, caplog) -> None:
+    def test_unrestricted_caller_logs_no_warning(self, caplog) -> None:
         caplog.set_level(logging.WARNING, logger='orchestrator.agents.invoke')
-        await _codex_argv(tmp_path, None, None)
+        codex_exec_argv('gpt-6-astra')
         assert self._invoke_warnings(caplog) == []
 
 
@@ -821,6 +798,15 @@ _CODEX_MCP_CONFIG = {'mcpServers': {
 }}
 
 
+def _codex_mcp_overrides(mcp_config) -> list[str]:
+    """The `-c mcp_servers.*` override values on codex's argv for *mcp_config*."""
+    argv = codex_exec_argv('gpt-6-astra', mcp_config=mcp_config)
+    return [
+        value for flag, value in zip(argv, argv[1:], strict=False)
+        if flag == '-c' and value.startswith('mcp_servers.')
+    ]
+
+
 class TestCodexMcpServersNeverWrittenIntoCwd:
     """MCP servers reach codex as per-invocation `-c mcp_servers.<name>.*`
     overrides, so nothing is written into the caller's cwd: not a
@@ -830,10 +816,7 @@ class TestCodexMcpServersNeverWrittenIntoCwd:
     def test_override_args_round_trip_through_toml(self) -> None:
         import tomllib
 
-        fragment = _codex_mcp_override_args(_CODEX_MCP_CONFIG)
-
-        assert fragment[0::2] == ['-c'] * (len(fragment) // 2)
-        parsed = tomllib.loads('\n'.join(fragment[1::2]))
+        parsed = tomllib.loads('\n'.join(_codex_mcp_overrides(_CODEX_MCP_CONFIG)))
         assert parsed == {'mcp_servers': {
             'verdict-tools': {
                 'command': '/venv/bin/python',
@@ -847,9 +830,9 @@ class TestCodexMcpServersNeverWrittenIntoCwd:
     def test_server_names_are_bare_key_segments(self) -> None:
         """tomllib reads a quoted and a bare segment as one key, but codex's
         `-c` splitter keeps the quotes in the server name (esc-5403-4)."""
-        fragment = _codex_mcp_override_args(_CODEX_MCP_CONFIG)
-
-        key_paths = {override.split('=', 1)[0] for override in fragment[1::2]}
+        key_paths = {
+            override.split('=', 1)[0] for override in _codex_mcp_overrides(_CODEX_MCP_CONFIG)
+        }
         assert key_paths == {
             'mcp_servers.verdict-tools.command',
             'mcp_servers.verdict-tools.args',
@@ -863,13 +846,19 @@ class TestCodexMcpServersNeverWrittenIntoCwd:
     @pytest.mark.parametrize('name', ['has space', 'dotted.name', 'quo"te', ''])
     def test_a_name_no_bare_key_can_spell_is_rejected(self, name: str) -> None:
         with pytest.raises(ValueError):
-            _codex_mcp_override_args({'mcpServers': {name: {'command': 'srv'}}})
+            codex_exec_argv('gpt-6-astra', mcp_config={'mcpServers': {name: {'command': 'srv'}}})
+
+    def test_overrides_sit_just_before_the_stdin_marker(self) -> None:
+        argv = codex_exec_argv('gpt-6-astra', effort='high', mcp_config=_CODEX_MCP_CONFIG)
+        mcp_args = [arg for override in _codex_mcp_overrides(_CODEX_MCP_CONFIG) for arg in ('-c', override)]
+
+        assert argv[-1] == '-'
+        assert argv[-1 - len(mcp_args):-1] == mcp_args
 
     async def _invoke_with_mcp(self, cwd: Path) -> dict:
         captured: dict = {}
 
         async def fake_run_subprocess_local(cmd, cwd, *args, **kwargs):
-            captured['argv'] = cmd
             captured['cwd_entries'] = sorted(cwd.iterdir())
             return _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=1)
 
@@ -901,13 +890,29 @@ class TestCodexMcpServersNeverWrittenIntoCwd:
         assert codex_file.read_bytes() == b''
         assert codex_file.stat().st_mode & 0o777 == 0o444
 
-    @pytest.mark.asyncio
-    async def test_overrides_sit_just_before_the_stdin_marker(self, tmp_path) -> None:
-        argv = (await self._invoke_with_mcp(tmp_path))['argv']
-        fragment = _codex_mcp_override_args(_CODEX_MCP_CONFIG)
 
-        assert argv[-1] == '-'
-        assert argv[-1 - len(fragment):-1] == fragment
+@pytest.mark.asyncio
+class TestInvokeCodexRunsTheBuiltArgv:
+    """`_invoke_codex` hands its runner exactly `codex_exec_argv`'s argv, with
+    every input threaded through and no wrap when no sandbox was requested."""
+
+    async def test_runner_receives_the_built_argv(self, tmp_path) -> None:
+        empty = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=1)
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=empty) as run:
+            await _invoke_codex(
+                prompt='p', system_prompt='s', cwd=tmp_path, model='gpt-6-astra',
+                max_budget_usd=1.0, mcp_config=_CODEX_MCP_CONFIG, sandbox_modules=None,
+                effort='high',
+                allowed_tools=REVIEWER_COMPREHENSIVE.allowed_tools,
+                disallowed_tools=REVIEWER_COMPREHENSIVE.disallowed_tools,
+            )
+
+        assert run.call_args.args[0] == codex_exec_argv(
+            'gpt-6-astra', effort='high', mcp_config=_CODEX_MCP_CONFIG,
+            allowed_tools=REVIEWER_COMPREHENSIVE.allowed_tools,
+            disallowed_tools=REVIEWER_COMPREHENSIVE.disallowed_tools,
+        )
 
 
 @pytest.mark.asyncio
