@@ -9,18 +9,34 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
+import shutil
+import subprocess
 import types
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
-from review_all_program_cli import ProgramEnv, load_program_module
+from review_all_program_cli import FIXTURE_RETURNS, RUN_ID, ProgramEnv, load_program_module
 from review_all_program_fixture import FIXTURE_DIR, FakeStore, running_fake_store
 
+SCRIPT = 'watch_sessions.py'
 SPAWNED_AFTER = '2026-10-19T09:00:00Z'
 S3_TITLE = 'prd:fixture S3'
+S2_TITLE = 'prd:fixture S2'
+S1_TITLE = 'prd:fixture S1'
 Q2_TITLE = 'team:fixture S1 Q2'
+FIXTURE_SESSIONS = FIXTURE_DIR / 'sessions'
+FIXTURE_SLUGS = types.MappingProxyType({
+    'checkpoint-running': 'fixture-s3-author',
+    'final-exited': 'fixture-s3-author',
+    'finished-idle': 'fixture-s2-author',
+    'checkpoint-exited': 'fixture-s1-q2-team',
+    'unreadable': 'fixture-s1-author',
+})
+"""Each fixture record dir's slug, named here because the unreadable record cannot be parsed for its own."""
 
 
 @pytest.fixture(scope='module')
@@ -195,3 +211,163 @@ def test_a_spawned_after_that_is_not_an_aware_iso_stamp_is_refused(stamp: str) -
         dataclasses.replace(_s3_author(), spawned_after=stamp)
 
     assert 'spawned_after' in str(refused.value) and stamp in str(refused.value)
+
+
+def registry(env: ProgramEnv) -> Path:
+    """The registry the watcher reads: its HOME is the cwd, so ``<cwd>/.claude/fleet/sessions``."""
+    return env.cwd / '.claude' / 'fleet' / 'sessions'
+
+
+def put_record(env: ProgramEnv, label: str, slug: str | None = None) -> Path:
+    """Copy fixture record dir *label* into the registry, its files stamped now."""
+    target = registry(env) / (slug if slug is not None else FIXTURE_SLUGS[label])
+    shutil.copytree(
+        FIXTURE_SESSIONS / label, target, copy_function=shutil.copyfile, dirs_exist_ok=True,
+    )
+    return target
+
+
+def spawned(env: ProgramEnv, title: str, stream: str, pass_: str, item: str | None = None) -> None:
+    sessions = _sessions()
+    sessions.add(_home(env), sessions.SpawnedSession(
+        title=title, stream=stream, pass_=_state().Pass(pass_), item=item,
+        spawned_after=SPAWNED_AFTER, record_dir=None,
+    ))
+
+
+def watch(env: ProgramEnv) -> subprocess.CompletedProcess[str]:
+    return env.run(SCRIPT, '--run', RUN_ID)
+
+
+def standing_line(proc: subprocess.CompletedProcess[str], title: str) -> str:
+    """The one line of *proc*'s stdout reporting where *title* stands (not its record line)."""
+    (line,) = [
+        line for line in proc.stdout.splitlines()
+        if line.startswith(f'{title}: ') and not line.startswith(f'{title}: record ')
+    ]
+    return line
+
+
+def _record_dirs(env: ProgramEnv) -> dict[str, str | None]:
+    return {title: entry['record_dir'] for title, entry in _sessions_json(env).items()}
+
+
+B10_SESSIONS = (
+    (S3_TITLE, 'S3', 'author', None, 'checkpoint-running'),
+    (S2_TITLE, 'S2', 'author', None, 'finished-idle'),
+    (Q2_TITLE, 'S1', 'investigate', 'Q2', 'checkpoint-exited'),
+    (S1_TITLE, 'S1', 'author', None, 'unreadable'),
+)
+B10_INBOX = ('S3.author.json', 'S2.author.json', 'S1.investigate-Q2.json')
+
+
+@pytest.fixture
+def b10(env: ProgramEnv) -> ProgramEnv:
+    """Four spawned sessions over the fixture record dirs, with their fixture returns in the inbox."""
+    for title, stream, pass_, item, label in B10_SESSIONS:
+        spawned(env, title, stream, pass_, item)
+        put_record(env, label)
+    for name in B10_INBOX:
+        env.put_inbox(name)
+    return env
+
+
+def _output(proc: subprocess.CompletedProcess[str]) -> str:
+    return proc.stdout + proc.stderr
+
+
+def test_b10_a_pass_resolves_each_readable_record_and_fills_its_record_dir(b10: ProgramEnv) -> None:
+    proc = watch(b10)
+
+    assert proc.returncode == 0, _output(proc)
+    resolved = {
+        title: str(registry(b10) / FIXTURE_SLUGS[label])
+        for title, _, _, _, label in B10_SESSIONS if label != 'unreadable'
+    }
+    assert _record_dirs(b10) == {**resolved, S1_TITLE: None}
+    for title, record_dir in resolved.items():
+        assert f'{title}: record {record_dir}' in proc.stdout.splitlines()
+
+
+def test_b10_a_running_checkpoint_is_archived_and_nothing_is_applied(b10: ProgramEnv) -> None:
+    before = b10.snapshot()
+
+    proc = watch(b10)
+
+    assert proc.returncode == 0, _output(proc)
+    archived = b10.home / 'handbacks' / 'S3.author.checkpoint-1.md'
+    assert archived.read_bytes() == (FIXTURE_SESSIONS / 'checkpoint-running' / 'result.md').read_bytes()
+    assert (b10.home / 'inbox' / 'S3.author.json').read_bytes() == (
+        FIXTURE_RETURNS / 'S3.author.json').read_bytes()
+    assert not (b10.home / 'returns' / 'S3.author.json').exists()
+    assert b10.snapshot().get('ledger.jsonl') == before.get('ledger.jsonl')
+    line = standing_line(proc, S3_TITLE)
+    assert line.startswith(f'{S3_TITLE}: checkpoint')
+    assert 'handbacks/S3.author.checkpoint-1.md' in line
+
+
+def test_b10_a_terminal_outcome_on_an_idle_record_is_finished_not_exited(b10: ProgramEnv) -> None:
+    proc = watch(b10)
+
+    assert proc.returncode == 0, _output(proc)
+    assert standing_line(proc, S2_TITLE).startswith(f'{S2_TITLE}: finished, not exited')
+    assert (b10.home / 'handbacks' / 'S2.author.checkpoint-1.md').is_file()
+    assert (b10.home / 'inbox' / 'S2.author.json').read_bytes() == (
+        FIXTURE_RETURNS / 'S2.author.json').read_bytes()
+
+
+def test_b10_a_checkpoint_on_an_exited_record_ended_at_checkpoint(b10: ProgramEnv) -> None:
+    proc = watch(b10)
+
+    assert proc.returncode == 0, _output(proc)
+    assert standing_line(proc, Q2_TITLE).startswith(
+        f'{Q2_TITLE}: ended at checkpoint — relaunch or resume')
+    assert (b10.home / 'handbacks' / 'S1.investigate-Q2.checkpoint-1.md').is_file()
+    assert (b10.home / 'inbox' / 'S1.investigate-Q2.json').read_bytes() == (
+        FIXTURE_RETURNS / 'S1.investigate-Q2.json').read_bytes()
+
+
+def test_b10_an_unreadable_record_is_printed_not_swallowed(b10: ProgramEnv) -> None:
+    proc = watch(b10)
+
+    assert proc.returncode == 0, _output(proc)
+    assert str(registry(b10) / 'fixture-s1-author' / 'record.json') in standing_line(proc, S1_TITLE)
+
+
+def test_a_record_older_than_the_spawn_is_not_resolved(env: ProgramEnv) -> None:
+    spawned(env, S2_TITLE, 'S2', 'author')
+    record_json = put_record(env, 'finished-idle') / 'record.json'
+    earlier = datetime(2026, 10, 19, 8, 0, tzinfo=UTC).timestamp()
+    os.utime(record_json, (earlier, earlier))
+
+    proc = watch(env)
+
+    assert proc.returncode == 0, _output(proc)
+    assert _record_dirs(env) == {S2_TITLE: None}
+    assert standing_line(proc, S2_TITLE) == f'{S2_TITLE}: no registry record yet'
+
+
+def test_a_record_of_another_role_is_not_resolved(env: ProgramEnv) -> None:
+    spawned(env, S2_TITLE, 'S2', 'author')
+    record_json = put_record(env, 'finished-idle') / 'record.json'
+    record = json.loads(record_json.read_text(encoding='utf-8'))
+    record_json.write_text(json.dumps({**record, 'role': 'team'}), encoding='utf-8')
+
+    proc = watch(env)
+
+    assert proc.returncode == 0, _output(proc)
+    assert _record_dirs(env) == {S2_TITLE: None}
+    assert standing_line(proc, S2_TITLE) == f'{S2_TITLE}: no registry record yet'
+
+
+def test_two_records_of_one_title_leave_it_unresolved_and_name_both(env: ProgramEnv) -> None:
+    spawned(env, S2_TITLE, 'S2', 'author')
+    put_record(env, 'finished-idle')
+    put_record(env, 'finished-idle', slug='fixture-s2-twin')
+
+    proc = watch(env)
+
+    assert proc.returncode == 0, _output(proc)
+    assert _record_dirs(env) == {S2_TITLE: None}
+    line = standing_line(proc, S2_TITLE)
+    assert 'fixture-s2-author' in line and 'fixture-s2-twin' in line
