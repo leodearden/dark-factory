@@ -838,3 +838,20 @@ class TestTheAbstainWord:
     @pytest.mark.parametrize('word', ['YES', 'NO', 'CENTRAL', 'SECONDARY', 'TIED', None, 'unclear'])
     def test_no_other_word_abstains(self, word: str | None) -> None:
         assert not _mod().is_abstain(word)
+
+
+class TestTheCrossFamilyRole:
+    def test_is_a_rater_role(self) -> None:
+        rubric = _mod()
+        assert rubric.Role.CROSS_FAMILY == 'cross_family'
+        assert rubric.Role.CROSS_FAMILY in rubric.RATER_ROLES
+
+    def test_its_rows_keep_the_evidence_contract(self) -> None:
+        row = _row(role='cross_family', conflict='YES')
+        del row['conflict_quote']
+        with pytest.raises(ValueError, match='conflict_quote'):
+            _mod().resolve_judgements([row])
+
+    def test_its_rows_keep_the_skipped_follow_up_contract(self) -> None:
+        with pytest.raises(ValueError, match='lacks loss'):
+            _mod().resolve_judgements([_row(role='cross_family', home='YES', conflict='NO')])

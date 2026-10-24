@@ -696,3 +696,18 @@ class TestTheSplitCommand:
         assert path.read_text() == '{}'
         assert _mod().main(['split', '--eval-dir', str(out), '--refreeze']) == 0
         assert json.loads(path.read_text()) == frozen
+
+
+class TestTheOpusCorpusIsOpusOnly:
+    def test_assemble_refuses_a_cross_family_row_naming_it(self, evalset: _EvalSet) -> None:
+        evalset.rate()
+        key = evalset.key()
+        [item] = key['shards']['primary_00']['items'][:1]
+        key['shards']['cross_00'] = {'role': 'cross_family', 'rater': 'gpt-6.1-sol:high',
+                                     'round': 0, 'items': [item]}
+        (evalset.scratch / 'key.json').write_text(json.dumps(key))
+        (evalset.scratch / 'ratings' / 'cross_00.jsonl').write_text(
+            json.dumps({'id': item, **KEPT, 'reason': 'r'}) + '\n')
+        with pytest.raises(ValueError, match=r'cross_family.*cross_00'):
+            evalset.assemble()
+        assert not evalset.out.exists()
