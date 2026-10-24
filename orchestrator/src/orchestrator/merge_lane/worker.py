@@ -7111,6 +7111,28 @@ async def _advance_train(
 _TRAIN_REMOTE_VERIFY_MAX_MEMBERS = 2
 
 
+async def _run_verify_reaped(
+    verify: Coroutine[Any, Any, MergeOutcome | None],
+    *,
+    reap: Callable[[asyncio.Task[MergeOutcome | None]], Awaitable[None]],
+) -> MergeOutcome | None:
+    """Run *verify* as its own task, for a merger that awaits it inline.
+
+    Interrupted, the still-live task is handed to *reap*, the caller's
+    teardown through ``SpeculativeMergeWorker._teardown_verify_task``, so a
+    remote verify is aborted on its host before the local task unwinds; then
+    the interruption propagates.  The verify's own outcome or exception is
+    returned or raised as is.
+    """
+    task = asyncio.create_task(verify)
+    try:
+        await asyncio.wait({task})
+    except BaseException:
+        await reap(task)
+        raise
+    return task.result()
+
+
 class _TrainVerifyHost:
     """The host a train's verifies run on: the slot it leased, or unleased local."""
 
@@ -7175,15 +7197,10 @@ class _TrainVerifyHost:
         Interrupted, the verify is aborted on its host and reaped through the
         worker's teardown chokepoint while it is still live.
         """
-        verify_task = asyncio.create_task(verify)
-        try:
-            await asyncio.wait({verify_task})
-        except BaseException:
-            await self._worker._teardown_verify_task(
-                self._lease, verify_task, self._task_id, shutdown_defensive=True,
-            )
-            raise
-        return verify_task.result()
+        return await _run_verify_reaped(verify, reap=functools.partial(
+            self._worker._teardown_verify_task,
+            self._lease, task_id=self._task_id, shutdown_defensive=True,
+        ))
 
     async def release(self, *, aborted: bool) -> None:
         """Give the slot back.
@@ -18524,8 +18541,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         (sole-waiter abandon, operator halt, dead-verify no-progress),
         ``_run_inflight_verify``'s ``finally`` orphan guard (task 3043), which
         reaps the inner verify task on any exit route the three abort triggers
-        do not cover (in practice: external cancellation), and a train's
-        verify interrupted mid-run (``_TrainVerifyHost.run_verify``, task 6160).
+        do not cover (in practice: external cancellation), and the reap of a
+        verify interrupted mid-run in :func:`_run_verify_reaped`, serving a
+        train's verify (``_TrainVerifyHost.run_verify``, task 6160) and a
+        remote gate re-verify (``_gate_reverify_on_head_host``, task 6278).
 
         ORDER IS LOAD-BEARING, and sole-callership is what now guarantees it.
         The remote cancel must fire while ``_inflight_request_id`` is still
@@ -18899,11 +18918,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         A remote that turns out unreachable is benched through the
         ``on_unavailable`` chokepoint and the gate re-runs on local, leaseless,
         never blocking the item; its restart-drain deadline restarts with it.
+        An interrupted remote attempt is aborted on its host while still live.
         """
         if lease is not None and not lease.is_local and history_leg_command is None:
             try:
-                return await self._lane_post_merge_verify(
-                    git_ops, req, merge_wt, runner=lease.runner, **gate_kwargs,
+                return await _run_verify_reaped(
+                    self._lane_post_merge_verify(
+                        git_ops, req, merge_wt, runner=lease.runner, **gate_kwargs,
+                    ),
+                    reap=functools.partial(
+                        self._teardown_verify_task,
+                        lease, task_id=req.task_id, shutdown_defensive=True,
+                    ),
                 )
             except RunnerUnavailable as exc:
                 logger.warning(
