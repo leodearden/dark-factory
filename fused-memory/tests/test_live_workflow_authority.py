@@ -26,6 +26,7 @@ from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_TREE_HEADER,
+    ACTIVE_TASK_TREE_TITLE,
     FilteredTaskTree,
     format_filtered_task_tree,
 )
@@ -101,6 +102,10 @@ class TestProbedScopeRule:
         )
 
         assert format_filtered_task_tree(tree).startswith(ACTIVE_TASK_TREE_HEADER + '\n')
+
+    def test_the_clipped_header_names_the_tree_by_the_title_its_header_renders(self) -> None:
+        assert ACTIVE_TASK_TREE_HEADER.endswith(ACTIVE_TASK_TREE_TITLE)
+        assert ACTIVE_TASK_TREE_TITLE in clipped_section_header(2, 5)
 
 
 def _stage_local_live_workflow_text(prompt: str) -> str:

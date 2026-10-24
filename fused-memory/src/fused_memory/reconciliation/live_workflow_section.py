@@ -24,6 +24,7 @@ from fused_memory.models.reconciliation import FindingSeverity
 from fused_memory.models.scope import ProjectRoot
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_TREE_HEADER,
+    ACTIVE_TASK_TREE_TITLE,
     MAX_ACTIVE_TASKS_RENDERED,
 )
 from fused_memory.services.landed_on_main import LandingQuery, LandingVerdict, probe_landing
@@ -96,7 +97,7 @@ def clipped_section_header(probed: int | str, total_active: int | str) -> str:
     """The section header when the fan-out cap probed only *probed* of *total_active* tasks."""
     return LIVE_WORKFLOW_SECTION_HEADER + (
         f' (probed the first {probed} of {total_active} active tasks — the same cap '
-        f'the Active Task Tree applies, so every task shown there was probed)'
+        f'the {ACTIVE_TASK_TREE_TITLE} applies, so every task shown there was probed)'
     )
 
 
@@ -175,7 +176,7 @@ def render_live_workflow_authority_rules() -> str:
         f'`{CITATION_CONTRADICTIONS_KEY}`, and counted in '
         f'`{CITATION_CONTRADICTIONS_STAT}` (reify run 6aa50844 cited task/5891 as '
         f'live while its section listed nothing).\n\n'
-        f'This section probes exactly the tasks the {tree} lists: both are rendered '
+        f'This section probes exactly the active tasks the {tree} lists: both are rendered '
         f'from one prefix of the active tasks under one cap. When that cap clipped '
         f'the probe, the section header says so and reads {clipped}. A missing row, '
         f'or a missing section, is evidence of no live signal and no landing ONLY for '

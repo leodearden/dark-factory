@@ -850,7 +850,8 @@ MAX_CANCELLED_TASKS_RETAINED: int = 15
 # always reference the same set of tasks — see task_knowledge_sync.assemble_payload().
 MAX_ACTIVE_TASKS_RENDERED: int = 50
 
-ACTIVE_TASK_TREE_HEADER: str = '### Active Task Tree'
+ACTIVE_TASK_TREE_TITLE: str = 'Active Task Tree'
+ACTIVE_TASK_TREE_HEADER: str = f'### {ACTIVE_TASK_TREE_TITLE}'
 
 # Status priority for sorting: lower value = higher priority.
 # Matches _select_proactive_sample in task_knowledge_sync.py.
