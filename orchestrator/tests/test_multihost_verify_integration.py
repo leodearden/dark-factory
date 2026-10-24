@@ -88,6 +88,7 @@ from orchestrator.merge_lane.liveness import (
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
 )
+from orchestrator.merge_lane.ports import ClockPort
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import PRODUCTION_CLOCK, MergeRequest
 from orchestrator.verify import VerifyResult
@@ -1360,13 +1361,18 @@ class _ShortSleepClock:
     async def sleep(self, secs: float) -> None:
         await asyncio.sleep(min(secs, self._CAP_SECS))
 
-    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+    async def wait_for_any(
+        self, aws: Collection[asyncio.Future[Any]], timeout: float,
+    ) -> set[asyncio.Future[Any]]:
         # UNCAPPED, unlike the sleep above: capping it would re-check the
         # lane's halt and abandonment branches ~500x more often and reorder
         # the halt-vs-verify interleaving this file's capstone measures. So
         # this one method wants production semantics exactly, and delegates
         # rather than restating them.
         return await PRODUCTION_CLOCK.wait_for_any(aws, timeout)
+
+
+_SHORT_SLEEP_CLOCK_IS_A_CLOCK_PORT: ClockPort = _ShortSleepClock()
 
 
 class _HostEscalationQueue:

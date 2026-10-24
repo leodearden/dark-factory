@@ -337,6 +337,7 @@ class TestFakeClockWaitsForAny:
         task = asyncio.create_task(asyncio.sleep(0.05))
         try:
             done = await clock.wait_for_any({task}, timeout=600.0)
+            assert_type(done, set[asyncio.Future[Any]])
             polls = 1
             while not done and polls < self.POLL_BUDGET:
                 done = await clock.wait_for_any({task}, timeout=600.0)
