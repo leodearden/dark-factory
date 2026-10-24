@@ -10,7 +10,8 @@ call-site is wired up here (that's alpha3/alpha4).
 Contract (PRD Sec Contract) — derived per-invocation from the worktree path:
   1. whole worktree root (D1)
   2. ``<base>/.task-meta/<name>/`` (via ``TaskArtifacts.meta_root_for``)
-  2b. ``<base>/.task-meta/task-<id>/`` (via ``TaskArtifacts.task_root_for``)
+  2b. the dispatch's task root, by default ``<base>/.task-meta/task-<id>/``
+      (via ``TaskArtifacts.task_root_for``)
   3-6. main ``.git`` carve-outs (``objects/``, ``refs/heads/task/``,
        ``logs/refs/heads/task/``, ``worktrees/<name>/``) derived by parsing
        ``<worktree>/.git``'s ``gitdir:`` line
@@ -130,9 +131,16 @@ def _parse_gitdir(worktree: Path) -> Path:
     return admindir.resolve()
 
 
-def compute_write_set(worktree: Path, *, task_id: str, home: Path | None = None) -> WriteSet:
+def compute_write_set(
+    worktree: Path, *, task_id: str, task_root: Path | None = None, home: Path | None = None,
+) -> WriteSet:
     """Derive the full writable-path set for a sandboxed agent invocation
     of task *task_id* rooted at ``worktree``.
+
+    ``task_root`` is the task root the dispatch actually uses (the workflow
+    passes its own, so a single-root eval dispatch is granted no
+    ``task-<id>`` dir its parallel trials would share); ``None`` derives
+    ``TaskArtifacts.task_root_for(worktree.parent, task_id)``.
 
     Pure: reads ``<worktree>/.git`` and resolves symlinks, but performs no
     filesystem writes (no makedirs) — existence/creation remains the
@@ -157,7 +165,10 @@ def compute_write_set(worktree: Path, *, task_id: str, home: Path | None = None)
         # to the real directory landlock enforces on — see
         # TestTaskMetaSymlinkResolution in test_write_set.py.
         task_meta=TaskArtifacts.meta_root_for(worktree.parent, worktree.name).resolve(),
-        task_root=TaskArtifacts.task_root_for(worktree.parent, task_id).resolve(),
+        task_root=(
+            task_root if task_root is not None
+            else TaskArtifacts.task_root_for(worktree.parent, task_id)
+        ).resolve(),
         git_objects=(main_git / 'objects').resolve(),
         git_task_refs=(main_git / 'refs' / 'heads' / 'task').resolve(),
         git_task_reflogs=(main_git / 'logs' / 'refs' / 'heads' / 'task').resolve(),

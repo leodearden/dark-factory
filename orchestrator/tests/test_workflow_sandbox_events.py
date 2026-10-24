@@ -216,7 +216,7 @@ class TestInvokeWiresEnsureSandboxDirs:
         hermetic = _make_write_set(claude_fleet=claude_fleet)
         assert not claude_fleet.exists()
         monkeypatch.setattr(
-            'orchestrator.workflow.compute_write_set', lambda _cwd, *, task_id: hermetic,
+            'orchestrator.workflow.compute_write_set', lambda _cwd, *, task_id, task_root: hermetic,
         )
 
         # Spy: record whether claude_fleet already exists on disk at the moment

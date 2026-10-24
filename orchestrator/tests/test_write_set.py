@@ -133,6 +133,12 @@ class TestComputeWriteSetHappyPath:
             TaskArtifacts.task_root_for(worktree.parent, '2904').resolve()
         )
 
+    def test_a_single_root_dispatch_grants_no_task_root(self, worktree: Path, tmp_home: Path):
+        lane_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+        ws = compute_write_set(worktree, task_id='2904', task_root=lane_root, home=tmp_home)
+        assert ws.task_root == lane_root.resolve()
+        assert TaskArtifacts.task_root_for(worktree.parent, '2904').resolve() not in ws.writable_paths()
+
     def test_invalid_task_id_raises(self, worktree: Path, tmp_home: Path):
         with pytest.raises(ValueError):
             compute_write_set(worktree, task_id='a/b', home=tmp_home)

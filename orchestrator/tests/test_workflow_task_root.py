@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 from _workflow_helpers import AgentStub, _build_workflow, _init_repo
 
+from orchestrator.agents import sandbox_dispatch
 from orchestrator.artifacts import ARTIFACT_ROOTS, ArtifactRoot, TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
 from orchestrator.git_ops import GitOps, _run
@@ -112,10 +113,15 @@ async def test_cold_dispatch_keeps_task_artifacts_in_the_task_root(
     assert lane_names <= _LANE_KEYED
 
 
-@pytest.mark.asyncio
-async def test_external_worktree_stays_single_root(config, git_ops, task_assignment, stub, tmp_path):
+async def _eval_worktree(config: OrchestratorConfig, tmp_path: Path) -> Path:
     worktree = tmp_path / 'evals' / '42' / 'run-a'
     await _run(['git', 'worktree', 'add', '-b', 'eval/42-a', str(worktree)], cwd=config.project_root)
+    return worktree
+
+
+@pytest.mark.asyncio
+async def test_external_worktree_stays_single_root(config, git_ops, task_assignment, stub, tmp_path):
+    worktree = await _eval_worktree(config, tmp_path)
     workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
     workflow.worktree = worktree
 
@@ -127,3 +133,23 @@ async def test_external_worktree_stays_single_root(config, git_ops, task_assignm
     assert workflow.artifacts.lane_root == workflow.artifacts.task_root == lane
     assert (lane / 'plan.json').is_file()
     assert not TaskArtifacts.task_root_for(worktree.parent, '42').exists()
+
+
+@pytest.mark.asyncio
+async def test_external_worktree_sandbox_grants_no_task_root(
+    config, git_ops, task_assignment, stub, tmp_path,
+):
+    """Parallel eval trials of one id would all share the task root, so a
+    single-root dispatch must not be granted it."""
+    config.sandbox.enabled = True
+    sandbox_dispatch.set_backend('none')
+    worktree = await _eval_worktree(config, tmp_path)
+    workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+    workflow.worktree = worktree
+
+    await workflow.run()
+
+    extras = stub.sandbox_extras_by_role['implementer']
+    assert extras is not None
+    assert str(TaskArtifacts.meta_root_for(worktree.parent, worktree.name).resolve()) in extras
+    assert str(TaskArtifacts.task_root_for(worktree.parent, '42').resolve()) not in extras

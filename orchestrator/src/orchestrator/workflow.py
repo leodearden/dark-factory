@@ -2610,12 +2610,15 @@ class TaskWorkflow:
 
         An external (eval-mode) worktree gets its lane root twice: eval trials
         of one task id share a parent dir, so a task-keyed root would
-        interleave their plans (task 3155 plan, design decision 4).
+        interleave their plans (task 3155 plan, design decision 4). Any other
+        worktree gets ``TaskArtifacts.for_task``'s pair, the one the steward
+        also opens.
         """
-        lane_root = _meta_root_for_worktree(worktree)
         if self._worktree_external:
+            lane_root = _meta_root_for_worktree(worktree)
             return lane_root, lane_root
-        return lane_root, TaskArtifacts.task_root_for(worktree.parent, self.task_id)
+        dual = TaskArtifacts.for_task(worktree, self.task_id)
+        return dual.lane_root, dual.task_root
 
     async def _setup_worktree_and_artifacts(self, branch_name: str) -> None:
         """Set in-progress, create/inspect the worktree, init artifacts, scrub .task/.
@@ -14197,7 +14200,9 @@ class TaskWorkflow:
         sandbox_modules = None
         sandbox_extras = None
         if self.config.sandbox.enabled and role.sandboxed:
-            write_set = compute_write_set(cwd, task_id=self.task_id)
+            write_set = compute_write_set(
+                cwd, task_id=self.task_id, task_root=self._artifact_roots(cwd)[1],
+            )
             # Pre-create the load-bearing claude_fleet carve-out OUTSIDE the
             # sandbox at this single INV-5/D11 write-set consumption point, so it
             # exists before sandbox_extras (below) is built (task 2996) — see

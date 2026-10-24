@@ -957,6 +957,7 @@ class AgentStub:
         self.calls: list[str] = []
         # Last env_overrides seen per role — set by invoke_agent before dispatch.
         self.env_overrides_by_role: dict[str, dict[str, str] | None] = {}
+        self.sandbox_extras_by_role: dict[str, list[str] | None] = {}
         self._impl_iteration = 0
         # Sequence of verify results to return (pops from front)
         self._verify_results = list(verify_results or [VerifyResult(
@@ -1003,6 +1004,7 @@ class AgentStub:
         role = self._detect_role(system_prompt)
         self.calls.append(role)
         self.env_overrides_by_role[role] = env_overrides
+        self.sandbox_extras_by_role[role] = sandbox_extras
 
         if role == 'architect':
             return await self._architect(cwd)
