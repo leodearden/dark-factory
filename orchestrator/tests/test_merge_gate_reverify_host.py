@@ -1,5 +1,5 @@
-"""The single-branch gate re-verify runs with the lane's own verify handles
-(task 6278, folding 6344).
+"""The single-branch gate re-verify runs on the head's own leased host, with
+the lane's own verify handles (task 6278, folding 6344).
 
 Every scene drives one request through the lane's own queue over a real tmp
 git repo. Main moves from inside the request's first verify, so
@@ -10,12 +10,14 @@ gate genuinely re-verifies the rebased tree.
 from __future__ import annotations
 
 import asyncio
+import collections
 import dataclasses
+import functools
 import subprocess
 import time
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -37,6 +39,8 @@ from df_pytest_isolation import git_redirect_env
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeRequest, QueuedBranch
+from orchestrator.verify import VerifyResult
+from orchestrator.verify_runner import RunnerUnavailable
 
 pytestmark = pytest.mark.asyncio
 
@@ -113,6 +117,17 @@ def scene(tmp_path: Path) -> _Scene:
     return _scene(tmp_path)
 
 
+def _remote_scene(tmp_path: Path, **overrides: Any) -> _Scene:
+    """A scene whose lane prefers a free remote host."""
+    return _scene(tmp_path, verify_host_policy='prefer_remote', **overrides)
+
+
+@pytest.fixture
+def remote_scene(tmp_path: Path) -> _Scene:
+    """As DF's own config does, the lane adopts a remote green without a local cross-check."""
+    return _remote_scene(tmp_path, verify_cross_check_remote_green=False)
+
+
 async def _single(scene: _Scene, name: str) -> MergeRequest:
     worktree = (await scene.git_ops.create_worktree(name)).path
     (worktree / f'{name}.txt').write_text(f'{name}\n')
@@ -144,6 +159,89 @@ class _MovesMainOnFirstCall(FakeVerifier):
         if len(self.heads) == 1:
             _land_drift(self._repo)
         return super().next_script(task_id)
+
+
+_HostScript = Callable[['_HeadHost'], Awaitable[VerifyResult]]
+
+
+async def _host_passes(host: _HeadHost) -> VerifyResult:
+    return VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='',
+        summary=f'green on {host.name}',
+    )
+
+
+def _host_moves_main_then_passes(move_main: Callable[[], None]) -> _HostScript:
+    async def script(host: _HeadHost) -> VerifyResult:
+        move_main()
+        return await _host_passes(host)
+
+    return script
+
+
+async def _host_unreachable(host: _HeadHost) -> VerifyResult:
+    host.healthy = False
+    raise RunnerUnavailable(f'ssh {host.name} exited 255: connection reset')
+
+
+async def _host_hangs(host: _HeadHost) -> VerifyResult:
+    host.gate_entered.set()
+    never: asyncio.Future[VerifyResult] = asyncio.get_running_loop().create_future()
+    return await never
+
+
+class _HeadHost:
+    """The remote verify host a head leases, duck-typed to
+    ``verify_runner.py::VerifyRunner`` as test_train_verify_host.py::_FakeRemote is.
+
+    Not a ``RemoteRunner``, so ``VerifyRunnerPool.dispatch`` calls it with
+    ``(merge_sha, spec)`` alone and skips the INV-2 code sync. Each
+    ``run_merge_verify`` call keeps its merge SHA in ``calls``, plays the next
+    of *scripts* (passing once they run out) and records how it ended in
+    ``endings``. ``live`` is set while a call runs, as ``RemoteRunner``'s
+    in-flight id is; ``cancels`` records whether each remote cancel found a
+    call still live to abort. An unhealthy host never probes healthy or clean,
+    so the reprobe sweep cannot re-admit it during a test.
+    """
+
+    is_local: ClassVar[bool] = False
+
+    def __init__(self, *scripts: _HostScript, name: str = 'laptop') -> None:
+        self.name = name
+        self.healthy = True
+        self._scripts = collections.deque(scripts)
+        self.calls: list[str] = []
+        self.endings: list[str] = []
+        self.cancels: list[bool] = []
+        self.live = False
+        self.gate_entered = asyncio.Event()
+
+    async def health(self) -> bool:
+        return self.healthy
+
+    async def probe_clean(self) -> bool:
+        return self.healthy
+
+    async def cancel_verify(self) -> int:
+        self.cancels.append(self.live)
+        return 0
+
+    async def run_merge_verify(self, merge_sha: str, spec: Any) -> VerifyResult:
+        self.calls.append(merge_sha)
+        script = self._scripts.popleft() if self._scripts else _host_passes
+        self.live = True
+        try:
+            result = await script(self)
+        except asyncio.CancelledError:
+            self.endings.append('cancelled')
+            raise
+        except BaseException:
+            self.endings.append('raised')
+            raise
+        finally:
+            self.live = False
+        self.endings.append('returned')
+        return result
 
 
 def _rows(store: _RecordingEventStore, kind: str, merge_sha: str) -> list[dict[str, Any]]:
@@ -191,3 +289,57 @@ async def test_a_red_gate_reverify_spawns_a_dry_run_investigation(scene: _Scene)
     assert outcome.status == 'blocked', outcome
     assert outcome.reason.startswith('Post-merge verification failed'), outcome.reason
     assert len(verifier.investigations) == 1, verifier.investigations
+
+
+# ─── A remote-lease head gates on the host it already holds ─────────────────
+
+
+def _moves_main_then_gates(scene: _Scene) -> _HeadHost:
+    return _HeadHost(
+        _host_moves_main_then_passes(functools.partial(_land_drift, scene.repo)), _host_passes,
+    )
+
+
+async def test_a_remote_lease_head_gates_on_the_host_it_holds(remote_scene: _Scene) -> None:
+    request = await _single(remote_scene, 'gate')
+    host = _moves_main_then_gates(remote_scene)
+    verifier = FakeVerifier()
+    store = _RecordingEventStore()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(
+        remote_scene.git_ops, queue,
+        verifier=verifier, clock=healthy_verify_clock(), event_store=store,
+        remote_runners=[host],
+    )
+
+    outcome = await merge_through_lane(lane, queue, request)
+
+    assert outcome.status == 'done', outcome
+    landed = remote_scene.main_sha()
+    assert len(host.calls) == 2, host.calls
+    assert host.calls[1] == landed != host.calls[0]
+    assert verifier.verify_calls == []
+    assert [row['runner'] for row in _rows(store, 'merge_verify', landed)] == ['laptop']
+
+
+async def test_a_remote_gate_keeps_the_local_cross_check(tmp_path: Path) -> None:
+    scene = _remote_scene(tmp_path, verify_cross_check_remote_green=True)
+    request = await _single(scene, 'gate')
+    host = _moves_main_then_gates(scene)
+    store = _RecordingEventStore()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(
+        scene.git_ops, queue,
+        verifier=FakeVerifier(), clock=healthy_verify_clock(), event_store=store,
+        remote_runners=[host],
+    )
+
+    outcome = await merge_through_lane(lane, queue, request)
+
+    assert outcome.status == 'done', outcome
+    assert len(host.calls) == 2, host.calls
+    parity = [
+        (event['data']['merge_sha'], event['data']['remote_runner'])
+        for name, event in store.events if name == 'verdict_parity_ok'
+    ]
+    assert parity == [(host.calls[0], 'laptop'), (scene.main_sha(), 'laptop')]
