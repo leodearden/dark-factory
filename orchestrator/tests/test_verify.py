@@ -11510,20 +11510,15 @@ class TestWithJunitxmlStr:
         assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
 
 
-class TestSerialPytestStrRefusedRewriteIsLogged:
-    """_serial_pytest_str must RECORD a refused serial rewrite, not swallow it.
+class TestSerialPytestStrLogsOnlyUnappliedRewrites:
+    """_serial_pytest_str places the flags where it can and RECORDS where it cannot.
 
-    Task 4121, the "louder failure" half. ``verify_cmd``'s raw-chain appender
-    refuses outright rather than splice the flags into an unclosed quote —
-    the rule, and the measurements behind it, live in
-    ``verify_cmd._unspliceable_pytest_spans`` and are deliberately not
-    restated here.
-
-    Refusing is right, but a SILENT refusal is its own defect: the
-    ENV_TRANSIENT retry then re-runs the ORIGINAL command and fails for its
-    own reason, and an operator reading that log cannot tell "recovery ran
-    without its flags" from "recovery ran". One WARNING here makes the
-    difference legible.
+    A quoted chain operator (``-k 'a && b'``) once made the raw-chain
+    appender refuse (task 4121); since task 4178 those chains are recovered,
+    with no WARNING. A raw-retained PYTEST chain that still comes back
+    unchanged is logged: the ENV_TRANSIENT retry then re-runs the ORIGINAL
+    command, and an operator reading that log cannot otherwise tell
+    "recovery ran without its flags" from "recovery ran".
 
     Modelled test-for-test on ``TestWithJunitxmlStr`` above — this file's
     established template for a ``*_str`` wrapper's capability-loss record —
@@ -11531,29 +11526,30 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
     same way rather than each inventing its own assertion style.
     """
 
-    _REFUSED = "pytest -k 'a && b' tests/ && true"
-
-    def test_refused_rewrite_returns_the_callers_own_string_and_logs_once(
-        self, caplog: pytest.LogCaptureFixture,
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            pytest.param("pytest -k 'a && b' tests/ && true", id='quoted-and-single'),
+            pytest.param('pytest -k "a && b" tests/ && true', id='quoted-and-double'),
+            pytest.param("pytest -k 'a | b' tests/ && true", id='quoted-pipe'),
+            pytest.param("pytest --deselect 'x;y' tests/ && true", id='quoted-semicolon'),
+            pytest.param("uv run pytest -k 'a && b' tests/ && true", id='uv-run-prefix'),
+            pytest.param("( cd x && pytest -k 'a && b' tests/ )", id='inside-subshell'),
+            pytest.param("pytest -k 'a && b' t1/ && pytest t2/", id='two-invocations'),
+        ],
+    )
+    def test_a_quoted_chain_operator_is_recovered_without_a_warning(
+        self, raw: str, caplog: pytest.LogCaptureFixture,
     ):
         from orchestrator.verify import _serial_pytest_str
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            result = _serial_pytest_str(self._REFUSED, invocation_dir=None)
+            result = _serial_pytest_str(raw, invocation_dir=None)
 
-        assert result is self._REFUSED, "the no-op must return the caller's own string"
-        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
-        assert len(records) == 1, f'expected exactly one record, got {[r.message for r in records]}'
-        assert records[0].levelno == logging.WARNING
-        # Asserted on substance, not prose: the command must be quotable from
-        # the record, and a stable keyword must identify WHICH recovery was
-        # lost. Anchoring on the full sentence would make this a spelling test.
-        assert self._REFUSED in records[0].getMessage()
-        assert 'serial' in records[0].getMessage().lower()
-        # The OFFENDING SPAN, not just the whole command: on a long
-        # multi-segment test_command the operator would otherwise have to
-        # re-derive the regex segmentation by hand to find it.
-        assert "pytest -k 'a " in records[0].getMessage()
+        assert result is not raw
+        assert result is not None
+        assert 'no:xdist' in result
+        assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
 
     def test_the_message_does_not_assert_a_cause_it_has_not_measured(
         self, caplog: pytest.LogCaptureFixture,
@@ -11586,21 +11582,23 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
     ):
         """The asymmetry ``_with_pytest_numprocesses_str``'s docstring claims.
 
-        Both wrappers refuse identically (one appender), but only the serial
-        one logs: a suppressed ``-n`` leaves the command at its configured
-        worker count, which is the pre-cap status quo and not a lost
-        capability, whereas suppressed serial-recovery flags mean a recovery
-        attempt ran without the thing that makes it a recovery. That claim is
-        pinned here rather than left to the docstring, since the serial twin
-        got a whole class for exactly this and the asymmetry was otherwise
-        unguarded.
+        Both wrappers find nothing to append to in ``echo "pytest" && true``
+        (one appender; the serial twin's WARNING for it is pinned above), but
+        only the serial one logs: a suppressed ``-n`` leaves the command at
+        its configured worker count, which is the pre-cap status quo and not
+        a lost capability, whereas suppressed serial-recovery flags mean a
+        recovery attempt ran without the thing that makes it a recovery. That
+        claim is pinned here rather than left to the docstring, since the
+        serial twin got a whole class for exactly this and the asymmetry was
+        otherwise unguarded.
         """
         from orchestrator.verify import _with_pytest_numprocesses_str
 
+        cmd = 'echo "pytest" && true'
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            result = _with_pytest_numprocesses_str(self._REFUSED, '4')
+            result = _with_pytest_numprocesses_str(cmd, '4')
 
-        assert result is self._REFUSED, "the no-op must return the caller's own string"
+        assert result is cmd, "the no-op must return the caller's own string"
         assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
 
     @pytest.mark.parametrize(
@@ -11736,13 +11734,12 @@ class TestSerialPytestStrReSuppliesGoverningAddopts:
         from orchestrator.verify import _serial_pytest_str
 
         tree = _write_serial_recovery_tree(tmp_path)
-        refused = "pytest -k 'a && b' tests/ && true"
+        refused = 'echo "pytest" && true'
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
             assert _serial_pytest_str(refused, invocation_dir=tree) is refused
         records = [r for r in caplog.records if r.name == 'orchestrator.verify']
         assert len(records) == 1
         assert refused in records[0].getMessage()
-        assert "pytest -k 'a " in records[0].getMessage()
 
 
 # ---------------------------------------------------------------------------
