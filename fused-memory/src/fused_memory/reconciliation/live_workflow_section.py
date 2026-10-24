@@ -22,7 +22,10 @@ from shared.timestamps import parse_timestamp_or_warn
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import FindingSeverity
 from fused_memory.models.scope import ProjectRoot
-from fused_memory.reconciliation.task_filter import MAX_ACTIVE_TASKS_RENDERED
+from fused_memory.reconciliation.task_filter import (
+    ACTIVE_TASK_TREE_HEADER,
+    MAX_ACTIVE_TASKS_RENDERED,
+)
 from fused_memory.services.landed_on_main import LandingQuery, LandingVerdict, probe_landing
 from fused_memory.services.live_workflow_detector import (
     DEFAULT_BRANCH_PREFIX,
@@ -89,6 +92,14 @@ LIVE_WORKFLOW_RULES_HEADING = '### Reading the Live-Workflow Signals section'
 _HEARTBEAT_TTL_MINUTES = int(DEFAULT_CLAIMANT_HEARTBEAT_TTL.total_seconds() // 60)
 
 
+def clipped_section_header(probed: int | str, total_active: int | str) -> str:
+    """The section header when the fan-out cap probed only *probed* of *total_active* tasks."""
+    return LIVE_WORKFLOW_SECTION_HEADER + (
+        f' (probed the first {probed} of {total_active} active tasks — the same cap '
+        f'the Active Task Tree applies, so every task shown there was probed)'
+    )
+
+
 def render_live_workflow_authority_rules() -> str:
     """The reading rules over this section's rendered tokens, for the Stage 1 and 2 prompts.
 
@@ -98,6 +109,8 @@ def render_live_workflow_authority_rules() -> str:
     """
     claimant = {label: f'`{CLAIMANT_FIELD}{label}`' for label in ClaimantLabel}
     signals = ' / '.join(f'`{signal}`' for signal in LiveSignal)
+    tree = f'`{ACTIVE_TASK_TREE_HEADER}`'
+    clipped = f"`{clipped_section_header('N', 'M')}`"
     return (
         f'{LIVE_WORKFLOW_RULES_HEADING}\n'
         f'Each row reads `- task/<id>: <per-task signals>; {CLAIMANT_FIELD}<label>; '
@@ -161,7 +174,16 @@ def render_live_workflow_authority_rules() -> str:
         f'finding that contradicts the section is detected after the fact, annotated '
         f'`{CITATION_CONTRADICTIONS_KEY}`, and counted in '
         f'`{CITATION_CONTRADICTIONS_STAT}` (reify run 6aa50844 cited task/5891 as '
-        f'live while its section listed nothing).'
+        f'live while its section listed nothing).\n\n'
+        f'This section probes exactly the tasks the {tree} lists: both are rendered '
+        f'from one prefix of the active tasks under one cap. When that cap clipped '
+        f'the probe, the section header says so and reads {clipped}. A missing row, '
+        f'or a missing section, is evidence of no live signal and no landing ONLY for '
+        f'a task the {tree} lists. Any other task was never probed: one past the cap, '
+        f'one named only in an episode, memory or finding, or every task when this '
+        f'payload carries no {tree}. The section says nothing about such a '
+        f"task's liveness or landing, so apply the `get_task` test above before "
+        f'treating it as stranded.'
     )
 
 
@@ -251,19 +273,14 @@ class LiveWorkflowSnapshot:
         """
         if not self.rows:
             return ''
-        header = LIVE_WORKFLOW_SECTION_HEADER + self._header_scope()
+        header = (
+            clipped_section_header(self.probed, self.total_active)
+            if self.total_active > self.probed
+            else LIVE_WORKFLOW_SECTION_HEADER
+        )
         project_line = _project_line(self.project_orchestrator_live)
         preamble = [header, *([project_line] if project_line else []), _legend()]
         return '\n'.join([*preamble, *(row.render() for row in self.rows)]) + '\n'
-
-    def _header_scope(self) -> str:
-        if self.total_active <= self.probed:
-            return ''
-        return (
-            f' (probed the first {self.probed} of {self.total_active} '
-            f'active tasks — the same cap the Active Task Tree applies, so every '
-            f'task shown there was probed)'
-        )
 
 
 async def render_live_workflow_section(

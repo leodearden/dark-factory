@@ -850,6 +850,8 @@ MAX_CANCELLED_TASKS_RETAINED: int = 15
 # always reference the same set of tasks — see task_knowledge_sync.assemble_payload().
 MAX_ACTIVE_TASKS_RENDERED: int = 50
 
+ACTIVE_TASK_TREE_HEADER: str = '### Active Task Tree'
+
 # Status priority for sorting: lower value = higher priority.
 # Matches _select_proactive_sample in task_knowledge_sync.py.
 # 'done': 4 is included so that _select_proactive_sample (which sorts ALL tasks
@@ -1564,7 +1566,7 @@ def _format_header(shown: int, omitted_active: int, tree: FilteredTaskTree) -> s
         tree: FilteredTaskTree supplying the done/cancelled/other/total counts.
     """
     return (
-        f'### Active Task Tree\n'
+        f'{ACTIVE_TASK_TREE_HEADER}\n'
         f'({shown} active shown'
         + (f', {omitted_active} more active omitted by max_tasks cap' if omitted_active > 0 else '')
         + f', {tree.done_count} done, {tree.cancelled_count} cancelled, '
