@@ -406,22 +406,61 @@ def _population(scored: Sequence[_Scored], strata: Mapping[str, int] | None) -> 
 def _kappa(
     scored: Sequence[_Scored], judgements: Mapping[_rubric.PairKey, _rubric.Judgement],
 ) -> dict[str, Any]:
-    """Cohen's kappa per binary between the primary and second rater, over consumed answers."""
-    pairs: dict[_rubric.Binary, list[tuple[str, str]]] = {binary: [] for binary in _rubric.Binary}
-    for s in scored:
-        if s.decided is None:
-            continue
-        for target, binary in sorted(_consumed(s, s.decided)):
-            judgement = judgements.get(_rubric.PairKey(s.item.entry_id, target, _rubric.Basis.CURRENT))
-            answers = None if judgement is None else _primary_and_second(judgement, binary)
-            if answers is not None:
-                pairs[binary].append(answers)
+    """:func:`kappa_over_consumed` over every decided item's consumed answers."""
+    consumed = [
+        (_rubric.PairKey(s.item.entry_id, target, _rubric.Basis.CURRENT), binary)
+        for s in scored if s.decided is not None
+        for target, binary in _consumed(s, s.decided)
+    ]
+    return kappa_over_consumed(consumed, judgements)
+
+
+ConsumedKey = tuple[_rubric.PairKey, _rubric.Binary]
+"""A current-basis pair key and a binary whose answers a figure read."""
+
+
+def kappa_over_consumed(
+    consumed: Iterable[ConsumedKey], judgements: Mapping[_rubric.PairKey, _rubric.Judgement],
+) -> dict[str, Any]:
+    """Cohen's kappa per binary between the primary and second rater, over *consumed* keys.
+
+    *judgements* is ``resolve_judgements``' output. Each key counts once, and
+    only where :func:`consumed_answer_pairs` finds both raters' answers. A
+    floor binary meets the floor at :data:`KAPPA_MIN_PAIRS` keys and
+    :data:`KAPPA_FLOOR`.
+    """
+    pairs = consumed_answer_pairs(consumed, judgements)
     return {
         'floor': KAPPA_FLOOR,
         'min_pairs': KAPPA_MIN_PAIRS,
         'floor_binaries': [str(binary) for binary in KAPPA_FLOOR_BINARIES],
-        'by_binary': {str(binary): _kappa_block(consumed) for binary, consumed in pairs.items()},
+        'by_binary': {
+            str(binary): _kappa_block([(primary, second) for _, primary, second in answered])
+            for binary, answered in pairs.items()
+        },
     }
+
+
+def consumed_answer_pairs(
+    consumed: Iterable[ConsumedKey], judgements: Mapping[_rubric.PairKey, _rubric.Judgement],
+) -> dict[_rubric.Binary, list[tuple[_rubric.PairKey, str, str]]]:
+    """Each binary's sorted (key, primary answer, second answer) over the distinct *consumed* keys.
+
+    A key is kept only when exactly one primary and one second vote both
+    decided its binary. A key off the current basis is refused: agreement is
+    measured on the current basis (``calibration/write_triage_reader_metrics.md`` §4).
+    """
+    pairs: dict[_rubric.Binary, list[tuple[_rubric.PairKey, str, str]]] = {
+        binary: [] for binary in _rubric.Binary
+    }
+    for key, binary in sorted(set(consumed)):
+        if key.basis != _rubric.Basis.CURRENT:
+            raise ValueError(f'consumed key {key} {binary} is on the {key.basis} basis, not current')
+        judgement = judgements.get(key)
+        answers = None if judgement is None else _primary_and_second(judgement, binary)
+        if answers is not None:
+            pairs[binary].append((key, *answers))
+    return pairs
 
 
 def _consumed(s: _Scored, decided: _rubric.Decided) -> frozenset[tuple[str, _rubric.Binary]]:

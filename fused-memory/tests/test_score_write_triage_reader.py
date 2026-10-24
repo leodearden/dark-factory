@@ -589,7 +589,7 @@ class TestKappaOverConsumed:
         consumed = _consumed(('W', 'T1', 'loss'), ('W', 'T1', 'home'))
         by_binary = _mod().kappa_over_consumed(consumed, judgements)['by_binary']
         assert by_binary['loss'] == _agreement(0, None)
-        assert by_binary['home'] == _agreement(1, None)
+        assert by_binary['home'] == _agreement(1, _stats().cohen_kappa([('YES', 'NO')]))
 
     @pytest.mark.parametrize(('agreeing', 'split', 'kappa', 'floor_met'), [
         (60, 0, 1.0, True),
