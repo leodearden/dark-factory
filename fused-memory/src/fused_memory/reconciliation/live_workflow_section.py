@@ -385,18 +385,20 @@ async def build_live_workflow_snapshot(
     A clipped render also says so IN THE SECTION HEADER (``### Live-Workflow
     Signals (probed the first 50 of 512 active tasks …)``), because the WARNING
     and the safety argument below are both invisible to the reader that acts on
-    this payload.  Both stage prompts state the rule "absent from this section
-    ⇒ no live signal"; under a cap, absence acquires a second meaning — *past
-    the cap, never probed* — and the payload is the only place that can
-    disclose which one applies.  The header is bare when nothing was clipped,
+    this payload.  Both stage prompts scope the rule "absent from this section
+    ⇒ no live signal" to tasks the Active Task Tree lists, because past the cap
+    absence means *never probed*; the header disclosure is what lets a reader
+    see that the probe was clipped.  The header is bare when nothing was clipped,
     so the common case reads exactly as before.
 
     Capping here is SAFE.  This section is *advisory* input to the Stage 2 LLM
     about tasks it can see in the Active Task Tree, and that tree is rendered
     from the identical prefix slice (``render_active_section`` does
     ``tree.active_tasks[:max_tasks]`` with the same constant, task_filter.py:1614).
-    A task past the cap is therefore one the LLM was never shown and cannot act
-    on, so declining to probe it removes work without removing information.
+    A task past the cap is therefore one the tree never shows; an episode or
+    memory can still name it, but the prompts route such a task to ``get_task``
+    rather than to this section's silence, so declining to probe it removes
+    work without removing information.
     The load-bearing guard against racing a live pipeline is NOT this section
     but :func:`recon_write_policy.check` Gate 2, which is per-task, uncapped,
     and evaluated at write time.

@@ -3339,8 +3339,9 @@ class TaskKnowledgeSync(BaseStage):
     # ── Inference-bearing payload sections (task 5113) ──────────────────────
     # INCLUSION CRITERION — a section belongs here iff prompts/stage2.py tells
     # the model to draw an inference from that section's ABSENCE ("If
-    # `### Live-Workflow Signals` is absent from the payload, no task is live
-    # this cycle …"). Every payload builder renders these via
+    # `### Live-Workflow Signals` is absent from the payload, no task the
+    # `### Active Task Tree` lists is live this cycle …"). Every payload builder
+    # renders these via
     # _render_required_sections(). Enforced by
     # tests/reconciliation/test_stage2_payload_section_parity.py, whose module
     # docstring holds the section census: why each other conditional section
