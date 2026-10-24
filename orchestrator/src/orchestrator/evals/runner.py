@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable
@@ -14,6 +15,7 @@ from typing import Any
 
 from shared.eval_lane import is_eval_fixture_task_id
 
+from orchestrator import verify
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import (
     BackendsConfig,
@@ -27,6 +29,7 @@ from orchestrator.config import (
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import (
+    TaskWorkflow,
     WorkflowOutcome,
     _meta_root_for_worktree,
     build_workflow,
@@ -57,12 +60,18 @@ from .eval_gate import (
     owned_usage_gate,
 )
 from .metrics import (
-    collect_metrics,
+    EvalMetrics,
+    RoleUnderTest,
+    compute_composite,
+    is_false_green,
+    is_null_work,
     is_proxied_endpoint,
+    resolve_cost_usd,
 )
 from .profile import apply_eval_profile
 from .replay_frame import REPLAY_FRAME_ID, ReplayFramedBriefingAssembler
 from .results import CellName, EvalResult, ResultStore
+from .scoring import recovery_score_for_run
 from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
@@ -340,16 +349,15 @@ async def run_eval(
     intended memory writes instead of dropping them (see
     ``build_eval_orch_config`` for the full contract).
 
-    *judge_config* (eval-revival ο) is the judge OFAT knob: left ``None`` (every
-    existing caller) this is byte-identical to today — the result is labeled by
-    ``config`` and no ``role_under_test`` stamp fires. Supplied (run_ofat_stage's
-    judge branch), it (1) threads into ``build_eval_orch_config`` so ONLY the ζ
-    completion judge's model/effort derive from the candidate (the implementer
-    ``config`` stays pinned), (2) RELABELS the result to ``judge_config.name`` so
-    the persisted JSON is keyed by the judge candidate rather than the pinned
-    implementer (which would collide both judge rows), and (3) stamps
-    ``metrics['role_under_test']='judge'`` so ``select_survivors`` groups the
-    judge candidates as their own OFAT survivor axis.
+    *judge_config* (eval-revival ο) is the judge OFAT knob: left ``None`` the
+    result is labeled by ``config`` and is an IMPLEMENTER cell. Supplied
+    (run_ofat_stage's judge branch), it (1) threads into
+    ``build_eval_orch_config`` so ONLY the ζ completion judge's model/effort
+    derive from the candidate (the implementer ``config`` stays pinned), (2)
+    RELABELS the result to ``judge_config.name`` so the persisted JSON is keyed
+    by the judge candidate rather than the pinned implementer (which would
+    collide both judge rows), and (3) makes the cell a JUDGE cell so
+    ``select_survivors`` groups the judge candidates as their own OFAT axis.
     """
     task = load_task(task_path)
     task_id = task['id']
@@ -453,18 +461,13 @@ async def run_eval(
         wall_clock_ms = int(time.monotonic() * 1000) - start_ms
 
         # 7. Collect metrics
+        role = RoleUnderTest.JUDGE if judge_config is not None else RoleUnderTest.IMPLEMENTER
         try:
-            metrics = await collect_metrics(workflow, worktree, task)
+            metrics = await collect_metrics(workflow, worktree, task, role=role)
             metrics_dict = metrics.to_dict()
         except Exception as e:
             logger.warning(f'Metric collection failed: {e}')
-            metrics_dict = {}
-        # ο: stamp the judge OFAT axis so select_survivors groups judge runs as their
-        # own survivor group (collect_metrics itself does not know which role/stage
-        # invoked it — mirrors run_end_to_end's post-collect_metrics stamp). None →
-        # no stamp fires, so every existing caller is byte-identical.
-        if judge_config is not None:
-            metrics_dict['role_under_test'] = 'judge'
+            metrics_dict = _uncollected_metrics(role, None)
 
         result = EvalResult(
             task_id=address.task_id,
@@ -578,7 +581,7 @@ async def run_end_to_end(
     coupling question exists (PRD decision 9).
 
     The result's ``config_name`` encodes the ``(architect, implementer)`` combo
-    and its metrics carry ``role_under_test='end_to_end'``. Mirrors run_eval's
+    and it is an END_TO_END cell. Mirrors run_eval's
     timeout / exception handling and persists into *store* (``None`` persists
     into :meth:`ResultStore.packaged`). Its
     architect is briefed in the replay frame, and the cell is stamped
@@ -664,16 +667,16 @@ async def run_end_to_end(
 
         wall_clock_ms = int(time.monotonic() * 1000) - start_ms
 
-        # 6. Collect metrics, then STAMP role_under_test='end_to_end' (collect_metrics
-        #    itself does not know which methodology stage invoked it).
+        # 6. Collect metrics.
         try:
-            metrics = await collect_metrics(workflow, worktree, task)
+            metrics = await collect_metrics(
+                workflow, worktree, task,
+                role=RoleUnderTest.END_TO_END, replay_frame=REPLAY_FRAME_ID,
+            )
             metrics_dict = metrics.to_dict()
         except Exception as e:
             logger.warning(f'Metric collection failed: {e}')
-            metrics_dict = {}
-        metrics_dict['role_under_test'] = 'end_to_end'
-        metrics_dict['replay_frame'] = REPLAY_FRAME_ID
+            metrics_dict = _uncollected_metrics(RoleUnderTest.END_TO_END, REPLAY_FRAME_ID)
 
         result = EvalResult(
             task_id=address.task_id,
@@ -691,6 +694,196 @@ async def run_end_to_end(
             f'({wall_clock_ms / 1000:.1f}s)'
         )
         return result
+
+
+async def collect_metrics(
+    workflow: TaskWorkflow,
+    worktree: Path,
+    task: dict,
+    *,
+    role: RoleUnderTest,
+    replay_frame: str | None = None,
+) -> EvalMetrics:
+    """Collect metrics from a completed workflow run, stamped with *role* and *replay_frame*."""
+    wf_metrics = workflow.metrics
+
+    # Plan completion
+    plan = workflow.artifacts.read_plan() if workflow.artifacts else {}
+    steps = plan.get('steps', [])
+    done_count = sum(1 for s in steps if isinstance(s, dict) and s.get('status') == 'done')
+    total_steps = len(steps) if steps else 1
+    plan_completion = done_count / total_steps
+
+    # Verification results (re-read from last run)
+    verification = await verify.run_verification(worktree, workflow.config)
+
+    # Review stats from artifacts
+    reviews = workflow.artifacts.aggregate_reviews() if workflow.artifacts else None
+    blocking_issues = len(reviews.blocking_issues) if reviews else 0
+    suggestions = len(reviews.suggestions) if reviews else 0
+
+    # Git stats (diff against pre-task commit to capture all workflow changes)
+    lines_changed, files_changed = await _git_diff_stats(
+        worktree, task['pre_task_commit'],
+    )
+
+    # Inference speed metrics
+    duration_secs = wf_metrics.total_duration_ms / 1000 if wf_metrics.total_duration_ms else 0.0
+    tps = wf_metrics.total_output_tokens / duration_secs if duration_secs > 0 else 0.0
+    # Via the shared predicate, NOT an inline env read: the same signal decides
+    # whether build_eval_orch_config seeds the proxied price table, so the two
+    # must not be able to drift apart (see is_proxied_endpoint).
+    is_local = is_proxied_endpoint(workflow.config.env_overrides)
+
+    # Cost provenance (Invariant P5): the CLI's own cost figure is wrong for a
+    # proxied endpoint, so resolve cost from the config price table by the run's
+    # model, tracking which source was used. collect_metrics is the IMPLEMENTER
+    # path (run_eval), so the model under test is config.models.implementer.
+    # ``run_architect_eval`` resolves through this SAME seam (task 3656) — with
+    # ``model=EvalConfig.model`` and ``prices`` from its own eval orch config,
+    # the leaves that actually produced its tokens — and then composes its
+    # two-component (architect + plan-judge) label via ``compose_cost_source``.
+    # So both eval paths share ONE cost-provenance seam rather than one
+    # resolving and one copying the raw CLI number.
+    run_model = workflow.config.models.implementer
+    resolved_cost, cost_source = resolve_cost_usd(
+        wf_metrics.total_input_tokens,
+        wf_metrics.total_output_tokens,
+        model=run_model,
+        prices=workflow.config.prices,
+        cli_cost_usd=wf_metrics.total_cost_usd,
+        is_local_model=is_local,
+    )
+
+    m = EvalMetrics(
+        tests_pass=verification.passed if verification else False,
+        lint_clean=(not verification.lint_output) if verification else False,
+        typecheck_clean=(not verification.type_output) if verification else False,
+        plan_completion_pct=plan_completion,
+        plan_steps=total_steps,
+        cost_usd=resolved_cost,
+        cost_source=cost_source,
+        workflow_duration_ms=wf_metrics.total_duration_ms,
+        turns_used=wf_metrics.total_turns,
+        iterations=wf_metrics.execute_iterations,
+        debug_cycles=wf_metrics.verify_attempts,
+        judge_invocations=wf_metrics.judge_invocations,
+        judge_cost_usd=wf_metrics.judge_cost_usd,
+        judge_early_exits=wf_metrics.judge_early_exits,
+        input_tokens=wf_metrics.total_input_tokens,
+        output_tokens=wf_metrics.total_output_tokens,
+        cache_read_tokens=wf_metrics.total_cache_read_tokens,
+        cache_create_tokens=wf_metrics.total_cache_create_tokens,
+        review_blocking_issues=blocking_issues,
+        review_suggestions=suggestions,
+        lines_changed=lines_changed,
+        files_changed=files_changed,
+        tokens_per_second=round(tps, 2),
+        is_local_model=is_local,
+        role_under_test=role,
+        replay_frame=replay_frame,
+    )
+    # False-green guard — catches the 404-bug signature so the same class of
+    # silent failure doesn't need manual quarantine in future runs.
+    if is_false_green(m, workflow.config.max_execute_iterations):
+        logger.warning(
+            'False-green signature for task %s: %d iters @ cap, '
+            '$0 cost, 0 lines / 0 files changed, T/T/T — '
+            'nulling gate fields so score is 0',
+            task.get('id', '?'), m.iterations,
+        )
+        m.tests_pass = None
+        m.lint_clean = None
+        m.typecheck_clean = None
+    # Null-work guard — catches the NULL-byte implementer signature where
+    # real inference ran (cost > 0) but the model emitted pad tokens instead
+    # of tool calls, producing zero code changes.
+    elif is_null_work(m):
+        logger.warning(
+            'Null-work signature for task %s: %d iters, '
+            '$%.4f cost, 0 lines / 0 files changed — '
+            'nulling gate fields so score is 0',
+            task.get('id', '?'), m.iterations, m.cost_usd,
+        )
+        m.tests_pass = None
+        m.lint_clean = None
+        m.typecheck_clean = None
+
+    m.composite_score = compute_composite(m)
+
+    # Stamp the adversarial flag from the task record BEFORE recovery scoring
+    # runs, so it is set regardless of whether recovery scoring succeeds, is
+    # None, or raises below. The report keys its ``adversarial`` column on this
+    # flag (not on ``recovery_score is not None``), so a recovery-scoring
+    # FAILURE on an adversarial fixture renders as ``adversarial: true`` with a
+    # null score — visibly distinct from a genuinely non-adversarial run.
+    m.adversarial = bool(task.get('adversarial'))
+
+    # Recovery-behavior scoring (eval-revival η) — a rubric DISTINCT from the
+    # base composite, scored only for adversarial fixtures (returns None
+    # otherwise). Guarded: a recovery-scoring bug degrades to a named WARNING +
+    # null column and never nukes the run's composite/cost/gate metrics.
+    try:
+        m.recovery_score = await recovery_score_for_run(
+            task, workflow.artifacts, worktree, task['pre_task_commit'],
+        )
+    except Exception:
+        logger.warning(
+            'recovery scoring failed for %s', task.get('id', '?'),
+            exc_info=True,
+        )
+
+    return m
+
+
+async def _git_diff_stats(worktree: Path, base_commit: str) -> tuple[int, int]:
+    """Get lines changed and files changed vs the pre-task baseline commit.
+
+    Returns (-1, -1) on git failure or subprocess error so callers can
+    distinguish a genuine zero-change diff from a failed measurement.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git', 'diff', '--stat', f'{base_commit}..HEAD',
+            cwd=str(worktree),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                '_git_diff_stats: git diff --stat failed (rc=%s) base=%s: %s',
+                proc.returncode, base_commit,
+                stderr.decode(errors='replace')[:200],
+            )
+            return -1, -1
+        output = stdout.decode().strip()
+        if not output:
+            return 0, 0
+
+        # Last line: " X files changed, Y insertions(+), Z deletions(-)"
+        summary = output.split('\n')[-1]
+        files_changed = 0
+        lines_changed = 0
+
+        m = re.search(r'(\d+) files? changed', summary)
+        if m:
+            files_changed = int(m.group(1))
+        for m in re.finditer(r'(\d+) (?:insertions?|deletions?)', summary):
+            lines_changed += int(m.group(1))
+
+        return lines_changed, files_changed
+    except Exception:
+        logger.warning(
+            '_git_diff_stats: git diff raised for base=%s',
+            base_commit, exc_info=True,
+        )
+        return -1, -1
+
+
+def _uncollected_metrics(role: RoleUnderTest, replay_frame: str | None) -> dict[str, Any]:
+    """The metrics of a cell whose collection raised: only the stamps the executor knows."""
+    return {'role_under_test': role, 'replay_frame': replay_frame}
 
 
 def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.CancelledError]:

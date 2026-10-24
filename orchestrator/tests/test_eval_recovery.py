@@ -21,8 +21,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.evals import runner
-from orchestrator.evals.metrics import EvalMetrics, collect_metrics
+from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
 from orchestrator.evals.results import EvalResult
+from orchestrator.evals.runner import collect_metrics
 from orchestrator.evals.scoring import (
     _RECOVERY_DETECTORS,
     compute_recovery_score,
@@ -364,7 +365,7 @@ def _collect_patches(diff: str):
             AsyncMock(return_value=_verify_pass()),
         ),
         patch(
-            'orchestrator.evals.metrics._git_diff_stats',
+            'orchestrator.evals.runner._git_diff_stats',
             AsyncMock(return_value=(10, 2)),
         ),
         patch(
@@ -403,7 +404,9 @@ class TestCollectMetricsRecoveryWiring:
         wf = _workflow(_RECOVERED_PLAN, _RECOVERED_BLOCKING)
         p_verify, p_stat, p_diff = _collect_patches(_RECOVERED_DIFF)
         with p_verify, p_stat, p_diff:
-            m = await collect_metrics(wf, Path('/fake/wt'), task)
+            m = await collect_metrics(
+                wf, Path('/fake/wt'), task, role=RoleUnderTest.IMPLEMENTER,
+            )
         # A real, populated float — not the None sentinel.
         assert m.recovery_score == 1.0
         assert isinstance(m.recovery_score, float)
@@ -413,7 +416,9 @@ class TestCollectMetricsRecoveryWiring:
         wf = _workflow(_RECOVERED_PLAN, [])
         p_verify, p_stat, p_diff = _collect_patches('')
         with p_verify, p_stat, p_diff:
-            m = await collect_metrics(wf, Path('/fake/wt'), task)
+            m = await collect_metrics(
+                wf, Path('/fake/wt'), task, role=RoleUnderTest.IMPLEMENTER,
+            )
         assert m.recovery_score is None
 
     async def test_adversarial_task_stamps_adversarial_flag(self):
@@ -427,7 +432,9 @@ class TestCollectMetricsRecoveryWiring:
         wf = _workflow(_RECOVERED_PLAN, _RECOVERED_BLOCKING)
         p_verify, p_stat, p_diff = _collect_patches(_RECOVERED_DIFF)
         with p_verify, p_stat, p_diff:
-            m = await collect_metrics(wf, Path('/fake/wt'), task)
+            m = await collect_metrics(
+                wf, Path('/fake/wt'), task, role=RoleUnderTest.IMPLEMENTER,
+            )
         assert m.adversarial is True
         assert m.to_dict()['adversarial'] is True
 
@@ -436,7 +443,9 @@ class TestCollectMetricsRecoveryWiring:
         wf = _workflow(_RECOVERED_PLAN, [])
         p_verify, p_stat, p_diff = _collect_patches('')
         with p_verify, p_stat, p_diff:
-            m = await collect_metrics(wf, Path('/fake/wt'), task)
+            m = await collect_metrics(
+                wf, Path('/fake/wt'), task, role=RoleUnderTest.IMPLEMENTER,
+            )
         assert m.adversarial is False
 
     async def test_recovery_failure_warns_and_nulls_without_nuking_composite(
@@ -453,9 +462,11 @@ class TestCollectMetricsRecoveryWiring:
         wf = _workflow(_RECOVERED_PLAN, [])  # 0 blocking → composite 1.0
         p_verify, p_stat, p_diff = _collect_patches('')
         with p_verify, p_stat, p_diff, caplog.at_level(
-            logging.WARNING, logger='orchestrator.evals.metrics',
+            logging.WARNING, logger='orchestrator.evals.runner',
         ):
-            m = await collect_metrics(wf, Path('/fake/wt'), task)
+            m = await collect_metrics(
+                wf, Path('/fake/wt'), task, role=RoleUnderTest.IMPLEMENTER,
+            )
         assert m.recovery_score is None
         assert m.composite_score == 1.0
         # The adversarial flag SURVIVES the recovery-scoring failure — it is
