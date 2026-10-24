@@ -1020,7 +1020,6 @@
     "pyright: ignore[reportMissingImports] c450fe7d0d1f": 2,
     "pyright: ignore[reportMissingImports] fb4302019f1d": 1,
     "pyright: ignore[reportUnsupportedDunderAll] f1b63a0c8307": 1,
-    "pyright: ignore[reportUnusedExcept] eeb832d61884": 1,
     "type: ignore 063d124e84b9": 4,
     "type: ignore 40475ab48d23": 1,
     "type: ignore 7688b4207e80": 1,
