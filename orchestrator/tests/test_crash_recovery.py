@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2650,10 +2650,6 @@ def _stale_lock(root: Path) -> Path:
     return lock_path
 
 
-def _cleanup_worktree_mock(harness: Harness) -> AsyncMock:
-    return cast(AsyncMock, harness.git_ops.cleanup_worktree)
-
-
 @pytest.mark.asyncio
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 2376: heavy class
 class TestRecoveryReadsTheTaskRoot:
@@ -2661,6 +2657,8 @@ class TestRecoveryReadsTheTaskRoot:
     async def test_cold_worktree_recovers_its_task_root_plan_and_clears_the_lock(
         self, harness: Harness,
     ):
+        cleanup = AsyncMock()
+        harness.git_ops.cleanup_worktree = cleanup
         base = harness.git_ops.worktree_base
         wt = _setup_worktree(base, '35')
         task_root = _setup_task_plan(base, '35', _make_plan(steps_done=3, steps_total=5, task_id='35'))
@@ -2671,11 +2669,13 @@ class TestRecoveryReadsTheTaskRoot:
         assert len(harness._recovered_plans['35']['steps']) == 5
         assert not lock_path.exists()
         assert wt.exists()
-        _cleanup_worktree_mock(harness).assert_not_called()
+        cleanup.assert_not_called()
 
     async def test_cold_worktree_stamped_zero_completed_task_root_plan_is_preserved(
         self, harness: Harness,
     ):
+        cleanup = AsyncMock()
+        harness.git_ops.cleanup_worktree = cleanup
         base = harness.git_ops.worktree_base
         _setup_worktree(base, '38')
         task_root = _setup_task_plan(base, '38', _make_plan(
@@ -2688,11 +2688,13 @@ class TestRecoveryReadsTheTaskRoot:
         assert '38' in harness._preserved_worktrees
         assert '38' not in harness._recovered_plans
         assert not lock_path.exists()
-        _cleanup_worktree_mock(harness).assert_not_called()
+        cleanup.assert_not_called()
 
     async def test_recordless_lane_takes_its_task_id_from_lane_metadata(
         self, harness: Harness,
     ):
+        cleanup = AsyncMock()
+        harness.git_ops.cleanup_worktree = cleanup
         _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
         (base / '_lane-0').mkdir(parents=True)
@@ -2703,7 +2705,7 @@ class TestRecoveryReadsTheTaskRoot:
 
         assert '42' in harness._recovered_plans
         assert '_lane-0' not in harness._recovered_plans
-        _cleanup_worktree_mock(harness).assert_not_called()
+        cleanup.assert_not_called()
 
     async def test_record_adopted_lane_reads_its_plan_from_the_task_root(
         self, harness: Harness,
@@ -2727,6 +2729,8 @@ class TestRecoveryReadsTheTaskRoot:
         self, harness: Harness,
     ):
         """plan.json is task-scoped; a copy in the lane root names no task."""
+        cleanup = AsyncMock()
+        harness.git_ops.cleanup_worktree = cleanup
         _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
         lane = base / '_lane-0'
@@ -2738,7 +2742,7 @@ class TestRecoveryReadsTheTaskRoot:
         await harness._recover_crashed_tasks()
 
         assert harness._recovered_plans == {}
-        _cleanup_worktree_mock(harness).assert_called_once_with(lane, '_lane-0')
+        cleanup.assert_called_once_with(lane, '_lane-0')
 
 
 class TestSessionResumeReasons:
