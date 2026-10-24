@@ -34,9 +34,8 @@ def test_persisted_role_values_are_the_storage_vocabulary():
 
 
 def test_candidate_roles_exclude_the_end_to_end_stage():
-    assert CANDIDATE_ROLES == {
-        RoleUnderTest.IMPLEMENTER, RoleUnderTest.ARCHITECT, RoleUnderTest.JUDGE,
-    }
+    expected = {RoleUnderTest.IMPLEMENTER, RoleUnderTest.ARCHITECT, RoleUnderTest.JUDGE}
+    assert expected == CANDIDATE_ROLES
 
 
 class TestEvalConfigRole:

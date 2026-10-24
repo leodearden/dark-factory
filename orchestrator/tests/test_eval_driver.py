@@ -46,6 +46,7 @@ from _campaign_gate_helpers import (
 )
 
 from orchestrator.evals.configs import EvalConfig
+from orchestrator.evals.metrics import RoleUnderTest
 from orchestrator.evals.results import EvalResult, ResultStore
 from orchestrator.workflow import WorkflowOutcome
 
@@ -56,7 +57,7 @@ def _impl_cfg() -> EvalConfig:
 
 def _arch_cfg() -> EvalConfig:
     # model!='opus' and effort!='high' so both diverge from the hardcoded pin.
-    return EvalConfig('architect-sonnet-max', 'claude', 'sonnet', 'max', role='architect')
+    return EvalConfig('architect-sonnet-max', 'claude', 'sonnet', 'max', role=RoleUnderTest.ARCHITECT)
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +327,7 @@ class TestBuildEvalOrchConfigJudgeOverride:
 
         base = _base_config(tmp_path)
         # model!='sonnet' AND effort!='medium' so BOTH derived fields diverge.
-        judge = EvalConfig('judge-haiku-high', 'claude', 'haiku', 'high', role='judge')
+        judge = EvalConfig('judge-haiku-high', 'claude', 'haiku', 'high', role=RoleUnderTest.JUDGE)
         cfg = build_eval_orch_config(_impl_cfg(), {}, base, judge_config=judge)
 
         # The judge's model/effort now derive from the candidate (judge OFAT axis).
@@ -464,7 +465,7 @@ class TestRunEvalJudgeConfig:
     ):
         base = _base_config(tmp_path)
         impl = EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max')
-        judge = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge')
+        judge = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role=RoleUnderTest.JUDGE)
         result, captured = await _run_eval_hermetic(
             impl, base, _judge_task(tmp_path), monkeypatch, judge_config=judge,
         )
@@ -890,7 +891,7 @@ class TestRunOfatStage:
         t1.touch()
         t2.touch()
         impl_cfg = EvalConfig('claude-opus-high', 'claude', 'opus', 'high')
-        arch_cfg = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect')
+        arch_cfg = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT)
 
         eval_calls: list[tuple[str, str, int]] = []
         arch_calls: list[tuple[str, str, int]] = []
@@ -963,8 +964,8 @@ class TestRunOfatStage:
         return [t1, t2], [
             EvalConfig('claude-opus-high', 'claude', 'opus', 'high'),
             EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high',
-                       role='architect'),
-            EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge'),
+                       role=RoleUnderTest.ARCHITECT),
+            EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role=RoleUnderTest.JUDGE),
         ]
 
     def _stage(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe, **kw):
@@ -1045,7 +1046,7 @@ class TestRunOfatStageJudge:
         t1.touch()
         # impl_cfg deliberately != the pin so the judge branch's pin is visible.
         impl_cfg = EvalConfig('claude-opus-high', 'claude', 'opus', 'high')
-        judge_cfg = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge')
+        judge_cfg = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role=RoleUnderTest.JUDGE)
 
         # Records (fixture, config.name, judge_config.name|None, trial) per dispatch.
         eval_calls: list[tuple[str, str, str | None, int]] = []
@@ -1099,8 +1100,8 @@ class TestRunOfatStageJudge:
         t1 = tmp_path / 'df_task_a.json'
         t1.touch()
         impl_cfg = EvalConfig('claude-opus-high', 'claude', 'opus', 'high')
-        arch_cfg = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect')
-        judge_cfg = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge')
+        arch_cfg = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT)
+        judge_cfg = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role=RoleUnderTest.JUDGE)
 
         eval_calls: list[tuple[str, str | None]] = []
         arch_calls: list[str] = []
@@ -1147,8 +1148,8 @@ class TestRunMatrixStage:
 
     def _invoke(self, runner, paths, base):
         arch_survivors = [
-            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role='architect'),
-            EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect'),
+            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT),
+            EvalConfig('arch-opus', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT),
         ]
         impl_survivors = [EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')]
 
@@ -1222,8 +1223,8 @@ class TestRunMatrixStage:
         # (arch-sonnet × impl-sonnet, arch-opus × impl-opus) are the same-family
         # diagonals the matrix must NOT skip.
         arch_survivors = [
-            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role='architect'),
-            EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect'),
+            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT),
+            EvalConfig('arch-opus', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT),
         ]
         impl_survivors = [
             EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high'),
@@ -1275,7 +1276,7 @@ class TestRunMatrixStage:
         t1.touch()
 
         arch_survivors = [
-            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role='architect'),
+            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT),
         ]
         impl_survivors = [
             EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high'),
@@ -1316,7 +1317,7 @@ class TestRunConfirmStage:
 
     def _invoke(self, runner, paths, base):
         arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high',
-                                 role='architect')
+                                 role=RoleUnderTest.ARCHITECT)
         impl_winner = EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')
 
         async def stage():
@@ -1385,7 +1386,7 @@ class TestRunConfirmStage:
         t1.touch()
         t2.touch()
 
-        arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect')
+        arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT)
         impl_winner = EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')
 
         e2e_calls: list[tuple[str, str, str, int]] = []
@@ -1424,7 +1425,7 @@ class TestRunConfirmStage:
         t1 = tmp_path / 'df_task_a.json'
         t1.touch()
 
-        arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect')
+        arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT)
         impl_winner = EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')
 
         async def fake_run_end_to_end(task_path, arch_config, impl_config, *_a, trial=1, **_k):

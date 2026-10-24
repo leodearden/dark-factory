@@ -63,12 +63,14 @@ def _cell(
     that needs the pre-σ shape must therefore ask for it with
     ``drop_metrics=_PRE_SIGMA``. Do not pass the same key in both.
     """
-    from orchestrator.evals.metrics import EvalMetrics
+    from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
     from orchestrator.evals.results import EvalResult
 
     m = EvalMetrics(
         plan_quality=plan_quality,
-        role_under_test=role_under_test,
+        role_under_test=(
+            RoleUnderTest(role_under_test) if role_under_test is not None else None
+        ),
         plan_steps=plan_steps,
         cost_usd=cost_usd,
         judge_cost_usd=judge_cost_usd,

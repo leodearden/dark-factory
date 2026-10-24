@@ -195,8 +195,9 @@ class TestCodexSlatePin:
             EvalConfig,
             codex_pi_candidates,
         )
+        from orchestrator.evals.metrics import RoleUnderTest
 
         by_name = {c.name: c for c in codex_pi_candidates()}
         assert by_name['pi-sonnet-control'] == EvalConfig(
-            'pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max', role='implementer',
+            'pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max', role=RoleUnderTest.IMPLEMENTER,
         )

@@ -7,6 +7,7 @@ import logging
 import re
 from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -67,6 +68,21 @@ DECLINE_KINDS: tuple[str, ...] = tuple(DECLINE_READERS)
 # The CLOSED terminal vocabulary: a scorable plan, the five declines, or
 # neither.  :func:`resolve_terminal_kind` always returns a member of this tuple.
 TERMINAL_KINDS: tuple[str, ...] = ('planned', *DECLINE_KINDS, 'none')
+
+
+class RoleUnderTest(StrEnum):
+    """Which role an eval cell put under test."""
+
+    IMPLEMENTER = 'implementer'
+    ARCHITECT = 'architect'
+    JUDGE = 'judge'
+    END_TO_END = 'end_to_end'
+
+
+# The roles an OFAT candidate can vary; END_TO_END is a methodology stage.
+CANDIDATE_ROLES: frozenset[RoleUnderTest] = frozenset({
+    RoleUnderTest.IMPLEMENTER, RoleUnderTest.ARCHITECT, RoleUnderTest.JUDGE,
+})
 
 
 @dataclass
@@ -174,12 +190,9 @@ class EvalMetrics:
     # it degrades to the structural floor, not to None.
     plan_quality: float | None = None
 
-    # Which role this run put UNDER TEST (eval-revival θ / C4 role_under_test),
-    # threaded from the candidate's ``EvalConfig.role``. ``None`` for legacy
-    # runs; ``'architect'`` for an architect-eval run, ``'implementer'`` for the
-    # ordinary path. The plan-quality report keys its column on this being
-    # ``'architect'``.
-    role_under_test: str | None = None
+    # END_TO_END marks a both-live methodology cell. None only for cells persisted
+    # before task 6738, which results.normalize_legacy_metrics maps to IMPLEMENTER.
+    role_under_test: RoleUnderTest | None = None
 
     # Infra-failure markers (tasks 3118, 6734). ``invocation_errors`` holds one
     # typed record per stage that produced no measurement; ``None`` means none was
