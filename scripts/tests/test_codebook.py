@@ -1087,6 +1087,131 @@ def test_merge_invalid_correction_is_skipped_whole(build_record):
 
 
 # ---------------------------------------------------------------------------
+# task 7448: a correction that names the task whose whole outcome for the
+# entry it is (`outcome_of_task`). The merger records that task on the
+# entry's `corrected_by`, which disposition reads, so the task's done is never
+# taken for a fix of the entry's defect.
+# ---------------------------------------------------------------------------
+
+_T7448_UNIT_TASK_REF = {"project_root": "/r", "task_id": 5687}
+
+
+def _outcome_correction_record(
+    session="sess-outcome", task_ref: dict | None = None
+) -> dict:
+    """A note-only §7.3 correction naming *task_ref* (default task 5687 of
+    root "/r") in `outcome_of_task`: no title, cause or status."""
+    return {
+        "session": session,
+        "date": "2026-10-24",
+        "project": "dark_factory",
+        "agent_class": "task-agent",
+        "corrections": [
+            {
+                "entry_id": "entry-a",
+                "note": "The task's whole outcome was this record's correction.",
+                "outcome_of_task": dict(task_ref or _T7448_UNIT_TASK_REF),
+            }
+        ],
+    }
+
+
+def test_validate_coding_record_accepts_a_correction_naming_its_outcome_task():
+    assert mod.validate_coding_record(_outcome_correction_record()) == []
+
+
+@pytest.mark.parametrize(
+    "task_ref",
+    [
+        {"project_root": "/r", "task_id": "5687"},
+        {"project_root": "/r", "task_id": True},
+        {"task_id": 5687},
+        {"project_root": "", "task_id": 5687},
+        {"project_root": "/r"},
+    ],
+    ids=["str-task-id", "bool-task-id", "no-project-root", "empty-project-root", "no-task-id"],
+)
+def test_validate_coding_record_rejects_a_malformed_outcome_task(task_ref):
+    record = _outcome_correction_record()
+    record["corrections"][0]["outcome_of_task"] = task_ref
+
+    errors = mod.validate_coding_record(record)
+
+    assert errors and all("outcome_of_task" in error for error in errors)
+
+
+def test_merge_outcome_correction_records_the_task_on_the_entry_only():
+    codebook = _codebook_with_entry_a()
+    before = copy.deepcopy(codebook["entries"][0])
+
+    merge = _merge_one(codebook, _outcome_correction_record())
+
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
+    for field in ("title", "status"):
+        assert entry[field] == before[field]
+    assert "cause" not in entry
+    assert [s["session"] for s in entry["sightings"]] == ["sess-outcome"]
+    assert "outcome_of_task" not in entry["sightings"][0]
+    assert entry["sightings"][0]["note"]
+    assert entry["corrected_by"] == [{"project_root": "/r", "task_id": 5687}]
+    assert _report(merge) == _clean_report(corrections_applied=1)
+    assert mod.validate(merge.codebook) == []
+
+
+def test_merge_outcome_correction_re_apply_is_a_no_op():
+    record = _outcome_correction_record()
+    once = _merge_one(_codebook_with_entry_a(), record).codebook
+
+    twice = _merge_one(once, record)
+
+    assert twice.codebook == once
+    assert _report(twice) == _clean_report()
+    assert not twice.mutated
+
+
+def test_merge_outcome_corrections_dedupe_the_task_and_append_new_ones_in_order():
+    first = _merge_one(_codebook_with_entry_a(), _outcome_correction_record("sess-1")).codebook
+    same_task = _merge_one(first, _outcome_correction_record("sess-2")).codebook
+    entry = next(e for e in same_task["entries"] if e["id"] == "entry-a")
+    assert entry["corrected_by"] == [{"project_root": "/r", "task_id": 5687}]
+
+    other_task = _merge_one(
+        same_task,
+        _outcome_correction_record("sess-3", {"project_root": "/r", "task_id": 5688}),
+    ).codebook
+
+    entry = next(e for e in other_task["entries"] if e["id"] == "entry-a")
+    assert entry["corrected_by"] == [
+        {"project_root": "/r", "task_id": 5687},
+        {"project_root": "/r", "task_id": 5688},
+    ]
+    assert [s["session"] for s in entry["sightings"]] == ["sess-1", "sess-2", "sess-3"]
+
+
+def test_merge_correction_without_an_outcome_task_writes_no_corrected_by():
+    merge = _merge_one(_codebook_with_entry_a(), _correction_record())
+
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
+    assert "corrected_by" not in entry
+
+
+def test_validate_accepts_a_well_formed_corrected_by():
+    codebook = _codebook_with_entry_a()
+    codebook["entries"][0]["corrected_by"] = [{"project_root": "/r", "task_id": 5687}]
+
+    assert mod.validate(codebook) == []
+
+
+def test_validate_rejects_a_corrected_by_item_with_a_string_task_id():
+    codebook = _codebook_with_entry_a()
+    codebook["entries"][0]["corrected_by"] = [{"project_root": "/r", "task_id": "5687"}]
+
+    errors = mod.validate(codebook)
+
+    assert errors and all("corrected_by" in error for error in errors)
+
+
+# ---------------------------------------------------------------------------
 # step-13: RED (§8.3 never-delete) — NeverDeleteError + assert_no_deletion
 # ---------------------------------------------------------------------------
 
