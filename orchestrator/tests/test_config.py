@@ -3600,6 +3600,17 @@ class TestPriceEntry:
         with pytest.raises(ValidationError):
             PriceEntry(input_per_1m=-1, output_per_1m=1)
 
+    def test_cached_input_rate_validates(self):
+        entry = PriceEntry(input_per_1m=10.0, output_per_1m=50.0, cached_input_per_1m=1.0)
+        assert entry.cached_input_per_1m == 1.0
+
+    def test_cached_input_rate_is_optional(self):
+        assert PriceEntry(input_per_1m=1.10, output_per_1m=4.40).cached_input_per_1m is None
+
+    def test_negative_cached_input_rate_rejected(self):
+        with pytest.raises(ValidationError):
+            PriceEntry(input_per_1m=1, output_per_1m=1, cached_input_per_1m=-0.5)
+
 
 class TestOrchestratorConfigPrices:
     """OrchestratorConfig.prices is seeded from the packaged defaults.yaml
@@ -3636,6 +3647,19 @@ class TestOrchestratorConfigPrices:
         table = default_price_table()
         assert set(table) == self._SEED_KEYS
         assert table['o4-mini'] == {'input_per_1m': 1.10, 'output_per_1m': 4.40}
+
+    def test_astra_seeds_a_cached_input_rate(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        assert default_price_table()['gpt-6-astra']['cached_input_per_1m'] == 1.00
+        assert OrchestratorConfig().prices['gpt-6-astra'].cached_input_per_1m == 1.00
+
+    def test_sol_and_terra_have_no_cached_input_rate(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        prices = OrchestratorConfig().prices
+        assert prices['gpt-5.6-sol'].cached_input_per_1m is None
+        assert prices['gpt-5.6-terra'].cached_input_per_1m is None
 
     def test_default_price_table_matches_defaults_yaml(self):
         """config.py's `_DEFAULT_PRICES` constant and defaults.yaml's

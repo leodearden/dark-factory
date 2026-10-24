@@ -45,6 +45,12 @@ logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
+# The backends that spend the leased Claude OAuth token, so only their caps are
+# a Claude account's caps: claude via CLAUDE_CODE_OAUTH_TOKEN, pi via
+# ANTHROPIC_OAUTH_TOKEN (orchestrator/src/orchestrator/agents/invoke.py::_invoke_pi).
+# codex bills the ChatGPT login and gemini a Google account; a cap there is the
+# backend's own window, waited out without touching the account pool.
+ACCOUNT_POOL_BACKENDS = frozenset({'claude', 'pi'})
 # Bounded retry budget for a pre-turn CLI rejection (task 3143 / esc-3118-1):
 # the CLI exited on argument validation before contacting the API, so nothing
 # was billed and no work was lost — a free retry.  ONE is deliberate: any
@@ -2102,6 +2108,17 @@ def _to_token_count(v: int | None) -> int | None:
     return v or None
 
 
+def _backend_window_wait_secs(resets_at: datetime | None, hits: int, now: datetime) -> float:
+    """Seconds to wait out a non-pool backend's cap window: the cooldown
+    doubling per consecutive hit, or until *resets_at* when that is later. The
+    floor holds when a named reset has already passed, so a backend that keeps
+    naming it is never redispatched back to back."""
+    backoff = min(_CAP_HIT_COOLDOWN_SECS * 2 ** (hits - 1), _MAX_CAP_COOLDOWN_SECS)
+    if resets_at is None:
+        return backoff
+    return max(backoff, (resets_at - now).total_seconds())
+
+
 def _reset_for_fresh_retry(invoke_kwargs: dict[str, Any], original_prompt: str) -> None:
     """Switch the retry loop to a fresh (non-resume) invocation.
 
@@ -2640,7 +2657,8 @@ async def invoke_with_cap_retry(
         # None (the general scope). Scoped ONLY for the claude backend
         # (decision 7 "claude-backend scope only"): a non-claude backend
         # (codex/gemini) never touches the OAuth account pool's model-scoped
-        # caps, satisfying B8. Lazy import mirrors the invocation_outcome
+        # caps, satisfying B8 (account-level caps are scoped separately, by
+        # ACCOUNT_POOL_BACKENDS). Lazy import mirrors the invocation_outcome
         # import below to avoid the usage_gate<->cli_invoke cycle.
         # getattr(...,'_config',None) is None for a spec'd MagicMock gate and
         # scope_for(m, <no config>) is None, so every existing mock-based suite
@@ -2850,8 +2868,27 @@ async def invoke_with_cap_retry(
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                     continue  # __aexit__ releases probe slot
 
-                if not result.success and slot.detect_cap_hit(
-                    result.stderr, result.output, backend=backend,
+                if isinstance(outcome, CapHit) and backend not in ACCOUNT_POOL_BACKENDS:
+                    slot.confirm(result.cost_usd)
+                    consecutive_cap_hits += 1
+                    wait = _backend_window_wait_secs(
+                        outcome.resets_at, consecutive_cap_hits, datetime.now(UTC),
+                    )
+                    _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                    logger.warning(
+                        f'{label}: {backend} cap hit ({outcome.reason}; resets_at='
+                        f'{outcome.resets_at}) is not a Claude account cap — sleeping '
+                        f'{wait:.0f}s then retrying fresh on account {account_name}',
+                    )
+                    now = time.monotonic()
+                    _check_cap_wait(now, now - retry_start, wait, consecutive_cap_hits)
+                    await asyncio.sleep(wait)
+                    continue
+
+                if (
+                    backend in ACCOUNT_POOL_BACKENDS
+                    and not result.success
+                    and slot.detect_cap_hit(result.stderr, result.output, backend=backend)
                 ):
                     consecutive_cap_hits += 1
                     full_cycles = (consecutive_cap_hits - 1) // num_accounts
@@ -3071,7 +3108,8 @@ async def invoke_with_cap_retry(
                 # the retry loop can wait / fail over instead of silently returning a
                 # useless "success" to the caller.
                 if (
-                    not result.success  # is_error=true → success=False after fix 2
+                    backend in ACCOUNT_POOL_BACKENDS
+                    and not result.success  # is_error=true → success=False after fix 2
                     and result.cost_usd == 0
                     and result.turns <= 1
                     and result.duration_ms < 5000
