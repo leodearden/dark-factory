@@ -1208,9 +1208,7 @@ def test_verify_merge_uses_acquire_host_verify_worktree(tmp_path, monkeypatch):
     """verify-merge must call acquire_host_verify_worktree, NOT _create_merge_worktree."""
     patched = _patched_verify_merge(tmp_path, monkeypatch, persistent=True)
     git_ops = patched.git_ops
-    git_ops._create_merge_worktree = AsyncMock(
-        return_value=(tmp_path / '_merge-verify', _VERIFY_MERGE_SHA),
-    )
+    git_ops._create_merge_worktree = AsyncMock(return_value=(MagicMock(), _VERIFY_MERGE_SHA))
 
     r = patched.invoke()
 
@@ -1424,7 +1422,7 @@ def test_verify_merge_flock_contention_emits_distinguished_result(tmp_path, monk
     patched = _patched_verify_merge(tmp_path, monkeypatch, persistent=True)
     git_ops = patched.git_ops
     worktree_base = git_ops.worktree_base
-    git_ops._create_merge_worktree = AsyncMock(return_value=(tmp_path / '_merge-verify', 'sha'))
+    git_ops._create_merge_worktree = AsyncMock(return_value=(MagicMock(), _VERIFY_MERGE_SHA))
     # The distinguished payload must round-trip through the real codec on stdout.
     monkeypatch.setattr('orchestrator.verify_runner.result_to_json', result_to_json)
     monkeypatch.setattr(cli_module, 'MERGE_VERIFY_FLOCK_WAIT_SECS', 0.3)
