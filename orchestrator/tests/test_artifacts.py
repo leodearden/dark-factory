@@ -1807,9 +1807,8 @@ class TestWorktreeMissingTolerance:
         import shutil
         shutil.rmtree(worktree)
 
-        # _write_json into a path under .root with the dir gone — should swallow
-        target = ta.artifact_path('reviews') / 'foo.json'
-        ta._write_json(target, {'a': 1})  # no exception
+        # _write_json into an artifact whose root is gone — should swallow
+        ta._write_json('reviews/foo.json', {'a': 1})  # no exception
 
     def test_write_review_still_raises_for_genuine_io_errors(
         self, tmp_path: Path, monkeypatch

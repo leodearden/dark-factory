@@ -544,11 +544,11 @@ class TaskArtifacts:
         }
         if base_commit:
             metadata['base_commit'] = base_commit
-        self._write_json(self.artifact_path('metadata.json'), metadata)
+        self._write_json('metadata.json', metadata)
 
     def read_base_commit(self) -> str | None:
         """Read the base commit SHA stored at init time."""
-        meta_path = self._read_path('metadata.json')
+        meta_path = self.artifact_path('metadata.json')
         if not meta_path.exists():
             return None
         metadata = json.loads(meta_path.read_text())
@@ -568,12 +568,12 @@ class TaskArtifacts:
 
     def update_base_commit(self, new_base: str) -> None:
         """Update the base_commit in metadata.json after a rebase."""
-        meta_path = self._read_path('metadata.json')
+        meta_path = self.artifact_path('metadata.json')
         if not meta_path.exists():
             return
         metadata = json.loads(meta_path.read_text())
         metadata['base_commit'] = new_base
-        self._write_json(self.artifact_path('metadata.json'), metadata)
+        self._write_json('metadata.json', metadata)
 
     @contextmanager
     def plan_mutex(self) -> Iterator[None]:
@@ -625,7 +625,7 @@ class TaskArtifacts:
                 f'{self.artifact_path("plan.json")} reached its write without {lock_path} held: '
                 'run the whole read-modify-write inside plan_mutex()'
             )
-        self._write_json(self.artifact_path('plan.json'), plan)
+        self._write_json('plan.json', plan)
 
     def ensure_lane_plan_symlink(self) -> None:
         """Single-source plan.json onto the durable meta-root copy.
@@ -679,13 +679,13 @@ class TaskArtifacts:
             'main_sha_at_report': main_sha_at_report,
             'reported_at': datetime.now(UTC).isoformat(),
         }
-        self._write_json(self.artifact_path('blocking_dependency.json'), data)
+        self._write_json('blocking_dependency.json', data)
 
     def read_blocking_dependency(self) -> dict | None:
         """Return the parsed ``.task/blocking_dependency.json`` artifact if
         present, else ``None``.
         """
-        path = self._read_path('blocking_dependency.json')
+        path = self.artifact_path('blocking_dependency.json')
         if not path.exists():
             return None
         return json.loads(path.read_text())
@@ -720,13 +720,13 @@ class TaskArtifacts:
             'evidence': evidence,
             'reported_at': datetime.now(UTC).isoformat(),
         }
-        self._write_json(self.artifact_path('already_done.json'), data)
+        self._write_json('already_done.json', data)
 
     def read_already_done(self) -> dict | None:
         """Return the parsed ``.task/already_done.json`` artifact if present,
         else ``None``.
         """
-        path = self._read_path('already_done.json')
+        path = self.artifact_path('already_done.json')
         if not path.exists():
             return None
         return json.loads(path.read_text())
@@ -751,13 +751,13 @@ class TaskArtifacts:
             'evidence': evidence,
             'reported_at': datetime.now(UTC).isoformat(),
         }
-        self._write_json(self.artifact_path('ready_to_merge.json'), data)
+        self._write_json('ready_to_merge.json', data)
 
     def read_ready_to_merge(self) -> dict | None:
         """Return the parsed ``.task/ready_to_merge.json`` artifact if
         present, else ``None``.
         """
-        path = self._read_path('ready_to_merge.json')
+        path = self.artifact_path('ready_to_merge.json')
         if not path.exists():
             return None
         return json.loads(path.read_text())
@@ -779,13 +779,13 @@ class TaskArtifacts:
             'evidence': evidence,
             'reported_at': datetime.now(UTC).isoformat(),
         }
-        self._write_json(self.artifact_path('unactionable_task.json'), data)
+        self._write_json('unactionable_task.json', data)
 
     def read_unactionable_task(self) -> dict | None:
         """Return the parsed ``.task/unactionable_task.json`` artifact if
         present, else ``None``.
         """
-        path = self._read_path('unactionable_task.json')
+        path = self.artifact_path('unactionable_task.json')
         if not path.exists():
             return None
         return json.loads(path.read_text())
@@ -814,13 +814,13 @@ class TaskArtifacts:
             'proposed_resolution': proposed_resolution,
             'reported_at': datetime.now(UTC).isoformat(),
         }
-        self._write_json(self.artifact_path('false_premise.json'), data)
+        self._write_json('false_premise.json', data)
 
     def read_false_premise(self) -> dict | None:
         """Return the parsed ``.task/false_premise.json`` artifact if present,
         else ``None``.
         """
-        path = self._read_path('false_premise.json')
+        path = self.artifact_path('false_premise.json')
         if not path.exists():
             return None
         return json.loads(path.read_text())
@@ -898,7 +898,7 @@ class TaskArtifacts:
             'reviewer_fingerprint': reviewer_fingerprint,
             'ts': datetime.now(UTC).isoformat(),
         }
-        self._write_json(self.artifact_path('review_state.json'), state)
+        self._write_json('review_state.json', state)
 
     def get_cached_verdict(self, tree_hash: str) -> dict | None:
         """Return the recorded verdict record for ``tree_hash``, else ``None``."""
@@ -935,7 +935,7 @@ class TaskArtifacts:
             state['amendment_rounds_total'] = int(amendment_rounds_total)
         if review_cycles_total is not None:
             state['review_cycles_total'] = int(review_cycles_total)
-        self._write_json(self.artifact_path('review_state.json'), state)
+        self._write_json('review_state.json', state)
 
     def clear_review_counters(self) -> None:
         """Reset the task-lifetime amendment/review counters to zero.
@@ -964,10 +964,7 @@ class TaskArtifacts:
         state = self.read_review_state()
         state['amendment_rounds_total'] = 0
         state['review_cycles_total'] = 0
-        self._write_json(self.artifact_path('review_state.json'), state)
-
-    def _read_path(self, name: str) -> Path:
-        return self.artifact_path(name)
+        self._write_json('review_state.json', state)
 
     def _read_json_object(self, name: str) -> dict | None:
         """The single fail-safe read seam for the whole-file JSON-object
@@ -977,7 +974,7 @@ class TaskArtifacts:
         non-object file, logging a warning for every case except absent.
         Decodes as UTF-8 to match ``shared.safe_io.atomic_write_text``.
         """
-        path = self._read_path(name)
+        path = self.artifact_path(name)
         try:
             data = json.loads(path.read_text(encoding='utf-8'))
         except FileNotFoundError:
@@ -1010,7 +1007,7 @@ class TaskArtifacts:
         return plan
 
     def _read_normalized_plan(self) -> tuple[dict, bool]:
-        plan_path = self._read_path('plan.json')
+        plan_path = self.artifact_path('plan.json')
         if not plan_path.exists():
             return {}, False
         return _normalize_plan(json.loads(plan_path.read_text()))
@@ -1152,7 +1149,7 @@ class TaskArtifacts:
         Returns (entries, corrupted) where corrupted contains raw lines that
         failed JSON parsing.
         """
-        log_path = self._read_path('iterations.jsonl')
+        log_path = self.artifact_path('iterations.jsonl')
         if not log_path.exists():
             return [], []
         entries = []
@@ -1194,8 +1191,7 @@ class TaskArtifacts:
                 reviewer_name, root,
             )
             return
-        review_path = self.artifact_path(f'reviews/{reviewer_name}.json')
-        self._write_json(review_path, review)
+        self._write_json(f'reviews/{reviewer_name}.json', review)
 
     def read_reviews(self) -> dict[str, dict]:
         """Read all reviews from the reviews/ directory."""
@@ -1358,7 +1354,7 @@ class TaskArtifacts:
         escalation path rather than a generic BLOCKED error.
         """
         try:
-            plan_path = self._read_path('plan.json')
+            plan_path = self.artifact_path('plan.json')
             data = json.loads(plan_path.read_text())
             if data.get('_session_id') == session_id:
                 return True
@@ -1431,7 +1427,7 @@ class TaskArtifacts:
             resume_count=resume_count,
             schema_version=AGENT_SESSION_SCHEMA_VERSION,
         )
-        self._write_json(self.artifact_path('agent_session.json'), session.to_dict())
+        self._write_json('agent_session.json', session.to_dict())
 
     def clear_agent_session(self) -> None:
         """Remove ``.task/agent_session.json`` if present (idempotent)."""
@@ -1460,7 +1456,7 @@ class TaskArtifacts:
             # fail-safe None as any other corruption rather than propagating.
             logger.warning(
                 'Malformed %s at %s: unparseable field (%s)',
-                name, self._read_path(name), exc,
+                name, self.artifact_path(name), exc,
             )
             return None
 
@@ -1529,7 +1525,7 @@ class TaskArtifacts:
             return
         keys.add((step_id, stale_commit))
         self._write_json(
-            self.artifact_path('reconcile_state.json'),
+            'reconcile_state.json',
             {
                 'emitted_done_step_escalations': sorted(
                     [k[0], k[1]] for k in keys
@@ -1563,8 +1559,7 @@ class TaskArtifacts:
                 role, root,
             )
             return
-        verdict_path = self.artifact_path(f'verdicts/{role}.json')
-        self._write_json(verdict_path, envelope)
+        self._write_json(f'verdicts/{role}.json', envelope)
 
     def read_verdict(self, role: str) -> dict | None:
         """Return parsed ``.task/verdicts/{role}.json``, or ``None`` if the
@@ -1704,8 +1699,9 @@ class TaskArtifacts:
 
         return False
 
-    def _write_json(self, path: Path, data: dict) -> None:
-        """Write *data* to *path* as JSON, ATOMICALLY and DURABLY.
+    def _write_json(self, name: str, data: dict) -> None:
+        """Write *data* to artifact *name* (routed by ``artifact_path``) as
+        JSON, ATOMICALLY and DURABLY.
 
         The single write seam behind every whole-file `.task-meta` artifact
         (metadata, plan, review_state, reviews, verdicts, agent_session,
@@ -1765,7 +1761,7 @@ class TaskArtifacts:
         umask-derived mode ``write_text`` would have given it.
 
         A SYMLINKED target is written THROUGH, as ``write_text`` wrote through
-        it: *path* is resolved first and the real file is what gets replaced.
+        it: the path is resolved first and the real file is what gets replaced.
         This is load-bearing, not hygiene — ``ensure_lane_plan_symlink`` makes
         ``<worktree>/.task/plan.json`` a symlink onto the meta-root plan, and
         a bare replace onto the link path would swap it for a regular file,
@@ -1793,6 +1789,7 @@ class TaskArtifacts:
         # (init, plan, base_commit, etc.) check their root themselves; the
         # opportunistic writes (reviews, iteration log) just want a no-op
         # when the worktree has been deleted out-of-band.
+        path = self.artifact_path(name)
         try:
             # Resolve FIRST — write through a symlink, never onto it.  Order
             # inside this block is deliberate: the refusal must precede any
@@ -1823,7 +1820,7 @@ class TaskArtifacts:
                 mkdir=True,
             )
         except FileNotFoundError:
-            root = self._task_root if path.is_relative_to(self._task_root) else self._lane_root
+            root = self._root_for(Path(name).parts[0])
             if not root.is_dir():
                 logger.info(
                     'TaskArtifacts: skipping _write_json to %s — root %s no longer exists',
