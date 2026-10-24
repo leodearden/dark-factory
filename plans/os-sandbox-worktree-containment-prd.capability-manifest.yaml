@@ -219,7 +219,7 @@ tasks:
       - dashboard/orchestrator.yaml
       expect: present
 - label: γ7a
-  task_id: 649
+  external_task_id: autopilot_video:649
   title: autopilot-video sandbox flip (autopilot_video registry)
   capabilities:
   - name: autopilot-video-flip
@@ -230,7 +230,7 @@ tasks:
       kind: manual
       reason: foreign-registry task
 - label: γ7b
-  task_id: 592
+  external_task_id: know_live:592
   title: know-live sandbox flip (know_live registry)
   capabilities:
   - name: know-live-flip
@@ -241,7 +241,7 @@ tasks:
       kind: manual
       reason: foreign-registry task
 - label: γ7c
-  task_id: 16
+  external_task_id: pump_web_ui:16
   title: pump-web-ui sandbox flip (pump_web_ui registry)
   capabilities:
   - name: pump-web-ui-flip
@@ -252,7 +252,7 @@ tasks:
       kind: manual
       reason: foreign-registry task
 - label: γ7d
-  task_id: 95
+  external_task_id: solar_challenge:95
   title: solar-challenge sandbox flip (solar_challenge registry)
   capabilities:
   - name: solar-challenge-flip
@@ -264,7 +264,7 @@ tasks:
       kind: manual
       reason: foreign-registry task
 - label: γ7e
-  task_id: 164
+  external_task_id: solar_challenge_platform:164
   title: solar-challenge-platform sandbox flip (solar_challenge_platform registry)
   capabilities:
   - name: solar-challenge-platform-flip
