@@ -666,6 +666,42 @@ def test_find_matching_transcript_path_like_bound_id_falls_back_to_prompt_match(
     assert got == present
 
 
+@pytest.mark.parametrize("launch_file_present", [True, False], ids=["launch-file", "no-launch-file"])
+def test_find_matching_transcript_path_like_current_id_matches_exactly_on_launch_id(
+    tmp_path, caplog, launch_file_present,
+):
+    """A rejected current id leaves the record bound by its launch id: exact match, no prompt fallback."""
+    projects = tmp_path / "projects"
+    bad_id = "../elsewhere/decoy"
+    rec = _spawn_record(
+        "sess-bad-current-id", _DF_CWD, _USABLE_PROMPT,
+        claude_session_id=bad_id,
+        claude_launch_session_id=_LAUNCH_SESSION_ID,
+    )
+    expected_dir = projects / mod.inventory.encode_cwd(_DF_CWD)
+    decoy_name = f"{bad_id}.jsonl"
+    (expected_dir / decoy_name).parent.mkdir(parents=True, exist_ok=True)
+    _write_transcript(projects, _DF_CWD, decoy_name, "An unrelated session elsewhere.")
+    respawn = _write_transcript(projects, _DF_CWD, "respawn.jsonl", _USABLE_PROMPT)
+    _set_mtime(respawn, FIXED_NOW - timedelta(hours=1))
+    launch = None
+    if launch_file_present:
+        launch = _write_transcript(
+            projects, _DF_CWD, f"{_LAUNCH_SESSION_ID}.jsonl",
+            "An opening turn unrelated to the recorded prompt.",
+        )
+
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        got = mod.find_matching_transcript(
+            rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+        )
+
+    assert got == launch
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("claude_session_id" in m and bad_id in m for m in warned), warned
+    assert not any("claude_launch_session_id" in m for m in warned), warned
+
+
 # ---------------------------------------------------------------------------
 # task 5873: unbound slash-command spawns (STRONG tier)
 # ---------------------------------------------------------------------------
