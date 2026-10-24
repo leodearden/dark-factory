@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from shared.task_submit import SubmitFailed, SubmitOutcome
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
@@ -65,6 +66,9 @@ class _Scheduler:
 
     async def dispatch_tool(self, name, arguments, *, timeout=30.0):
         return {}
+
+    async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
+        return SubmitFailed('_Scheduler files nothing')
 
     def release(self, tid):
         pass
