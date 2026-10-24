@@ -11633,12 +11633,12 @@ class TestSerialPytestStrLogsOnlyUnappliedRewrites:
         STRUCTURED path, never reaches the appender, and IS successfully
         mutated via ``base_flags`` — a span-content gate would warn about a
         command that lost nothing. The fourth is the over-refusal guard at
-        the log level: ``pytest tests/ && echo "pytest done"`` has an
-        unterminated SPAN (``'pytest done"'``, the word inside ``echo``'s
-        argument) but no unterminated INVOCATION, so its real invocation is
-        rewritten normally and there is nothing to report. The non-pytest and
-        OPAQUE cases are expected, benign no-ops; logging those would fire on
-        every lint and type leg and train operators to ignore the record.
+        the log level: ``pytest tests/ && echo "pytest done"`` has the word
+        ``pytest`` inside ``echo``'s argument but no unterminated INVOCATION,
+        so its real invocation is rewritten normally and there is nothing to
+        report. The non-pytest and OPAQUE cases are expected, benign no-ops;
+        logging those would fire on every lint and type leg and train
+        operators to ignore the record.
         """
         from orchestrator.verify import _serial_pytest_str
 
