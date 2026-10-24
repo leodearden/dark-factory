@@ -302,16 +302,18 @@ def unsafe_pgid_reason(pgid: int, proc_pid: int | None = None) -> str | None:
     return None
 
 
-_SURVIVOR_POLL_SECS = 0.1
+_SURVIVOR_POLL_FIRST_SECS = 0.1
+_SURVIVOR_POLL_MAX_SECS = 1.0
 
 
-def _survivors_of_reaped_leader(pgid: int) -> list[ProcessGroupMember]:
-    """The running members of group *pgid*, once its leader has been reaped.
+def _killable_survivors_of_reaped_leader(pgid: int) -> list[ProcessGroupMember]:
+    """The running members of group *pgid* still ours to SIGKILL, once its leader is reaped.
 
     The kernel never reallocates a pid number while any process, zombies
     included, still uses it as a pgid: so a survivor seen in group *pgid* pins
     it at that instant, and a process with pid == *pgid* after the leader's
-    reap proves the number was recycled, which yields [] (the group is a stranger's).
+    reap proves the number was recycled, which yields [] although group *pgid*
+    may hold running processes: they are a stranger's, and none of ours remain.
     """
     members = process_group_members(pgid)
     if any(m.pid == pgid for m in members):
@@ -329,17 +331,25 @@ def _survivors_of_reaped_leader(pgid: int) -> list[ProcessGroupMember]:
 async def _group_terminated_within(
     proc: asyncio.subprocess.Process, pgid: int, timeout: float
 ) -> bool:
-    """True iff *proc* exits and every member of *pgid* terminates within *timeout*."""
+    """True iff *proc* exits and none of its group *pgid* still runs within *timeout*.
+
+    Each /proc walk costs tens of milliseconds of a worker thread, so the walks
+    back off from ``_SURVIVOR_POLL_FIRST_SECS``, doubling up to
+    ``_SURVIVOR_POLL_MAX_SECS``, and never sleep past the deadline.
+    """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     try:
         await asyncio.wait_for(proc.wait(), timeout)
     except TimeoutError:
         return False
-    while await asyncio.to_thread(_survivors_of_reaped_leader, pgid):
-        if loop.time() >= deadline:
+    poll_secs = _SURVIVOR_POLL_FIRST_SECS
+    while await asyncio.to_thread(_killable_survivors_of_reaped_leader, pgid):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
             return False
-        await asyncio.sleep(_SURVIVOR_POLL_SECS)
+        await asyncio.sleep(min(poll_secs, remaining))
+        poll_secs = min(poll_secs * 2, _SURVIVOR_POLL_MAX_SECS)
     return True
 
 
@@ -347,7 +357,7 @@ async def _sigkill_remaining(proc: asyncio.subprocess.Process, pgid: int) -> boo
     """SIGKILL whatever still runs in group *pgid*; True iff a SIGKILL was dispatched."""
     if proc.returncode is None:
         return sigkill_process_group(proc, pgid) is not SigkillDispatch.NOT_SIGNALLED
-    survivors = await asyncio.to_thread(_survivors_of_reaped_leader, pgid)
+    survivors = await asyncio.to_thread(_killable_survivors_of_reaped_leader, pgid)
     if not survivors:
         return False
     with contextlib.suppress(OSError):
@@ -385,7 +395,7 @@ async def terminate_process_group(
        is not enough.
     4. If anything still runs, SIGKILL it: through :func:`sigkill_process_group`
        while the leader is unreaped, and once it is reaped only while a running
-       survivor pins the pgid (:func:`_survivors_of_reaped_leader`).  Then wait
+       survivor pins the pgid (:func:`_killable_survivors_of_reaped_leader`).  Then wait
        another *grace_secs*.
 
     No ``killpg`` failure propagates, because the group may vanish between our

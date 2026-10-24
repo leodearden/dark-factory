@@ -765,7 +765,10 @@ class TestTerminateProcessGroup:
 
         A survivor holding the stdout pipe keeps ``proc.wait()`` pending past
         the grace; one that released it lets ``proc.wait()`` return at once.
+        Either way the SIGTERM leg spends one grace, and the SIGKILL leg ends
+        as soon as the group is dead rather than spending a second one.
         """
+        grace_secs = 5.0
         proc = await asyncio.create_subprocess_shell(
             survivor_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -776,9 +779,15 @@ class TestTerminateProcessGroup:
         try:
             await _await_shell_ready(proc, what='survivor SIGTERM trap installed')
             await _await_group_membership(pgid, total=2, comm='sleep', comm_count=1)
+            loop = asyncio.get_running_loop()
+            started = loop.time()
 
-            await terminate_process_group(proc, pgid, grace_secs=0.5)
+            await terminate_process_group(proc, pgid, grace_secs=grace_secs)
 
+            elapsed = loop.time() - started
+            assert elapsed < grace_secs + 2.0, (
+                f'the SIGKILL leg outlived the dead group: {elapsed:.2f}s for grace {grace_secs}s'
+            )
             assert proc.returncode == -signal.SIGTERM, (
                 f'the leader must die of the SIGTERM itself, got {proc.returncode}'
             )
