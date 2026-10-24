@@ -17,6 +17,7 @@ Step map:
 from __future__ import annotations
 
 import functools
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -406,11 +407,15 @@ async def _run_eval_hermetic(
     injected_gate=_NO_INJECTED_GATE,
     run_side_effect: BaseException | None = None,
     collect_side_effect: BaseException | None = None,
+    worktree_path: Path | None = None,
 ):
     """Drive run_eval with the worktree/workflow/metrics boundaries mocked.
 
     Returns ``(result, captured)`` where ``captured['build_workflow']`` is the
-    kwargs dict build_workflow received (for asserting the threaded config).
+    kwargs dict build_workflow received (for asserting the threaded config) and
+    ``captured['create_wt']`` the worktree-creation mock (its return value is
+    the created ``(worktree, run_id)``). ``worktree_path=`` forwards to
+    run_eval's worktree-reuse parameter.
 
     The cell's gate builder is replaced UNCONDITIONALLY (task 4427): runner's
     ``owned_usage_gate`` is rebound to the real context manager with
@@ -435,9 +440,7 @@ async def _run_eval_hermetic(
     from orchestrator.evals import eval_gate, runner
 
     captured: dict = {}
-
-    async def fake_create_wt(*_a, **_k):
-        return Path('/fake/wt'), 'run-eval'
+    mock_create_wt = AsyncMock(return_value=(Path('/fake/wt'), 'run-eval'))
 
     fake_wf = MagicMock()
     fake_wf.run = AsyncMock(
@@ -452,7 +455,7 @@ async def _run_eval_hermetic(
     mock_store = MagicMock(spec=ResultStore)
     mock_build_gate = AsyncMock(return_value=gate)
 
-    monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
+    monkeypatch.setattr(runner, 'create_eval_worktree', mock_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
     monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
     monkeypatch.setattr(runner, 'load_task', lambda _p: task)
@@ -464,13 +467,14 @@ async def _run_eval_hermetic(
     captured['wf'] = fake_wf
     captured['save'] = mock_store.save
     captured['collect'] = mock_collect
+    captured['create_wt'] = mock_create_wt
 
     extra: dict[str, Any] = (
         {} if injected_gate is _NO_INJECTED_GATE else {'usage_gate': injected_gate}
     )
     result = await runner.run_eval(
         Path('/fake/task.json'), config, base, judge_config=judge_config,
-        store=mock_store, **extra,
+        worktree_path=worktree_path, store=mock_store, **extra,
     )
     return result, captured
 
@@ -565,9 +569,7 @@ async def _run_end_to_end_hermetic(
     from orchestrator.evals import eval_gate, runner
 
     captured: dict = {}
-
-    async def fake_create_wt(*_a, **_k):
-        return Path('/fake/wt'), 'run-e2e'
+    mock_create_wt = AsyncMock(return_value=(Path('/fake/wt'), 'run-e2e'))
 
     fake_wf = MagicMock()
     fake_wf.run = AsyncMock(
@@ -582,7 +584,7 @@ async def _run_end_to_end_hermetic(
     mock_store = MagicMock(spec=ResultStore)
     mock_build_gate = AsyncMock(return_value=gate)
 
-    monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
+    monkeypatch.setattr(runner, 'create_eval_worktree', mock_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
     monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
     monkeypatch.setattr(runner, 'load_task', lambda _p: task)
@@ -599,7 +601,7 @@ async def _run_end_to_end_hermetic(
     )
     return result, captured, {
         'collect': mock_collect, 'save': mock_store.save, 'wf': fake_wf,
-        'build_gate': mock_build_gate,
+        'build_gate': mock_build_gate, 'create_wt': mock_create_wt,
     }
 
 
@@ -714,19 +716,19 @@ class TestEndToEndCarriesReplayFrame:
 
 
 # ---------------------------------------------------------------------------
-# task 6738 — each executor hands its role (and the replay frame, when framed)
-# to collect_metrics, which sets them on the EvalMetrics dataclass; a cell whose
-# collection raised still carries the stamps the executor knows.
+# task 6738 — the workflow-cell executors through their public entry points.
+# Each adapter normalises to ``(result, captured)``, ``captured`` holding the
+# mocks (``save``, ``collect``, ``create_wt``) and ``build_workflow`` kwargs.
 # ---------------------------------------------------------------------------
 
-async def _role_cell_implementer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw):
+async def _cell_via_run_eval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw):
     result, captured = await _run_eval_hermetic(
         _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch, **kw,
     )
     return result, captured
 
 
-async def _role_cell_judge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw):
+async def _cell_via_judge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw):
     result, captured = await _run_eval_hermetic(
         _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
         judge_config=_judge_cfg(), **kw,
@@ -734,7 +736,7 @@ async def _role_cell_judge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw
     return result, captured
 
 
-async def _role_cell_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw):
+async def _cell_via_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kw):
     result, captured, mocks = await _run_end_to_end_hermetic(
         _arch_cfg(), _impl_cfg(), _base_config(tmp_path), _e2e_task(tmp_path),
         monkeypatch, **kw,
@@ -746,10 +748,10 @@ def _role_cells():
     from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
 
     return [
-        pytest.param(_role_cell_implementer, RoleUnderTest.IMPLEMENTER, None, id='implementer'),
-        pytest.param(_role_cell_judge, RoleUnderTest.JUDGE, None, id='judge'),
+        pytest.param(_cell_via_run_eval, RoleUnderTest.IMPLEMENTER, None, id='implementer'),
+        pytest.param(_cell_via_judge, RoleUnderTest.JUDGE, None, id='judge'),
         pytest.param(
-            _role_cell_end_to_end, RoleUnderTest.END_TO_END, REPLAY_FRAME_ID,
+            _cell_via_end_to_end, RoleUnderTest.END_TO_END, REPLAY_FRAME_ID,
             id='end_to_end',
         ),
     ]
@@ -757,10 +759,15 @@ def _role_cells():
 
 @pytest.mark.asyncio
 class TestExecutorsStampTheirRole:
+    """Each executor hands its role (and frame, when framed) to collect_metrics.
+
+    A cell whose collection raised still carries the stamps the executor knows.
+    """
+
     async def test_run_eval_cell_is_an_implementer_cell(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
-        _result, captured = await _role_cell_implementer(tmp_path, monkeypatch)
+        _result, captured = await _cell_via_run_eval(tmp_path, monkeypatch)
 
         captured['collect'].assert_awaited_once()
         assert captured['collect'].await_args.kwargs['role'] is RoleUnderTest.IMPLEMENTER
@@ -770,7 +777,7 @@ class TestExecutorsStampTheirRole:
     async def test_judge_cell_hands_the_judge_role_to_collection(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
-        result, captured = await _role_cell_judge(tmp_path, monkeypatch)
+        result, captured = await _cell_via_judge(tmp_path, monkeypatch)
 
         assert captured['collect'].await_args.kwargs['role'] is RoleUnderTest.JUDGE
         assert result.config_name == 'judge-haiku'
@@ -781,7 +788,7 @@ class TestExecutorsStampTheirRole:
     ):
         from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
 
-        _result, captured = await _role_cell_end_to_end(tmp_path, monkeypatch)
+        _result, captured = await _cell_via_end_to_end(tmp_path, monkeypatch)
 
         kwargs = captured['collect'].await_args.kwargs
         assert kwargs['role'] is RoleUnderTest.END_TO_END
@@ -799,6 +806,82 @@ class TestExecutorsStampTheirRole:
         persisted = captured['save'].call_args.args[0]
         assert persisted.metrics['role_under_test'] == role
         assert persisted.metrics.get('replay_frame') == frame
+
+
+_CELL_EXECUTORS = [
+    pytest.param(_cell_via_run_eval, id='run_eval'),
+    pytest.param(_cell_via_end_to_end, id='run_end_to_end'),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('drive', _CELL_EXECUTORS)
+class TestWorkflowCellContract:
+    """What every workflow cell guarantees, whichever executor ran it."""
+
+    @pytest.mark.parametrize(
+        ('failure', 'outcome'),
+        [(TimeoutError(), 'timeout'), (RuntimeError('boom'), 'blocked')],
+        ids=['timed_out', 'raised'],
+    )
+    async def test_a_failed_workflow_persists_its_outcome(
+        self, drive, failure: BaseException, outcome: str,
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        result, captured = await drive(tmp_path, monkeypatch, run_side_effect=failure)
+
+        assert result.outcome == outcome
+        assert captured['save'].call_args.args[0].outcome == outcome
+
+    async def test_the_saved_cell_is_the_result_at_the_created_worktree(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        result, captured = await drive(tmp_path, monkeypatch)
+
+        worktree, run_id = captured['create_wt'].return_value
+        captured['save'].assert_called_once()
+        assert captured['save'].call_args.args[0] is result
+        assert result.run_id == run_id
+        assert result.worktree_path == str(worktree)
+        assert result.wall_clock_ms >= 0
+
+
+@pytest.mark.asyncio
+class TestRunEvalPlan:
+    async def test_a_planless_fixture_fails_before_any_worktree_exists(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals import runner
+
+        task = {k: v for k, v in _judge_task(tmp_path).items() if k != 'plan'}
+        with pytest.raises(ValueError, match='df_task_judge'):
+            await _run_eval_hermetic(_impl_cfg(), _base_config(tmp_path), task, monkeypatch)
+
+        create_wt = runner.create_eval_worktree
+        assert isinstance(create_wt, AsyncMock)
+        create_wt.assert_not_awaited()
+
+    async def test_a_reused_worktree_resumes_its_relocated_plan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.workflow import _meta_root_for_worktree
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        resumed = {'steps': [{'id': 's1', 'status': 'done'}, {'id': 's2', 'status': 'pending'}]}
+        meta_root = _meta_root_for_worktree(wt)
+        meta_root.mkdir(parents=True)
+        (meta_root / 'plan.json').write_text(json.dumps(resumed))
+
+        result, captured = await _run_eval_hermetic(
+            _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+            worktree_path=wt,
+        )
+
+        captured['create_wt'].assert_not_awaited()
+        assert result.run_id == 'wt'
+        assert result.worktree_path == str(wt)
+        assert captured['build_workflow']['initial_plan'] == resumed
 
 
 # ---------------------------------------------------------------------------
