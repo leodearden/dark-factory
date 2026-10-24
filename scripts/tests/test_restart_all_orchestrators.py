@@ -445,7 +445,7 @@ def _run_drain_until_polled(bin_dir, state_path, fleet_dir, trace_path, *, verdi
             f"{UNIT_R} never polled {verdict} {polls_needed} times inside the "
             f"{exc.timeout}s must-not-hang deadline; "
             f"ledger={read_drain_poll_trace(trace_path, complete_only=True)!r} "
-            f"stdout={_decode(exc.stdout)!r}"
+            f"stdout={_decode(exc.stdout)!r} stderr={_decode(exc.stderr)!r}"
         )
 
     polls = read_drain_poll_trace(trace_path)
@@ -888,12 +888,13 @@ def test_absent_heartbeat_polls_through_a_nonzero_grace_then_restarts(tmp_path):
 
     The complement of test_unknown_grace_withholds_restart_while_absent below,
     which proves the wait is REAL by being stopped inside it on its poll
-    ledger and so can never observe its end. Nothing else covers that end: the only other top-level
-    absent elapse test uses a grace of 0, where drain_await_fresh breaks on
-    its FIRST elapsed-check and the loop never sleeps. Here the grace is a
-    small NONZERO 3s and the run COMPLETES -- >= 2 ledger polls catch the loop
-    iterating, the proceed line shows the grace elapsed, and the restart shows
-    the gate opened anyway (I4 fail-toward-convergence).
+    ledger and so can never observe its end. Nothing else covers that end:
+    the only other top-level absent elapse test uses a grace of 0, where
+    drain_await_fresh breaks on its FIRST elapsed-check and the loop never
+    sleeps. Here the grace is a small NONZERO 3s and the run COMPLETES -- >= 2
+    ledger polls catch the loop iterating, the proceed line shows the grace
+    elapsed, and the restart shows the gate opened anyway (I4
+    fail-toward-convergence).
     """
     fleet_dir = tmp_path / "fleet"
     trace_path = tmp_path / "drain-poll-trace.tsv"
