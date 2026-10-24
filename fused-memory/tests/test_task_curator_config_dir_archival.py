@@ -109,6 +109,22 @@ def _archive_root(config: FusedMemoryConfig) -> Path:
     return root
 
 
+def _make_archive_root_unreachable(config: FusedMemoryConfig) -> None:
+    """Point the archive root beneath a regular file, so every archive write fails."""
+    (Path(config.reconciliation.explore_codebase_root) / 'blocker').write_text('not a dir')
+    object.__setattr__(config.reconciliation, 'transcript_archive_root', 'blocker/archive')
+
+
+def _reclaim_failures(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The reasons the sweep logged for each dir it failed to reclaim."""
+    return [
+        str(r.exc_info[1])
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and 'failed to reclaim' in r.getMessage()
+        and r.exc_info is not None
+    ]
+
+
 @pytest.fixture
 def _fresh_curator_sweep():
     """The curator sweep runs once per process, so an earlier gated test in this
@@ -147,8 +163,7 @@ class TestDeadPidSweepArchivesFirst:
         dead = _find_dead_pid()
         planted = _plant_dead_curator_dir(base, dead)
         config = make_config()
-        (Path(config.reconciliation.explore_codebase_root) / 'blocker').write_text('not a dir')
-        object.__setattr__(config.reconciliation, 'transcript_archive_root', 'blocker/archive')
+        _make_archive_root_unreachable(config)
 
         with caplog.at_level(logging.WARNING):
             await _curate_and_sweep(_gated_curator(base, config))
@@ -157,11 +172,10 @@ class TestDeadPidSweepArchivesFirst:
             _MAIN_TRANSCRIPT
         ]
         assert not (planted / '.credentials.json').exists()
-        assert any(
-            'failed to reclaim' in r.getMessage()
-            for r in caplog.records
-            if r.levelno >= logging.WARNING
-        )
+        assert [
+            reason for reason in _reclaim_failures(caplog)
+            if f'{len(_DEAD_TRANSCRIPTS)} transcript(s) held' in reason
+        ]
 
         reset_sweep_once_state(_CURATOR_SWEEP_PREFIX)
         _backdate(planted)
@@ -174,6 +188,34 @@ class TestDeadPidSweepArchivesFirst:
             _DEAD_TRANSCRIPTS[_MAIN_TRANSCRIPT]
         )
         assert not planted.exists()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores directory write permission')
+    @pytest.mark.asyncio
+    async def test_a_dir_archived_but_not_removable_is_reported_as_a_removal_failure(
+        self, tmp_path, caplog,
+    ):
+        base = tmp_path / 'tmp'
+        dead = _find_dead_pid()
+        planted = _plant_dead_curator_dir(base, dead)
+        locked = planted / 'sessions' / 'locked'
+        locked.mkdir(parents=True)
+        (locked / 'pinned').write_text('x')
+        locked.chmod(0o500)
+        _backdate(planted)
+        config = make_config()
+        root = _archive_root(config)
+
+        try:
+            with caplog.at_level(logging.WARNING):
+                await _curate_and_sweep(_gated_curator(base, config))
+        finally:
+            locked.chmod(0o700)
+
+        for rel, body in _DEAD_TRANSCRIPTS.items():
+            assert (root / f'fm-curator-{dead}' / rel).read_bytes() == body
+        reasons = _reclaim_failures(caplog)
+        assert any('could not be removed' in reason for reason in reasons)
+        assert not any('held' in reason for reason in reasons)
 
     @pytest.mark.asyncio
     async def test_with_archival_switched_off_the_sweep_still_reclaims_without_archiving(
@@ -225,6 +267,22 @@ class TestCloseArchivesThisProcessesDir:
         )
         assert archived.read_bytes() == _LIVE_TRANSCRIPT
         assert not kwargs['config_dir'].path.exists()
+
+    @pytest.mark.asyncio
+    async def test_close_with_an_unreachable_archive_root_holds_the_transcript_and_purges_the_credential(
+        self, tmp_path,
+    ):
+        config = make_config()
+        curator = _gated_curator(tmp_path / 'tmp', config)
+        kwargs = await _curate_and_sweep(curator)
+        transcript = _plant_live_transcript(kwargs)
+        kwargs['config_dir'].write_credentials('secret')
+        _make_archive_root_unreachable(config)
+
+        await curator.close()
+
+        assert transcript.read_bytes() == _LIVE_TRANSCRIPT
+        assert not (kwargs['config_dir'].path / '.credentials.json').exists()
 
     @pytest.mark.asyncio
     async def test_close_with_archival_switched_off_leaves_the_dir_for_the_sweep(self, tmp_path):

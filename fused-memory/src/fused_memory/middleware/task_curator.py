@@ -169,12 +169,13 @@ def _archive_curator_config_dir(config_dir: Path, archive_root: Path) -> Archive
     )
     if outcome.archived or outcome.held:
         logger.info(
-            'TaskCurator config dir %s transcripts archived before removal: archived=%d '
-            'already_current=%d held=%d archive_root=%s',
+            'TaskCurator config dir %s archival: archived=%d already_current=%d held=%d '
+            'removed=%s archive_root=%s',
             config_dir.name,
             outcome.archived,
             outcome.already_current,
             len(outcome.held),
+            outcome.config_dir_removed,
             archive_root,
         )
     return outcome
@@ -191,7 +192,9 @@ def _reclaim_by_archiving(path: Path, *, archive_root: Path) -> None:
         return
     if not path.exists():
         raise FileNotFoundError(path)
-    raise OSError(f'{len(outcome.held)} transcript(s) held, not archivable, in {path}')
+    if outcome.held:
+        raise OSError(f'{len(outcome.held)} transcript(s) held, not archivable, in {path}')
+    raise OSError(f'transcripts archived, but the dir could not be removed: {path}')
 
 
 def _sweep_stale_curator_config_dirs_once(
@@ -2648,12 +2651,20 @@ class TaskCurator:
         Archival goes first, so a hanging client close cannot starve it. The
         thread hop holds the delete as well as the archival, so a cancelled
         await cannot skip one and keep the other, which is the hazard
-        ``archive_before_delete``'s no-``to_thread`` note guards against.
+        ``archive_before_delete``'s no-``to_thread`` note guards against. A
+        cancellation landing on that await still releases the clients.
         """
         config_dir, self._config_dir = self._config_dir, None
         archive_root = self._transcript_archive_root()
-        if config_dir is not None and archive_root is not None:
-            await asyncio.to_thread(_archive_curator_config_dir, config_dir.path, archive_root)
+        try:
+            if config_dir is not None and archive_root is not None:
+                await asyncio.to_thread(
+                    _archive_curator_config_dir, config_dir.path, archive_root,
+                )
+        finally:
+            await self._close_clients()
+
+    async def _close_clients(self) -> None:
         if self._qdrant_client is not None:
             import contextlib as _ctx
 
