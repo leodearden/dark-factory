@@ -839,152 +839,20 @@ def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.Ca
     return errors
 
 
-async def run_eval_matrix(
-    task_paths: list[Path],
-    configs: list[EvalConfig] | None = None,
-    base_config: OrchestratorConfig | None = None,
-    max_parallel: int | None = None,
-    trials: int = 1,
-    force: bool = False,
-    timeout_override: int | None = None,
-    *,
-    store: ResultStore | None = None,
-) -> list[EvalResult]:
-    """Run all (task, config, trial) combinations with bounded concurrency.
-
-    A (task, config) pair *store* already holds is skipped unless *force*;
-    every cell run persists into *store* (``None`` means
-    :meth:`ResultStore.packaged`).
-
-    Raises:
-        asyncio.CancelledError: if any individual eval coroutine raises
-            CancelledError, or if this coroutine itself is cancelled from
-            outside.  In either case we log, cancel any still-running
-            sibling tasks, await their cleanup, and re-raise.
-    """
-    configs = configs or EVAL_CONFIGS
-    store = store or ResultStore.packaged()
-
-    async with campaign_usage_gate(base_config) as gate:
-        # ONE gate for the whole matrix (task 4427) — see campaign_usage_gate
-        # for why sharing it across concurrent cells is safe, what else one gate
-        # shares, and why a None ``gate`` must still be threaded AS SUCH.
-        #
-        # Specific to this fan-out: the `async with` spans the monitor loop AND
-        # its sibling-cancellation drain, so the teardown also fires on the
-        # CancelledError re-raise, where a leaked probe loop would otherwise
-        # survive the aborted campaign.
-
-        combos = [
-            (task_path, config, t)
-            for task_path in task_paths
-            for config in configs
-            for t in range(1, trials + 1)
-        ]
-
-        if max_parallel is None:
-            max_parallel = len(combos)
-        sem = asyncio.Semaphore(max_parallel)
-
-        async def _run_one(
-            task_path: Path, config: EvalConfig, trial: int,
-        ) -> EvalResult | None:
-            task = load_task(task_path)
-            if not force and store.exists(task['id'], config.name):
-                logger.info(f'Skipping existing: {task["id"]} × {config.name}')
-                return None
-            async with sem:
-                return await run_eval(
-                    task_path, config, base_config,
-                    trial=trial, timeout_override=timeout_override,
-                    usage_gate=gate, store=store,
-                )
-
-        # Design decision: use asyncio.wait(FIRST_COMPLETED) monitor loop instead of
-        # asyncio.gather(return_exceptions=True).
-        #
-        # asyncio.gather(return_exceptions=True) blocks until ALL tasks complete before
-        # the post-gather loop can detect CancelledError and re-raise it.  For a large
-        # matrix where one eval is cancelled early, N-1 siblings continue running their
-        # full duration — wasting CPU proportional to matrix size × timeout_minutes.
-        #
-        # asyncio.wait(FIRST_COMPLETED) lets us react to each task completion
-        # individually: on CancelledError we immediately cancel all remaining tasks and
-        # re-raise, typically within milliseconds.  Non-cancel exceptions are still
-        # logged and the loop continues — identical happy-path/error-path semantics to
-        # the previous gather loop, with strictly better cancellation behaviour.
-        #
-        # This is the same pattern used in harness.py (lines 305, 317) for managing
-        # concurrent workflow tasks.  Cleanup follows the established pattern from
-        # steward.py (lines 101-104): cancel tasks explicitly then await them with
-        # return_exceptions=True to ensure clean teardown before re-raising.
-        active: set[asyncio.Task] = {
-            asyncio.create_task(_run_one(tp, cfg, t))
-            for tp, cfg, t in combos
-        }
-        results: list[EvalResult] = []
-        # Distinguish two cancellation scenarios:
-        #   Inner-task cancellation — an individual _run_one coroutine was cancelled
-        #     or raised CancelledError.  asyncio.wait surfaces this via
-        #     task.cancelled() or task.exception() inside the monitor loop below;
-        #     we log it, cancel siblings, and re-raise to propagate.
-        #   Outer-task cancellation — run_eval_matrix itself was cancelled (e.g.
-        #     SIGINT / asyncio.wait_for timeout).  The CancelledError interrupts
-        #     the *await asyncio.wait(...)* call directly and is caught by the
-        #     outer except clause, which performs the same sibling cleanup.
-        try:
-            while active:
-                done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
-                # Task 586: scan the full done batch for ALL CancelledErrors before
-                # processing any results.  Multiple tasks can complete in the same
-                # event-loop iteration and land in the same done set (e.g. when a
-                # shutdown signal fires while two evals are parked at the same
-                # await point).  The old code raised on the first cancel it saw,
-                # silently discarding subsequent cancels in the batch.
-                cancel_errors = _collect_cancel_errors(done)
-                if cancel_errors:
-                    for ce in cancel_errors:
-                        logger.error('Eval cancelled', exc_info=ce)
-                    for t in active:
-                        t.cancel()
-                    await asyncio.gather(*active, return_exceptions=True)
-                    active.clear()
-                    raise cancel_errors[0]
-                # No cancellations in this batch — handle results and non-cancel
-                # exceptions.  task.cancelled() is False for all remaining tasks so
-                # task.exception() / task.result() are safe to call.
-                for task in done:
-                    exc = task.exception()
-                    if exc is not None:
-                        logger.error('Eval failed', exc_info=exc)
-                    else:
-                        r = task.result()
-                        if r is not None:
-                            results.append(r)
-        except asyncio.CancelledError:
-            # External cancellation (e.g. SIGINT / asyncio.wait_for timeout).
-            # Cancel all remaining sibling tasks and await their cleanup before
-            # re-raising so we don't leave orphaned tasks behind.
-            for t in active:
-                t.cancel()
-            await asyncio.gather(*active, return_exceptions=True)
-            raise
-        return results
-
-
 async def _bounded_fanout(
     thunks: list[Callable[[], Awaitable[EvalResult | None]]],
     max_parallel: int | None = None,
 ) -> list[EvalResult]:
     """Run each *thunk* with bounded concurrency, returning the flattened results.
 
-    The single-sourced fan-out skeleton the μ methodology stages
-    (:func:`run_ofat_stage` / :func:`run_matrix_stage` / :func:`run_confirm_stage`)
-    share, mirroring :func:`run_eval_matrix`'s ``asyncio.wait(FIRST_COMPLETED)``
-    monitor loop EXACTLY: a non-cancel failure in one cell is logged and the
-    fan-out CONTINUES; a ``CancelledError`` (inner or external) cancels the
-    still-running siblings, awaits their teardown, and re-raises. Each thunk is a
-    zero-arg coroutine factory returning one ``EvalResult`` (or ``None`` to skip).
+    The fan-out skeleton every campaign entry point shares (:func:`run_eval_matrix`,
+    :func:`run_ofat_stage`, :func:`run_matrix_stage`, :func:`run_confirm_stage`).
+    An ``asyncio.wait(FIRST_COMPLETED)`` monitor loop rather than ``gather``, so
+    the fan-out reacts to each cell as it finishes: a non-cancel failure in one
+    cell is logged and the fan-out CONTINUES; a ``CancelledError`` (inner or
+    external) cancels the still-running siblings at once, awaits their teardown,
+    and re-raises. Each thunk is a zero-arg coroutine factory returning one
+    ``EvalResult`` (or ``None`` to skip).
     """
     if not thunks:
         return []
@@ -1024,6 +892,55 @@ async def _bounded_fanout(
         await asyncio.gather(*active, return_exceptions=True)
         raise
     return results
+
+
+async def run_eval_matrix(
+    task_paths: list[Path],
+    configs: list[EvalConfig] | None = None,
+    base_config: OrchestratorConfig | None = None,
+    max_parallel: int | None = None,
+    trials: int = 1,
+    force: bool = False,
+    timeout_override: int | None = None,
+    *,
+    store: ResultStore | None = None,
+) -> list[EvalResult]:
+    """Run all (task, config, trial) combinations with bounded concurrency.
+
+    A (task, config) pair *store* already holds is skipped unless *force*;
+    every cell run persists into *store* (``None`` means
+    :meth:`ResultStore.packaged`). A failed cell is logged and skipped, and a
+    cancellation cancels every sibling and re-raises (:func:`_bounded_fanout`).
+    """
+    configs = configs or EVAL_CONFIGS
+    store = store or ResultStore.packaged()
+
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the whole matrix (task 4427) — see campaign_usage_gate for
+        # why sharing it across concurrent cells is safe, what else one gate
+        # shares, and why a None ``gate`` must still be threaded AS SUCH.
+        def _thunk(
+            task_path: Path, config: EvalConfig, trial: int,
+        ) -> Callable[[], Awaitable[EvalResult | None]]:
+            async def _run() -> EvalResult | None:
+                task = load_task(task_path)
+                if not force and store.exists(task['id'], config.name):
+                    logger.info(f'Skipping existing: {task["id"]} × {config.name}')
+                    return None
+                return await run_eval(
+                    task_path, config, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate, store=store,
+                )
+            return _run
+
+        thunks = [
+            _thunk(tp, config, trial)
+            for tp in task_paths
+            for config in configs
+            for trial in range(1, trials + 1)
+        ]
+        return await _bounded_fanout(thunks, max_parallel)
 
 
 async def run_ofat_stage(
