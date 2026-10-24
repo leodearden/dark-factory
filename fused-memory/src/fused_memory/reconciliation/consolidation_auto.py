@@ -203,8 +203,9 @@ UNREADABLE = _Unreadable()
 #: None of those six is registered vocabulary today — ``memory_metadata``
 #: censuses all of them as unknown keys — which is why they are enumerated here
 #: as observed corpus facts rather than imported from a registry that does not
-#: carry them. The supersession mark is the one REGISTERED key in the set,
-#: written by ``services/supersession_mark.py::mark_superseded``. The arm is
+#: carry them. The supersession mark is the one key in the set that this
+#: codebase defines (``shared.memory_supersession``) and fused-memory itself
+#: writes, via ``services/supersession_mark.py::mark_superseded``. The arm is
 #: REFUSAL-ONLY, so widening it can only make the predicate more conservative
 #: and can never grant a pass.
 CORRECTION_METADATA_KEYS: frozenset[str] = frozenset({
