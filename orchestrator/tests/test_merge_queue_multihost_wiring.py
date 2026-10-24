@@ -1995,10 +1995,20 @@ class _HostBenchScene:
         *,
         remotes: tuple[str, ...] = ('leo-laptop',),
         escalation_queue: Any = _DEFAULT_EQ,
-        escalate_after_n: int = 3,
-        escalate_after_secs: float = 600.0,
+        escalate_after_n: int | None = None,
+        escalate_after_secs: float | None = None,
         build: bool = True,
     ) -> None:
+        escalation_knobs = {
+            'verify_host_unreachable_escalate_after_n': escalate_after_n,
+            'verify_host_unreachable_escalate_after_secs': escalate_after_secs,
+        }
+        given_knobs = {field: value for field, value in escalation_knobs.items() if value is not None}
+        assert build or not given_knobs, (
+            f'{sorted(given_knobs)} with build=False: the worker copies these knobs off '
+            "the config only in build(), so this scene's benches would run on the "
+            "worker's __init__ defaults"
+        )
         self.clock = FakeClock()
         self.runners = {name: _runner_double(name, is_local=False) for name in remotes}
         self.events = _RecordingEventStore()
@@ -2010,32 +2020,42 @@ class _HostBenchScene:
         git_ops = _make_git_ops_mock()
         git_ops.project_root = tmp_path
         self.config = OrchestratorConfig(
-            project_root=tmp_path,
-            verify_host_unreachable_escalate_after_n=escalate_after_n,
-            verify_host_unreachable_escalate_after_secs=escalate_after_secs,
-            verify_host_reprobe_interval_s=120.0,
-        )
+            project_root=tmp_path, verify_host_reprobe_interval_s=120.0,
+        ).model_copy(update=given_knobs)
         self.worker = SpeculativeMergeWorker(
             git_ops=git_ops, queue=asyncio.Queue(), event_store=self.events,
             escalation_queue=self.eq, clock=self.clock,
             remote_runners=list(self.runners.values()),
         )
-        self._allocator: HostAllocator | None = self.build() if build else None
+        self._installed: object | None = None
+        if build:
+            self.build()
 
     @property
     def allocator(self) -> HostAllocator:
-        assert self._allocator is not None, 'scene made with build=False: call build() first'
-        return self._allocator
+        """The HostAllocator the scene built or placed in the worker."""
+        assert isinstance(self._installed, HostAllocator), (
+            f'the scene put no HostAllocator in the worker (it holds {self._installed!r}): '
+            'call build(), or place() a real one'
+        )
+        return self._installed
 
     def build(self) -> HostAllocator:
         """Build the worker's allocator, as its first verify dispatch would."""
-        self._allocator = self.worker._ensure_host_allocator(self.config)
-        return self._allocator
+        assert self._installed is None, (
+            f'build() over the {self._installed!r} already in the worker would hand it '
+            'back without copying the escalation knobs'
+        )
+        allocator = self.worker._ensure_host_allocator(self.config)
+        self._installed = allocator
+        return allocator
 
     def place(self, alloc: object) -> None:
         """Put allocator *alloc*, real or a double, in the worker instead of its own."""
+        assert self._installed is None, f'the worker already holds {self._installed!r}'
         worker = self.worker
         worker._host_allocator = alloc  # type: ignore[assignment]
+        self._installed = alloc
 
     def bench(
         self, host: str, reason: str = 'ssh: connect refused', *,
@@ -3710,19 +3730,25 @@ class TestReprobeCompatAndErrorPaths:
 
     # -- (a) compat fallback: no remote_runner ---------------------------------
 
-    async def test_recovers_via_quarantined_remote_runners_fallback(self, tmp_path):
+    async def test_recovers_via_quarantined_remote_runners_fallback(self, tmp_path, caplog):
         """`remote_runner` absent → resolve through quarantined_remote_runners()."""
         runner = self._healthy_runner()
         alloc = _AllocatorWithoutRemoteRunner({'legacy-host': runner})
         assert not hasattr(alloc, 'remote_runner'), 'fixture precondition'
         scene = _scene_on_double(tmp_path, alloc, 'legacy-host')
 
-        await scene.sweep(advance=60.0)
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
+            await scene.sweep(advance=60.0)
+            next_sweep_levels = await _sweep_record_levels(scene, caplog, 'legacy-host')
 
         assert runner.health.await_count == 1, 'the fallback never resolved a runner'
         assert alloc.readmitted == ['legacy-host']
+        assert next_sweep_levels == [], (
+            'a recovered host must leave the tracker: the next sweep, which can no '
+            'longer resolve its runner, must not WARN about it'
+        )
 
-    async def test_fallback_map_is_built_at_most_once_per_sweep(self, tmp_path):
+    async def test_fallback_map_is_built_at_most_once_per_sweep(self, tmp_path, caplog):
         """The hoisted map is loop-INVARIANT — not rebuilt per tracked host."""
         runners = {f'legacy-{i}': self._healthy_runner() for i in range(4)}
         alloc = _AllocatorWithoutRemoteRunner(runners)
@@ -3737,13 +3763,20 @@ class TestReprobeCompatAndErrorPaths:
         alloc.quarantined_remote_runners = _counting  # type: ignore[method-assign]
         scene = _scene_on_double(tmp_path, alloc, *runners)
 
-        await scene.sweep(advance=60.0)
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
+            await scene.sweep(advance=60.0)
+            first_sweep_builds = len(calls)
+            caplog.clear()
+            await scene.sweep(advance=120.0)
 
-        assert len(calls) == 1, (
-            f'quarantined_remote_runners() was rebuilt {len(calls)}x for 4 tracked '
+        assert first_sweep_builds == 1, (
+            f'quarantined_remote_runners() was rebuilt {first_sweep_builds}x for 4 tracked '
             'hosts — the fallback map must be hoisted out of the per-host loop'
         )
         assert alloc.readmitted == list(runners)
+        assert [r for r in caplog.records if r.name == 'orchestrator.merge_lane'] == [], (
+            'every recovered host must leave the tracker, so the next sweep is silent'
+        )
 
     # -- (b) compat fallback: no readmit --------------------------------------
 
@@ -3775,12 +3808,14 @@ class TestReprobeCompatAndErrorPaths:
         scene = _scene_on_double(tmp_path, alloc, 'legacy-host')
 
         await scene.sweep(advance=60.0)
+        await scene.sweep(advance=60.0)
 
         assert runner.probe_clean.await_count == 0, (
             'without is_parked the sweep cannot know the slot is parked, so it '
             'must not consult the cleanliness probe at all'
         )
         assert alloc.readmitted == ['legacy-host']
+        assert runner.health.await_count == 1, 'a recovered host must leave the tracker'
 
     # -- (d) probe_clean RAISES (vs returning False) ---------------------------
 
@@ -4220,6 +4255,17 @@ class TestQuarantineUnreachableHostChokepoint:
         """Local is the trust anchor: never quarantined, tracked or alarmed for."""
         scene = _HostBenchScene(tmp_path, escalate_after_n=1)
         scene.bench('local', 'ssh timeout')
+
+        host = scene.host('local')
+        assert (host['quarantined'], host['streak']) == (False, None)
+        assert scene.eq.submitted == []
+
+    def test_local_benched_before_any_allocator_is_a_noop(self, tmp_path):
+        """With no allocator to name it, the local host is still known as 'local'."""
+        scene = _HostBenchScene(tmp_path, build=False)
+        scene.bench('local', 'ssh timeout')
+
+        scene.build()
 
         host = scene.host('local')
         assert (host['quarantined'], host['streak']) == (False, None)
