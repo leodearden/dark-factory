@@ -562,7 +562,7 @@ add_memory(
   category="decisions_and_rationale",  # or "preferences_and_norms" for conventions
   project_id="<target project_id from TARGET_CONFIG>",
   agent_id="claude-interactive",
-  entities=[{'kind': 'task', 'id': 3127}]  # the blocked task; [] if the decision concerns none
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the blocked task id here and in content; [] if none
 )
 ```
 
