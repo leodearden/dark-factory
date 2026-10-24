@@ -7283,34 +7283,6 @@ async def _check_reopen_freshness(
     return None
 
 
-def _merged_audit_metadata(before: dict, audit_fields: dict) -> dict:
-    """Merge ``audit_fields`` onto the task's pre-existing metadata.
-
-    ``set_task_status`` writes audit fields (``reopen_reason`` /
-    ``done_provenance``) via a separate ``tm.update_task(metadata=…)`` call.
-    The default backend path is now shallow-merge (``metadata_mode=None``), so
-    this read-modify-write is belt-and-braces — the backend would also preserve
-    sibling keys.  The explicit merge is kept for clarity and defence-in-depth
-    (it is not safe to rely on the backend default never changing).
-
-    Audit fields win on collision (a fresh ``reopen_reason`` should never be
-    shadowed by a stale one from an earlier reopen).
-
-    Delegates the malformed-string policy to
-    :func:`shared.task_metadata.parse_metadata` (``direction='read'``) via
-    :func:`_parse_metadata_value` and emits a ``task_metadata.schema_warning``
-    WARNING when a non-None ``before['metadata']`` cannot be resolved to a
-    dict — I4: this replaces a silent discard (the merge still proceeds onto
-    ``{}`` so behaviour is otherwise unchanged).
-    """
-    raw = before.get('metadata') if isinstance(before, dict) else None
-    parsed, warnings = _parse_metadata_value(raw)
-    if warnings:
-        _warn_metadata_discard('_merged_audit_metadata', raw, warnings)
-    existing: dict = parsed if isinstance(parsed, dict) else {}
-    return {**existing, **audit_fields}
-
-
 async def _repair_done_provenance_same_status(
     tm: Any,
     task_id: str,
