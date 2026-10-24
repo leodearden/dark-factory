@@ -2332,10 +2332,7 @@ class TestHarnessInjectedTurnFilter:
         assert meta['n_user_turns'] == 0
         assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
 
-    @pytest.mark.parametrize(
-        'text', HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT,
-        ids=['adjudicator', 'replan', 'watcher'],
-    )
+    @pytest.mark.parametrize('text', HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT)
     def test_human_turn_naming_an_injected_prompt_stays_gold(self, text):
         turns = mod.iter_user_turns([_user_text(text)])
 

@@ -250,10 +250,7 @@ class TestHarnessInjectedTurnFilter:
     def test_watcher_rotation_prompt_is_excluded(self):
         assert reingestion.is_harness_injected_turn(WATCHER_ROTATION_PROMPT) is True
 
-    @pytest.mark.parametrize(
-        'text', HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT,
-        ids=['adjudicator', 'replan', 'watcher'],
-    )
+    @pytest.mark.parametrize('text', HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT)
     def test_human_turn_naming_an_injected_prompt_is_retained(self, text):
         assert reingestion.is_harness_injected_turn(text) is False
 

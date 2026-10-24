@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -374,18 +375,31 @@ WATCHER_ROTATION_PROMPT = (
 )
 """The rotation prompt
 ``orchestrator/src/orchestrator/harness.py::Harness._run_watcher_rotation``
-composes, with the values sighted in reify 4aaf48b0 record 2. The opener is
-restated because the harness builds it inline; follow-up agent-followup-7441
-(tkt_0RW5QBHZMRJ9JGM2BW1DHGM1KN) gives it a pure builder to call instead.
-The outcome guidance is the real constant, spliced as the harness does."""
+composes, restated and abridged with the values sighted in reify 4aaf48b0
+record 2: it omits the ``tooling_root_block`` the harness inserts after the
+'Escalation queue:' line. The opener is restated because the harness builds it
+inline; follow-up agent-followup-7441 (tkt_0RW5QBHZMRJ9JGM2BW1DHGM1KN) gives it
+a pure builder to call instead. The outcome guidance is the real constant,
+spliced as the harness does."""
 
 
-HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT: tuple[str, ...] = (
-    'the adjudicator keeps suppressing my fix — why does it think the concern '
-    'was resolved in a prior round?',
-    'the implementation was reviewed twice and the blocking issues it found '
-    'were stale, please re-check',
-    'why is the autonomous escalation watcher re-arming twice per rotation?',
+HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT = (
+    pytest.param(
+        'the adjudicator keeps suppressing my fix — why does it think the concern '
+        'was resolved in a prior round?',
+        id='adjudicator',
+    ),
+    pytest.param(
+        'the implementation was reviewed twice and the blocking issues it found '
+        'were stale, please re-check',
+        id='replan',
+    ),
+    pytest.param(
+        'why is the autonomous escalation watcher re-arming twice per rotation?',
+        id='watcher',
+    ),
 )
 """Human turns that name the adjudicator, replan and watcher prompts without
-carrying their opening sentences, so they stay dialogue."""
+carrying their opening sentences, so they stay dialogue. Each is a
+``pytest.param`` carrying its own id, ready to parametrize a single ``text``
+argument."""
