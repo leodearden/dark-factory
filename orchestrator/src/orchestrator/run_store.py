@@ -199,24 +199,12 @@ class RunStore:
         """Add ``code_sha`` to a pre-6565 ``runs``.
 
         Same shape as :meth:`_migrate_scheduler_state_ewa_value`, deliberately:
-        additive-only, ``PRAGMA table_info`` feature-detect, the column added
-        LAST, a concurrent construction's ``duplicate column name`` swallowed
-        and every other failure raised.  An existing row reads NULL, meaning
-        "the run predates task 6565".
+        additive-only, the column added LAST.  An existing row reads NULL,
+        meaning "the run predates task 6565".
         """
-        existing = {row[1] for row in conn.execute('PRAGMA table_info(runs)')}
-        if 'code_sha' in existing:
-            return
-        try:
-            # Column name is a hard-coded literal, never caller input.
-            conn.execute('ALTER TABLE runs ADD COLUMN code_sha TEXT')
-        except sqlite3.OperationalError as exc:
-            if 'duplicate column name' not in str(exc).lower():
-                raise
-            logger.debug('RunStore: runs.code_sha already added concurrently')
-            return
-        conn.commit()
-        logger.info('RunStore: migrated runs — added code_sha')
+        if add_column_if_missing_sync(conn, 'runs', 'code_sha', 'TEXT'):
+            conn.commit()
+            logger.info('RunStore: migrated runs — added code_sha')
 
     def start_run(
         self,

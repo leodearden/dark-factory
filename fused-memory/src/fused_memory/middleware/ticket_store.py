@@ -156,9 +156,9 @@ SCHEMA_SQL = TABLE_SQL + INDEX_SQL
 
 
 _CURATION_RETRY_COLUMNS: Final = {
-    'attempts': 'attempts INTEGER NOT NULL DEFAULT 0',
-    'next_attempt_at': 'next_attempt_at TEXT',
-    'defer_reason': 'defer_reason TEXT',
+    'attempts': 'INTEGER NOT NULL DEFAULT 0',
+    'next_attempt_at': 'TEXT',
+    'defer_reason': 'TEXT',
 }
 
 
@@ -261,16 +261,14 @@ class TicketStore:
             logger.info('TicketStore: migrated tickets table — added escalated_at column')
 
     async def _migrate_add_curation_retry_columns(self) -> None:
-        access = self._require_access()
-        cols = {row[1] for row in await access.read_all('PRAGMA table_info(tickets)')}
-        missing = {
-            name: ddl for name, ddl in _CURATION_RETRY_COLUMNS.items() if name not in cols
-        }
-        if missing:
-            async with access.write() as db:
-                for ddl in missing.values():
-                    await db.execute(f'ALTER TABLE tickets ADD COLUMN {ddl}')
-            logger.info('TicketStore: migrated tickets table — added %s', ', '.join(missing))
+        async with self._require_access().write() as db:
+            added = [
+                column
+                for column, column_ddl in _CURATION_RETRY_COLUMNS.items()
+                if await add_column_if_missing(db, 'tickets', column, column_ddl)
+            ]
+        if added:
+            logger.info('TicketStore: migrated tickets table — added %s', ', '.join(added))
 
     def _require_access(self) -> AtomicConnection:
         if self._access is None:
