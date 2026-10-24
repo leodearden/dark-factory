@@ -65,16 +65,19 @@ def _history_db(path: Path, rows: list[tuple[str, str | None, str, str, str]]) -
     return path
 
 
+@pytest.fixture
+def history(tmp_path: Path) -> Path:
+    """p1 edited twice, p2 once, and p3 once by an UPDATE that kept no old text."""
+    return _history_db(tmp_path / 'history.db', [
+        ('p1', None, 'first', 'ADD', '2026-10-01T00:00:00+00:00'),
+        ('p1', 'first', 'second', 'UPDATE', '2026-10-05T00:00:00+00:00'),
+        ('p1', 'second', 'third', 'UPDATE', '2026-10-09T00:00:00+00:00'),
+        ('p2', 'other', 'other v2', 'UPDATE', '2026-10-03T00:00:00+00:00'),
+        ('p3', None, 'lost', 'UPDATE', '2026-10-03T00:00:00+00:00'),
+    ])
+
+
 class TestTextAt:
-    @pytest.fixture
-    def history(self, tmp_path: Path) -> Path:
-        return _history_db(tmp_path / 'history.db', [
-            ('p1', None, 'first', 'ADD', '2026-10-01T00:00:00+00:00'),
-            ('p1', 'first', 'second', 'UPDATE', '2026-10-05T00:00:00+00:00'),
-            ('p1', 'second', 'third', 'UPDATE', '2026-10-09T00:00:00+00:00'),
-            ('p2', 'other', 'other v2', 'UPDATE', '2026-10-03T00:00:00+00:00'),
-            ('p3', None, 'lost', 'UPDATE', '2026-10-03T00:00:00+00:00'),
-        ])
 
     @pytest.mark.parametrize(('instant', 'expected'), [
         ('2026-10-02T12:00:00.000001+00:00', 'first'),
@@ -90,6 +93,65 @@ class TestTextAt:
     def test_an_edit_without_its_old_text_is_unrecoverable(self, history: Path) -> None:
         at = datetime.fromisoformat('2026-10-02T00:00:00+00:00')
         assert _mod().text_at(history, 'p3', at, 'lost') is None
+
+
+class TestMemoryHistory:
+    """MemoryHistory reads the UPDATE events once and answers as text_at does."""
+
+    @pytest.mark.parametrize(('instant', 'expected'), [
+        ('2026-10-02T12:00:00.000001+00:00', 'first'),
+        ('2026-10-07T00:00:00+00:00', 'second'),
+        ('2026-10-10T00:00:00+00:00', 'third, current'),
+    ])
+    def test_answers_as_text_at_does(self, history: Path, instant: str, expected: str) -> None:
+        at = datetime.fromisoformat(instant)
+        rounds = _mod()
+        assert rounds.MemoryHistory.read(history).text_at('p1', at, 'third, current') == expected
+        assert rounds.text_at(history, 'p1', at, 'third, current') == expected
+
+    def test_an_edit_without_its_old_text_is_unrecoverable(self, history: Path) -> None:
+        at = datetime.fromisoformat('2026-10-02T00:00:00+00:00')
+        assert _mod().MemoryHistory.read(history).text_at('p3', at, 'lost') is None
+
+    @pytest.mark.parametrize(('memory_id', 'instant', 'edited'), [
+        ('p1', '2026-10-07T00:00:00+00:00', True),
+        ('p1', '2026-10-10T00:00:00+00:00', False),
+        ('p3', '2026-10-02T00:00:00+00:00', True),
+        ('never-edited', '2026-10-01T00:00:00+00:00', False),
+    ])
+    def test_edited_after_is_whether_an_update_follows_the_instant(
+        self, history: Path, memory_id: str, instant: str, edited: bool,
+    ) -> None:
+        at = datetime.fromisoformat(instant)
+        assert _mod().MemoryHistory.read(history).edited_after(memory_id, at) is edited
+
+    def test_a_history_read_for_some_memories_refuses_any_other(self, history: Path) -> None:
+        partial = _mod().MemoryHistory.read(history, memory_ids=['p2'])
+        at = datetime.fromisoformat('2026-10-02T00:00:00+00:00')
+        assert partial.text_at('p2', at, 'other v2') == 'other'
+        with pytest.raises(ValueError, match='p1'):
+            partial.text_at('p1', at, 'third, current')
+        with pytest.raises(ValueError, match='p1'):
+            partial.edited_after('p1', at)
+
+
+class TestCapped:
+    def test_a_text_within_the_cap_is_unchanged(self) -> None:
+        assert _mod().capped('x' * 4000) == 'x' * 4000
+
+    def test_a_longer_text_is_cut_at_the_cap_and_marked_with_its_length(self) -> None:
+        assert _mod().capped('x' * 4500) == 'x' * 4000 + '…[truncated, 4500 chars total]'
+
+    def test_capping_a_capped_text_changes_nothing(self) -> None:
+        once = _mod().capped('y' * 9000)
+        assert _mod().capped(once) == once
+
+    def test_a_shard_of_a_capped_text_shows_the_original_length(self) -> None:
+        rounds = _mod()
+        entry = rounds.ShardEntry('e', 't', 'current', 'df', 'child', rounds.capped('p' * 4500))
+        text = rounds.shard([entry], name='primary_00').text
+        assert '…[truncated, 4500 chars total]' in text
+        assert text.count('…[truncated,') == 1
 
 
 CHILD = 'The deploy uses blue-green.\nRollback takes   five minutes.'
