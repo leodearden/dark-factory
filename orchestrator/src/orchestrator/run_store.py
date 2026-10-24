@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.sqlite_column_migration import add_column_if_missing_sync
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
 
 if TYPE_CHECKING:
@@ -138,16 +139,12 @@ class RunStore:
     def _migrate_task_results_block_context(self, conn: sqlite3.Connection) -> None:
         """Add ``block_reason``/``block_phase`` to a pre-3068 ``task_results``.
 
-        Deliberately additive-only, with no ``PRAGMA user_version`` ladder:
-        ``RunStore`` has never had one, and this change needs no destructive
-        table rebuild, so the light feature-detect idiom
-        (``ticket_store._migrate_add_escalated_at`` /
-        ``write_journal._migrate``) is sufficient.  Introducing a version
-        header to an existing un-versioned DB would itself need a "version 0
-        means unknown" special case, for no benefit.
+        Additive-only, with no ``PRAGMA user_version`` ladder (``RunStore`` has
+        never had one), per the rule in
+        ``shared/src/shared/sqlite_column_migration.py``.
 
         Idempotent, and a no-op on a fresh DB — ``_SCHEMA`` already declares
-        both columns there, so ``PRAGMA table_info`` finds them present.
+        both columns there, so the probe finds them present.
 
         Existing rows read NULL for both columns, which is exactly right: NULL
         means "row predates task 3068", while ``''`` (what both writers now
@@ -159,33 +156,14 @@ class RunStore:
         ``RunStore(db_path)`` in ``except Exception: logger.error(...)`` and
         continues, so a raise here does NOT halt the run — it drops
         ``task_results`` persistence for the whole run.  That is strictly worse
-        than writing NULLs, so we do NOT raise on the one failure mode that is
-        both plausible and benign: a concurrent construction that already added
-        the column.  ``duplicate column name`` means the migration's goal is
-        met, and is swallowed per-column.  Everything else (a corrupt DB, a
-        lock we could not take inside the busy_timeout) still surfaces, because
-        those are real and a silent half-migrated schema would be worse.
+        than writing NULLs, which is why tolerating a concurrent construction
+        that already added the column matters here.
         """
-        existing = {row[1] for row in conn.execute('PRAGMA table_info(task_results)')}
-        added = []
-        for column in ('block_reason', 'block_phase'):
-            if column in existing:
-                continue
-            try:
-                # Column name is a hard-coded literal, never caller input.
-                conn.execute(f'ALTER TABLE task_results ADD COLUMN {column} TEXT')
-            except sqlite3.OperationalError as exc:
-                # Another RunStore construction won the race between our
-                # table_info read and this ALTER.  The column exists, which is
-                # all we wanted; raising would cost the caller task_results
-                # persistence for an entire run over a no-op.
-                if 'duplicate column name' not in str(exc).lower():
-                    raise
-                logger.debug(
-                    'RunStore: task_results.%s already added concurrently', column,
-                )
-                continue
-            added.append(column)
+        added = [
+            column
+            for column in ('block_reason', 'block_phase')
+            if add_column_if_missing_sync(conn, 'task_results', column, 'TEXT')
+        ]
         if added:
             conn.commit()
             logger.info(
@@ -196,13 +174,10 @@ class RunStore:
         """Add ``ewa_value`` to a pre-4559 ``scheduler_state``.
 
         Same shape as :meth:`_migrate_task_results_block_context`, deliberately:
-        additive-only, ``PRAGMA table_info`` feature-detect, no
-        ``PRAGMA user_version`` ladder.  ``RunStore`` has never had a version
-        header, and adding one to an existing un-versioned DB would itself need
-        a "version 0 means unknown" special case for no benefit.
+        additive-only, no ``PRAGMA user_version`` ladder.
 
         Idempotent, and a no-op on a fresh DB — ``_SCHEMA`` already declares the
-        column there, so ``PRAGMA table_info`` finds it present.
+        column there, so the probe finds it present.
 
         An existing row reads NULL, which is exactly right: NULL means "row
         predates task 4559", and ``Harness._load_persisted_scheduler_pause``
@@ -214,49 +189,22 @@ class RunStore:
         (``Harness.run``) wraps ``RunStore(db_path)`` in
         ``except Exception: logger.error(...)`` and continues, so it would drop
         persistence for the whole run rather than halt it.  That is strictly
-        worse than a NULL column, so the one plausible-and-benign failure — a
-        concurrent construction that already added the column between our
-        ``table_info`` read and this ``ALTER`` — is swallowed: ``duplicate
-        column name`` means the migration's goal is already met.  Everything
-        else (a corrupt DB, a lock we could not take inside the busy_timeout)
-        still surfaces, because a silent half-migrated schema would be worse.
+        worse than a NULL column.
         """
-        existing = {row[1] for row in conn.execute('PRAGMA table_info(scheduler_state)')}
-        if 'ewa_value' in existing:
-            return
-        try:
-            # Column name is a hard-coded literal, never caller input.
-            conn.execute('ALTER TABLE scheduler_state ADD COLUMN ewa_value REAL')
-        except sqlite3.OperationalError as exc:
-            if 'duplicate column name' not in str(exc).lower():
-                raise
-            logger.debug('RunStore: scheduler_state.ewa_value already added concurrently')
-            return
-        conn.commit()
-        logger.info('RunStore: migrated scheduler_state — added ewa_value')
+        if add_column_if_missing_sync(conn, 'scheduler_state', 'ewa_value', 'REAL'):
+            conn.commit()
+            logger.info('RunStore: migrated scheduler_state — added ewa_value')
 
     def _migrate_runs_code_sha(self, conn: sqlite3.Connection) -> None:
         """Add ``code_sha`` to a pre-6565 ``runs``.
 
         Same shape as :meth:`_migrate_scheduler_state_ewa_value`, deliberately:
-        additive-only, ``PRAGMA table_info`` feature-detect, the column added
-        LAST, a concurrent construction's ``duplicate column name`` swallowed
-        and every other failure raised.  An existing row reads NULL, meaning
-        "the run predates task 6565".
+        additive-only, the column added LAST.  An existing row reads NULL,
+        meaning "the run predates task 6565".
         """
-        existing = {row[1] for row in conn.execute('PRAGMA table_info(runs)')}
-        if 'code_sha' in existing:
-            return
-        try:
-            # Column name is a hard-coded literal, never caller input.
-            conn.execute('ALTER TABLE runs ADD COLUMN code_sha TEXT')
-        except sqlite3.OperationalError as exc:
-            if 'duplicate column name' not in str(exc).lower():
-                raise
-            logger.debug('RunStore: runs.code_sha already added concurrently')
-            return
-        conn.commit()
-        logger.info('RunStore: migrated runs — added code_sha')
+        if add_column_if_missing_sync(conn, 'runs', 'code_sha', 'TEXT'):
+            conn.commit()
+            logger.info('RunStore: migrated runs — added code_sha')
 
     def start_run(
         self,

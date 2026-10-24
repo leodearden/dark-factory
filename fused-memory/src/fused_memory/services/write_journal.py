@@ -32,6 +32,7 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
 from fused_memory.services.read_rollup import (
@@ -488,21 +489,13 @@ class WriteJournal:
 
     async def _migrate(self) -> None:
         """Add columns introduced after initial schema (idempotent)."""
-        access = self._require_access()
-        existing = {row[1] for row in await access.read_all('PRAGMA table_info(write_ops)')}
-        existing_backend_ops = {
-            row[1] for row in await access.read_all('PRAGMA table_info(backend_ops)')
-        }
-
-        async with access.write() as db:
-            if 'session_id' not in existing:
-                await db.execute('ALTER TABLE write_ops ADD COLUMN session_id TEXT')
+        async with self._require_access().write() as db:
+            if await add_column_if_missing(db, 'write_ops', 'session_id', 'TEXT'):
                 logger.info('Migration: added session_id column to write_ops')
 
-            if 'kind' not in existing:
-                await db.execute(
-                    "ALTER TABLE write_ops ADD COLUMN kind TEXT NOT NULL DEFAULT 'write'"
-                )
+            if await add_column_if_missing(
+                db, 'write_ops', 'kind', "TEXT NOT NULL DEFAULT 'write'"
+            ):
                 await db.execute(
                     "UPDATE write_ops SET kind = 'read' WHERE operation = 'search'"
                 )
@@ -516,22 +509,18 @@ class WriteJournal:
             # Deliberately NOT backfilled (unlike `kind`): a pre-change row's
             # terminal outcome is genuinely unknown and must stay NULL rather
             # than be guessed.
-            if 'terminal_status' not in existing:
-                await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_status TEXT')
+            if await add_column_if_missing(db, 'write_ops', 'terminal_status', 'TEXT'):
                 logger.info('Migration: added terminal_status column to write_ops')
 
-            if 'terminal_at' not in existing:
-                await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_at TEXT')
+            if await add_column_if_missing(db, 'write_ops', 'terminal_at', 'TEXT'):
                 logger.info('Migration: added terminal_at column to write_ops')
 
-            if 'terminal_error' not in existing:
-                await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_error TEXT')
+            if await add_column_if_missing(db, 'write_ops', 'terminal_error', 'TEXT'):
                 logger.info('Migration: added terminal_error column to write_ops')
 
             # Same O(1), no-backfill stance as terminal_* above: a historical
             # row's duration is unknown, so it stays NULL.
-            if 'duration_ms' not in existing_backend_ops:
-                await db.execute('ALTER TABLE backend_ops ADD COLUMN duration_ms REAL')
+            if await add_column_if_missing(db, 'backend_ops', 'duration_ms', 'REAL'):
                 logger.info('Migration: added duration_ms column to backend_ops')
 
             # Indexes on new columns (safe after migration ensures columns exist)
