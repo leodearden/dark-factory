@@ -25,6 +25,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_categories import FailureCategory
 
 
 def test_merge_shadow_exports_moved_public_symbols() -> None:
@@ -421,6 +422,37 @@ class TestCoarseShadowCompare:
         ):
             await _run_coarse_shadow_compare(
                 git_ops, req, 'd15cfull01020304', esc_queue, event_store,
+                verifier=PRODUCTION_VERIFIER,
+            )
+
+        esc_queue.submit.assert_not_called()
+        event_store.emit.assert_not_called()
+
+    @pytest.mark.parametrize(
+        'category',
+        [FailureCategory.LINT_ERROR, FailureCategory.TYPE_ERROR, FailureCategory.INFRA_ABORT],
+    )
+    async def test_task_4843_category_no_map_is_inconclusive_no_alarm(
+        self, category: FailureCategory,
+    ) -> None:
+        """Lint, type and abort reds are not build-STAGE failures: with no
+        parseable map they stay inconclusive, as unknown_test_failure always
+        did, instead of newly alarming a suspected red main. The build set is
+        hand-enumerated, so admitting one must be a loud, deliberate edit."""
+        from orchestrator.merge_lane.shadow import _run_coarse_shadow_compare
+
+        esc_queue = self._esc_queue()
+        event_store = MagicMock()
+        cold_red = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='cold verify red', category=category.value,
+        )
+        with patch(
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify_suite',
+            AsyncMock(return_value=cold_red), create=True,
+        ):
+            await _run_coarse_shadow_compare(
+                MagicMock(), self._req(), 'd15cfull01020304', esc_queue, event_store,
                 verifier=PRODUCTION_VERIFIER,
             )
 

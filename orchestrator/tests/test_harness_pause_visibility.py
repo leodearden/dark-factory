@@ -22,6 +22,7 @@ from _orch_helpers import claimant_row, wire_scheduler_liveness_mock
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.cost_store import CostStore
+from shared.project_layout import escalation_queue_dir
 from test_harness_park_stop import _make_harness_with_mocks, _query_events
 
 import orchestrator.harness as harness_mod
@@ -75,7 +76,7 @@ def _tripping_harness(tmp_path: Path, cost_store: CostStore, lifecycle_events: i
 
 
 def _queue_for(harness: Harness, tmp_path: Path) -> EscalationQueue:
-    return EscalationQueue(Path(tmp_path) / harness.config.escalation.queue_dir)
+    return EscalationQueue(escalation_queue_dir(harness.config.project_root))
 
 
 class TestEwaTripStormAnnotation:

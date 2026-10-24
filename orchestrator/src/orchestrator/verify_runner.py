@@ -42,7 +42,6 @@ import logging
 import os
 import posixpath
 import shlex
-import signal
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -60,6 +59,8 @@ from typing import (
     get_args,
     runtime_checkable,
 )
+
+from shared.git_async import run_git
 
 from orchestrator import flake_ledger, verify
 from orchestrator.config import EnvProbeConfig, ModuleConfig, VerifyHostPolicy
@@ -967,36 +968,21 @@ async def _default_subprocess_run(
     *,
     cwd: str | Path | None = None,
 ) -> tuple[int, str, str]:
-    """Default subprocess helper — similar to git_ops._run but without the WorktreeMissing pre-flight.
+    """Default subprocess helper: (returncode, stdout, stderr), both streams stripped.
 
-    Returns (returncode, stdout_str, stderr_str).  A missing ``cwd`` surfaces as
-    a raw ``FileNotFoundError`` (caught by callers as OSError → RunnerUnavailable)
-    rather than the ``WorktreeMissing`` sentinel that git_ops._run would raise.
-
-    The child runs in its own process group.  If the await is cancelled (a
-    caller's ``asyncio.timeout``), the whole group is killed and the child
-    reaped before the cancellation propagates: a timed-out ``git push``
-    takes its ssh with it rather than leaving both running.
+    A thin adapter over ``shared.git_async.run_git``, which owns the
+    cancellation contract: on any interruption, including one landing
+    mid-spawn, the child's whole process group is killed and reaped (task
+    6346; this transport's former copy lacked the mid-spawn half, task 7304),
+    so a timed-out ``git push`` takes its ssh with it.  ``bounded=False``
+    because every caller imposes its own deadline and pushes are long-lived.
+    ``pin_c_locale=False`` because the child must see the dispatcher's own
+    environment: ssh forwards ``LANG``/``LC_*`` to the verify host.  A missing
+    binary or ``cwd`` surfaces as a raw ``FileNotFoundError``, which callers
+    class as transport.
     """
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
-        start_new_session=True,
-    )
-    try:
-        stdout_b, stderr_b = await proc.communicate()
-    except BaseException:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        await asyncio.shield(proc.wait())
-        raise
-    return (
-        proc.returncode or 0,
-        stdout_b.decode().strip(),
-        stderr_b.decode().strip(),
-    )
+    result = await run_git(argv, cwd, bounded=False, pin_c_locale=False)
+    return (result.returncode, result.stdout, result.stderr)
 
 
 def _env_probe_local_cwd() -> str | None:
@@ -1132,6 +1118,14 @@ async def _default_ssh_heartbeat_run(
     be a loop-bound ``StreamWriter`` whose ``write``/``drain`` must not be
     called from another thread, and routing through ``call_soon_threadsafe``
     would put the write back on the very loop whose stalls are the defect.
+
+    That raw stdin fd is also why this keeps its own spawn instead of adapting
+    ``shared.git_async.run_git`` as :func:`_default_subprocess_run` does:
+    ``run_git`` only feeds a one-shot ``input_text`` through ``communicate()``
+    and then closes stdin.  So its kill-the-group-on-cancel contract does not
+    cover this child.  A cancelled dispatch is ended by the connection-death
+    protocol instead: stopping the writer closes ``write_fd``, and the remote
+    watchdog fires on that EOF.
 
     A failed beat never raises out of the writer nor alters the returned
     ``(rc, stdout, stderr)``; ``verify_cancel.run_stdin_heartbeat`` names each
@@ -3225,9 +3219,9 @@ class DriftDetector:
     → no verdict; a remote's RunnerUnavailable is reported to the pool's
     ``on_unavailable`` sink so the merge worker benches it by kind.
 
-    The detector runs the two runners DIRECTLY (not via run_verdict_parity) so
-    it can distinguish RunnerUnavailable (transport ≠ divergence, Invariant 5)
-    from a genuine two-verdict disagreement.
+    The detector runs the two legs itself, concurrently (not via
+    run_verdict_parity), so it can distinguish RunnerUnavailable (transport ≠
+    divergence, Invariant 5) from a genuine two-verdict disagreement.
     """
 
     def __init__(
@@ -3256,8 +3250,21 @@ class DriftDetector:
         """
         return land_count > 0 and land_count % self._every_n_lands == 0
 
-    async def check(self, merge_sha: str, spec: MergeVerifySpec) -> DriftCheckResult:
-        """Run *merge_sha* on both runners and compare verdicts.
+    async def check(
+        self,
+        merge_sha: str,
+        spec: MergeVerifySpec,
+        *,
+        on_leg_done: Callable[[VerifyRunner], Awaitable[None]] | None = None,
+    ) -> DriftCheckResult:
+        """Run *merge_sha* on both runners at once and compare verdicts.
+
+        *on_leg_done* is awaited once per leg, with that leg's runner, as soon
+        as the leg ends (pass, fail or raise), so a caller can free that host
+        while the other leg still runs.  A remote RunnerUnavailable is reported
+        before its leg's *on_leg_done*.  A leg is never cancelled because its
+        sibling failed; an unexpected leg exception is raised once both legs
+        have ended.
 
         Returns DriftCheckResult.  Side-effects:
         - AGREE   → emit verdict_parity_ok event (None-safe), whose data carries
@@ -3272,18 +3279,12 @@ class DriftDetector:
         if local is None or remote is None:
             return DriftCheckResult(merge_sha=merge_sha, verdict=DriftVerdict.INCONCLUSIVE)
 
-        try:
-            local_result = await local.run_merge_verify(merge_sha, spec)
-        except RunnerUnavailable:
-            # Local transport failure also yields INCONCLUSIVE — symmetric with remote.
+        results = await self._run_legs(local, remote, merge_sha, spec, on_leg_done)
+        if results is None:
+            # No verdict ≠ divergence (Invariant 5): a closed/flaky host must
+            # never raise a false drift alarm.
             return DriftCheckResult(merge_sha=merge_sha, verdict=DriftVerdict.INCONCLUSIVE)
-        try:
-            remote_result = await remote.run_merge_verify(merge_sha, spec)
-        except RunnerUnavailable as exc:
-            # No verdict ≠ divergence (Invariant 5): a closed/flaky laptop must
-            # never raise a false drift alarm, but it is benched like any other.
-            self._pool.report_unavailable(remote.name, exc)
-            return DriftCheckResult(merge_sha=merge_sha, verdict=DriftVerdict.INCONCLUSIVE)
+        local_result, remote_result = results
 
         local_passed = local_result.passed
         remote_passed = remote_result.passed
@@ -3381,6 +3382,39 @@ class DriftDetector:
             escalated=escalated,
             quarantined=True,
         )
+
+    async def _run_legs(
+        self,
+        local: VerifyRunner,
+        remote: VerifyRunner,
+        merge_sha: str,
+        spec: MergeVerifySpec,
+        on_leg_done: Callable[[VerifyRunner], Awaitable[None]] | None,
+    ) -> tuple[VerifyResult, VerifyResult] | None:
+        """Both legs' results, or None when either leg's runner was unavailable."""
+
+        async def _leg(runner: VerifyRunner) -> VerifyResult:
+            try:
+                return await runner.run_merge_verify(merge_sha, spec)
+            except RunnerUnavailable as exc:
+                if runner is remote:
+                    # Benched BEFORE on_leg_done frees its slot, so nothing is
+                    # dispatched onto a host that just failed.
+                    self._pool.report_unavailable(runner.name, exc)
+                raise
+            finally:
+                if on_leg_done is not None:
+                    await on_leg_done(runner)
+
+        local_outcome, remote_outcome = await asyncio.gather(
+            _leg(local), _leg(remote), return_exceptions=True,
+        )
+        for outcome in (local_outcome, remote_outcome):
+            if isinstance(outcome, BaseException) and not isinstance(outcome, RunnerUnavailable):
+                raise outcome
+        if isinstance(local_outcome, BaseException) or isinstance(remote_outcome, BaseException):
+            return None
+        return local_outcome, remote_outcome
 
     async def check_env(
         self,

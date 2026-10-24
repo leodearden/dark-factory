@@ -501,6 +501,31 @@ class TestAdjudicateNeutralCwd:
         assert call_kwargs['cwd'] != Path('/some/project')
 
 
+@pytest.mark.asyncio
+class TestAdjudicateMcpScoping:
+    """The adjudicator's CLI call scopes MCP to zero servers, strictly.
+
+    Neither the wildcard deny (``--tools ''`` filters built-in and deferred
+    tools only) nor the neutral cwd (it removes only the project
+    ``.mcp.json``) closes MCP: an account-scoped claude.ai connector stayed
+    connected at a neutral cwd (measured on CLI 2.1.283, task 3995).
+    """
+
+    async def test_passes_zero_server_strict_mcp_config(self, tmp_path):
+        adj = _make_adjudicator(tmp_path=tmp_path)
+        result = _agent_result(
+            success=True,
+            structured_output={'verdict': 'allow', 'reason': 'ok'},
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)) as mock_invoke:
+            await _do_adjudicate(adj)
+
+        assert mock_invoke.await_args is not None
+        call_kwargs = mock_invoke.await_args.kwargs
+        assert call_kwargs.get('mcp_config') == {'mcpServers': {}}
+        assert call_kwargs.get('strict_mcp_config') is True
+
+
 # ===========================================================================
 # Task 3122: is_confirmed_misroute — the correctly-polarised accessor for a
 # soft-signal caller, whose base state is ALLOW rather than REJECT.

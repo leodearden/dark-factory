@@ -82,6 +82,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # to stop. _iter_leaves yields the list WHOLE, so it reloads atomically: a
     # half-applied prefix list would admit a caller no operator ever wrote.
     'reconciliation.deterministic_provenance_allowed_agent_prefixes',
+    # Recon transcript archival (task 3972); why green: the schema descriptions.
+    'reconciliation.transcript_archive_enabled',
+    'reconciliation.transcript_archive_root',
     # Write-triage band thresholds (task 3130). Written by
     # scripts/calibrate_write_triage.py --write-config, which derives them from
     # measured similarity distributions -- so hot-reload is what lets a

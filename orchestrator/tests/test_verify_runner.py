@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, ClassVar
@@ -11,10 +12,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _gate_fixtures import gate_argv, gated_remote_runner
-from _orch_helpers import pydantic_spec
+from _orch_helpers import pydantic_spec, wait_responsive
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.event_store import EventType
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     HEARTBEAT_STOP_JOIN_SECS,
@@ -23,6 +24,7 @@ from orchestrator.verify_runner import (
     UnscopedTypecheckSpec,
     VerifyCommand,
     VerifyRunner,
+    VerifyRunnerPool,
     result_from_dict,
     result_from_json,
     result_to_dict,
@@ -1673,6 +1675,49 @@ class TestDispatchChainItems:
         data = kwargs['data']
         assert data['runner'] == 'local'      # the fallback ran
         assert data['chain_items'] == 7       # ...and telemetry survived it
+
+
+@pytest.mark.asyncio
+class TestDispatchDurationWiring:
+    """The persisted merge_verify payload's ``duration_ms`` is the runner's real wall time.
+
+    It rides in ``data`` only; the events.duration_ms column stays NULL, so
+    scripts/merge-deep-canary-predicate.sh reads its verify_p90 from here.
+    """
+
+    async def test_persisted_merge_verify_payload_carries_the_runner_wall_time(self, tmp_path):
+        async def _slow_pass(*_args, **_kwargs):
+            await asyncio.sleep(0.2)
+            return _make_pass_result()
+
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.is_local = True
+        fake_runner.run_merge_verify = AsyncMock(side_effect=_slow_pass)
+        db_path = tmp_path / 'runs.db'
+        pool = VerifyRunnerPool(
+            [fake_runner],
+            event_store=EventStore(db_path, 'run-duration'),
+            task_id='t-dur',
+        )
+
+        t0 = time.monotonic()
+        await pool.dispatch('sha-dur', _make_spec(), chain_items=2)
+        outer_ms = (time.monotonic() - t0) * 1000
+
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT data, duration_ms FROM events WHERE event_type = 'merge_verify'"
+            ).fetchall()
+        finally:
+            conn.close()
+        assert len(rows) == 1, rows
+        (data, duration_column), = rows
+        assert duration_column is None, rows
+        duration_ms = json.loads(data)['duration_ms']
+        assert isinstance(duration_ms, int) and not isinstance(duration_ms, bool), duration_ms
+        assert 150 <= duration_ms <= outer_ms + 1, (duration_ms, outer_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -4963,7 +5008,7 @@ class TestVerifyRunnerPoolQuarantine:
 # ---------------------------------------------------------------------------
 
 
-def _make_drift_pool(local_result=None, remote_result=None):
+def _make_drift_pool(local_result=None, remote_result=None, *, on_unavailable=None):
     """Return a VerifyRunnerPool with injected fake runners."""
     from orchestrator.verify_runner import VerifyRunnerPool
     local_fake = MagicMock(spec=VerifyRunner)
@@ -4974,7 +5019,7 @@ def _make_drift_pool(local_result=None, remote_result=None):
     remote_fake.name = 'laptop'
     remote_fake.is_local = False
     remote_fake.run_merge_verify = AsyncMock(return_value=remote_result or _make_pass_result())
-    pool = VerifyRunnerPool([local_fake, remote_fake])
+    pool = VerifyRunnerPool([local_fake, remote_fake], on_unavailable=on_unavailable)
     return pool, local_fake, remote_fake
 
 
@@ -5534,6 +5579,176 @@ class TestDriftDetectorInconclusive:
         assert result.verdict == DriftVerdict.INCONCLUSIVE
         assert result.local_category == ''
         assert result.remote_category == ''
+
+
+# ---------------------------------------------------------------------------
+# task 6648: DriftDetector runs its two legs concurrently
+# ---------------------------------------------------------------------------
+
+_LEG_WAIT_SECS = 5
+
+
+def _gated_verify(gate, result, *, on_finish=None):
+    """A run_merge_verify double that parks until *gate* is set, then returns *result*."""
+    async def _body(*_args, **_kwargs):
+        await gate.wait()
+        if on_finish is not None:
+            on_finish()
+        return result
+    return AsyncMock(side_effect=_body)
+
+
+class _LegDoneRecorder:
+    """An ``on_leg_done`` sink: logs ``('done', runner.name)`` and sets that leg's Event."""
+
+    def __init__(self, log=None):
+        self.log = [] if log is None else log
+        self.ended = {'local': asyncio.Event(), 'laptop': asyncio.Event()}
+
+    async def __call__(self, runner):
+        self.log.append(('done', runner.name))
+        self.ended[runner.name].set()
+
+    @property
+    def done(self):
+        return [entry[1] for entry in self.log if entry[0] == 'done']
+
+
+@pytest.mark.asyncio
+class TestDriftDetectorConcurrentLegs:
+    """DriftDetector.check(): both legs run at once; each leg's end is reported as it happens."""
+
+    async def test_remote_leg_starts_while_local_leg_is_still_running(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, local_fake, remote_fake = _make_drift_pool()
+        local_gate = asyncio.Event()
+        remote_started = asyncio.Event()
+
+        async def _remote(*_args, **_kwargs):
+            remote_started.set()
+            return _make_pass_result()
+
+        local_fake.run_merge_verify = _gated_verify(local_gate, _make_pass_result())
+        remote_fake.run_merge_verify = AsyncMock(side_effect=_remote)
+        check = asyncio.create_task(DriftDetector(pool).check('sha1', _make_spec()))
+        try:
+            await wait_responsive(
+                remote_started.wait(), timeout=_LEG_WAIT_SECS, label='remote leg started',
+            )
+        finally:
+            local_gate.set()
+            result = await asyncio.wait_for(check, _LEG_WAIT_SECS)
+        assert result.verdict == DriftVerdict.AGREE
+
+    async def test_on_leg_done_reports_the_remote_leg_before_the_local_leg_completes(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, local_fake, _ = _make_drift_pool()
+        local_gate = asyncio.Event()
+        local_fake.run_merge_verify = _gated_verify(local_gate, _make_pass_result())
+        recorder = _LegDoneRecorder()
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=MagicMock())
+        check = asyncio.create_task(
+            detector.check('sha1', _make_spec(), on_leg_done=recorder)
+        )
+        try:
+            await wait_responsive(
+                recorder.ended['laptop'].wait(), timeout=_LEG_WAIT_SECS,
+                label='remote leg reported done',
+            )
+            assert recorder.done == ['laptop']
+        finally:
+            local_gate.set()
+            result = await asyncio.wait_for(check, _LEG_WAIT_SECS)
+        assert recorder.done == ['laptop', 'local']
+        assert result.verdict == DriftVerdict.AGREE
+        event_store.emit.assert_called_once()
+        (event_type,), kwargs = event_store.emit.call_args
+        assert event_type == EventType.verdict_parity_ok
+        assert set(kwargs['data']) == {
+            'merge_sha', 'local_runner', 'remote_runner', 'passed',
+            'local_category', 'remote_category',
+        }
+
+    async def test_unavailable_remote_is_benched_before_its_slot_is_reported_done(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, RunnerUnavailable
+        log: list[tuple[str, ...]] = []
+        pool, local_fake, remote_fake = _make_drift_pool(
+            on_unavailable=lambda name, _exc: log.append(('bench', name)),
+        )
+        local_gate = asyncio.Event()
+        local_fake.run_merge_verify = _gated_verify(
+            local_gate, _make_pass_result(), on_finish=lambda: log.append(('local finished',)),
+        )
+        remote_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('down'))
+        recorder = _LegDoneRecorder(log)
+        event_store, escalation_queue = MagicMock(), MagicMock()
+        detector = DriftDetector(pool, event_store=event_store, escalation_queue=escalation_queue)
+        check = asyncio.create_task(
+            detector.check('sha1', _make_spec(), on_leg_done=recorder)
+        )
+        try:
+            await wait_responsive(
+                recorder.ended['laptop'].wait(), timeout=_LEG_WAIT_SECS,
+                label='remote leg reported done',
+            )
+            assert ('local finished',) not in log
+        finally:
+            local_gate.set()
+            result = await asyncio.wait_for(check, _LEG_WAIT_SECS)
+        assert log.index(('bench', 'laptop')) < log.index(('done', 'laptop'))
+        assert log.index(('local finished',)) < log.index(('done', 'local'))
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+        event_store.emit.assert_not_called()
+        escalation_queue.submit.assert_not_called()
+
+    async def test_unavailable_local_still_lets_the_remote_leg_finish_and_benches_nothing(self):
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, RunnerUnavailable
+        benched: list[str] = []
+        pool, local_fake, remote_fake = _make_drift_pool(
+            on_unavailable=lambda name, _exc: benched.append(name),
+        )
+        remote_gate = asyncio.Event()
+        local_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('local down'))
+        remote_fake.run_merge_verify = _gated_verify(remote_gate, _make_pass_result())
+        recorder = _LegDoneRecorder()
+        check = asyncio.create_task(
+            DriftDetector(pool).check('sha1', _make_spec(), on_leg_done=recorder)
+        )
+        try:
+            await wait_responsive(
+                recorder.ended['local'].wait(), timeout=_LEG_WAIT_SECS,
+                label='local leg reported done',
+            )
+        finally:
+            remote_gate.set()
+            result = await asyncio.wait_for(check, _LEG_WAIT_SECS)
+        remote_fake.run_merge_verify.assert_awaited_once()
+        assert benched == []
+        assert sorted(recorder.done) == ['laptop', 'local']
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+
+    async def test_unexpected_leg_exception_is_raised_after_both_legs_finish(self):
+        from orchestrator.verify_runner import DriftDetector
+        pool, local_fake, remote_fake = _make_drift_pool()
+        remote_gate = asyncio.Event()
+        local_fake.run_merge_verify = AsyncMock(side_effect=ValueError('boom'))
+        remote_fake.run_merge_verify = _gated_verify(remote_gate, _make_pass_result())
+        recorder = _LegDoneRecorder()
+        check = asyncio.create_task(
+            DriftDetector(pool).check('sha1', _make_spec(), on_leg_done=recorder)
+        )
+        try:
+            await wait_responsive(
+                recorder.ended['local'].wait(), timeout=_LEG_WAIT_SECS,
+                label='local leg reported done',
+            )
+        finally:
+            remote_gate.set()
+        with pytest.raises(ValueError, match='boom'):
+            await asyncio.wait_for(check, _LEG_WAIT_SECS)
+        assert sorted(recorder.done) == ['laptop', 'local']
+        remote_fake.run_merge_verify.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

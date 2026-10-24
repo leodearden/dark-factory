@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, VerifyScript
+from escalation.pins import classify_pins
 from escalation.queue import EscalationQueue
 from shared.task_metadata import RetryLedger
 from test_merge_queue_main_health import (
@@ -113,6 +114,39 @@ TEST_FAILURE_RESULT = VerifyResult(
     cause_hint='TestFoo.test_bar',
     category='test_failure',
 )
+
+
+# (live_claimant, live_claimant_id): nobody live, live with no resolvable id,
+# and live with a composed id.
+PIN_LIVENESS_STATES: tuple[tuple[bool, str | None], ...] = (
+    (False, None),
+    (True, None),
+    (True, 'run-live/sess-live/pid=1'),
+)
+
+
+def _assert_pins_only_as_queue_handoff(
+    escalation_queue: EscalationQueue, task_id: str,
+) -> None:
+    """A worker main-health record has no filing incarnation, so its pin must
+    not depend on one. A level-0 filing would read dead_l0 with no live
+    claimant (escalation.pins Link 4), which this rejects."""
+    records = escalation_queue.get_by_task(task_id, status='pending')
+    assert records, f'Expected open escalations for task {task_id!r}; got none'
+    record_ids = tuple(r.id for r in records)
+    levels = [r.level for r in records]
+    for live_claimant, live_claimant_id in PIN_LIVENESS_STATES:
+        report = classify_pins(
+            task_id, records,
+            live_claimant=live_claimant, live_claimant_id=live_claimant_id,
+        )
+        assert report.queue_handoff == record_ids and report.dead_l0 == (), (
+            f'At live_claimant={live_claimant}, '
+            f'live_claimant_id={live_claimant_id!r}, records at levels '
+            f'{levels} must all be queue_handoff; got '
+            f'queue_handoff={report.queue_handoff}, dead_l0={report.dead_l0}, '
+            f'non_pinning={report.non_pinning}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +451,7 @@ class TestDeferredProbeHappyPath:
             f'Expected detail derived from the main-red reason; '
             f'got {esc.detail!r}'
         )
+        _assert_pins_only_as_queue_handoff(escalation_queue, req.task_id)
         assert esc.level == 1, (
             f'A main-health escalation is for the auto-watcher, never a '
             f'steward: expected level 1; got {esc.level}'
@@ -816,6 +851,7 @@ class TestAutoHealMainHealthDeferredHappyPath:
             f'outcome; got {esc.dedupe_fingerprint!r} vs '
             f'{outcome.dedupe_fingerprint!r}'
         )
+        _assert_pins_only_as_queue_handoff(escalation_queue, req.task_id)
         assert esc.level == 1, (
             f'The halt-owner escalation must be L1; got {esc.level}'
         )
@@ -926,6 +962,7 @@ class TestAutoHealMainHealthDeferredGuards:
             f'Expected category=preexisting_main_break; got '
             f'{pending[0].category!r}'
         )
+        _assert_pins_only_as_queue_handoff(escalation_queue, req.task_id)
         assert pending[0].level == 1, (
             f'Expected level 1; got {pending[0].level}'
         )
@@ -969,6 +1006,7 @@ class TestAutoHealMainHealthDeferredGuards:
             f'Expected exactly one preexisting_main_break escalation to be '
             f'filed; got {pending}'
         )
+        _assert_pins_only_as_queue_handoff(escalation_queue, req.task_id)
         assert pending[0].level == 1, (
             f'Expected level 1; got {pending[0].level}'
         )
@@ -992,15 +1030,17 @@ class TestAutoHealMainHealthDeferredGuards:
             'compile_error', outcome.failure_cause_hint, outcome.reason,
         )
 
-        # Simulates a concurrent auto-heal already in flight — halted
-        # directly (not via a prior _auto_heal_main_health_deferred call),
-        # mirroring test_merge_queue_auto_heal.py's TestAutoHealIdempotency.
+        # Simulates THIS signature's auto-heal already in flight — its
+        # attempt recorded and the lane halted directly (not via a prior
+        # _auto_heal_main_health_deferred call).  A lane halted by anything
+        # else is task 5471's foreign-halt branch, not this one.
+        worker.auto_heal_registry.record_attempt(sig)
         worker.halt_lane('normal', 'x')
 
         asyncio.run(worker._auto_heal_main_health_deferred(outcome, req))
 
         worker._spawn_main_health_fix_task.assert_not_awaited()
-        assert worker.auto_heal_registry.attempts(sig) == 0, (
+        assert worker.auto_heal_registry.attempts(sig) == 1, (
             f'The idempotency branch must NOT record a second attempt; got '
             f'{worker.auto_heal_registry.attempts(sig)}'
         )
@@ -1009,6 +1049,7 @@ class TestAutoHealMainHealthDeferredGuards:
             f'Expected the idempotency branch to still file/fold exactly one '
             f'pending escalation; got {pending}'
         )
+        _assert_pins_only_as_queue_handoff(escalation_queue, req.task_id)
         assert pending[0].level == 1, (
             f'Expected level 1; got {pending[0].level}'
         )

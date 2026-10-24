@@ -15,7 +15,6 @@ import functools
 import json
 import logging
 import os
-import shutil
 import sys
 import tempfile
 import time
@@ -50,6 +49,7 @@ from orchestrator.evals.reviewer_trial.variants import (
 )
 from orchestrator.mcp_lifecycle import verdict_tools_mcp_server
 from orchestrator.review_inputs import gather_review_subject
+from orchestrator.tree_removal import remove_tree
 
 logger = logging.getLogger(__name__)
 
@@ -361,7 +361,7 @@ async def _review(
         return spec.name, None, total_cost
     finally:
         if owns_root:
-            shutil.rmtree(root, ignore_errors=True)
+            await remove_tree(root, ignore_errors=True)
 
 
 async def run_panel(

@@ -122,6 +122,7 @@ from fastmcp.tools.base import ToolResult
 from pydantic import Field
 
 from shared.boundary_storm_escape import BoundaryStormEscape, Sink, call_sink
+from shared.mcp_tool_schema import live_tool_parameters
 from shared.toolcall_markup import (
     MARKUP_OVERRIDE_KEY,
     # ``detect`` is BACK (task 4502) after task 4696 removed it — but NOT for
@@ -962,36 +963,19 @@ class MarkupGuardMiddleware(Middleware):
     async def _schema_properties(context, name: str) -> Mapping[str, Any]:
         """The invoked tool's LIVE JSON-Schema ``properties`` map.
 
-        Two measured substrate facts, both of which the PRD's section 6 table
-        gets wrong for fastmcp 3.2.2: ``get_tool`` is a COROUTINE and must be
-        awaited, and ``tool.parameters`` is a full JSON Schema dict — so the
-        names are under ``'properties'``, not the object itself.
+        ``{}`` when :func:`~shared.mcp_tool_schema.live_tool_parameters` has no
+        schema, which makes repair() refuse rather than recover against a
+        phantom schema. That is the same fail-safe direction ``_as_name_set``
+        already takes: with no schema, every recovered name is out-of-schema,
+        so nothing can be fabricated.
 
-        LIVE rather than declared at registration: what a recovery is allowed
-        to name has to be checked against the tool as it actually is, or the
-        guard would validate against a schema that has since drifted.
-
-        Any failure to resolve one yields an EMPTY map, which makes repair()
-        refuse rather than recover against a phantom schema. That is the same
-        fail-safe direction ``_as_name_set`` already takes: with no schema,
-        every recovered name is out-of-schema, so nothing can be fabricated.
-
-        The full map rather than only its keys, because two callers need two
-        different things out of ONE walk: :meth:`_schema_params` wants the
-        names, and :func:`_coerce_recovered` wants each parameter's declared
-        type. A second copy of this ``parameters`` -> ``properties`` traversal
-        is exactly the lock-step duplication INV-5 exists to end.
+        The full map rather than only its keys, because :meth:`_schema_params`
+        wants the names and :func:`_coerce_recovered` wants each parameter's
+        declared type.
         """
-        try:
-            tool = await context.fastmcp_context.fastmcp.get_tool(name)
-        except Exception:
-            logger.exception('markup guard could not resolve the schema for %r', name)
-            return {}
-        parameters = getattr(tool, 'parameters', None) or {}
-        properties = parameters.get('properties') if isinstance(parameters, dict) else None
-        if not isinstance(properties, dict):
-            return {}
-        return properties
+        parameters = await live_tool_parameters(context, name)
+        properties = parameters.get('properties') if parameters is not None else None
+        return properties if isinstance(properties, dict) else {}
 
     @classmethod
     async def _schema_params(cls, context, name: str) -> tuple[str, ...]:
@@ -1814,8 +1798,8 @@ def accepts_markup_override(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     SUBSTRATE, MEASURED IN THIS WORKTREE (fastmcp 3.2.2, CPython 3.13.9) — the
     PRD's section 6 table has been wrong about this library before, so this is
-    recorded the way :meth:`MarkupGuardMiddleware._schema_properties` records
-    its own two facts:
+    recorded the way :mod:`shared.mcp_tool_schema` records its own substrate
+    facts:
 
     1. FastMCP builds ``inputSchema`` from ``__signature__``, so appending a
        parameter there is enough — the function's own parameter list is never

@@ -59,15 +59,6 @@ _RUN_CURRENT = 'run-current'
 #: I1: the only tiers whose evidence may set an outcome state.
 _PRESENT_TRUTH_SOURCES = frozenset({'live', 'event_store', 'git'})
 
-_BRANCH_KEY_DEFECT = (
-    'esc-4834-3, follow-up tkt_0RVWJQ8EMTQQ4JX0F81NN4237P: every producer writes '
-    "branch as QueuedBranch.bare_id while merge_status matches the branch key "
-    "literally, so the 'task/<id>' form the merge-queue, unblock and "
-    'unblock-low-risk skills document answers no_record/never_submitted for a '
-    "prior run's row."
-)
-
-
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ['git', *args], cwd=repo, check=True, capture_output=True, text=True,
@@ -639,7 +630,6 @@ async def test_consumer_skill_branches_on_the_server_answer(
     )
 
 
-@pytest.mark.xfail(strict=True, reason=_BRANCH_KEY_DEFECT)
 async def test_branch_key_in_the_skills_full_ref_form_resolves_a_prior_run_row(
     world: _World,
 ) -> None:
@@ -651,6 +641,36 @@ async def test_branch_key_in_the_skills_full_ref_form_resolves_a_prior_run_row(
     assert response['state'] == MergeState.stale_record
     assert response['last_outcome'] is not None
     assert response['last_outcome']['request_id'] == prior.request_id
+
+
+#: The _SCENES rows whose scene.key is {'task_id': ...}.
+_TASK_ID_KEYED_ROWS = ('B1', 'B2', 'B3', 'B4', 'B5', 'B8')
+
+
+@pytest.mark.parametrize('row', sorted(_SCENES))
+async def test_task_id_keyed_rows_names_every_scene_keyed_by_task_id(
+    world: _World, row: str,
+) -> None:
+    scene = await _SCENES[row](world)
+
+    assert ('task_id' in scene.key) == (row in _TASK_ID_KEYED_ROWS), (
+        f'{row} polls by {sorted(scene.key)}: update _TASK_ID_KEYED_ROWS'
+    )
+
+
+@pytest.mark.parametrize('row', _TASK_ID_KEYED_ROWS)
+async def test_a_branch_key_in_either_spelling_answers_what_the_task_id_key_answers(
+    world: _World, row: str,
+) -> None:
+    scene = await _SCENES[row](world)
+    task_id = scene.key['task_id']
+
+    by_task_id = await _poll(scene.server, task_id=task_id)
+    by_bare_branch = await _poll(scene.server, branch=task_id)
+    by_full_ref = await _poll(scene.server, branch=f'task/{task_id}')
+
+    assert by_bare_branch == by_task_id, f'{row}: branch={task_id!r} diverged from task_id'
+    assert by_full_ref == by_task_id, f'{row}: branch=task/{task_id} diverged from task_id'
 
 
 _SEED_MEMBER = 'seeded_drift'

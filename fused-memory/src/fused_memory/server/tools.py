@@ -13,11 +13,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
+from shared.defects import DeclareEvent, MalformedDefectRef, OutcomeEvent
 from shared.delivered_check_polarity import (
     GATE_REF,
     extract_delivered_checks,
@@ -27,6 +28,11 @@ from shared.delivered_check_polarity import (
 from shared.task_statuses import ACTIVE
 from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
 
+from fused_memory.backends.defect_records import (
+    DefectEventInvalid,
+    parse_declare_wire,
+    parse_outcome_wire,
+)
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.backends.mem0_client import (
     _FUSED_MEMORY_OWNED_METADATA_KEYS,
@@ -43,6 +49,7 @@ from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
+from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
 from fused_memory.middleware.deferral_gate import StatusWriteScope
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
@@ -4017,6 +4024,9 @@ def create_mcp_server(
             # allow_near_duplicate is a write-time-only control flag for the
             # guard above; it must never be persisted into stored metadata.
             cleaned_meta.pop('allow_near_duplicate', None)
+            # Only the contested attach below may write this, so no caller can
+            # make a hand-declared contest look triage-written.
+            cleaned_meta.pop(TRIAGE_CONTESTED_METADATA_KEY, None)
         # An ATTACH outcome reroutes this same write into a child of the memory
         # it restates: same content, same category, same agent, plus the parent
         # link. It does NOT touch the canonical — triage issues no
@@ -4073,10 +4083,11 @@ def create_mcp_server(
             _triage_fail_open_counter.record(project=project_id)
         write_meta = cleaned_meta
         if attached_to is not None:
-            # Every key written here is an ATTACH_OWNED_KEY, and overwriting
-            # them is safe ONLY because `caller_owns_attach_keys` force-stored
-            # every write that carried any one of them — so none can be
-            # present here. Adding a key to this dict without adding it to
+            # Every key written here is an ATTACH_OWNED_KEY (the triage-contest
+            # marker excepted: TestOnlyTriageWritesTheTriageContestMarker), and
+            # overwriting them is safe ONLY because `caller_owns_attach_keys`
+            # force-stored every write that carried any one of them — so none
+            # can be present here. Adding a key to this dict without adding it to
             # ATTACH_OWNED_KEYS re-opens the loss for that key; the gate suite
             # pins the two sets against each other for exactly that reason,
             # unioned across the outcomes because they no longer write the
@@ -4111,6 +4122,8 @@ def create_mcp_server(
                 # this one. The canonical it contradicts is left exactly as it
                 # was, and nothing is scheduled to settle the disagreement.
                 write_meta[CONTESTED_METADATA_KEY] = True
+                # Read by link-heal's H1 row 2: a contest triage made is healable.
+                write_meta[TRIAGE_CONTESTED_METADATA_KEY] = True
         try:
             result = await memory_service.add_memory(
                 content=content,
@@ -9194,7 +9207,7 @@ def create_mcp_server(
 
         Callers should follow up with ``resolve_ticket`` to obtain the final
         task_id once the curator has decided (create / drop / combine).
-        Under an unavailable curator pool the ticket parks as
+        When the curator cannot judge it yet, the ticket parks as
         ``awaiting_curation`` and is curated later.
 
         ``planning_mode=True`` switches to a synchronous, curator-bypassing
@@ -9595,11 +9608,11 @@ def create_mcp_server(
           is the target task's id.
         - ``failed``   — an error occurred; ``reason`` describes it. Common
           reasons: ``timeout``, ``server_restart``, ``expired``.
-        - ``awaiting_curation`` — NON-terminal: the curator's account pool could
-          not serve, so the submission is durably parked and retried
-          automatically. NO ``task_id`` is returned. It is neither a failure
-          nor a creation: do NOT re-submit and do NOT count it as created;
-          call ``resolve_ticket`` again later.
+        - ``awaiting_curation`` — NON-terminal: the curator could not judge the
+          submission yet (``reason`` says why), so it is durably parked and
+          retried automatically until it gets a verdict. NO ``task_id`` is
+          returned. It is neither a failure nor a creation: do NOT re-submit
+          and do NOT count it as created; call ``resolve_ticket`` again later.
         - ``refused``  — a deterministic guard (cancelled-premise blocklist /
           recon premise registry) rejected the candidate. **NO TASK WAS
           CREATED and NO ``task_id`` is returned** — the key is absent, not
@@ -9835,6 +9848,137 @@ def create_mcp_server(
             },
         )
         return response
+
+    async def _defect_write_reply(
+        project_root: str,
+        task_id: str,
+        event: DeclareEvent | OutcomeEvent,
+        *,
+        operation: Literal['declare_defect', 'record_defect_outcome'],
+        agent_id: str | None,
+        tag: str | None,
+    ) -> dict[str, Any]:
+        reply = await task_interceptor.apply_defect_events(
+            task_id, project_root, [event], operation=operation, agent_id=agent_id, tag=tag,
+        )
+        if reply.get('success') is not True:
+            return reply
+        return {**reply, 'project_id': resolve_project_id(project_root), 'project_root': project_root}
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def declare_defect(
+        project_root: str,
+        task_id: str,
+        event: dict[str, Any],
+        tag: str | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Declare a defect on a task, or record a closure, retirement or sighting of one.
+
+        Any filer may call it. ``event`` is the JSON dump of one
+        ``shared.defects`` declare event: ``Declare``, ``DeclareClosure``,
+        ``DeclareRetirement`` or ``Sighting``. It is folded into the task's
+        record for its ref (``metadata.defects``, or
+        ``metadata.defect_test_retirements`` for a retirement) in one write,
+        under the transition rules in ``shared/src/shared/defects.py``.
+
+        Refused, with nothing written: a task in a terminal status
+        (``defect_write_to_terminal_task``); a transition the rules forbid
+        (``defect_transition_refused``); a ``duplicate_of`` or
+        ``superseded_by`` ref that no task declares (``defect_ref_not_live``,
+        see ``lookup_defect_ref``); an event that is not a declare event
+        (``defect_event_invalid``). Each refusal is
+        ``{'success': False, 'error': <code>, 'task_id', ..., 'detail'}``.
+        """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
+        if err := _reject_if_ticket_id('task_id', task_id):
+            return err
+        normalized = await asyncio.to_thread(_normalize_project_root, project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        try:
+            parsed = parse_declare_wire(event)
+        except DefectEventInvalid as exc:
+            return exc.to_error_dict(task_id=task_id)
+        return await _defect_write_reply(
+            normalized, task_id, parsed, operation='declare_defect', agent_id=agent_id, tag=tag,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def record_defect_outcome(
+        project_root: str,
+        task_id: str,
+        ref: str,
+        event: dict[str, Any],
+        tag: str | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Record a proof of, or a ruling on, the defect *ref* declared on a task.
+
+        ``event`` is the JSON dump of one ``shared.defects`` outcome event,
+        ``Proof`` or ``Rule``, and must concern *ref*
+        (``defect_ref_mismatch`` otherwise). Applied in one write under the
+        same rules and refusals as ``declare_defect``.
+
+        Its intended callers are the orchestrator workflow
+        (``SchedulerFacade.dispatch_tool``) and ``scripts/prove_defect.py``
+        (``plans/defect-tests-prd.md`` decision 7); interactive sessions are
+        Leo's trust domain and are not machine-guarded. No dispatched role's
+        ``allowed_tools`` grants it
+        (``orchestrator/tests/test_role_defect_outcome_authority.py``), but
+        that list is a permission allow list, not a denial: a dispatched
+        session that mounts fused-memory can still reach this tool, since no
+        role denies it through ``disallowed_tools`` yet.
+        """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
+        if err := _reject_if_ticket_id('task_id', task_id):
+            return err
+        normalized = await asyncio.to_thread(_normalize_project_root, project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        try:
+            parsed = parse_outcome_wire(event, ref=ref)
+        except DefectEventInvalid as exc:
+            return exc.to_error_dict(task_id=task_id)
+        return await _defect_write_reply(
+            normalized, task_id, parsed, operation='record_defect_outcome',
+            agent_id=agent_id, tag=tag,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def lookup_defect_ref(
+        project_root: str,
+        ref: str,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """The tasks, of any status, whose ``metadata.defects`` declares *ref*.
+
+        A ref is live when it has a carrier; ``declare_defect`` requires a
+        ``duplicate_of`` or ``superseded_by`` ref to be live. Returns ``ref``,
+        ``live``, ``carriers`` (``task_id``, ``task_status``,
+        ``defect_status``) and ``unreadable_task_ids``, the tasks whose
+        defect entries could not be read. A ref outside the grammar is a
+        ``ValidationError`` naming the known prefixes.
+        """
+        normalized = await asyncio.to_thread(_normalize_project_root, project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        try:
+            lookup = await task_interceptor.lookup_defect_ref(normalized, ref, tag=tag)
+        except MalformedDefectRef as e:
+            return {'error': str(e), 'error_type': 'ValidationError'}
+        pid = resolve_project_id(normalized)
+        await _log_read(
+            'lookup_defect_ref',
+            project_id=pid,
+            result_summary={'project_id': pid, 'ref': ref, 'carriers': len(lookup.carriers)},
+        )
+        return {'project_id': pid, 'project_root': normalized, **lookup.as_dict()}
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -10222,7 +10366,12 @@ def create_mcp_server(
                   remainder back. It works on done/merged tasks, but you must
                   send back the ``done_provenance`` you just read, unchanged —
                   adding, changing or dropping it is rejected with
-                  ``error == 'done_provenance_via_update_task'``.
+                  ``error == 'done_provenance_via_update_task'``. The same
+                  holds for ``defects`` and ``defect_test_retirements``,
+                  refused with ``error == 'defect_records_via_update_task'``:
+                  after creation only ``declare_defect`` and
+                  ``record_defect_outcome`` write them, and every other mode
+                  refuses either key outright, echo included.
             append: DEPRECATED shim. ``True`` → ``'additive'``. A bare
                 ``append=False`` (no ``metadata_mode``) on a metadata write is
                 now **rejected** by the backend — it used to silently whole-blob

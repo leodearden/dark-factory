@@ -152,9 +152,29 @@ marked `done` on the strength of an unverified claim.
 | `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required; `stamped_at` written server-side (see below) |
 | `deterministic-deploy` | `DeterministicRunner` cross-unit deploy completed | — |
 | `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run` | — |
-| `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | `escalation_id` **required** — cites the resolving gate escalation, recorded verbatim (no cross-service lookup) |
+| `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | `escalation_id` **required on write** — cites the resolving gate escalation, recorded verbatim (no cross-service lookup) |
 | `deterministic-milestone` | A `kind='predicate'` milestone check exited `0` | — |
 | `operational-verified` | A `normal`-task no-code operational ask closed via a resolved escalation, not a merge | `escalation_id` **and** `note` required |
+
+The per-kind contract has one home:
+`shared/src/shared/task_metadata.py::DoneProvenance`. It holds the kind
+vocabulary, the fields each kind requires, and the evidence fields a `done`
+write records for each kind; the table above summarises it. Three rules hold
+for every kind:
+
+- **Blank means absent.** A whitespace-only value counts as missing, so
+  `commit: "  "` fails a `commit` requirement. Surrounding whitespace is
+  trimmed before the value is recorded.
+- **Evidence is type-checked, not filtered.** A wrongly-typed field such as
+  `pid: "abc"` or `fire_delay_secs: "soon"` refuses the whole write with
+  `done_provenance_invalid`; it is not silently dropped. A well-typed field
+  the kind does not record (for example `pid` on `merged`) is discarded.
+- **The `deterministic-gate` `escalation_id` requirement is write-time
+  only.** New `done` writes must carry it, while stored blobs written before
+  task 5241, which lack it, still read without a schema warning.
+
+A caller that fails a caller bar below is refused on its identity before the
+payload's shape is checked.
 
 `operational-verified` is commitless like the `deterministic-*` kinds, so
 it is likewise exempt from the reopen-freshness gate (which only inspects
@@ -1372,7 +1392,8 @@ related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
 execution_class, merge_lane, pending_since, pending_since_backfilled,
-claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at
+claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at,
+main_health_signature
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1508,8 +1529,20 @@ asymmetry is deliberate; the reason for it is stated once, in
 `escalation/src/escalation/merge_lane_resolution.py`, under the same one-place
 rule this section applies to the carrier census below.
 
+The lane is decided once, at enqueue. Editing `metadata.merge_lane` on a task
+whose request is already queued moves nothing (task 5246). An operator moves a
+request that is still waiting for the merger with the `merge_relane` MCP tool
+(`escalation/src/escalation/server.py::merge_relane`). It also reaches a
+coalesced member by task id and moves the member's whole train. The tool
+changes the live lane at once and writes the new lane as `metadata.merge_lane`
+on every task the entry carries. That write is the durable lane: a train's live
+lane is lost when the train dissolves (for example at a restart drain), but its
+members re-enqueue at the written lane. The tool reports each write, so a
+failed one shows up and can be repeated by hand.
+
 `'high'` remains reserved for the **rare, gated hotfix / main-health class**
-(task 1689) — its three machine writers are all of that shape. Routine work
+(task 1689) — its three machine writers are all of that shape, and its fourth
+writer, the operator's `merge_relane`, is meant for the same class. Routine work
 declaring itself urgent starves the normal lane, which is the failure the
 reservation exists to prevent. The carrier census and the reason this key was
 blessed rather than typed are recorded beside the frozenset entry in
@@ -1526,8 +1559,9 @@ supply is dropped, not honoured, and the strip is logged under
 waiting to be dispatched. It is written only by the fused-memory status
 chokepoints (`sqlite_task_backend.py::stamp_pending_since`, reached from
 `add_task`, `set_task_status` and `set_status_and_stamp_audit`) on a
-`* -> pending` landing, and read by the scheduler's age term and the watchdog
-idle clock. `pending_since_backfilled` is written only by the one-shot v4 ->
+`* -> pending` landing, and read by the orchestrator scheduler's age term
+through `orchestrator/src/orchestrator/pending_age.py::read_pending_age`.
+`pending_since_backfilled` is written only by the one-shot v4 ->
 v5 migration, marking the rows it anchored from `updated_at` so that
 population stays countable.
 
@@ -1897,7 +1931,7 @@ since `_merge_metadata` is a shallow `{**old, **new}` with no deletion
 sentinel. Until task 3777 that made a whole-blob `'replace'` impossible on
 most of the corpus. It is now admitted when the payload carries the stored
 `done_provenance` through verbatim (the contract is
-`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_assert_done_provenance_passthrough`),
+`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_assert_passthrough_only_keys`),
 which is exactly what the migration script sends. Any other shape that
 touches the key is still refused.
 
@@ -1914,20 +1948,38 @@ either key must also pass the whole list through
 - **`defects`**: a list of `DefectDeclaration` records, one per declared
   defect, each keyed by its ref.
   - *Who writes it:* at creation, `submit_task` accepts only fresh `open`
-    entries. After creation only `declare_defect` and
-    `record_defect_outcome` write it, never `update_task`; the PRD's α2 leaf
-    builds those two tools and the `update_task` refusal. A defect leaves
-    `open` only through a recorded I2 transition
+    entries and refuses anything else synchronously with
+    `error == 'defect_creation_refused'`, whose `detail` names the allowed
+    values. After creation `declare_defect` (`Declare`, `DeclareClosure`,
+    `Sighting`) and `record_defect_outcome` (`Proof`, `Rule`) are its only
+    writers. A defect leaves `open` only through a recorded I2 transition
     (`shared/src/shared/defects.py::apply_event`).
   - *PRD:* `plans/defect-tests-prd.md` decisions 7, 13 and 15; Contract I1
     and I2.
 - **`defect_test_retirements`**: a list of `Retirement` records, carried on
   the task whose diff removes a proven defect's test, not on the defect's
   own task.
-  - *Who writes it:* declared through `declare_defect` (a
+  - *Who writes it:* at creation, `submit_task` accepts only unruled
+    entries. After creation it is declared through `declare_defect` (a
     `DeclareRetirement` event) and ruled through `record_defect_outcome` (a
     `Rule` event).
   - *PRD:* `plans/defect-tests-prd.md` decisions 13 and 14.
+
+**The write path** for both keys is
+`fused-memory/src/fused_memory/backends/defect_records.py`, which holds the
+creation floor, the per-ref event fold and the typed refusals; read the
+rules there rather than here. `record_defect_outcome` is meant for the
+orchestrator workflow and `scripts/prove_defect.py` alone. No dispatched
+role's `allowed_tools` grants it (pinned by
+`orchestrator/tests/test_role_defect_outcome_authority.py`), but that list
+is a permission allow list, not a denial, so a dispatched session that
+mounts fused-memory can still reach the tool: no role denies it through
+`disallowed_tools` yet. A `duplicate_of` or `superseded_by` ref must already
+be declared on some task, which `lookup_defect_ref` answers. `update_task`
+never writes either key: it refuses one with
+`error == 'defect_records_via_update_task'`, except under
+`metadata_mode='replace'` when the payload carries the stored value through
+verbatim, the same rule as `done_provenance` above.
 
 **Census corollary:** like `delivered_checks` above, both registrations are
 an import side effect of `shared.defects`, so a census script must import
@@ -2155,13 +2207,26 @@ were prose.
   the default shallow merge can add and overwrite but never delete. Send
   the complete new blob — a `replace` drops every key you omit, including
   the gate markers (`task_kind`, `operational_mode`, `always_escalates`,
-  `execution_class`).
-- `description` is replace-only and capped at 5,000 characters. Breaching
-  the cap times out and the write does NOT land. Combining `append=True`
-  with `description`/`title`/`priority` is rejected outright.
-- Split `details` (append-capable) and `metadata`/`title` into separate
-  `update_task` calls — `append=True` silently drops `metadata` and
-  `title` passed in the same call.
+  `execution_class`). It also drops the stored `pending_since` anchor, even
+  one you copy into the blob (§8).
+- Four keys are the exception: a `replace` must carry `done_provenance`,
+  `defects` and `defect_test_retirements` (§8) and `deferral` (§9
+  "Deferring a task") exactly as stored, present if stored and absent if
+  not; a stored blob that is corrupt or not a JSON object counts as
+  storing none of them. Otherwise the call is refused and nothing is
+  written. Send those keys back exactly as you read them
+  (`sqlite_task_backend.py::_assert_passthrough_only_keys`,
+  `sqlite_task_backend.py::_assert_deferral_unchanged`).
+- `title`, `description` and `priority` are replace-only. Combining any of
+  them with `append=True` is refused with `AppendUnsupportedFieldError`
+  (task 4039), and nothing is written. `append=True` concatenates onto
+  `details`. With `metadata` and no `metadata_mode` it selects the additive
+  merge, which only grows the blob: it unions lists, keeps the stored value
+  on any scalar collision, and never removes a key. So append to `details`
+  in one call, and rotate `description` and `metadata` in a separate call
+  with `append` omitted and `metadata_mode='replace'`.
+- No column has a length cap of its own. The only size guidance is the
+  whole-task threshold above, and no write is refused for exceeding it.
 - Re-read the task from the store afterwards and confirm the status, the
   gate markers and the untouched columns survived.
 
@@ -2204,6 +2269,55 @@ Worked precedents: `autopilot_video` 648 (mem0
 
 ---
 
+## 11. In-place memory amendments are not task-agent work
+
+**A plan step — or a task description — that amends an EXISTING memory in
+place must be routed to a curator sitting or a reconciliation stage, never
+assigned to an orchestrator-dispatched task agent.** In-place amendment
+means `update_memory`'s `content_amend` arm, which rewrites a record's text
+and re-embeds it under the same point id. Architect, implementer, debugger,
+`simple_task` and steward are all dispatched roles; none of them may be told
+to make that call.
+
+**This is certain, not merely discouraged.** The arm is gated on an
+`agent_id`-prefix allowlist that ships as `['recon-stage-', 'curator-']`,
+and every dispatched `agent_id` is `claude-task-<id>-<role>`
+(`orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._agent_identity`),
+which matches neither prefix. The refusal — `Mem0UpdateNotAuthorized` — is
+deterministic, not a race or a flake. The tool is not even reachable: no
+dispatched role is granted `update_memory` at all
+(`orchestrator/src/orchestrator/agents/roles.py::_MEMORY_TOOLS`). A plan
+step naming that call is unexecutable twice over.
+
+**Write this instead.** Either write a NEW memory recording the correction
+— `add_memory` *is* granted to dispatched roles, and a superseding record is
+the sanctioned way for a task agent to correct the store — or file a
+follow-up task for a curator sitting to perform the amendment. Adopting a
+`curator-` `agent_id` to get past the refusal is explicitly forbidden: that
+is self-authorization for a silent-rewrite primitive.
+
+**Widening the allowlist is not the remedy.** The narrow bar on
+`mem0_update.content_amend_allowed_agent_prefixes` is ratified as
+working-as-designed; the suggestion to widen it was retracted in esc-3891-6.
+
+**The cost is measured, not theoretical.** Task 3891's plan step-6
+instructed an implementer to call the arm, pre-specifying a fallback only
+for a metadata rejection. It produced five escalations (esc-3891-4, -5, -6,
+-7, -8) and left residual task 4478 — a curator sitting — outstanding, all
+for a single memory edit.
+
+For the mechanics, read these rather than re-deriving them:
+
+- **`skills/curate-fused-memories/SKILL.md`** — the sanctioned curator
+  route, and the passage separating legitimate adoption of `curator-` from
+  adopting it because you hit `Mem0UpdateNotAuthorized`.
+- **`plans/mem0-in-place-update-decision.md`** §4 — the ratified
+  authorization model, and why the two arms carry different bars.
+- **`OPERATIONS.md`** — the two `mem0_update.*` allowlist keys and the
+  `mem0_update.enabled` kill switch.
+
+---
+
 ## Cross-references
 
 - **`README.md`** — repo orientation and top-level entry points.
@@ -2217,3 +2331,8 @@ Worked precedents: `autopilot_video` 648 (mem0
   of `metadata.delivered_checks`-bearing capability tasks (§3.3).
 - **`docs/legibility/design-invariants.md`** — the design invariants gating
   `/prd` decompose and `/review` phase 2.
+- **`skills/curate-fused-memories/SKILL.md`** — the sanctioned curator
+  sitting: the only dispatched-agent-adjacent route that may amend a memory
+  in place (§11).
+- **`plans/mem0-in-place-update-decision.md`** — the ratified `update_memory`
+  design: tool shape, and the two-arm authorization model behind §11.

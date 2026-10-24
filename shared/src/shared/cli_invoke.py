@@ -138,6 +138,15 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         takes the supervisor's unclean path.
 #                                         Neither blocks a queue.
 #
+# orchestrator/evals/architect_eval.py    14-day default OK (esc-4002-1, task
+#   (invoke_architect invocation)         7320).  A cap lands MID-cell after
+# orchestrator/evals/measurement.py       real spend, which --resume carries
+#   (measured_call invocation)            across the account switch: waiting
+#                                         is ~free, while tainting re-spends
+#                                         it.  AllAccountsCappedException is
+#                                         recorded as an Unmeasured with cause
+#                                         cap_exhausted, never raised.
+#
 # fused_memory/middleware/task_curator.py _CURATOR_CAP_WAIT_SANITY_SECS=120s
 #   (LLM triage calls)                    + park_on_frozen_pool=False.  DEFERS,
 #                                         never creates, when the pool cannot
@@ -173,34 +182,6 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         retries FRESH (resume_on_cap_hit=
 #                                         False).
 #
-# orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 172800 s (48 h).
-#   (run_architect_eval invocation)       RAISED from 1800 s on 2026-08-25
-#                                         (esc-3634-1).  It is the one caller in
-#                                         this table that does NOT take the
-#                                         short house value, deliberately.  A
-#                                         cap lands MID-cell after real spend,
-#                                         which --resume preserves across the
-#                                         account switch: waiting is ~free,
-#                                         while tainting discards that spend and
-#                                         pays it again on the re-run.  48 h
-#                                         skates the 5-hour account caps that
-#                                         produce the common short all-capped
-#                                         windows.  Since task 4002 it also
-#                                         bounds the gate park, so an
-#                                         all-capped window longer than 48 h
-#                                         taints the cell rather than parking
-#                                         to the reset (esc-4002-1).
-#                                         AllAccountsCappedException
-#                                         is still caught and recorded as a
-#                                         `cap_exhausted:` marker on the cell
-#                                         (tainted, so the cell is EXCLUDED from
-#                                         the reported mean rather than scored a
-#                                         fabricated 0.0), never raised.  No
-#                                         max_cap_retries: cooldown doubles per
-#                                         pool cycle, so a fixed count would
-#                                         give a BIGGER account pool LESS
-#                                         wall-clock patience.
-#
 # scripts/legibility/session_runner.py    NO patience at all: park_on_frozen_
 #   (nightly legibility trickle + census, pool=False + max_cap_retries=
 #    every LLM call they make)            gate.account_count.  The contract is
@@ -215,12 +196,6 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         PoolFrozen, which the runner types
 #                                         per task 5947 (all-capped defers at
 #                                         exit 0; all-auth-failed fails loud).
-#                                         is_usable_reply per stage: its
-#                                         codebook is dominated by usage-limit
-#                                         clusters, so a verdict QUOTING a
-#                                         banner must not cap a healthy
-#                                         account, while an unparseable exit-0
-#                                         banner still rotates.
 #                                         cap_wait_sanity_secs left at the
 #                                         default: the two bounds above always
 #                                         fire first.  Was an audited
@@ -2367,7 +2342,6 @@ async def invoke_with_cap_retry(
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     park_on_frozen_pool: bool = True,
-    is_usable_reply: Callable[[str], bool] | None = None,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -2427,20 +2401,14 @@ async def invoke_with_cap_retry(
     must defer rather than wait and must tell a cap from rejected
     credentials, which will not clear at a reset (task 6042).
 
-    *is_usable_reply* decides which SUCCESSFUL results are offered to the cap
-    detector.  ``UsageGate.detect_cap_hit`` builds a synthetic
-    ``success=False`` result before classifying, so a successful reply that
-    merely QUOTES a banner reads as a cap: measured 2026-10-02, a verdict
-    whose evidence quotes ``REAL_CLI_CAP_HIT_MESSAGES[0]`` classifies ``OK()``
-    as it is and ``CapHit`` once forced to fail.  ``None`` (the default)
-    offers every result, unchanged for the fleet.  A predicate offers a
-    successful result only when it REJECTS the output — a reply the caller
-    could not use at all, which is where a banner delivered at exit 0 lands —
-    so a usable reply quoting cap text never costs an account, while an exit-0
-    banner still rotates it (task 5637's route).  The predicate decides only
-    whether to ASK; the gate's strict detector still decides whether it is a
-    cap.  Failed results are always offered.  Consumer: the legibility runner,
-    whose replies routinely quote cap text (task 6042).
+    Only FAILED results are offered to the cap detector.
+    ``UsageGate.detect_cap_hit`` classifies a synthetic ``success=False``
+    result, so a successful reply that merely QUOTES a banner would read as a
+    cap and bench a healthy account (task 6042).  A genuine cap under
+    ``--output-format json`` always arrives with ``is_error`` true at exit 1
+    (measured, task 6213), so it fails here; the one exception is a salvaged
+    structured payload, which is finished work and is returned.  A successful
+    run's near-cap annotation is therefore not recorded (task 7334).
 
     *rebuild_prompt*, when provided, is a ``PromptBuilder`` awaited with no
     arguments immediately before EVERY re-dispatch — whatever triggered it
@@ -2917,14 +2885,9 @@ async def invoke_with_cap_retry(
                     await asyncio.sleep(wait)
                     continue
 
-                offered_to_cap_detector = (
-                    not result.success
-                    or is_usable_reply is None
-                    or not is_usable_reply(result.output)
-                )
                 if (
                     backend in ACCOUNT_POOL_BACKENDS
-                    and offered_to_cap_detector
+                    and not result.success
                     and slot.detect_cap_hit(result.stderr, result.output, backend=backend)
                 ):
                     consecutive_cap_hits += 1

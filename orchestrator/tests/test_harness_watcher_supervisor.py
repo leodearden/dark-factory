@@ -28,9 +28,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import _init_harness_state_for_test
 from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import (
     _WATCHER_ALLOWED_TOOLS,
@@ -652,25 +654,14 @@ class TestRunWatcherRotation:
     ) -> None:
         """The banner's --queue-dir is the SAME path the orchestrator itself uses.
 
-        Task 3605 (review amendment).  escalation.queue_dir is an unconstrained
-        str with nothing forcing it relative, and the harness's own authoritative
-        resolution (_emit_digest) is `Path(project_root) / queue_dir`, which
-        returns an absolute RHS unchanged.  Building the banner's copy by f-string
-        concatenation instead would render '/project//abs/queue' — harmless while
-        it was only a display line, but this banner now hands the agent an
-        executable `--queue-dir` it is told to run verbatim, so a divergence arms
-        an inotify watcher on a directory that never receives escalations and
-        times out (exit 124) every slice for the whole rotation: a silent no-op,
-        precisely what watcher-rearm.sh's guards exist to prevent.
-
-        Asserted against `Path(project_root) / queue_dir` rather than a literal, so
-        this cannot pass by re-deriving the bug it is pinning.
+        Task 3605 (review amendment).  The banner hands the agent an executable
+        `--queue-dir` it is told to run verbatim, so a divergence arms an inotify
+        watcher on a directory that never receives escalations.  Both the banner
+        line and the argument must be shared.project_layout.escalation_queue_dir.
         """
         from shared.cli_invoke import AgentResult
 
         h = _make_rotation_harness(tmp_path)
-        abs_queue = tmp_path / 'elsewhere' / 'escalations'
-        h.config.escalation.queue_dir = str(abs_queue)
         df_root = tmp_path / 'df-tooling-checkout'
         captured: dict = {}
 
@@ -685,18 +676,13 @@ class TestRunWatcherRotation:
             await h._run_watcher_rotation()
 
         prompt = captured['prompt']
-        expected = str(
-            Path(h.config.project_root) / h.config.escalation.queue_dir
-        )
+        expected = str(escalation_queue_dir(h.config.project_root))
         assert f'--queue-dir {expected}' in prompt, (
             'the re-arm command must name the queue the harness itself watches; '
             f'expected --queue-dir {expected} in:\n{prompt}'
         )
         assert f'Escalation queue: {expected}' in prompt, (
             'the banner line and the re-arm argument must be the same string'
-        )
-        assert f'{h.config.project_root}{abs_queue}' not in prompt, (
-            'an absolute queue_dir must not be concatenated onto project_root'
         )
 
     @pytest.mark.asyncio
@@ -868,6 +854,39 @@ class TestRunWatcherRotation:
         assert 'INHERITED' in prompt, 'the banner must say the value reaches the child'
         assert 'known-bad' in prompt, 'the banner must say the inherited value is wrong'
         assert 'ask the operator' in prompt
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('root_resolves', [True, False], ids=['resolved', 'unresolved'])
+    async def test_user_prompt_carries_rearm_outcome_guidance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_resolves: bool
+    ) -> None:
+        """The outcome-branching block reaches prompt= whether or not the tooling root resolved.
+
+        Task 3606: the re-arm command the banner hands over is useless without
+        what to do with its result, in both banner branches.
+        """
+        from shared.cli_invoke import AgentResult
+
+        if not root_resolves:
+            monkeypatch.delenv(DARK_FACTORY_ROOT_ENV, raising=False)
+        h = _make_rotation_harness(tmp_path)
+        resolved_root = tmp_path / 'df-tooling-checkout' if root_resolves else None
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=resolved_root),
+        ):
+            await h._run_watcher_rotation()
+
+        assert WATCHER_REARM_OUTCOME_GUIDANCE in captured['prompt'], (
+            'the rotation prompt must carry WATCHER_REARM_OUTCOME_GUIDANCE verbatim; '
+            f'got:\n{captured["prompt"]}'
+        )
 
     @pytest.mark.asyncio
     async def test_rotation_start_logs_bash_max_timeout_ms(

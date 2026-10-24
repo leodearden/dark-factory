@@ -4,7 +4,10 @@ Joins three sources — the per-root task snapshot unit
 (``dashboard.data.task_snapshot``, which owns every read of the task tree),
 per-task runtime state (via the orchestrator's escalation MCP,
 ``get_task_runtime_state``), and optional burst state from reconciliation —
-into the ``ACTIVE_TASKS`` shape consumed by the React dashboard's tasks tab.
+into the per-root task rows that ``/api/v2/dashboard/tasks`` serves as
+``TASKS_SNAPSHOT[p].rows`` and that
+``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state`` joins
+against.
 
 THIS MODULE READS NOTHING ITSELF beyond the runtime fan-out and the batched
 external-status tail. A root's task state arrives as a ``TaskSnapshot``,
@@ -13,9 +16,11 @@ half, whether that measurement succeeded and why not. What lives here is the
 WALK — the budget, the admission width, the rotation, the canonical
 re-assembly — and the SHAPING of one root's rows out of one unit.
 
-Output shape (per task) matches ``data.js`` mock fixtures. A task's
-description/details are NOT on it: the Task Detail pane fetches them for the
-selected task from ``dashboard/src/dashboard/api/task_prose.py::api_task_prose``.
+Output shape (per row); the ``TASKS_SNAPSHOT`` seed comment in
+``dashboard/src/dashboard/static/redux/data.js`` documents the same shape for
+the client. A task's description/details are NOT on it: the Task Detail pane
+fetches them for the selected task from
+``dashboard/src/dashboard/api/task_prose.py::api_task_prose``.
 
     {
         'id': 'dark_factory/T-19',
@@ -59,6 +64,8 @@ selected task from ``dashboard/src/dashboard/api/task_prose.py::api_task_prose``
         'meta_files': ['src/...py', ...],  # taskmaster metadata.files; retained on API for
                                            # debugging/tooling — no frontend UI reads it directly
         'train': {'id': 'demo', 'order': 0},  # present when metadata.train is set; None otherwise
+        'deferral': {...},  # ONLY on a deferred row: dashboard.data.deferral_summary's summary,
+                            # or None when the row carries no record
     }
 
 Lock state is surfaced via the scheduler endpoint (see /api/v2/dashboard/scheduler).
@@ -81,11 +88,13 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.timestamps import parse_timestamp_or_warn
 
 from dashboard.config import DashboardConfig
+from dashboard.data.deferral_summary import UNREAD, HoldReads, deferral_row_fields
 from dashboard.data.task_runtime import fetch_task_runtime
 from dashboard.data.task_snapshot import (
     SnapshotFailure,
     TaskSnapshot,
     acquire_snapshot,
+    measured_status_map,
     unmeasured_snapshot,
     withhold_rows,
 )
@@ -210,12 +219,13 @@ _TASKS_PER_PROJECT_BUDGET = 14.0
 # called in-process against the live fused-memory with the production roots,
 # served 30.4 MB: 9 roots, all fresh on both halves, and 3128 active rows.
 # ACTIVE_TASKS was 15.2 MB, and the same rows again under
-# TASKS_SNAPSHOT[p].rows were another 15.2 MB, until γ3 (task 5590) retires
-# ACTIVE_TASKS. Main's live endpoint, at the same hour, served 17.4 MB
-# for 3634 rows. 506 of those rows were terminal, at 2.2 MB, so that 2.2 MB is
-# all that leaving terminal rows out of the default render saved on the wire.
-# The PRD baseline's 9.4 MB terminal-window row measures the READ (its caption:
-# the dashboard's own fetch_tasks), not the capped slice of it that shipped.
+# TASKS_SNAPSHOT[p].rows were another 15.2 MB, until γ3 (task 5590) retired
+# ACTIVE_TASKS (sizes not re-measured since). Main's live endpoint, at the same
+# hour, served 17.4 MB for 3634 rows. 506 of those rows were terminal, at
+# 2.2 MB, so that 2.2 MB is all that leaving terminal rows out of the default
+# render saved on the wire. The PRD baseline's 9.4 MB terminal-window row
+# measures the READ (its caption: the dashboard's own fetch_tasks), not the
+# capped slice of it that shipped.
 _TASKS_TOTAL_BUDGET = 20.0
 
 # How many project roots ``collect_tasks_with_counts`` may have in flight.
@@ -372,6 +382,7 @@ def _build_task_row(
     *,
     prd: str | None = None,
     now: datetime | None = None,
+    hold_reads: HoldReads = UNREAD,
 ) -> dict:
     """Build the common row fields shared by active and done task rows.
 
@@ -413,6 +424,10 @@ def _build_task_row(
     NOT the render instant, so a stale half is not re-judged against a later
     clock; ``shape_terminal_rows`` passes the render instant, which a terminal
     row never consults (the predicate gates on ``in-progress``).
+
+    ``deferral`` is present only on a deferred row, worded against
+    *hold_reads* by ``dashboard.data.deferral_summary``, and ``None`` when the
+    row carries no record.
     """
     metadata = task.get('metadata') or {}
     meta_files = list(metadata.get('files') or [])
@@ -449,6 +464,7 @@ def _build_task_row(
         'train': train,
         'external_deps': external_deps,
         'prd': prd if prd is not None else _coalesce_prd(metadata),
+        **deferral_row_fields(task, now=resolve_now(now), reads=hold_reads),
     }
 
 
@@ -662,6 +678,10 @@ def _shape_one_project(
 
     # Lookup table for dep title/status resolution within the same project.
     by_id: dict[int, dict] = {t['id']: t for t in tasks if isinstance(t.get('id'), int)}
+    hold_reads = HoldReads(
+        carrier_statuses=measured_status_map(snapshot),
+        holder_liveness=snapshot.holder_liveness,
+    )
 
     active: list[dict] = []
     for task in tasks:
@@ -670,7 +690,9 @@ def _shape_one_project(
             continue
         rt = _runtime_fields(runtime_index, runtime_status, task_id, now=now)
         uid = task_uid(project, task_id)
-        row = _build_task_row(project, task, task_id, rt, uid, now=judged_at)
+        row = _build_task_row(
+            project, task, task_id, rt, uid, now=judged_at, hold_reads=hold_reads,
+        )
         # active rows: started from the runtime entry; deps from task tree.
         row['started'] = rt['started']
         row['deps'] = _resolve_deps(task, by_id, project, status_map=snapshot.status_map)

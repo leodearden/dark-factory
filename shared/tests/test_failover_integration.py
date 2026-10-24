@@ -57,6 +57,11 @@ def make_result(success=True, output='done', session_id='', stderr='', cost_usd=
     )
 
 
+def make_cap_result(**kw):
+    """A genuine cap: the CLI reports it as a failed turn, banner on stderr."""
+    return make_result(success=False, **kw)
+
+
 def _cap_stderr(account=''):
     """Return stderr text that triggers cap detection."""
     return f"You've hit your usage limit for account {account}. Your limit resets in 5h."
@@ -82,9 +87,9 @@ class TestFullFailoverLifecycle:
             tokens_used.append(token)
             call_count[0] += 1
             if token == 'fake-token-A':
-                return make_result(success=True, output='', stderr=_cap_stderr('A'))
+                return make_cap_result(output='', stderr=_cap_stderr('A'))
             elif token == 'fake-token-B':
-                return make_result(success=True, output='', stderr=_cap_stderr('B'))
+                return make_cap_result(output='', stderr=_cap_stderr('B'))
             else:
                 return make_result(success=True, output='task done', cost_usd=1.23)
 
@@ -120,7 +125,7 @@ class TestFullFailoverLifecycle:
             call_count[0] += 1
             kwargs.get('oauth_token')
             if call_count[0] <= 3:
-                return make_result(success=True, output='', stderr=_cap_stderr())
+                return make_cap_result(output='', stderr=_cap_stderr())
             return make_result(success=True, output='finally done', cost_usd=0.7)
 
         async def background_uncap():
@@ -160,7 +165,7 @@ class TestFullFailoverLifecycle:
             call_count[0] += 1
             kwargs.get('oauth_token')
             if call_count[0] <= 5:
-                return make_result(success=True, output='', stderr=_cap_stderr())
+                return make_cap_result(output='', stderr=_cap_stderr())
             return make_result(success=True, output='done', cost_usd=0.3)
 
         async def background_uncap():
@@ -206,7 +211,7 @@ class TestSessionResumeAcrossFailover:
         """A: session_id='sess-1', cap hit -> B: resume with sess-1 -> success."""
         gate = make_gate(['A', 'B'])
 
-        capped = make_result(session_id='sess-1', stderr=_cap_stderr('A'))
+        capped = make_cap_result(session_id='sess-1', stderr=_cap_stderr('A'))
         ok = make_result(success=True, output='resumed ok', cost_usd=0.8)
 
         with (
@@ -230,9 +235,9 @@ class TestSessionResumeAcrossFailover:
         """A caps (sess-1) -> B resume caps (sess-1) -> C resume with sess-1."""
         gate = make_gate(['A', 'B', 'C'])
 
-        capped_a = make_result(session_id='sess-1', stderr=_cap_stderr('A'))
+        capped_a = make_cap_result(session_id='sess-1', stderr=_cap_stderr('A'))
         # B also caps while resuming — returns the *same* session_id
-        capped_b = make_result(session_id='sess-1', stderr=_cap_stderr('B'))
+        capped_b = make_cap_result(session_id='sess-1', stderr=_cap_stderr('B'))
         ok = make_result(success=True, output='done on C')
 
         with (
@@ -255,7 +260,7 @@ class TestSessionResumeAcrossFailover:
         """A caps (sess-1) -> B resume fails (not cap) -> C fresh with original prompt."""
         gate = make_gate(['A', 'B', 'C'])
 
-        capped_a = make_result(session_id='sess-1', stderr=_cap_stderr('A'))
+        capped_a = make_cap_result(session_id='sess-1', stderr=_cap_stderr('A'))
         failed_resume = make_result(success=False, output='resume error')
         ok = make_result(success=True, output='fresh success')
 
@@ -281,7 +286,7 @@ class TestSessionResumeAcrossFailover:
         gate = make_gate(['A', 'B', 'C'])
 
         results = [
-            make_result(session_id='sess-1', stderr=_cap_stderr('A')),  # A caps
+            make_cap_result(session_id='sess-1', stderr=_cap_stderr('A')),  # A caps
             make_result(success=False, output='resume error'),          # B resume fails
             make_result(success=True, output='ok'),                     # C fresh
         ]
@@ -325,7 +330,7 @@ class TestAllCappedThenResume:
         async def mock_invoke(**kwargs):
             call_count[0] += 1
             if call_count[0] <= 2:
-                return make_result(stderr=_cap_stderr())
+                return make_cap_result(stderr=_cap_stderr())
             return make_result(success=True, output='unblocked')
 
         async def background_uncap():
@@ -362,7 +367,7 @@ class TestAllCappedThenResume:
         async def mock_invoke(**kwargs):
             call_count[0] += 1
             if call_count[0] == 1:
-                return make_result(stderr=_cap_stderr())
+                return make_cap_result(stderr=_cap_stderr())
             return make_result(success=True, output='ok')
 
         async def run_retry():
@@ -435,7 +440,7 @@ class TestSingleAccountFullLifecycle:
         async def mock_invoke(**kwargs):
             call_count[0] += 1
             if call_count[0] == 1:
-                return make_result(stderr=_cap_stderr())
+                return make_cap_result(stderr=_cap_stderr())
             return make_result(success=True, output='solo done')
 
         async def background_uncap():
@@ -476,7 +481,7 @@ class TestSingleAccountFullLifecycle:
         async def mock_invoke(**kwargs):
             call_count[0] += 1
             if call_count[0] <= 2:
-                return make_result(stderr=_cap_stderr())
+                return make_cap_result(stderr=_cap_stderr())
             return make_result(success=True, output='finally done')
 
         async def uncap_on_sleep(duration):
@@ -750,7 +755,7 @@ class TestConcurrentTasksWithFailover:
             await asyncio.sleep(0)
             # First invocation on A triggers cap
             if token == 'fake-token-A' and invoke_count[0] == 1:
-                return make_result(stderr=_cap_stderr('A'), cost_usd=0.0)
+                return make_cap_result(stderr=_cap_stderr('A'), cost_usd=0.0)
             return make_result(success=True, output='ok', cost_usd=0.1)
 
         with (
@@ -818,10 +823,10 @@ class TestConcurrentTasksWithFailover:
             await asyncio.sleep(0)
             # First call on A caps it
             if token == 'fake-token-A' and not gate._accounts[0].capped:
-                return make_result(stderr=_cap_stderr('A'), cost_usd=0.0)
+                return make_cap_result(stderr=_cap_stderr('A'), cost_usd=0.0)
             # First call on B caps it
             if token == 'fake-token-B' and not gate._accounts[1].capped:
-                return make_result(stderr=_cap_stderr('B'), cost_usd=0.0)
+                return make_cap_result(stderr=_cap_stderr('B'), cost_usd=0.0)
             return make_result(success=True, output='ok', cost_usd=0.05)
 
         with (
@@ -891,7 +896,7 @@ class TestCostTrackingIntegration:
         cost_store.save_invocation = AsyncMock()
         cost_store.save_account_event = AsyncMock()
 
-        capped = make_result(stderr=_cap_stderr('A'))
+        capped = make_cap_result(stderr=_cap_stderr('A'))
         ok = make_result(success=True, output='ok', cost_usd=0.5)
 
         with (
@@ -939,7 +944,7 @@ class TestCostTrackingIntegration:
         cost_store.save_invocation = AsyncMock(side_effect=RuntimeError('db locked'))
         cost_store.save_account_event = AsyncMock(side_effect=RuntimeError('db locked'))
 
-        capped = make_result(stderr=_cap_stderr('A'))
+        capped = make_cap_result(stderr=_cap_stderr('A'))
         ok = make_result(success=True, output='ok')
 
         with (
@@ -974,7 +979,7 @@ async def _await_account_events(store, start_iso, end_iso, event_type, *, deadli
 
 async def _invoke_until_first_detection(gate, store, stderr, cwd):
     async def _cli(**_kw):
-        return make_result(stderr=stderr)
+        return make_cap_result(stderr=stderr)
 
     with pytest.raises(AllAccountsCappedException):
         await invoke_with_cap_retry(
@@ -1069,7 +1074,7 @@ class TestEdgeCases:
         gate = make_gate(['A', 'B'])
 
         long_stderr = 'x' * 10_000 + "\nYou've hit your usage limit. Resets in 3h.\n"
-        capped = make_result(stderr=long_stderr)
+        capped = make_cap_result(stderr=long_stderr)
         ok = make_result(success=True, output='ok')
 
         with (
@@ -1174,7 +1179,7 @@ class TestConfigDirIntegrationWithFailover:
         gate = make_gate(['A', 'B'])
         config_dir = TaskConfigDir('failover-cred-test', base_dir=tmp_path)
 
-        capped = make_result(stderr=_cap_stderr('A'))
+        capped = make_cap_result(stderr=_cap_stderr('A'))
         ok = make_result(success=True, output='ok')
 
         tokens_written = []

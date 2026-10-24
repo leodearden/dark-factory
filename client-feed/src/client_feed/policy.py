@@ -1,4 +1,4 @@
-"""The publisher's factory-side policy (plans/client-feed-prd.md §7.6): what a client sees and how its lines count."""
+"""The publisher's factory-side policy (plans/client-feed-prd.md §7.6, §14.3): what a client sees, how its lines count, and the defect filer's block."""
 
 from __future__ import annotations
 
@@ -17,12 +17,13 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    StrictInt,
+    HttpUrl,
+    StrictBool,
     ValidationError,
     model_validator,
 )
 
-from client_feed.contract import FileKind, NonNegativeInt, ProjectId, RepoPath
+from client_feed.contract import FileKind, NonNegativeInt, PositiveInt, ProjectId, RepoPath
 from client_feed.sources.git import GitError, repository_toplevel
 
 DEFAULT_TEST_GLOBS: Final = ('**/tests/**', '**/test_*.py', '**/*_test.py', '**/conftest.py')
@@ -113,7 +114,33 @@ def _require_absolute(path: Path) -> Path:
 Glob = Annotated[RepoPath, AfterValidator(_require_compilable)]
 Globs = tuple[Glob, ...]
 AbsolutePath = Annotated[Path, AfterValidator(_require_absolute)]
-PositiveInt = Annotated[StrictInt, Field(ge=1)]
+
+
+def _require_outside(what: str, path: Path, *, of: str, container: Path) -> None:
+    if path.is_relative_to(container):
+        raise ValueError(f'{what} {path} must lie outside {of} {container}')
+
+
+class TaskPriority(StrEnum):
+    """The factory's task priority tiers, re-declared from orchestrator/src/orchestrator/config.py::PRIORITY_TIERS because client_feed may not import orchestrator."""
+
+    CRITICAL = 'critical'
+    HIGH = 'high'
+    MEDIUM = 'medium'
+    LOW = 'low'
+    POLISH = 'polish'
+
+
+class FilerPolicy(BaseModel):
+    """The client defect filer's block (§14.3)."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    fused_memory_url: HttpUrl = HttpUrl('http://127.0.0.1:8002')
+    state_dir: AbsolutePath
+    auto_dispatch: StrictBool = False
+    interval_seconds: PositiveInt = 10
+    fix_priority: TaskPriority = TaskPriority.HIGH
 
 
 class Policy(BaseModel):
@@ -136,6 +163,8 @@ class Policy(BaseModel):
     generated_globs: Globs = ()
     max_line_bytes: PositiveInt = 400
     max_cases_per_run: PositiveInt = 5000
+    filer_grace_seconds: PositiveInt = 600
+    filer: FilerPolicy | None = None
 
     @model_validator(mode='before')
     @classmethod
@@ -153,10 +182,19 @@ class Policy(BaseModel):
         if self.out_dir == self.in_dir:
             raise ValueError(f'out_dir and in_dir must differ, both are {self.out_dir}')
         for name, path in (('out_dir', self.out_dir), ('in_dir', self.in_dir)):
-            if path.is_relative_to(self.project_root):
-                raise ValueError(
-                    f'{name} {path} must lie outside project_root {self.project_root}'
-                )
+            _require_outside(name, path, of='project_root', container=self.project_root)
+        return self
+
+    @model_validator(mode='after')
+    def _filer_state_dir_stands_apart(self) -> Self:
+        if self.filer is None:
+            return self
+        for name, path in (
+            ('out_dir', self.out_dir),
+            ('in_dir', self.in_dir),
+            ('project_root', self.project_root),
+        ):
+            _require_outside('filer.state_dir', self.filer.state_dir, of=name, container=path)
         return self
 
     def is_visible(self, path: str) -> bool:
@@ -253,28 +291,45 @@ def _require_repository_root(config: Path, policy: Policy) -> None:
         )
 
 
-def _require_owned_out_dir(config: Path, policy: Policy) -> None:
-    out_dir = policy.out_dir
+class OutDirRefused(Exception):
+    """An out_dir the publisher must not write to: missing, not a real directory, or another user's."""
+
+    def __init__(self, *, problem: PolicyProblem, out_dir: Path, detail: str) -> None:
+        self.problem = problem
+        self.out_dir = out_dir
+        self.detail = detail
+        super().__init__(f'out_dir refused ({problem}): {detail}')
+
+
+def require_usable_out_dir(out_dir: Path) -> None:
+    """The one check that out_dir is a directory, not a symlink, owned by the running user; at policy load and at writer open."""
     try:
         status = os.lstat(out_dir)
     except OSError as exc:
-        raise PolicyError(
-            config=config,
+        raise OutDirRefused(
             problem=PolicyProblem.OUT_DIR_UNUSABLE,
+            out_dir=out_dir,
             detail=f'out_dir {out_dir} cannot be inspected: {exc.strerror}',
         ) from exc
     if not stat.S_ISDIR(status.st_mode):
-        raise PolicyError(
-            config=config,
+        raise OutDirRefused(
             problem=PolicyProblem.OUT_DIR_UNUSABLE,
+            out_dir=out_dir,
             detail=f'out_dir {out_dir} is not a directory (a symlink is refused)',
         )
     if status.st_uid != os.geteuid():
-        raise PolicyError(
-            config=config,
+        raise OutDirRefused(
             problem=PolicyProblem.OUT_DIR_NOT_OWNED,
+            out_dir=out_dir,
             detail=f'out_dir {out_dir} is owned by uid {status.st_uid}, not the running uid {os.geteuid()}',
         )
+
+
+def _require_owned_out_dir(config: Path, policy: Policy) -> None:
+    try:
+        require_usable_out_dir(policy.out_dir)
+    except OutDirRefused as exc:
+        raise PolicyError(config=config, problem=exc.problem, detail=exc.detail) from exc
 
 
 def load_policy(config: Path) -> Policy:

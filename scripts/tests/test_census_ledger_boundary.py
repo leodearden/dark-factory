@@ -37,6 +37,9 @@ _DATE = "2026-10-06"
 _RUN_ID = "census-p-20261006"
 _EMPTY_JUDGMENT = json.dumps({"matches": [], "candidates": []})
 _LANDED = unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1)
+_EMPTY_SYNTHESIS = json.dumps(
+    {"new": [], "re_observed": [], "phase_refinements": [], "corrections": [], "notes": []},
+)
 _ONE_HOT_AXES = itertools.count()
 
 
@@ -171,7 +174,7 @@ class _Census:
             selection_of=lambda: source.selection,
             invoke=_Invoke(),
             verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
-            synthesize_fn=lambda verified, *, model: "No novel clusters this census.",
+            synthesize_fn=lambda brief, *, model: _EMPTY_SYNTHESIS,
             submit_fn=_Recorder({"ticket": "tkt_1"}),
             task_store=FakeTaskStore(),
             escalate_fn=_Recorder(),

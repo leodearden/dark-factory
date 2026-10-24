@@ -5,7 +5,9 @@ merge was rebased onto a moved main, whether that rebased tree may advance
 without a fresh verify. ``ReverifyGateReason`` names every way the decision
 can go, and is the one home of which reasons skip the verify and which
 ``GateClearance`` a skip yields. ``ReverifyGateDecision`` records the facts
-the decision was made on; ``event_data`` renders them as the row's payload.
+the decision was made on, and carries the history leg command a
+``same_tree_history_leg`` decision runs; ``event_data`` renders the facts as
+the row's payload.
 
 The row is written BEFORE any re-verify runs, so it states what the gate
 decided, not how a fired re-verify ended: that verdict is the ``merge_verify``
@@ -34,6 +36,8 @@ class GateClearance(StrEnum):
     """Footprint-disjoint from trusted drift; see ``gates.py::_disjoint_skip_blockers``."""
     reverified = 'reverified'
     """A full re-verify of the rebased tree passed."""
+    history_leg = 'history_leg'
+    """The rebased tree is the verified tree, and the project's declared history leg passed."""
 
 
 class ReverifyGateReason(StrEnum):
@@ -49,6 +53,9 @@ class ReverifyGateReason(StrEnum):
     """The branch and the intervening main delta touched a common path."""
     overlap_unknown = 'overlap_unknown'
     """The overlap probe failed, so the overlap is unknown."""
+    same_tree_history_leg = 'same_tree_history_leg'
+    """The rebased tree is the verified tree, but the project declares a history leg, so only
+    that leg runs (``merge_gate_history_pure`` with ``merge_gate_history_test_command``)."""
 
     @property
     def skip_clearance(self) -> GateClearance | None:
@@ -75,18 +82,24 @@ class ReverifyGateDecision:
     rebased_onto: str
     overlap: tuple[str, ...] = ()
     blockers: tuple[str, ...] = ()
+    history_leg_command: str | None = None
 
     def __post_init__(self) -> None:
         overlap_fits = bool(self.overlap) == (self.reason is ReverifyGateReason.overlap)
         blockers_fit = bool(self.blockers) == (
             self.reason is ReverifyGateReason.disjoint_untrusted
         )
-        if not (overlap_fits and blockers_fit):
+        leg = self.history_leg_command
+        leg_fits = (leg is not None) == (
+            self.reason is ReverifyGateReason.same_tree_history_leg
+        ) and (leg is None or bool(leg.strip()))
+        if not (overlap_fits and blockers_fit and leg_fits):
             raise ValueError(
                 f'ReverifyGateDecision for task {self.task_id}: reason {self.reason} '
-                f'requires overlap paths exactly for overlap and blockers exactly for '
-                f'disjoint_untrusted; got overlap={self.overlap!r}, '
-                f'blockers={self.blockers!r}'
+                f'requires overlap paths exactly for overlap, blockers exactly for '
+                f'disjoint_untrusted and a non-blank history leg command exactly for '
+                f'same_tree_history_leg; got overlap={self.overlap!r}, '
+                f'blockers={self.blockers!r}, history_leg_command={leg!r}'
             )
 
     @property

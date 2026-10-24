@@ -41,6 +41,7 @@ from fused_memory.maintenance.link_heal import (
     undo_changes,
 )
 from fused_memory.maintenance.link_heal_store import LiveRecord, MetadataChange, text_sha256
+from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     CONTESTED_METADATA_KEY,
@@ -61,6 +62,7 @@ def _state(
     kind: str | None = AMENDMENT_KIND,
     *,
     contested: Any = None,
+    contested_by_triage: Any = None,
     presence: ParentPresence = ParentPresence.FOUND,
     parent_meta: dict[str, Any] | None = None,
     has_children: bool = False,
@@ -73,6 +75,8 @@ def _state(
         meta['kind'] = kind
     if contested is not None:
         meta[CONTESTED_METADATA_KEY] = contested
+    if contested_by_triage is not None:
+        meta[TRIAGE_CONTESTED_METADATA_KEY] = contested_by_triage
     parent = (
         LiveRecord(memory_id=PARENT, text=parent_text, metadata=parent_meta or {})
         if presence is ParentPresence.FOUND
@@ -196,6 +200,66 @@ class TestDecidePrecedence:
         assert kind_class('peer') is KindClass.PEER
 
 
+class TestATriageStampedContest:
+    """H1 row 2 amendment (task 6533): only a hand-declared contest is protected.
+
+    A contest write triage's judge stamped is adjudicated like any other link
+    and healed by detach only.
+    """
+
+    @pytest.mark.parametrize('verdict', [*Verdict, None])
+    def test_a_hand_declared_contest_is_reported_whatever_the_verdict(self, verdict):
+        basis = None if verdict is None else _basis(verdict)
+        assert decide(_state(contested=True), basis).outcome is Report.CONTESTED_REPORTED
+
+    @pytest.mark.parametrize('marker', ['true', 1, False])
+    def test_a_marker_that_is_not_exactly_true_keeps_the_protection(self, marker):
+        state = _state(contested=True, contested_by_triage=marker)
+        assert decide(state, _basis('RELATED')).outcome is Report.CONTESTED_REPORTED
+
+    @pytest.mark.parametrize('verdict', ['RELATED', 'UNRELATED'])
+    def test_a_triage_stamped_misfile_is_detached(self, verdict):
+        decision = decide(_state(contested=True, contested_by_triage=True), _basis(verdict))
+        assert decision.outcome is HealAction.DETACH
+        assert decision.basis_source is BasisSource.CORPUS
+
+    def test_a_triage_stamped_contest_with_its_parent_gone_is_a_deterministic_detach(self):
+        state = _state(
+            contested=True, contested_by_triage=True, presence=ParentPresence.ABSENT,
+        )
+        decision = decide(state, None)
+        assert decision.outcome is HealAction.DETACH
+        assert decision.basis_source is BasisSource.DETERMINISTIC
+
+    @pytest.mark.parametrize(
+        ('kind', 'verdict'),
+        [
+            *((AMENDMENT_KIND, verdict) for verdict in ('SAME', 'EXTENDS', 'SUBSUMED', 'CORRECTS')),
+            *((SIGHTING_KIND, verdict) for verdict in ('EXTENDS', 'CORRECTS')),
+            *((None, verdict) for verdict in ('EXTENDS', 'CORRECTS', 'SAME')),
+        ],
+    )
+    def test_a_triage_stamped_contest_is_healed_by_detach_only(self, kind, verdict):
+        state = _state(kind, contested=True, contested_by_triage=True)
+        assert decide(state, _basis(verdict)).outcome is Report.NO_ACTION
+
+    def test_unclear_stays_unclear(self):
+        state = _state(contested=True, contested_by_triage=True)
+        assert decide(state, _basis('UNCLEAR')).outcome is Report.UNCLEAR
+
+    def test_it_reaches_the_verdict_rows_unrated(self):
+        state = _state(contested=True, contested_by_triage=True)
+        assert decide(state, None).outcome is Report.UNEXAMINED
+
+    def test_a_chain_still_outranks_it(self):
+        state = _state(
+            contested=True,
+            contested_by_triage=True,
+            parent_meta={PARENT_ID_KEY: '33333333-3333-3333-3333-333333333333'},
+        )
+        assert decide(state, _basis('RELATED')).outcome is Report.CHAIN_REPORTED
+
+
 class TestStaleness:
     def test_an_edited_child_is_stale(self):
         state = _state(child_text='edited after rating')
@@ -211,8 +275,16 @@ class TestStaleness:
         assert decision.basis_source is BasisSource.DETERMINISTIC
 
 
-def _image(kind: str | None, *, contested: Any = None, parent: str | None = PARENT) -> LinkImage:
-    return LinkImage(parent_id=parent, kind=kind, contested=contested)
+def _image(
+    kind: str | None,
+    *,
+    contested: Any = None,
+    contested_by_triage: Any = None,
+    parent: str | None = PARENT,
+) -> LinkImage:
+    return LinkImage(
+        parent_id=parent, kind=kind, contested=contested, contested_by_triage=contested_by_triage,
+    )
 
 
 class TestChangeFor:
@@ -262,6 +334,13 @@ class TestChangeFor:
         post = post_image_for(HealAction.DETACH, _image('extension'))
         assert post.as_dict() == {'kind': 'extension'}
 
+    def test_detaching_a_triage_stamped_contest_drops_the_flag_and_its_marker(self):
+        pre = _image(AMENDMENT_KIND, contested=True, contested_by_triage=True)
+        assert change_for(HealAction.DETACH, pre) == MetadataChange.delete_only(
+            [PARENT_ID_KEY, 'kind', CONTESTED_METADATA_KEY, TRIAGE_CONTESTED_METADATA_KEY],
+        )
+        assert post_image_for(HealAction.DETACH, pre).as_dict() == {}
+
 
 class TestUndoChanges:
     def test_undoing_a_detach_restores_parent_and_kind_in_one_patch(self):
@@ -269,6 +348,18 @@ class TestUndoChanges:
         post = post_image_for(HealAction.DETACH, pre)
         assert undo_changes(post, pre) == [
             MetadataChange.patch_only({PARENT_ID_KEY: PARENT, 'kind': AMENDMENT_KIND}),
+        ]
+
+    def test_undoing_a_triage_contest_detach_restores_every_key_in_one_patch(self):
+        pre = _image(AMENDMENT_KIND, contested=True, contested_by_triage=True)
+        post = post_image_for(HealAction.DETACH, pre)
+        assert undo_changes(post, pre) == [
+            MetadataChange.patch_only({
+                PARENT_ID_KEY: PARENT,
+                'kind': AMENDMENT_KIND,
+                CONTESTED_METADATA_KEY: True,
+                TRIAGE_CONTESTED_METADATA_KEY: True,
+            }),
         ]
 
     def test_undoing_a_no_kind_completion_deletes_the_kind(self):

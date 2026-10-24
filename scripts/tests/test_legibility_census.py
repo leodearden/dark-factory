@@ -25,6 +25,7 @@ import logging
 import math
 import re
 import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
@@ -48,6 +49,7 @@ from legibility import (
     session_ledger,
     session_runner,
     similarity,
+    synthesis,
     task_store,
     trickle_state,
     unlanded,
@@ -425,21 +427,25 @@ def test_mine_to_saturation_storm_batch_never_counts_as_saturated():
     assert len(result.batch_stats) == 4
 
     assert result.batch_stats[0].saturated is True
-    assert result.batch_stats[0].status == "ok"
+    assert isinstance(result.batch_stats[0].status, coder.CodingStatus)
+    assert result.batch_stats[0].status == coder.CodingStatus.OK
 
     storm = result.batch_stats[1]
     assert storm.total == 10
     assert storm.succeeded == 4
     assert storm.failed == 6
-    assert storm.status == "failure", "RunResult.status must be surfaced on BatchStats"
+    assert isinstance(storm.status, coder.CodingStatus)
+    assert storm.status == coder.CodingStatus.FAILURE, (
+        "RunResult.status must be surfaced on BatchStats"
+    )
     assert storm.dup_rate == pytest.approx(1.0), "dup_rate is still recorded for visibility"
     assert storm.saturated is False, "a storm batch must never satisfy saturation"
 
     # post-storm-reset: TWO fresh consecutive real-saturated batches are needed to stop
     assert result.batch_stats[2].saturated is True
-    assert result.batch_stats[2].status == "ok"
+    assert result.batch_stats[2].status == coder.CodingStatus.OK
     assert result.batch_stats[3].saturated is True
-    assert result.batch_stats[3].status == "ok"
+    assert result.batch_stats[3].status == coder.CodingStatus.OK
 
 
 # ---------------------------------------------------------------------------
@@ -1369,7 +1375,6 @@ def test_render_report_carries_each_piece_in_its_own_section():
     matrix_md = "| origin \\ manifested | merge |\n| --- | --- |\n| implement | 2 |\n"
     sections = _sections(
         matrix_md=matrix_md,
-        synthesis_md="Fable synthesis prose goes here.",
         filing=_filing_record("tkt_1234", "tkt_1235"),
         cost_note="~$3.42 across 20 Sonnet calls + 1 Fable call.",
     )
@@ -1398,7 +1403,7 @@ def test_render_report_carries_each_piece_in_its_own_section():
     assert "# confusion census 2026-07-14" in header
     assert "Project: dark_factory" in header
     assert matrix_md in _section_text(sections, mod.SECTION_MATRIX), "embedded verbatim"
-    assert "Fable synthesis prose goes here." in _section_text(sections, mod.SECTION_SYNTHESIS)
+    assert ": prose" in _section_text(sections, mod.SECTION_SYNTHESIS)
     filed = _filed_table(_section_text(sections, mod.SECTION_FILED_TASKS))
     assert [row["ticket"] for row in filed] == ["tkt_1234", "tkt_1235"]
     assert "~$3.42 across 20 Sonnet calls + 1 Fable call." in _section_text(
@@ -1416,19 +1421,22 @@ def test_render_report_carries_each_piece_in_its_own_section():
 
 
 @pytest.mark.parametrize(
-    "synthesis_md",
-    ["prose", "No novel, verified confusion clusters this census."],
-    ids=["model-prose", "runner-empty-run-sentence"],
+    "result",
+    [
+        synthesis.Synthesis(),
+        synthesis.Unavailable("reply is not a JSON object: x"),
+        None,
+    ],
+    ids=["ok", "unavailable", "skipped"],
 )
-def test_synthesis_section_states_the_census_applies_nothing_it_proposes(synthesis_md):
-    # Behaviour only; the exact wording is _GOLDEN_FLAGLESS_REPORT's to lock.
-    # The notice is true of every run, so it must not depend on who wrote the
-    # body: the model's prose or the runner's own empty-run sentence.
-    lines = _section(_sections(synthesis_md=synthesis_md), mod.SECTION_SYNTHESIS).lines
+def test_the_synthesis_section_is_the_rendering_of_the_records_synthesis_value(result):
+    record = _census_record(synthesis=synthesis.SynthesisReport(
+        brief=_synthesis_brief(), result=result, applied=synthesis.Applied(), standing=3,
+    ).to_record())
 
-    assert lines.count(mod.SYNTHESIS_NOT_APPLIED_NOTICE) == 1
-    notice_at = lines.index(mod.SYNTHESIS_NOT_APPLIED_NOTICE)
-    assert lines.index("## Synthesis") < notice_at < lines.index(synthesis_md)
+    lines = _section(mod.census_report_sections(record), mod.SECTION_SYNTHESIS).lines
+
+    assert lines == tuple(synthesis.report_lines(record["synthesis"]))
 
 
 def test_render_report_is_deterministic_no_clock():
@@ -1580,9 +1588,18 @@ extra:
 matrix
 ## Synthesis
 
-_The census does not parse this section: nothing proposed in it has been applied to the codebook._
+- applied: 0 phase refinement(s) to 0 cluster(s) and 0 new entr(ies); 0 correction(s) applied, 0 skipped
+- standing, no new evidence: 2
+- invariant violations this run: none
+- unkeyed entries re-observed: 0
 
-prose
+### New
+
+- fk-4091f5fda485 "Docs omit the X convention": prose
+
+### Re-observed
+
+_none this run._
 
 ## Findings
 
@@ -1626,7 +1643,22 @@ Method block gains ``extra.screened`` and the real inputs note.
 
 Moved by task 6406 (census PRD leaf L7): ## Adjudication renders on every run
 (check_census_report.SECTIONS requires it), and the Method block gains
-``extra.attached`` and ``extra.adjudicated``."""
+``extra.attached`` and ``extra.adjudicated``.
+
+Moved by task 6407 (census PRD leaf L10): ## Synthesis is rendered from the
+record's structured ``synthesis`` value (``_sample_synthesis_record``), so the
+not-applied notice and the model's verbatim prose give way to the applied
+line, the runner's counts and the New / Re-observed blocks."""
+
+
+def _sample_synthesis_record() -> dict[str, Any]:
+    """A fixed ``synthesis`` record: one new finding, one observation on it,
+    nothing applied, two standing entries."""
+    brief = _synthesis_brief()
+    document = synthesis.Synthesis(new=(synthesis.NewObservation(brief.new[0].key, "prose"),))
+    return synthesis.SynthesisReport(
+        brief=brief, result=document, applied=synthesis.Applied(), standing=2,
+    ).to_record()
 
 
 def _capped_mining_result(*, stop_reason, max_batches, batches=2):
@@ -1655,16 +1687,39 @@ def _storm_capped_mining_result():
         batch_stats=[
             mod.BatchStats(
                 index=0, total=10, succeeded=10, failed=0, dup_rate=0.1,
-                saturated=False, status="ok",
+                saturated=False, status=coder.CodingStatus.OK,
             ),
             mod.BatchStats(
                 index=1, total=10, succeeded=4, failed=6, dup_rate=1.0,
-                saturated=False, status="failure",
+                saturated=False, status=coder.CodingStatus.FAILURE,
             ),
         ],
         stop_reason="capped",
         max_batches=2,
     )
+
+
+def test_batch_status_reads_back_from_a_census_record_as_a_coding_status():
+    """run_census renders the report from the record's JSON text, which
+    stores the status as its string; BatchStats.from_record reads it back
+    as the enum, and the report renders the same either way."""
+    record = _census_record(mining_result=_storm_capped_mining_result())
+    restored = json.loads(json.dumps(record))
+
+    batches = [mod.BatchStats.from_record(stats) for stats in restored["mining"]["batch_stats"]]
+
+    assert batches == _storm_capped_mining_result().batch_stats
+    assert all(isinstance(batch.status, coder.CodingStatus) for batch in batches)
+    assert mod.census_report_sections(restored) == mod.census_report_sections(record)
+
+
+def test_a_census_record_batch_status_outside_coding_status_is_rejected():
+    record = _census_record(mining_result=_storm_capped_mining_result())
+    restored = json.loads(json.dumps(record))
+    restored["mining"]["batch_stats"][1]["status"] = "stormy"
+
+    with pytest.raises(ValueError, match="stormy"):
+        mod.census_report_sections(restored)
 
 
 def _section(sections, key):
@@ -1813,7 +1868,7 @@ def _render_kwargs(**overrides) -> dict[str, Any]:
         force=False,
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
-        synthesis_md="prose",
+        synthesis=_sample_synthesis_record(),
         project_root=_RENDER_ROOT,
         filing=_filing_record("tkt_1"),
         dispositions=_EMPTY_DISPOSITIONS,
@@ -2348,9 +2403,19 @@ def test_a_pipe_in_a_statement_does_not_break_the_findings_table():
 def test_build_census_record_carries_identity_and_method():
     record = _census_record()
 
-    assert record["record_version"] == 1
+    assert record["record_version"] == 2
     assert record["run_id"] == _SAMPLE_METHOD["run_id"]
     assert record["method"] == _SAMPLE_METHOD
+
+
+def test_a_version_1_record_is_refused_naming_its_version():
+    """Version 1 records carry ``synthesis_md`` prose in place of the
+    ``synthesis`` mapping, as the committed 2026-10-10 and 10-17 records do."""
+    record = _census_record()
+    old = {key: value for key, value in record.items() if key != "synthesis"}
+
+    with pytest.raises(ValueError, match="census record version 1 is not 2"):
+        mod.render_report({**old, "record_version": 1, "synthesis_md": "prose"})
 
 
 _METHOD_WINDOW = census_window.MiningWindow(
@@ -2698,7 +2763,7 @@ def test_render_report_flagless_output_is_byte_identical_golden():
         force=False,
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
-        synthesis_md="prose",
+        synthesis=_sample_synthesis_record(),
         project_root=_RENDER_ROOT,
         filing=_filing_record("tkt_1"),
         dispositions=_EMPTY_DISPOSITIONS,
@@ -2981,14 +3046,21 @@ def _make_fake_verify_fn(
     return fake_verify_fn
 
 
-def _make_fake_synthesize_fn(text="Fable synthesis prose."):
-    """Fake Fable `synthesize_fn(verified, *, model)` seam. Always returns
-    `text`; records every call's (verified, model) in `.calls`."""
+_EMPTY_C6_DOCUMENT = json.dumps(
+    {"new": [], "re_observed": [], "phase_refinements": [], "corrections": [], "notes": []},
+)
+"""The valid C6 synthesis document that observes nothing."""
+
+
+def _make_fake_synthesize_fn(reply: str | Callable[[synthesis.Brief], str] = _EMPTY_C6_DOCUMENT):
+    """Fake Fable `synthesize_fn(brief, *, model) -> str` seam. Returns
+    *reply*, or ``reply(brief)`` when it is callable; records every call's
+    (brief, model) in `.calls`."""
     calls = []
 
-    def fake_synthesize_fn(verified, *, model):
-        calls.append({"verified": verified, "model": model})
-        return text
+    def fake_synthesize_fn(brief, *, model):
+        calls.append({"brief": brief, "model": model})
+        return reply(brief) if callable(reply) else reply
 
     fake_synthesize_fn.calls = calls
     return fake_synthesize_fn
@@ -3082,8 +3154,8 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     assert fake_verify_fn.calls[0]["model"] == "sonnet", "verify routed to census_verify"
     assert len(fake_synthesize_fn.calls) == 1
     assert fake_synthesize_fn.calls[0]["model"] == "fable", "synthesis routed to census_synthesis"
-    verified_titles_seen = {c["title"] for c in fake_synthesize_fn.calls[0]["verified"]}
-    assert verified_titles_seen == {"Silent no-op subagent contract"}
+    brief = fake_synthesize_fn.calls[0]["brief"]
+    assert [finding.title for finding in brief.new] == ["Silent no-op subagent contract"]
 
     # --- remediation filing: curator path, never planning_mode ---
     assert len(fake_submit_fn.calls) == 1, "only the verified cluster is filed"
@@ -3113,7 +3185,8 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     assert kwargs["report_path"].exists()
     report_text = kwargs["report_path"].read_text(encoding="utf-8")
     assert "# confusion census 2026-07-14" in report_text
-    assert "Fable synthesis prose." in report_text
+    synthesis_section = _report_section(report_text, "Synthesis")
+    assert '"Silent no-op subagent contract": no observation stated' in synthesis_section
 
     # --- best-effort commit of report + codebook + state ---
     assert len(fake_commit.calls) == 1
@@ -4670,10 +4743,10 @@ def test_run_census_reads_a_verdictless_clusters_in_tree_remediation_into_its_ve
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    [cluster] = synthesize_fn.calls[0]["verified"]
-    assert cluster["verdict"].remediation == verdict.Remediation(**_IN_TREE_REMEDIATION)
-    assert cluster["verdict"].route is verdict.Route.MECHANICAL
-    assert cluster["remediation"] == _IN_TREE_REMEDIATION
+    [finding] = synthesize_fn.calls[0]["brief"].new
+    assert finding.verdict is not None
+    assert finding.verdict.proposal == _IN_TREE_REMEDIATION["change"]
+    assert finding.verdict.route == verdict.Route.MECHANICAL.value
     [filed] = kwargs["submit_fn"].calls
     assert _IN_TREE_REMEDIATION["path"] in filed["description"]
     assert _recorded_normalisations(kwargs) == _normalisation_counts(
@@ -4692,9 +4765,9 @@ def test_run_census_drops_a_verdictless_clusters_out_of_tree_remediation(tmp_pat
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    [cluster] = synthesize_fn.calls[0]["verified"]
-    assert cluster["verdict"].remediation is None
-    assert "remediation" not in cluster
+    [finding] = synthesize_fn.calls[0]["brief"].new
+    assert finding.verdict is not None
+    assert finding.verdict.proposal is None
     assert all("docs/missing.md" not in call["description"] for call in kwargs["submit_fn"].calls)
     assert _recorded_normalisations(kwargs) == _normalisation_counts(
         anchor_from_title=1, severity_missing=1, route_defaulted=1, reason_missing=1,
@@ -4809,7 +4882,7 @@ def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
     # assert instead what this path actually renders (nothing), rather than
     # adding a cap this test never passed just to force it to appear.
     assert outcome.stop_reason == "exhausted"
-    # Scoped to the Saturation section, not the whole report: synthesis_md,
+    # Scoped to the Saturation section, not the whole report: the synthesis,
     # matrix_md and the cost note are assembled elsewhere by other fakes, so
     # a whole-report check would fail this storm-detection test for reasons
     # that have nothing to do with storms or capped coverage.
@@ -6820,7 +6893,7 @@ def test_main_hands_run_census_one_runners_invokers_for_the_census_stages(
     assert runner.calls[-1] == (specs[0].name, "haiku")
     kwargs["verify_fn"]([{"title": "x"}], model="sonnet")
     assert runner.calls[-1] == (specs[1].name, "sonnet")
-    kwargs["synthesize_fn"]([{"title": "x"}], model="fable")
+    kwargs["synthesize_fn"](_synthesis_brief(), model="fable")
     assert runner.calls[-1] == (specs[2].name, "fable")
 
 
@@ -8789,56 +8862,46 @@ def test_verify_prompt_embeds_the_quality_definition_and_asks_for_the_c4_verdict
     assert str(tmp_path) in prompt
 
 
-def test_synthesis_prompt_embeds_the_quality_definition_and_the_verdicts(tmp_path):
-    root = _tree_with_guide(tmp_path)
-    found = verdict.parse_verdict(
-        {
-            "verified": True,
-            "reason": "r",
-            "anchor": "docs/guide.md",
-            "tags": ["h2"],
-            "severity": "low",
-            "severity_reason": "contained",
-            "route": "structural",
-        },
-        title=_REMEDIATED_TITLE,
-        project_root=root,
+def _synthesis_brief() -> synthesis.Brief:
+    """A brief holding one new finding: the entry a run promoted from session s-1."""
+    anchor = "orchestrator/x.py::f"
+    identity = census_findings.FindingIdentity.mint("orchestrator", anchor, ("h2", verdict.KIND_TAG))
+    sighting = {
+        "date": "2026-10-21", "project": "dark_factory", "session": "s-1",
+        "origin_phase": "implement", "manifested_phase": "verify",
+    }
+    entry = {
+        "id": "entry-cand-20261021-1", "title": _REMEDIATED_TITLE, "severity": "low", "status": "open",
+        "origin_phase": "implement", "manifested_phase": "verify", "sightings": [sighting],
+        **identity.to_fields(),
+    }
+    found = verdict.Verdict(
+        verified=True, reason="r", anchor=anchor, tags=identity.tags, severity="low",
+        severity_reason="contained", route=verdict.Route.STRUCTURAL, remediation=None,
     )
-    fake_invoke = _make_fake_invoke(default="Synthesis prose.")
-
-    mod._build_default_synthesize_fn(fake_invoke)(
-        [{"title": _REMEDIATED_TITLE, "verdict": found}], model="fable",
+    return synthesis.Brief.of(
+        run_id="census-dark_factory-20261021",
+        before={"version": 2, "entries": []},
+        after={"version": 2, "entries": [entry]},
+        verdicts=[census_findings.Adjudication(entry["id"], found, None)],
+        adopted={},
+        run_sessions={"s-1"},
+        counts={"confirmed": 1},
     )
-    prompt = fake_invoke.calls[0]["prompt"]
 
+
+def test_synthesis_prompt_embeds_the_quality_definition_the_c6_reply_and_the_brief():
+    brief = _synthesis_brief()
+    fake_invoke = _make_fake_invoke(default="the raw reply")
+
+    reply = mod._build_default_synthesize_fn(fake_invoke)(brief, model="fable")
+
+    [call] = fake_invoke.calls
+    prompt = call["prompt"]
+    assert (reply, call["model"]) == ("the raw reply", "fable")
     assert _quality_block_of(prompt) == code_quality.guidance()
-    assert '"anchor": "docs/guide.md"' in prompt
-    assert '"severity": "low"' in prompt
-
-
-def test_synthesis_prompt_names_the_not_applied_proposals_heading(tmp_path):
-    root = _tree_with_guide(tmp_path)
-    found = verdict.parse_verdict(
-        {
-            "verified": True,
-            "reason": "r",
-            "anchor": "docs/guide.md",
-            "tags": ["h2"],
-            "severity": "low",
-            "severity_reason": "contained",
-            "route": "structural",
-        },
-        title=_REMEDIATED_TITLE,
-        project_root=root,
-    )
-    fake_invoke = _make_fake_invoke(default="Synthesis prose.")
-
-    mod._build_default_synthesize_fn(fake_invoke)(
-        [{"title": _REMEDIATED_TITLE, "verdict": found}], model="fable",
-    )
-    prompt = fake_invoke.calls[0]["prompt"]
-
-    assert mod.SYNTHESIS_PROPOSALS_HEADING in prompt
+    assert synthesis.reply_instructions() in prompt
+    assert json.dumps(brief.to_record()) in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -11872,3 +11935,172 @@ def test_an_unreadable_vector_cache_skips_the_stage_with_one_escalation_naming_i
     assert mod.run_census(**kwargs).status == "done"
 
     _assert_the_stage_was_skipped(kwargs, str(cache))
+
+
+# ---------------------------------------------------------------------------
+# task 6407 (PRD L10) step-11: run_census synthesises over this run's findings
+# after promotion, validates the C6 document, applies its phase refinements
+# and corrections, and degrades to "synthesis unavailable" on an invalid reply
+# (PRD §4.8 row 14).
+# ---------------------------------------------------------------------------
+
+def _synthesis_kwargs(root, *, synthesize_fn, escalate_fn=None, **overrides):
+    """A run in *root* that promotes _PROMOTED_TITLE under _ROW5_KEY, with
+    its own vector cache so two runs side by side cannot share one."""
+    root.mkdir(exist_ok=True)
+    _write_briefing(root)
+    kwargs = _run_census_kwargs(
+        root,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[_novel_verified_batch()],
+        verify_fn=_keyed_verify_fn(),
+        synthesize_fn=synthesize_fn,
+        escalate_fn=escalate_fn or _poison("escalate_fn"),
+        commit=_make_fake_commit(),
+        embedder=embeddings.Embedder(embed_fn=_nothing_similar_embed, cache_path=root / "vectors.sqlite"),
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _c6_document(**lists) -> str:
+    return json.dumps({**json.loads(_EMPTY_C6_DOCUMENT), **lists})
+
+
+_DATA_SECTIONS = ("Findings", "Filed Tasks", "Screened", "Adjudication", "Origin x Manifestation Matrix")
+
+
+def _codebook_text_beside(kwargs) -> str:
+    """The persisted codebook with the run's own project root, which its
+    back-links carry, written as <root>."""
+    return kwargs["codebook_path"].read_text(encoding="utf-8").replace(kwargs["project_root"], "<root>")
+
+
+def test_run_census_row14_an_invalid_synthesis_is_unavailable_and_every_data_section_stands(tmp_path):
+    escalate_fn = _make_fake_escalate_fn()
+    invalid = _synthesis_kwargs(
+        tmp_path / "invalid", synthesize_fn=_make_fake_synthesize_fn("not json at all"), escalate_fn=escalate_fn,
+    )
+    valid = _synthesis_kwargs(tmp_path / "valid", synthesize_fn=_make_fake_synthesize_fn())
+
+    assert mod.run_census(**invalid).status == "done"
+    assert mod.run_census(**valid).status == "done"
+
+    invalid_report = invalid["report_path"].read_text(encoding="utf-8")
+    valid_report = valid["report_path"].read_text(encoding="utf-8")
+    assert "synthesis unavailable:" in _report_section(invalid_report, "Synthesis")
+    for title in _DATA_SECTIONS:
+        assert _report_section(invalid_report, title) == _report_section(valid_report, title), title
+    assert _codebook_text_beside(invalid) == _codebook_text_beside(valid)
+    assert _run_record(invalid)["synthesis"]["outcome"] == "unavailable"
+    [escalation] = escalate_fn.calls
+    assert escalation["severity"] == "info"
+    assert "synthesis" in escalation["summary"]
+
+
+_QUIET_IDENTITY = census_findings.FindingIdentity.mint("shared", "shared/y.py::g", ("h2", verdict.KIND_TAG))
+
+
+def _quiet_standing_codebook() -> dict:
+    """_keyed_standing_codebook with its keyed entry moved to another
+    location, so a run at the row-5 anchor never sights it."""
+    cb = _keyed_standing_codebook()
+    for record in (*cb["entries"][1:], *cb["candidates"]):
+        record.update(_QUIET_IDENTITY.to_fields())
+    return cb
+
+
+def test_run_census_briefs_the_promoted_finding_as_new_and_never_an_unsighted_standing_entry(tmp_path):
+    synthesize_fn = _make_fake_synthesize_fn()
+    kwargs = _synthesis_kwargs(tmp_path, synthesize_fn=synthesize_fn, codebook_dict=_quiet_standing_codebook())
+
+    assert mod.run_census(**kwargs).status == "done"
+
+    [call] = synthesize_fn.calls
+    brief = call["brief"]
+    assert [finding.key for finding in brief.new] == [_ROW5_KEY]
+    assert brief.re_observed == ()
+    sent = json.dumps(brief.to_record())
+    for standing in (_STANDING_ENTRY_ID, _QUIET_IDENTITY.key, "An earlier titled shape"):
+        assert standing not in sent, standing
+
+
+def test_run_census_applies_a_phase_refinement_to_the_promoted_entry_and_the_matrix(tmp_path):
+    def refining(brief):
+        [finding] = brief.new
+        return _c6_document(phase_refinements=[{
+            "key": finding.key, "origin_phase": "merge", "manifested_phase": "review", "why": "a merge made it",
+        }])
+
+    kwargs = _synthesis_kwargs(tmp_path, synthesize_fn=_make_fake_synthesize_fn(refining))
+
+    assert mod.run_census(**kwargs).status == "done"
+
+    entry = _persisted_promoted_entry(kwargs)
+    assert (entry["origin_phase"], entry["manifested_phase"]) == ("merge", "review")
+    report = kwargs["report_path"].read_text(encoding="utf-8")
+    matrix = _report_section(report, "Origin x Manifestation Matrix")
+    assert matrix.strip() == mod.render_matrix({"merge": {"review": 1}}).strip()
+    applied = _run_record(kwargs)["synthesis"]["applied"]
+    assert (applied["clusters_refined"], applied["entries_refined"]) == (1, 1)
+
+
+def _re_observing_invoke(prompt, model):
+    """Mining replies: the "dup-k" session matches the keyed standing entry,
+    every other prompt (the headroom probe included) matches entry-a."""
+    entry_id = _STANDING_ENTRY_ID if "dup-k" in prompt else "entry-a"
+    return json.dumps({"matches": [{"entry_id": entry_id}], "candidates": []})
+
+
+def test_run_census_applies_a_correction_to_a_re_observed_standing_entry(tmp_path):
+    note = "the earlier framing was refuted"
+
+    def correcting(brief):
+        [finding] = brief.re_observed
+        return _c6_document(corrections=[{"entry_id": finding.entry_id, "note": note, "cause": "A truer cause."}])
+
+    synthesize_fn = _make_fake_synthesize_fn(correcting)
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_re_observing_invoke),
+        batch_source=[[_hand_digest("dup-k", "the earlier shape again")]],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=synthesize_fn,
+        escalate_fn=_poison("escalate_fn"),
+        commit=_make_fake_commit(),
+        codebook_dict=_keyed_standing_codebook(),
+    )
+
+    assert mod.run_census(**kwargs).status == "done"
+
+    [call] = synthesize_fn.calls
+    assert [(f.entry_id, f.gained_sessions) for f in call["brief"].re_observed] == [(_STANDING_ENTRY_ID, ("dup-k",))]
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    entry = next(e for e in persisted["entries"] if e["id"] == _STANDING_ENTRY_ID)
+    assert entry["cause"] == "A truer cause."
+    [audit] = [s for s in entry["sightings"] if s["session"] == kwargs["run_id"]]
+    assert audit["note"] == note
+    record = _run_record(kwargs)
+    assert record["synthesis"]["applied"]["corrections_applied"] == 1
+    section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Synthesis")
+    assert "1 correction(s) applied" in section
+
+
+def test_run_census_makes_no_synthesis_call_when_nothing_is_new_or_re_observed(tmp_path):
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("dup-1", "nothing new here")]],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_poison("synthesize_fn"),
+        escalate_fn=_poison("escalate_fn"),
+        commit=_make_fake_commit(),
+    )
+
+    assert mod.run_census(**kwargs).status == "done"
+
+    record = _run_record(kwargs)
+    assert record["method"]["cost"]["synthesis_calls"] == 0
+    assert "synthesis=0" in record["cost_note"]
+    assert (record["synthesis"]["outcome"], record["synthesis"]["calls"]) == ("skipped", 0)

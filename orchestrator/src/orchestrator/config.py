@@ -29,6 +29,12 @@ from pydantic_settings import (
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+from shared.project_id import project_id_for_root
+from shared.project_layout import (
+    ESCALATION_QUEUE_RELPATH,
+    park_eviction_requests_db,
+    scheduler_overrides_db,
+)
 from shared.task_metadata import KNOWN_ROLE_NAMES
 
 from orchestrator.agents.review_briefing import ReviewBriefing
@@ -1483,7 +1489,13 @@ class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
     url: str = Field(default='http://localhost:8002')
-    project_id: str = Field(default='dark_factory')
+    project_id: str = Field(
+        default='',
+        description=(
+            'Empty means derived from project_root by OrchestratorConfig '
+            '(shared.project_id.project_id_for_root); a declared value wins.'
+        ),
+    )
     config_path: str = Field(default='fused-memory/config/config.yaml')
     server_command: list[str] = Field(
         default_factory=lambda: [
@@ -1516,11 +1528,28 @@ class SandboxConfig(BaseModel):
 
 
 class EscalationConfig(BaseModel):
-    """Escalation MCP server configuration."""
+    """Escalation MCP server configuration.
 
-    queue_dir: str = Field(default='data/escalations')
+    ``queue_dir`` is kept only so existing yamls load; the queue is always
+    ``shared.project_layout.escalation_queue_dir(project_root)``.
+    """
+
+    queue_dir: str = Field(default=ESCALATION_QUEUE_RELPATH)
     port: int = Field(default=8100)
     host: str = Field(default='127.0.0.1')
+
+    @field_validator('queue_dir', mode='after')
+    @classmethod
+    def _refuse_a_non_layout_queue_dir(cls, v: str) -> str:
+        if posixpath.normpath(v) == ESCALATION_QUEUE_RELPATH:
+            return ESCALATION_QUEUE_RELPATH
+        raise ValueError(
+            f'escalation.queue_dir {v!r} is not the layout value '
+            f'{ESCALATION_QUEUE_RELPATH!r}: every package reads the escalation queue '
+            f'at shared.project_layout.escalation_queue_dir(project_root), so another '
+            f'value would split the queue; remove the key or set it to '
+            f'{ESCALATION_QUEUE_RELPATH!r}.'
+        )
 
 
 from shared.config_models import AccountConfig, UsageCapConfig  # noqa: F401, E402
@@ -3954,15 +3983,24 @@ class OrchestratorConfig(BaseSettings):
     # restarting the fleet is not a kill switch (the argument already written
     # for ``config_key_census.*`` and ``merge_deep.chain_cap``).
     merge_disjoint_skip_requires_verified_drift: bool = Field(default=True)
-    # The project's merge gate verdict is a function of the tree alone: no
-    # leg reads git history (ancestry of HEAD, a merge-base, a log).  Only
-    # then may ``merge_lane/gates.py::_reverify_rebased_tree`` skip the
-    # re-verify of a rebased tree byte-identical to the one that just passed
-    # (task 6647).  False (the default) re-verifies it.  GREEN TIER for the
-    # reason given for ``merge_disjoint_skip_requires_verified_drift``
-    # above: read fresh off ``req.config`` at each gate evaluation, and it
-    # only ever decides whether one more verify runs before an advance.
+    # The project's merge gate verdict is a function of the tree alone: every
+    # gate leg judges the tree, except the tests
+    # ``merge_gate_history_test_command`` selects, which read git history
+    # (ancestry of HEAD, a merge-base, a log) and so re-run on the same tree.
+    # Only then may ``merge_lane/gates.py::_reverify_rebased_tree`` forgo the
+    # full re-verify of a rebased tree byte-identical to the one that just
+    # passed (tasks 6647, 7248).  False (the default) re-verifies it.  GREEN
+    # TIER for the reason given for
+    # ``merge_disjoint_skip_requires_verified_drift`` above: read fresh off
+    # ``req.config`` at each gate evaluation, and it only ever decides
+    # whether one more verify runs before an advance.
     merge_gate_history_pure: bool = Field(default=False)
+    # The shell command, run from the merge worktree root, that runs exactly
+    # the merge gate's history-reading tests (task 7248).  Consulted only
+    # when ``merge_gate_history_pure`` is True, on a same-tree rebase, where
+    # it runs instead of skipping.  None (the default) declares no history
+    # leg, so that rebase skips.
+    merge_gate_history_test_command: str | None = Field(default=None)
     # Fix (b), task 2822 — per-land cross-check of a REMOTE merge-verify green.
     # When True (default), after a remote two-host verify returns a real-suite
     # PASS that would DECIDE a land, the merge worker re-runs the LOCAL
@@ -4351,16 +4389,10 @@ class OrchestratorConfig(BaseSettings):
     # scripts/restart-all-orchestrators.sh is mid-sweep it holds that lease and
     # the coordinator stands down; the bound is what keeps a lease stranded by
     # a SIGKILLed sweep (whose EXIT trap cannot run, by construction) from
-    # wedging the fleet. DERIVED, not picked: the common long --drain sweep
-    # (task 5371) is the whole 11400s ORCH_DRAIN_VERIFY_MAX_WAIT_SECS verify-wait
-    # cap, plus 7 x (verify 30 + grace 120) restart verification, plus 7 x 120s
-    # stale/absent grace = ~13,300s ~= 3.7h, so 14400 (4h) clears it with
-    # headroom while staying far below the 72h
-    # orchestrator_restart_min_interval_secs — a leaked lease therefore delays at
-    # most ONE redeploy window. NOT a worst case: each unit left on the legacy
-    # merge-idle gate (pre-5371 code, or a refused request) can add its 600s
-    # busy grace, so two of them on top of a capped verify wait overrun it and
-    # the sweep degrades, bounded, to the pre-4755 collision. Deliberately NOT
+    # wedging the fleet. FIXED: a --drain sweep is fitted under it at
+    # scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS.
+    # Far below the 72h orchestrator_restart_min_interval_secs, so a leaked
+    # lease delays at most ONE redeploy window. Deliberately NOT
     # in RELOADABLE_FIELDS:
     # red-tier / restart-only, matching its siblings
     # orchestrator_restart_merge_phase_grace_secs /
@@ -4372,10 +4404,9 @@ class OrchestratorConfig(BaseSettings):
         description=(
             'Max age of the in-flight fleet-redeploy lease before the '
             'orchestrator coordinator stops honouring it and redeploys anyway. '
-            'Derived from the common long --drain sweep (~13,300s: the '
-            '11400s verify-wait cap plus per-unit restart verification and '
-            'stale-heartbeat grace; legacy-gate units can add 600s each) and '
-            'kept far below the 72h min-interval, so a lease stranded by a '
+            'Fixed; a --drain sweep is fitted under it at '
+            'scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS. '
+            'Kept far below the 72h min-interval, so a lease stranded by a '
             'SIGKILLed sweep delays at most one window. 4h default.'
         ),
     )
@@ -5585,6 +5616,23 @@ class OrchestratorConfig(BaseSettings):
         return self
 
     @model_validator(mode='after')
+    def _derive_fused_memory_project_id(self) -> 'OrchestratorConfig':
+        """Fill an empty ``fused_memory.project_id`` from ``project_root``.
+
+        Same sentinel idiom as ``_default_verify_admission_slots_dir``. The
+        submodel is replaced by a copy, never mutated, so an instance shared
+        with another config keeps its own id.
+        """
+        if not self.fused_memory.project_id:
+            derived = project_id_for_root(self.project_root)
+            object.__setattr__(
+                self,
+                'fused_memory',
+                self.fused_memory.model_copy(update={'project_id': derived}),
+            )
+        return self
+
+    @model_validator(mode='after')
     def _validate_clock_stop_markers(self) -> 'OrchestratorConfig':
         """When clock-stop is enabled, the three marker strings must be non-empty,
         mutually distinct, AND pairwise non-substrings.  No-op when disabled so
@@ -5852,7 +5900,7 @@ class OrchestratorConfig(BaseSettings):
         Stored separately from runs.db so reify cycles and set_task_status
         writes cannot wipe override rows.
         """
-        return self.project_root / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+        return scheduler_overrides_db(self.project_root)
 
     @property
     def park_eviction_requests_db_path(self) -> Path:
@@ -5861,7 +5909,7 @@ class OrchestratorConfig(BaseSettings):
         Stored in a dedicated file isolated from the overrides schema to
         keep the operator eviction lever narrow-blast-radius (PRD D3).
         """
-        return self.project_root / 'data' / 'orchestrator' / 'park_eviction_requests.db'
+        return park_eviction_requests_db(self.project_root)
 
     model_config = SettingsConfigDict(
         env_prefix='ORCH_',
@@ -6513,6 +6561,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # Same-tree gate skip precondition (task 6647) — green-tier for the
         # reason given directly above.
         'merge_gate_history_pure',
+        # Same-tree history leg (task 7248) — read fresh off req.config at each
+        # gate evaluation, and it only decides what one gate run executes.
+        'merge_gate_history_test_command',
         # Task-text amendment gate on the Lever-B skip (task 4031) — read off
         # self.config at each revalidation decision and never captured, so a
         # flip affects only the next decision.

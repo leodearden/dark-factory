@@ -22,12 +22,9 @@ from pathlib import Path
 import pytest
 from _fm_helpers import load_script_module
 from _jsonl_fixture import parse_jsonl_fixture
+from _write_triage_calibration_fixtures import CALIBRATION_FIXTURES, REIFY_FIXTURE_PATH
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
-FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
-DARK_FACTORY_FIXTURE_PATH = (
-    Path(__file__).parent / 'fixtures' / 'write_triage_calibration_dark_factory.jsonl'
-)
 
 UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 
@@ -61,16 +58,16 @@ def _mod() -> types.ModuleType:
 @pytest.fixture(scope='module')
 def records() -> list[dict]:
     """The reify fixture — the one the reify-specific rulings and counts pin."""
-    return parse_jsonl_fixture(FIXTURE_PATH)
+    return parse_jsonl_fixture(REIFY_FIXTURE_PATH)
 
 
 @pytest.fixture(
     scope='module',
-    params=[FIXTURE_PATH, DARK_FACTORY_FIXTURE_PATH],
-    ids=['reify', 'dark_factory'],
+    params=list(CALIBRATION_FIXTURES.values()),
+    ids=list(CALIBRATION_FIXTURES),
 )
 def fixture_records(request: pytest.FixtureRequest) -> list[dict]:
-    """Every committed curator fixture — the shape contract both must keep."""
+    """Every committed curator fixture — the shape contract each must keep."""
     return parse_jsonl_fixture(request.param)
 
 

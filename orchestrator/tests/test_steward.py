@@ -167,6 +167,20 @@ def _make_result(
     )
 
 
+def _make_capped_result(session_id='sess-capped', cost=1.0):
+    from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
+    from shared.cli_invoke import AgentResult
+    return AgentResult(
+        success=False,
+        output='',
+        stderr=REAL_CLI_CAP_HIT_MESSAGES[0],
+        cost_usd=cost,
+        duration_ms=5000,
+        turns=1,
+        session_id=session_id,
+    )
+
+
 def _make_escalation(**overrides):  # type: ignore[no-untyped-def]
     defaults: dict = dict(
         id='esc-42-1',
@@ -653,7 +667,10 @@ class TestStewardCapHitBackoff:
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
         ):
-            mock_invoke.return_value = _make_result(session_id='sess-new')
+            mock_invoke.side_effect = [
+                _make_capped_result(),
+                _make_result(session_id='sess-new'),
+            ]
             await steward._handle_escalation(esc)
 
             # Value-level check on the single cap hit's cooldown (first cycle,
@@ -693,7 +710,11 @@ class TestStewardCapHitBackoff:
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
-            mock_invoke.return_value = _make_result(session_id='sess-new')
+            mock_invoke.side_effect = [
+                _make_capped_result(),
+                _make_capped_result(),
+                _make_result(session_id='sess-new'),
+            ]
             await steward._handle_escalation(esc)
 
         assert mock_invoke.call_count == 3, (
@@ -726,7 +747,10 @@ class TestStewardCapHitBackoff:
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
-            mock_invoke.return_value = _make_result(session_id='sess-capped')
+            mock_invoke.side_effect = [
+                _make_capped_result(session_id='sess-capped'),
+                _make_result(session_id='sess-new'),
+            ]
             await steward._handle_escalation(esc)
 
             # Second call should resume with the capped session
@@ -753,7 +777,7 @@ class TestStewardCapHitBackoff:
         ):
             # First call: cap hit with no session_id
             mock_invoke.side_effect = [
-                _make_result(session_id=''),
+                _make_capped_result(session_id=''),
                 _make_result(session_id='sess-new'),
             ]
             await steward._handle_escalation(esc)
@@ -847,7 +871,10 @@ class TestStewardAccountName:
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
-            mock_invoke.return_value = _make_result(session_id='sess-new')
+            mock_invoke.side_effect = [
+                _make_capped_result(),
+                _make_result(session_id='sess-new'),
+            ]
             result = await steward._invoke_with_session(
                 prompt='test prompt',
                 cwd=worktree,
@@ -1065,7 +1092,10 @@ class TestStewardTimeoutPassthrough:
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
-            mock_invoke.return_value = _make_result(session_id='sess-t')
+            mock_invoke.side_effect = [
+                _make_capped_result(),
+                _make_result(session_id='sess-t'),
+            ]
             await steward._invoke_with_session(
                 prompt='do work',
                 cwd=steward.worktree,
@@ -2289,11 +2319,14 @@ class TestPreTriageUsageGateCleanup:
         """
         gate = _make_pre_triage_gate(cap_effects=[True, False])
         steward.usage_gate = gate
-        mock_result = _make_result(cost=0.3, session_id='sess-triage')
 
         with (
             patch('orchestrator.steward.invoke_agent',
-                  new_callable=AsyncMock, return_value=mock_result) as mock_invoke,
+                  new_callable=AsyncMock,
+                  side_effect=[
+                      _make_capped_result(),
+                      _make_result(cost=0.3, session_id='sess-triage'),
+                  ]) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             await steward._pre_triage_suggestions(self._esc())
@@ -2311,7 +2344,7 @@ class TestPreTriageUsageGateCleanup:
         gate = _make_pre_triage_gate(cap_effects=[True, False])
         steward.usage_gate = gate
 
-        cap_result = _make_result(cost=0.1, session_id='sess-cap')
+        cap_result = _make_capped_result(session_id='sess-cap', cost=0.1)
         success_result = _make_result(cost=0.3, session_id='sess-resumed')
 
         with (

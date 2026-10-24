@@ -247,11 +247,17 @@ class TestDoneProvenance:
             DoneProvenance(kind='bogus')  # type: ignore[arg-type]
 
     def test_extra_subfields_retained_through_round_trip(self):
+        dp = DoneProvenance.model_validate(
+            {'kind': 'deterministic-deploy-scheduled', 'x_restart_reason': 'self-restart'}
+        )
+        assert dp.model_dump()['x_restart_reason'] == 'self-restart'
+
+    def test_scheduled_deploy_evidence_round_trips(self):
         dp = DoneProvenance(
             kind='deterministic-deploy-scheduled',
             unit='fused-memory.service',
-            transient_unit='fused-memory-restart-1234.service',  # type: ignore[call-arg]
-            fire_delay_secs=5,  # type: ignore[call-arg]
+            transient_unit='fused-memory-restart-1234.service',
+            fire_delay_secs=5,
         )
         dumped = dp.model_dump()
         assert dumped['transient_unit'] == 'fused-memory-restart-1234.service'

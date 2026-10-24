@@ -15,27 +15,30 @@ Two call shapes reach the CLI through a built-in tool REGISTRY filter
   ``--tools <list>``, which names the built-in tools that exist and says
   nothing about MCP (task 4344).
 
-In both cases MCP tools stay reachable — and the CLI
-ambient-merges whatever ``.mcp.json`` sits at ``cwd``.  This repo's root holds a
-live one (servers ``escalation``, ``fused-memory``), and the wildcard callers
+In both cases MCP tools stay reachable — the CLI ambient-merges whatever
+``.mcp.json`` sits at ``cwd``, and account-scoped claude.ai connectors connect
+wherever ``cwd`` is.  This repo's root holds a live ``.mcp.json`` (servers
+``escalation``, ``fused-memory``), and the wildcard callers
 run at ``permission_mode='bypassPermissions'``, so the result is unreviewed MCP
 **write** access: ``halt_scheduler`` and ``delete_memory`` are in the blast
 radius.  A registry-filter caller's permission mode is no substitute for
 closing MCP either: the mode can change at the call, and this gate reads only
 what closes the hole.
 
-A caller closes the hole in one of exactly two ways, and this scanner
-recognises both:
+A caller closes the hole one way, and it is the only one this scanner
+recognises: ``mcp_config=no_mcp_servers_config()`` together with
+``strict_mcp_config=True``.  See
+``shared/src/shared/cli_invoke.py::no_mcp_servers_config``: it returns
+``{'mcpServers': {}}``, a TRUTHY zero-server config, and the truthiness is
+load-bearing — ``--strict-mcp-config`` is emitted inside
+``build_claude_argv``'s ``if mcp_config:`` block, so a bare ``{}`` silently
+emits NEITHER flag and reinstates the hole while looking correct.
 
-(a) ``mcp_config=no_mcp_servers_config()`` together with
-    ``strict_mcp_config=True``.  See
-    ``shared/src/shared/cli_invoke.py::no_mcp_servers_config``: it returns
-    ``{'mcpServers': {}}``, a TRUTHY zero-server config, and the truthiness is
-    load-bearing — ``--strict-mcp-config`` is emitted inside
-    ``build_claude_argv``'s ``if mcp_config:`` block, so a bare ``{}`` silently
-    emits NEITHER flag and reinstates the hole while looking correct.
-(b) run at ``shared/src/shared/neutral_cwd.py::neutral_cli_cwd()`` — an empty
-    scratch directory, so there is no ambient ``.mcp.json`` to merge.
+Running at ``shared/src/shared/neutral_cwd.py::neutral_cli_cwd()`` removes only
+the ambient project ``.mcp.json``.  It does not close MCP: an account-scoped
+claude.ai connector still connected at an empty neutral cwd and exposed write
+tools (CLI 2.1.283 system/init inventory, task 3995), so this scanner does not
+accept it.
 
 Tasks 4145 and 4242 each found and hand-fixed one instance of this.  Two
 hand-fixes of one shape is the point at which a guard is cheaper than a third,
@@ -79,7 +82,6 @@ import ast
 from collections.abc import Iterable
 from typing import NamedTuple
 
-from loop_blocking_scan import _shallow_nodes
 from silent_fallthrough_scan import (
     ParsedFile,
     _build_parent_map,
@@ -99,32 +101,23 @@ TARGET_CALLEES: frozenset[str] = frozenset({
     'invoke_claude_agent',
 })
 
-#: ``shared/src/shared/neutral_cwd.py::neutral_cli_cwd`` — matched on the bare
-#: name, so the ``neutral_cwd.neutral_cli_cwd()`` attribute spelling counts too.
-NEUTRAL_CWD_CALLEE = 'neutral_cli_cwd'
-
-#: ``shared/src/shared/cli_invoke.py::no_mcp_servers_config`` — matched the same
-#: way, so ``cli_invoke.no_mcp_servers_config()`` counts too.
+#: ``shared/src/shared/cli_invoke.py::no_mcp_servers_config`` — matched on the
+#: bare name, so the ``cli_invoke.no_mcp_servers_config()`` spelling counts too.
 NO_MCP_SERVERS_CALLEE = 'no_mcp_servers_config'
 
 #: How a site is protected.  Named constants rather than bare literals at the
 #: comparison sites, so a typo is an ImportError instead of a silent miss.
 EXEMPT_STRICT_MCP = 'strict_mcp_config'
-EXEMPT_NEUTRAL_CWD = 'neutral_cwd'
 NOT_EXEMPT = ''
 
 _VIOLATION_MESSAGE = (
     "a registry filter (available_tools, or a wildcard deny + output_schema, which "
-    "becomes --tools '') does not filter MCP, so MCP tools stay reachable and the "
-    'ambient .mcp.json at cwd is merged'
+    "becomes --tools '') does not filter MCP, so the ambient .mcp.json at cwd and "
+    'account-scoped connectors stay reachable'
 )
 _STRICT_MCP_MESSAGE = (
     'MCP closed explicitly: a truthy mcp_config with strict_mcp_config=True '
     'scopes the run to only those servers'
-)
-_NEUTRAL_CWD_MESSAGE = (
-    f'runs at {NEUTRAL_CWD_CALLEE}(), an empty scratch dir, so there is no '
-    f'ambient .mcp.json for the CLI to merge'
 )
 
 
@@ -312,7 +305,7 @@ def find_wildcard_mcp_scoping_sites(
             continue
 
         pmap = parent_map()
-        exemption, message = _classify(node, pmap)
+        exemption, message = _classify(node)
         sites.append(WildcardMcpScopingSite(
             filename=filename,
             qualname=_compute_qualname(node, pmap),
@@ -325,103 +318,9 @@ def find_wildcard_mcp_scoping_sites(
     return sites
 
 
-def _enclosing_function(
-    node: ast.AST,
-    parent_map: dict[int, ast.AST],
-) -> ast.AST | None:
-    """Return the NEAREST enclosing ``def``/``async def``, or None at module scope."""
-    current = parent_map.get(id(node))
-    while current is not None:
-        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            return current
-        current = parent_map.get(id(current))
-    return None
-
-
-def _neutral_cwd_locals(func: ast.AST) -> set[str]:
-    """Local names *func*'s OWN body binds to a ``neutral_cli_cwd()`` call.
-
-    ``_shallow_nodes`` (borrowed from ``loop_blocking_scan``, which in turn
-    mirrors ``silent_fallthrough_scan``) stops descent at nested ``def`` /
-    ``class`` / ``lambda``, so an assignment made inside a nested helper cannot
-    launder the exemption up to its enclosing function.
-
-    Both assignment spellings are read: ``ast.Assign`` — including the chained
-    ``a = b = neutral_cli_cwd()`` form, which binds every ``Name`` target — and
-    ``ast.AnnAssign`` carrying a value. A tuple-unpacking target binds no single
-    name to the call's result and is skipped.
-    """
-    bound: set[str] = set()
-    for node in _shallow_nodes(func):
-        if isinstance(node, ast.Assign):
-            targets: list[ast.expr] = list(node.targets)
-            value = node.value
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            targets = [node.target]
-            value = node.value
-        else:
-            continue
-        if _callee_name(value) == NEUTRAL_CWD_CALLEE:
-            bound.update(t.id for t in targets if isinstance(t, ast.Name))
-    return bound
-
-
-def _resolves_to_neutral_cwd(
-    call: ast.Call,
-    parent_map: dict[int, ast.AST],
-) -> bool:
-    """True when *call*'s ``cwd=`` argument is a ``neutral_cli_cwd()`` result.
-
-    Two spellings resolve, and they are the two that actually occur:
-
-    (i)  DIRECT — ``cwd=neutral_cli_cwd()``, bare or attribute-qualified.
-    (ii) VIA A LOCAL NAME — ``cwd=<name>`` where the enclosing function's own
-         body assigns ``<name> = neutral_cli_cwd()``. This is the spelling ALL
-         THREE real neutral-cwd sites use.
-
-    The scope limits below are the guard's PRECISION BOUNDARY, each deliberate:
-
-    * ONE level of indirection, no transitive chains. No real site needs a
-      second hop, and each hop widens the ways a non-neutral value could be
-      laundered past the guard.
-    * FUNCTION-LOCAL ONLY — never a module global, never an attribute such as
-      ``self._cwd``. A guard that accepted ``cwd=self._cwd`` would pass ANY
-      instance attribute whatsoever, which is precisely the silent-exposure
-      shape being guarded against.
-    * LAST-ASSIGNMENT-WINS IS NOT MODELLED: any matching assignment anywhere in
-      the function exempts. A function that assigns ``cwd`` from
-      ``neutral_cli_cwd()`` and then reassigns it to a project root is not a
-      shape that occurs, and a false RED costs more here than this miss.
-
-    This resolution is deliberately used INSTEAD of listing the three real
-    sites in an allowlist. They are COMPLIANT, not exempt; an allowlist entry
-    would freeze that judgement, so a later edit changing
-    ``cwd = neutral_cli_cwd()`` to ``cwd = self._project_root`` would leave the
-    blessing in place and the guard silent exactly where it matters. Tied to
-    the property that makes the call safe, the exemption evaporates the moment
-    the property does.
-    """
-    cwd = _keyword(call, 'cwd')
-    if cwd is None:
-        return False
-    if _callee_name(cwd) == NEUTRAL_CWD_CALLEE:
-        return True
-    if not isinstance(cwd, ast.Name):
-        return False
-    func = _enclosing_function(call, parent_map)
-    return func is not None and cwd.id in _neutral_cwd_locals(func)
-
-
-def _classify(call: ast.Call, parent_map: dict[int, ast.AST]) -> tuple[str, str]:
-    """Return the ``(exemption, message)`` pair describing how *call* is (un)safe.
-
-    Explicit scoping is reported ahead of neutral-cwd when a call carries both,
-    so the exemption named is the one the call states rather than the one it
-    inherits from where it happens to run.
-    """
+def _classify(call: ast.Call) -> tuple[str, str]:
+    """Return the ``(exemption, message)`` pair describing how *call* is (un)safe."""
     strict = _is_true_literal(_keyword(call, 'strict_mcp_config'))
     if strict and _is_known_truthy_config(_keyword(call, 'mcp_config')):
         return EXEMPT_STRICT_MCP, _STRICT_MCP_MESSAGE
-    if _resolves_to_neutral_cwd(call, parent_map):
-        return EXEMPT_NEUTRAL_CWD, _NEUTRAL_CWD_MESSAGE
     return NOT_EXEMPT, _VIOLATION_MESSAGE

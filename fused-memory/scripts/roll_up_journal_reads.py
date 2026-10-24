@@ -387,13 +387,15 @@ def _verify_chunk(
             )
 
 
-def migrate_chunk(conn: sqlite3.Connection, lo: int, hi: int) -> ChunkResult:
+def migrate_chunk(
+    conn: sqlite3.Connection, lo: int, hi: int, *, clock: Callable[[], float] = time.monotonic,
+) -> ChunkResult:
     """Move one rowid window in ONE transaction, committed only if every key's
     rollup delta equals the raw rows it removed."""
     # Outside the lock so the cold index reads do not hold it (see PREWARM_PRIMARY_KEY_SQL).
     conn.execute(PREWARM_PRIMARY_KEY_SQL, (lo, hi)).fetchone()
     conn.execute('BEGIN IMMEDIATE')
-    lock_acquired = time.monotonic()
+    lock_acquired = clock()
     try:
         preview = conn.execute(RAW_READS_BY_ROLLUP_KEY_SQL, (lo, hi)).fetchall()
         keys = [tuple(row[:4]) for row in preview]
@@ -406,7 +408,7 @@ def migrate_chunk(conn: sqlite3.Connection, lo: int, hi: int) -> ChunkResult:
         conn.execute('ROLLBACK')
         raise
     conn.execute('COMMIT')
-    lock_seconds = time.monotonic() - lock_acquired
+    lock_seconds = clock() - lock_acquired
     conn.execute('PRAGMA wal_checkpoint(PASSIVE)').fetchall()
     return ChunkResult(lo=lo, hi=hi, keys=len(keys), rows_moved=deleted, lock_seconds=lock_seconds)
 
@@ -432,25 +434,27 @@ def _limit_reached(limits: MigrationLimits, chunks: int, elapsed: float) -> bool
     return limits.max_seconds is not None and elapsed >= limits.max_seconds
 
 
-def migrate(conn: sqlite3.Connection, limits: MigrationLimits) -> MigrationReport:
-    setup_started = time.monotonic()
+def migrate(
+    conn: sqlite3.Connection, limits: MigrationLimits, *, clock: Callable[[], float] = time.monotonic,
+) -> MigrationReport:
+    setup_started = clock()
     span = count_only_span(conn)
-    started = time.monotonic()
+    started = clock()
     rows_moved = 0
     chunk_seconds: list[float] = []
     lock_seconds: list[float] = []
     if span is not None:
         lo, hi = span.first_rowid, span.max_rowid + 1
-        while lo < hi and not _limit_reached(limits, len(chunk_seconds), time.monotonic() - started):
-            chunk_started = time.monotonic()
-            result = migrate_chunk(conn, lo, min(lo + limits.chunk_rowids, hi))
-            chunk_seconds.append(time.monotonic() - chunk_started)
+        while lo < hi and not _limit_reached(limits, len(chunk_seconds), clock() - started):
+            chunk_started = clock()
+            result = migrate_chunk(conn, lo, min(lo + limits.chunk_rowids, hi), clock=clock)
+            chunk_seconds.append(clock() - chunk_started)
             lock_seconds.append(result.lock_seconds)
             rows_moved += result.rows_moved
             lo = result.hi
             if lo < hi:
                 time.sleep(limits.pause_seconds)
-    seconds = time.monotonic() - started
+    seconds = clock() - started
     return MigrationReport(
         applied=True,
         chunks=len(chunk_seconds),

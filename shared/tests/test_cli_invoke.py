@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
     _MAX_CAP_COOLDOWN_SECS,
@@ -79,6 +80,15 @@ def _make_result(**overrides: Any) -> AgentResult:
     }
     defaults.update(overrides)
     return AgentResult(**defaults)
+
+
+def _make_cap_result(**overrides: Any) -> AgentResult:
+    """A genuine cap: the CLI reports it as a failed turn carrying the banner."""
+    defaults: dict[str, Any] = {
+        'success': False, 'output': REAL_CLI_CAP_HIT_MESSAGES[0],
+    }
+    defaults.update(overrides)
+    return _make_result(**defaults)
 
 
 class TestAgentResultAccountNameField:
@@ -167,7 +177,7 @@ class TestAccountNameThreading:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result(), result],
             ),
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -212,7 +222,7 @@ class TestCapHitBackoff:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result(), result],
             ) as mock_invoke,
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -263,7 +273,7 @@ class TestCapHitBackoff:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result()] * 2 + [result],
             ),
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -292,7 +302,7 @@ class TestCapHitBackoff:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result()] * 3 + [result],
             ),
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -325,7 +335,7 @@ class TestCapHitBackoff:
             patch(
                 'shared.cli_invoke.invoke_claude_agent',
                 new_callable=AsyncMock,
-                return_value=result,
+                side_effect=[_make_cap_result()] * num_hits + [result],
             ),
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
@@ -477,7 +487,7 @@ class TestCapHitResume:
             active_account_name='acct-b',
         )
 
-        capped_result = _make_result(session_id='sess-123')
+        capped_result = _make_cap_result(session_id='sess-123')
         ok_result = _make_result()
 
         with (
@@ -505,7 +515,7 @@ class TestCapHitResume:
             active_account_name='acct-b',
         )
 
-        capped_result = _make_result(session_id='')
+        capped_result = _make_cap_result(session_id='')
         ok_result = _make_result()
 
         with (
@@ -532,7 +542,7 @@ class TestCapHitResume:
             active_account_name='acct-b',
         )
 
-        capped_result = _make_result(session_id='sess-123')
+        capped_result = _make_cap_result(session_id='sess-123')
         failed_resume = _make_result(success=False, output='resume error')
         ok_result = _make_result()
 
@@ -566,8 +576,8 @@ class TestCapHitResume:
             active_account_name='next',
         )
 
-        r1 = _make_result(session_id='sess-1')
-        r2 = _make_result(session_id='sess-2')
+        r1 = _make_cap_result(session_id='sess-1')
+        r2 = _make_cap_result(session_id='sess-2')
         r3 = _make_result()
 
         with (
@@ -727,7 +737,7 @@ class TestResumeFallbackCounter:
             active_account_name='acct-b',
         )
         failed_resume_1 = _make_result(success=False, output='resume error')
-        capped = _make_result(session_id='sess-capped')
+        capped = _make_cap_result(session_id='sess-capped')
         failed_resume_2 = _make_result(success=False, output='resume error')
         ok_result = _make_result()
 
@@ -3127,7 +3137,7 @@ class TestCapWaitPeriodicLog:
         gate = self._exact_hit_gate(hits=1)
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -3149,7 +3159,7 @@ class TestCapWaitPeriodicLog:
         label = 'task-99-architect'
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -3166,7 +3176,7 @@ class TestCapWaitPeriodicLog:
         gate = self._exact_hit_gate(hits=1, soonest_resets_at=reset_dt)
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -3182,7 +3192,7 @@ class TestCapWaitPeriodicLog:
         gate = self._exact_hit_gate(hits=1, soonest_resets_at=None)
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
@@ -3198,7 +3208,7 @@ class TestCapWaitPeriodicLog:
         gate = self._exact_hit_gate(hits=3)
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] * 3 + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             # All monotonic calls return 0.0 — time never advances, throttle stays active
             patch('shared.cli_invoke.time.monotonic', return_value=0.0),
@@ -3226,7 +3236,7 @@ class TestCapWaitPeriodicLog:
         )
 
         with (
-            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[_make_cap_result()] * 3 + [_make_result()]),
             patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_vals),
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),

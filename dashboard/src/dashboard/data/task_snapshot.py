@@ -48,6 +48,7 @@ from types import MappingProxyType
 from typing import Any, Generic, TypeVar
 
 import httpx
+from shared.process_identity import Liveness
 from shared.task_statuses import ACTIVE, TERMINAL
 
 from dashboard.config import DashboardConfig
@@ -58,6 +59,7 @@ from dashboard.data.census import (
     build_census,
 )
 from dashboard.data.datum import Datum, DatumState, aged_at, unknown_datum, validate_datum
+from dashboard.data.deferral_summary import read_liveness, session_holders
 from dashboard.data.mcp_fanout import TTLCache
 from dashboard.data.tasks import (
     fetch_statuses,
@@ -245,6 +247,10 @@ class TaskSnapshot:
             dependency chips.
         failure: Why this unit is not wholly measured; see
             :class:`SnapshotFailure`.
+        holder_liveness: Each deferred held_by_session row's holder liveness,
+            read from /proc once per unit. RAW MATERIAL like ``status_map``,
+            not part of the wire shape. Empty when the unit read none, which
+            every reader takes as "not read", never as "live".
     """
 
     census: Datum[TaskCensus]
@@ -254,6 +260,7 @@ class TaskSnapshot:
     skew_seconds: int | None
     status_map: Mapping[int, str]
     failure: SnapshotFailure
+    holder_liveness: Mapping[int, Liveness | None] = MappingProxyType({})
 
     def to_wire(self) -> dict[str, object]:
         """Render the five contract keys; the raw map stops here."""
@@ -459,6 +466,7 @@ def _assemble(
     failure: SnapshotFailure,
     now: datetime,
     project_root: str,
+    holder_liveness: Mapping[int, Liveness | None] = MappingProxyType({}),
 ) -> TaskSnapshot:
     """Turn a rows ``Datum`` and a map outcome into one stamped, contract-checked unit.
 
@@ -488,6 +496,7 @@ def _assemble(
             dict(map_half.value) if isinstance(map_half.value, Mapping) else {}
         ),
         failure=failure,
+        holder_liveness=MappingProxyType(dict(holder_liveness)),
     )
     # Check the contract HERE, where the producer still has the context to
     # name what it built, rather than letting a break surface as a shaping
@@ -527,10 +536,19 @@ async def _read_unit(
         ),
     )
     root = str(project_root)
+    rows = _datum(rows_half, now=now, project_root=root, name='rows')
     return _assemble(
-        _datum(rows_half, now=now, project_root=root, name='rows'),
-        map_half, failure=rows_half.failure, now=now, project_root=root,
+        rows, map_half, failure=rows_half.failure, now=now, project_root=root,
+        holder_liveness=await _read_holder_liveness(rows),
     )
+
+
+async def _read_holder_liveness(rows: Datum[list[dict]]) -> Mapping[int, Liveness | None]:
+    """Read every deferred session holder's liveness, on a worker thread: /proc reads block."""
+    holders = session_holders(rows.value or [])
+    if not holders:
+        return {}
+    return await asyncio.to_thread(read_liveness, holders)
 
 
 def unmeasured_snapshot(
@@ -710,6 +728,17 @@ task completing late — is real, which is why this is 8x the 50-row cap the
 retired default-render buckets used, why exceeding it WARNS, and why the
 answer crosses the wire as ``LOWER_BOUND`` rather than as a plain list.
 """
+
+
+def measured_status_map(snapshot: TaskSnapshot) -> Mapping[int, str] | None:
+    """*snapshot*'s ``{id: status}`` map, or ``None`` if it did not measure one.
+
+    A failed map half leaves ``status_map`` empty. Offered as carrier statuses,
+    that empty map would read every carrier as missing.
+    """
+    if snapshot.census.state is not DatumState.FRESH:
+        return None
+    return snapshot.status_map
 
 
 def measured_terminal_total(snapshot: TaskSnapshot) -> int | None:

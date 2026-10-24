@@ -12,10 +12,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _curator_helpers import zot_agent_result
 from _fm_helpers import _init_git_repo, make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 from shared.async_sqlite_base import CheckpointResult
-from shared.cli_invoke import AgentResult
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TaskStatus
 
@@ -16727,13 +16727,6 @@ _NEW_TASK_ID = '77'
 _DUP_TASK_ID = '42'
 
 
-def _zot_agent_result() -> AgentResult:
-    return AgentResult(
-        success=False, output='', subtype='error_empty_output',
-        timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
-    )
-
-
 def _stamp_calls(tm) -> list:
     return [
         call for call in tm.update_task.await_args_list
@@ -16785,7 +16778,7 @@ class TestZotDuplicateSweepWiring:
             prompt_tokens=0,
         )
         with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(return_value=_zot_agent_result())):
+                   new=AsyncMock(return_value=zot_agent_result())):
             return await curator.curate(
                 candidate, project_id, _ZOT_PROJECT_ROOT, prepared=prepared,
             )

@@ -24,7 +24,7 @@ import posixpath
 import re
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -2172,6 +2172,42 @@ def _entry_covered(norm: str, touched_set: set[str]) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class DeclarationCoverage:
+    undeclared: tuple[str, ...]
+    """Changed paths no declared entry covers, sorted."""
+    undelivered: tuple[str, ...]
+    """Declared entries, exactly as written, that cover no changed path, sorted."""
+
+
+def declaration_coverage(
+    declared: Iterable[str], paths: Iterable[str],
+) -> DeclarationCoverage:
+    """Difference a declaration against changed paths, in both directions.
+
+    The git-free half of :func:`_check_plan_files_touched_in_branch`'s
+    coverage rule (:func:`_normalize_plan_path` + :func:`_entry_covered`),
+    applied per changed path for ``undeclared`` and per declared entry for
+    ``undelivered``.  The gate's existence probe and rename arm need git and
+    are not applied, so a renamed declared path reads as one undelivered
+    entry plus one undeclared path.  Caller:
+    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_landed_scope``.
+    """
+    norms = {entry: _normalize_plan_path(entry) for entry in declared if entry}
+    path_set = set(paths)
+    undeclared = sorted(
+        p for p in path_set
+        if not any(_entry_covered(norm, {p}) for norm in norms.values())
+    )
+    undelivered = sorted(
+        entry for entry, norm in norms.items()
+        if not _entry_covered(norm, path_set)
+    )
+    return DeclarationCoverage(
+        undeclared=tuple(undeclared), undelivered=tuple(undelivered),
+    )
+
+
 _MAX_RENAME_HOPS = 8
 """Upper bound on how many consecutive rename hops the resolver will follow.
 
@@ -3342,6 +3378,12 @@ async def _same_tree(git_ops: GitOps, a: str, b: str) -> bool:
     return rc == 0 and len(trees) == 2 and trees[0] == trees[1]
 
 
+def _declared_history_leg(req: MergeRequest) -> str | None:
+    """The project's same-tree history leg command, or None when it declares none."""
+    command = getattr(req.config, 'merge_gate_history_test_command', None)
+    return command if isinstance(command, str) and command.strip() else None
+
+
 async def _decide_reverify_gate(
     git_ops: GitOps,
     req: MergeRequest,
@@ -3362,6 +3404,11 @@ async def _decide_reverify_gate(
     )
     history_pure = getattr(req.config, 'merge_gate_history_pure', False) is True
     if history_pure and await _same_tree(git_ops, verified_merge_sha, merge_sha):
+        if (history_leg_command := _declared_history_leg(req)) is not None:
+            return decide(
+                reason=ReverifyGateReason.same_tree_history_leg,
+                history_leg_command=history_leg_command,
+            )
         return decide(reason=ReverifyGateReason.same_tree)
     overlap = await _rebase_delta_touched_overlap(
         req.worktree, rebased_from, rebased_onto, git_ops,
@@ -3436,11 +3483,17 @@ async def _reverify_rebased_tree(
        ``merge_gate_history_pure``: when *merge_sha*'s tree equals
        *verified_merge_sha*'s, clear as ``GateClearance.same_tree`` with no
        verify.  PRECONDITION: the gate's verdict is a function of the tree
-       alone.  A gate leg that reads git history (ancestry of HEAD, a
-       merge-base) can turn red on the same tree under a new parent, so for
-       such a project the key stays False and the tree is re-verified.  Under
-       the precondition a gate that passed tree T sees exactly T again, and
-       neither premise of :func:`_disjoint_skip_blockers` is consulted.
+       alone, except the tests ``merge_gate_history_test_command`` selects.
+       A gate leg that reads git history (ancestry of HEAD, a merge-base) can
+       turn red on the same tree under a new parent, so for a project that
+       cannot name those tests the key stays False and the tree is
+       re-verified.  When the project declares that command, only it runs, on
+       *merge_wt*, through *run_post_merge_verify* with
+       ``history_leg_command``: a pass clears as
+       ``GateClearance.history_leg``, and a red or unrunnable leg gets the
+       re-verify's full failure handling.  Under the precondition a gate that
+       passed tree T sees exactly T again, and neither premise of
+       :func:`_disjoint_skip_blockers` is consulted.
     1. **Disjoint** (``_rebase_delta_touched_overlap`` is empty) with no
        :func:`_disjoint_skip_blockers`: clear as ``GateClearance.disjoint``
        with no verify.  Disjointness alone is NOT sufficient: see that
@@ -3475,7 +3528,8 @@ async def _reverify_rebased_tree(
         legacy single-keep behaviour (only ``merge_wt`` is protected).
     run_post_merge_verify:
         The worker's ``_run_post_merge_verify``, which this gate delegates the
-        re-verify to when it fires.
+        re-verify to when it fires, and the declared history leg to, as
+        ``history_leg_command``, on a same tree.
     event_store:
         Receives the decision row, and is forwarded to the re-verify.
     """
@@ -3499,8 +3553,13 @@ async def _reverify_rebased_tree(
         merge_sha=merge_sha,
         keep_worktrees=keep_worktrees,
         event_store=event_store,
+        history_leg_command=decision.history_leg_command,
     )
-    return GateClearance.reverified if failure is None else failure
+    if failure is not None:
+        return failure
+    if decision.history_leg_command is None:
+        return GateClearance.reverified
+    return GateClearance.history_leg
 
 
 async def _check_post_merge_pyright(

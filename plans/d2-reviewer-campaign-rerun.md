@@ -13,7 +13,8 @@ below is one action.
 ## 1. Where
 
 1. Run every command from the MAIN checkout's `orchestrator/`, after task 5438
-   has merged.
+   has merged. Invocation B (§3) and the CLI Astra route (§4) also need task
+   7265 merged: it lets the CLI accept `--briefing d2` on its own.
 2. Pass an ABSOLUTE results dir. A relative one resolves against
    `orchestrator/`:
 
@@ -53,19 +54,21 @@ Run into the SAME `$RESULTS`:
 ```bash
 uv run python -m orchestrator.evals.reviewer_trial campaign \
   --results-dir "$RESULTS" --split test --trials 3 --max-parallel 6 \
-  --arms variant_a,variant_fable51_solo,variant_a_xhigh,variant_sonnet5_solo \
-  --briefing diff-only,d2
+  --arms variant_a,variant_fable51_solo,variant_a_xhigh --briefing d2
 ```
 
-- **The CLI refuses `--briefing d2` on its own.**
-  `orchestrator/src/orchestrator/evals/reviewer_trial/__main__.py::_parse_briefings`
-  requires `diff-only` first whenever d2 is listed, so this command also runs
-  every new arm's diff-only generation. That is 333 panels beyond the d2 arms
-  (see §6).
-- **The incumbent's panels are not paid twice.**
-  `orchestrator/src/orchestrator/evals/reviewer_trial/runner.py::run_trial`
-  reuses Invocation A's `variant_a__<fixture>.json` and
-  `variant_a_d2__<fixture>.json` checkpoints by file name.
+- Leo's ruling on gate 7263 (2026-10-21) drops `variant_sonnet5_solo`.
+- Start B only after Invocation A reports D2 PASS.
+- `--briefing d2` alone runs only each arm's d2 arm. The incumbent is the
+  first arm's d2 arm, `variant_a_d2`. The rule is in
+  `orchestrator/src/orchestrator/evals/reviewer_trial/__main__.py::_parse_briefings`,
+  the arm order in
+  `orchestrator/src/orchestrator/evals/reviewer_trial/variants.py::campaign_arms`.
+- **The incumbent's panels are not paid twice.** Invocation A's
+  `variant_a_d2__<fixture>.json` checkpoints are reused by file name:
+  panel results by
+  `orchestrator/src/orchestrator/evals/reviewer_trial/runner.py::run_trial`,
+  and their score files under `trial-<n>/scores/` by `__main__.py::campaign`.
 - Afterwards, copy `campaign_report.{md,json}` to `d6-report.{md,json}`. A
   rerun with identical arguments only reduces, so an overwritten report can
   be regenerated for free.
@@ -79,19 +82,19 @@ Keep codex on the ChatGPT login and never the API key (Leo's ruling).
 ```bash
 uv run python -m orchestrator.evals.reviewer_trial campaign \
   --results-dir "$RESULTS" --split test --trials 3 \
-  --arms variant_a,variant_cross_family --briefing diff-only,d2
+  --arms variant_a,variant_cross_family --briefing d2
 ```
 
-This also runs the diff-only Astra arm, which spends ChatGPT windows too.
+Afterwards, copy `campaign_report.{md,json}` to `d7-report.{md,json}`.
 
 **If 5403 has not landed**, the CLI has no window handling. A cap-hit panel is
 persisted as `ERROR` and reused on resume, so delete those result files
 before you resume.
 
-To spend windows on the d2 arm only, adapt the untracked
-`cross_family_arm.py`. It predates d2: it runs the diff-only
-`VARIANT_CROSS_FAMILY` into `campaign/` and writes panel results only. It needs
-three changes:
+To pause on a cap instead, adapt the untracked `cross_family_arm.py`, which
+sleeps until the reset time the codex cap message names. It predates d2: it
+runs the diff-only `VARIANT_CROSS_FAMILY` into `campaign/` and writes panel
+results only. It needs three changes:
 
 - run `with_briefing(VARIANT_CROSS_FAMILY, ReviewBriefing.CONTEXT_COMPLETE)`
   (`variants.py::with_briefing`);
@@ -106,9 +109,13 @@ way `complement_adjudication.md` did. Unresolved items go to Leo.
 
 ## 5. The verdicts
 
-Every `campaign_report` pairs each arm against `variant_a`, the diff-only
-incumbent. D6 and D7 are judged against `variant_a_d2`. So re-reduce the
-cached d2 score records with that incumbent; it spends nothing:
+D6 and D7 are judged against `variant_a_d2`. B's report, and the CLI Astra
+route's, already pair every arm against it, so read D6 straight from
+`d6-report.md` and, on the CLI route, D7 from `d7-report.md`.
+
+Only the codex arm run outside the CLI by `cross_family_arm.py` needs a
+re-reduce. Re-reduce the cached d2 score records with `variant_a_d2` as the
+incumbent; it spends nothing:
 
 ```bash
 uv run python - <<'PY'
@@ -140,10 +147,11 @@ Read the three verdicts. Each rule lives in
 
 - **D2**: the `variant_a_d2` line for `::non_inferior` in `d2-gate-report.md`.
 - **D6**: the `variant_fable51_solo_d2` line for `::strict_improvement` in
-  `report.md`. Report its blocking precision (`blocking P`) and its
+  `d6-report.md`. Report its blocking precision (`blocking P`) and its
   `$/blocking finding` alongside the verdict.
 - **D7**: the `variant_cross_family_d2` line for `::clears_self_complement_band`
-  in `report.md`, AND an adjudicated complement precision of at least 50%.
+  in `d7-report.md` (CLI route) or `report.md` (`cross_family_arm.py` route),
+  AND an adjudicated complement precision of at least 50%.
   The noise floor is the incumbent's own band, `::self_complement_band`. The
   report prints it on the "Incumbent self-complement band" line.
 
@@ -159,11 +167,11 @@ Read the three verdicts. Each rule lives in
   | Invocation | Panels | What runs |
   |---|---|---|
   | A | 210 | `variant_a` diff-only and d2 |
-  | B | 630 | the three new arms, d2 (297) and diff-only (333) |
+  | B | 198 | `variant_fable51_solo_d2` and `variant_a_xhigh_d2`, 99 each; `variant_a_d2` is reused from A |
   | Astra, d2 only | 99 | `variant_cross_family_d2` |
 
-- B's 333 diff-only panels are the largest avoidable spend. D6 needs only the
-  d2 arms, but the CLI cannot run them alone today.
+- Running d2 alone saves the two arms' 222 diff-only panels, about $450 of
+  shared-pool spend at the September diff-only rates.
 
 After the run, `add_memory` the headline numbers and hand the three verdicts
 to the study session.

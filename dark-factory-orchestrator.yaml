@@ -84,9 +84,24 @@ lock_depth: 12
 # RED TIER: module_overrides is not in RELOADABLE_FIELDS and _limit_for memoises
 # per process, so this takes effect at the next orchestrator restart (the
 # explicit deploy task filed with this carrier), not on reload_config.
+#
+# THE TWO RATCHET JSON PATHS (Leo's ruling 3 of 2026-10-21, task 7298) are
+# UNBOUNDED, not widened: 99 is above any max_concurrent_tasks this repo has run.
+# They are derived artefacts the gate regenerates, declared in metadata.files by
+# ~115 pending tasks, and that lock serialised dispatch on top of the merge
+# conflicts it was meant to prevent. Authorizations are now one file each and the
+# baseline merges through the ratchet-baseline driver, so concurrent declarers
+# no longer collide. The ledger keys are the RETIRED array path, kept because
+# pending tasks still declare it, and the directory's one fixed file. A PARK on
+# these keys takes one of the key's slots instead of reserving it exclusively
+# (orchestrator/src/orchestrator/scheduler.py::ModuleLockTable._iter_blocking_park_owners).
+# Same red tier as above.
 module_overrides:
   orchestrator/src/orchestrator/workflow.py: 2
   orchestrator/src/orchestrator/harness.py: 2
+  orchestrator/tests/merge_lane_ratchet_baseline.json: 99
+  orchestrator/tests/merge_lane_ratchet_authorized_raises.json: 99
+  orchestrator/tests/merge_lane_ratchet_raises/_README.json: 99
 
 # Verification commands (dark-factory multi-subproject layout)
 # test_command fans out per-subproject so each runs in its own venv with its
@@ -1555,14 +1570,13 @@ recovery_emission:
 # of this file alone does not auto-fire a fleet restart. Activation is the
 # separate τ deterministic-deploy capstone task.
 merge_verify_breadth: "full"
-# Same-tree gate skip (task 6647) stays OFF: these gate legs read HEAD's git
-# history, so a byte-identical tree under a new parent can turn them red —
-#   fused-memory/tests/test_read_transform_selection_regeneration.py::TestEveryCommittedFixtureStampIsOnThisHistory::test_every_stamp_is_an_ancestor_of_head
-#   fused-memory/tests/arm_harness/test_lme_control_artifacts.py::test_every_run_is_pinned_to_one_code_sha_and_the_committed_corpus
-#   fused-memory/tests/arm_harness/test_lme_embedding_artifacts.py::test_the_candidates_preregistration_sha_carries_the_doc_and_precedes_head
-#   fused-memory/tests/arm_harness/test_lme_screening_artifacts.py::test_one_preregistration_sha_that_carries_the_doc_and_is_on_this_history
-#   dashboard/tests/test_index_html.py::test_redux_cache_buster_is_newer_than_merge_base
-merge_gate_history_pure: false
+# Same-tree gate (tasks 6647, 7248). The pytest marker reads_git_history
+# selects every gate test that reads the checkout's git history; on a rebase
+# whose tree is byte-identical to the verified one, only those tests re-run,
+# through the leg below. tests/scripts/test_merge_gate_history_leg.py keeps the
+# marks, this leg's segments and the flag in step.
+merge_gate_history_pure: true
+merge_gate_history_test_command: "uv run --directory fused-memory pytest tests/ -m 'reads_git_history and not integration' --tb=short -q --timeout=300 && uv run --directory orchestrator pytest tests/ -m 'reads_git_history and not warm_lane_bash' --tb=short -q --timeout=300 && uv run --directory dashboard pytest tests/ -m reads_git_history --tb=short -q --timeout=300"
 merge_train_former_enabled: true
 merge_train_coalesce_enabled: true
 merge_train_max_members: 3
@@ -1751,9 +1765,14 @@ unblock_auto:
 
 # Task 3546 (mu gate), Leo's ruling of 2026-10-18 on esc-3546-1: enforce strand
 # conversion (task 3539) fleet-wide. Restart-only, so it takes effect at the next
-# scheduled fleet redeploy. workflow_exit_contract_enforce stays False until task
-# 3113 lands and a fresh soak shows zero would-violates.
+# scheduled fleet redeploy.
 convert_to_blocked_enforce: true
+# Task 3546 (mu gate), Leo's ruling E of 2026-10-20 (task 7255): enforce the
+# run()-exit contract (task 3542) fleet-wide. Soak clean on 2026-10-22: zero
+# workflow_exit_contract events of any verdict in all 8 fleet run stores since
+# 2026-10-20T01:10Z, after 3113's deploy, with every unit restarted inside the
+# window. Restart-only, so it goes live at the next fleet restart.
+workflow_exit_contract_enforce: true
 
 psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2026-09-08)
   mem_some_avg10: 15.0
@@ -1762,3 +1781,8 @@ psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (
   runqueue_ratio: 4.0     # provisional (D9); the calibration gate re-derives it
   min_inflight_floor: 3
   # cpu_some_avg10 and own_cpu_some_avg10 deliberately absent: off (D1, D2)
+
+# Ruling D2 (task 7263, Leo 2026-10-22): the context-complete reviewer briefing.
+# Runbook: plans/d2-context-complete-reviewer-gate.md (watch section 3, kill rule section 4).
+review:
+  reviewer_briefing: d2

@@ -8,9 +8,11 @@ observed through its log and the calls its halves make.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import threading
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -22,10 +24,11 @@ import pytest
 from _curator_helpers import agent_result, make_config, pool_with_ids
 from _fm_helpers import LoopFreedomProbe
 from shared.cli_invoke import AgentResult, TranscriptEvidence, transcript_evidence
-from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir, reset_sweep_once_state
 from shared.usage_gate import UsageGate
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
+from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
@@ -36,6 +39,9 @@ from fused_memory.middleware.task_curator import (
 _CURATOR_MODULE = 'fused_memory.middleware.task_curator'
 _INVOKE = f'{_CURATOR_MODULE}.invoke_with_cap_retry'
 _EVIDENCE_READ = f'{_CURATOR_MODULE}.transcript_evidence_for_session'
+_SWEEP = f'{_CURATOR_MODULE}.sweep_stale_pid_dirs'
+_CURATOR_SWEEP_PREFIX = CONFIG_DIR_PREFIX + 'fm-curator-'
+_SWEEP_HOLD_CEILING_SECONDS = 30.0
 _TRANSCRIPTS = Path(__file__).parent / 'fixtures' / 'curator_transcripts'
 
 _SINGLE_OK = {'action': 'create', 'justification': 'x'}
@@ -244,6 +250,63 @@ class TestCuratorTranscriptThreading:
         assert kwargs.get('config_dir') is None
         assert kwargs.get('session_id') is None
         assert 'startup_grace_secs' not in kwargs
+
+
+@pytest.fixture
+def _fresh_curator_sweep():
+    """The curator sweep runs once per process, so an earlier gated test in this
+    worker would otherwise have consumed it."""
+    reset_sweep_once_state(_CURATOR_SWEEP_PREFIX)
+    yield
+    reset_sweep_once_state(_CURATOR_SWEEP_PREFIX)
+
+
+class _HeldSweep:
+    """A dead-PID sweep that holds until released.
+
+    It never holds on the event-loop thread, where holding would deadlock the
+    test instead of failing it.
+    """
+
+    def __init__(self) -> None:
+        self.loop_thread = threading.get_ident()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.calls: list[tuple[str, Path | None]] = []
+
+    def __call__(self, prefix: str, *, base_dir: Path | None = None, **_kwargs: Any) -> int:
+        self.calls.append((prefix, base_dir))
+        if threading.get_ident() != self.loop_thread:
+            self.release.wait(_SWEEP_HOLD_CEILING_SECONDS)
+        self.finished.set()
+        return 0
+
+
+@pytest.mark.usefixtures('_fresh_curator_sweep')
+class TestCuratorStaleConfigDirSweep:
+    """The first gated call starts the dead-PID sweep and never waits for it.
+
+    The sweep reclaims other, dead processes' leftovers, so no call depends on
+    it. With no base dir it reads the whole system tempdir, which under
+    merge-verify load took longer than a submitter's resolve budget (task 7335).
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('call_kwargs', 'expected_timeout'), _CALL_SITES)
+    async def test_gated_call_does_not_wait_for_the_stale_config_dir_sweep(
+        self, call_kwargs, expected_timeout, tmp_path,
+    ):
+        curator, _ = _gated_curator(tmp_path)
+        sweep = _HeldSweep()
+
+        with patch(_SWEEP, new=sweep):
+            await call_kwargs(curator)
+            returned_while_held = not sweep.finished.is_set()
+            sweep.release.set()
+            assert await asyncio.to_thread(sweep.finished.wait, _SWEEP_HOLD_CEILING_SECONDS)
+
+        assert returned_while_held
+        assert sweep.calls == [(_CURATOR_SWEEP_PREFIX, tmp_path)]
 
 
 def _fixture_lines(name: str) -> list[str]:
@@ -619,7 +682,7 @@ class TestCuratorTranscriptSalvage:
 
         decision = await _curate(curator, invoke)
 
-        assert decision.action == 'create'
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
         assert _reported_failure(escalator)['subtype'] == 'error_timeout_killed_with_progress'
 
     @pytest.mark.asyncio
@@ -633,7 +696,7 @@ class TestCuratorTranscriptSalvage:
         with patch(_EVIDENCE_READ, return_value=salvageable):
             decision = await _curate(curator, invoke)
 
-        assert decision.action == 'create'
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
         escalator.report_failure.assert_awaited_once()
 
 
@@ -798,7 +861,7 @@ class TestSalvageRequiresAKilledRunWithAnAcceptedVerdict:
         with caplog.at_level(logging.WARNING, logger=_CURATOR_MODULE):
             decision = await _curate(curator, invoke)
 
-        assert decision.action == 'create'
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
         report = _reported_failure(escalator)
         assert report['schema_tool_denied'] is failure.schema_tool_denied
         assert report['subtype'] == failure.subtype
@@ -852,7 +915,7 @@ class TestGatedSchemaToolDenialEscalates:
 
         decision = await _curate(curator, invoke)
 
-        assert decision.action == 'create'
+        assert (decision.action, decision.defer_reason) == ('defer', DeferReason.LLM_FAILED)
         assert _reported_failure(escalator)['schema_tool_denied'] is True
 
     @pytest.mark.asyncio
@@ -867,6 +930,6 @@ class TestGatedSchemaToolDenialEscalates:
 
         decisions = [await _curate(curator, invoke, title) for title in 'ABCD']
 
-        assert decisions[1].action == 'create'
+        assert decisions[1].defer_reason is DeferReason.LLM_FAILED
         assert invoke.await_count == 3
-        assert decisions[3].justification == 'zero-output-breaker-open'
+        assert decisions[3].defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN

@@ -14,11 +14,11 @@ from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
 from orchestrator.agents.grep_pattern_guidance import GREP_PATTERN_ESCAPING_GUIDANCE
 from orchestrator.agents.partial_failure_guidance import MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
 from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
+from orchestrator.agents.pipeline_status_guidance import PIPELINE_EXIT_STATUS_GUIDANCE
 from orchestrator.agents.pkill_guidance import PKILL_SELF_MATCH_GUIDANCE
 from orchestrator.agents.premise_refutation_guidance import PREMISE_REFUTATION_GUIDANCE
 from orchestrator.agents.python_literal_guidance import PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
 from orchestrator.agents.review_briefing import ReviewBriefing
-from orchestrator.agents.sigpipe_guidance import SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
 
 # Maps each MCP-family name to the allowed_tools prefixes that "belong" to
 # it.  Used by AgentRole.__post_init__ (below) to enforce that wiring a tool
@@ -29,8 +29,7 @@ from orchestrator.agents.sigpipe_guidance import SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
 # did not exist and the Lever-C fast-path silently always fell through to the
 # architect).  jcodemunch tools intentionally have no prefix entry here — they
 # ride inside the 'orchestrator' MCP config but are not themselves a trigger
-# for requiring a family (a role may use jcodemunch alone with no family
-# declared, e.g. reviewer_comprehensive).
+# for requiring a family.
 _FAMILY_TOOL_PREFIXES: dict[str, tuple[str, ...]] = {
     'orchestrator': ('mcp__fused-memory__', 'mcp__escalation__'),
     'plan_tools': ('mcp__plan-tools__',),
@@ -69,6 +68,24 @@ class AgentRole:
     # whenever the paired CONTRACT changes materially, invalidating any stale
     # pinned artifact for the old contract). None when prompt_spec is None.
     prompt_harness_version: str | None = None
+
+    @property
+    def strict_mcp_scope(self) -> bool:
+        """Whether this role's whole MCP surface is its declared families.
+
+        True when it declares a family, none is 'orchestrator', and every
+        mcp__ grant falls under a declared family's prefix.
+        """
+        if not self.mcp_families or 'orchestrator' in self.mcp_families:
+            return False
+        declared_prefixes = tuple(
+            prefix for family in self.mcp_families for prefix in _FAMILY_TOOL_PREFIXES[family]
+        )
+        return all(
+            tool.startswith(declared_prefixes)
+            for tool in self.allowed_tools
+            if tool.startswith('mcp__')
+        )
 
     def __post_init__(self) -> None:
         """Import-time capability assertion (W9-η, reify esc-4943-54 class).
@@ -383,6 +400,86 @@ single normative source for all of this; consult it rather than guessing.
 """
 
 
+# The routing rule for IN-PLACE memory amendment, spliced into
+# _MEMORY_INSTRUCTIONS below so all five roles that carry that block inherit
+# it with no per-role edits (task 4548).
+#
+# WHY IT EXISTS. Task 3891's plan step-6 instructed an implementer to call
+# `update_memory`'s `content_amend` arm, pre-specifying a fallback only for a
+# metadata rejection. The arm is gated on an `agent_id`-prefix allowlist that
+# ships as `['recon-stage-', 'curator-']`
+# (`fused_memory/config/schema.py::Mem0UpdateConfig`, enforced by
+# `fused_memory/server/mem0_update_authz.py::resolve_mem0_update_authorization`),
+# and every dispatched identity is `claude-task-<id>-<role>`
+# (`orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._agent_identity`),
+# so the step was unexecutable by construction. It cost five escalations
+# (esc-3891-4 through -8) and left residual task 4478 -- a curator sitting --
+# for a single memory edit. The rule itself was already ratified, but lived
+# only in curator- and operator-facing files
+# (`skills/curate-fused-memories/SKILL.md`,
+# `plans/mem0-in-place-update-decision.md`, `OPERATIONS.md`), none of which a
+# dispatched plan AUTHOR reads. The durable, greppable statement now lives in
+# `docs/task-authoring.md`, cited by HEADING TITLE rather than by its section
+# ordinal both here and in the prompt text below: a later section inserted
+# ahead of it would silently repoint five role prompts at the wrong section,
+# and nothing checks the docs half (deliberately -- see
+# tests/test_roles_memory_amend_routing.py's docstring). This constant is the
+# half that reaches an agent that never opens that file.
+#
+# WHY HERE, not in `orchestrator/src/orchestrator/agents/briefing.py`. One
+# splice reaches both plan AUTHORS (architect, simple_task) and the plan
+# EXECUTORS who would receive such a step (implementer, debugger), plus
+# deep_reviewer. The briefing assembles the architect prompt at four separate
+# call sites and reaches only the architect, so a briefing-side fix is four
+# edits or a new shared constant anyway. This block is also where the
+# `add_memory` guidance the rule qualifies already lives.
+#
+# WHY STEWARD IS NOT RE-SPLICED. STEWARD does not embed _MEMORY_INSTRUCTIONS
+# at all -- it composes its own block over _STEWARD_MEMORY_TOOLS -- so
+# covering it costs a second edit and a second per-invocation token spend,
+# and the evidence says it is not needed: resolving esc-3891-6 the steward
+# considered adopting a `curator-` agent_id to perform the amendment itself
+# and correctly declined on exactly this reasoning. The plan-authoring
+# invariant in tests/test_roles_memory_amend_routing.py keys on plan-step
+# authoring, so it does not spuriously demand steward coverage -- and if the
+# steward is ever granted plan-authoring tools, that test fires and forces
+# this decision to be revisited.
+#
+# HARD CONSTRAINT (a) -- do NOT write a fully-qualified `mcp__<family>__<name>`
+# tool name into the text below. tests/test_roles_ancestry_check.py::
+# test_role_holds_every_mcp_tool_its_prompt_names is parametrized over every
+# role and asserts each such name in a system_prompt is in THAT role's
+# allowed_tools; NO role is granted `update_memory` (see _MEMORY_TOOLS above,
+# pinned by tests/test_roles_memory_amend_routing.py::
+# test_no_role_is_granted_the_in_place_update_tool), so the qualified spelling
+# would fail five roles at once. Name the tools BARE, as the surrounding block
+# already does for `add_memory`/`search`/`get_entity`. Same constraint the
+# comments on _TOOL_CALL_REJECTION_KNOWN_SHAPES and
+# MISSING_REQUIRED_PARAMETER_REJECTION record.
+#
+# HARD CONSTRAINT (b) -- no literal `{`/`}` braces. Role prompts reach this
+# only by plain `+` concatenation, which is brace-safe by construction, but
+# staying brace-free keeps it safe if a future splice site interpolates.
+MEMORY_AMEND_ROUTING_RULE = """
+### Amending an existing memory
+
+Amending an EXISTING memory in place — `update_memory`'s `content_amend` arm
+— is not yours to perform, and must never be written into a plan step for
+another agent to perform. The arm is gated on an `agent_id`-prefix allowlist
+admitting only reconciliation stages and a sanctioned curator sitting; your
+dispatched agent_id matches neither, so the refusal is deterministic — not a
+flake to retry around or a permission to request.
+
+Instead, write a NEW memory with `add_memory` recording the correction, and
+— if you hold a task-filing tool — file a follow-up task for a curator
+sitting (`skills/curate-fused-memories`) to perform the amendment. If you
+cannot file tasks, escalate asking for one to be filed. Renaming yourself to
+a `curator-` agent_id to clear the gate is forbidden: that is
+self-authorization for a silent-rewrite primitive. Stop, leave the record
+alone, and escalate. Full rule and cross-links: `docs/task-authoring.md`,
+section "In-place memory amendments are not task-agent work".
+"""
+
 _MEMORY_INSTRUCTIONS = """
 ## Memory
 
@@ -408,7 +505,7 @@ Parameters:
 - `agent_id`: Use the agent_id from your Agent Identity section
 
 Write immediately when you discover something — don't batch until the end.
-
+""" + MEMORY_AMEND_ROUTING_RULE + """
 ### Reading memories (`search`, `get_entity`)
 
 Use when you need context not in your briefing:
@@ -715,12 +812,11 @@ A killed run says NOTHING about the code under test: it is neither failing nor
 hanging. Never report it as a test failure or a hang. Say it was killed
 externally, and quote the raw code.
 
-Do NOT pipe a long run into `| tail`, `| head` or `| grep`. Bash here runs
-without `pipefail`, so a pipeline reports its LAST stage's status and the real
-exit code is thrown away. A kill that takes the process group also takes
-whatever was buffered in the pipe, leaving a code and no output. Redirect to a
-file and `Read` the file: a killed run then still leaves its partial output
-on disk.
+Do NOT pipe a long run into `| tail`, `| head` or `| grep`. A kill that takes
+the process group also takes whatever was buffered in the pipe, leaving a code
+and no output. Redirect to a file and `Read` the file: a killed run then still
+leaves its partial output on disk. For what a pipe does to the exit code
+itself, see the pipeline exit-status section below.
 
 To diagnose a 137, re-run it once, on ONE line:
 
@@ -763,9 +859,9 @@ BACKGROUND_WAIT_GUIDANCE = (
 # that for ~8% of the block's bytes.
 #
 # THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
-# BACKGROUND_WAIT_GUIDANCE 10022 B (= BACKGROUND_TASK_WARNING 1193 +
-# WAIT_PATTERN_GUIDANCE 6411 + EXTERNAL_KILL_GUIDANCE 2418),
-# WAIT_PATTERN_REMINDER 766 B -> 766/10022 = 7.6%.
+# BACKGROUND_WAIT_GUIDANCE 9992 B (= BACKGROUND_TASK_WARNING 1193 +
+# WAIT_PATTERN_GUIDANCE 6411 + EXTERNAL_KILL_GUIDANCE 2388),
+# WAIT_PATTERN_REMINDER 766 B -> 766/9992 = 7.7%.
 # Re-derive rather than trust these after any edit to the strings:
 #   python -c "from orchestrator.agents.roles import *; \
 #              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
@@ -1309,7 +1405,7 @@ _BASH_CAPABLE_ROLE_PREAMBLE = (
     + PATH_NOT_FOUND_GUIDANCE
     + BASH_CWD_ANCHOR_GUIDANCE
     + FILE_LOOKUP_GUIDANCE
-    + SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
+    + PIPELINE_EXIT_STATUS_GUIDANCE
     + PREMISE_REFUTATION_GUIDANCE
 )
 
@@ -2099,6 +2195,18 @@ correct resolution, not picking one. If combining is unclear, call
 Include in the escalation summary (and in the `submit_merge_disposition`
 reason): the list of dropped files and a one-line description of what each
 dropped file contributes that the kept side lacks.
+
+## A Conflict Resolved by a Script, Never by Hand
+
+In a repository carrying `scripts/split_merge_lane_ratchet_ledger.py` (dark-factory):
+a modify/delete conflict on `orchestrator/tests/merge_lane_ratchet_authorized_raises.json`
+means this branch appended a raise entry to the RETIRED single-array ledger,
+which main has split into one file per entry under
+`orchestrator/tests/merge_lane_ratchet_raises/`. Resolve it ONLY by running
+`python3 scripts/split_merge_lane_ratchet_ledger.py` from the worktree root, then
+`git add -A orchestrator/tests`: it writes each entry as its file and deletes the
+array. Never `git rm` the array (that silently drops this branch's entries) and
+never keep it.
 
 ## CRITICAL: Git Staging Rules
 

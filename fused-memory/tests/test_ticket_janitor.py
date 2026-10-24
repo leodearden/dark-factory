@@ -27,7 +27,11 @@ from _fm_helpers import LoopFreedomProbe
 from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import ticket_janitor
-from fused_memory.middleware.curation_deferral import CurationRetryPolicy, DeferReason
+from fused_memory.middleware.curation_deferral import (
+    CurationRetryPolicy,
+    DeferReason,
+    backlog_remediation,
+)
 from fused_memory.middleware.ticket_janitor import (
     CURATION_BACKLOG_ANCHOR,
     TicketJanitor,
@@ -1513,6 +1517,32 @@ class TestCurationBacklogEscalation:
             'accounts-auth-failed', 'blocking', 1,
         )
         assert [t['ticket_id'] for t in auth_detail['tickets']] == [auth_failed]
+
+    @pytest.mark.asyncio
+    async def test_each_record_names_its_own_reasons_remediation(self, store, tmp_path, pid):
+        await _park(store, pid, title='corpus', reason=DeferReason.CORPUS_FAILED, deferrals=2)
+        await _park(store, pid, title='capped', reason=DeferReason.ALL_ACCOUNTS_CAPPED, deferrals=2)
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        [corpus_record] = self._pending(tmp_path, DeferReason.CORPUS_FAILED)
+        [capped_record] = self._pending(tmp_path, DeferReason.ALL_ACCOUNTS_CAPPED)
+        assert corpus_record.severity == 'blocking'
+        assert backlog_remediation(DeferReason.CORPUS_FAILED) in corpus_record.suggested_action
+        assert backlog_remediation(DeferReason.ALL_ACCOUNTS_CAPPED) not in corpus_record.suggested_action
+        assert backlog_remediation(DeferReason.ALL_ACCOUNTS_CAPPED) in capped_record.suggested_action
+
+    @pytest.mark.asyncio
+    async def test_a_possibly_transient_blocking_record_does_not_claim_it_never_clears(
+        self, store, tmp_path, pid,
+    ):
+        await _park(store, pid, title='corpus', reason=DeferReason.CORPUS_FAILED, deferrals=2)
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        [record] = self._pending(tmp_path, DeferReason.CORPUS_FAILED)
+        assert record.severity == 'blocking'
+        assert 'will not clear by itself' not in record.suggested_action
 
     @pytest.mark.asyncio
     async def test_the_detail_lists_at_most_twenty_tickets(self, store, tmp_path, pid):

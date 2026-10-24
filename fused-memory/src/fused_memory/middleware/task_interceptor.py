@@ -7,23 +7,33 @@ import json
 import logging
 import os
 import uuid as uuid_mod
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, get_args
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, get_args
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
+from pydantic import ValidationError
 from shared import process_identity
+from shared.defects import DeclareEvent, OutcomeEvent
+from shared.mcp_envelope import write_failure_reason
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
+from fused_memory.backends import defect_ref_lookup
+from fused_memory.backends.defect_records import (
+    DefectCreationRefused,
+    DefectWriteRefused,
+    require_creation_floor,
+)
 from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
+    DefectRecordsWriteAuthorityError,
     DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
@@ -38,6 +48,7 @@ from fused_memory.middleware import deferral_gate, recon_write_policy
 from fused_memory.middleware.curation_deferral import (
     POOL_UNAVAILABLE_ERRORS,
     CurationRetryPolicy,
+    DeferReason,
     dedupe_skipped_marker,
     pool_defer_reason,
 )
@@ -446,18 +457,35 @@ def _format_ticket_result(row: dict) -> dict:
     return result
 
 
-def _create_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
-    """Degrade a curator failure that escaped ``curate()`` to create.
+def _decision_after_curator_failure(
+    ticket_id: str, exc: CuratorFailureError,
+) -> tuple[CuratorDecision, str | None]:
+    """Decide a ticket whose curation raised out of ``curate()``.
 
-    Keeps the ZOT marker, so the no-orchestrator path still gets swept and
-    stamped even though no escalation could be filed for it.
+    Returns the decision and the degrade reason a create records. A
+    zero-output hang degrades to create with the ZOT marker, so the
+    no-orchestrator path still gets swept and stamped even though no
+    escalation could be filed for it. Any other failure defers, so the ticket
+    is parked until the curator can judge it; a parked row records only its
+    defer reason, so it gets no degrade reason and the failure is logged here.
     """
-    return CuratorDecision(
+    if not exc.zero_output_timeout:
+        logger.warning(
+            'ticket %s: curator.curate raised CuratorFailureError, deferring curation: %s',
+            ticket_id, exc,
+        )
+        return CuratorDecision.deferred(DeferReason.LLM_FAILED), None
+    logger.warning(
+        'ticket %s: curator.curate hung with zero output, degrading to create: %s',
+        ticket_id, exc,
+    )
+    decision = CuratorDecision(
         action='create',
         justification=f'curator-failed: {exception_summary(exc)}',
         degraded=True,
-        degraded_by_zot=exc.zero_output_timeout,
+        degraded_by_zot=True,
     )
+    return decision, str(exc)
 
 
 # The label a non-create decision carries when its ticket still ends in a
@@ -1709,18 +1737,19 @@ class TaskInterceptor:
                 audit_fields['reopen_from'] = old_status
                 audit_fields['reopen_at'] = datetime.now(UTC).isoformat()
 
-            # 2b. Done-provenance gate: validate done_provenance first (kind +
-            # commit + ancestor backstop) so the verified result can decide
-            # whether the phantom-done gate also needs to fire.
+            # 2b. Done-provenance gate: authorize the caller, parse
+            # done_provenance and ancestor-check any commit first, so the
+            # verified result can decide whether the phantom-done gate also
+            # needs to fire.
             #
             # 2c. Phantom-done gate: refuse when metadata.files lists paths
-            # absent at project_root. Skipped when 2b returns
-            # ``kind ∈ {'merged', 'found_on_main'}`` with a verified commit —
+            # absent at project_root. Skipped when 2b returns a kind in
+            # ``DoneProvenance.COMMIT_REQUIRED_KINDS`` with a verified commit —
             # the architect's plan can include files that get squashed/
             # refactored away before merge, and the ancestor-checked commit
             # already vouches that the work is on main.  Defense for
-            # non-workflow callers (no provenance / unknown kind) preserves
-            # the original gate behaviour.
+            # non-workflow callers (no provenance / a commitless kind)
+            # preserves the original gate behaviour.
             if status == 'done':
                 validation_err, resolved_provenance = await _validate_done_provenance(
                     task_id,
@@ -1776,11 +1805,7 @@ class TaskInterceptor:
 
                 _verified_provenance = (
                     isinstance(resolved_provenance, dict)
-                    and resolved_provenance.get('kind')
-                    in (
-                        'merged',
-                        'found_on_main',
-                    )
+                    and resolved_provenance.get('kind') in DoneProvenance.COMMIT_REQUIRED_KINDS
                     and resolved_provenance.get('commit') is not None
                 )
                 if not _verified_provenance:
@@ -4022,8 +4047,15 @@ class TaskInterceptor:
             return err
 
         metadata = kwargs.pop('metadata', None)
-        if 'deferral' in (coerce_task_metadata(metadata) or {}):
+        incoming_metadata = coerce_task_metadata(metadata)
+        if 'deferral' in (incoming_metadata or {}):
             return DeferralWriteAuthorityError(None).to_error_dict()
+        # Before the planning_mode split, so both creation paths refuse
+        # synchronously, before a ticket or a row is written.
+        try:
+            require_creation_floor(incoming_metadata)
+        except DefectCreationRefused as exc:
+            return exc.to_error_dict()
 
         # Inject the override reason into task metadata (both the normal ticket
         # path and the planning_mode path benefit from this placement).  When no
@@ -4333,10 +4365,12 @@ class TaskInterceptor:
         synthetic failed dict WITHOUT mutating the ticket row — the worker may
         still resolve it later.
 
-        ``awaiting_curation`` is the one non-terminal answer: the curator's
-        account pool could not serve, so the submission is durably parked and
-        retried by the ticket janitor. It carries the row's ``reason`` and no
-        ``task_id``; a waiter blocked before the park is woken with it.
+        ``awaiting_curation`` is the one non-terminal answer: the curator
+        could not judge the submission (for one of the reasons in
+        :class:`~fused_memory.middleware.curation_deferral.DeferReason`), so
+        the submission is durably parked and retried by the ticket janitor. It
+        carries the row's ``reason`` and no ``task_id``; a waiter blocked
+        before the park is woken with it.
 
         The worker-liveness reaper (:meth:`TicketJanitor.tick`) terminalises
         pending tickets whose project's curator worker has died, marking them
@@ -4566,9 +4600,10 @@ class TaskInterceptor:
         Failure handling: an exception escaping the batch is logged, every
         ticket in it is marked ``failed/curator_failed`` (best-effort) and its
         waiters are signalled so ``resolve_ticket`` callers are not blocked
-        forever. The worker never waits on account-pool capacity: a pool that
-        cannot serve comes back as a ``defer`` decision, which parks the ticket
-        durably (``awaiting_curation``) for the ticket janitor to requeue.
+        forever. The worker never waits for the curator to recover: a
+        submission the curator could not judge comes back as a ``defer``
+        decision, which parks the ticket durably (``awaiting_curation``) for
+        the ticket janitor to requeue.
 
         Independent workers per project restore the per-project fairness of
         the old curator_lock approach: project B is never blocked by a slow
@@ -5339,17 +5374,9 @@ class TaskInterceptor:
                     try:
                         decision = await curator.curate(candidate, project_id, project_root)
                     except CuratorFailureError as exc:
-                        logger.warning(
-                            '_process_add_ticket: curator.curate raised CuratorFailureError '
-                            'for %s; degrading to create. reason=%s',
-                            ticket_id,
-                            exc,
+                        decision, curator_degrade_reason = _decision_after_curator_failure(
+                            ticket_id, exc,
                         )
-                        # Degrade gracefully to create — avoids losing the task on
-                        # transient LLM failures.  Record the failure so the facade
-                        # and callers can see it in result_json.
-                        curator_degrade_reason = str(exc)
-                        decision = _create_after_curator_failure(exc)
 
                 status, task_id, reason, result_dict, _ = await self._dispatch_ticket_decision(
                     ticket_id=ticket_id,
@@ -5495,11 +5522,13 @@ class TaskInterceptor:
         Per-ticket failures are isolated: one ticket failing does not prevent
         other tickets from being processed.
 
-        A curator account pool that cannot serve (``POOL_UNAVAILABLE_ERRORS``,
-        whether returned as ``defer`` decisions or raised from
-        ``curate_batch_prepared``) parks every LLM-bound ticket
-        ``awaiting_curation``, and a within-batch drop onto a parked sibling
-        parks with it; nothing is created for them.
+        A submission the curator could not judge parks ``awaiting_curation``,
+        and a within-batch drop onto a parked sibling parks with it; nothing
+        is created for them. That covers a ``defer`` decision, an account
+        pool that cannot serve raised from ``curate_batch_prepared``
+        (``POOL_UNAVAILABLE_ERRORS``), a :class:`CuratorFailureError` escaping
+        ``curate()`` other than a zero-output hang, and any other exception
+        ``curate_batch_prepared`` raises instead of deciding.
         """
         if self._ticket_store is None:
             return
@@ -5667,9 +5696,10 @@ class TaskInterceptor:
                         '_process_add_tickets_batch_prepared: '
                         'curate_batch_prepared raised CuratorFailureError '
                         'for project %s; falling back to %d individual '
-                        'curate() calls',
+                        'curate() calls: %s',
                         project_id,
                         len(non_none_prepared),
+                        exc,
                     )
                     # Iterate curatable_records only — unprepared_records are
                     # curated exactly once by the dedicated backfill loop
@@ -5688,20 +5718,20 @@ class TaskInterceptor:
                                 project_root,
                             )
                         except CuratorFailureError as e:
-                            rec.decision = _create_after_curator_failure(e)
-                            rec.degrade_reason = str(e)
-                    # Refer to exc to satisfy linters; main signal logged above.
-                    _ = exc
-                except Exception:  # pyright: ignore[reportUnusedExcept]
+                            rec.decision, rec.degrade_reason = _decision_after_curator_failure(
+                                rec.ticket.ticket_id, e,
+                            )
+                except Exception:
                     logger.exception(
                         '_process_add_tickets_batch_prepared: '
                         'curate_batch_prepared failed for project %s; '
-                        'degrading all %d candidates to create',
+                        'deferring %d candidates',
                         project_id,
-                        len(non_none_prepared),
+                        len(curatable_records),
                     )
-                    for rec in records:
-                        rec.decision = None
+                    for rec in curatable_records:
+                        rec.decision = CuratorDecision.deferred(DeferReason.CURATOR_RAISED)
+                        rec.target = None
 
             # Backfill any unprepared candidates via single-item curate() so
             # we still get a curator decision instead of falling through to
@@ -5721,8 +5751,9 @@ class TaskInterceptor:
                             project_root,
                         )
                     except CuratorFailureError as exc:
-                        rec.decision = _create_after_curator_failure(exc)
-                        rec.degrade_reason = str(exc)
+                        rec.decision, rec.degrade_reason = _decision_after_curator_failure(
+                            rec.ticket.ticket_id, exc,
+                        )
 
             # ── Topologically-ordered dispatch ────────────────────────────────
             # Records with a target wait for that target to be dispatched
@@ -5921,7 +5952,11 @@ class TaskInterceptor:
            ``{'success': False, 'error': 'status_via_update_task' | 'done_provenance_via_update_task',
            'task_id': …, …}`` shape defined in ``task_backend_errors.py`` (task C2).
            Any add, alter or removal of ``metadata.deferral`` raises
-           ``DeferralWriteAuthorityError``, returned the same way.
+           ``DeferralWriteAuthorityError``, returned the same way, and so does
+           any add, change or removal of ``metadata.defects`` /
+           ``metadata.defect_test_retirements`` (the same carry-verbatim rule as
+           ``done_provenance``): :class:`~fused_memory.backends.task_backend_errors.DefectRecordsWriteAuthorityError`,
+           ``error='defect_records_via_update_task'``, for every caller.
            The backend also rejects a metadata payload that is not a JSON object,
            in every mode, with
            :class:`~fused_memory.backends.task_backend_errors.MetadataNotAnObjectError`,
@@ -6092,6 +6127,7 @@ class TaskInterceptor:
             except (
                 StatusWriteAuthorityError,
                 DoneProvenanceWriteAuthorityError,
+                DefectRecordsWriteAuthorityError,
                 DeferralWriteAuthorityError,
                 MetadataNotAnObjectError,
             ) as e:
@@ -6508,6 +6544,50 @@ class TaskInterceptor:
             include_value=include_value,
         )
 
+    async def apply_defect_events(
+        self,
+        task_id: str,
+        project_root: str,
+        events: Sequence[DeclareEvent | OutcomeEvent],
+        *,
+        operation: Literal['declare_defect', 'record_defect_outcome'],
+        agent_id: str | None,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """The defect-record tools' write: the backend core under the write lock, journalled.
+
+        No backlog gate and no idempotency key: a proof or ruling must never be
+        shed under reconciliation backlog, and a replayed proof is refused by
+        I2's later-proof rule rather than replayed. A refusal returns its
+        ``to_error_dict()``; nothing was written.
+        """
+        tm = await self._ensure_taskmaster()
+        project_id = resolve_project_id(project_root)
+        async with self._write_lock(project_id):
+            try:
+                result = await self._journal_around(
+                    operation,
+                    project_root,
+                    {'task_id': task_id, 'events': [event.model_dump(mode='json') for event in events]},
+                    tm.apply_defect_events(task_id, project_root, events, tag=tag),
+                    agent_id=agent_id,
+                )
+            except DefectWriteRefused as exc:
+                return exc.to_error_dict(task_id=task_id)
+        await self._journal(
+            self._make_event(
+                EventType.task_modified,
+                project_root,
+                {'task_id': task_id, 'operation': operation},
+            )
+        )
+        return {'success': True, **result}
+
+    async def lookup_defect_ref(
+        self, project_root: str, ref: str, *, tag: str | None = None,
+    ) -> defect_ref_lookup.DefectRefLookup:
+        return await defect_ref_lookup.lookup_defect_ref(self, project_root, ref, tag=tag)
+
     def _require_done_provenance(self) -> bool:
         """True when the provenance gate is enforcing (reject missing/invalid).
 
@@ -6704,16 +6784,27 @@ def _done_gate_error(task_id: str, declared: list[str], missing: list[str]) -> d
     }
 
 
-# Single source of truth for done_provenance.kind membership (I2) — derived
-# once from shared.task_metadata.DoneProvenance rather than re-derived on
-# every _validate_done_provenance call (the retired _VALID_PROVENANCE_KINDS
-# was a module-level constant too; this keeps that shape while sourcing the
-# values from the shared model so a 5th kind auto-propagates here and into
-# the human-readable message below without a second edit).
-_DONE_PROVENANCE_KINDS = get_args(DoneProvenance.model_fields['kind'].annotation)
-_DONE_PROVENANCE_KINDS_TEXT = (
-    ', '.join(f'"{k}"' for k in _DONE_PROVENANCE_KINDS[:-1])
-    + f', or "{_DONE_PROVENANCE_KINDS[-1]}"'
+def _render_done_provenance_kinds() -> str:
+    """Every ``DoneProvenance.kind``, quoted, for a caller-facing remedy (I2).
+
+    Derived from the shared Literal so a new kind reaches every refusal that
+    names the vocabulary without a second edit.
+    """
+    kinds = get_args(DoneProvenance.model_fields['kind'].annotation)
+    return ', '.join(f'"{k}"' for k in kinds[:-1]) + f', or "{kinds[-1]}"'
+
+
+_DONE_PROVENANCE_KINDS_TEXT = _render_done_provenance_kinds()
+_KIND_REQUIRED_REASON = (
+    f'done_provenance.kind is required (must be {_DONE_PROVENANCE_KINDS_TEXT}). '
+    'Use kind="merged" with commit=<merge-sha> after a successful '
+    'merge_request; kind="found_on_main" with commit=<sha> and '
+    'note=<explanation> when the implementation is already on main '
+    'from a sibling task; or kind="operational-verified" with '
+    'escalation_id=<id> and note=<text> for a no-code operational ask '
+    'closed via a resolved escalation. The deterministic-* kinds are '
+    'stamped by DeterministicRunner, not supplied by hand — see the '
+    'per-kind table in docs/task-authoring.md.'
 )
 
 
@@ -6743,15 +6834,17 @@ class _AncestorCheckFailure(NamedTuple):
 
 
 def _provenance_kind(raw: object) -> str | None:
-    """The ``kind`` a raw ``done_provenance`` payload CLAIMS, for the journal.
+    """The ``kind`` a raw ``done_provenance`` payload CLAIMS.
 
     Pure and total: a non-dict payload, a missing key, a non-``str`` value or
     a blank one all read as ``None``. It reports the CLAIM, not a validated
     kind — a refused write's row must still say what the caller asserted, and
     an unreadable claim must not be able to skip the audit row by raising.
 
-    Shared by every journal site so an accepted and a refused row report the
-    kind identically (SPOT).
+    Shared by every journal site and by the caller bar
+    (:func:`_provenance_caller_refusal`), so an accepted and a refused row
+    report the kind identically and the bar judges the same claim the
+    journal records (SPOT).
     """
     if not isinstance(raw, dict):
         return None
@@ -6774,6 +6867,73 @@ def _provenance_stamp_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _provenance_caller_refusal(
+    task_id: str,
+    claimed_kind: str | None,
+    *,
+    is_recon_stage: bool,
+    agent_id: str | None,
+    config: Any,
+) -> dict | None:
+    """The done_provenance caller bar, judged on the kind a payload CLAIMS.
+
+    Returns the refusal payload, or ``None`` when this caller may record that
+    kind. Runs before the payload's shape is parsed, so an unauthorized caller
+    is refused on identity rather than handed a shape hint first.
+    """
+    if claimed_kind in DETERMINISTIC_PROVENANCE_KINDS:
+        # Factor 1 (PRD D11): config-free, and FIRST. A recon stage may not
+        # self-authorize a runner-stamped close, and an operator who adds
+        # 'recon-stage-' to the allowlist must not thereby reopen incident
+        # 5156.
+        if is_recon_stage:
+            return _done_provenance_error(
+                task_id,
+                f'done_provenance with kind={claimed_kind!r} cannot be recorded by a '
+                'recon-stage caller — a recon stage may not self-authorize a '
+                'close that asserts a DeterministicRunner observation. This '
+                'refusal is config-free: granting the caller prefix does not '
+                'lift it.',
+                error_type=DETERMINISTIC_CALLER_ERROR_TYPE,
+            )
+        # Factor 2: the configured caller allowlist, read live so the leaf
+        # stays green-tier hot-reloadable.
+        decision = resolve_deterministic_provenance_authorization(config, agent_id=agent_id)
+        if not decision.allowed:
+            return _done_provenance_error(
+                task_id,
+                decision.error or '',
+                error_type=decision.error_type,
+            )
+    if claimed_kind == 'operational-verified' and is_recon_stage:
+        return _done_provenance_error(
+            task_id,
+            'done_provenance with kind="operational-verified" cannot be '
+            'recorded by a recon-stage caller — a recon stage may not '
+            'self-authorize an operational close.',
+        )
+    return None
+
+
+def _done_provenance_parse_reason(exc: ValidationError) -> str:
+    """The caller-facing ``reason`` for a payload ``DoneProvenance`` refused.
+
+    Routes on the first error's structured fields only. A missing or unknown
+    kind gets the self-correcting remedy naming every kind; a per-kind
+    requirement (``loc == ()``) is the model's own message, verbatim.
+    """
+    err = exc.errors()[0]
+    loc = err['loc']
+    if loc == ('kind',):
+        if err['type'] == 'missing' or err['input'] is None:
+            return _KIND_REQUIRED_REASON
+        return f'done_provenance.kind must be {_DONE_PROVENANCE_KINDS_TEXT} (got {err["input"]!r})'
+    if loc == ():
+        return err['msg']
+    field = '.'.join(str(part) for part in loc)
+    return f'done_provenance.{field}: {err["msg"]} (got {err["input"]!r})'
+
+
 async def _validate_done_provenance(
     task_id: str,
     raw: object,
@@ -6784,137 +6944,62 @@ async def _validate_done_provenance(
     agent_id: str | None = None,
     config: Any = None,
 ) -> tuple[dict | None, dict | None]:
-    """Validate + resolve done_provenance for set_task_status(done).
+    """Authorize, parse and resolve done_provenance for set_task_status(done).
 
-    Schema:
-        {
-            "kind": <one of shared.task_metadata.DoneProvenance.kind>,
-                                                 # required; that Literal is the
-                                                 # SINGLE source of truth (I2) and
-                                                 # feeds _DONE_PROVENANCE_KINDS_TEXT.
-                                                 # Per-kind table: docs/task-authoring.md
-            "commit": <sha-or-ref>,              # required for "merged"/"found_on_main"
-            "note":   <free text>,               # required for "found_on_main" and
-                                                 # "operational-verified"; optional
-                                                 # for the deterministic-* kinds
-            "pid":    <int>,                     # deterministic-deploy: new MainPID
-            "unit":   <str>,                     # deterministic-deploy(-scheduled): target unit name
-            "active_enter_timestamp": <str>,     # deterministic-deploy: new AET string
-            "transient_unit": <str>,             # deterministic-deploy-scheduled: scheduled restart unit
-            "fire_delay_secs": <int>,            # deterministic-deploy-scheduled: --on-active delay
-            "escalation_id": <str>,              # required for "operational-verified"
-                                                 # and for "deterministic-gate" (which
-                                                 # cites the resolving gate escalation)
-        }
+    The per-kind contract — which fields each kind requires and which it
+    records — lives on ``shared/src/shared/task_metadata.py::DoneProvenance``;
+    the author-facing table is in ``docs/task-authoring.md``. This function
+    owns only what that model cannot know, in this order:
 
-    CALLER BAR FOR THE `deterministic-*` FAMILY (PRD C5 / D11, task 5241).
-    Those four kinds assert a MACHINE observation — a restart with fresh PID
-    evidence, a predicate that exited 0, a gate escalation that resolved — and
-    DeterministicRunner is their only live producer. Two factors gate them,
-    evaluated in this order and both surfacing
-    ``error_type='DeterministicProvenanceCallerNotPermitted'``:
-
-    1. ``is_recon_stage=True`` is refused UNCONDITIONALLY. Config-free by
-       design: a recon stage may not self-authorize a runner-stamped close,
-       and no operator edit may grant it (incident 5156).
-    2. Otherwise ``agent_id`` must match a prefix in
+    1. THE CALLER BAR (:func:`_provenance_caller_refusal`), on the CLAIMED
+       kind. The ``deterministic-*`` family (PRD C5 / D11, task 5241) asserts
+       a MACHINE observation whose only live producer is DeterministicRunner:
+       a ``recon-stage-`` caller is refused unconditionally (config-free,
+       incident 5156), and any other caller must match a prefix in
        ``reconciliation.deterministic_provenance_allowed_agent_prefixes``
-       (default ``['orchestrator']``; an EMPTY list denies everyone, the live
-       kill switch). DENY-ON-MISSING: a missing/corrupt leaf, or a missing
-       *config* object entirely, refuses — see
-       ``middleware/done_provenance_authz.py``.
+       (deny-on-missing; see ``middleware/done_provenance_authz.py``). Both
+       refusals carry ``error_type='DeterministicProvenanceCallerNotPermitted'``.
+       A recon stage is also refused ``operational-verified``, with no
+       ``error_type``: it may not self-authorize an operational close.
 
-    That module also carries the honest caveat, repeated here because this is
-    where the refusal is issued: the identity is SELF-REPORTED. Under
-    stateless HTTP a tool call carries no clientInfo for
-    ``server/tools.py::_resolve_identity`` to fall back to, so a caller that
-    sends no ``agent_id`` arrives as ``None`` and is refused; the orchestrator
-    therefore sends ``agent_id='orchestrator'`` explicitly
-    (``orchestrator/src/orchestrator/scheduler.py::Scheduler.set_task_status``).
-    The bar DETERS a cooperating
-    caller; it is not a security boundary. The residual is made visible rather
-    than prevented — every done write, accepted or refused, leaves a
-    write-journal row naming the resolved caller and the provenance kind.
+       The identity is SELF-REPORTED. Under stateless HTTP a tool call
+       carries no clientInfo for ``server/tools.py::_resolve_identity`` to
+       fall back to, so a caller that sends no ``agent_id`` arrives as
+       ``None`` and is refused; the orchestrator therefore sends
+       ``agent_id='orchestrator'`` explicitly
+       (``orchestrator/src/orchestrator/scheduler.py::Scheduler.set_task_status``).
+       The bar DETERS a cooperating caller; it is not a security boundary.
+       The residual is made visible rather than prevented — every done
+       write, accepted or refused, leaves a write-journal row naming the
+       resolved caller and the provenance kind.
 
-    - ``kind="merged"``: the work landed on main via a merge commit. ``commit``
-      is required and must resolve via ``git rev-parse``; the resolved SHA is
-      additionally checked with ``git merge-base --is-ancestor <sha> main`` so
-      a steward cannot record a SHA that is only on a feature branch.
-    - ``kind="found_on_main"``: the implementation is already on main from a
-      sibling task / prior orchestrator run. Both ``commit`` and ``note`` are
-      required. ``commit`` is resolved + ancestor-checked identical to
-      ``kind="merged"``; the kinds differ only in audit semantics (``note``
-      is required for ``found_on_main`` to cite the providing task/commit).
-    - ``kind="deterministic-deploy"``: the task was completed by a cross-unit
-      service restart, not a code merge. No ``commit`` is required or expected.
-      ``pid`` (int), ``unit`` (str), and ``active_enter_timestamp`` (str) carry
-      the PID evidence captured after the restart; ``note`` may carry a
-      human-readable annotation (e.g. resume path). The phantom-done file gate
-      is NOT bypassed for this kind — deploy gate tasks carry no
-      ``metadata.files`` so the gate is already a no-op.
-    - ``kind="deterministic-deploy-scheduled"``: the task was completed by
-      DeterministicRunner's own-unit self-restart path (epsilon): a detached
-      ``systemd-run`` transient unit was successfully *registered* to restart
-      the orchestrator's own unit after ``run()`` returns, but — unlike
-      ``deterministic-deploy`` — the restart has not fired yet, so there is no
-      fresh PID/AET to verify (done = scheduled, not verified). No ``commit``
-      is required or expected. ``unit`` (str) is the target (own) unit,
-      ``transient_unit`` (str) is the scheduled restart unit's name, and
-      ``fire_delay_secs`` (int) is its ``--on-active`` delay; ``note`` may
-      carry a human-readable annotation (e.g. the crash-resume path).
-    - ``kind="deterministic-gate"``: a PURE deterministic gate (a gate task
-      with no ``before_done`` action) resolved. There is no deploy evidence
-      and no ``commit`` — the kind exists precisely so such a close passes
-      ``require_done_provenance`` without claiming a deploy happened (task
-      2331). ``note`` carries the gate-resolution text. ``escalation_id`` is
-      REQUIRED (task 5241): it cites the resolving gate escalation and is
-      recorded VERBATIM, with no cross-service lookup — the same no-lookup
-      contract ``operational-verified`` has. It is a deliberate SHAPE
-      DETERRENT stacked on the caller bar above: a hand-passer must at
-      minimum name a record, and that id lands in the audit trail where a
-      reader can check it. NOTE the asymmetry: the requirement is enforced
-      HERE only, not in ``shared.task_metadata.DoneProvenance``, because the
-      bar exists against callers who hand-build a dict and never touch the
-      shared model — this server is the one chokepoint every producer
-      crosses. Stamped by DeterministicRunner (deterministic_runner.py),
-      never supplied by hand.
-    - ``kind="deterministic-milestone"``: a ``before_done`` ``kind="predicate"``
-      milestone check exited 0. No ``commit`` is required or expected; ``note``
-      carries a bounded structured verdict summarizing the predicate's stdout.
-      Stamped by DeterministicRunner, never supplied by hand.
-    - ``kind="operational-verified"``: the task was a no-code operational ask
-      (e.g. a restart/redeploy/confirm) closed out via a resolved escalation
-      rather than a code merge or a DeterministicRunner action. No ``commit``
-      is required or expected — commitless, like the ``deterministic-*``
-      kinds, and therefore exempt from the alpha reopen-freshness gate.
-      ``escalation_id`` (str) — the resolving escalation id, recorded
-      VERBATIM for Stage-2 audit with no live cross-service lookup — and
-      ``note`` are both required. Accepted only from non-recon-stage callers
-      (``is_recon_stage=True`` is rejected): a recon stage must not
-      self-authorize an operational close.
+    2. PARSE AT THE BOUNDARY through ``DoneProvenance.parse_for_write``, which
+       also enforces the write-time-only requirements. A refusal's reason is
+       built by :func:`_done_provenance_parse_reason`; the record keeps
+       ``recorded_evidence()``.
 
-    Returns ``(error_payload, resolved_provenance)``. Error payload is a
-    structured dict suitable for returning to the MCP caller; when it is
-    non-None the transition must be aborted. Resolved provenance is a dict
-    with the validated ``kind``, normalised ``commit`` (full 40-char SHA) when
-    supplied, and ``note`` when supplied — plus the original ``commit_input``
-    when a short hash or ref was resolved.
+    3. GIT: a supplied ``commit`` must resolve via ``git rev-parse`` and be an
+       ancestor of main (``git merge-base --is-ancestor <sha> main``), so a
+       steward cannot record a SHA that is only on a feature branch. The full
+       SHA is recorded, plus the original ``commit_input`` when a short hash
+       or ref was resolved.
 
-    When ``require`` is False, missing/empty provenance logs a warning but
-    returns ``(None, None)`` so the transition proceeds. Malformed provenance
-    (wrong type, unknown kind, unresolvable commit, branch-only SHA) always
-    errors regardless of ``require`` — we never want to record corrupt
-    provenance on the task.
+    4. ``stamped_at`` for ``found_on_main`` is written here, server-side
+       (task 3576); a caller-supplied value is discarded, never parsed.
+
+    Returns ``(error_payload, resolved_provenance)``. When the error payload
+    is non-None the transition must be aborted. When ``require`` is False,
+    missing/empty provenance logs a warning and returns ``(None, None)`` so
+    the transition proceeds; malformed provenance always errors regardless of
+    ``require`` — we never want to record corrupt provenance on the task.
 
     ``is_recon_stage`` mirrors ``_apply_status_transition``'s
     ``is_recon_stage_write`` classification (``agent_id.startswith(
-    'recon-stage-')``); it is consulted by the ``kind="operational-verified"``
-    branch and by factor 1 of the `deterministic-*` caller bar above. It is
-    passed SEPARATELY from ``agent_id`` rather than re-derived here so this
-    function and the transition gate can never disagree about who is a recon
-    stage. ``agent_id`` and ``config`` feed factor 2; both default to the
-    denying value, so a caller that forgets to thread them refuses rather
-    than silently opening the bar.
+    'recon-stage-')``). It is passed SEPARATELY from ``agent_id`` rather than
+    re-derived here so this function and the transition gate can never
+    disagree about who is a recon stage. ``agent_id`` and ``config`` default
+    to the denying value, so a caller that forgets to thread them refuses
+    rather than silently opening the bar.
     """
     if raw is None or raw == {}:
         if require:
@@ -6938,134 +7023,25 @@ async def _validate_done_provenance(
             None,
         )
 
-    kind = raw.get('kind')
-    commit_input = raw.get('commit')
-    note = raw.get('note')
-    escalation_id = raw.get('escalation_id')
+    refusal = _provenance_caller_refusal(
+        task_id,
+        _provenance_kind(raw),
+        is_recon_stage=is_recon_stage,
+        agent_id=agent_id,
+        config=config,
+    )
+    if refusal is not None:
+        return refusal, None
 
-    if kind is not None and not isinstance(kind, str):
-        return _done_provenance_error(task_id, 'kind must be a string'), None
-    if commit_input is not None and not isinstance(commit_input, str):
-        return _done_provenance_error(task_id, 'commit must be a string'), None
-    if note is not None and not isinstance(note, str):
-        return _done_provenance_error(task_id, 'note must be a string'), None
-    if escalation_id is not None and not isinstance(escalation_id, str):
-        return _done_provenance_error(task_id, 'escalation_id must be a string'), None
+    try:
+        provenance = DoneProvenance.parse_for_write(
+            {key: value for key, value in raw.items() if key != 'stamped_at'}
+        )
+    except ValidationError as exc:
+        return _done_provenance_error(task_id, _done_provenance_parse_reason(exc)), None
 
-    kind = (kind or '').strip() or None
-    commit_input = (commit_input or '').strip() or None
-    note = (note or '').strip() or None
-    escalation_id = (escalation_id or '').strip() or None
-
-    if kind is None:
-        return _done_provenance_error(
-            task_id,
-            f'done_provenance.kind is required (must be {_DONE_PROVENANCE_KINDS_TEXT}). '
-            'Use kind="merged" with commit=<merge-sha> after a successful '
-            'merge_request; kind="found_on_main" with commit=<sha> and '
-            'note=<explanation> when the implementation is already on main '
-            'from a sibling task; or kind="operational-verified" with '
-            'escalation_id=<id> and note=<text> for a no-code operational ask '
-            'closed via a resolved escalation. The deterministic-* kinds are '
-            'stamped by DeterministicRunner, not supplied by hand — see the '
-            'per-kind table in docs/task-authoring.md.',
-        ), None
-    if kind not in _DONE_PROVENANCE_KINDS:
-        return _done_provenance_error(
-            task_id,
-            f'done_provenance.kind must be {_DONE_PROVENANCE_KINDS_TEXT} (got {kind!r})',
-        ), None
-
-    if kind in DETERMINISTIC_PROVENANCE_KINDS:
-        # Factor 1 (PRD D11): config-free, and FIRST. A recon stage may not
-        # self-authorize a runner-stamped close, and an operator who adds
-        # 'recon-stage-' to the allowlist must not thereby reopen incident
-        # 5156. Same shape as the 'operational-verified' branch below, so a
-        # reader sees one rule applied twice rather than two rules.
-        if is_recon_stage:
-            return _done_provenance_error(
-                task_id,
-                f'done_provenance with kind={kind!r} cannot be recorded by a '
-                'recon-stage caller — a recon stage may not self-authorize a '
-                'close that asserts a DeterministicRunner observation. This '
-                'refusal is config-free: granting the caller prefix does not '
-                'lift it.',
-                error_type=DETERMINISTIC_CALLER_ERROR_TYPE,
-            ), None
-        # Factor 2: the configured caller allowlist, read live so the leaf
-        # stays green-tier hot-reloadable.
-        decision = resolve_deterministic_provenance_authorization(config, agent_id=agent_id)
-        if not decision.allowed:
-            return _done_provenance_error(
-                task_id,
-                decision.error or '',
-                error_type=decision.error_type,
-            ), None
-        # AFTER the caller bar, deliberately: an unauthorized caller is
-        # refused on identity, not handed a shape hint first. And this
-        # refusal keeps the plain `done_provenance_invalid` with NO
-        # error_type — a shape defect from an AUTHORIZED caller is a
-        # different proposition, and conflating it under the caller error
-        # type would tell an operator to fix an allowlist when they need to
-        # fix a payload.
-        if kind == 'deterministic-gate' and escalation_id is None:
-            return _done_provenance_error(
-                task_id,
-                'done_provenance with kind="deterministic-gate" requires '
-                'escalation_id=<resolving gate escalation id>, recorded '
-                'verbatim. DeterministicRunner supplies it from the task\'s '
-                'milestone_gate record; a hand-built blob must at minimum '
-                'name the record it is closing against.',
-            ), None
-
-    if kind == 'merged' and commit_input is None:
-        return _done_provenance_error(
-            task_id,
-            'done_provenance with kind="merged" requires commit=<sha-or-ref> '
-            '(the merge commit on main). Use kind="found_on_main" instead '
-            'when this branch did not supply the merge but the work is '
-            'already on main under a different commit — it also requires '
-            'commit=<sha-or-ref> (ancestor-checked) plus note=<explanation> '
-            'citing the impl-providing task/commit.',
-        ), None
-    if kind == 'found_on_main' and commit_input is None:
-        return _done_provenance_error(
-            task_id,
-            'done_provenance with kind="found_on_main" requires '
-            'commit=<sha-or-ref> (the impl-providing commit on main, '
-            'ancestor-checked) — note alone is no longer accepted '
-            '(post-3092 phantom-done hardening; cite the landing commit so '
-            'the server can verify it). Use kind="merged" instead when this '
-            'branch supplied the merge.',
-        ), None
-    if kind == 'found_on_main' and note is None:
-        return _done_provenance_error(
-            task_id,
-            'done_provenance with kind="found_on_main" requires note=<text> '
-            'citing the impl-providing task or commit.',
-        ), None
-    if kind == 'operational-verified':
-        if is_recon_stage:
-            return _done_provenance_error(
-                task_id,
-                'done_provenance with kind="operational-verified" cannot be '
-                'recorded by a recon-stage caller — a recon stage may not '
-                'self-authorize an operational close.',
-            ), None
-        if escalation_id is None:
-            return _done_provenance_error(
-                task_id,
-                'done_provenance with kind="operational-verified" requires '
-                'escalation_id=<resolving escalation id>.',
-            ), None
-        if note is None:
-            return _done_provenance_error(
-                task_id,
-                'done_provenance with kind="operational-verified" requires '
-                'note=<text> describing the operational action taken.',
-            ), None
-
-    resolved: dict = {'kind': kind}
+    resolved = provenance.recorded_evidence()
+    commit_input = provenance.commit
     if commit_input is not None:
         sha_or_err = await _resolve_commit_sha(project_root, commit_input)
         if isinstance(sha_or_err, _CommitResolutionFailure):
@@ -7079,10 +7055,8 @@ async def _validate_done_provenance(
         resolved['commit'] = sha_or_err
         if sha_or_err != commit_input:
             resolved['commit_input'] = commit_input
-        # Ancestor backstop applies to every accepted kind ('merged' and
-        # 'found_on_main' are validated identically; they differ only in
-        # audit semantics).  Unknown kinds are rejected by the early-return
-        # above, so this check is always reached for any valid kind.
+        # The ancestor backstop applies to every kind that cites a commit,
+        # not only the kinds that require one.
         ancestor_result = await _verify_commit_on_main(project_root, sha_or_err)
         if ancestor_result is not None:
             # rc=1 is the only confirmed off-main verdict; every other
@@ -7095,54 +7069,11 @@ async def _validate_done_provenance(
             )
             return _done_provenance_error(
                 task_id,
-                f'kind={kind!r} but commit {sha_or_err} {prefix}: {ancestor_result.detail}.',
+                f'kind={provenance.kind!r} but commit {sha_or_err} {prefix}: '
+                f'{ancestor_result.detail}.',
             ), None
-    if note is not None:
-        resolved['note'] = note
-    if kind in ('operational-verified', 'deterministic-gate') and escalation_id is not None:
-        # Required — and already validated non-None above — for BOTH kinds
-        # (task 5241 made it so for 'deterministic-gate', which cites the
-        # resolving gate escalation). The `is not None` guard is retained as
-        # the uniform shape this block shares with every other conditional
-        # copy below, not because either kind can reach here without one.
-        resolved['escalation_id'] = escalation_id
 
-    if kind in ('deterministic-deploy', 'deterministic-deploy-scheduled'):
-        # Preserve the evidence captured by DeterministicRunner after a
-        # cross-unit service restart (B6 success path and resume path) or an
-        # own-unit self-restart scheduling (epsilon B8 success path and
-        # resume path).  Only copy fields that carry the right type —
-        # silently skip missing or wrongly-typed fields so a partial shape
-        # (e.g. resume without pid, or resume without transient_unit) is
-        # still accepted.
-        unit = raw.get('unit')
-        if isinstance(unit, str):
-            unit_stripped = unit.strip()
-            if unit_stripped:
-                resolved['unit'] = unit_stripped
-
-    if kind == 'deterministic-deploy':
-        pid = raw.get('pid')
-        active_enter_timestamp = raw.get('active_enter_timestamp')
-        if isinstance(pid, int):
-            resolved['pid'] = pid
-        if isinstance(active_enter_timestamp, str):
-            aet_stripped = active_enter_timestamp.strip()
-            if aet_stripped:
-                resolved['active_enter_timestamp'] = aet_stripped
-    elif kind == 'deterministic-deploy-scheduled':
-        # transient_unit: the scheduled restart unit's name (B8 success path).
-        # fire_delay_secs: its --on-active delay in seconds.
-        transient_unit = raw.get('transient_unit')
-        fire_delay_secs = raw.get('fire_delay_secs')
-        if isinstance(transient_unit, str):
-            transient_unit_stripped = transient_unit.strip()
-            if transient_unit_stripped:
-                resolved['transient_unit'] = transient_unit_stripped
-        if isinstance(fire_delay_secs, int):
-            resolved['fire_delay_secs'] = fire_delay_secs
-
-    if kind == 'found_on_main':
+    if provenance.kind == 'found_on_main':
         # THE SINGLE WRITE SITE for done_provenance.stamped_at (task 3576).
         #
         # Every found_on_main producer funnels through this function: the
@@ -7466,8 +7397,8 @@ async def _check_reopen_freshness(
 
     Inert (returns None immediately) unless ALL of:
       - ``resolved_provenance`` is a dict with ``kind`` in
-        ``{'merged', 'found_on_main'}`` (commitless kinds — deterministic-*
-        — self-evidence and are exempt);
+        ``DoneProvenance.COMMIT_REQUIRED_KINDS`` (commitless kinds —
+        deterministic-* — self-evidence and are exempt);
       - it carries a truthy ``commit``;
       - ``before`` (the pre-write task snapshot) has a non-empty
         ``metadata.reopen_at`` (a task that was never reopened has nothing
@@ -7526,7 +7457,7 @@ async def _check_reopen_freshness(
     """
     if not isinstance(resolved_provenance, dict):
         return None
-    if resolved_provenance.get('kind') not in ('merged', 'found_on_main'):
+    if resolved_provenance.get('kind') not in DoneProvenance.COMMIT_REQUIRED_KINDS:
         return None
     evidence_commit = resolved_provenance.get('commit')
     if not evidence_commit:
@@ -7722,43 +7653,12 @@ def _reject_directory_locks_in_update_metadata(
 def interceptor_write_succeeded(resp: object) -> bool:
     """Return True iff *resp* represents a successful TaskInterceptor write.
 
-    Centralises the success/failure contract for *internal* consumers that
-    need a boolean classification (e.g. reconciliation hint-attachment in
-    ``TargetedReconciler._on_task_blocked``).  MCP passthrough call sites
-    (such as ``server/tools.py``'s ``update_task`` handler) must return the
-    raw response dict to the client so rejection details (``error``,
-    ``hint``, ``task_id``) reach the user — do **not** route them through
-    this helper.
-
-    Rejection-dict shapes this helper recognises as failures:
-
-    * The canonical write-authority rejection shape — defined once in
-      ``fused_memory.backends.task_backend_errors``
-      (``status_via_update_task_error`` / ``done_provenance_via_update_task_error``,
-      tasks C1/C2) and surfaced here via
-      ``StatusWriteAuthorityError`` / ``DoneProvenanceWriteAuthorityError
-      .to_error_dict()`` →
-      ``{'success': False, 'error': 'status_via_update_task' | 'done_provenance_via_update_task', 'task_id': …, …}``
-    * ``BacklogVerdict.to_error_dict()`` (and other no-``success``/has-``error``
-      shapes, e.g. lock-charter rejections) →
-      ``{'error': '<rendered-msg>', 'error_type': 'ReconciliationBacklogExceeded', …}``
-      (no ``success`` key — defeated by the ``not resp.get('error')`` clause)
-
-    The ``success`` key defaults to ``True`` so a successful Taskmaster passthrough
-    that does not include an explicit ``success`` field still classifies correctly.
-    Non-dict responses (``None``, strings, lists) are always treated as failures.
-
-    An empty dict ``{}`` carries no positive write signal and is therefore treated as
-    **failure** (``bool({})`` is ``False``). Production Taskmaster responses always
-    include at least one of ``success`` or ``id``; if you see ``{}`` in logs,
-    investigate the caller.
+    The predicate's single home is ``shared.mcp_envelope.write_failure_reason``;
+    this boolean form is for INTERNAL consumers (e.g.
+    ``TargetedReconciler._on_task_blocked``).  MCP passthrough sites
+    (``server/tools.py``'s ``update_task``) must return the raw dict instead.
     """
-    return (
-        isinstance(resp, dict)
-        and bool(resp)
-        and bool(resp.get('success', True))
-        and not resp.get('error')
-    )
+    return write_failure_reason(resp) is None
 
 
 def _journal_error_text(resp: object) -> str | None:

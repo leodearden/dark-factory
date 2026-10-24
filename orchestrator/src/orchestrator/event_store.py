@@ -106,10 +106,24 @@ class EventType(StrEnum):
     # by evidencing the DURABLE write; persisted=False means the in-memory
     # narrowing applied but the metadata write failed (non-critical).
     set_to_plan = 'set_to_plan'
+    # Declared-vs-landed at done, from
+    # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_landed_scope.
+    # One row per done-time reconcile of a MEASURED merge diff.  data:
+    # {merge_sha, landed, plan_files: BASIS | null, metadata_files: BASIS | null}
+    # where BASIS is {declared, undeclared, undelivered}.  plan_files: plan.json
+    # files as held at done (architect declaration plus steward scope grants;
+    # the census basis), null when no plan was loaded.  metadata_files: the
+    # last-persisted metadata.files this reconcile overwrites, null when the
+    # backend read failed.  Coverage rule:
+    # orchestrator/src/orchestrator/merge_lane/gates.py::declaration_coverage
+    # (no rename arm).  Reading the series: docs/landed-scope-diff.md.
+    landed_scope_diff = 'landed_scope_diff'
     merge_attempt = 'merge_attempt'
     # The merge worker's POST-rebase verify verdict (task_id-keyed).  data:
     # {runner, merge_sha, passed, duration_ms, attempt, depth, speculative}
-    # (depth/speculative always-present, None when absent — task 2340), PLUS
+    # (depth/speculative always-present, None when absent — task 2340;
+    # duration_ms, the dispatch wall time in ms, rides in data ONLY: the
+    # events.duration_ms column stays NULL for this type), PLUS
     # two always-present retry-scope keys (task 2837, PRD verify-retry-
     # failed-only D5) derived from spec.verify_env — the D2 failed-only retry
     # contract the orchestrator ITSELF built and shipped to reify, NOT a reify
@@ -238,6 +252,11 @@ class EventType(StrEnum):
     #   - merge_shadow's warm/cold compare emits a wholly different
     #     {merge_commit, shadow_compare, warm_test_count, cold_test_count}.
     verdict_parity_ok = 'verdict_parity_ok'
+    # A due drift check could not acquire both host slots within its settle
+    # window, so it ran nothing and re-arms for the next landing.  Producer:
+    # merge_lane/drift.py::_run_drift_check.  Payload {merge_sha,
+    # consecutive_deferrals, hosts}, hosts being HostAllocator.host_states().
+    drift_check_deferred = 'drift_check_deferred'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence
     # and local-infra-inconclusive outcomes their own auditable types.

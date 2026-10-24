@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 import os
 import re
 import subprocess
@@ -120,12 +121,19 @@ def repository_toplevel(root: Path) -> Path:
     return Path(os.fsdecode(completed.stdout.rstrip(b'\n')))
 
 
+def _peeled_commit(root: Path, rev: str) -> str | None:
+    completed = _run(root, 'rev-parse', '--verify', '-q', f'{rev}^{{commit}}', ok_returncodes=(0, 1))
+    return completed.stdout.decode().strip() if completed.returncode == 0 else None
+
+
 def main_head(root: Path) -> str | None:
     """refs/heads/main's commit, or None before main's first commit."""
-    completed = _run(
-        root, 'rev-parse', '--verify', '-q', f'{_MAIN_REF}^{{commit}}', ok_returncodes=(0, 1)
-    )
-    return completed.stdout.decode().strip() if completed.returncode == 0 else None
+    return _peeled_commit(root, _MAIN_REF)
+
+
+def has_commit(root: Path, commit: str) -> bool:
+    """Whether the repository holds `commit` as a commit object; a GitError, never False, when git cannot answer."""
+    return _peeled_commit(root, _require_sha(commit)) is not None
 
 
 class EntryKind(StrEnum):
@@ -355,3 +363,121 @@ def last_changes(root: Path, head: str, *, since: str | None) -> dict[str, datet
         for path in paths:
             changed.setdefault(path, when)
     return changed
+
+
+class ChangeStatus(StrEnum):
+    ADDED = 'A'
+    DELETED = 'D'
+    MODIFIED = 'M'
+    RENAMED = 'R'
+    TYPE_CHANGED = 'T'
+
+
+_ABSENT_MODE: Final = '000000'
+_ABSENT_SHA: Final = re.compile(r'0{40}|0{64}')
+_HUNK_MARK: Final = b'@@'
+_ADDED_MARK: Final = b'+'
+
+
+@dataclass(frozen=True)
+class PathChange:
+    """One path's change between two trees; each side absent (None) where the path did not exist."""
+
+    status: ChangeStatus
+    old_path: str | None
+    new_path: str | None
+    old_blob: str | None
+    new_blob: str | None
+    old_kind: EntryKind | None
+    new_kind: EntryKind | None
+
+
+def _change_status(letter: str) -> ChangeStatus:
+    try:
+        return ChangeStatus(letter.rstrip('0123456789'))
+    except ValueError as exc:
+        raise ValueError(f'unsupported change status {letter}') from exc
+
+
+def _side_kind(mode: str) -> EntryKind | None:
+    if mode == _ABSENT_MODE:
+        return None
+    kind = _MODE_KINDS.get(mode)
+    if kind is None:
+        raise ValueError(f'unsupported tree entry mode {mode} in a change')
+    return kind
+
+
+def _side_blob(sha: str) -> str | None:
+    return None if _ABSENT_SHA.fullmatch(sha) else sha
+
+
+def _record_path(tokens: Iterator[bytes], meta: bytes) -> str:
+    path = next(tokens, None)
+    if path is None:
+        raise ValueError(f'raw change record {meta!r} ends before its path')
+    return os.fsdecode(path)
+
+
+def _raw_change(meta: bytes, tokens: Iterator[bytes]) -> PathChange:
+    """One `--raw -z` record from its ':<modes> <shas> <status>' token, its one path (two for a rename) taken from `tokens`."""
+    old_mode, new_mode, old_sha, new_sha, letter = meta.removeprefix(b':').decode().split()
+    status = _change_status(letter)
+    first = _record_path(tokens, meta)
+    second = _record_path(tokens, meta) if status is ChangeStatus.RENAMED else first
+    return PathChange(
+        status=status,
+        old_path=None if status is ChangeStatus.ADDED else first,
+        new_path=None if status is ChangeStatus.DELETED else second,
+        old_blob=_side_blob(old_sha),
+        new_blob=_side_blob(new_sha),
+        old_kind=_side_kind(old_mode),
+        new_kind=_side_kind(new_mode),
+    )
+
+
+def _raw_changes(tokens: Iterator[bytes]) -> tuple[PathChange, ...]:
+    return tuple(_raw_change(meta, tokens) for meta in tokens if meta)
+
+
+def tree_changes(root: Path, old: str, new: str) -> tuple[PathChange, ...]:
+    """Every path that differs between two commits' trees, renames paired by git's default detection."""
+    output = _run(
+        root, 'diff-tree', '-r', '-z', '-M', '--raw', '--no-abbrev', _require_sha(old), _require_sha(new)
+    ).stdout
+    return _raw_changes(iter(output.split(b'\0')))
+
+
+def _change_sets(tokens: Iterator[bytes]) -> tuple[tuple[PathChange, ...], ...]:
+    """A `log --raw -z` stream split per commit: a commit mark opens a set, and each record consumes its own paths."""
+    sets: list[list[PathChange]] = []
+    for token in tokens:
+        if token.startswith(_COMMIT_MARK):
+            sets.append([])
+        elif token:
+            sets[-1].append(_raw_change(token.removeprefix(b'\n'), tokens))
+    return tuple(tuple(changes) for changes in sets)
+
+
+def first_parent_changes(root: Path, *, since: str, head: str) -> tuple[tuple[PathChange, ...], ...]:
+    """Each first-parent commit after `since` through `head`, oldest first, as its changes against its first parent."""
+    output = _run(
+        root,
+        'log', '--first-parent', _FIRST_PARENT_DIFF, '-M', '--raw', '-z', '--no-abbrev', '--reverse',
+        '--format=%x01%H',
+        f'{_require_sha(since)}..{_require_sha(head)}', '--',
+    ).stdout
+    return _change_sets(iter(output.split(b'\0')))
+
+
+def added_lines(root: Path, old_blob: str, new_blob: str) -> bytes:
+    """The lines `new_blob` adds or changes against `old_blob`, joined by newlines; nothing for identical blobs."""
+    output = _run(
+        root,
+        'diff', '-U0', '-a', '--no-color', '--no-ext-diff', '--no-textconv',
+        _require_sha(old_blob), _require_sha(new_blob),
+        ok_returncodes=(0, 1),
+    ).stdout
+    lines = iter(output.split(b'\n'))
+    hunks = itertools.dropwhile(lambda line: not line.startswith(_HUNK_MARK), lines)
+    return b'\n'.join(line[1:] for line in hunks if line.startswith(_ADDED_MARK))

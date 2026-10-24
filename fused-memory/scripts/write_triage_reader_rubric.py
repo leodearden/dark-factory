@@ -1,11 +1,12 @@
-"""The one definition of write-triage correctness rubric v2.
+"""The one definition of write-triage correctness rubric v2.1.
 
 A rated item is a (write, record) pair judged on the binaries of
 :class:`Binary`. This module defines the verdict-row contract, the per-binary
-majority that resolves several raters' rows into one :class:`Judgement`, and
-the derivation that turns judgements into the wrong cells a reader meets.
+resolution of several raters' rows into one :class:`Judgement`, and the
+derivation that turns judgements into the wrong cells a reader meets.
 
-The rater-facing wording is ``fused-memory/calibration/write_triage_rater_brief_v2.md``;
+The rater-facing wording is ``fused-memory/calibration/write_triage_rater_brief_v2.md``
+(rater brief v2.1);
 the metrics built on the cells are ``fused-memory/calibration/write_triage_reader_metrics.md``.
 """
 from __future__ import annotations
@@ -18,6 +19,7 @@ from functools import partial
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
+from fused_memory.server.grouped_read import _digest
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -52,6 +54,7 @@ class Binary(StrEnum):
     LOSS = 'loss'
     CONFLICT = 'conflict'
     SCOPE = 'scope'
+    ACTION_CHANGING = 'action_changing'
     DIGEST = 'digest'
 
 
@@ -71,8 +74,16 @@ class Role(StrEnum):
     DERIVED = 'derived'
 
 
+RATER_ROLES = frozenset({Role.PRIMARY, Role.SECOND, Role.THIRD})
+"""The roles of a row a rater answered; only these rows carry evidence or non_consumed answers."""
+
+
 class Resolved(StrEnum):
-    """What the rows carrying one binary of one pair say, taken together."""
+    """What the rows carrying one binary of one pair say, taken together.
+
+    OPEN is a decisive follow-up no row carries, whose preconditions the rater
+    votes resolve to its needs.
+    """
 
     YES = 'YES'
     NO = 'NO'
@@ -80,6 +91,7 @@ class Resolved(StrEnum):
     SECONDARY = 'SECONDARY'
     UNCLEAR = ABSTAIN
     TIED = 'TIED'
+    OPEN = 'OPEN'
 
 
 _WORDS: Mapping[Binary, type[StrEnum]] = MappingProxyType({
@@ -87,15 +99,60 @@ _WORDS: Mapping[Binary, type[StrEnum]] = MappingProxyType({
     Binary.LOSS: Answer,
     Binary.CONFLICT: Answer,
     Binary.SCOPE: Scope,
+    Binary.ACTION_CHANGING: Answer,
     Binary.DIGEST: Answer,
 })
 """The answer vocabulary of each binary."""
 
-_FOLLOWS: Mapping[Binary, Binary] = MappingProxyType({
-    Binary.SCOPE: Binary.CONFLICT,
-    Binary.DIGEST: Binary.LOSS,
+FOLLOW_UPS: Mapping[Binary, Mapping[Binary, Answer]] = MappingProxyType({
+    Binary.LOSS: MappingProxyType({Binary.HOME: Answer.YES, Binary.CONFLICT: Answer.NO}),
+    Binary.SCOPE: MappingProxyType({Binary.CONFLICT: Answer.YES}),
+    Binary.ACTION_CHANGING: MappingProxyType({Binary.CONFLICT: Answer.YES}),
+    Binary.DIGEST: MappingProxyType({Binary.LOSS: Answer.YES}),
 })
-"""A conditional follow-up, and the binary that must be YES on the same row to ask it."""
+"""Each conditional follow-up, and the answers the same row must give before it is asked."""
+
+DECISIVE_FOLLOW_UPS: frozenset[Binary] = frozenset({Binary.LOSS})
+"""The follow-ups :func:`derive` reads that a rater answers; DIGEST is computed from loss_spans.
+
+A rater row whose own answers meet one's ``FOLLOW_UPS`` needs must give it, so a
+skipped one is refused, never resolved UNCLEAR. One the rater votes ask that no
+rater row reached resolves OPEN.
+"""
+
+
+def _is_conflict_quote(value: object) -> bool:
+    return isinstance(value, dict) and all(
+        _is_text(value.get(side)) for side in ('parent', 'child')
+    )
+
+
+def _is_loss_spans(value: object) -> bool:
+    return isinstance(value, list) and bool(value) and all(map(_is_text, value))
+
+
+def _is_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+@dataclass(frozen=True)
+class _Evidence:
+    """A row field that must back an answer, the shape it must have, and its check."""
+
+    field: str
+    shape: str
+    valid: Callable[[object], bool]
+
+
+_LOSS_SPANS = _Evidence('loss_spans', 'a non-empty list of non-empty strings', _is_loss_spans)
+
+_EVIDENCE: Mapping[tuple[Binary, Answer], _Evidence] = MappingProxyType({
+    (Binary.CONFLICT, Answer.YES): _Evidence(
+        'conflict_quote', 'an object with non-empty string parent and child', _is_conflict_quote,
+    ),
+    (Binary.LOSS, Answer.YES): _LOSS_SPANS,
+})
+"""The evidence a rater row must give for an answer; a derived row gives none."""
 
 _POLES: Mapping[Binary, tuple[Resolved, Resolved]] = MappingProxyType({
     binary: (Resolved.CENTRAL, Resolved.SECONDARY) if words is Scope else (Resolved.YES, Resolved.NO)
@@ -121,35 +178,54 @@ class PairKey:
 
 @dataclass(frozen=True)
 class Vote:
-    """One rater's validated answers on one pair key."""
+    """One rater's validated answers on one pair key.
+
+    ``answers`` holds only the voting answers; a binary in ``non_consumed`` was
+    answered and recorded, but a derived row fixes it, so it never votes.
+    """
 
     rater: str
     role: Role
     answers: Mapping[Binary, StrEnum]
+    non_consumed: frozenset[Binary] = frozenset()
 
 
 @dataclass(frozen=True)
 class Judgement:
-    """Every vote on one pair key, and the binaries those votes resolve to."""
+    """Every vote on one pair key, and the binaries those votes resolve to.
+
+    ``unreached_follow_ups`` names each follow-up no vote carries whose
+    preconditions all resolve to the answers it needs, at least one of them
+    fixed by a derived row. A rater row meeting those needs must give a
+    decisive follow-up, so no rater reached it, and it resolves UNCLEAR.
+    A decisive follow-up the rater votes alone ask, though no rater row met its
+    needs, resolves OPEN instead: a further blind rater answering the whole
+    item may reach it.
+    """
 
     key: PairKey
     votes: tuple[Vote, ...]
     resolved: Mapping[Binary, Resolved]
+    unreached_follow_ups: frozenset[Binary] = frozenset()
 
     def answer(self, binary: Binary) -> Resolved | None:
-        """The resolved answer on *binary*, or None when no row carries it."""
+        """*binary*'s resolved answer; None only when no row carries it and no rule resolves it."""
         return self.resolved.get(binary)
 
 
 def resolve_judgements(rows: Iterable[Mapping[str, Any]]) -> Mapping[PairKey, Judgement]:
-    """Validate every verdict row and resolve each pair key's binaries by strict majority.
+    """Validate every verdict row and resolve each pair key's binaries.
 
-    Votes on one binary come from the rows carrying it. UNCLEAR abstains, an
-    all-UNCLEAR binary resolves UNCLEAR and an even split resolves TIED. The
-    ``current`` and ``attach_time`` bases are separate pair keys and never mix.
-    A malformed row, or a rater voting twice on one pair key, is refused.
+    Votes on one binary come from the rows carrying it as a voting answer.
+    UNCLEAR abstains, an all-UNCLEAR binary resolves UNCLEAR and an even split
+    resolves TIED, a follow-up a derived row's precondition left unasked
+    resolves UNCLEAR, and a decisive follow-up the rater votes ask but no rater
+    row reached resolves OPEN. The ``current`` and ``attach_time`` bases are
+    separate pair keys and never mix. A malformed row, a rater voting twice on one pair key,
+    and a pair key whose rater answers and derived rows disagree about which
+    binaries a derived row fixes are refused.
     """
-    votes: defaultdict[PairKey, dict[str, Vote]] = defaultdict(dict)
+    votes: defaultdict[PairKey, dict[str, tuple[int, Vote]]] = defaultdict(dict)
     for index, row in enumerate(rows):
         pair = (row.get('entry_id'), row.get('target_id'), row.get('basis'))
         violation = _row_violation(row)
@@ -160,16 +236,45 @@ def resolve_judgements(rows: Iterable[Mapping[str, Any]]) -> Mapping[PairKey, Ju
             raise ValueError(
                 f'verdict row {index}: rater {row["rater"]!r} already rated pair {pair}'
             )
-        votes[key][row['rater']] = Vote(
-            rater=row['rater'],
-            role=Role(row['role']),
-            answers=MappingProxyType({
-                binary: words(row[binary]) for binary, words in _WORDS.items() if binary in row
-            }),
-        )
+        votes[key][row['rater']] = (index, _vote(row))
+    for key, indexed in votes.items():
+        _refuse_mixed_votes(key, list(indexed.values()))
     return MappingProxyType({
-        key: _judgement(key, tuple(votes[key].values())) for key in sorted(votes)
+        key: _judgement(key, tuple(vote for _, vote in votes[key].values())) for key in sorted(votes)
     })
+
+
+def _vote(row: Mapping[str, Any]) -> Vote:
+    non_consumed = frozenset(Binary(name) for name in row.get('non_consumed', ()))
+    return Vote(
+        rater=row['rater'],
+        role=Role(row['role']),
+        answers=MappingProxyType({
+            binary: words(row[binary])
+            for binary, words in _WORDS.items()
+            if binary in row and binary not in non_consumed
+        }),
+        non_consumed=non_consumed,
+    )
+
+
+def _refuse_mixed_votes(key: PairKey, indexed: list[tuple[int, Vote]]) -> None:
+    """Refuse a rater answer that votes beside a derived row, or a non_consumed one beside none."""
+    fixed = {binary for _, vote in indexed if vote.role is Role.DERIVED for binary in vote.answers}
+    pair = (key.entry_id, key.target_id, key.basis.value)
+    for index, vote in indexed:
+        for binary in sorted(vote.non_consumed - fixed):
+            raise ValueError(
+                f'verdict row {index} on pair {pair}: rater {vote.rater!r} lists non_consumed'
+                f' {binary.value!r}, which no derived row of the pair fixes'
+            )
+        if vote.role is Role.DERIVED:
+            continue
+        for binary in sorted(vote.answers.keys() & fixed):
+            raise ValueError(
+                f'verdict row {index} on pair {pair}: rater {vote.rater!r} votes {binary.value!r},'
+                ' which a derived row of the pair fixes, so the answer must be non_consumed'
+            )
 
 
 def _row_violation(row: Mapping[str, Any]) -> str | None:
@@ -181,34 +286,108 @@ def _row_violation(row: Mapping[str, Any]) -> str | None:
         if not isinstance(row[key], str) or not row[key]:
             return f'{key} {row[key]!r} is not a non-empty string'
     for key, words in (('basis', Basis), ('role', Role)):
-        if row[key] not in set(words):
+        if not _is_word(row[key], words):
             return f'{key} {row[key]!r} is not one of {sorted(words)}'
     carried = [binary for binary in _WORDS if binary in row]
     if not carried:
         return f'carries no binary (one of {", ".join(_WORDS)})'
     for binary in carried:
-        if row[binary] not in set(_WORDS[binary]):
+        if not _is_word(row[binary], _WORDS[binary]):
             return f'{binary} {row[binary]!r} is not one of {sorted(_WORDS[binary])}'
     unclear = [binary for binary in carried if is_abstain(row[binary])]
     reason = row.get('unclear_reason')
     if unclear and not (isinstance(reason, str) and reason.strip()):
         return f'{unclear[0]} {ABSTAIN!r} needs a non-empty unclear_reason'
-    for follow_up, asked_after in _FOLLOWS.items():
-        if follow_up in row and row.get(asked_after) != Answer.YES:
+    for follow_up, needs in FOLLOW_UPS.items():
+        if follow_up not in row:
+            continue
+        for asked_after, needed in needs.items():
+            if row.get(asked_after) != needed:
+                return (
+                    f'{follow_up} {row[follow_up]!r} needs {asked_after} {needed.value!r},'
+                    f' got {row.get(asked_after)!r}'
+                )
+    return (
+        _skipped_follow_up_violation(row) or _evidence_violation(row, carried)
+        or _non_consumed_violation(row)
+    )
+
+
+def _is_word(value: object, words: type[StrEnum]) -> bool:
+    return isinstance(value, str) and value in set(words)
+
+
+def _skipped_follow_up_violation(row: Mapping[str, Any]) -> str | None:
+    """The first decisive follow-up a rater *row*'s own answers ask that it does not give; None if none."""
+    if row['role'] not in RATER_ROLES:
+        return None
+    for follow_up in sorted(DECISIVE_FOLLOW_UPS):
+        needs = FOLLOW_UPS[follow_up]
+        if follow_up not in row and all(row.get(binary) == needed for binary, needed in needs.items()):
+            asked_by = ' and '.join(f'{binary} {needed.value!r}' for binary, needed in needs.items())
+            return f'lacks {follow_up}, which a rater row with {asked_by} must give'
+    return None
+
+
+def _evidence_violation(row: Mapping[str, Any], carried: list[Binary]) -> str | None:
+    """The first answer *row* gives without the evidence that must back it; None if none."""
+    required = [
+        (binary, _EVIDENCE[binary, row[binary]])
+        for binary in carried
+        if row['role'] in RATER_ROLES and (binary, row[binary]) in _EVIDENCE
+    ]
+    if Binary.DIGEST in row:
+        required.append((Binary.DIGEST, _LOSS_SPANS))
+    for binary, evidence in required:
+        if not evidence.valid(row.get(evidence.field)):
             return (
-                f'{follow_up} {row[follow_up]!r} needs {asked_after} {Answer.YES.value!r},'
-                f' got {row.get(asked_after)!r}'
+                f'{binary} {row[binary]!r} needs {evidence.field}, {evidence.shape},'
+                f' got {row.get(evidence.field)!r}'
             )
+    return None
+
+
+def _non_consumed_violation(row: Mapping[str, Any]) -> str | None:
+    """Why *row*'s non_consumed list is malformed, naming the offending binary; None if it is not."""
+    if 'non_consumed' not in row:
+        return None
+    listed = row['non_consumed']
+    if not isinstance(listed, list):
+        return f'non_consumed {listed!r} is not a list of binary names'
+    if row['role'] not in RATER_ROLES:
+        return f'non_consumed {listed!r} is on a {row["role"]} row; only a rater answer is non_consumed'
+    for position, name in enumerate(listed):
+        if not isinstance(name, str) or name not in set(_WORDS):
+            return f'non_consumed names {name!r}, not one of {", ".join(_WORDS)}'
+        if name in listed[:position]:
+            return f'non_consumed names {name!r} twice'
+        if name not in row:
+            return f'non_consumed names {name!r}, which the row does not carry'
     return None
 
 
 def _judgement(key: PairKey, votes: tuple[Vote, ...]) -> Judgement:
     resolved = {
-        binary: _majority([vote.answers[binary] for vote in votes if binary in vote.answers], binary)
+        binary: _RESOLVERS[binary](
+            [vote.answers[binary] for vote in votes if binary in vote.answers], binary,
+        )
         for binary in _WORDS
         if any(binary in vote.answers for vote in votes)
     }
-    return Judgement(key=key, votes=votes, resolved=MappingProxyType(resolved))
+    derived = {binary for vote in votes if vote.role is Role.DERIVED for binary in vote.answers}
+    met = frozenset(
+        follow_up for follow_up, needs in FOLLOW_UPS.items()
+        if follow_up not in resolved
+        and all(resolved.get(binary) == Resolved(needed) for binary, needed in needs.items())
+    )
+    unreached = frozenset(
+        follow_up for follow_up in met if not derived.isdisjoint(FOLLOW_UPS[follow_up])
+    )
+    resolved.update(dict.fromkeys(unreached, Resolved.UNCLEAR))
+    resolved.update(dict.fromkeys((met - unreached) & DECISIVE_FOLLOW_UPS, Resolved.OPEN))
+    return Judgement(
+        key=key, votes=votes, resolved=MappingProxyType(resolved), unreached_follow_ups=unreached,
+    )
 
 
 def _majority(words: list[StrEnum], binary: Binary) -> Resolved:
@@ -227,6 +406,39 @@ def _strict_majority(yes: int, votes: int) -> bool | None:
     if 2 * yes == votes:
         return None
     return 2 * yes > votes
+
+
+def _all_visible(words: list[StrEnum], binary: Binary) -> Resolved:
+    """YES only when every decided vote is YES: a reader of the digest misses any span one rater needed."""
+    decided = [word for word in words if not is_abstain(word)]
+    if not decided:
+        return Resolved.UNCLEAR
+    positive, negative = _POLES[binary]
+    return positive if all(word == positive for word in decided) else negative
+
+
+_RESOLVERS: Mapping[Binary, Callable[[list[StrEnum], Binary], Resolved]] = MappingProxyType({
+    binary: _all_visible if binary is Binary.DIGEST else _majority for binary in _WORDS
+})
+"""How each binary's votes resolve: DIGEST by the all-visible rule, every other by strict majority."""
+
+
+def quote_found(quote: str, text: str) -> bool:
+    """Whether *quote* occurs in *text* verbatim up to whitespace; an empty quote is never found."""
+    needle = _normalised(quote)
+    return bool(needle) and needle in _normalised(text)
+
+
+def digest_visible(loss_spans: Sequence[str], child_text: str) -> bool:
+    """Whether every span lies inside the digest a reader of the parent sees of *child_text*."""
+    if not loss_spans:
+        raise ValueError('digest_visible needs at least one loss span')
+    digest = _digest(child_text)
+    return all(quote_found(span, digest) for span in loss_spans)
+
+
+def _normalised(text: str) -> str:
+    return ' '.join(text.split())
 
 
 class Cell(StrEnum):
@@ -280,17 +492,27 @@ CELL_RULES: Mapping[Cell, str] = MappingProxyType({
 
 
 class GapKind(StrEnum):
+    """Why a binary blocks: no row carries it; its votes split evenly; or it is a decisive
+    follow-up the rater votes ask that no rater row reached."""
+
     UNRATED = 'unrated'
     TIED = 'tied'
+    OPEN = 'open'
 
 
 @dataclass(frozen=True, order=True)
 class Gap:
-    """A binary the derivation needed on one record that the verdicts leave unrated or tied."""
+    """A binary the derivation needed on one record that the verdicts leave unrated, tied or open."""
 
     target_id: str
     binary: Binary
     kind: GapKind
+
+
+_BLOCKING: Mapping[Resolved, GapKind] = MappingProxyType({
+    Resolved.TIED: GapKind.TIED, Resolved.OPEN: GapKind.OPEN,
+})
+"""Each resolution that blocks a derivation asking for it, and the gap it is."""
 
 
 @dataclass(frozen=True)
@@ -299,24 +521,29 @@ class Decided:
 
     ``conflict`` says whether the write disputes its parent or any earlier
     record. ``m1_hidden`` is None outside the M1 band.
+    ``m1_hidden_as_amended`` is the counterfactual M1 of a band attach read as
+    if it were amended; None outside the band and for a stored write.
+    ``consumed`` names every (target, binary) the derivation read.
     """
 
     triage_cells: frozenset[Cell]
     status_quo_cells: frozenset[Cell]
     m1_hidden: bool | None
     conflict: bool
+    m1_hidden_as_amended: bool | None
+    consumed: frozenset[tuple[str, Binary]]
 
 
 @dataclass(frozen=True)
 class Unclear:
-    """A binary the derivation needed resolved UNCLEAR: every rater abstained on it."""
+    """A binary the derivation needed resolved UNCLEAR: every rater abstained, or none was asked it."""
 
     binaries: tuple[tuple[str, Binary], ...]
 
 
 @dataclass(frozen=True)
 class Incomplete:
-    """The verdicts leave binaries the derivation needed unrated or tied."""
+    """The verdicts leave binaries the derivation needed unrated, tied or open."""
 
     missing: tuple[Gap, ...]
 
@@ -338,17 +565,19 @@ def derive(
     write is read against each earlier record it might have joined, and each
     one is derived on its own. Binaries are asked lazily, in a fixed order per
     outcome, so a binary is decisive exactly when the derivation asks for it: a
-    decisive unrated or tied binary makes the write Incomplete (naming every
-    gap the three derivations met), a decisive UNCLEAR one makes it Unclear,
-    and a binary never asked never blocks. The triage, status-quo and M1
-    derivations stand or fall together: a gap or an UNCLEAR in any one of them
-    decides the whole write, even when the others are complete.
+    decisive unrated, tied or open binary makes the write Incomplete (naming every
+    gap the derivations met), a decisive UNCLEAR one makes it Unclear, and a
+    binary never asked never blocks. The triage, status-quo, M1 and
+    counterfactual-M1 derivations stand or fall together: a gap or an UNCLEAR
+    in any one of them decides the whole write, even when the others are
+    complete.
     ``supersedes_target`` and ``superseded_marks`` are metadata facts
     (ruling 5c), never rater answers.
     """
+    asked: set[tuple[str, Binary]] = set()
     regimes = _regimes(
         outcome, judgements_by_target, supersedes_target=supersedes_target,
-        superseded_marks=superseded_marks, in_m1_band=in_m1_band,
+        superseded_marks=superseded_marks, in_m1_band=in_m1_band, asked=asked,
     )
     results: dict[str, list[Any]] = {regime: [] for regime in regimes}
     gaps: set[Gap] = set()
@@ -373,6 +602,8 @@ def derive(
         status_quo_cells=_Reading.union(results['status_quo']).cells,
         m1_hidden=results['m1'][0] if in_m1_band else None,
         conflict=triage.conflict,
+        m1_hidden_as_amended=results['m1_as_amended'][0] if regimes['m1_as_amended'] else None,
+        consumed=frozenset(asked),
     )
 
 
@@ -391,18 +622,23 @@ class _Abstained(Exception):
 
 @dataclass(frozen=True)
 class _Reader:
-    """Lazy access to one record's judgement; ``marked`` = it carries a superseded-by mark."""
+    """Lazy access to one record's judgement; ``marked`` = it carries a superseded-by mark.
+
+    Every binary asked is recorded in ``asked``, the one derive call's set.
+    """
 
     target_id: str
     judgement: Judgement | None
+    asked: set[tuple[str, Binary]]
     marked: bool = False
 
     def yes(self, binary: Binary) -> bool:
+        self.asked.add((self.target_id, binary))
         resolved = None if self.judgement is None else self.judgement.answer(binary)
         if resolved is None:
             raise _Undecided(Gap(self.target_id, binary, GapKind.UNRATED))
-        if resolved is Resolved.TIED:
-            raise _Undecided(Gap(self.target_id, binary, GapKind.TIED))
+        if resolved in _BLOCKING:
+            raise _Undecided(Gap(self.target_id, binary, _BLOCKING[resolved]))
         if resolved is Resolved.UNCLEAR:
             raise _Abstained(self.target_id, binary)
         return resolved is Resolved.YES
@@ -482,13 +718,14 @@ def _regimes(
     supersedes_target: bool,
     superseded_marks: frozenset[str],
     in_m1_band: bool,
+    asked: set[tuple[str, Binary]],
 ) -> dict[str, list[Callable[[], Any]]]:
     """The deferred derivations of each regime, refusing a write the rubric cannot read."""
     rule = _CELL_RULES.get(outcome)
     if rule is None:
         raise ValueError(f'outcome {outcome!r} is not one of {sorted(TRIAGE_OUTCOMES)}')
     readers = [
-        _Reader(target, judgement, marked=target in superseded_marks)
+        _Reader(target, judgement, asked, marked=target in superseded_marks)
         for target, judgement in sorted(judgements_by_target.items())
     ]
     if outcome == OUTCOME_STORED:
@@ -503,4 +740,13 @@ def _regimes(
         'triage': [partial(rule, reader) for reader in readers],
         'status_quo': [partial(_stored_cells, reader) for reader in flat],
         'm1': [partial(_m1_hidden, outcome, readers)] if in_m1_band else [],
+        'm1_as_amended': (
+            [partial(_m1_hidden, OUTCOME_AMENDED, readers)]
+            if reads_as_amended(outcome, in_m1_band=in_m1_band) else []
+        ),
     }
+
+
+def reads_as_amended(outcome: str, *, in_m1_band: bool) -> bool:
+    """Whether :func:`derive` gives a write a counterfactual M1 as amended: a band attach."""
+    return in_m1_band and outcome != OUTCOME_STORED

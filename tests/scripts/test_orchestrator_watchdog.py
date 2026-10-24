@@ -50,6 +50,7 @@ from df_pytest_isolation import (  # noqa: E402
     load_scaled_grace,
     read_drain_poll_trace,
     read_leaked_pid,
+    read_proc_state,
     run_in_new_session,
     run_in_new_session_until,
     synthetic_unit,
@@ -11275,7 +11276,11 @@ def _reliably_dead_pid() -> int:
     """A pid that has exited AND been reaped, so it names no live process."""
     proc = subprocess.Popen([sys.executable, "-c", ""])
     proc.wait()
-    assert wait_pid_gone(proc.pid), f"pid {proc.pid} outlived its own reaping"
+    state = read_proc_state(proc.pid)
+    assert state is None, (
+        f"pid {proc.pid} still has a /proc entry {state} after proc.wait() reaped it; "
+        "os.kill(pid, 0), which the lease liveness check uses, would read it as alive"
+    )
     return proc.pid
 
 
@@ -12233,9 +12238,10 @@ def test_fleet_lease_max_age_matches_config_default(monkeypatch: pytest.MonkeyPa
 
     Modelled on test_orch_restart_min_interval_secs_matches_config_default
     above. The bound is what makes a SIGKILLed sweep cost at most one delayed
-    window, and its 14400s value is DERIVED (worst legitimate sweep ~= 13,300s),
-    not chosen — so a tier drifting off it is a silent correctness change, not
-    a cosmetic one.
+    window, and a --drain sweep is fitted under its 14400s value (at
+    scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS) —
+    so a tier drifting off it is a silent correctness change, not a cosmetic
+    one.
 
     Two statements, because there are exactly two tiers that READ the value:
     the coordinator via OrchestratorConfig and the watchdog via its own env

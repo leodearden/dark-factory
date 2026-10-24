@@ -34,7 +34,9 @@ from shared.cli_invoke import (
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.eval_lane import eval_lane_provenance
+from shared.loop_stall import LoopStallMonitor
 from shared.mcp_envelope import resolver_failed
+from shared.project_layout import escalation_queue_dir, orchestrator_data_dir, runs_db
 from shared.repo_paths import (
     rejected_dark_factory_root_override,
     resolve_dark_factory_root,
@@ -60,6 +62,12 @@ from orchestrator import recovery_pins, recut_ruling
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
+from orchestrator.already_landed_tick_view import (
+    AlreadyLandedTickView,
+    branch_absent_and_unmarked,
+    read_already_landed_tick_view,
+)
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.background_service import (
     DEFAULT_BACKOFF_SECS,
@@ -145,7 +153,7 @@ from orchestrator.recovery_emission import (
     veto_signature,
 )
 from orchestrator.recovery_pins import records_pin_recovery
-from orchestrator.review_checkpoint import ReviewCheckpoint
+from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.run_store import RunStore
@@ -1051,7 +1059,7 @@ def _acquire_project_lock(project_root: Path) -> IO:
     (closing or GC releases the lock).  Raises ``SystemExit(1)`` if
     another orchestrator instance already holds the lock.
     """
-    lock_path = project_root / 'data' / 'orchestrator' / 'orchestrator.lock'
+    lock_path = orchestrator_data_dir(project_root) / 'orchestrator.lock'
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     lock_file = open(lock_path, 'w')  # noqa: SIM115
@@ -1146,9 +1154,53 @@ class HarnessReport:
     paused_for_cap: bool = False
     cap_pause_duration_secs: float = 0.0
     review_checkpoints: int = 0
+    review_checkpoints_skipped: int = 0
     review_findings: int = 0
     review_tasks_created: int = 0
     review_cost_usd: float = 0.0
+
+    @property
+    def reviews_attempted(self) -> int:
+        return self.review_checkpoints + self.review_checkpoints_skipped
+
+    def record_review(self, review: ReviewReport) -> None:
+        if not review.ran:
+            self.review_checkpoints_skipped += 1
+            return
+        self.review_checkpoints += 1
+        self.review_findings += review.findings_count
+        self.review_tasks_created += len(review.tasks_created)
+        self.review_cost_usd += review.cost_usd
+
+    def to_dict(self) -> dict:
+        return {
+            'started_at': self.started_at,
+            'completed_at': self.completed_at,
+            'total_tasks': self.total_tasks,
+            'completed': self.completed,
+            'blocked': self.blocked,
+            'escalated': self.escalated,
+            'total_cost_usd': self.total_cost_usd,
+            'paused_for_cap': self.paused_for_cap,
+            'cap_pause_duration_secs': self.cap_pause_duration_secs,
+            'review_checkpoints': self.review_checkpoints,
+            'review_checkpoints_skipped': self.review_checkpoints_skipped,
+            'review_findings': self.review_findings,
+            'review_tasks_created': self.review_tasks_created,
+            'review_cost_usd': self.review_cost_usd,
+            'task_reports': [
+                {
+                    'task_id': r.task_id,
+                    'title': r.title,
+                    'outcome': r.outcome.value,
+                    'cost_usd': r.cost_usd,
+                    'duration_ms': r.duration_ms,
+                    'agent_invocations': r.agent_invocations,
+                    'completed_at': r.completed_at,
+                }
+                for r in self.task_reports
+            ],
+        }
 
     def summary(self) -> str:
         lines = [
@@ -1160,9 +1212,10 @@ class HarnessReport:
         ]
         if self.paused_for_cap:
             lines.append(f'  Cap pause: {self.cap_pause_duration_secs:.0f}s total')
-        if self.review_checkpoints > 0:
+        if self.reviews_attempted > 0:
             lines.append(
-                f'  Review checkpoints: {self.review_checkpoints} '
+                f'  Review checkpoints: {self.review_checkpoints} ran, '
+                f'{self.review_checkpoints_skipped} skipped '
                 f'({self.review_findings} findings, '
                 f'{self.review_tasks_created} tasks, '
                 f'${self.review_cost_usd:.2f})'
@@ -1708,6 +1761,9 @@ class Harness:
         #     bound method is late-bound — valid to reference here even though
         #     the Counter itself is created AFTER this Scheduler build, because
         #     it resolves the Counter at CALL time, not at reference time.
+        #   - read_already_landed_tick_view (task 4900): one local-branch
+        #     snapshot per already-landed consult, read through the bound
+        #     method so a test-replaced self.git_ops is honoured.
         self.scheduler = Scheduler(
             config,
             callbacks=SchedulerCallbacks(
@@ -1721,6 +1777,7 @@ class Harness:
                 on_warm_base_promote_l2=self._promote_warm_base_hard_down_l2,
                 on_warm_base_resolve=self._resolve_warm_base_hard_down,
                 suppress_blocked_write=self._is_action_teardown_task,
+                read_already_landed_tick_view=self._read_already_landed_tick_view,
             ),
             override_store=OverrideStore.from_config(config),
             park_eviction_store=ParkEvictionRequestStore.from_config(config),
@@ -2148,10 +2205,10 @@ class Harness:
             emit=self._emit_fleet_drain,
         )
         # Durable journal for in-flight merge requests (task 1772).
-        # Persisted at data/orchestrator/merge_queue.json; recovered on restart
-        # by _recover_pending_merges (called from run() after _rehydrate_merge_halt).
+        # Recovered on restart by _recover_pending_merges (called from run()
+        # after _rehydrate_merge_halt).
         self._merge_store: MergeQueueStore = MergeQueueStore(
-            config.project_root / 'data' / 'orchestrator' / 'merge_queue.json'
+            orchestrator_data_dir(config.project_root) / 'merge_queue.json'
         )
 
         # Post-merge staleness hook — restart services when a landed diff
@@ -2326,16 +2383,18 @@ class Harness:
         W10-η — PRD §5.3 LR-1/2/3).
 
         Registration order (also the ``stop_all()`` REVERSE order — LR-2):
-        escalation-server, merge-worker, offline-lane, orphan-l0-reaper,
-        terminal-status-watcher, watcher-supervisor, stranded-reconcile,
-        main-tip-sweep, no-landings-breaker, deterministic-recon-sweep,
-        warm-lane-gc, stale-service-restart, merge-heartbeat,
-        verify-admission-watch, flake-debt-drain.
-        escalation-server and merge-worker start first so the recovery block
-        (which runs immediately after ``start_all()`` returns) can depend on
-        both being live. The seven sweeps are conditionally registered on
-        their own ``config.X_enabled`` gate — ``BackgroundService`` itself has
-        no ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
+        loop-stall-monitor, escalation-server, merge-worker, offline-lane,
+        orphan-l0-reaper, terminal-status-watcher, watcher-supervisor,
+        stranded-reconcile, main-tip-sweep, no-landings-breaker,
+        deterministic-recon-sweep, warm-lane-gc, stale-service-restart,
+        merge-heartbeat, verify-admission-watch, flake-debt-drain.
+        loop-stall-monitor starts first so it watches every other service's
+        whole life, and stops last (task 7366). escalation-server and
+        merge-worker start next so the recovery block (which runs immediately
+        after ``start_all()`` returns) can depend on both being live. The
+        seven sweeps are conditionally registered on their own
+        ``config.X_enabled`` gate — ``BackgroundService`` itself has no
+        ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
         absent from the registry. The last four always run: they must keep
         their cadence whatever the dispatch loop is doing (task 5344; the
         verify-admission watch, task 5628; the flake-debt drain, task 6934).
@@ -2345,6 +2404,13 @@ class Harness:
         registry = LifecycleRegistry()
         sweep_backoff = BackoffPolicy(_BG_LOOP_FAILURE_BACKOFF_SECS)
 
+        monitor = LoopStallMonitor()
+        registry.register(ManagedService(
+            name='loop-stall-monitor',
+            start_fn=monitor.start,
+            stop_fn=monitor.stop,
+            stop_timeout_secs=_LIFECYCLE_SERVICE_STOP_TIMEOUT_SECS,
+        ))
         registry.register(ManagedService(
             name='escalation-server',
             start_fn=self._start_escalation_server,
@@ -2624,7 +2690,7 @@ class Harness:
 
         run_id = f'run-{uuid.uuid4().hex[:12]}'
         self._run_id = run_id
-        db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
+        db_path = runs_db(self.config.project_root)
         try:
             self.event_store = EventStore(db_path, run_id)
             self.scheduler.event_store = self.event_store
@@ -3143,7 +3209,7 @@ class Harness:
             self._checkpoint_stores()
 
             # Save HarnessReport alongside review checkpoint reports
-            if self.report.review_checkpoints > 0:
+            if self.report.reviews_attempted > 0:
                 self._save_harness_report()
 
             if self.usage_gate:
@@ -6282,7 +6348,7 @@ class Harness:
         # an owner.  And a `preexisting_main_break` pin (task 4645): this clause
         # ALONE relaxes the wider `recovery_pins.ON_MAIN_REMEDIABLE_ESC_CATEGORIES`,
         # because it only fires with the branch ON MAIN, where that escalation's
-        # ask (`await_preexisting_main_hotfix`) is already satisfied.  The
+        # ask (a fixed main so the branch can merge) is already satisfied.  The
         # off-main clause below keeps the shared set — there the ask is unmet.
         #
         # The relaxation itself is why this clause exists at all (PRD leaf δ):
@@ -12039,28 +12105,7 @@ class Harness:
         assert self.review_checkpoint is not None
         logger.info('Running full post-completion review...')
         try:
-            review_report = await self.review_checkpoint.run_full()
-            self.report.review_checkpoints += 1
-            self.report.review_findings += review_report.findings_count
-            self.report.review_tasks_created += len(review_report.tasks_created)
-            self.report.review_cost_usd += review_report.cost_usd
-            if review_report.parse_failed:
-                logger.warning(
-                    'Full review %s: reviewer output was unparseable — review '
-                    'inconclusive (findings_count=%d is not a clean pass)',
-                    review_report.review_id,
-                    review_report.findings_count,
-                )
-            logger.info(
-                'Full review complete: %d findings, %d tasks created',
-                review_report.findings_count,
-                len(review_report.tasks_created),
-            )
-            if _MODULE_TAGGER_ENABLED and review_report.tasks_created:
-                try:
-                    await self._tag_task_modules()
-                except Exception as tag_err:
-                    logger.warning(f'Post-review module tagging failed: {tag_err}')
+            await self._account_review(await self.review_checkpoint.run_full(), 'Full review')
         except Exception as e:
             logger.error(f'Full review failed: {e}')
 
@@ -12090,35 +12135,39 @@ class Harness:
         assert self.review_checkpoint is not None
         logger.info('Starting review checkpoint...')
         try:
-            review_report = await self.review_checkpoint.run_focused()
-            self.report.review_checkpoints += 1
-            self.report.review_findings += review_report.findings_count
-            self.report.review_tasks_created += len(review_report.tasks_created)
-            self.report.review_cost_usd += review_report.cost_usd
-            if review_report.parse_failed:
-                logger.warning(
-                    'Review checkpoint %s: reviewer output was unparseable — '
-                    'review inconclusive (findings_count=%d is not a clean pass)',
-                    review_report.review_id,
-                    review_report.findings_count,
-                )
-            logger.info(
-                'Review checkpoint complete: %d findings, %d tasks created, '
-                'cost=$%.2f',
-                review_report.findings_count,
-                len(review_report.tasks_created),
-                review_report.cost_usd,
+            await self._account_review(
+                await self.review_checkpoint.run_focused(), 'Review checkpoint',
             )
-            # Tag newly created tasks with module metadata (agents may have
-            # included modules, but re-run the batch tagger as a fallback
-            # for any tasks that lack them).
-            if _MODULE_TAGGER_ENABLED and review_report.tasks_created:
-                try:
-                    await self._tag_task_modules()
-                except Exception as tag_err:
-                    logger.warning(f'Post-review module tagging failed: {tag_err}')
         except Exception as e:
             logger.error(f'Review checkpoint failed: {e}')
+
+    async def _account_review(self, review_report: ReviewReport, label: str) -> None:
+        """Tally a finished review, then tag the tasks it created with modules."""
+        self.report.record_review(review_report)
+        if not review_report.ran:
+            logger.warning(
+                '%s %s: %s, not counted as a run',
+                label, review_report.review_id, review_report.outcome.value,
+            )
+            return
+        if review_report.parse_failed:
+            logger.warning(
+                '%s %s: reviewer output was unparseable — review inconclusive '
+                '(findings_count=%d is not a clean pass)',
+                label, review_report.review_id, review_report.findings_count,
+            )
+        logger.info(
+            '%s complete: %d findings, %d tasks created, cost=$%.2f',
+            label, review_report.findings_count, len(review_report.tasks_created),
+            review_report.cost_usd,
+        )
+        # Agents may already have set modules on the tasks they created; the
+        # batch tagger is the fallback for any that lack them.
+        if _MODULE_TAGGER_ENABLED and review_report.tasks_created:
+            try:
+                await self._tag_task_modules()
+            except Exception as tag_err:
+                logger.warning(f'Post-review module tagging failed: {tag_err}')
 
     def _checkpoint_stores(self) -> None:
         """Run WAL TRUNCATE checkpoint on each SQLite store — best-effort.
@@ -12162,36 +12211,8 @@ class Harness:
         ts = self.report.started_at.replace(':', '').replace('-', '')[:15]
         path = reports_dir / f'harness-{ts}.json'
 
-        data = {
-            'started_at': self.report.started_at,
-            'completed_at': self.report.completed_at,
-            'total_tasks': self.report.total_tasks,
-            'completed': self.report.completed,
-            'blocked': self.report.blocked,
-            'escalated': self.report.escalated,
-            'total_cost_usd': self.report.total_cost_usd,
-            'paused_for_cap': self.report.paused_for_cap,
-            'cap_pause_duration_secs': self.report.cap_pause_duration_secs,
-            'review_checkpoints': self.report.review_checkpoints,
-            'review_findings': self.report.review_findings,
-            'review_tasks_created': self.report.review_tasks_created,
-            'review_cost_usd': self.report.review_cost_usd,
-            'task_reports': [
-                {
-                    'task_id': r.task_id,
-                    'title': r.title,
-                    'outcome': r.outcome.value,
-                    'cost_usd': r.cost_usd,
-                    'duration_ms': r.duration_ms,
-                    'agent_invocations': r.agent_invocations,
-                    'completed_at': r.completed_at,
-                }
-                for r in self.report.task_reports
-            ],
-        }
-
         try:
-            path.write_text(json.dumps(data, indent=2))
+            path.write_text(json.dumps(self.report.to_dict(), indent=2))
             logger.info('HarnessReport saved: %s', path)
         except OSError as e:
             logger.warning('Failed to save HarnessReport: %s', e)
@@ -12528,7 +12549,7 @@ class Harness:
         if self._offline_lane_task is not None and not self._offline_lane_task.done():
             return
 
-        lock_path = self.config.project_root / 'data' / 'orchestrator' / 'offline_lane.lock'
+        lock_path = orchestrator_data_dir(self.config.project_root) / 'offline_lane.lock'
         worker = OfflineLaneWorker(
             self.git_ops,
             self.config,
@@ -13043,9 +13064,7 @@ class Harness:
             return
         assert HAS_ESCALATION  # narrows type: EscalationQueue and create_server are defined
 
-        queue_dir = Path(self.config.escalation.queue_dir)
-        if not queue_dir.is_absolute():
-            queue_dir = self.config.project_root / queue_dir
+        queue_dir = escalation_queue_dir(self.config.project_root)
         self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-unbound]
         self._escalation_queue.set_notify_callback(self._on_escalation)
         self._escalation_queue.set_resolve_callback(self._on_escalation_resolved)
@@ -13604,7 +13623,16 @@ class Harness:
             delivered_checks_enabled=self.config.delivered_checks.enabled,
         )
 
-    async def _already_landed_dispatch_gate(self, task_id: str) -> bool:
+    async def _read_already_landed_tick_view(self) -> AlreadyLandedTickView:
+        return await read_already_landed_tick_view(self.git_ops)
+
+    async def _already_landed_dispatch_gate(
+        self,
+        task_id: str,
+        *,
+        task: dict | None = None,
+        tick_view: AlreadyLandedTickView | None = None,
+    ) -> bool:
         """Pre-dispatch gate for OUT-OF-BAND already-landed tasks (task 2313).
 
         Architecturally parallel to :meth:`_landed_dispatch_gate` but
@@ -13784,9 +13812,25 @@ class Harness:
         any-level escalation pin, the degenerate-branch check, and each
         arm's ``validate_landing_evidence`` verdict), so a landing that is
         being refused anyway never pays for check work.
+
+        **Per-tick inputs** (task 4900): ``task`` is the scheduler's candidate
+        dict, so the gate re-reads it via ``scheduler.get_task`` only when it
+        is absent. That dict is tick-start state, minutes old for a late
+        candidate in a long tick. That is safe only while nothing rewrites
+        this gate's veto inputs on a PENDING task mid-tick. ``reopen_at``
+        changes only when a done task is reopened, and fused-memory's
+        ``done_evidence_stale`` gate re-reads the stored value at write time
+        anyway. ``branch_base_sha`` is stamped by the task's own workflow,
+        which runs only after dispatch. A new mid-tick writer of either field
+        must make this gate re-read the task before it flips one.
+        ``tick_view`` is the consult's shared branch snapshot; it
+        is consulted only after every veto above, and only to abstain early —
+        the safety argument lives in
+        ``orchestrator/src/orchestrator/already_landed_tick_view.py``.
         """
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
-        task = await self.scheduler.get_task(task_id)
+        if task is None:
+            task = await self.scheduler.get_task(task_id)
         metadata = (task.get('metadata') or {}) if task else {}
 
         # task 2677: a prior tick may have already had this exact
@@ -13963,6 +14007,11 @@ class Harness:
             self._clear_recovery_veto_streak(
                 RecoverySite.already_landed_gate, task_id,
             )
+
+        if tick_view is not None and await branch_absent_and_unmarked(
+            tick_view, self.git_ops, branch,
+        ):
+            return False
 
         branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
         branch_exists = branch_tip_sha is not None
@@ -14783,14 +14832,8 @@ class Harness:
         # injected env var and the banner below cannot disagree.
         df_root = resolve_dark_factory_root()
         # One queue string for both the 'Escalation queue:' line and the re-arm
-        # command below, so the two can never disagree (task 3605).  Joined with
-        # Path.__truediv__ -- NOT f-string concatenation -- to match the
-        # authoritative resolution of the same path in _emit_digest: queue_dir is
-        # an unconstrained str, so an operator who configures it ABSOLUTE would
-        # otherwise get '/project//abs/path' here while the harness itself watches
-        # '/abs/path', and the agent would arm an inotify watcher on a directory
-        # that never receives escalations (a silent per-slice timeout).
-        queue_dir = str(Path(cfg.project_root) / cfg.escalation.queue_dir)
+        # command below, so the two can never disagree (task 3605).
+        queue_dir = str(escalation_queue_dir(cfg.project_root))
         if df_root is None:
             # Omitting the key from env_overrides does NOT unset it in the child:
             # cli_invoke seeds the subprocess env from os.environ and updates it
@@ -14857,6 +14900,7 @@ class Harness:
             f'Project root: {cfg.project_root}\n'
             f'Escalation queue: {queue_dir}\n'
             f'{tooling_root_block}'
+            f'\n{WATCHER_REARM_OUTCOME_GUIDANCE}'
         )
         system_prompt = load_skill_system_prompt('escalation-watcher-auto')
         escalation_url = f'http://{cfg.escalation.host}:{cfg.escalation.port}/mcp'
@@ -18570,9 +18614,7 @@ class Harness:
                 window_start = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
 
             # (6) Gather escalation stats (fail-open via aggregate_escalations).
-            escalations_dir = (
-                Path(self.config.project_root) / self.config.escalation.queue_dir
-            )
+            escalations_dir = escalation_queue_dir(self.config.project_root)
             escalation_stats = digest_mod.aggregate_escalations(
                 escalations_dir, window_start, window_end
             )

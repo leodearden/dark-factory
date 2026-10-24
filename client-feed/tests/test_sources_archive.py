@@ -2,11 +2,26 @@
 
 import gzip
 import json
-from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _archive_files import (
+    SECRET_CMD,
+    SECRET_HINT,
+    SECRET_MESSAGE,
+    SECRET_TEXT,
+    TASK_ID,
+    junit_xml,
+    passed,
+    red,
+    stamp,
+    summary_payload,
+    task_dir,
+    write_junit,
+    write_plan,
+    write_summary,
+)
 
 from client_feed.contract import (
     FEED_VERSION,
@@ -25,101 +40,11 @@ from client_feed.sources.archive import (
     read_archived_run,
 )
 
-TASK_ID = 7
 BASE = datetime(2026, 10, 1, 10, 0, tzinfo=UTC)
-SECRET_CMD = 'uv run pytest /home/someone/private/tests'
-SECRET_HINT = 'AssertionError: secret customer value 0.393'
 
 
 def at(minutes: float) -> datetime:
     return BASE + timedelta(minutes=minutes)
-
-
-def task_dir(root: Path, task_id: int = TASK_ID) -> Path:
-    path = root / 'data' / 'verify-logs' / str(task_id)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def stamp(when: datetime) -> str:
-    return when.strftime('%Y%m%dT%H%M%S_%fZ')
-
-
-def qualified(qualifiers: str) -> str:
-    return f'.{qualifiers}' if qualifiers else ''
-
-
-def write_plan(root: Path, when: datetime, *, attempt: int = 1) -> Path:
-    path = task_dir(root) / f'attempt-{attempt}.plan-{stamp(when)}.json'
-    path.write_text(json.dumps({'legs': [{'label': 'test', 'reason': 'full suite'}]}))
-    return path
-
-
-def summary_payload(category: str, commands: Sequence[tuple[str, int]]) -> dict:
-    """The orchestrator's verify.py::_build_summary_payload shape."""
-    runs = [
-        {
-            'label': label,
-            'cmd': SECRET_CMD,
-            'rc': rc,
-            'timed_out': False,
-            'started_at': '2026-10-01T10:00:00+00:00',
-            'duration_secs': 1.5,
-            'segments': None,
-            'load': None,
-            'slot_wait_secs': None,
-        }
-        for label, rc in commands
-    ]
-    worst = max(runs, key=lambda run: run['rc'])
-    return {
-        'role': 'task',
-        'category': category,
-        'cause_hint': SECRET_HINT,
-        'label': worst['label'],
-        'rc': worst['rc'],
-        'timed_out': False,
-        'cmd': SECRET_CMD,
-        'started_at': '2026-10-01T10:00:00+00:00',
-        'duration_secs': 4.5,
-        'commands': runs,
-    }
-
-
-def write_summary(
-    root: Path,
-    when: datetime,
-    *,
-    qualifiers: str = 'alpha',
-    category: str = 'test_failure',
-    commands: Sequence[tuple[str, int]] = (('test', 1), ('lint', 0), ('type', 0)),
-    attempt: int = 1,
-    infix: str = 'summary',
-) -> Path:
-    name = f'attempt-{attempt}{qualified(qualifiers)}.{infix}-{stamp(when)}.json'
-    path = task_dir(root) / name
-    path.write_text(json.dumps(summary_payload(category, commands)))
-    return path
-
-
-def junit_xml(*testcases: str, suite_time: str | None = '1.5', wrapped: bool = True) -> bytes:
-    time_attribute = '' if suite_time is None else f' time="{suite_time}"'
-    suite = f'<testsuite name="pytest"{time_attribute}>{"".join(testcases)}</testsuite>'
-    document = f'<testsuites name="pytest tests">{suite}</testsuites>' if wrapped else suite
-    return f'<?xml version="1.0" encoding="utf-8"?>{document}'.encode()
-
-
-def passed(name: str, classname: str = 'tests.test_a') -> str:
-    return f'<testcase classname="{classname}" name="{name}" time="0.01" />'
-
-
-def write_junit(
-    root: Path, when: datetime, content: bytes, *, qualifiers: str = 'alpha', attempt: int = 1
-) -> Path:
-    name = f'attempt-{attempt}{qualified(qualifiers)}.junit-{stamp(when)}.xml.gz'
-    path = task_dir(root) / name
-    path.write_bytes(gzip.compress(content))
-    return path
 
 
 def read(
@@ -329,19 +254,6 @@ def test_another_tasks_directory_is_never_read(tmp_path: Path, task_id: int) -> 
     assert run.tests is None
 
 
-SECRET_MESSAGE = 'assert 0.2 > 0.393'
-SECRET_TEXT = 'SECRET-TRACEBACK-TEXT /home/someone/private/test_a.py:12'
-
-
-def red(name: str, tag: str, type_attribute: str | None = None) -> str:
-    type_part = '' if type_attribute is None else f' type="{type_attribute}"'
-    return (
-        f'<testcase classname="tests.test_a" name="{name}" time="0.5">'
-        f'<{tag} message="{SECRET_MESSAGE}"{type_part}>{SECRET_TEXT}</{tag}>'
-        '</testcase>'
-    )
-
-
 def skipped(name: str, skip_type: str) -> str:
     return (
         f'<testcase classname="tests.test_a" name="{name}" time="0.0">'
@@ -430,6 +342,27 @@ def test_case_ids_and_durations(
     case = archived_tests(tmp_path, junit_xml(f'<testcase {attributes} />')).cases[0]
 
     assert (case.id, case.duration_ms) == (case_id, duration_ms)
+
+
+def test_b22_a_case_id_holding_a_path_reaches_the_feed_redacted(tmp_path: Path) -> None:
+    tests = archived_tests(
+        tmp_path,
+        junit_xml(
+            passed(
+                'test_eval_worktree_root_is_recognised[/home/leo/src/dark-factory]',
+                'tests.test_eval_lane_containment',
+            ),
+            red('test_root[/home/someone/private/x.py]', 'failure'),
+        ),
+    )
+    failed_id = 'tests.test_a::test_root[[path]]'
+
+    assert set(by_id(tests)) == {
+        'tests.test_eval_lane_containment::test_eval_worktree_root_is_recognised[[path]]',
+        failed_id,
+    }
+    assert by_id(tests)[failed_id].outcome is CaseOutcome.FAILED
+    assert '/home/' not in repr(tests)
 
 
 def test_the_run_duration_sums_its_suites(tmp_path: Path) -> None:

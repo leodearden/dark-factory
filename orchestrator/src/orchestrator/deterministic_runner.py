@@ -357,24 +357,22 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
 import re
-import signal
 from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, assert_never
 
 from shared.before_done_paths import (
     BeforeDonePaths,
     resolve_before_done_paths,
     resolve_script_base,
 )
-from shared.proc_group import unsafe_pgid_reason
+from shared.proc_group import SigkillDispatch, sigkill_process_group
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_metadata import (
     HUMAN_CURATOR_ADJUDICATED_AT_KEY,
@@ -414,8 +412,8 @@ logger = logging.getLogger(__name__)
 #
 # The cross-unit blocking deploy may restart the very service backing the
 # orchestrator's own fused-memory/MCP connection (e.g. task 2059), severing
-# it for the duration of a `--drain` restart.  `McpSession._raw_call`
-# (mcp_lifecycle.py) opens a fresh httpx.AsyncClient and re-inits the session
+# it for the duration of a `--drain` restart.  `shared.mcp_session.McpSession.call`
+# opens a fresh httpx.AsyncClient and re-inits the session
 # on any transient failure, so the NEXT call auto-reconnects — a successful
 # write IS the reconnection proof.  The post-deploy verify+writeback retry
 # budget (``DeterministicRunner._writeback_backoffs``) sizes off the shared
@@ -476,8 +474,8 @@ class ProcessTeardown(Enum):
     )
     #: ``proc`` was already reaped, so the pid-recycling guard dispatched
     #: NOTHING and the whole tree below it SURVIVES.  See
-    #: ``_terminate_process_tree``'s docstring for why refusing to signal
-    #: beats reaping an orphan.
+    #: ``shared/src/shared/proc_group.py::sigkill_process_group`` for why
+    #: refusing to signal beats reaping an orphan.
     NOT_SIGNALLED = (
         'nothing was signalled at all — the script had already been reaped, so '
         'signalling its possibly-recycled pid was refused, and nothing the '
@@ -495,6 +493,19 @@ class ProcessTeardown(Enum):
         same fact.
         """
         return self.value
+
+    @classmethod
+    def from_dispatch(cls, dispatch: SigkillDispatch) -> ProcessTeardown:
+        """The disposition for what ``sigkill_process_group`` reports dispatching."""
+        match dispatch:
+            case SigkillDispatch.GROUP_KILLED:
+                return cls.GROUP_KILLED
+            case SigkillDispatch.DIRECT_KILLED:
+                return cls.DIRECT_KILLED
+            case SigkillDispatch.NOT_SIGNALLED:
+                return cls.NOT_SIGNALLED
+            case _:
+                assert_never(dispatch)
 
 
 class ScriptTimeout(Exception):
@@ -948,9 +959,9 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     absent), whereas ``exclude_none`` now omits the key entirely in that
     case.  All known consumers (``task_interceptor.py`` and this module's
     tests) read it via ``.get('pid')``, so a missing key and an explicit
-    ``None`` are observationally identical there; extra fields such as
-    ``transient_unit`` / ``fire_delay_secs`` survive via ``DoneProvenance``'s
-    ``extra='allow'``.
+    ``None`` are observationally identical there. ``transient_unit`` and
+    ``fire_delay_secs`` are declared, typed fields of ``DoneProvenance``, so
+    a wrongly-typed value raises here too.
 
     ``kind``/``**fields`` are intentionally loosely typed (``str``/``object``):
     the six call sites forward heterogeneous field subsets, so pyright's
@@ -1741,7 +1752,8 @@ class DeterministicRunner:
         # Capture the pgid NOW, while proc is guaranteed alive and unreaped: with
         # start_new_session=True, pgid == proc.pid by POSIX guarantee.  Reading it
         # later via os.getpgid could hit a recycled pid and signal a stranger's
-        # group (task 845) — see `_terminate_process_tree`'s docstring.
+        # group (task 845) — see shared/src/shared/proc_group.py's module
+        # docstring, "Why the caller captures pgid".
         pgid = proc.pid
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
@@ -1796,29 +1808,16 @@ class DeterministicRunner:
     async def _terminate_process_tree(
         self, proc: asyncio.subprocess.Process, pgid: int,
     ) -> ProcessTeardown:
-        """Kill *proc*'s entire process group and bound the reap (task 2090).
+        """SIGKILL *proc*'s whole process group, then bound the reap (task 2090).
 
-        ``proc`` must have been spawned with ``start_new_session=True`` so its
-        process group is its own — NOT the orchestrator's — otherwise
-        ``os.killpg`` would SIGKILL the orchestrator itself.
-
-        Tries a whole-group SIGKILL first, which reaches any grandchildren
-        (e.g. a backgrounded ``systemctl``/``curl``/``sleep``) that would
-        otherwise survive the direct child's death as leaked orphans —
-        continuing to run (and keep the inherited stdout pipe's write end
-        open) indefinitely.  Note this is NOT needed to unblock ``proc.wait()``
-        below: asyncio's ``Process.wait()`` resolves on the child's own exit
-        notification (via the event loop's child watcher), not on pipe EOF —
-        only ``communicate()`` waits on that.  The process-group kill's value
-        is purely in not leaking the grandchildren themselves.  If the process
-        has already exited (or the group lookup otherwise fails), falls back
-        to a direct ``proc.kill()``.  Both kill attempts tolerate an
-        already-dead process — this helper must NEVER raise, so a timeout
-        branch can always return cleanly even if the process is already gone.
-
-        The reap itself is bounded by ``self._reap_grace_secs`` so a process
-        stuck in an uninterruptible state cannot hang this helper (and
-        therefore ``_default_run_script``) forever.
+        The signal choice is
+        ``shared/src/shared/proc_group.py::sigkill_process_group``'s: the whole
+        group, a direct ``proc.kill()`` when the group kill is refused or
+        fails, or nothing once the leader is reaped.  This helper renders that
+        choice as a ``ProcessTeardown`` and bounds the reap by
+        ``self._reap_grace_secs``, so a process stuck in an uninterruptible
+        state cannot hang it (and therefore ``_default_run_script``) forever.
+        It never raises, so a timeout branch can always return cleanly.
 
         Returns:
             Which signal was DISPATCHED (``ProcessTeardown``) — the caller
@@ -1830,78 +1829,16 @@ class DeterministicRunner:
             spawned were deliberately left alone.
 
         Args:
-            proc: the timed-out child, spawned with ``start_new_session=True``.
+            proc: the timed-out child, spawned with ``start_new_session=True``
+                so its process group is its own, not the orchestrator's.
             pgid: the process group id, which MUST be the value captured
                 immediately after that spawn (where ``pgid == proc.pid`` by
-                POSIX guarantee).  It is never refreshed here via
-                ``os.getpgid``: once ``proc`` has been reaped the kernel may
-                recycle its pid, and ``os.getpgid`` would then return an
-                unrelated group's id — in the task-845 incidents that resolved
-                to the user ``systemd --user`` manager's group and killed the
-                whole login session.  ``shared/src/shared/proc_group.py``'s
-                module docstring is the canonical statement of this contract.
-
-        A frozen capture alone is necessary but not sufficient, because the
-        captured NUMBER also goes stale the moment the leader is reaped.  The
-        ``proc.returncode is not None`` short-circuit below is what closes that
-        residual window: it dispatches no signal at all rather than risk
-        signalling a stranger.  Accepted trade-off, matching the shared
-        helper's: if the leader is already reaped we forgo killing surviving
-        grandchildren — refusing to kill a stranger beats reaping an orphan.
-
-        The third layer is ``shared.proc_group.unsafe_pgid_reason``, applied
-        below: even a frozen, unreaped pgid is refused if it resolves to init,
-        this process, our parent, our own group, or anything other than
-        ``proc.pid``.  This helper deliberately REUSES that predicate rather
-        than growing a third copy of it — the repo's other two group-killers
-        (``shared.proc_group.terminate_process_group`` and
-        ``df_pytest_isolation._kill_process_group``) both apply it, and a
-        divergent hand-rolled copy here would be the weakest of the three.  A
-        refusal degrades to the direct ``proc.kill()``, exactly as
-        ``df_pytest_isolation``'s does.
-
-        Why this does NOT simply delegate to ``terminate_process_group``, which
-        it otherwise resembles: that helper escalates SIGTERM → wait →
-        SIGKILL, while this path SIGKILLs immediately and bounds the reap once.
-        The immediate SIGKILL is deliberate for a deploy script that has
-        already blown its timeout budget, and delegation would also double the
-        worst-case wait (``2 * grace_secs``) and drop both the ``proc.kill()``
-        fallback and the reap-abandoned warning below.  Delegating is a
-        behaviour change, not a refactor; the shared *predicate* is the part
-        that is genuinely common, so that is what is shared.
+                POSIX guarantee), never refreshed via ``os.getpgid``.
+                ``shared/src/shared/proc_group.py``'s module docstring ("Why
+                the caller captures pgid") is the canonical statement of this
+                contract.
         """
-        if proc.returncode is not None:
-            logger.debug(
-                'DeterministicRunner: proc %s already reaped — skipping killpg '
-                '(its pid may already be recycled onto another group)',
-                proc.pid,
-            )
-            teardown = ProcessTeardown.NOT_SIGNALLED
-        elif (reason := unsafe_pgid_reason(pgid, proc.pid)) is not None:
-            # Residual defence, degrading to the direct child exactly as
-            # df_pytest_isolation._kill_process_group does on the same refusal.
-            logger.error(
-                'DeterministicRunner: refusing to killpg — %s. Falling back to '
-                'a direct kill() of pid %s; any grandchildren will be left to '
-                'the caller. This indicates a bug in the pgid capture.',
-                reason, proc.pid,
-            )
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.kill()
-            teardown = ProcessTeardown.DIRECT_KILLED
-        else:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-                teardown = ProcessTeardown.GROUP_KILLED
-            except (ProcessLookupError, PermissionError, OSError) as exc:
-                logger.debug(
-                    'DeterministicRunner: killpg(%s) failed (%s: %s) — falling back '
-                    'to direct kill()',
-                    pgid, type(exc).__name__, exc,
-                )
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    proc.kill()
-                teardown = ProcessTeardown.DIRECT_KILLED
+        teardown = ProcessTeardown.from_dispatch(sigkill_process_group(proc, pgid))
 
         try:
             await asyncio.wait_for(proc.wait(), timeout=self._reap_grace_secs)
@@ -2498,7 +2435,7 @@ class DeterministicRunner:
         Task 2066: the cross-unit deploy script may restart the very service
         backing the orchestrator's own fused-memory/MCP connection (e.g. task
         2059), severing it for the duration of a ``--drain`` restart.  Because
-        ``McpSession._raw_call`` auto-reconnects on the next call after any
+        ``shared.mcp_session.McpSession.call`` auto-reconnects on the next call after any
         transient failure, a plain patient retry — not an explicit reconnect —
         is sufficient: a successful write IS the reconnection proof.
 

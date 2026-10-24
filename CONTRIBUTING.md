@@ -381,6 +381,22 @@ operator has seeded `scripts/inline_suppression_baseline.json` (step κ1 of
 skips and its skip reason says so, so a green suite does not yet mean your
 suppressions were checked.
 
+The merge-lane quality ratchet, `orchestrator/tests/test_merge_lane_ratchet.py`,
+also runs with the suite. Lowering a merge-lane measure is the point; it
+regenerates `orchestrator/tests/merge_lane_ratchet_baseline.json` in the same
+commit (`python scripts/merge_lane_metrics.py --write-baseline <that path>`).
+A raise is never silent: add `--authorize-raise <task-id> --reason "<why>"`,
+which records it as ONE NEW FILE under
+`orchestrator/tests/merge_lane_ratchet_raises/`. The pre-commit auditor
+`scripts/check_staged_ratchet_raise.py` refuses a commit whose raises its own new
+entry files do not cover, and one that modifies, deletes or renames a recorded
+entry. A new entry's task id must be one the branch works on -- the id in its
+name (`task/<id>`, `carry/<id>`, or a name ending `-<id>`) or one an earlier commit
+on the branch cites (`fix(<id>): ...` or `task <id>`) -- and its reason may not
+be blank; the commit being made cannot cite itself. The baseline itself merges through a structured 3-way driver (installed
+by `scripts/setup-host.sh` step 9), so two branches moving different code no
+longer conflict on it.
+
 Do this **before** `merge_request`/`/merge-queue`, not after — a red
 post-merge verify blocks or reverts the merge, which is more expensive than
 catching it locally.
