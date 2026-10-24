@@ -502,6 +502,10 @@ def preservation_mem0_filters(task_id: str) -> dict[str, Any]:
     it, and Stage 1's ``## Preserved-Specimen Corroboration`` directive renders
     it as the call the agent should run.  A fresh dict on every call.
 
+    Channel 1's recall rests on writers stamping ``metadata.task_id``; the
+    schema they are taught is
+    ``reconciliation/recon_self_model.py::render_investigation_outcome_section``.
+
     Pure, sync, no I/O.
     """
     return {'kind': MEM0_KIND_INVESTIGATION_OUTCOME, 'task_id': task_id, 'actionable': False}

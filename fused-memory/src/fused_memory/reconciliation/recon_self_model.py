@@ -543,6 +543,8 @@ def render_investigation_outcome_section() -> str:
         'evidence. Schema (observations_and_summaries category):\n'
         f'  - `metadata.kind = "{MEM0_KIND_INVESTIGATION_OUTCOME}"`\n'
         "  - `metadata.entity_uuid = <the investigated entity's uuid>`\n"
+        "  - `metadata.task_id = <the investigated task's id, when the investigated "
+        'entity is a task>`\n'
         '  - `metadata.actionable = false`\n'
         '  - `metadata.run_id = <current run_id>`\n\n'
         'Write one such record on every not-actionable investigation conclusion going '
