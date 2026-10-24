@@ -18883,6 +18883,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         git_ops: GitOps,
         req: MergeRequest,
         merge_wt: Path,
+        *,
+        history_leg_command: str | None = None,
         **gate_kwargs: Any,
     ) -> MergeOutcome | None:
         """Run a head's gate re-verify on the host the head ALREADY holds.
@@ -18891,11 +18893,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         (whose lease adoption already released) and a lease-less passthrough
         run it locally.  No slot is ever acquired for it: re-acquiring would
         wait on a slot held by the next in-order entry, which finalizes only
-        after this head.
+        after this head.  The history leg's runner is local-only, so a
+        declared *history_leg_command* runs on local whatever the head holds.
         """
-        runner = None if lease is None or lease.is_local else lease.runner
+        remote = (
+            lease.runner
+            if lease is not None and not lease.is_local and history_leg_command is None
+            else None
+        )
         return await self._lane_post_merge_verify(
-            git_ops, req, merge_wt, runner=runner, **gate_kwargs,
+            git_ops, req, merge_wt,
+            runner=remote, history_leg_command=history_leg_command, **gate_kwargs,
         )
 
     async def _run_inflight_verify(
