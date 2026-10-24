@@ -12,12 +12,23 @@ import pytest
 
 from fused_memory.reconciliation.live_workflow_section import (
     CLAIMANT_FIELD,
+    LIVE_WORKFLOW_SECTION_HEADER,
     PROJECT_LOCK_HELD,
+    LiveSignal,
+    LiveWorkflowRow,
+    LiveWorkflowSnapshot,
+    clipped_section_header,
     render_live_workflow_authority_rules,
 )
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+from fused_memory.reconciliation.task_filter import (
+    ACTIVE_TASK_TREE_HEADER,
+    FilteredTaskTree,
+    format_filtered_task_tree,
+)
+from fused_memory.services.landed_on_main import LandingVerdict
 from fused_memory.services.live_workflow_detector import ClaimantLabel
 
 
@@ -45,3 +56,47 @@ class TestTieBreakerRule:
 
     def test_quotes_the_project_line_the_section_renders(self) -> None:
         assert PROJECT_LOCK_HELD in render_live_workflow_authority_rules()
+
+
+def _snapshot(*, probed: int, total_active: int) -> LiveWorkflowSnapshot:
+    row = LiveWorkflowRow(
+        task_id='1',
+        branch='task/1',
+        is_live=True,
+        signals=(LiveSignal.WORKTREE,),
+        claimant=ClaimantLabel.NONE,
+        landing=LandingVerdict.unknown(),
+    )
+    return LiveWorkflowSnapshot(
+        rows=(row,), project_orchestrator_live=False, probed=probed, total_active=total_active,
+    )
+
+
+class TestProbedScopeRule:
+    def test_a_clipped_render_opens_with_the_clipped_header(self) -> None:
+        clipped_first_line = _snapshot(probed=2, total_active=5).render().splitlines()[0]
+        whole_first_line = _snapshot(probed=5, total_active=5).render().splitlines()[0]
+
+        assert clipped_first_line == clipped_section_header(2, 5)
+        assert clipped_first_line.startswith(LIVE_WORKFLOW_SECTION_HEADER)
+        assert whole_first_line == LIVE_WORKFLOW_SECTION_HEADER
+
+    def test_quotes_the_clipped_header_the_section_renders(self) -> None:
+        assert clipped_section_header('N', 'M') in render_live_workflow_authority_rules()
+
+    def test_names_the_tree_that_bounds_the_probe(self) -> None:
+        assert f'`{ACTIVE_TASK_TREE_HEADER}`' in render_live_workflow_authority_rules()
+
+    def test_the_named_tree_is_the_header_the_tree_renders(self) -> None:
+        tree = FilteredTaskTree(
+            active_tasks=[{'id': 1, 'title': 't', 'status': 'pending'}],
+            done_tasks=[],
+            cancelled_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=1,
+            max_task_id=1,
+        )
+
+        assert format_filtered_task_tree(tree).startswith(ACTIVE_TASK_TREE_HEADER + '\n')
