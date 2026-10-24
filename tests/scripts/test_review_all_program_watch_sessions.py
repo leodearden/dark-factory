@@ -20,7 +20,12 @@ from typing import Any
 
 import pytest
 from review_all_program_cli import FIXTURE_RETURNS, RUN_ID, ProgramEnv, load_program_module
-from review_all_program_fixture import FIXTURE_DIR, FakeStore, running_fake_store
+from review_all_program_fixture import (
+    FIXTURE_DIR,
+    FakeStore,
+    load_session_registry,
+    running_fake_store,
+)
 
 SCRIPT = 'watch_sessions.py'
 SPAWNED_AFTER = '2026-10-19T09:00:00Z'
@@ -520,3 +525,124 @@ def test_a_final_return_the_lead_already_applied_is_not_applied_again(b10: Progr
         for line in lines_about(proc, S3_TITLE)
     )
     assert _ledger(b10) == ledger
+
+
+REGISTRY = load_session_registry()
+EXIT_REQUESTED_AT = '2026-10-19T10:30:00Z'
+LIVE_STANDING_LABELS = {
+    (True, 'exited'): 'final',
+    (False, 'exited'): 'ended at checkpoint — relaunch or resume',
+    (True, 'idle'): 'finished, not exited',
+    (False, 'idle'): 'checkpoint',
+}
+"""The label for a hand-back by (its outcome is terminal, its record's status)."""
+
+
+@pytest.fixture
+def s2(env: ProgramEnv) -> ProgramEnv:
+    """The S2 author session spawned, with its fixture return in the inbox and no record yet."""
+    spawned(env, S2_TITLE, 'S2', 'author')
+    env.put_inbox('S2.author.json')
+    return env
+
+
+def put_written_record(env: ProgramEnv, result: str, **record_fields: Any) -> Path:
+    """The fixture finished-idle record dir, its record.json fields and its result.md written by the test."""
+    record_dir = put_record(env, 'finished-idle')
+    record_json = record_dir / 'record.json'
+    record = json.loads(record_json.read_text(encoding='utf-8'))
+    record_json.write_text(json.dumps({**record, **record_fields}), encoding='utf-8')
+    (record_dir / 'result.md').write_text(result, encoding='utf-8')
+    return record_dir
+
+
+def result_md(outcome: str) -> str:
+    return f'---\noutcome: {outcome}\nchanged: none\naction_needed: none\n---\nWritten by the test.\n'
+
+
+def _applied(env: ProgramEnv) -> bool:
+    return (env.home / 'returns' / 'S2.author.json').exists()
+
+
+def _reaped_pid() -> int:
+    child = subprocess.Popen(['true'])
+    child.wait()
+    return child.pid
+
+
+@pytest.mark.parametrize('status', ['exited', 'idle'])
+@pytest.mark.parametrize('outcome', REGISTRY.RESULT_OUTCOMES)
+def test_a_hand_back_is_final_iff_its_outcome_is_terminal_and_its_record_exited(
+    s2: ProgramEnv, outcome: Any, status: str,
+) -> None:
+    terminal = outcome in REGISTRY.TERMINAL_RESULT_OUTCOMES
+    put_written_record(s2, result_md(str(outcome)), status=status)
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    label = LIVE_STANDING_LABELS[(terminal, status)]
+    assert standing_line(proc, S2_TITLE).startswith(f'{S2_TITLE}: {label}')
+    assert _applied(s2) is (terminal and status == 'exited')
+
+
+def _sibling_record(env: ProgramEnv, *, exit_requested_at: str | None, owner_pid: int) -> None:
+    put_written_record(
+        env, result_md('done'), status='idle', spawn_mode='sibling',
+        exit_requested_at=exit_requested_at, claude_owner_pid=owner_pid,
+    )
+
+
+def test_a_sibling_whose_self_exit_owner_is_dead_is_final(s2: ProgramEnv) -> None:
+    _sibling_record(s2, exit_requested_at=EXIT_REQUESTED_AT, owner_pid=_reaped_pid())
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    assert standing_line(proc, S2_TITLE).startswith(f'{S2_TITLE}: final')
+    assert _applied(s2)
+
+
+def test_a_sibling_whose_self_exit_owner_is_alive_is_finished_not_exited(s2: ProgramEnv) -> None:
+    _sibling_record(s2, exit_requested_at=EXIT_REQUESTED_AT, owner_pid=os.getpid())
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    assert standing_line(proc, S2_TITLE).startswith(f'{S2_TITLE}: finished, not exited')
+    assert not _applied(s2)
+
+
+def test_a_dead_owner_without_a_self_exit_attempt_is_not_final(s2: ProgramEnv) -> None:
+    _sibling_record(s2, exit_requested_at=None, owner_pid=_reaped_pid())
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    assert standing_line(proc, S2_TITLE).startswith(f'{S2_TITLE}: finished, not exited')
+    assert not _applied(s2)
+
+
+def test_the_outcome_is_read_by_the_registrys_parser(s2: ProgramEnv) -> None:
+    padded = '\n\n---\noutcome:   handed-off  \nchanged: none\n---\nHanded to the lead.\n'
+    put_written_record(s2, padded, status='exited', exit_code=0)
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    assert standing_line(proc, S2_TITLE).startswith(f'{S2_TITLE}: final')
+    assert _applied(s2)
+
+
+def test_a_hand_back_without_a_contract_outcome_is_a_checkpoint_and_still_archived(
+    s2: ProgramEnv,
+) -> None:
+    put_written_record(s2, result_md('finished'), status='exited', exit_code=0)
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    assert standing_line(proc, S2_TITLE).startswith(
+        f'{S2_TITLE}: ended at checkpoint — relaunch or resume, '
+        'archived handbacks/S2.author.checkpoint-1.md')
+    assert not _applied(s2)
