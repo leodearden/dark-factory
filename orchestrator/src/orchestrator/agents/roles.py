@@ -480,6 +480,8 @@ alone, and escalate. Full rule and cross-links: `docs/task-authoring.md`,
 section "In-place memory amendments are not task-agent work".
 """
 
+# fused-memory/tests/test_referent_declaration_examples.py executes the `entities=`
+# example below against the live gate.
 _MEMORY_INSTRUCTIONS = """
 ## Memory
 
@@ -503,6 +505,8 @@ Parameters:
 - `category`: One of `observations_and_summaries`, `procedural_knowledge`, or `preferences_and_norms`
 - `project_id`: Use the project_id from your Agent Identity section
 - `agent_id`: Use the agent_id from your Agent Identity section
+- `entities`: The tasks the memory is about, or `[]` if you considered it and none apply. Name each declared task as `task NNN` in the content too, for example:
+  `add_memory(content="Task 3127's retry loop swallows the timeout", category="procedural_knowledge", project_id=..., agent_id=..., entities=[{'kind': 'task', 'id': 3127}])`
 
 Write immediately when you discover something — don't batch until the end.
 """ + MEMORY_AMEND_ROUTING_RULE + """
@@ -2600,7 +2604,8 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
     caller_indent='   ',
 ) + """
 2. For notable conventions among accepted items: write via `add_memory`
-   with category `preferences_and_norms`.
+   with category `preferences_and_norms` and `entities` set to `[]`, since a
+   convention is about a pattern; declare a task only if it concerns that one task.
 3. Call `resolve_issue` summarizing: N candidates submitted, K skipped (submit errors),
    M conventions written. Curator outcomes (created / combined / dropped) land in
    `tasks.json` asynchronously; any failed tickets will re-surface via the janitor as
@@ -2624,7 +2629,8 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
     caller_indent='  ',
 ) + """
 - **convention** — Pattern-level insight for future agents. Write via `add_memory`
-  with category `preferences_and_norms`.
+  with category `preferences_and_norms` and `entities` set to `[]`, unless it
+  concerns one specific task.
 - **dismiss** — Not actionable, already covered, or noise.
 
 **Deduplication:** Before creating any task, call `get_tasks` to check for existing

@@ -451,8 +451,8 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #       skills/prd/references/gates.md live; its enumeration and citation
 #       scans walk the repo with no skills/ prune (task 4941).
 #   fused-memory/tests/test_referent_declaration_examples.py — reads
-#       skills/reflect/SKILL.md to execute its `entities=` examples against
-#       the live entities_gate (task 3675).
+#       skills/reflect/SKILL.md and skills/orchestrate/SKILL.md to execute
+#       their `entities=` examples against the live entities_gate (tasks 3675, 5555).
 #   tests/scripts/test_merge_marker_search_snippets.py — EXECUTES every
 #       merge-marker search in skills/**/*.md against a shadowed fixture history (task 5774).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
