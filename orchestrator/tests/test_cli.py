@@ -1,6 +1,7 @@
 """Tests for CLI helpers."""
 
 import asyncio
+import contextlib
 import fcntl
 import io
 import logging
@@ -9,7 +10,7 @@ import subprocess
 import threading
 import time
 import traceback as traceback_module
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -1183,6 +1184,18 @@ def _flock_is_held(lock_path: Path) -> bool:
     except BlockingIOError:
         return True
     finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _holding_flock(lock_path: Path) -> Iterator[None]:
+    """Hold an exclusive flock on lock_path through an fd independent of the CLI's."""
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
