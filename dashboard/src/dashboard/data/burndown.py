@@ -59,6 +59,9 @@ logger = logging.getLogger(__name__)
 # acquire_snapshot never spends it.
 _SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIMEOUT
 
+# Wall-clock-aligned sampling tick for the burndown (and metrics) collectors.
+SAMPLE_INTERVAL_SECONDS = 600
+
 # Whole-operation backstop for ONE root's snapshot acquisition, enforced by
 # collect_snapshot's Phase-2 gather. Expiry is a GAP row naming this budget,
 # never a skipped root.
@@ -69,7 +72,7 @@ _SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIM
 #
 # FLOOR: _SNAPSHOT_UNIT_WORST_CASE_SECONDS, so the backstop never pre-empts a
 # unit still inside its own bounds and turns a bounded read into a gap row.
-# CEILING: half of loops._SAMPLE_INTERVAL_SECONDS, so one collector cycle is
+# CEILING: half of SAMPLE_INTERVAL_SECONDS, so one collector cycle is
 # finished before the next begins.
 #
 # 60.0 is ~3x the floor. Both bounds pinned by TestCollectSnapshotPerRootBudget
@@ -77,9 +80,8 @@ _SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIM
 _SNAPSHOT_PER_ROOT_BUDGET = 60.0
 
 # The age past which a burndown sample is no longer fresh: two sample
-# intervals of dashboard/loops.py::_SAMPLE_INTERVAL_SECONDS (not imported —
-# loops imports this module). Pinned through the wire by test_redux_api.py.
-SAMPLE_FRESHNESS_BOUND_SECONDS = 1200
+# intervals. Pinned through the wire by test_redux_api.py.
+SAMPLE_FRESHNESS_BOUND_SECONDS = 2 * SAMPLE_INTERVAL_SECONDS
 
 BURNDOWN_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS snapshots (

@@ -3908,7 +3908,8 @@ def create_server(
         said whether ``metadata.merge_lane`` had been honoured, which is half
         of why the key could sit inert unnoticed.  ``lane_source`` rides with
         it because ``'normal'`` alone cannot distinguish "the task asked for
-        normal" from "nothing asked at all".  The rest of the audit trail is
+        normal" from "nothing asked at all" from "the task-store read failed"
+        (``'unavailable'``, task 5564).  The rest of the audit trail is
         elsewhere, and deliberately so: ``get_merge_queue`` already carries
         ``lane`` per queue item (from the worker snapshot,
         ``orchestrator/src/orchestrator/merge_queue.py::
@@ -3936,7 +3937,10 @@ def create_server(
           lane_applied}``.  Branch was
           freshly dispatched (or wait_secs timeout expired).  ``lane`` is the
           resolved merge lane and ``lane_source`` names which input won it —
-          ``'argument'``, ``'task_metadata'`` or ``'default'`` (task 4888).
+          ``'argument'``, ``'task_metadata'``, ``'default'`` (the task was
+          read and asked for nothing) or ``'unavailable'`` (the task-store
+          read failed, so the lane fell open to ``'normal'`` without finding
+          out what the task asked for; tasks 4888, 5564).
           ``lane_applied`` is True here: the lane rode the enqueued request.
           ``position`` is ``int | None``;
           ``None`` means the live merge-worker snapshot was unavailable, so
@@ -4180,13 +4184,11 @@ def create_server(
             # merely slow into a silent lane downgrade at a threshold no
             # measurement here justifies, and report it as
             # `lane_source='default'`, i.e. "nothing asked at all" when the
-            # truth is "we could not find out".  That conflation is present
-            # today on the 15s failure too and is recorded as a known gap
-            # (esc-4888 amendment pass): `task_metadata` returns
-            # `TaskMetadataResult.unavailable`, so the honest source is
-            # available to a later change that widens the `lane_source`
-            # vocabulary; this pass does not, because that vocabulary is
-            # pinned as closed across four surfaces.
+            # truth is "we could not find out".  Since task 5564 a failed
+            # read is reported as `lane_source='unavailable'` instead, so a
+            # degraded store is distinguishable from a healthy no-op
+            # submission — but a shorter timeout would still make that
+            # downgrade routine, which is why it stays declined.
             #
             # Fail-soft with its OWN try/except (merge_request's fast-path has
             # no enclosing fire-safe wrapper): a probe fault must never break
@@ -4304,11 +4306,17 @@ def create_server(
         # lane — an explicit argument makes the metadata irrelevant by the
         # precedence rule, so it never triggers a read.  task_metadata returns
         # {} on every failure mode and never raises, so this can degrade a lane
-        # to 'normal' but can never fail a submission.
+        # to 'normal' but can never fail a submission; its `unavailable` flag
+        # rides along so the degradation is reported as
+        # lane_source='unavailable' rather than passing for 'default'.
+        lane_metadata = (
+            None if validated_lane is not None else await _task_metadata_once()
+        )
         lane_choice = resolve_merge_lane(
             requested=validated_lane,
-            task_metadata=(
-                None if validated_lane is not None else (await _task_metadata_once()).metadata
+            task_metadata=None if lane_metadata is None else lane_metadata.metadata,
+            metadata_unavailable=(
+                lane_metadata is not None and lane_metadata.unavailable
             ),
         )
 
