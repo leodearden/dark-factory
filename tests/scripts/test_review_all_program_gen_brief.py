@@ -506,7 +506,7 @@ def test_a_spawned_author_brief_records_the_session_and_prints_one_pointer_promp
     recorded = sessions_json(run)
     assert recorded == {S1_TITLE: {
         'stream': 'S1', 'pass': 'author', 'item': None,
-        'spawned_after': recorded[S1_TITLE]['spawned_after'], 'record_dir': None,
+        'spawned_after': recorded[S1_TITLE]['spawned_after'], 'record_dir': None, 'reported': None,
     }}
     assert started <= recorded[S1_TITLE]['spawned_after'] <= ended
     command = shlex.split(proc.stdout.splitlines()[-1])
@@ -579,7 +579,7 @@ def test_a_title_taken_while_the_brief_is_built_is_refused_and_no_brief_is_writt
     program_json = run.home / 'program.json'
     taken = {S1_TITLE: {
         'stream': 'S3', 'pass': 'author', 'item': None, 'spawned_after': '2026-10-23T00:00:00Z',
-        'record_dir': None,
+        'record_dir': None, 'reported': None,
     }}
 
     spawning = run.env.start(SCRIPT, '--run', RUN_ID, 'S1', 'author', '--spawn', S1_TITLE)
