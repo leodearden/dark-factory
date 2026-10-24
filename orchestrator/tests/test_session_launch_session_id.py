@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
 from _process_tree_fakes import claude_process_tree
 
 from orchestrator import session_hooks as sh
