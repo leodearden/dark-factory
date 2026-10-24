@@ -603,27 +603,41 @@ def curator_enabled_config():
 
 
 @pytest_asyncio.fixture
-async def curator_interceptor(
+async def make_curator_interceptor(
     taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path
 ):
+    """Build curator-enabled interceptors around the given curator, sharing one ticket store."""
     from fused_memory.middleware.ticket_store import TicketStore
 
     store = TicketStore(tmp_path / 'curator_tickets.db')
     await store.initialize()
-    ti = TaskInterceptor(
-        taskmaster,
-        reconciler,
-        event_buffer,
-        config=curator_enabled_config,
-        ticket_store=store,
-    )
-    yield ti
+    built: list[TaskInterceptor] = []
+
+    def make(curator=None) -> TaskInterceptor:
+        interceptor = TaskInterceptor(
+            taskmaster,
+            reconciler,
+            event_buffer,
+            config=curator_enabled_config,
+            ticket_store=store,
+            curator=curator,
+        )
+        built.append(interceptor)
+        return interceptor
+
+    yield make
     await store.close()
-    for _wt in list(ti._worker_tasks.values()):
-        if not _wt.done():
-            _wt.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await _wt
+    for interceptor in built:
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
+
+
+@pytest.fixture
+def curator_interceptor(make_curator_interceptor):
+    return make_curator_interceptor()
 
 
 def _mock_curator(decision: CuratorDecision) -> MagicMock:
@@ -15358,7 +15372,7 @@ async def test_refused_ticket_creates_no_task_end_to_end(
 
 @pytest.mark.asyncio
 async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
-    curator_interceptor, taskmaster,
+    make_curator_interceptor, taskmaster,
 ):
     """A refusal must never CASCADE. A sibling whose batch_target_index points
     at a refused candidate sees task_id=None and must fail OPEN to create —
@@ -15374,15 +15388,15 @@ async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
             justification='dup of batch 0',
         ),
     ])
-    curator_interceptor._curator = mock_curator
+    interceptor = make_curator_interceptor(mock_curator)
     taskmaster.add_task = AsyncMock(return_value={'id': '77', 'title': 'Unrelated sibling'})
 
-    ticket_ids = await submit_as_one_batch(curator_interceptor, mock_curator, [
+    ticket_ids = await submit_as_one_batch(interceptor, mock_curator, [
         {'title': 'Convert FIX C relay-flag deletion', 'description': 'x'},
         {'title': 'Unrelated sibling that names t1 as its target', 'description': 'x'},
     ])
     refused, sibling = [
-        await curator_interceptor.resolve_ticket(t, '/project', timeout_seconds=10.0)
+        await interceptor.resolve_ticket(t, '/project', timeout_seconds=10.0)
         for t in ticket_ids
     ]
 
@@ -15439,7 +15453,7 @@ def _real_blocklist_curator(tmp_path):
 
 @pytest.mark.asyncio
 async def test_identical_blocklisted_duplicates_in_one_batch_create_nothing(
-    curator_interceptor, taskmaster, tmp_path,
+    make_curator_interceptor, taskmaster, tmp_path,
 ):
     """Two BYTE-IDENTICAL blocklisted candidates in one batch must BOTH refuse.
 
@@ -15451,7 +15465,7 @@ async def test_identical_blocklisted_duplicates_in_one_batch_create_nothing(
     effect was identical to the pre-fix bug.
     """
     curator = _real_blocklist_curator(tmp_path)
-    curator_interceptor._curator = curator
+    interceptor = make_curator_interceptor(curator)
     taskmaster.add_task = AsyncMock(return_value={'id': '99', 'title': 'x'})
     # Byte-identical submissions → identical payload_hash → the dedup path.
     submission = {
@@ -15460,10 +15474,10 @@ async def test_identical_blocklisted_duplicates_in_one_batch_create_nothing(
     }
 
     ticket_ids = await submit_as_one_batch(
-        curator_interceptor, curator, [submission, submission],
+        interceptor, curator, [submission, submission],
     )
     answers = [
-        await curator_interceptor.resolve_ticket(t, '/project', timeout_seconds=10.0)
+        await interceptor.resolve_ticket(t, '/project', timeout_seconds=10.0)
         for t in ticket_ids
     ]
 
