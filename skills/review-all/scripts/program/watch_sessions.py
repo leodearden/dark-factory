@@ -11,7 +11,7 @@ import enum
 import math
 import sys
 import types
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -151,9 +151,8 @@ def resolve(session: SpawnedSession, entries: Iterable[RegistryEntry]) -> Regist
     if matches:
         return Seen(Standing.AMBIGUOUS, detail=': ' + ', '.join(m.record_dir.name for m in matches))
     unreadable = [entry.unreadable for entry in candidates if entry.unreadable is not None]
-    if unreadable:
-        return Seen(Standing.UNREADABLE, detail=': ' + '; '.join(unreadable))
-    return Seen(Standing.AWAITING_RECORD)
+    unchecked = '; records that could not be checked: ' + '; '.join(unreadable) if unreadable else ''
+    return Seen(Standing.AWAITING_RECORD, detail=unchecked)
 
 
 def read_resolved(record_dir: Path) -> SessionRecord:
@@ -177,12 +176,12 @@ def read_hand_back(record_dir: Path) -> HandBack | None:
     return HandBack(text, parse_result_outcome(text))
 
 
-def is_over(record: SessionRecord, owner_alive: Callable[[int], bool] = _pid_alive) -> bool:
+def is_over(record: SessionRecord) -> bool:
     """Whether the session has ended: a terminal status, or a self-exit attempt whose owner is dead."""
     if record.status in TERMINAL_STATUSES:
         return True
     owner = record.claude_owner_pid
-    return record.exit_requested_at is not None and owner is not None and not owner_alive(owner)
+    return record.exit_requested_at is not None and owner is not None and not _pid_alive(owner)
 
 
 def is_final(outcome: ResultOutcome | None, *, over: bool) -> bool:
@@ -270,7 +269,7 @@ def apply_final(home: state.Home, session: SpawnedSession) -> bool:
     inbox_file = home.inbox_file(session.stream, session.pass_, session.item)
     unusable = apply_return.degeneracy(inbox_file)
     if unusable is not None:
-        print(f'{session.title}: no usable return at {inbox_file}: {unusable}')
+        print(f'{session.title}: no usable return at {inbox_file}: {unusable}', file=sys.stderr)
         return True
     outcome = apply_return.apply(inbox_file, by=APPLIED_BY)
     apply_return.report(outcome, inbox_file)

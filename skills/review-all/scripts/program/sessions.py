@@ -5,8 +5,9 @@ The file is ``{title: {stream, pass, item, spawned_after, record_dir, reported}}
 ``state.now_utc`` stamp taken before the spawn. ``gen_brief.py --spawn`` creates an
 entry with ``record_dir`` and ``reported`` null; ``watch_sessions.py`` alone changes
 those two, filling ``record_dir`` once it resolves the session's record and setting
-``reported`` to the standing it last reported. A title names one session, so an
-entry is never replaced.
+``reported`` to the standing it last reported. An entry without ``reported``,
+written before the watcher owned that field, reads as unreported. A title names
+one session, so an entry is never replaced.
 """
 from __future__ import annotations
 
@@ -71,7 +72,8 @@ _TEXT_FIELDS: Mapping[str, bool] = types.MappingProxyType({
     'stream': False, 'item': True, 'spawned_after': False, 'record_dir': True,
 })
 """Each text field of an entry, and whether it may be null."""
-_FIELDS = frozenset({*_TEXT_FIELDS, 'pass', 'reported'})
+_REQUIRED_FIELDS = frozenset({*_TEXT_FIELDS, 'pass'})
+_FIELDS = frozenset({*_REQUIRED_FIELDS, 'reported'})
 _WATCHED_FIELDS = frozenset({'record_dir', 'reported'})
 """The fields ``update_watched`` may change; every other one is the spawn's."""
 
@@ -88,7 +90,7 @@ def _member(path: Path, where: str, kind: type[_Member], value: Any) -> _Member:
 def _checked_fields(path: Path, title: str, raw: Any) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise state.StateError(f'{path}: {title} is not an object: {raw!r}')
-    faults = [f'{title}.{name} is missing' for name in sorted(_FIELDS - set(raw))]
+    faults = [f'{title}.{name} is missing' for name in sorted(_REQUIRED_FIELDS - set(raw))]
     faults += [f'{title}.{name} is not a field of a session' for name in sorted(set(raw) - _FIELDS)]
     if faults:
         raise state.StateError(f'{path}: ' + '; '.join(faults))
@@ -97,7 +99,7 @@ def _checked_fields(path: Path, title: str, raw: Any) -> dict[str, Any]:
         if not (isinstance(value, str) or (nullable and value is None)):
             raise state.StateError(f'{path}: {title}.{name} is not a string: {value!r}')
     pass_ = _member(path, f'{title}.pass', state.Pass, raw['pass'])
-    reported = raw['reported']
+    reported = raw.get('reported')
     if reported is not None:
         reported = _member(path, f'{title}.reported', Standing, reported)
     return {**{name: raw[name] for name in _TEXT_FIELDS}, 'pass_': pass_, 'reported': reported}

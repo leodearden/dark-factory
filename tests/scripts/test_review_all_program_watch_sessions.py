@@ -210,6 +210,17 @@ def test_a_reported_value_outside_the_standings_is_refused_on_read(env: ProgramE
     assert all(standing in str(refused.value) for standing in sessions.Standing)
 
 
+def test_an_entry_written_without_reported_reads_as_unreported(env: ProgramEnv) -> None:
+    sessions = _sessions()
+    home = _home(env)
+    sessions.add(home, _s3_author())
+    unwatched = _sessions_json(env)
+    del unwatched[S3_TITLE]['reported']
+    home.sessions_json.write_text(json.dumps(unwatched), encoding='utf-8')
+
+    assert sessions.read(home)[S3_TITLE] == _s3_author()
+
+
 @pytest.mark.parametrize('stamp', ['2026-10-19 10:00', 'yesterday'])
 def test_a_spawned_after_that_is_not_an_aware_iso_stamp_is_refused(stamp: str) -> None:
     with pytest.raises(_state().StateError) as refused:
@@ -332,11 +343,29 @@ def test_b10_a_checkpoint_on_an_exited_record_ended_at_checkpoint(b10: ProgramEn
         FIXTURE_RETURNS / 'S1.investigate-Q2.json').read_bytes()
 
 
+UNCHECKED = 'no registry record yet; records that could not be checked: '
+
+
 def test_b10_an_unreadable_record_is_printed_not_swallowed(b10: ProgramEnv) -> None:
     proc = watch(b10)
 
     assert proc.returncode == 0, _output(proc)
-    assert str(registry(b10) / 'fixture-s1-author' / 'record.json') in standing_line(proc, S1_TITLE)
+    line = standing_line(proc, S1_TITLE)
+    assert line.startswith(f'{S1_TITLE}: {UNCHECKED}')
+    assert str(registry(b10) / 'fixture-s1-author' / 'record.json') in line
+
+
+def test_an_unreadable_record_leaves_an_unmatched_session_awaiting_its_record(env: ProgramEnv) -> None:
+    spawned(env, S2_TITLE, 'S2', 'author')
+    put_record(env, 'unreadable')
+
+    proc = watch(env)
+
+    assert proc.returncode == 0, _output(proc)
+    line = standing_line(proc, S2_TITLE)
+    assert line.startswith(f'{S2_TITLE}: {UNCHECKED}')
+    assert str(registry(env) / 'fixture-s1-author' / 'record.json') in line
+    assert _sessions_json(env)[S2_TITLE]['reported'] == 'awaiting-record'
 
 
 def test_a_record_older_than_the_spawn_is_not_resolved(env: ProgramEnv) -> None:
@@ -507,7 +536,8 @@ def test_a_final_session_without_a_return_names_its_inbox_path(b10: ProgramEnv) 
     proc = watch(b10)
 
     assert proc.returncode == 1, _output(proc)
-    assert any(str(inbox) in line and 'absent' in line for line in lines_about(proc, S3_TITLE))
+    (unusable,) = [line for line in proc.stderr.splitlines() if line.startswith(f'{S3_TITLE}: ')]
+    assert str(inbox) in unusable and 'absent' in unusable
 
 
 def test_a_final_return_the_lead_already_applied_is_not_applied_again(b10: ProgramEnv) -> None:
@@ -546,13 +576,20 @@ def s2(env: ProgramEnv) -> ProgramEnv:
     return env
 
 
-def put_written_record(env: ProgramEnv, result: str, **record_fields: Any) -> Path:
-    """The fixture finished-idle record dir, its record.json fields and its result.md written by the test."""
+def put_written_record(env: ProgramEnv, result: str | bytes | None, **record_fields: Any) -> Path:
+    """The fixture finished-idle record dir, its record.json fields and its result.md written by the test.
+
+    A *result* of None leaves the dir without a result.md.
+    """
     record_dir = put_record(env, 'finished-idle')
     record_json = record_dir / 'record.json'
     record = json.loads(record_json.read_text(encoding='utf-8'))
     record_json.write_text(json.dumps({**record, **record_fields}), encoding='utf-8')
-    (record_dir / 'result.md').write_text(result, encoding='utf-8')
+    hand_back = record_dir / 'result.md'
+    if result is None:
+        hand_back.unlink()
+    else:
+        hand_back.write_bytes(result.encode('utf-8') if isinstance(result, str) else result)
     return record_dir
 
 
@@ -646,3 +683,64 @@ def test_a_hand_back_without_a_contract_outcome_is_a_checkpoint_and_still_archiv
         f'{S2_TITLE}: ended at checkpoint — relaunch or resume, '
         'archived handbacks/S2.author.checkpoint-1.md')
     assert not _applied(s2)
+
+
+def _archived(env: ProgramEnv) -> list[Path]:
+    return sorted((env.home / 'handbacks').glob('*'))
+
+
+@pytest.mark.parametrize(('status', 'label'), [
+    ('exited', 'ended without a hand-back — relaunch or resume'),
+    ('idle', 'running, no hand-back yet'),
+])
+def test_a_record_without_a_hand_back_is_running_until_it_ends(
+    s2: ProgramEnv, status: str, label: str,
+) -> None:
+    put_written_record(s2, None, status=status)
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    assert standing_line(proc, S2_TITLE).startswith(f'{S2_TITLE}: {label}')
+    assert _archived(s2) == []
+    assert not _applied(s2)
+
+
+def test_a_hand_back_that_is_not_utf8_is_unreadable_and_not_archived(s2: ProgramEnv) -> None:
+    record_dir = put_written_record(
+        s2, b'---\noutcome: done\n---\n\xff\xfe\n', status='exited', exit_code=0,
+    )
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    assert standing_line(proc, S2_TITLE).startswith(
+        f'{S2_TITLE}: unreadable: {record_dir / "result.md"}: ')
+    assert _archived(s2) == []
+    assert not _applied(s2)
+
+
+def test_a_resolved_record_reaped_later_is_unreadable_and_its_archive_survives(s2: ProgramEnv) -> None:
+    record_dir = put_record(s2, 'finished-idle')
+    _watched_once(s2)
+    shutil.rmtree(record_dir)
+
+    proc = watch(s2)
+
+    assert proc.returncode == 0, _output(proc)
+    assert standing_line(proc, S2_TITLE) == (
+        f'{S2_TITLE}: unreadable: {record_dir / "record.json"}: absent')
+    assert _record_dirs(s2) == {S2_TITLE: str(record_dir)}
+    assert _archived(s2) == [s2.home / 'handbacks' / 'S2.author.checkpoint-1.md']
+    assert not _applied(s2)
+
+
+def test_a_corrupt_sessions_json_could_not_run_and_says_why_on_stderr(env: ProgramEnv) -> None:
+    sessions_json = env.home / 'sessions.json'
+    sessions_json.write_text('{"prd:fixture S2": ', encoding='utf-8')
+
+    proc = watch(env)
+
+    assert proc.returncode == 2, _output(proc)
+    assert proc.stdout == ''
+    assert proc.stderr.startswith(f'watch_sessions.py: could not run: {sessions_json} is not JSON')
