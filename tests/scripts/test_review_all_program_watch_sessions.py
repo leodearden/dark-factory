@@ -371,3 +371,152 @@ def test_two_records_of_one_title_leave_it_unresolved_and_name_both(env: Program
     assert _record_dirs(env) == {S2_TITLE: None}
     line = standing_line(proc, S2_TITLE)
     assert 'fixture-s2-author' in line and 'fixture-s2-twin' in line
+
+
+def lines_about(proc: subprocess.CompletedProcess[str], title: str) -> list[str]:
+    return [line for line in proc.stdout.splitlines() if line.startswith(f'{title}: ')]
+
+
+def _ledger(env: ProgramEnv) -> list[Any]:
+    return list(_state().read_ledger(_home(env)))
+
+
+def _watched_once(env: ProgramEnv) -> None:
+    proc = watch(env)
+    assert proc.returncode == 0, _output(proc)
+
+
+def _s3_final_after_one_pass(env: ProgramEnv) -> subprocess.CompletedProcess[str]:
+    """Pass 1 over the B10 sessions, then S3's record read again once it ended, then pass 2."""
+    _watched_once(env)
+    put_record(env, 'final-exited')
+    return watch(env)
+
+
+def test_b10_a_final_hand_back_is_archived_and_its_return_applied(b10: ProgramEnv) -> None:
+    _watched_once(b10)
+    before = _ledger(b10)
+    put_record(b10, 'final-exited')
+
+    proc = watch(b10)
+
+    assert proc.returncode == 0, _output(proc)
+    assert (b10.home / 'handbacks' / 'S3.author.md').read_bytes() == (
+        FIXTURE_SESSIONS / 'final-exited' / 'result.md').read_bytes()
+    assert not (b10.home / 'inbox' / 'S3.author.json').exists()
+    assert (b10.home / 'returns' / 'S3.author.json').read_bytes() == (
+        FIXTURE_RETURNS / 'S3.author.json').read_bytes()
+    after = _ledger(b10)
+    assert after[:len(before)] == before
+    (added,) = after[len(before):]
+    assert {key: added[key] for key in ('op', 'stream', 'status', 'by')} == {
+        'op': 'stream_status', 'stream': 'S3', 'status': 'authored', 'by': 'watch_sessions.py',
+    }
+    assert standing_line(proc, S3_TITLE).startswith(
+        f'{S3_TITLE}: final, archived handbacks/S3.author.md')
+    (digest,) = [line for line in proc.stdout.splitlines() if line.startswith('S3 author: ')]
+    assert digest.endswith('→ returns/S3.author.json')
+    assert _sessions_json(b10)[S3_TITLE]['reported'] == 'final'
+
+
+def test_b10_a_pass_after_final_reports_nothing_new_and_applies_nothing(b10: ProgramEnv) -> None:
+    second = _s3_final_after_one_pass(b10)
+    assert second.returncode == 0, _output(second)
+    after_final = b10.snapshot()
+
+    third = watch(b10)
+
+    assert third.returncode == 0, _output(third)
+    assert third.stdout == 'nothing new\n'
+    assert b10.snapshot() == after_final
+
+
+def test_b10_a_second_pass_over_unchanged_sessions_reports_nothing_new(b10: ProgramEnv) -> None:
+    _watched_once(b10)
+    before = b10.snapshot()
+
+    second = watch(b10)
+
+    assert second.returncode == 0, _output(second)
+    assert second.stdout == 'nothing new\n'
+    assert b10.snapshot() == before
+
+
+def test_new_checkpoint_content_is_archived_as_the_next_checkpoint(b10: ProgramEnv) -> None:
+    _watched_once(b10)
+    result = registry(b10) / 'fixture-s3-author' / 'result.md'
+    text = result.read_text(encoding='utf-8') + 'The gamma importer inventory is done.\n'
+    result.write_text(text, encoding='utf-8')
+
+    second = watch(b10)
+
+    assert second.returncode == 0, _output(second)
+    (line,) = second.stdout.splitlines()
+    assert line.startswith(f'{S3_TITLE}: checkpoint, archived handbacks/S3.author.checkpoint-2.md')
+    assert (b10.home / 'handbacks' / 'S3.author.checkpoint-2.md').read_text(encoding='utf-8') == text
+    assert watch(b10).stdout == 'nothing new\n'
+
+
+def test_a_standing_change_without_new_content_is_reported_once(b10: ProgramEnv) -> None:
+    _watched_once(b10)
+    record_json = registry(b10) / 'fixture-s3-author' / 'record.json'
+    record = json.loads(record_json.read_text(encoding='utf-8'))
+    record_json.write_text(json.dumps({**record, 'status': 'exited', 'exit_code': 0}), encoding='utf-8')
+
+    second = watch(b10)
+
+    assert second.returncode == 0, _output(second)
+    (line,) = second.stdout.splitlines()
+    assert line.startswith(f'{S3_TITLE}: ended at checkpoint — relaunch or resume')
+    assert not (b10.home / 'handbacks' / 'S3.author.checkpoint-2.md').exists()
+    assert watch(b10).stdout == 'nothing new\n'
+
+
+def test_a_final_return_that_fails_validation_is_left_for_the_lead(b10: ProgramEnv) -> None:
+    _watched_once(b10)
+    inbox = b10.home / 'inbox' / 'S3.author.json'
+    fixture_return = json.loads((FIXTURE_RETURNS / 'S3.author.json').read_text(encoding='utf-8'))
+    over_cap = 'n' * (_state().NOTES_CAP + 1)
+    inbox.write_text(json.dumps({**fixture_return, 'notes': over_cap}), encoding='utf-8')
+    refused_return = inbox.read_bytes()
+    put_record(b10, 'final-exited')
+
+    proc = watch(b10)
+
+    assert proc.returncode == 1, _output(proc)
+    assert 'notes' in proc.stderr
+    assert inbox.read_bytes() == refused_return
+    assert not (b10.home / 'returns' / 'S3.author.json').exists()
+    assert (b10.home / 'handbacks' / 'S3.author.md').is_file()
+    after = watch(b10)
+    assert after.returncode == 0, _output(after)
+    assert after.stdout == 'nothing new\n'
+
+
+def test_a_final_session_without_a_return_names_its_inbox_path(b10: ProgramEnv) -> None:
+    _watched_once(b10)
+    inbox = b10.home / 'inbox' / 'S3.author.json'
+    inbox.unlink()
+    put_record(b10, 'final-exited')
+
+    proc = watch(b10)
+
+    assert proc.returncode == 1, _output(proc)
+    assert any(str(inbox) in line and 'absent' in line for line in lines_about(proc, S3_TITLE))
+
+
+def test_a_final_return_the_lead_already_applied_is_not_applied_again(b10: ProgramEnv) -> None:
+    _watched_once(b10)
+    applied = b10.run('apply_return.py', b10.home / 'inbox' / 'S3.author.json')
+    assert applied.returncode == 0, _output(applied)
+    ledger = _ledger(b10)
+    put_record(b10, 'final-exited')
+
+    proc = watch(b10)
+
+    assert proc.returncode == 0, _output(proc)
+    assert any(
+        'already applied' in line and 'returns/S3.author.json' in line
+        for line in lines_about(proc, S3_TITLE)
+    )
+    assert _ledger(b10) == ledger
