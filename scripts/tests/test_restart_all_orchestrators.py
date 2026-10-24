@@ -16,6 +16,8 @@ import json
 import math
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -299,6 +301,23 @@ def _install_fixed_epoch(bin_dir, epoch):
         f'if [ "$#" -eq 1 ] && [ "$1" = "+%s" ]; then echo {int(epoch)}; '
         'else exec /bin/date "$@"; fi\n'
     )
+    shim.chmod(0o755)
+
+
+def _install_spawn_latency(bin_dir, secs):
+    """Shadow `python3` with a shim that sleeps *secs*, then execs the real one.
+
+    bin_dir is first on the script's PATH, so this delays every interpreter
+    start the sweep makes: the fake systemctl (`#!/usr/bin/env python3`) and
+    `python3 drain_check.py` alike. It delegates rather than replaces, so
+    drain_check.py still runs for real. The real interpreter is resolved here,
+    before bin_dir is ever on PATH, so the shim cannot find itself.
+    """
+    real = shutil.which("python3")
+    if real is None:
+        pytest.fail("no python3 on PATH to delegate the spawn-latency shim to")
+    shim = bin_dir / "python3"
+    shim.write_text(f'#!/bin/sh\nsleep {secs}\nexec {shlex.quote(real)} "$@"\n')
     shim.chmod(0o755)
 
 
@@ -2294,13 +2313,7 @@ def _three_unit_drain_sweep(tmp_path, heartbeats):
     return bin_dir, state_path, fleet_dir, trace_path, env
 
 
-def test_a_later_units_admission_is_not_halted_while_an_earlier_units_verify_is_awaited(
-    tmp_path,
-):
-    """Task 7297, the 2026-10-20 incident: the sweep waited 8009 s on reify's
-    verify while dark-factory, later in the order, sat with its merge admission
-    halted the whole time. Now a unit's request -- what halts its admission --
-    exists only from the moment the sweep reaches it until its restart."""
+def _assert_only_the_awaited_unit_is_halted(tmp_path, *, spawn_latency_secs=None):
     awaited_polls = 3
     bin_dir, state_path, fleet_dir, trace_path, env = _three_unit_drain_sweep(
         tmp_path,
@@ -2310,6 +2323,8 @@ def test_a_later_units_admission_is_not_halted_while_an_earlier_units_verify_is_
             UNIT_SELF: _hb_drain([]),
         },
     )
+    if spawn_latency_secs is not None:
+        _install_spawn_latency(bin_dir, spawn_latency_secs)
 
     with (
         _drain_requests_seen_at_gate_poll(
@@ -2348,6 +2363,51 @@ def test_a_later_units_admission_is_not_halted_while_an_earlier_units_verify_is_
     assert not list(fleet_dir.glob("*.drain.json")), (
         f"the sweep must release every request it wrote. {context}"
     )
+
+
+def test_a_later_units_admission_is_not_halted_while_an_earlier_units_verify_is_awaited(
+    tmp_path,
+):
+    """Task 7297, the 2026-10-20 incident: the sweep waited 8009 s on reify's
+    verify while dark-factory, later in the order, sat with its merge admission
+    halted the whole time. Now a unit's request -- what halts its admission --
+    exists only from the moment the sweep reaches it until its restart."""
+    _assert_only_the_awaited_unit_is_halted(tmp_path)
+
+
+# The sweep makes 19 interpreter starts, so 19 x 0.75 + its 3 one-second polls puts it past 15s on any host.
+_STARVED_SPAWN_LATENCY_SECS = 0.75
+
+
+def test_the_awaited_verify_sweep_completes_when_every_interpreter_start_is_starved(tmp_path):
+    _assert_only_the_awaited_unit_is_halted(
+        tmp_path, spawn_latency_secs=_STARVED_SPAWN_LATENCY_SECS,
+    )
+
+
+def test_a_sweep_that_only_repolls_the_same_verdict_is_reported_as_stalled(tmp_path):
+    bin_dir, state_path, fleet_dir, trace_path, env = _three_unit_drain_sweep(
+        tmp_path,
+        {
+            UNIT_R: _hb_drain([_verifying_entry(deadline_in=3600)]),
+            UNIT_S: _hb_drain([]),
+            UNIT_SELF: _hb_drain([]),
+        },
+    )
+    env["ORCH_DRAIN_VERIFY_MAX_WAIT_SECS"] = "20"
+
+    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+        _run_sweep_while_progressing(
+            bin_dir, state_path, fleet_dir, trace_path, "--drain", env=env, stall_timeout=3,
+        )
+
+    polls = read_drain_poll_trace(trace_path)
+    calls = [
+        [arg for arg in call if arg != "--user"] for call in _load_state(state_path)["calls"]
+    ]
+    assert exc_info.value.timeout == 3
+    assert polls and all(p == ("verifying", UNIT_R) for p in polls), polls
+    assert not [call for call in calls if call[:1] == ["restart"]], calls
 
 
 def test_each_units_verify_wait_cap_counts_from_its_own_request(tmp_path):
