@@ -887,8 +887,8 @@ def test_absent_heartbeat_polls_through_a_nonzero_grace_then_restarts(tmp_path):
     """ABSENT + BOUNDED: the unknown grace TERMINATES, and the restart follows.
 
     The complement of test_unknown_grace_withholds_restart_while_absent below,
-    which proves the wait is REAL by being killed inside it and so can never
-    observe its end. Nothing else covers that end: the only other top-level
+    which proves the wait is REAL by being stopped inside it on its poll
+    ledger and so can never observe its end. Nothing else covers that end: the only other top-level
     absent elapse test uses a grace of 0, where drain_await_fresh breaks on
     its FIRST elapsed-check and the loop never sleeps. Here the grace is a
     small NONZERO 3s and the run COMPLETES -- >= 2 ledger polls catch the loop
@@ -1194,7 +1194,7 @@ _HB_STALE = {"merge_idle": True, "ts_epoch": time.time() - 99999}
 # (reviewer_comprehensive #1).
 _DRAIN_POLL_INTERVAL_SECS = 1
 # ONE binding feeding both the grace and the timeout -- see
-# test_defer_withholds_restart_while_busy. Here the grace is a
+# df_pytest_isolation.py::wait_proof_grace_secs. Here the grace is a
 # MUST-NEVER-BE-REACHED bound rather than a wait-proving one: if the
 # in-loop resume regresses, the run silently consumes the spawn timeout
 # instead of force-firing early and looking like a pass.
@@ -1494,7 +1494,7 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
     (mutant MB) demonstrates via `_run_script`'s own timeout.
     """
     # ONE binding feeding both the grace and the timeout -- see
-    # test_defer_withholds_restart_while_busy. Deliberately unreachable here:
+    # df_pytest_isolation.py::wait_proof_grace_secs. Deliberately unreachable here:
     # the point is that the run finishes long before this busy grace would.
     spawn_timeout = 15
 
@@ -1559,7 +1559,7 @@ def test_unit_that_stops_heartbeating_mid_defer_proceeds_after_a_nonzero_grace_e
     sleep-and-recheck cycle before the grace elapses.
     """
     # ONE binding feeding both the grace and the timeout -- see
-    # test_defer_withholds_restart_while_busy. Deliberately unreachable here.
+    # df_pytest_isolation.py::wait_proof_grace_secs. Deliberately unreachable here.
     spawn_timeout = 15
     unknown_grace = 3
 
@@ -1637,7 +1637,7 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(
     """
     # ORCH_DRAIN_UNKNOWN_GRACE_SECS is the must-never-elapse bound here (the
     # unit drains on its own a few polls into it); ONE binding still feeds it
-    # from spawn_timeout, per test_defer_withholds_restart_while_busy.
+    # from spawn_timeout, per df_pytest_isolation.py::wait_proof_grace_secs.
     spawn_timeout = 20
     outlasting = _polls_outlasting(_SHORT_FORCE_FIRE_SECS)
 
