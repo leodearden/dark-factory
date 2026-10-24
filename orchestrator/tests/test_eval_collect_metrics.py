@@ -10,6 +10,7 @@ import pytest
 
 from orchestrator.evals.metrics import RoleUnderTest
 from orchestrator.evals.runner import collect_metrics
+from orchestrator.verify import VerifyResult
 
 
 def _workflow() -> MagicMock:
@@ -32,7 +33,9 @@ def _workflow() -> MagicMock:
 
 @pytest.mark.asyncio
 async def test_collect_metrics_sets_role_and_replay_frame_on_the_dataclass():
-    verification = MagicMock(passed=True, lint_output='', type_output='')
+    verification = VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='', summary='',
+    )
     with (
         patch('orchestrator.verify.run_verification', AsyncMock(return_value=verification)),
         patch('orchestrator.evals.runner._git_diff_stats', AsyncMock(return_value=(3, 1))),
