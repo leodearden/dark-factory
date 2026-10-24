@@ -97,7 +97,7 @@ from orchestrator.lane_lifecycle import (
     LaneState,
 )
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
-from orchestrator.teardown import complete_despite_cancellation
+from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
@@ -3370,25 +3370,17 @@ class GitOps:
                     self._remove_ephemeral_worktree(tmp_path, kind),
                 )
         finally:
-            # Release the advisory lock and — ONLY when this call was the
-            # one that acquired it — best-effort unlink the lock file,
-            # mirroring gc.sh's own `rm -f "$orphan_lock"` (gc.sh:606) on
-            # removal. Never unlink a lock we did not acquire: that would
-            # delete a foreign holder's lock file out from under it.
-            #
-            # Unlink BEFORE closing the fd — i.e. while we still hold the
-            # flock — rather than after. This mirrors gc.sh, which performs
-            # its own analogous `rm -f` while still holding ITS flock, and
-            # it closes a window that a close-then-unlink ordering would
-            # leave open: between releasing the flock and removing the
-            # directory entry, a new contender could open+flock the same
-            # (about-to-be-deleted) path, only to have our unlink yank the
-            # file out from under it. Unlinking first means any contender
-            # that opens the path afterward necessarily creates a fresh
-            # inode, so it can never observe a lock we are about to drop.
-            if acquired:
+            # Never touch a lock this call did not acquire; unlink while still holding the
+            # flock, so a later contender always creates a fresh inode.
+            if acquired and path_confirmed_absent(tmp_path):
                 with contextlib.suppress(Exception):
                     os.unlink(lock_path)
+            elif acquired:
+                logger.warning(
+                    'ephemeral_worktree(%s): %s survived cleanup; keeping %s so the residue '
+                    'stays lock-bearing for the flock-based reclaim',
+                    kind.name, tmp_path, lock_path,
+                )
             with contextlib.suppress(Exception):
                 os.close(lock_fd)
 
