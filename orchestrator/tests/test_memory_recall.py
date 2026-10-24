@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,8 @@ from _briefing_helpers import (
 )
 
 from orchestrator.agents.memory_recall import (
+    ENTITY_BLOCK_MAX_EDGES,
+    ENTITY_EDGES_OMITTED_NOTICE,
     FOREIGN_PROJECT_TAG_KEYS,
     MEMORY_CONTEXT_CAVEAT,
     MEMORY_EMPTY_NOTICE,
@@ -827,6 +830,15 @@ class TestContestingChildRender:
         assert ' · graphiti] ' in lines[contests_at], lines
 
 
+def _numbered_facts(count: int) -> list[str]:
+    """Distinct facts, zero-padded so that none is a substring of another."""
+    return [f'Task 3609 fact {i:02d}.' for i in range(count)]
+
+
+def _bullet_lines(lines: list[str]) -> list[str]:
+    return [line for line in lines if line.startswith('- ')]
+
+
 class TestRenderEntityBlock:
     """Only an exactly-named node is admitted: the server's fuzzy fallback
     answers a miss with a neighbouring task, whose facts would read as ours."""
@@ -887,6 +899,56 @@ class TestRenderEntityBlock:
         lines = render_entity_block(payload, 'Task 3609').splitlines()
 
         assert len([line for line in lines if fact in line]) == 1, lines
+
+    def test_an_n_edge_node_renders_the_cap_and_names_the_rest(self):
+        facts = _numbered_facts(ENTITY_BLOCK_MAX_EDGES + 3)
+        payload = {'nodes': [_node('Task 3609')], 'edges': [_edge(fact) for fact in facts]}
+
+        lines = render_entity_block(payload, 'Task 3609').splitlines()
+
+        assert _bullet_lines(lines) == [f'- {fact}' for fact in facts[:ENTITY_BLOCK_MAX_EDGES]]
+        assert lines[-1] == ENTITY_EDGES_OMITTED_NOTICE.format(count=3, name='Task 3609')
+
+    def test_a_node_at_the_cap_has_no_omission_line(self):
+        facts = _numbered_facts(ENTITY_BLOCK_MAX_EDGES)
+        payload = {'nodes': [_node('Task 3609')], 'edges': [_edge(fact) for fact in facts]}
+
+        lines = render_entity_block(payload, 'Task 3609').splitlines()
+
+        assert len(_bullet_lines(lines)) == ENTITY_BLOCK_MAX_EDGES
+        assert lines[-1].startswith('- '), lines
+
+    def test_the_newest_dated_edges_win_the_cap(self):
+        facts = _numbered_facts(ENTITY_BLOCK_MAX_EDGES + 2)
+        dated = [
+            (fact, f'{date(2026, 9, 1) + timedelta(days=i)}T00:00:00+00:00')
+            for i, fact in enumerate(facts[:ENTITY_BLOCK_MAX_EDGES])
+        ]
+        undated = facts[ENTITY_BLOCK_MAX_EDGES:]
+        payload = {
+            'nodes': [_node('Task 3609')],
+            'edges': [_edge(fact, valid_at=at) for fact, at in dated]
+            + [_edge(fact) for fact in undated],
+        }
+
+        lines = render_entity_block(payload, 'Task 3609').splitlines()
+
+        assert _bullet_lines(lines) == [f'- {fact} ({at[:10]})' for fact, at in reversed(dated)]
+        assert not [line for line in lines if any(fact in line for fact in undated)]
+        assert lines[-1] == ENTITY_EDGES_OMITTED_NOTICE.format(count=2, name='Task 3609')
+
+    def test_a_fact_the_summary_holds_does_not_spend_a_cap_slot(self):
+        held = 'Task 3609 held fact.'
+        others = _numbered_facts(ENTITY_BLOCK_MAX_EDGES)
+        payload = {
+            'nodes': [_node('Task 3609', held)],
+            'edges': [_edge(held)] + [_edge(fact) for fact in others],
+        }
+
+        assert render_entity_block(payload, 'Task 3609').splitlines() == [
+            f'**Task 3609** — {held}',
+            *(f'- {fact}' for fact in others),
+        ]
 
     def test_a_fuzzy_neighbour_renders_nothing(self):
         payload = {
