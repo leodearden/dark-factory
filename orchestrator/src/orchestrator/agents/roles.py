@@ -254,6 +254,10 @@ re-run or re-measure first, and never name a "last-known-good" ref you have not
 re-verified is actually good right now (it may have failed too, or the tip may
 have moved since you measured).
 
+Beside any commit SHA you cite, also cite `task/<id>` and the commit's subject:
+rebasing a task branch onto main rewrites its SHAs, so the cited object may not
+be the one that landed.
+
 Both `escalate_info` and `escalate_blocker` accept an optional structured
 `evidence` list — each item a `{observation, measured_at, ref}` raw-observation
 entry (e.g. `{"observation": "main red, exit 134", "measured_at": "HEAD=abc123",
