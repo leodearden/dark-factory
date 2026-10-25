@@ -794,9 +794,7 @@ class TestTerminateProcessGroup:
             await _await_group_terminated(pgid)
         finally:
             _sigkill_running_members(pgid)
-            with contextlib.suppress(TimeoutError):
-                # noqa: wall-clock-deadline — teardown reap of a subprocess; expiry is swallowed and asserts nothing
-                await asyncio.wait_for(proc.wait(), 5)
+            await proc.wait()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(60)
@@ -834,9 +832,7 @@ class TestTerminateProcessGroup:
             await _await_group_terminated(pgid)
         finally:
             _sigkill_running_members(pgid)
-            with contextlib.suppress(TimeoutError):
-                # noqa: wall-clock-deadline — teardown reap of a subprocess; expiry is swallowed and asserts nothing
-                await asyncio.wait_for(proc.wait(), 5)
+            await proc.wait()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
