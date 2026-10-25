@@ -16,10 +16,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _overreach_shadow_fixtures import judged_edge, judged_episode, non_judging_shadow
 
 from fused_memory.config.schema import (
     FusedMemoryConfig,
-    OverreachGuardConfig,
     ReconciliationConfig,
 )
 from fused_memory.models.reconciliation import (
@@ -46,14 +46,11 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
 )
-from fused_memory.services.overreach_guard import PROMPT_VERSION, EdgeJudgement, JudgeEdge
+from fused_memory.services.overreach_guard import PROMPT_VERSION
 from fused_memory.services.overreach_shadow import (
-    JudgedEpisode,
     OverreachFlag,
     OverreachFlagPage,
-    OverreachShadow,
     OverreachShadowStore,
-    ShadowOutcome,
 )
 from reconciliation.consolidator_fixtures import make_consolidator
 
@@ -61,11 +58,6 @@ MODULE_LOGGER = 'fused_memory.reconciliation.overreach_flags'
 PROJECT, OTHER = 'proj', 'other'
 T0 = datetime(2026, 10, 17, 12, 0, 0, tzinfo=UTC)
 T1 = T0 + timedelta(minutes=5)
-
-
-class _NeverJudges:
-    async def generate_response(self, *args, **kwargs):
-        raise AssertionError('fetching flags must never judge')
 
 
 class _Graph:
@@ -87,41 +79,21 @@ def _clock(*instants: datetime) -> Callable[[], datetime]:
     return lambda: queue.pop(0) if len(queue) > 1 else queue[0]
 
 
-def _episode(graph: str, uuid: str) -> JudgedEpisode:
-    return JudgedEpisode(
-        graph=graph, episode_uuid=uuid, judge_model='judge-m', prompt_version=PROMPT_VERSION,
-        classifiers=('category_decisions',), minted_count=2, outcome=ShadowOutcome.judged,
-    )
-
-
-def _judged(edge_uuid: str, label: str) -> tuple[JudgeEdge, EdgeJudgement]:
-    return (
-        JudgeEdge(uuid=edge_uuid, fact=f'fact of {edge_uuid}', source_name='S', target_name='T'),
-        EdgeJudgement(edge_uuid=edge_uuid, label=label, rationale=f'span for {edge_uuid}'),
-    )
-
-
-def _shadow(store: OverreachShadowStore, graph: _Graph | None = None) -> OverreachShadow:
-    return OverreachShadow(
-        store, _NeverJudges(), 'judge-m', graph or _Graph(), lambda: OverreachGuardConfig(),
-    )
-
-
 async def _seeded_store(tmp_path) -> OverreachShadowStore:
     store = await OverreachShadowStore.open(tmp_path / 'sidecar', clock=_clock(T0, T1, T1))
-    await store.record(episode=_episode(PROJECT, 'ep-a'), judgements=[
-        _judged('a1', 'overreach'), _judged('a2', 'holding'),
+    await store.record(episode=judged_episode('ep-a', graph=PROJECT), judgements=[
+        judged_edge('a1', 'overreach'), judged_edge('a2', 'holding'),
     ])
-    await store.record(episode=_episode(PROJECT, 'ep-b'), judgements=[
-        _judged('b2', 'overreach'), _judged('b1', 'overreach'),
+    await store.record(episode=judged_episode('ep-b', graph=PROJECT), judgements=[
+        judged_edge('b2', 'overreach'), judged_edge('b1', 'overreach'),
     ])
-    await store.record(episode=_episode(OTHER, 'ep-x'), judgements=[_judged('x1', 'overreach')])
+    await store.record(episode=judged_episode('ep-x', graph=OTHER), judgements=[judged_edge('x1', 'overreach')])
     return store
 
 
 @pytest_asyncio.fixture
 async def shadow(tmp_path):
-    runner = _shadow(await _seeded_store(tmp_path))
+    runner = non_judging_shadow(await _seeded_store(tmp_path), _Graph())
     yield runner
     await runner.close()
 
@@ -178,7 +150,7 @@ class TestFetch:
 
     @pytest.mark.asyncio
     async def test_a_flag_whose_edge_is_gone_or_retired_is_not_offered(self, tmp_path) -> None:
-        runner = _shadow(await _seeded_store(tmp_path), _Graph(gone=['b1'], retired=['b2']))
+        runner = non_judging_shadow(await _seeded_store(tmp_path), _Graph(gone=['b1'], retired=['b2']))
         try:
             page = await fetch_overreach_flags(runner, PROJECT)
             await acknowledge_overreach_flags(runner, page)
@@ -226,10 +198,10 @@ class TestCarryOver:
             tmp_path / 'burst', clock=_clock(*(T0 + timedelta(seconds=i) for i in range(count))),
         )
         for i in range(count):
-            await store.record(episode=_episode(PROJECT, f'ep-{i:02d}'), judgements=[
-                _judged(f'e-{i:02d}', 'overreach'),
+            await store.record(episode=judged_episode(f'ep-{i:02d}', graph=PROJECT), judgements=[
+                judged_edge(f'e-{i:02d}', 'overreach'),
             ])
-        runner = _shadow(store)
+        runner = non_judging_shadow(store, _Graph())
         try:
             first = await fetch_overreach_flags(runner, PROJECT)
             await acknowledge_overreach_flags(runner, first)
