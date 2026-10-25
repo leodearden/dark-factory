@@ -905,6 +905,18 @@ class NightlyResult:
             alarm.landed and alarm.kind is AlarmKind.BARREN_STREAK for alarm in self.alarms
         )
 
+    def journal_line(self) -> str:
+        """The pass's one closing journal line."""
+        return (
+            f'legibility trickle: {self.target_date} outcome={self.outcome} '
+            f'alarms={len(self.alarms)} '
+            f'landed={sum(alarm.landed for alarm in self.alarms)} '
+            f'project={self.project_id} pass={self.pass_kind.value} '
+            f'exit_code={self.exit_code} applied={self.applied} '
+            f'commit_made={self.commit_made} census_fire={self.census_fire} '
+            f'retry_due={len(self.retry_due)}'
+        )
+
 
 class _LedgerWrite(NamedTuple):
     written: int
@@ -1505,11 +1517,13 @@ def run_nightly(
         )
     else:
         raise ValueError('run_nightly requires either config_path or project_id')
-    return _run_configured_nightly(
+    result = _run_configured_nightly(
         cfg, resolved_config_path, seams,
         projects_root=projects_root, target_date=target_date, now=now,
         pass_kind=pass_kind, max_barren_runs=max_barren_runs,
     )
+    logger.info('%s', result.journal_line())
+    return result
 
 
 
