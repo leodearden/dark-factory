@@ -11,15 +11,25 @@ legibility state root conftest.py's autouse fixture installs.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 import yaml
+from escalation.disposition import ObservationConsumed
+from escalation.models import NOTE_TO_FILE_CLASS, Escalation
 from legibility import config as config_mod
 from legibility import plan_deviation_census as mod
+from shared.plan_deviation import DeviationRecord
 
 _LOGGER = 'legibility.plan_deviation_census'
+
+NOW = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
+HORIZON = NOW - timedelta(days=28)
 
 SHIPPED_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / 'docs' / 'legibility' / 'legibility.yaml'
@@ -173,3 +183,256 @@ def test_shipped_config_block_is_accepted_without_warning(caplog):
     assert settings == config_mod.PlanDeviationCensus()
     assert _warnings(caplog) == []
     assert 'plan_deviation_census:' in SHIPPED_CONFIG_PATH.read_text(encoding='utf-8')
+
+
+# ---------------------------------------------------------------------------
+# readers — plan.json step deviations (stat before read) and archived
+# plan-deviation notes in the escalation queue
+# ---------------------------------------------------------------------------
+
+def _deviation(
+    *, recorded_at: datetime, kind: str = 'wrong_inference', prose_only: bool = False,
+) -> dict:
+    return DeviationRecord(
+        kind=kind,
+        observed='observed',
+        expected='expected',
+        action_taken='action',
+        prose_only=prose_only,
+        note='note',
+        recorded_at=recorded_at.isoformat(),
+        recorded_by=None,
+    ).to_dict()
+
+
+def _set_mtime(path: Path, mtime: datetime) -> None:
+    os.utime(path, (mtime.timestamp(), mtime.timestamp()))
+
+
+def _write_plan(
+    root: Path,
+    lane: str,
+    *,
+    steps: Sequence[Sequence[object]] = (),
+    prerequisites: Sequence[Sequence[object]] = (),
+    mtime: datetime = NOW,
+) -> Path:
+    """A plan.json under ``<root>/<lane>/`` whose items each carry one
+    ``deviations`` list; its ``task_id`` deliberately differs from *lane*."""
+    path = root / lane / 'plan.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = {
+        'task_id': f'doc-{lane}',
+        'prerequisites': [
+            {'id': f'pre-{n}', 'deviations': list(entries)}
+            for n, entries in enumerate(prerequisites, start=1)
+        ],
+        'steps': [
+            {'id': f'step-{n}', 'deviations': list(entries)}
+            for n, entries in enumerate(steps, start=1)
+        ],
+    }
+    path.write_text(json.dumps(doc), encoding='utf-8')
+    _set_mtime(path, mtime)
+    return path
+
+
+def _write_raw_plan(root: Path, lane: str, data: bytes, *, mtime: datetime) -> Path:
+    path = root / lane / 'plan.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    _set_mtime(path, mtime)
+    return path
+
+
+def _sorted(records: Sequence[mod.CensusRecord]) -> list[mod.CensusRecord]:
+    return sorted(records, key=lambda r: (r.task_id, r.recorded_at))
+
+
+def test_plan_reader_reads_step_and_prerequisite_deviations_across_roots(tmp_path):
+    root_a = tmp_path / '.worktrees' / '.task-meta'
+    root_b = tmp_path / 'other-meta'
+    step_at = NOW - timedelta(days=1)
+    pre_at = NOW - timedelta(days=2)
+    other_at = NOW - timedelta(days=3)
+    _write_plan(
+        root_a, '101',
+        steps=[[_deviation(recorded_at=step_at, kind='wrong_inference')], []],
+        prerequisites=[[_deviation(recorded_at=pre_at, kind='other', prose_only=True)]],
+    )
+    _write_plan(root_b, '102', steps=[[_deviation(recorded_at=other_at, kind='never_checked_fact')]])
+    _write_plan(root_b, '103')
+
+    corpus = mod.read_plan_deviations([root_a, root_b], horizon=HORIZON)
+
+    assert _sorted(corpus.records) == [
+        mod.CensusRecord(
+            task_id='101', recorded_at=pre_at, kind='other', prose_only=True,
+            source=mod.RecordSource.PLAN_STEP,
+        ),
+        mod.CensusRecord(
+            task_id='101', recorded_at=step_at, kind='wrong_inference', prose_only=False,
+            source=mod.RecordSource.PLAN_STEP,
+        ),
+        mod.CensusRecord(
+            task_id='102', recorded_at=other_at, kind='never_checked_fact', prose_only=False,
+            source=mod.RecordSource.PLAN_STEP,
+        ),
+    ]
+    for record in corpus.records:
+        assert record.recorded_at.utcoffset() == timedelta(0)
+    assert corpus.opened == 3
+    assert corpus.skipped == 0
+
+
+def test_plan_reader_skips_files_older_than_the_horizon_without_opening_them(tmp_path):
+    root = tmp_path / '.worktrees' / '.task-meta'
+    stale = HORIZON - timedelta(days=1)
+    _write_plan(
+        root, '201',
+        steps=[[_deviation(recorded_at=NOW - timedelta(days=1))]],
+        mtime=stale,
+    )
+    _write_raw_plan(root, '202', b'\xff not json at all {', mtime=stale)
+    _write_plan(root, '203', steps=[[_deviation(recorded_at=NOW - timedelta(days=1))]])
+
+    corpus = mod.read_plan_deviations([root], horizon=HORIZON)
+
+    assert [record.task_id for record in corpus.records] == ['203']
+    assert corpus.opened == 1
+    assert corpus.skipped == 0
+
+
+def test_plan_reader_counts_bad_files_and_bad_entries_without_aborting(tmp_path):
+    root = tmp_path / '.worktrees' / '.task-meta'
+    kept_at = NOW - timedelta(days=1)
+    _write_raw_plan(root, '301', b'{"steps": [', mtime=NOW)
+    _write_raw_plan(root, '302', b'\xff\xfe\x00garbage', mtime=NOW)
+    _write_plan(
+        root, '303',
+        steps=[[
+            'not a dict',
+            {**_deviation(recorded_at=kept_at), 'recorded_at': 'not-a-date'},
+            {**_deviation(recorded_at=kept_at), 'kind': 'bogus_kind'},
+            {**_deviation(recorded_at=kept_at), 'prose_only': 'yes'},
+            _deviation(recorded_at=kept_at, kind='prediction_falsified'),
+        ]],
+    )
+
+    corpus = mod.read_plan_deviations([root], horizon=HORIZON)
+
+    assert corpus.records == (
+        mod.CensusRecord(
+            task_id='303', recorded_at=kept_at, kind='prediction_falsified',
+            prose_only=False, source=mod.RecordSource.PLAN_STEP,
+        ),
+    )
+    assert corpus.opened == 1
+    assert corpus.skipped == 6
+
+
+def test_plan_reader_absent_root_is_an_empty_corpus(tmp_path):
+    corpus = mod.read_plan_deviations([tmp_path / 'no-such-root'], horizon=HORIZON)
+
+    assert corpus == mod.CorpusRead(records=(), opened=0, skipped=0)
+
+
+def _escalation(
+    esc_id: str,
+    *,
+    task_id: str,
+    agent_role: str = 'implementer',
+    severity: str = 'info',
+    category: str = 'design_concern',
+    resolution_class: str | None = None,
+    status: str = 'pending',
+    timestamp: datetime,
+) -> Escalation:
+    return Escalation(
+        id=esc_id,
+        task_id=task_id,
+        agent_role=agent_role,
+        severity=severity,
+        category=category,
+        summary=f'summary of {esc_id}',
+        timestamp=timestamp.isoformat(),
+        status=status,
+        resolution_class=resolution_class,
+        note_to_file=resolution_class == NOTE_TO_FILE_CLASS,
+    )
+
+
+def _write_escalation(directory: Path, esc: Escalation) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f'{esc.id}.json'
+    path.write_text(esc.to_json(), encoding='utf-8')
+    return path
+
+
+def test_note_reader_counts_noted_classes_and_the_implementer_fallback(tmp_path):
+    queue_dir = tmp_path / 'data' / 'escalations'
+    archive = queue_dir / 'archive'
+    stamps = {name: NOW - timedelta(days=n) for n, name in enumerate(
+        ['n2f', 'obs', 'impl-pending', 'impl-resolved', 'blk', 'arch', 'infra'], start=1,
+    )}
+    counted = [
+        (archive / '2026-10-20', _escalation(
+            'esc-401-1', task_id='401', agent_role='reviewer',
+            resolution_class=NOTE_TO_FILE_CLASS, status='resolved', timestamp=stamps['n2f'],
+        )),
+        (archive / '2026-10-20', _escalation(
+            'esc-402-1', task_id='402', agent_role='architect',
+            resolution_class=ObservationConsumed.resolution_class, status='resolved',
+            timestamp=stamps['obs'],
+        )),
+        (queue_dir, _escalation('esc-403-1', task_id='403', timestamp=stamps['impl-pending'])),
+        (archive / '2026-10-21', _escalation(
+            'esc-404-1', task_id='404', status='resolved', timestamp=stamps['impl-resolved'],
+        )),
+    ]
+    not_counted = [
+        (queue_dir, _escalation(
+            'esc-405-1', task_id='405', severity='blocking', timestamp=stamps['blk'],
+        )),
+        (archive / '2026-10-21', _escalation(
+            'esc-406-1', task_id='406', agent_role='architect', status='resolved',
+            timestamp=stamps['arch'],
+        )),
+        (queue_dir, _escalation(
+            'esc-407-1', task_id='407', category='infra_issue', timestamp=stamps['infra'],
+        )),
+    ]
+    for directory, esc in [*counted, *not_counted]:
+        _write_escalation(directory, esc)
+
+    corpus = mod.read_archived_notes(queue_dir)
+
+    assert _sorted(corpus.records) == [
+        mod.CensusRecord(
+            task_id=esc.task_id, recorded_at=datetime.fromisoformat(esc.timestamp),
+            kind=None, prose_only=False, source=mod.RecordSource.ESCALATION,
+        )
+        for _, esc in counted
+    ]
+    assert corpus.opened == 7
+    assert corpus.skipped == 0
+
+
+def test_note_reader_counts_an_unparsable_record_as_skipped(tmp_path):
+    queue_dir = tmp_path / 'data' / 'escalations'
+    queue_dir.mkdir(parents=True)
+    (queue_dir / 'esc-501-1.json').write_text('{"id": ', encoding='utf-8')
+    _write_escalation(queue_dir, _escalation(
+        'esc-502-1', task_id='502', timestamp=NOW - timedelta(days=1),
+    ))
+
+    corpus = mod.read_archived_notes(queue_dir)
+
+    assert [record.task_id for record in corpus.records] == ['502']
+    assert corpus.skipped == 1
+
+
+def test_note_reader_absent_queue_dir_is_an_empty_corpus(tmp_path):
+    corpus = mod.read_archived_notes(tmp_path / 'data' / 'escalations')
+
+    assert corpus == mod.CorpusRead(records=(), opened=0, skipped=0)
