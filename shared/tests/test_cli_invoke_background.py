@@ -882,7 +882,7 @@ class TestDeliveredNotificationIsAReap:
             _monitor_armed(),
             _assistant([_fg_bash('git status')]),
             _delivered_mid_turn(_monitor_event_text()),
-            _assistant([_fg_bash('git log --oneline -3')]),
+            _assistant([_fg_bash('git diff --stat')]),
         ]
         assert detect_ended_awaiting_background(records) is False
 
