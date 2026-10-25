@@ -24,8 +24,9 @@ Both cost Stage 1 prompt tokens, and the second class may lead Stage 1 to
 re-consolidate its predecessor's output. That cost is recoverable; a skipped
 external item is not. Nothing here tests that re-presentation is harmless. If
 the churn matters, drop reconciliation-sourced records from the "new" list by
-their source metadata. Do not move the anchor back to completion: that reopens
-the hole for external writes.
+their source metadata. Measured immaterial on 2026-10-25 (task 6077):
+plans/recon-window-anchor-payload-measurement-2026-10-25.md. Do not move the
+anchor back to completion: that reopens the hole for external writes.
 
 The anchor is ``run.started_at``. On a fresh run it is stamped before Stage 1.
 On a resumed run (task sigma) it is the ORIGINAL start of the interrupted run,
