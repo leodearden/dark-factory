@@ -24,7 +24,7 @@ from escalation.disposition import ObservationConsumed
 from escalation.models import NOTE_TO_FILE_CLASS, Escalation
 from legibility import config as config_mod
 from legibility import plan_deviation_census as mod
-from shared.plan_deviation import DeviationRecord
+from shared.plan_deviation import DEVIATION_KINDS, DeviationRecord
 
 _LOGGER = 'legibility.plan_deviation_census'
 
@@ -436,3 +436,170 @@ def test_note_reader_absent_queue_dir_is_an_empty_corpus(tmp_path):
     corpus = mod.read_archived_notes(tmp_path / 'data' / 'escalations')
 
     assert corpus == mod.CorpusRead(records=(), opened=0, skipped=0)
+
+
+# ---------------------------------------------------------------------------
+# evaluate — pure; three independent triggers over windows measured from now
+# ---------------------------------------------------------------------------
+
+_KINDS = sorted(DEVIATION_KINDS)
+
+
+def _daily(
+    per_day: int,
+    days: range,
+    *,
+    kind: str | None = None,
+    kindless: bool = False,
+    prose_only: bool = False,
+    task_id: str = 'task-a',
+) -> list[mod.CensusRecord]:
+    """*per_day* records on each day *d* in *days*, at ``now - d days - (1+k) h``.
+    Kinds run round-robin over the vocabulary unless *kind* or *kindless* is
+    given; a kindless record comes from the escalation source."""
+    return [
+        mod.CensusRecord(
+            task_id=task_id,
+            recorded_at=NOW - timedelta(days=d, hours=1 + k),
+            kind=None if kindless else (kind or _KINDS[k % len(_KINDS)]),
+            prose_only=prose_only,
+            source=mod.RecordSource.ESCALATION if kindless else mod.RecordSource.PLAN_STEP,
+        )
+        for d in days
+        for k in range(per_day)
+    ]
+
+
+def _at(stamp: datetime, *, task_id: str = 'task-a') -> mod.CensusRecord:
+    return mod.CensusRecord(
+        task_id=task_id, recorded_at=stamp, kind='other', prose_only=False,
+        source=mod.RecordSource.PLAN_STEP,
+    )
+
+
+def _evaluate(records: Sequence[mod.CensusRecord], *, now: datetime = NOW) -> mod.Verdict:
+    return mod.evaluate(records, now=now, config=config_mod.PlanDeviationCensus())
+
+
+def _evidence(verdict: mod.Verdict, ref: str) -> dict:
+    (entry,) = [entry for entry in verdict.evidence if entry['ref'] == ref]
+    return entry
+
+
+BASELINE_DAYS = range(7, 28)
+RECENT_DAYS = range(0, 7)
+
+
+def test_evaluate_positive_control_fires_on_a_rate_rise():
+    verdict = _evaluate(_daily(3, BASELINE_DAYS) + _daily(8, RECENT_DAYS))
+
+    assert verdict.fire is True
+    window = _evidence(verdict, 'window')
+    assert window['recent_count'] == 56
+    assert window['recent_mean'] == 8.0
+    assert window['baseline_count'] == 63
+    assert window['baseline_mean'] == 3.0
+    assert any(reason.startswith('rate-rise') and reason.endswith(' -> FIRE')
+               for reason in verdict.reasons)
+    for entry in verdict.evidence:
+        assert {'observation', 'measured_at', 'ref'} <= entry.keys()
+        assert entry['measured_at'] == NOW.isoformat()
+
+
+def test_evaluate_negative_control_flat_rate_does_not_fire():
+    verdict = _evaluate(_daily(3, range(0, 28)))
+
+    assert verdict.fire is False
+    assert len(verdict.reasons) == 3
+    assert not any(reason.endswith(' -> FIRE') for reason in verdict.reasons)
+
+
+def test_evaluate_rate_rise_below_min_records_does_not_fire():
+    verdict = _evaluate(_daily(1, range(0, 5)))
+
+    assert verdict.fire is False
+    assert _evidence(verdict, 'window')['recent_count'] == 5
+
+
+def test_evaluate_one_dominant_kind_fires_the_pattern_trigger():
+    baseline = _daily(1, BASELINE_DAYS)
+    recent = (
+        _daily(1, range(0, 7), kind='wrong_inference')
+        + _daily(1, range(0, 3), kind='wrong_inference')
+        + _daily(1, range(3, 5), kind='other')
+    )
+    assert len(recent) == 12
+
+    verdict = _evaluate(baseline + recent)
+
+    assert verdict.fire is True
+    kinds = _evidence(verdict, 'kinds')
+    assert set(kinds['kind_counts']) == DEVIATION_KINDS
+    assert kinds['kind_counts']['wrong_inference'] == 10
+    assert kinds['kind_counts']['never_checked_fact'] == 0
+    rate_rise = [reason for reason in verdict.reasons if reason.startswith('rate-rise')]
+    assert rate_rise and not rate_rise[0].endswith(' -> FIRE')
+
+
+def test_evaluate_dominant_kind_below_min_records_does_not_fire():
+    verdict = _evaluate(_daily(1, BASELINE_DAYS) + _daily(1, range(0, 6), kind='other'))
+
+    assert verdict.fire is False
+
+
+def test_evaluate_kindless_records_never_form_a_pattern():
+    verdict = _evaluate(_daily(3, range(0, 28), kindless=True))
+
+    assert verdict.fire is False
+    assert _evidence(verdict, 'kinds')['unkinded'] == 21
+
+
+@pytest.mark.parametrize(('prose_only_count', 'fires'), [(3, True), (2, False)])
+def test_evaluate_prose_only_records_fire_at_the_minimum(prose_only_count, fires):
+    flat = _daily(3, range(0, 28))
+    prose = _daily(1, range(0, prose_only_count), kind='other', prose_only=True)
+
+    verdict = _evaluate(flat + prose)
+
+    assert verdict.fire is fires
+    assert _evidence(verdict, 'prose_only')['prose_only_count'] == prose_only_count
+
+
+def test_evaluate_windows_are_measured_from_now_not_a_day_boundary():
+    second = timedelta(seconds=1)
+    records = [
+        _at(NOW + second),
+        _at(NOW - timedelta(days=28) - second),
+        _at(NOW - timedelta(days=7) + second),
+        _at(NOW - timedelta(days=7) - second),
+    ]
+
+    window = _evidence(_evaluate(records), 'window')
+
+    assert window['recent_count'] == 1
+    assert window['baseline_count'] == 1
+
+
+def test_evaluate_naive_now_is_read_as_utc():
+    records = _daily(3, BASELINE_DAYS) + _daily(8, RECENT_DAYS)
+
+    assert _evaluate(records, now=NOW.replace(tzinfo=None)) == _evaluate(records, now=NOW)
+
+
+def test_evaluate_top_task_ids_are_the_five_busiest_recent_tasks():
+    counts = {'t1': 1, 't2': 5, 't3': 3, 't4': 3, 't5': 7, 't6': 2, 't7': 4}
+    records = [
+        _at(NOW - timedelta(hours=1 + n), task_id=task_id)
+        for task_id, count in counts.items()
+        for n in range(count)
+    ]
+
+    top = _evidence(_evaluate(records), 'top_task_ids')['top_task_ids']
+
+    assert top == [
+        {'task_id': 't5', 'count': 7},
+        {'task_id': 't2', 'count': 5},
+        {'task_id': 't7', 'count': 4},
+        {'task_id': 't3', 'count': 3},
+        {'task_id': 't4', 'count': 3},
+    ]
