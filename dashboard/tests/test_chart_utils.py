@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import typing
 
 import pytest
@@ -301,6 +302,10 @@ class TestSeparateLabelBoundsWithinRange:
 # ---------------------------------------------------------------------------
 
 
+class _WidthedChart(ChartData):
+    bucket_minutes: int
+
+
 class TestTrimLeadingZeroBuckets:
     """Tests for trim_leading_zero_buckets — drop leading zero-value (label, 0) pairs."""
 
@@ -362,3 +367,17 @@ class TestTrimLeadingZeroBuckets:
         data: ChartData = {'labels': ['a', 'b'], 'values': [1]}
         with pytest.raises(ValueError):
             trim_leading_zero_buckets(data)
+
+    @pytest.mark.parametrize('labels, values, trimmed_labels, trimmed_values', [
+        (['a', 'b', 'c'], [0, 2, 0], ['b', 'c'], [2, 0]),
+        (['a'], [0], [], []),
+    ])
+    def test_keeps_every_key_beside_the_series(self, labels, values, trimmed_labels, trimmed_values):
+        """A key the chart carries beside labels and values survives the trim."""
+        data: _WidthedChart = {'labels': labels, 'values': values, 'bucket_minutes': 60}
+        before = copy.deepcopy(data)
+
+        result = trim_leading_zero_buckets(data)
+
+        assert result == {'labels': trimmed_labels, 'values': trimmed_values, 'bucket_minutes': 60}
+        assert data == before
