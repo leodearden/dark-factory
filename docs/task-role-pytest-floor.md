@@ -42,7 +42,9 @@ runs the full suite.
   `orchestrator/tests/test_whole_tree_scan_timeout_guard.py` turns red on any
   detected `rglob`/`glob('*.py')` scanner that `is_whole_tree_guard_module`
   does not admit. Without that check a new scanner would silently drop out of
-  task-role verify.
+  task-role verify. The same check covers every module that consumes the
+  shared tree pass (`orchestrator/tests/_tree_scan.py`), so a guard that stops
+  globbing privately and joins the pass cannot drop out of the family either.
 - **Coverage stays monotone in the diff.** A co-committed test only adds a
   target. That is the property task 3294 restored.
 
