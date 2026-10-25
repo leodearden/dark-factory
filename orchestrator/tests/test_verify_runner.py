@@ -8878,7 +8878,7 @@ LOOP_ANSWER_CEILING_SECS = HEARTBEAT_STOP_JOIN_SECS
 
 
 class _WedgedHeartbeatWriter(threading.Thread):
-    """A heartbeat writer that ignores stop(); join() reports if the event loop stayed free."""
+    """A heartbeat writer that ignores stop(); each join() samples once whether the loop answers."""
 
     def __init__(self) -> None:
         release = threading.Event()
