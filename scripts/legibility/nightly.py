@@ -1035,7 +1035,6 @@ def _joined_failures(failures: Sequence[tuple[str, str]]) -> str:
     return '; '.join(f'{session}: {reason}' for session, reason in failures)
 
 
-
 def _ledger_fault(
     cfg: LegibilityConfig, target_date: date, *, failed: int, error: Exception,
 ) -> _LedgerWrite:
@@ -1049,10 +1048,8 @@ def _ledger_fault(
     return outcome
 
 
-
 def _trickle_run_ref(cfg: LegibilityConfig, target_date: date) -> str:
     return f'trickle-{cfg.project_id}-{target_date:%Y%m%d}'
-
 
 
 def _ledger_coded_sessions(
@@ -1085,7 +1082,6 @@ def _ledger_coded_sessions(
     return _LedgerWrite(written=written, failed=0, error=None)
 
 
-
 def _report_merge(
     cfg: LegibilityConfig,
     target_date: date,
@@ -1101,7 +1097,6 @@ def _report_merge(
     codebook.warn_unknown_invariant_slugs(
         merge.invariant_slugs, invariant_slugs, run=_trickle_run_ref(cfg, target_date),
     )
-
 
 
 def _report_sample_outcome(
@@ -1462,7 +1457,6 @@ def run_nightly(
     return result
 
 
-
 def _load_config_for_project(
     project_id: str,
     target_date: date,
@@ -1508,7 +1502,6 @@ def _census_anchor(state_path: Path) -> str | None:
     of the same file owns the malformed WARNING."""
     _status, anchor = trickle_state.read_last_census_at(state_path)
     return anchor if isinstance(anchor, str) else None
-
 
 
 def _run_configured_nightly(

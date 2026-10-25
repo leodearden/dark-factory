@@ -6,9 +6,10 @@ Every stage is exercised through run_nightly's injected seams (selector,
 digest_builder, invoke, committer, census_launcher, status_fetcher, poster,
 recorder) — no test here ever touches a real LLM, the machine-operated main
 git checkout, a live escalation server, a real census, or real systemd. The
-main()-entry tests, which can inject nothing, spy the census.py subprocess. The one true end-to-end test
-(test_run_nightly_happy_path_end_to_end) uses a real temp `git init` repo so
-the commit path is genuinely exercised without risking main.
+main()-entry tests, which can inject nothing, spy the census.py subprocess.
+The one true end-to-end test (test_run_nightly_happy_path_end_to_end) uses a
+real temp `git init` repo so the commit path is genuinely exercised without
+risking main.
 """
 from __future__ import annotations
 
@@ -3892,16 +3893,15 @@ def _run_e2e_nightly(tmp_path, *, branch=None, recorder=None, budget_bytes=None,
     The other knobs shape a run that does NOT fail: *budget_bytes* rewrites
     the config with a digest byte budget small enough to suppress the whole
     night, *transcript=False* makes it a genuinely quiet one, *invariants_doc*
-    is committed as the project's design-invariants doc, and
-    *recorder* / *committer* / *poster* / *invoke* / *digest_builder* /
-    *census_launcher* are the injected seams (*census_launcher* defaults to a
-    no-op, so no night here can spawn census.py), *census_state* is written as
-    the repo's census-state.json
-    (*poster* defaults to a no-op, so a test that does not care about
-    escalations never has to build one), and *pass_kind* (default
-    ``MANUAL``) is passed through. *unreadable_transcripts* is the
-    exception: it strips every permission bit from the projects root for the
-    run, so enumerating the transcripts raises inside sampling.
+    is committed as the project's design-invariants doc, and *census_state*
+    is written as the repo's census-state.json. *recorder* / *committer* /
+    *poster* / *invoke* / *digest_builder* / *census_launcher* are the
+    injected seams; *poster* and *census_launcher* default to no-ops, so a
+    test that does not care about escalations never builds a poster and no
+    night here can spawn census.py. *pass_kind* (default ``MANUAL``) is
+    passed through. *unreadable_transcripts* is the exception: it strips
+    every permission bit from the projects root for the run, so enumerating
+    the transcripts raises inside sampling.
     """
     work_cwd = str(tmp_path / 'work')
     repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
