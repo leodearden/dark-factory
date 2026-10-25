@@ -157,6 +157,30 @@ def test_unhatched_sibling():
             f'sibling; got {found!r}'
         )
 
+    def test_flags_inline_bare_construction(self, tmp_path):
+        """``OrchestratorConfig().x.y == literal`` binds no name at all.
+
+        The most common one-line defaults test asserts straight off the
+        construction, so the scan must not bail out when no name is bound.
+        """
+        src = _write(tmp_path, 'test_synth_inline.py', '''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_inline_default():
+    assert OrchestratorConfig().starvation_watchdog.skip_threshold == 50
+''')
+        found = list(iter_default_asserting_tests(src))
+        assert _names(found) == {(None, 'test_inline_default')}, (
+            f'expected the inline bare-construction landmine to be flagged; '
+            f'got {found!r}'
+        )
+        _cls, _test, _lineno, attr, literal = found[0]
+        assert attr == 'starvation_watchdog.skip_threshold', (
+            f'expected the dotted path below the inline call; got {attr!r}'
+        )
+        assert literal == 50, f'expected the asserted literal; got {literal!r}'
+
 
 # ---------------------------------------------------------------------------
 # MUST NOT FLAG
@@ -272,6 +296,36 @@ def test_not_a_default():
 ''')
         assert list(iter_default_asserting_tests(src)) == [], (
             'only literals equal to the package default may be flagged'
+        )
+
+    def test_inline_construction_under_the_hatch(self, tmp_path):
+        """The inline shape is honoured by the hatch like the bound shape."""
+        src = _write(tmp_path, 'test_synth_inline_hatched.py', '''
+import pytest
+from orchestrator.config import OrchestratorConfig
+
+
+@pytest.mark.usefixtures("code_default_config")
+def test_inline_default():
+    assert OrchestratorConfig().starvation_watchdog.skip_threshold == 50
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'an inline bare construction under the sanctioned hatch must be '
+            'honoured'
+        )
+
+    def test_inline_construction_with_kwargs(self, tmp_path):
+        """Only a BARE inline call is a root; any other Call root is not."""
+        src = _write(tmp_path, 'test_synth_inline_kwargs.py', '''
+from orchestrator.config import GitConfig, OrchestratorConfig
+
+
+def test_inline_explicit():
+    assert OrchestratorConfig(git=GitConfig(main_branch='main')).git.merge_config_only_full_gate_globs == []
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'an inline config constructed with explicit kwargs is not a '
+            'bare-default landmine'
         )
 
 
