@@ -3,7 +3,7 @@
 The fused-memory server 307-redirects ``/mcp/`` to ``/mcp``. A bare
 ``httpx.AsyncClient`` does not follow that redirect, so a POST to the slashed
 form is a perfectly successful HTTP exchange that discards the payload. The
-sweep guard in ``test_mcp_post_transport.py`` exists to stop a future call site
+sweep guard in ``test_mcp_url_sweep_guard.py`` exists to stop a future call site
 from reintroducing the slash; this module is how it looks.
 
 WHY PARSING, NOT GREP. The guard originally matched the substring ``}/mcp/'``.
@@ -210,7 +210,7 @@ def _slashed_url_spans(source: str, *, filename: str) -> list[tuple[int, int]]:
     # vs 6.2s for the equivalent sub-walk form. (Parsing those files costs
     # ~7s on top of either, so this is a real but not dominant share; the
     # guard's actual fix for wall clock is caching the walk — see
-    # ``test_mcp_post_transport.py::_sweep_findings``.)
+    # ``test_mcp_url_sweep_guard.py::_sweep_findings``.)
     nested: set[int] = set()
     for node in ast.walk(tree):
         # A suppressed node's descendants are suppressed too; a tail-owning

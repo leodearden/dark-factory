@@ -1,6 +1,6 @@
 """Unit tests for the AST-based trailing-slash MCP URL detector.
 
-The repo-wide sweep guard in ``test_mcp_post_transport.py`` used to look for
+The repo-wide sweep guard in ``test_mcp_url_sweep_guard.py`` used to look for
 the substring ``}/mcp/'``. That anchor was chosen because a bare ``/mcp/``
 also matches unrelated prose in ``merge_queue.py`` docstrings — but it bought
 that immunity by hard-coding one single spelling of one single construct, so
