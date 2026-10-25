@@ -11,8 +11,11 @@ as NEW.
 The move is audited as ONE change, merge-base(OLD, NEW) -> NEW, under the commit
 gate's own rules: the baseline may not be deleted, the ledger is append-only,
 and a raise is covered by the sum of the entry files the move adds. A rewind
-adds nothing and passes. Same exit ladder as the commit gate: 0 clean, 1 a
-policy refusal, 2 the auditor could not do its job.
+adds nothing and passes. A sideways move is a rewind to the merge base plus an
+advance from it, so what only OLD holds -- an entry main recorded, a lowering
+main took -- is dropped unrefused, exactly as a rewind drops it. Same exit
+ladder as the commit gate: 0 clean, 1 a policy refusal, 2 the auditor could not
+do its job.
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ import argparse
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -41,6 +45,21 @@ except ImportError as exc:
     raise SystemExit(2) from exc
 
 _PREFIX = 'ratchet advance gate:'
+
+
+@dataclass(frozen=True)
+class _Move:
+    """main's move OLD -> NEW over their merge base, and the baseline blob at each end.
+
+    ``base`` is None for histories with nothing in common, and a baseline oid is
+    None where that commit holds no baseline.
+    """
+
+    old: str
+    new: str
+    base: str | None
+    base_baseline_oid: str | None
+    new_baseline_oid: str | None
 
 
 def _say(*lines: str, refusal: bool = False) -> None:
@@ -80,18 +99,16 @@ def _raises(root: Path, base_oid: str, new_oid: str) -> list[metrics.Violation]:
         )
 
 
-def _refuse_unrecorded(
-    old: str, new: str, base: str, unrecorded: list[metrics.Violation]
-) -> int:
+def _refuse_unrecorded(move: _Move, unrecorded: list[metrics.Violation]) -> int:
     baseline = metrics.BASELINE_RELPATH
     _say(
-        f"main's move {old[:10]}..{new[:10]} RAISES {len(unrecorded)} measure(s) of "
+        f"main's move {move.old[:10]}..{move.new[:10]} RAISES {len(unrecorded)} measure(s) of "
         f'{baseline} that the entry files it adds do not record:',
         *(f'  {violation.message}' for violation in unrecorded),
         metrics.RAISE_REMEDY,
         'This raise reached main without passing the commit gate (a rebase, a '
         'clean merge or a hook-less commit). Record it on the branch against '
-        f"main's baseline: `git checkout {base} -- {baseline}`, then "
+        f"main's baseline: `git checkout {move.base} -- {baseline}`, then "
         f'`python scripts/merge_lane_metrics.py --write-baseline {baseline} '
         '--authorize-raise <task-id> --reason "<why this is net-additive>"`, '
         'then commit both artifacts.',
@@ -120,27 +137,24 @@ def _restores_mains_previous_image(
     return True
 
 
-def _audit_baseline(
-    root: Path, old: str, new: str, base: str | None, own: list[dict]
-) -> int:
+def _audit_baseline(root: Path, move: _Move, own: list[dict]) -> int:
     """Audit NEW's baseline against BASE's, covered by the move's own entries."""
-    new_oid = _baseline_oid(root, new)
-    base_oid = None if base is None else _baseline_oid(root, base)
+    base_oid, new_oid = move.base_baseline_oid, move.new_baseline_oid
     if new_oid is None or new_oid == base_oid:
         return 0
-    if base is None or base_oid is None:
+    if move.base is None or base_oid is None:
         _say(
             f'{metrics.BASELINE_RELPATH} is absent from the merge base, so this is '
             'a first write with nothing to compare against.'
         )
         return 0
     raises = _raises(root, base_oid, new_oid)
-    if not raises or _restores_mains_previous_image(root, base, new_oid, raises):
+    if not raises or _restores_mains_previous_image(root, move.base, new_oid, raises):
         return 0
     unrecorded = metrics.unrecorded_raises(raises, own)
     if not unrecorded:
         return 0
-    return _refuse_unrecorded(old, new, base, unrecorded)
+    return _refuse_unrecorded(move, unrecorded)
 
 
 def _audit(root: Path, old_revision: str, new_revision: str) -> int:
@@ -165,7 +179,14 @@ def _audit(root: Path, old_revision: str, new_revision: str) -> int:
 
     if not _changed_artifacts(root, base, new):
         return 0
-    if base is not None and _baseline_oid(root, base) and not _baseline_oid(root, new):
+    move = _Move(
+        old,
+        new,
+        base,
+        base_baseline_oid=None if base is None else _baseline_oid(root, base),
+        new_baseline_oid=_baseline_oid(root, new),
+    )
+    if move.base_baseline_oid and not move.new_baseline_oid:
         _say(
             f'{metrics.BASELINE_RELPATH} may not be DELETED. With nothing to '
             'compare against, every frozen measure resets and every ceiling is '
@@ -179,7 +200,7 @@ def _audit(root: Path, old_revision: str, new_revision: str) -> int:
         # A VERDICT, so the POLICY rung, uniform with the commit gate.
         _say(str(exc), refusal=True)
         return 1
-    return _audit_baseline(root, old, new, base, own)
+    return _audit_baseline(root, move, own)
 
 
 def _build_parser() -> argparse.ArgumentParser:

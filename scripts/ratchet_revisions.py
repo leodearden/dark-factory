@@ -85,11 +85,12 @@ def blob_text(root: Path, oid: str) -> str:
     return git(root, 'cat-file', 'blob', oid)
 
 
-def restores_previous_image(root: Path, staged_oid: str, history_tip: str) -> str | None:
-    """The commit whose baseline blob *staged_oid* restores, if it is the LAST one.
+def restores_previous_image(root: Path, candidate_oid: str, history_tip: str) -> str | None:
+    """The commit whose baseline blob *candidate_oid* restores, if it is the LAST one.
 
-    *history_tip* names the history the rule reads: HEAD for a commit, the merge
-    base for a move of main.
+    *candidate_oid* is the baseline blob seeking admission and *history_tip* the
+    history the rule reads it against: the staged blob and HEAD for a commit,
+    NEW's blob and the merge base for a move of main.
 
     UNDOING THE LAST CHANGE TO THE BASELINE IS NOT A NEW RAISE. The path's
     immediately-previous value is the state this repository held one commit ago,
@@ -141,7 +142,7 @@ def restores_previous_image(root: Path, staged_oid: str, history_tip: str) -> st
         oid = line.split()[:1]
         if oid == [tip_oid]:
             continue
-        return commit if oid == [staged_oid] else None
+        return commit if oid == [candidate_oid] else None
     return None
 
 
@@ -182,12 +183,12 @@ def own_entries(root: Path, parents: list[str], tip: str | None = None) -> list[
     refusals are ``metrics``' own ``AppendOnlyViolation`` verdicts, which each
     gate puts on its policy rung.
     """
-    staged = entry_listing(root, tip)
+    tip_listing = entry_listing(root, tip)
     own_names = metrics.own_entry_names(
-        [entry_listing(root, parent) for parent in parents], staged
+        [entry_listing(root, parent) for parent in parents], tip_listing
     )
-    own = [metrics.parse_entry(name, blob_text(root, staged[name])) for name in own_names]
-    return metrics.retire_legacy_ledger(retired_entries(root, parents, tip), staged, own)
+    own = [metrics.parse_entry(name, blob_text(root, tip_listing[name])) for name in own_names]
+    return metrics.retire_legacy_ledger(retired_entries(root, parents, tip), tip_listing, own)
 
 
 def retired_entries(root: Path, parents: list[str], tip: str | None = None) -> list[dict]:
@@ -203,8 +204,9 @@ def retired_entries(root: Path, parents: list[str], tip: str | None = None) -> l
         if None in held.values():
             raise metrics.AppendOnlyViolation(
                 f'{legacy} was retired: a raise is recorded as one file under '
-                f'{metrics.LEDGER_DIR_RELPATH}/. Delete it from this commit and '
-                'split any entry only it carries with '
+                f'{metrics.LEDGER_DIR_RELPATH}/. Delete it from the change (the '
+                'commit, or the branch being landed) and split any entry only it '
+                'carries with '
                 'scripts/split_merge_lane_ratchet_ledger.py.'
             )
         return []
