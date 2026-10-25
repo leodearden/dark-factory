@@ -2,13 +2,20 @@
 
 import functools
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from _git_repo import Repo, make_repo, path_with_git_answering, path_with_git_replaced_on
+from _git_repo import (
+    Repo,
+    make_repo,
+    path_with_git_answering,
+    path_with_git_replaced_on,
+    path_with_git_stalled_on,
+)
 
 from client_feed.contract import Branch
 from client_feed.sources.git import (
@@ -172,6 +179,24 @@ def test_reading_an_unknown_blob_raises_a_typed_error(repo: Repo) -> None:
 
     assert caught.value.subcommand == 'cat-file'
     assert str(repo.root) not in str(caught.value)
+
+
+def test_a_blob_read_git_never_answers_fails_as_a_timeout(
+    repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo.write('a.txt', 'a\n')
+    commit = repo.commit('one', when=T0)
+    blob = repo.rev(f'{commit}:a.txt')
+    monkeypatch.setenv('PATH', path_with_git_stalled_on(tmp_path / 'bin', 'cat-file', seconds=30))
+    started = time.monotonic()
+
+    with pytest.raises(GitError) as caught, blob_reader(repo.root, timeout_secs=0.5) as read:
+        read(blob)
+
+    assert caught.value.subcommand == 'cat-file'
+    assert caught.value.returncode is None
+    assert 'timed out' in caught.value.reason
+    assert time.monotonic() - started < 15
 
 
 @pytest.mark.parametrize('commit', ['--output=x', 'HEAD', 'a' * 39, 'A' * 40, f'{"a" * 40}\n'])
