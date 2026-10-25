@@ -573,6 +573,135 @@ def _failure_error(
     )
 
 
+def _append_pool_truncation(
+    lines: list[str], withheld: PoolWithheld | None,
+) -> None:
+    """Append the pool-truncation block to *lines*, if there is one.
+
+    The one place the candidate-section renderer emits the census, so the fact
+    and its guidance cannot end up worded differently on the single and batch
+    paths. Appends nothing when the pool was complete.
+    """
+    rendered = withheld.render() if withheld is not None else None
+    if rendered is not None:
+        lines.append(rendered)
+        lines.append('')
+
+
+@dataclass(frozen=True)
+class _SectionHeadings:
+    """The two heading lines that tell one prompt's candidate section from another's."""
+
+    candidate: str
+    pool: str
+
+    @classmethod
+    def single(cls) -> _SectionHeadings:
+        return cls(candidate='Candidate task (not yet created)', pool='Pool')
+
+    @classmethod
+    def batch(cls, index: int) -> _SectionHeadings:
+        return cls(
+            candidate=f'Candidate batch_index={index}', pool=f'Pool for batch_index={index}',
+        )
+
+
+def _render_candidate_section(
+    candidate: CandidateTask,
+    pool: list[PoolEntry],
+    withheld: PoolWithheld | None,
+    headings: _SectionHeadings,
+    cfg: CuratorConfig,
+) -> list[str]:
+    """The lines of one candidate's prompt section: the candidate, its pool, the pool's census."""
+    desc_cap = cfg.entry_description_chars
+    details_cap = cfg.entry_details_chars
+
+    lines = [
+        f'# {headings.candidate}',
+        f'  title: {candidate.title}',
+        f'  priority: {candidate.priority}',
+        f'  spawn_context: {candidate.spawn_context}',
+    ]
+    if candidate.spawned_from:
+        lines.append(f'  spawned_from: {candidate.spawned_from}')
+    if candidate.description:
+        lines.append(f'  description: {clip_for_prompt(candidate.description, desc_cap)}')
+    if candidate.details:
+        lines.append(f'  details: {clip_for_prompt(candidate.details, details_cap)}')
+    if candidate.files_to_modify:
+        lines.append('  files_to_modify: ' + ', '.join(candidate.files_to_modify))
+    lines.append('')
+
+    lines.append(f'# {headings.pool} ({len(pool)} tasks)')
+    if not pool:
+        lines.append('  (empty — no candidates; answer "create")')
+    else:
+        for entry in pool:
+            lines.append(entry.render(desc_cap, details_cap))
+            lines.append('')
+    _append_pool_truncation(lines, withheld)
+    return lines
+
+
+def _render_single_prompt(
+    candidate: CandidateTask,
+    pool: list[PoolEntry],
+    withheld: PoolWithheld | None,
+    cfg: CuratorConfig,
+) -> str:
+    """The user prompt that asks for one candidate's decision."""
+    return '\n'.join([
+        *_render_candidate_section(candidate, pool, withheld, _SectionHeadings.single(), cfg),
+        'Decide drop / combine / create per the system-prompt rules. '
+        'Return only the JSON object required by the schema.',
+    ])
+
+
+def _render_batch_section(
+    candidate: CandidateTask,
+    pool: list[PoolEntry],
+    index: int,
+    withheld: PoolWithheld | None,
+    cfg: CuratorConfig,
+) -> str:
+    """Candidate *index*'s section of a batch prompt, ending in a blank line.
+
+    :meth:`TaskCurator.prepare_candidate` estimates a candidate's token cost
+    from this same text, so the batch-sizing accumulator counts what is sent.
+    """
+    headings = _SectionHeadings.batch(index)
+    return '\n'.join([*_render_candidate_section(candidate, pool, withheld, headings, cfg), ''])
+
+
+def _render_batch_prompt(
+    candidates: list[CandidateTask],
+    pools: list[list[PoolEntry]],
+    withheld_list: list[PoolWithheld | None] | None,
+    cfg: CuratorConfig,
+) -> str:
+    """The user prompt that asks for one decision per candidate, addressed by batch_index.
+
+    Pools stay per-candidate (never unioned), and so does each pool's census,
+    which renders inside its own candidate's section so a truncated pool for
+    one candidate is never read as a qualifier on another's. A short or absent
+    *withheld_list* renders nothing for the missing entries, which is what an
+    untruncated pool renders anyway.
+    """
+    censuses = withheld_list or []
+    sections = [
+        _render_batch_section(
+            candidate, pool, i, censuses[i] if i < len(censuses) else None, cfg,
+        )
+        for i, (candidate, pool) in enumerate(zip(candidates, pools, strict=True))
+    ]
+    instruction = (
+        'Return one decision per candidate as {"decisions": [...]} '
+        'with a candidate_index field on each item, per the schema.'
+    )
+    return '\n'.join([*sections, instruction])
+
+
 @dataclass
 class _DegradedStreak:
     """One project's run of consecutive degraded curations.
@@ -3168,135 +3297,6 @@ def _count_absent(task_ids: Iterable[str], admitted: set[str]) -> int:
     moment each cap fires reports entries that end up present.
     """
     return len({tid for tid in task_ids if tid and tid not in admitted})
-
-
-def _append_pool_truncation(
-    lines: list[str], withheld: PoolWithheld | None,
-) -> None:
-    """Append the pool-truncation block to *lines*, if there is one.
-
-    The one place the candidate-section renderer emits the census, so the fact
-    and its guidance cannot end up worded differently on the single and batch
-    paths. Appends nothing when the pool was complete.
-    """
-    rendered = withheld.render() if withheld is not None else None
-    if rendered is not None:
-        lines.append(rendered)
-        lines.append('')
-
-
-@dataclass(frozen=True)
-class _SectionHeadings:
-    """The two heading lines that tell one prompt's candidate section from another's."""
-
-    candidate: str
-    pool: str
-
-    @classmethod
-    def single(cls) -> _SectionHeadings:
-        return cls(candidate='Candidate task (not yet created)', pool='Pool')
-
-    @classmethod
-    def batch(cls, index: int) -> _SectionHeadings:
-        return cls(
-            candidate=f'Candidate batch_index={index}', pool=f'Pool for batch_index={index}',
-        )
-
-
-def _render_candidate_section(
-    candidate: CandidateTask,
-    pool: list[PoolEntry],
-    withheld: PoolWithheld | None,
-    headings: _SectionHeadings,
-    cfg: CuratorConfig,
-) -> list[str]:
-    """The lines of one candidate's prompt section: the candidate, its pool, the pool's census."""
-    desc_cap = cfg.entry_description_chars
-    details_cap = cfg.entry_details_chars
-
-    lines = [
-        f'# {headings.candidate}',
-        f'  title: {candidate.title}',
-        f'  priority: {candidate.priority}',
-        f'  spawn_context: {candidate.spawn_context}',
-    ]
-    if candidate.spawned_from:
-        lines.append(f'  spawned_from: {candidate.spawned_from}')
-    if candidate.description:
-        lines.append(f'  description: {clip_for_prompt(candidate.description, desc_cap)}')
-    if candidate.details:
-        lines.append(f'  details: {clip_for_prompt(candidate.details, details_cap)}')
-    if candidate.files_to_modify:
-        lines.append('  files_to_modify: ' + ', '.join(candidate.files_to_modify))
-    lines.append('')
-
-    lines.append(f'# {headings.pool} ({len(pool)} tasks)')
-    if not pool:
-        lines.append('  (empty — no candidates; answer "create")')
-    else:
-        for entry in pool:
-            lines.append(entry.render(desc_cap, details_cap))
-            lines.append('')
-    _append_pool_truncation(lines, withheld)
-    return lines
-
-
-def _render_single_prompt(
-    candidate: CandidateTask,
-    pool: list[PoolEntry],
-    withheld: PoolWithheld | None,
-    cfg: CuratorConfig,
-) -> str:
-    """The user prompt that asks for one candidate's decision."""
-    return '\n'.join([
-        *_render_candidate_section(candidate, pool, withheld, _SectionHeadings.single(), cfg),
-        'Decide drop / combine / create per the system-prompt rules. '
-        'Return only the JSON object required by the schema.',
-    ])
-
-
-def _render_batch_section(
-    candidate: CandidateTask,
-    pool: list[PoolEntry],
-    index: int,
-    withheld: PoolWithheld | None,
-    cfg: CuratorConfig,
-) -> str:
-    """Candidate *index*'s section of a batch prompt, ending in a blank line.
-
-    :meth:`TaskCurator.prepare_candidate` estimates a candidate's token cost
-    from this same text, so the batch-sizing accumulator counts what is sent.
-    """
-    headings = _SectionHeadings.batch(index)
-    return '\n'.join([*_render_candidate_section(candidate, pool, withheld, headings, cfg), ''])
-
-
-def _render_batch_prompt(
-    candidates: list[CandidateTask],
-    pools: list[list[PoolEntry]],
-    withheld_list: list[PoolWithheld | None] | None,
-    cfg: CuratorConfig,
-) -> str:
-    """The user prompt that asks for one decision per candidate, addressed by batch_index.
-
-    Pools stay per-candidate (never unioned), and so does each pool's census,
-    which renders inside its own candidate's section so a truncated pool for
-    one candidate is never read as a qualifier on another's. A short or absent
-    *withheld_list* renders nothing for the missing entries, which is what an
-    untruncated pool renders anyway.
-    """
-    censuses = withheld_list or []
-    sections = [
-        _render_batch_section(
-            candidate, pool, i, censuses[i] if i < len(censuses) else None, cfg,
-        )
-        for i, (candidate, pool) in enumerate(zip(candidates, pools, strict=True))
-    ]
-    instruction = (
-        'Return one decision per candidate as {"decisions": [...]} '
-        'with a candidate_index field on each item, per the schema.'
-    )
-    return '\n'.join([*sections, instruction])
 
 
 def _task_files(task: dict) -> list[str]:
