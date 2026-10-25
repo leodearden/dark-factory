@@ -149,11 +149,6 @@ OUTSIDE_THE_SHARED_PASS_DECLARATION = governed_exceptions(
     default_covers=1,
 )
 
-# Family members still sweeping privately; shrinks to empty as each migrates.
-_NOT_YET_MIGRATED = frozenset({
-    'test_whole_tree_scan_timeout_guard.py',
-})
-
 # Worst wall clock MEASURED for a member of this family under REAL load: a
 # per-test TOTAL (setup + call + teardown, what a timeout mark bounds; almost all
 # of it module-fixture setup) of 148.65s for test_merge_lane_ratchet.py::
@@ -1473,19 +1468,28 @@ def _sub_ceiling_marks_in_consumers(modules: Mapping[str, _ModuleCensus]) -> lis
 
 
 def _unsanctioned_private_sweeps(modules: Mapping[str, _ModuleCensus]) -> list[str]:
-    """(iv) Private sweepers other than the shared pass's home and the reasoned exemptions."""
-    sanctioned = {_SHARED_PASS_MODULE} | _PERMANENT_PRIVATE_SWEEPS.keys() | _NOT_YET_MIGRATED
+    """(iv) The private sweepers must be exactly the shared pass's home plus the reasoned exemptions.
+
+    An exemption that stopped sweeping is (vi)'s stale entry, so only the home's
+    absence is reported here.
+    """
+    sweepers = _sweepers(modules)
+    sanctioned = {_SHARED_PASS_MODULE} | _PERMANENT_PRIVATE_SWEEPS.keys()
     return [
-        f'{name}: sweeps a directory tree for *.py itself'
-        for name in sorted(_sweepers(modules) - sanctioned)
+        *(
+            f'{name}: sweeps a directory tree for *.py itself'
+            for name in sorted(sweepers - sanctioned)
+        ),
+        *(
+            [f'{_SHARED_PASS_MODULE}: the shared pass no longer sweeps a tree for *.py']
+            if _SHARED_PASS_MODULE not in sweepers else []
+        ),
     ]
 
 
 def _members_outside_the_shared_pass(modules: Mapping[str, _ModuleCensus]) -> list[str]:
     """(v) Family members that neither consume the pass nor carry a reasoned exemption."""
-    reasoned = (
-        _PERMANENT_PRIVATE_SWEEPS.keys() | _OUTSIDE_THE_SHARED_PASS.keys() | _NOT_YET_MIGRATED
-    )
+    reasoned = _PERMANENT_PRIVATE_SWEEPS.keys() | _OUTSIDE_THE_SHARED_PASS.keys()
     return [
         f'{name}: is a whole-tree guard family member that does not consume the shared pass'
         for name in sorted(_family(modules) - _consumers(modules) - reasoned)
@@ -1496,11 +1500,6 @@ def _stale_allowlist_entries(modules: Mapping[str, _ModuleCensus]) -> list[str]:
     """(vi) Allowlist entries whose module no longer has the shape the entry excuses."""
     family, sweepers, consumers = _family(modules), _sweepers(modules), _consumers(modules)
     return [
-        *(
-            f'_NOT_YET_MIGRATED: {name} is not a family member still waiting to migrate'
-            for name in sorted(_NOT_YET_MIGRATED)
-            if name not in family or name in consumers
-        ),
         *(
             f'_PERMANENT_PRIVATE_SWEEPS: {name} no longer sweeps privately'
             for name in sorted(_PERMANENT_PRIVATE_SWEEPS)
@@ -1693,4 +1692,42 @@ def test_formerly_mixed_module_is_not_a_family_member(module_name: str) -> None:
     )
     assert _scans_whole_tree_py(source) is False, (
         f'{module_name} sweeps a directory tree for *.py files. {reason}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Every scan of the original family now reaches the tree through the shared
+# pass (task 4600, acceptance 4(c)).
+#
+# The family task 4215 marked -- its twelve scanners plus this meta-guard -- by
+# the module that now hosts each one's scan. test_merge_queue_reachback_patch_guard.py
+# and test_serial_merge_worker_import_guard.py are omitted: tasks 5036 and 5034
+# deleted them.
+# ---------------------------------------------------------------------------
+
+_ORIGINAL_FAMILY_HOMES = MappingProxyType({
+    'test_eval_boundary_suite.py': 'test_taskworkflow_construction_point_guard.py',
+    'test_event_loop_antipattern_guard.py': 'test_event_loop_antipattern_guard.py',
+    'test_killpg_frozen_pgid_guard.py': 'test_killpg_frozen_pgid_guard.py',
+    'test_lane_lifecycle_gitops.py': 'test_lane_note_assigned_single_writer_guard.py',
+    'test_lock_release_single_writer_guard.py': 'test_lock_release_single_writer_guard.py',
+    'test_marker_registration_drift.py': 'test_marker_registration_drift.py',
+    'test_prune_chokepoint_guard.py': 'test_prune_chokepoint_guard.py',
+    'test_raw_semaphore_access_guard.py': 'test_raw_semaphore_access_guard.py',
+    'test_scheduler_hold_history.py': 'test_lock_event_emit_site_guard.py',
+    'test_whole_tree_scan_timeout_guard.py': 'test_whole_tree_scan_timeout_guard.py',
+    'test_workflow_factory.py': 'test_taskworkflow_construction_point_guard.py',
+})
+
+
+def test_every_original_family_scan_is_served_by_the_shared_pass() -> None:
+    outside = [
+        f'{original}: its scan lives in {home}, which does not consume the shared pass'
+        for original, home in sorted(_ORIGINAL_FAMILY_HOMES.items())
+        if not _consumes_tree_pass((_TESTS_DIR / home).read_text(encoding='utf-8'))
+    ]
+    assert outside == [], (
+        'Each scan of the original whole-tree guard family must resolve to the one '
+        'shared tree pass (_tree_scan.py), not a private sweep of its own:\n  '
+        + '\n  '.join(outside)
     )
