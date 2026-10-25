@@ -4,14 +4,18 @@ command, run in its checkout, says whether a census output may land there
 repo under ``tmp_path`` as the checkout."""
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
 import subprocess
 import sys
-import time
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from legibility import config, landing_gate
+
+from df_pytest_isolation import read_leaked_pid, wait_pid_gone
 
 GateStatus = landing_gate.GateStatus
 
@@ -137,14 +141,6 @@ def test_a_failed_verdict_describes_its_command_and_exit_code(checkout: Path) ->
     assert sys.executable in described
 
 
-def _running(pid: int) -> bool:
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
-        return False
-    return stat.rsplit(")", 1)[1].split()[0] != "Z"
-
-
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
 def test_a_timeout_kills_every_process_the_command_started(checkout: Path, tmp_path_factory) -> None:
     pidfile = tmp_path_factory.mktemp("grandchild") / "pid"
@@ -159,15 +155,16 @@ def test_a_timeout_kills_every_process_the_command_started(checkout: Path, tmp_p
     verdict = landing_gate.run_gate(checkout, _spec(code, timeout_secs=3))
 
     assert verdict.status is GateStatus.DID_NOT_RUN
-    pid = int(pidfile.read_text())
+    grandchild = read_leaked_pid(pidfile)
     try:
-        deadline = time.monotonic() + 5
-        while _running(pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert not _running(pid)
+        assert wait_pid_gone(grandchild, timeout=5), (
+            f"pid {grandchild}, a grandchild the gate command started, is still running after the gate "
+            "timed out: the timeout did not kill the command's whole process group"
+        )
     finally:
-        if _running(pid):
-            subprocess.run(["kill", "-9", str(pid)], check=False)
+        if not wait_pid_gone(grandchild, timeout=0):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(grandchild, signal.SIGKILL)
 
 
 def test_output_that_is_not_utf_8_still_fails_with_its_output(checkout: Path) -> None:
