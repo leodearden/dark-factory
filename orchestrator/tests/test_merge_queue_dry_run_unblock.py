@@ -458,9 +458,9 @@ class TestUnscopedTypecheckFailedSpawns:
             # The ONE patch this file still needs (PRD γ9 residual). Every
             # sibling arm produces its condition for real -- the RED verify
             # through the injected port, "not pre-existing" through
-            # `escalate_preexisting_main_break=False`, the disk skip through
-            # the port's disk guard -- but a genuinely RED main has no such
-            # seam: `verify_failure_is_preexisting_on_main` lives in
+            # `_make_config(tmp_path, escalate_preexisting=False)`, the disk
+            # skip through the port's disk guard -- but a genuinely RED main
+            # has no such seam: `verify_failure_is_preexisting_on_main` lives in
             # `orchestrator.verify`, takes no port, and probes by running a
             # real scoped verification in a real `_mainprobe-` worktree.
             with (
