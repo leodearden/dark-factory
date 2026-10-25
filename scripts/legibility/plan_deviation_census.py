@@ -9,9 +9,10 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
@@ -31,6 +32,8 @@ _PLAN_SECTIONS = ('prerequisites', 'steps')
 _NOTED_RESOLUTION_CLASSES = frozenset({NOTE_TO_FILE_CLASS, ObservationConsumed.resolution_class})
 _FALLBACK_AGENT_ROLES = frozenset({'implementer'})
 _NOTE_SCAN_CONTEXT = 'plan_deviation_census.read_archived_notes'
+_TOP_TASK_IDS = 5
+_FIRE_SUFFIX = ' -> FIRE'
 
 _MAX_REPR_CHARS = 80
 
@@ -294,3 +297,169 @@ def _is_counted_note(esc: Escalation) -> bool:
         and esc.category == EscalationCategory.DESIGN_CONCERN
         and _is_str_in(esc.agent_role, _FALLBACK_AGENT_ROLES)
     )
+
+
+# ---------------------------------------------------------------------------
+# evaluate — pure: two windows measured back from now, three triggers
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Verdict:
+    fire: bool
+    reasons: tuple[str, ...]
+    evidence: tuple[dict, ...]
+
+
+@dataclass(frozen=True)
+class _Windows:
+    """The records in the recent window ``(now-7d, now]`` and the baseline
+    window ``(now-horizon, now-7d]``."""
+
+    now: datetime
+    recent: tuple[CensusRecord, ...]
+    baseline: tuple[CensusRecord, ...]
+    baseline_days: int
+
+    @property
+    def recent_mean(self) -> float:
+        return len(self.recent) / RECENT_WINDOW_DAYS
+
+    @property
+    def baseline_mean(self) -> float:
+        return len(self.baseline) / self.baseline_days
+
+    def kind_counts(self) -> dict[str, int]:
+        counts = Counter(record.kind for record in self.recent)
+        return {kind: counts[kind] for kind in sorted(DEVIATION_KINDS)}
+
+
+def _as_utc(now: datetime) -> datetime:
+    return now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
+
+
+def _split(records: Sequence[CensusRecord], *, now: datetime, horizon_days: int) -> _Windows:
+    recent_start = now - timedelta(days=RECENT_WINDOW_DAYS)
+    horizon = now - timedelta(days=horizon_days)
+    return _Windows(
+        now=now,
+        recent=tuple(r for r in records if recent_start < r.recorded_at <= now),
+        baseline=tuple(r for r in records if horizon < r.recorded_at <= recent_start),
+        baseline_days=horizon_days - RECENT_WINDOW_DAYS,
+    )
+
+
+def evaluate(
+    records: Sequence[CensusRecord], *, now: datetime, config: PlanDeviationCensus,
+) -> Verdict:
+    """Whether the recorded deviations rose in rate or formed a pattern.
+    Records after *now* or at or before the horizon are ignored."""
+    windows = _split(records, now=_as_utc(now), horizon_days=config.horizon_days)
+    triggers = (
+        _rate_rise(windows, config),
+        _kind_pattern(windows, config),
+        _prose_only(windows, config),
+    )
+    return Verdict(
+        fire=any(fired for fired, _ in triggers),
+        reasons=tuple(text + _FIRE_SUFFIX if fired else text for fired, text in triggers),
+        evidence=_evidence(windows, config),
+    )
+
+
+def _rate_rise(windows: _Windows, config: PlanDeviationCensus) -> tuple[bool, str]:
+    count = len(windows.recent)
+    bar = config.rate_rise_factor * windows.baseline_mean
+    fired = windows.recent_mean > bar and count >= config.min_records
+    return fired, (
+        f'rate-rise: {RECENT_WINDOW_DAYS}d mean {windows.recent_mean:.2f}/d vs prior '
+        f'{windows.baseline_days}d mean {windows.baseline_mean:.2f}/d '
+        f'(bar x{float(config.rate_rise_factor)} = {bar:.2f}/d; '
+        f'{RECENT_WINDOW_DAYS}d count {count}, min {config.min_records})'
+    )
+
+
+def _kind_pattern(windows: _Windows, config: PlanDeviationCensus) -> tuple[bool, str]:
+    counts = windows.kind_counts()
+    total = len(windows.recent)
+    if not any(counts.values()):
+        return False, f'kind-pattern: no kinded records in {RECENT_WINDOW_DAYS}d ({total} record(s))'
+    top_kind = min(counts, key=lambda kind: (-counts[kind], kind))
+    share = counts[top_kind] / total
+    fired = share >= config.pattern_share and counts[top_kind] >= config.min_records
+    return fired, (
+        f'kind-pattern: {top_kind} {counts[top_kind]}/{total} = {share:.2f} of '
+        f'{RECENT_WINDOW_DAYS}d records (bar {config.pattern_share}; min {config.min_records})'
+    )
+
+
+def _prose_only(windows: _Windows, config: PlanDeviationCensus) -> tuple[bool, str]:
+    count = sum(record.prose_only for record in windows.recent)
+    return count >= config.prose_only_min, (
+        f'prose-only: {count} prose-only record(s) in {RECENT_WINDOW_DAYS}d '
+        f'(min {config.prose_only_min})'
+    )
+
+
+def _evidence(windows: _Windows, config: PlanDeviationCensus) -> tuple[dict, ...]:
+    measured_at = windows.now.isoformat()
+    return tuple(
+        {'observation': observation, 'measured_at': measured_at, 'ref': ref, **fields}
+        for ref, observation, fields in (
+            _window_evidence(windows, config),
+            _kinds_evidence(windows),
+            _prose_only_evidence(windows),
+            _top_task_ids_evidence(windows),
+            _sources_evidence(windows),
+        )
+    )
+
+
+def _window_evidence(windows: _Windows, config: PlanDeviationCensus) -> tuple[str, str, dict]:
+    recent, baseline = len(windows.recent), len(windows.baseline)
+    return 'window', (
+        f'{recent} record(s) in the {RECENT_WINDOW_DAYS} days to {windows.now.isoformat()} '
+        f'(mean {windows.recent_mean:.2f}/d); {baseline} in the prior '
+        f'{windows.baseline_days} days (mean {windows.baseline_mean:.2f}/d)'
+    ), {
+        'window_end': windows.now.isoformat(),
+        'recent_window_days': RECENT_WINDOW_DAYS,
+        'baseline_window_days': windows.baseline_days,
+        'recent_count': recent,
+        'recent_mean': windows.recent_mean,
+        'baseline_count': baseline,
+        'baseline_mean': windows.baseline_mean,
+        'rate_rise_factor': config.rate_rise_factor,
+    }
+
+
+def _kinds_evidence(windows: _Windows) -> tuple[str, str, dict]:
+    counts = windows.kind_counts()
+    unkinded = sum(record.kind is None for record in windows.recent)
+    named = ', '.join(f'{kind} {n}' for kind, n in counts.items() if n) or 'none'
+    return 'kinds', (
+        f'recent records by kind: {named}; {unkinded} without a kind'
+    ), {'kind_counts': counts, 'unkinded': unkinded, 'recent_count': len(windows.recent)}
+
+
+def _prose_only_evidence(windows: _Windows) -> tuple[str, str, dict]:
+    count = sum(record.prose_only for record in windows.recent)
+    return 'prose_only', (
+        f'{count} recent record(s) were recorded in prose only'
+    ), {'prose_only_count': count}
+
+
+def _top_task_ids_evidence(windows: _Windows) -> tuple[str, str, dict]:
+    counts = Counter(record.task_id for record in windows.recent)
+    top = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:_TOP_TASK_IDS]
+    named = ', '.join(f'{task_id} {n}' for task_id, n in top) or 'none'
+    return 'top_task_ids', (
+        f'busiest tasks in the recent window: {named}'
+    ), {'top_task_ids': [{'task_id': task_id, 'count': n} for task_id, n in top]}
+
+
+def _sources_evidence(windows: _Windows) -> tuple[str, str, dict]:
+    counts = Counter(record.source for record in windows.recent)
+    plan_step, escalation = counts[RecordSource.PLAN_STEP], counts[RecordSource.ESCALATION]
+    return 'sources', (
+        f'recent records by source: {plan_step} plan-step, {escalation} escalation'
+    ), {RecordSource.PLAN_STEP.value: plan_step, RecordSource.ESCALATION.value: escalation}
