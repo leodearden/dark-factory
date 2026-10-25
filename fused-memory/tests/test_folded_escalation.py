@@ -22,6 +22,7 @@ helper would be a behaviour change, not a refactor.
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib
 import importlib.util
 import json
@@ -37,6 +38,8 @@ from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.middleware._folded_escalation import file_folded_escalation
+from fused_memory.middleware.curation_deferral import DeferReason
+from fused_memory.middleware.ticket_store import CurationBacklog
 from fused_memory.services.write_journal import JournalGrowthSample
 
 #: Applied PER CLASS rather than as a module-level ``pytestmark``, so the
@@ -608,6 +611,30 @@ def _unverified_claim(module: Any, project_root: str) -> object:
     )
 
 
+class _OneCurationBacklogStore:
+    """The reads a bare `TicketJanitor.tick` makes: no failed tickets, and one
+    backlog that has survived a retry."""
+
+    async def fetch_unescalated_failures(self, project_id=None, limit=100) -> list[dict]:
+        return []
+
+    async def summarise_awaiting_curation(self) -> list[CurationBacklog]:
+        return [CurationBacklog(
+            project_id='dark_factory', defer_reason=DeferReason.ALL_ACCOUNTS_CAPPED,
+            count=1, oldest_created_at='2026-10-08T00:00:00+00:00', max_attempts=2,
+        )]
+
+    async def oldest_awaiting_curation(self, project_id, *, defer_reason, limit) -> list[dict]:
+        return []
+
+
+def _curation_backlog(module: Any, project_root: str) -> object:
+    janitor = module.TicketJanitor(
+        _OneCurationBacklogStore(), known_projects={'dark_factory': project_root},
+    )
+    return asyncio.run(janitor.tick())
+
+
 #: THE SINGLE POINT OF TRUTH (heuristic 11) for the escalation level each
 #: migrated filer's record is born at.
 #:
@@ -708,6 +735,12 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
         ),
         1,
     ),
+    _Filer(
+        'ticket_janitor curation-backlog',
+        'fused_memory.middleware.ticket_janitor',
+        _curation_backlog,
+        1,
+    ),
 )
 
 
@@ -796,6 +829,10 @@ class TestEveryFilerPinsItsLevels:
     def test_a_lost_alarm_is_logged_at_warning_on_the_filers_own_logger(
         self, filer, tmp_path, monkeypatch, caplog,
     ):
+        """Only the lines the helper itself emits are compared. A long-lived
+        filer such as the ticket janitor logs once on construction, and driving
+        an async filer starts an event loop that logs on `asyncio`; neither is
+        the lost alarm."""
         monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
         module = importlib.import_module(filer.module)
 
@@ -803,7 +840,10 @@ class TestEveryFilerPinsItsLevels:
         with caplog.at_level(logging.DEBUG):
             assert filer.fire(module, str(tmp_path)) is None
 
-        records = [(r.name, r.levelno) for r in caplog.records]
+        records = [
+            (r.name, r.levelno) for r in caplog.records
+            if r.pathname == _folded_escalation.__file__
+        ]
         assert records == [(filer.module, logging.WARNING)], (
             f'{filer.label} logged {records!r} for a lost alarm. Every filer '
             'logs on its own `__name__` logger, and a lost alarm below WARNING '
@@ -917,7 +957,6 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
     )
-    from fused_memory.middleware.curation_deferral import DeferReason
     from fused_memory.middleware.entity_mint_storm_escalator import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as ENTITY_MINT_ANCHOR,
     )
