@@ -55,8 +55,8 @@ def _make_workflow(tmp_path: Path) -> tuple[TaskWorkflow, EscalationQueue, FakeS
         config=config,
         git_ops=MagicMock(),
         scheduler=scheduler,
-        briefing=FakeBriefing(),    # type: ignore[arg-type]
-        mcp=FakeMcp(),              # type: ignore[arg-type]
+        briefing=FakeBriefing(),
+        mcp=FakeMcp(),
         escalation_queue=queue,
     )
     workflow.worktree = tmp_path / 'wt'
