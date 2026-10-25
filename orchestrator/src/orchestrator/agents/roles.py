@@ -157,6 +157,24 @@ something later promotes it, and promotion is not retroactive: it can land after
 branch has already merged.
 """
 
+# The one statement of the escalate_info contract (plans/plan-deviation-recording-prd.md
+# D3; INV-5 no-lockstep-duplication). It is rendered once, into ESCALATION_LADDER_CORE;
+# every other site that mentions escalate_info points at "## Escalation" instead of
+# restating it. The reviewer/router disposition is plans/info-l0-disposition-router-prd.md.
+ESCALATE_INFO_CONTRACT = """
+### What `escalate_info` files
+
+`escalate_info` files a non-blocking observation.
+
+- With `note_to_file=True` it is a record that requests nothing and is archived
+  unrouted: no reviewer, steward or watcher will read it.
+- Without it, it is an observation the reviewer dispositions in its verdict, or
+  the router closes at workflow exit.
+
+A work item is `submit_task`. A decision you need before continuing is
+`escalate_blocker`.
+"""
+
 # Split (task 4169): the original single `_ESCALATION_INSTRUCTIONS` literal
 # ended with a paragraph telling every escalating role that `level=1` is "the
 # STEWARD's route, not yours" -- correct for the six non-steward escalating
@@ -197,7 +215,7 @@ ESCALATION_LADDER_CORE = """
 
 If you encounter a problem you cannot solve at your scope, you can escalate:
 
-- **`escalate_info(...)`** — Non-blocking observation. Report it and continue working.
+- **`escalate_info(...)`** — Report it and continue working. What it files is stated below.
 - **`escalate_blocker(...)`** — Blocking problem. Report it, then read the `action` key
   of the response and do what it says.
   - `terminate_cleanly` (every normal branch) — commit any in-progress work, log your
@@ -223,7 +241,7 @@ Use escalation when:
 - A test failure's root cause is in code you can't modify
 - A design decision requires broader context than this task provides
 - The verify/debug loop won't converge due to an external dependency
-
+""" + ESCALATE_INFO_CONTRACT + """
 ### Observations vs. hypotheses
 
 State OBSERVATIONS as fact; state causal diagnoses as clearly-marked hypotheses.
@@ -2438,10 +2456,9 @@ reaper to maybe recover:
         "name this task's id, the escalation id if one exists, the concrete file\n"
         "paths, and the rationale verbatim. `escalation_id` and `suggestion_hash`\n"
         "(the R4 idempotency keys) MUST be present so a re-filed candidate dedupes.\n"
-        "A pure observation with no work item goes to `escalate_info` instead; when\n"
-        "something is BOTH an observation and a work item, do both. One-time\n"
-        "operational asks (run a script after X lands, a service needs a restart) do\n"
-        "NOT go here — those route through the deterministic task mechanism."
+        'An observation that is not a work item is not filed here: see "## Escalation".\n'
+        "One-time operational asks (run a script after X lands, a service needs a\n"
+        "restart) do NOT go here — those route through the deterministic task mechanism."
     ),
 )
 
@@ -2911,7 +2928,7 @@ For each finding, classify and act:
 | Classification | Criteria | Action |
 |---|---|---|
 | **create_task** | Unambiguous bug, missing wiring, unfilled stub, clear fix path | Call `submit_task` (single step) — see Creating tasks below |
-| **escalate** | Ambiguous, multiple valid approaches, architectural implications, design questions | Call `escalate_info` with category and summary |
+| **escalate** | Ambiguous, multiple valid approaches, architectural implications, design questions | Call `escalate_info` with category `design_concern` (architectural question) or `risk_identified` (potential issue) and a summary naming the options; its contract is under "## Escalation" |
 | **dismiss** | Known gap in briefing, noise, style preference, intentionally incomplete | Skip |
 
 ### Creating tasks
@@ -2939,12 +2956,6 @@ or expired tickets as a follow-up escalation):
         '- `project_root`: use the value from your Agent Identity section'
     ),
 ) + """
-
-### Escalating ambiguous findings
-
-Use the `escalate_info` MCP tool for findings that need human judgment:
-- `category`: "design_concern" for architectural questions, "risk_identified" for potential issues
-- `summary`: clear description of the finding, why it's ambiguous, and what the options are
 
 ## Rules
 
