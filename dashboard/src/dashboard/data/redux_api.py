@@ -512,7 +512,8 @@ def _shape_outcomes(raw: Mapping[str, Any] | None) -> dict[str, Any]:
 def _shape_depth(raw: Mapping[str, Any] | None) -> dict[str, Any]:
     """Serve a depth series as ``{labels, values, bucket_minutes}``.
 
-    ``bucket_minutes`` is None when the series names no width.
+    ``bucket_minutes`` is the width in minutes each bucket spans, None when
+    the series names no width.
     """
     depth = raw or {}
     return {
@@ -536,16 +537,15 @@ def shape_merge_queue(
     from absolute project_root paths to each root's project label
     (``dashboard/project_labels.py::ProjectLabels``) so the React side can
     match against ``PROJECTS[].name``.  Per project: ``depth`` (renamed from
-    ``depth_timeseries``, carrying ``bucket_minutes``: the width each of its
-    buckets spans, None when the series names none), ``outcomes``, ``latency`` (whose ``with_duration``
-    and ``without_duration`` sum to the outcomes total), ``recent``,
-    ``recent_total`` (how many merges the window holds; ``recent`` is capped),
-    ``speculative``, ``active`` (the live probe's entries), ``in_queue``,
-    ``live_probe_configured`` (false keeps the project out of the client's
-    multi-project in-queue totals), ``active_spark``, ``halt``,
-    ``train_events``. ``in_queue``, ``speculative``, ``recent_total`` and
-    ``live_probe_configured`` are required: the route resolves them for every
-    project.
+    ``depth_timeseries``, shaped by :func:`_shape_depth`), ``outcomes``,
+    ``latency`` (whose ``with_duration`` and ``without_duration`` sum to the
+    outcomes total), ``recent``, ``recent_total`` (how many merges the window
+    holds; ``recent`` is capped), ``speculative``, ``active`` (the live
+    probe's entries), ``in_queue``, ``live_probe_configured`` (false keeps
+    the project out of the client's multi-project in-queue totals),
+    ``active_spark``, ``halt``, ``train_events``. ``in_queue``,
+    ``speculative``, ``recent_total`` and ``live_probe_configured`` are
+    required: the route resolves them for every project.
 
     ``in_queue``, ``speculative``, ``recent_total`` and every
     ``recent``/``active`` row's ``title`` are Datums the route resolved, each
