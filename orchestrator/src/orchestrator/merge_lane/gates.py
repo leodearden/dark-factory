@@ -306,7 +306,9 @@ def _emit_merge_attempt(
 #: rebase-under-drift re-verifies, and the registry refills from the first
 #: landing onward.  Empty means "I have not seen this tip go green", which is
 #: the fail-SAFE answer — the same direction ``_OVERLAP_GIT_ERROR_SENTINEL``
-#: fails.
+#: fails.  A root spelled differently from the landing queue's (a symlink, a
+#: relative path) gets that same answer: keys compare as given, unresolved, and
+#: every production writer and reader passes the worker's one ``GitOps``.
 _QUEUE_VERIFIED_MAIN_TIPS: dict[Path, list[str]] = {}
 
 #: Per-repository cap on :data:`_QUEUE_VERIFIED_MAIN_TIPS`.  Only the most
