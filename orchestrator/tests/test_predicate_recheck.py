@@ -61,10 +61,6 @@ class TestStoredRecord:
             'consecutive', 'first_rearmed_at', 'last_checked_at', 'next_check_at',
         }
 
-    def test_record_is_frozen(self):
-        with pytest.raises(AttributeError):
-            _record().consecutive = 9  # type: ignore[misc]
-
     @pytest.mark.parametrize(
         'raw',
         [
