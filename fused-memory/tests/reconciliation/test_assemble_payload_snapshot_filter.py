@@ -11,6 +11,9 @@ from _clip_assertions import assert_elided
 from fused_memory.models.reconciliation import (
     AssembledPayload,
     ContextItem,
+    EventSource,
+    EventType,
+    ReconciliationEvent,
     StageId,
     StageReport,
     Watermark,
@@ -335,3 +338,65 @@ class TestRunSurfacesSnapshotStrippedStat:
             f'Expected report.stats["entity_summary_snapshot_lines_stripped"]=3, '
             f'got stats={report.stats!r}'
         )
+
+
+def _buffered_event(n: int) -> ReconciliationEvent:
+    return ReconciliationEvent(
+        id=f'ev{n}', type=EventType.memory_added, source=EventSource.agent,
+        project_id='test_project', timestamp=datetime.now(UTC),
+    )
+
+
+async def _run_with_assembled_payload(assembled_payload: AssembledPayload | None) -> StageReport:
+    stage = make_consolidator()
+    stage.scope = make_scope('test_project', stage.scope.project_root)
+    stage.assembled_payload = assembled_payload
+    base_report = StageReport(
+        stage=StageId.memory_consolidator,
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        items_flagged=[],
+        stats={},
+    )
+    with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+        return await stage.run(
+            events=[],
+            watermark=Watermark(project_id='test_project'),
+            prior_reports=[],
+            run_id='run-assembled-budget',
+        )
+
+
+class TestRunRecordsAssembledBudget:
+    """run() records the assembled payload's budget accounting in report.stats.
+
+    This is what the next cap re-evaluation reads from runs.stage_reports
+    (plans/recon-evidence-caps-measurement-2026-10.md).
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_assembled_path_records_its_budget_accounting(self):
+        payload = AssembledPayload(
+            events=[_buffered_event(0), _buffered_event(1)],
+            context_items={f'c{n}': ContextItem(id=f'c{n}', source='mem0', formatted='x') for n in range(3)},
+            total_tokens=1234,
+            events_remaining=5,
+            token_budget=130_000,
+        )
+
+        report = await _run_with_assembled_payload(payload)
+
+        assert report.stats['stage1_assembled_budget'] == {
+            'estimated_tokens': 1234,
+            'token_budget': 130000,
+            'events': 2,
+            'context_items': 3,
+            'events_deferred': 5,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_time_windowed_path_records_none(self):
+        report = await _run_with_assembled_payload(None)
+
+        assert 'stage1_assembled_budget' in report.stats
+        assert report.stats['stage1_assembled_budget'] is None
