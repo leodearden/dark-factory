@@ -5439,17 +5439,16 @@ class TaskWorkflow:
         # a plan.  Its new L0s are promoted verbatim to L1 and the task blocks
         # behind them, skipping the steward and the no-plan loop.  An
         # info-only filing is not an escalation in lieu of a plan; it falls
-        # through to the no-plan handler, as does a filing none of whose
-        # blocking L0s could be promoted.
+        # through to the no-plan handler.  A refused promotion does not: a
+        # fallback L1 carries the L0's finding.
         if not self.plan and self.escalation_queue:
             post_l0 = self.escalation_queue.get_by_task(
                 self.task_id, status='pending', level=0,
             )
             new_l0 = [e for e in post_l0 if e.id not in pre_l0_ids]
-            if any(is_queue_handoff(e) for e in new_l0):
-                blocked = await self._block_on_architect_escalations(new_l0)
-                if blocked is not None:
-                    return blocked
+            blocked = await self._block_on_architect_escalations(new_l0)
+            if blocked is not None:
+                return blocked
 
         if not self.plan:
             cls = classify_agent_failure(result)
@@ -6371,17 +6370,24 @@ class TaskWorkflow:
     async def _block_on_architect_escalations(
         self, filed: list[Escalation],
     ) -> WorkflowOutcome | None:
-        """Promote every L0 the architect *filed* to L1, then block behind them.
+        """Promote every L0 the architect *filed* to L1 and block behind them.
 
-        The task blocks only once a promoted L1 is a queue handoff; otherwise
-        this returns ``None`` and the caller runs its no-plan handler.
+        Returns ``None`` when none of *filed* is a queue handoff.  An L0 that
+        cannot be promoted is carried by a fallback L1 instead.
         """
-        promoted = [
-            (l0, l1) for l0 in filed
-            if (l1 := self._promote_architect_l0(l0)) is not None
-        ]
+        lead = next((e for e in filed if is_queue_handoff(e)), None)
+        if lead is None:
+            return None
+        promoted: list[Escalation] = []
+        refused: list[Escalation] = []
+        for l0 in filed:
+            l1 = self._promote_architect_l0(l0)
+            if l1 is None:
+                refused.append(l0)
+            else:
+                promoted.append(l1)
         if self.event_store:
-            for _, l1 in promoted:
+            for l1 in promoted:
                 self.event_store.emit(
                     EventType.escalation_created,
                     task_id=self.task_id, phase=self.state.value,
@@ -6391,19 +6397,26 @@ class TaskWorkflow:
                         'summary': l1.summary[:200],
                     },
                 )
-        lead = next((l0 for l0, l1 in promoted if is_queue_handoff(l1)), None)
-        if lead is None:
+        promoted_ids = ', '.join(l1.id for l1 in promoted)
+        if refused:
+            refused_ids = ', '.join(e.id for e in refused)
             logger.warning(
-                'Task %s: none of the architect L0s %s was promoted to a '
-                'blocking L1; falling through to the no-plan handler',
-                self.task_id, ', '.join(e.id for e in filed),
+                'Task %s: architect filed L0 without plan — promoted to [%s]; '
+                'could not promote [%s], filing a fallback L1 that carries them',
+                self.task_id, promoted_ids, refused_ids,
             )
-            return None
+            return await self._mark_blocked(
+                f'Architect filed L0 without plan; could not promote '
+                f'{refused_ids} to L1: {refused[0].summary}',
+                detail='\n\n'.join(
+                    f'[{e.id}] {e.summary}\n{e.detail}' for e in refused
+                ),
+                escalate_to_human=True,
+            )
         logger.warning(
             'Task %s: architect filed L0 without plan (%s) — promoted to %s '
             'to break no-plan loop',
-            self.task_id, lead.summary[:120],
-            ', '.join(l1.id for _, l1 in promoted),
+            self.task_id, lead.summary[:120], promoted_ids,
         )
         return await self._mark_blocked(
             f'Architect filed L0 without plan: {lead.summary}',
@@ -6412,7 +6425,11 @@ class TaskWorkflow:
         )
 
     def _promote_architect_l0(self, l0: Escalation) -> Escalation | None:
-        """Promote one architect L0, or leave it pending if its L1 cannot be filed."""
+        """Promote one architect L0 to L1.
+
+        Returns ``None`` when its L1 cannot be filed, leaving the L0 pending
+        for the caller's fallback.
+        """
         assert self.escalation_queue is not None
         try:
             return promote_l0_to_l1(
