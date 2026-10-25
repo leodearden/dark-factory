@@ -6932,29 +6932,32 @@ async def _verify_commit_on_main(project_root: str, sha: str) -> _AncestorCheckF
 
 
 async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitResolutionFailure:
-    """Resolve a tree-ish to a 40-char SHA via ``git rev-parse --verify``.
+    """Resolve a tree-ish to a 40-char SHA via ``git rev-parse --verify --quiet``.
 
     Returns the SHA on success, or a :class:`_CommitResolutionFailure` whose
     ``confirmed_absent`` flag says whether git actually rendered a verdict
-    (task 3455, mirroring :func:`_verify_commit_on_main`):
+    (task 3455, mirroring :func:`_verify_commit_on_main`'s rc=1 policy):
 
-    - ``confirmed_absent=True`` for a non-zero rev-parse exit — git ran,
-      evaluated the ref against this checkout, and rejected it. Only then
-      may the caller say the commit was "not found in <project_root>".
-    - ``confirmed_absent=False`` for a timed-out ``run_git`` result, a
-      missing git binary, an unexpected exception, or empty output on
-      rc=0 — rev-parse never rendered a verdict on the ref, so the honest
-      report is "could not be resolved", with the same fetch /
-      fix-the-checkout / retry remedy as an unconfirmed ancestor check.
-      Any failure branch added later inherits ``False``, i.e. the weaker
-      claim, by default.
+    - ``confirmed_absent=True`` ONLY for rc=1 under ``--verify --quiet`` —
+      git ran inside a readable repository, evaluated the ref, and rejected
+      it (missing, unknown name, not peelable to a commit, ambiguous
+      prefix). Only then may the caller say the commit was "not found in
+      <project_root>".
+    - ``confirmed_absent=False`` for every other outcome: rc=128, which git
+      returns for a project_root that is not a readable git repository or
+      does not exist (task 5274); a timed-out ``run_git`` result; a missing
+      git binary; an unexpected exception; or empty output on rc=0.
+      rev-parse never rendered a verdict on the ref, so the honest report
+      is "could not be resolved", with the same fetch / fix-the-checkout /
+      retry remedy as an unconfirmed ancestor check. Any failure branch
+      added later inherits ``False``, i.e. the weaker claim, by default.
 
     Uses a commit-peeling suffix (``^{commit}``) so a tag that points at a
     commit resolves to the commit SHA directly.
     """
     try:
         result = await run_git(
-            ['git', '-C', project_root, 'rev-parse', '--verify', f'{commit}^{{commit}}'],
+            ['git', '-C', project_root, 'rev-parse', '--verify', '--quiet', f'{commit}^{{commit}}'],
             timeout=_GIT_PROBE_TIMEOUT_SECS,
         )
     except FileNotFoundError:
@@ -6964,8 +6967,10 @@ async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitRe
 
     if result.timed_out:
         return _CommitResolutionFailure(False, 'git rev-parse timed out')
+    if result.returncode == 1:
+        return _CommitResolutionFailure(True, result.stderr or 'no such commit')
     if result.returncode != 0:
-        return _CommitResolutionFailure(True, result.stderr or 'no such ref')
+        return _CommitResolutionFailure(False, result.stderr or 'rev-parse failed')
     sha = result.stdout
     if not sha or len(sha) < 7:
         return _CommitResolutionFailure(False, 'empty rev-parse output')
