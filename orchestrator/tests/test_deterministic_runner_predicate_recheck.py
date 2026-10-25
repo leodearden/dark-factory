@@ -9,20 +9,36 @@ a real ``EscalationQueue`` and a real ``EventStore``.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from orchestrator.deterministic_runner import DeterministicRunner
-from orchestrator.event_store import EventStore
+from orchestrator.deterministic_runner import DETERMINISTIC_AGENT_ROLE, DeterministicRunner
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 
 TASK_ID = '880'
 DATED = {'mode': 'dated', 'at': '2026-10-25T00:00:00+00:00'}
+FIXED_NOW = datetime(2026, 10, 25, 6, 0, tzinfo=UTC)
+NOT_YET = 'probe log line\n{"run":"R","verdict":"not_yet","share":0.63}'
+NOT_YET_VERDICT = {'run': 'R', 'verdict': 'not_yet', 'share': 0.63}
+
+
+@dataclass
+class _Clock:
+    """The runner's injected clock, advanced by hand between runs."""
+
+    now: datetime = FIXED_NOW
+
+    def __call__(self) -> datetime:
+        return self.now
 
 
 @dataclass
@@ -217,3 +233,187 @@ class TestVerdictStampOnFailure:
         [payload] = scheduler.updates()
         assert set(payload) == {'gate_escalated_at', 'predicate_verdict'}
         assert payload['predicate_verdict'] is None
+
+
+DECLARED_MILESTONE = {**DATED, 'x_note': 'kept across the re-arm'}
+
+
+def _declared_task(**stamps: Any) -> dict:
+    return _predicate_task(recheck_secs=86400, milestone=dict(DECLARED_MILESTONE), **stamps)
+
+
+def _seed_resolved_escalation(queue: EscalationQueue) -> str:
+    escalation = Escalation(
+        id=queue.make_id(TASK_ID),
+        task_id=TASK_ID,
+        agent_role=DETERMINISTIC_AGENT_ROLE,
+        severity='critical',
+        category='milestone_check_failed',
+        summary='Milestone predicate check failed (rc=1)',
+        detail='earlier failure',
+        level=2,
+    )
+    queue.submit(escalation)
+    queue.resolve(escalation.id, 'fixed upstream')
+    return escalation.id
+
+
+def _own_records(queue: EscalationQueue) -> list:
+    return queue.get_by_task(TASK_ID, agent_role=DETERMINISTIC_AGENT_ROLE)
+
+
+def _rearm_kwargs(clock: _Clock, cap: int = 30) -> dict:
+    return {'clock': clock, 'predicate_recheck_stall_cap': cap}
+
+
+@pytest.mark.asyncio
+class TestRearmOnNotYet:
+    async def test_declared_not_yet_advances_the_dated_milestone(
+        self, queue, event_store, caplog,
+    ):
+        scheduler = _scheduler(_declared_task(), event_store)
+        next_at = (FIXED_NOW + timedelta(seconds=86400)).isoformat()
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.deterministic_runner'):
+            outcome = await _run(
+                scheduler, queue, _ScriptRunner(75, NOT_YET), **_rearm_kwargs(_Clock()),
+            )
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        assert [kind for kind, _ in scheduler.writes] == ['update_task', 'set_task_status']
+        [(_, write)] = [w for w in scheduler.writes if w[0] == 'update_task']
+        assert write['mode'] == 'merge'
+        payload = write['metadata']
+        assert set(payload) == {'milestone', 'predicate_recheck', 'predicate_verdict'}
+        assert payload['milestone'] == {**DECLARED_MILESTONE, 'at': next_at}
+        assert payload['predicate_recheck'] == {
+            'consecutive': 1,
+            'first_rearmed_at': FIXED_NOW.isoformat(),
+            'last_checked_at': FIXED_NOW.isoformat(),
+            'next_check_at': next_at,
+        }
+        assert payload['predicate_verdict'] == NOT_YET_VERDICT
+        assert scheduler.statuses() == [{'status': 'pending'}]
+        assert _own_records(queue) == []
+        [event] = event_store.fetch_events_by_type(EventType.predicate_rearmed)
+        assert event['task_id'] == TASK_ID
+        assert set(event['data']) == {
+            'rc', 'consecutive', 'stall_cap', 'recheck_secs', 'next_check_at', 'verdict',
+        }
+        assert (event['data']['rc'], event['data']['consecutive'], event['data']['stall_cap']) == (
+            75, 1, 30,
+        )
+        assert f'predicate re-armed (rc=75, consecutive=1/30, next_check_at={next_at})' in (
+            caplog.text
+        )
+
+    async def test_a_second_not_yet_extends_the_streak(self, queue, event_store):
+        scheduler = _scheduler(_declared_task(), event_store)
+        clock = _Clock()
+        await _run(scheduler, queue, _ScriptRunner(75, NOT_YET), **_rearm_kwargs(clock))
+        clock.now = FIXED_NOW + timedelta(days=1)
+
+        outcome = await _run(scheduler, queue, _ScriptRunner(75, NOT_YET), **_rearm_kwargs(clock))
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        record = scheduler.task['metadata']['predicate_recheck']
+        assert record['consecutive'] == 2
+        assert record['first_rearmed_at'] == FIXED_NOW.isoformat()
+        assert record['last_checked_at'] == clock.now.isoformat()
+        assert scheduler.task['metadata']['milestone']['at'] == (
+            clock.now + timedelta(seconds=86400)
+        ).isoformat()
+
+
+@pytest.mark.asyncio
+class TestUndeclaredNotYetIsAFailure:
+    @pytest.mark.parametrize(
+        ('task_fields', 'gap_fragment'),
+        [
+            ({'milestone': DATED}, 'before_done.recheck_secs'),
+            (
+                {'recheck_secs': 86400, 'milestone': {'mode': 'delayed', 'after_secs': 60}},
+                "mode='dated'",
+            ),
+        ],
+        ids=['no-recheck-secs', 'delayed-milestone'],
+    )
+    async def test_files_milestone_check_failed_naming_the_gap(
+        self, queue, event_store, task_fields, gap_fragment,
+    ):
+        scheduler = _scheduler(_predicate_task(**task_fields), event_store)
+
+        outcome = await _run(
+            scheduler, queue, _ScriptRunner(75, NOT_YET), **_rearm_kwargs(_Clock()),
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        [escalation] = _pending(queue)
+        assert escalation.category == 'milestone_check_failed'
+        assert escalation.summary == 'Milestone predicate check failed (rc=75)'
+        detail_lines = escalation.detail.splitlines()
+        exit_line = detail_lines.index('Predicate check exit code: rc=75')
+        assert gap_fragment in detail_lines[exit_line + 1]
+        assert event_store.fetch_events_by_type(EventType.predicate_rearmed) == []
+        assert 'milestone' not in scheduler.updates()[0]
+
+
+@pytest.mark.asyncio
+class TestRearmAfterAResolvedGate:
+    async def test_a_stale_gate_stamp_re_runs_and_re_arms(self, queue, event_store):
+        stale = '2026-10-20T00:00:00+00:00'
+        _seed_resolved_escalation(queue)
+        scheduler = _scheduler(_declared_task(gate_escalated_at=stale), event_store)
+        script = _ScriptRunner(75, NOT_YET)
+        clock = _Clock()
+
+        outcome = await _run(scheduler, queue, script, **_rearm_kwargs(clock))
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        assert scheduler.task['metadata']['gate_escalated_at'] == stale
+        assert len(_own_records(queue)) == 1
+
+        clock.now = FIXED_NOW + timedelta(days=1)
+        outcome = await _run(scheduler, queue, script, **_rearm_kwargs(clock))
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        assert script.calls == 2
+        assert scheduler.task['metadata']['predicate_recheck']['consecutive'] == 2
+        assert len(_own_records(queue)) == 1
+
+
+@pytest.mark.asyncio
+class TestRearmWriteFailures:
+    async def test_a_lost_status_write_still_requeues(self, queue, event_store):
+        scheduler = _scheduler(
+            _declared_task(), event_store, status_error=RuntimeError('connection severed'),
+        )
+
+        outcome = await _run(
+            scheduler, queue, _ScriptRunner(75, NOT_YET), **_rearm_kwargs(_Clock()),
+        )
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        assert _own_records(queue) == []
+        assert scheduler.task['metadata']['milestone']['at'] == (
+            FIXED_NOW + timedelta(seconds=86400)
+        ).isoformat()
+
+    async def test_a_refused_metadata_write_escalates_instead_of_re_dispatching(
+        self, queue, event_store,
+    ):
+        scheduler = _scheduler(_declared_task(), event_store, update_ok=False)
+
+        outcome = await _run(
+            scheduler, queue, _ScriptRunner(75, NOT_YET), **_rearm_kwargs(_Clock()),
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert [s['status'] for s in scheduler.statuses()] == ['blocked']
+        [escalation] = _pending(queue)
+        assert escalation.category == 'infra_issue'
+        assert escalation.level == 2
+        assert 're-arm write' in escalation.summary
+        assert len(scheduler.updates()) == 1
+        assert 'gate_escalated_at' not in scheduler.updates()[0]
+        assert event_store.fetch_events_by_type(EventType.predicate_rearmed) == []
