@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -143,16 +144,14 @@ def test_a_failed_verdict_describes_its_command_and_exit_code(checkout: Path) ->
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
 def test_a_timeout_kills_every_process_the_command_started(checkout: Path, tmp_path_factory) -> None:
+    """A timeout kills every process the command started, not just the command. The grandchild
+    holds none of the gate's pipes and the foreground is exec'd, so killing only the direct child
+    would leave the grandchild running here rather than stall the gate on pipe EOF."""
     pidfile = tmp_path_factory.mktemp("grandchild") / "pid"
-    grandchild = f"import os, pathlib, time; pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(60)"
-    code = (
-        "import pathlib, subprocess, sys, time; "
-        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}]); "
-        f"[time.sleep(0.05) for _ in iter(lambda: pathlib.Path({str(pidfile)!r}).exists(), True)]; "
-        "time.sleep(60)"
-    )
+    command = f"sleep 300 >/dev/null 2>&1 & echo $! > {shlex.quote(str(pidfile))}; exec sleep 60"
+    spec = config.LandingGate(argv=("/bin/sh", "-c", command), timeout_secs=3)
 
-    verdict = landing_gate.run_gate(checkout, _spec(code, timeout_secs=3))
+    verdict = landing_gate.run_gate(checkout, spec)
 
     assert verdict.status is GateStatus.DID_NOT_RUN
     grandchild = read_leaked_pid(pidfile)
