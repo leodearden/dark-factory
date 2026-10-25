@@ -39,10 +39,10 @@ async def test_fake_scheduler_smoke() -> None:
 @pytest.mark.asyncio
 async def test_fake_scheduler_submit_task_through_the_chronic_flake_adapter_files_nothing() -> None:
     """The chronic-flake adapter submits through FakeScheduler, which records the call and files nothing."""
-    from _workflow_helpers import FakeScheduler  # noqa: PLC0415
-    from shared.task_submit import SubmitFailed  # noqa: PLC0415
+    from _workflow_helpers import FakeScheduler
+    from shared.task_submit import SubmitFailed
 
-    from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient  # noqa: PLC0415
+    from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
 
     sched = FakeScheduler()
     outcome = await SchedulerChronicFlakeTaskClient(sched, '/proj').submit_task({'title': 't'})
