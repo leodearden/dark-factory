@@ -10,6 +10,7 @@ from shared.prompt_artifact import PromptSpec
 from orchestrator.agents.bash_cwd_guidance import BASH_CWD_ANCHOR_GUIDANCE
 from orchestrator.agents.chained_command_guidance import CHAINED_COMMAND_STATUS_GUIDANCE
 from orchestrator.agents.code_quality import guidance
+from orchestrator.agents.deviation_doctrine import render_deviation_doctrine
 from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
 from orchestrator.agents.grep_pattern_guidance import GREP_PATTERN_ESCAPING_GUIDANCE
 from orchestrator.agents.partial_failure_guidance import MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
@@ -1748,6 +1749,10 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 )
 
 
+# The doctrine's text lives in orchestrator/src/orchestrator/agents/deviation_doctrine.py.
+IMPLEMENTER_DEVIATION_DOCTRINE = render_deviation_doctrine(_PLAN_DEVIATION_TOOLS[0].rsplit('__', 1)[-1])
+
+
 IMPLEMENTER = AgentRole(
     name='implementer',
     system_prompt="""\
@@ -1762,7 +1767,7 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 
 ## Rules
 
-1. **Follow the plan exactly.** Do not deviate from the plan structure. Do not add steps or skip steps.
+1. **Keep to the plan's structure.** Do not add, skip or reorder steps. When a step's text proves wrong, the plan-deviation section below governs.
 2. **TDD discipline.** For `test` steps: write the test, run it, confirm it fails. For `impl` steps: write implementation, run tests, confirm they pass.
 3. **Commit each step.** After completing a step, stage ONLY your code changes (not `.task/` files) and commit. Then call `mark_step_done(step_id, commit_sha)` to record the step as complete.
 4. **Stop at logical boundaries.** Don't exhaust your context trying to complete everything. Complete a logical chunk of steps, commit, mark done, and stop. The next iteration will continue from where you left off.
@@ -1799,9 +1804,8 @@ The workflow for each step is:
 ## Important
 
 - Run tests frequently to verify your work.
-- If you encounter an unexpected issue that the plan doesn't account for, note it and stop. Do NOT modify the plan.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + IMPLEMENTER_DEVIATION_DOCTRINE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
