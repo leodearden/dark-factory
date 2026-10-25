@@ -15,9 +15,8 @@ import json
 import logging
 import os
 from collections.abc import Sequence
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 import yaml
@@ -860,11 +859,20 @@ def test_run_disabled_reads_and_calls_nothing(tmp_path):
     assert fake.calls == []
 
 
+class _BrokenTz(tzinfo):
+    def utcoffset(self, dt):
+        raise RuntimeError('boom')
+
+
 def test_run_an_evaluation_failure_is_a_no_fire_line_not_a_raise(tmp_path, caplog):
     caplog.set_level(logging.DEBUG, logger=_LOGGER)
     fake = _FakeCallTool()
 
-    line = mod.run(_load_cfg(tmp_path), now=cast(Any, object()), call_tool=fake)
+    line = mod.run(
+        _load_cfg(tmp_path),
+        now=datetime(2026, 10, 25, 12, 0, tzinfo=_BrokenTz()),
+        call_tool=fake,
+    )
 
     assert line.startswith('plan-deviation census: NO-FIRE -- evaluation failed (')
     assert fake.calls == []
