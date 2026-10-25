@@ -50,7 +50,7 @@ Record each deviation on exactly one of two channels, never both for one fact:
   `escalate_info(..., note_to_file=True)`.
 
 Nothing downstream compares your diff to the plan text: no reviewer is given
-the plan, and the completion judge is idle. So the record is not for a
+the plan, and the judge of task completion is idle. So the record is not for a
 reviewer. A nightly census counts these records in aggregate, so write each
 one to stand alone without your session.
 """
