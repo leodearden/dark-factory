@@ -38,8 +38,8 @@ The pair
 ``shared/tests`` has a settled triad idiom — ``<name>_scan.py`` +
 ``<name>_allowlist.py`` + ``test_<name>_gate.py`` (see ``silent_fallthrough``,
 ``loop_blocking``, ``config_dir_archival``).  This guard is deliberately a PAIR:
-the scanner and this file, with no allowlist.  The tree is measured at 6
-matching sites, all 6 compliant, 0 needing exemption — a ledger plus its
+the scanner and this file, with no allowlist.  The tree is measured at 5
+matching sites, all 5 compliant, 0 needing exemption — a ledger plus its
 disposition vocabulary and stale-entry hygiene would be machinery with no
 subject.  A future caller that genuinely needs ambient MCP therefore cannot
 self-bless; the whole-tree failure message says so and directs them to
@@ -154,7 +154,7 @@ class TestDetectorFires:
         assert is_violation(sites[0]), f'got {sites[0]!r}'
 
     def test_an_awaited_call_in_an_async_method_is_flagged(self) -> None:
-        """The shape all six real sites use: awaited inside an async method."""
+        """The shape all five real sites use: awaited inside an async method."""
         sites = _scan('''
             class Curator:
                 async def _call_llm(self, prompt):
@@ -615,23 +615,22 @@ class TestInjectedInvokerSites:
 # --------------------------------------------------------------------------- #
 
 #: Every matching call site in the first-party tree, re-measured on 2026-10-25
-#: (task 6706): 6 matched, 0 violations, all six protected by
+#: (task 6706): 5 matched, 0 violations, all five protected by
 #: ``no_mcp_servers_config()`` + ``strict_mcp_config=True``;
 #: AgentLoop._call_claude_cli matches through available_tools (task 4344), and
-#: ClaudeShardAsker.__call__ matches through its injected invoker, whose
-#: constructor default is invoke_with_cap_retry.
+#: ClaudeShardAsker.__call__ and TaskCurator._invoke_curator match through
+#: their injected invokers, whose constructor default is invoke_with_cap_retry.
+#: The curator's single and batch calls share that one site.
 #: Kept as an exact SET, not a count: a new
 #: matching caller anywhere in the tree must be looked at even when it is
-#: correctly scoped, and none of these six may silently vanish.
+#: correctly scoped, and none of these five may silently vanish.
 _KNOWN_SITES: frozenset[tuple[str, str]] = frozenset({
     ('fused-memory/src/fused_memory/maintenance/link_adjudicator.py',
      'ClaudeShardAsker.__call__'),
     ('fused-memory/src/fused_memory/middleware/path_scope_adjudicator.py',
      'PathScopeAdjudicator.adjudicate'),
     ('fused-memory/src/fused_memory/middleware/task_curator.py',
-     'TaskCurator._call_llm'),
-    ('fused-memory/src/fused_memory/middleware/task_curator.py',
-     'TaskCurator._call_llm_batch'),
+     'TaskCurator._invoke_curator'),
     ('fused-memory/src/fused_memory/reconciliation/agent_loop.py',
      'AgentLoop._call_claude_cli'),
     ('fused-memory/src/fused_memory/reconciliation/judge.py',

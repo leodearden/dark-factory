@@ -579,7 +579,7 @@ class TestCuratorTranscriptSalvage:
     accepted returns that verdict instead of failing.
 
     This is the transcript route, for a run whose stdout never arrived; the
-    stdout route is ``TestCurateFallbacks::test_call_llm_salvages_schema_payload``.
+    stdout route is ``TestCurateFallbacks::test_a_salvaged_schema_payload_is_parsed``.
     A salvaged verdict is held to exactly the validation a returned one is.
     """
 
