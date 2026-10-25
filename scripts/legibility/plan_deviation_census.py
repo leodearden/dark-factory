@@ -6,6 +6,7 @@ Design and rationale: plans/plan-deviation-recording-prd.md D8-D11.
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
@@ -20,9 +21,10 @@ from escalation.categories import EscalationCategory
 from escalation.disposition import ObservationConsumed
 from escalation.models import NOTE_TO_FILE_CLASS, Escalation, normalised_severity
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
-from legibility import state_docs
-from legibility.config import PlanDeviationCensus
+from legibility import census_trigger, state_docs, trickle_state
+from legibility.config import LegibilityConfig, PlanDeviationCensus
 from shared.plan_deviation import DEVIATION_KINDS
+from shared.project_layout import escalation_queue_dir
 
 logger = logging.getLogger('legibility.plan_deviation_census')
 
@@ -34,6 +36,17 @@ _FALLBACK_AGENT_ROLES = frozenset({'implementer'})
 _NOTE_SCAN_CONTEXT = 'plan_deviation_census.read_archived_notes'
 _TOP_TASK_IDS = 5
 _FIRE_SUFFIX = ' -> FIRE'
+
+STATE_FILENAME = 'plan-deviation-census-state.json'
+AGENT_ROLE = 'plan-deviation-census'
+CATEGORY = EscalationCategory.DESIGN_CONCERN.value
+SEVERITY = 'blocking'
+_LINE_PREFIX = 'plan-deviation census'
+_DESIGN_POINTER = 'plans/plan-deviation-recording-prd.md D9-D10'
+_MCP_TIMEOUT_SECS = 10.0
+_MAX_FAILURE_CHARS = 200
+
+CallTool = Callable[[str, dict], object]
 
 _MAX_REPR_CHARS = 80
 
@@ -463,3 +476,221 @@ def _sources_evidence(windows: _Windows) -> tuple[str, str, dict]:
     return 'sources', (
         f'recent records by source: {plan_step} plan-step, {escalation} escalation'
     ), {RecordSource.PLAN_STEP.value: plan_step, RecordSource.ESCALATION.value: escalation}
+
+
+# ---------------------------------------------------------------------------
+# state — when the census last filed, so it files at most once per cooldown
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CensusState:
+    last_filed_at: datetime
+    escalation_id: str
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            'last_filed_at': self.last_filed_at.isoformat(),
+            'escalation_id': self.escalation_id,
+        }
+
+
+def _state_codec(raw: object) -> CensusState:
+    doc = state_docs.json_object(raw, 'plan-deviation census state')
+    return CensusState(
+        last_filed_at=state_docs.required(doc, 'last_filed_at', state_docs.as_datetime),
+        escalation_id=state_docs.required(doc, 'escalation_id', state_docs.as_str),
+    )
+
+
+def default_state_path(project_id: str) -> Path:
+    return trickle_state.project_state_dir(project_id) / STATE_FILENAME
+
+
+def synthetic_task_id(project_id: str) -> str:
+    return f'plan-deviation-census-{project_id}'
+
+
+# ---------------------------------------------------------------------------
+# run — one census pass, one journal line, never raises
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _Disposition:
+    """What became of a FIRE verdict; *degraded* when a step meant to guard
+    or record the filing could not do its job."""
+
+    text: str
+    degraded: bool
+
+
+def _failure(exc: BaseException) -> str:
+    return f'{type(exc).__name__}: {_bounded(str(exc), _MAX_FAILURE_CHARS)}'
+
+
+def _default_call_tool(cfg: LegibilityConfig) -> CallTool:
+    return functools.partial(
+        census_trigger.post_mcp_tool_call,
+        f'http://localhost:{cfg.escalation_port}/mcp',
+        timeout=_MCP_TIMEOUT_SECS,
+    )
+
+
+def run(
+    cfg: LegibilityConfig,
+    *,
+    now: datetime | None = None,
+    call_tool: CallTool | None = None,
+    state_path: Path | None = None,
+) -> str:
+    """Run the census for *cfg*'s project: read both corpora, evaluate, and on
+    FIRE file one escalation unless the cooldown or a pending census
+    escalation holds it. Logs and returns one ``plan-deviation census:
+    FIRE|NO-FIRE -- ...`` line. Never raises."""
+    try:
+        line, degraded = _census_line(
+            cfg,
+            now=datetime.now(UTC) if now is None else now,
+            call_tool=_default_call_tool(cfg) if call_tool is None else call_tool,
+            state_path=default_state_path(cfg.project_id) if state_path is None else state_path,
+        )
+    except Exception as exc:
+        line, degraded = f'{_LINE_PREFIX}: NO-FIRE -- evaluation failed ({_failure(exc)})', True
+    logger.log(logging.WARNING if degraded else logging.INFO, '%s', line)
+    return line
+
+
+def _census_line(
+    cfg: LegibilityConfig, *, now: datetime, call_tool: CallTool, state_path: Path,
+) -> tuple[str, bool]:
+    settings = settings_from_mapping(cfg.plan_deviation_census)
+    if not settings.enabled:
+        return f'{_LINE_PREFIX}: NO-FIRE -- disabled by plan_deviation_census.enabled', False
+    now = _as_utc(now)
+    plans = read_plan_deviations(
+        [Path(cfg.project_root) / root for root in settings.meta_roots],
+        horizon=now - timedelta(days=settings.horizon_days),
+    )
+    notes = read_archived_notes(escalation_queue_dir(cfg.project_root))
+    verdict = evaluate([*plans.records, *notes.records], now=now, config=settings)
+    summary = (
+        f'{"; ".join(verdict.reasons)}; corpus: {len(plans.records)} plan-step + '
+        f'{len(notes.records)} escalation record(s), {plans.skipped + notes.skipped} skipped'
+    )
+    if not verdict.fire:
+        return f'{_LINE_PREFIX}: NO-FIRE -- {summary}', False
+    disposition = _dispose(
+        verdict, project_id=cfg.project_id, settings=settings, now=now,
+        call_tool=call_tool, state_path=state_path,
+    )
+    return f'{_LINE_PREFIX}: FIRE -- {summary}; {disposition.text}', disposition.degraded
+
+
+def _dispose(
+    verdict: Verdict,
+    *,
+    project_id: str,
+    settings: PlanDeviationCensus,
+    now: datetime,
+    call_tool: CallTool,
+    state_path: Path,
+) -> _Disposition:
+    """Cooldown, then the pending check, then the filing, then the state write."""
+    held = _cooldown_hold(state_path, now=now, cooldown_days=settings.cooldown_days)
+    if held is not None:
+        return held
+    task_id = synthetic_task_id(project_id)
+    held = _pending_hold(call_tool, task_id)
+    if held is not None:
+        return held
+    try:
+        escalation_id, status = _confirmed_filing(
+            call_tool('escalate_info', _filing_arguments(verdict, task_id))
+        )
+    except Exception as exc:
+        return _Disposition(f'filing failed ({_failure(exc)}) -- not filed', degraded=True)
+    return _record_filing(
+        state_path, CensusState(last_filed_at=now, escalation_id=escalation_id), status=status,
+    )
+
+
+def _cooldown_hold(state_path: Path, *, now: datetime, cooldown_days: int) -> _Disposition | None:
+    state = state_docs.read_state(state_path, _state_codec)
+    if isinstance(state, state_docs.Malformed):
+        return _Disposition(
+            f'state {state.path} malformed ({state.reason}) -- not filed', degraded=True,
+        )
+    if isinstance(state, state_docs.Missing):
+        return None
+    age = now - state.value.last_filed_at
+    if age >= timedelta(days=cooldown_days):
+        return None
+    return _Disposition(
+        f'cooldown: last filed {age / timedelta(days=1):.1f}d ago as '
+        f'{state.value.escalation_id} (cooldown {cooldown_days}d) -- not filed',
+        degraded=False,
+    )
+
+
+def _pending_hold(call_tool: CallTool, task_id: str) -> _Disposition | None:
+    try:
+        pending = _pending_ids(
+            call_tool('get_pending_escalations', {'task_id': task_id, 'compact': True})
+        )
+    except Exception as exc:
+        return _Disposition(f'pending check failed ({_failure(exc)}) -- not filed', degraded=True)
+    if not pending:
+        return None
+    return _Disposition(
+        f'pending: {", ".join(pending)} already open on {task_id} -- not filed', degraded=False,
+    )
+
+
+def _pending_ids(response: object) -> list[str]:
+    rows = response.get('result') if isinstance(response, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError(f'unexpected get_pending_escalations response {_bounded(repr(response))}')
+    return [str(row.get('id', '?')) if isinstance(row, dict) else '?' for row in rows]
+
+
+def _filing_arguments(verdict: Verdict, task_id: str) -> dict:
+    return {
+        'task_id': task_id,
+        'agent_role': AGENT_ROLE,
+        'category': CATEGORY,
+        'severity': SEVERITY,
+        'summary': 'plan-deviation census FIRE -- ' + '; '.join(verdict.reasons),
+        'detail': '\n'.join([*verdict.reasons, f'Design: {_DESIGN_POINTER}.']),
+        'suggested_action': (
+            'Read the evidence (window means, per-kind counts, prose-only count, top task '
+            'ids) and decide whether planning doctrine or tooling needs to change.'
+        ),
+        'evidence': list(verdict.evidence),
+    }
+
+
+def _confirmed_filing(response: object) -> tuple[str, str]:
+    """The escalation id and status of a filing the server confirmed it
+    persisted; ``ValueError`` naming why for any other response."""
+    if not isinstance(response, dict):
+        raise ValueError(f'unexpected escalate_info response {_bounded(repr(response))}')
+    if 'error' in response:
+        raise ValueError(f'server refused: {_bounded(repr(response["error"]))}')
+    status = str(response.get('status'))
+    if status == 'accepted_unpersisted':
+        raise ValueError('status accepted_unpersisted: the server could not confirm it persisted')
+    escalation_id = response.get('id')
+    if not isinstance(escalation_id, str) or not escalation_id:
+        raise ValueError(f'response carries no escalation id: {_bounded(repr(response))}')
+    return escalation_id, status
+
+
+def _record_filing(state_path: Path, state: CensusState, *, status: str) -> _Disposition:
+    filed = f'filed {state.escalation_id} (status={status})'
+    try:
+        state_docs.write_state(state_path, state)
+    except OSError as exc:
+        return _Disposition(
+            f'{filed}; state write failed ({_failure(exc)}) -- the pending check guards a refile',
+            degraded=True,
+        )
+    return _Disposition(filed, degraded=False)
