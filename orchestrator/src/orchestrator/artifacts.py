@@ -19,6 +19,7 @@ from shared.plan_deviation import DeviationRecord
 
 from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
+from orchestrator.review_payload import Verdict, normalize_review
 
 logger = logging.getLogger(__name__)
 
@@ -1101,26 +1102,22 @@ class TaskArtifacts:
         return reviews
 
     def aggregate_reviews(self) -> ReviewAggregation:
-        """Parse all reviews, separate blocking from suggestions.
-
-        Reviews with verdict ``ERROR`` are filtered into a separate list
-        so the workflow can detect incomplete reviewer coverage.
-        """
+        """Aggregate every review as ``orchestrator/review_payload.py::normalize_review`` reads it."""
         reviews = self.read_reviews()
         blocking = []
         suggestions = []
         errors = []
 
         for reviewer_name, review in reviews.items():
-            if review.get('verdict') == 'ERROR':
+            payload = normalize_review(review)
+            if payload.verdict is Verdict.ERROR:
                 errors.append(reviewer_name)
-                continue
-            for issue in review.get('issues', []):
-                enriched = {**issue, 'reviewer': reviewer_name}
-                if issue.get('severity') == 'blocking':
-                    blocking.append(enriched)
-                else:
-                    suggestions.append(enriched)
+            blocking.extend(
+                {**issue, 'reviewer': reviewer_name} for issue in payload.blocking_issues
+            )
+            suggestions.extend(
+                {**issue, 'reviewer': reviewer_name} for issue in payload.suggestions
+            )
 
         clean = {k: v for k, v in reviews.items() if k not in errors}
         return ReviewAggregation(
