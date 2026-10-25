@@ -22,9 +22,12 @@ the merge-lane ratchet sweep measures per module.  Folding them in would pull
 that import, and the ratchet key that carries it, into a module every test
 family imports.
 
-Lane tests that only STUFF the buffers (``worker._lane_buffers[...].extend``)
-to build a scene still touch the private attribute; the claim this module
-owns is the READING of placement, and those files read it through here.
+Lane tests that STUFF the buffers (``worker._lane_buffers[...].extend``) to
+build a scene still touch the private attribute, and so does a check that
+needs the request OBJECTS back (identity, or a list to re-stuff), which
+``snapshot()`` cannot return.  Any other placement read off the buffers makes
+this module's claim a second way: this module is the destination, not a
+completed migration.
 """
 from __future__ import annotations
 
@@ -39,15 +42,18 @@ QUEUED = 'queued'
 #: Lane names in the priority order ``snapshot()`` enumerates them.
 LANES = ('high', 'normal')
 
+#: *lane* value that reads every lane in ``snapshot()``'s pipeline order — the
+#: lane buffers in priority order, then undrained outer-queue arrivals — so a
+#: requeued head reads as the LAST entry.
+ALL_LANES = None
+
 
 def queued_entries(
     worker: SpeculativeMergeWorker, lane: str | None = 'normal',
 ) -> list[dict]:
     """Every ``snapshot()`` entry still queued in *lane*, head-of-line first.
 
-    ``lane=None`` reads every lane in ``snapshot()``'s pipeline order — the
-    lane buffers in priority order, then undrained outer-queue arrivals — so a
-    requeued head reads as the LAST entry.
+    *lane* :data:`ALL_LANES` reads wider than any single lane buffer.
     """
     return [
         entry for entry in worker.snapshot()['entries']

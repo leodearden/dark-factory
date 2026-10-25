@@ -91,7 +91,12 @@ from _merge_deep_scene import (
     _spy_chain_lane_release,
     git_repo,  # noqa: F401 — pytest fixture used by name, resolved from the shared deep scene
 )
-from _merge_lane_census import lanes_by_task, queued_in_lane, queued_request_ids
+from _merge_lane_census import (
+    ALL_LANES,
+    lanes_by_task,
+    queued_in_lane,
+    queued_request_ids,
+)
 from _merge_lane_fakes import (
     FakeVerifier,
     VerifyScript,
@@ -625,7 +630,7 @@ class TestTipPassAdoptionSignal:
             "_finalize_inflight's PASS arm asserts merge_wt is not None and "
             'threads it into advance_main'
         )
-        assert queued_request_ids(worker, None) == [r.request_id for r in _q], (
+        assert queued_request_ids(worker, ALL_LANES) == [r.request_id for r in _q], (
             'an adopted item is not re-queued: the two buffered followers are '
             'still the whole queue'
         )
@@ -748,7 +753,7 @@ class TestTipPassAdoptionSignal:
         assert res.outcome is None, 'a defer renders no MergeOutcome at all'
         assert res.merge_wt is None, 'the fail arm disposes its own worktrees'
         assert not item.request.result.done()
-        assert queued_request_ids(worker, None) == [
+        assert queued_request_ids(worker, ALL_LANES) == [
             *(r.request_id for r in queued), item.request.request_id,
         ], 'the followers keep their order; the deferred head goes behind them'
         assert all(not r.result.done() for r in queued)
@@ -780,7 +785,7 @@ class TestTipPassAdoptionSignal:
             'the one-shot suppression is what makes an infra blip cost exactly '
             'one non-chained round'
         )
-        assert queued_request_ids(worker, None) == [
+        assert queued_request_ids(worker, ALL_LANES) == [
             *(r.request_id for r in queued), item.request.request_id,
         ], 'the followers keep their order; the deferred head goes behind them'
         assert store.events_of(EventType.merge_attempt) == []
@@ -1059,7 +1064,7 @@ class TestInOrderCasWalk:
         s = await self._scene(git_repo, tmp_path, monkeypatch)
         worker = s['worker']
 
-        assert queued_in_lane(worker, None) == [_DELTA_TRUNCATOR], (
+        assert queued_in_lane(worker, ALL_LANES) == [_DELTA_TRUNCATOR], (
             'the truncator is the only thing still waiting for the merger'
         )
         for tid in ('101', *_DELTA_LINKS):
@@ -1355,7 +1360,7 @@ class TestStaleCasAbortLeavesTheRestAlone:
         # walks lane buffers), which is a different scenario.  Everything the
         # claim is about — the three links — is still buffered where round 1
         # left it, so the rebuild sees exactly the prefix it saw before.
-        assert queued_request_ids(worker, None)[-1] == s['reqs']['101'].request_id, (
+        assert queued_request_ids(worker, ALL_LANES)[-1] == s['reqs']['101'].request_id, (
             'the fail arm must have requeued the head, behind the links'
         )
         item2 = dataclasses.replace(
@@ -3557,7 +3562,7 @@ class TestDeepLandingEndToEnd:
         # Every FOLLOWER kept its exact lane slot — the chain took nothing —
         # and the head itself went back on the queue through the requeue
         # chokepoint, behind them, unresolved: "deferred", not "failed".
-        assert queued_in_lane(scene.worker, None) == [
+        assert queued_in_lane(scene.worker, ALL_LANES) == [
             *_DELTA_E2E_FOLLOWERS, '101',
         ], 'the chain mutated the queue on a red tip'
         assert queued_in_lane(scene.worker, 'high') == []
