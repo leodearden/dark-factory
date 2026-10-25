@@ -394,8 +394,8 @@ from orchestrator.deploy_state import (
     VerifyBaseline,
     enforce_transition,
 )
-from orchestrator.fm_retry import FM_RESTART_RETRY_WINDOW_SECS, fm_retry_backoffs
 from orchestrator.event_store import EventType
+from orchestrator.fm_retry import FM_RESTART_RETRY_WINDOW_SECS, fm_retry_backoffs
 from orchestrator.predicate_recheck import (
     PREDICATE_VERDICT_KEY,
     PredicateRecheck,
