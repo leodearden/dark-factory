@@ -34,15 +34,19 @@ from __future__ import annotations
 import ast
 import functools
 from collections import defaultdict, deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from types import FunctionType, MappingProxyType
 
+import pytest
+
 from orchestrator import verify, verify_runner
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.merge_lane import gates
+from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.verify import VerifyResult
 
 
 class Fidelity(Enum):
@@ -371,4 +375,128 @@ def test_census_resolves_reads_across_modules() -> None:
     assert len(census.reads) >= 30, sorted(census.reads)
     assert {'orchestrator.verify_plan', 'orchestrator.merge_lane.gates'} <= census.visited_modules, sorted(
         census.visited_modules
+    )
+
+
+# ---------------------------------------------------------------------------
+# The table's claims
+# ---------------------------------------------------------------------------
+
+
+def _rows(fidelity: Fidelity) -> dict[str, Classified]:
+    return {name: row for name, row in MERGE_PATH_CONFIG_READS.items() if row.fidelity is fidelity}
+
+
+def test_every_host_deciding_row_names_its_follow_up() -> None:
+    unowned = sorted(name for name, row in _rows(Fidelity.HOST_DECIDING).items() if not row.follow_ups)
+    assert not unowned, f'HOST_DECIDING rows must name the follow-up that owns the hole: {unowned}'
+
+
+def test_unread_candidates_stay_unread() -> None:
+    unknown = sorted(set(UNREAD_CANDIDATES) - CENSUS_NAMES)
+    assert not unknown, f'UNREAD_CANDIDATES names no OrchestratorConfig field or public member: {unknown}'
+    now_read = sorted(set(UNREAD_CANDIDATES) & set(_merge_path_census().reads))
+    assert not now_read, (
+        f'These unread candidates are now read on the merge path; move each into '
+        f'MERGE_PATH_CONFIG_READS and classify it: {now_read}'
+    )
+
+
+@dataclass(frozen=True)
+class _CarriedProbe:
+    dispatcher: Mapping[str, object]
+    host: Mapping[str, object]
+    observe: Callable[[OrchestratorConfig], object]
+    expected: object
+
+
+_CARRIED_PROBES: Mapping[str, _CarriedProbe] = MappingProxyType({
+    'merge_verify_workspace': _CarriedProbe(
+        dispatcher={'merge_verify_workspace': True},
+        host={'merge_verify_workspace': False},
+        observe=lambda cfg: cfg.merge_verify_workspace,
+        expected=True,
+    ),
+    'merge_verify_breadth': _CarriedProbe(
+        dispatcher={'merge_verify_breadth': 'full'},
+        host={'merge_verify_breadth': 'scoped'},
+        observe=lambda cfg: cfg.merge_verify_breadth,
+        expected='full',
+    ),
+    'verify_env': _CarriedProbe(
+        dispatcher={'verify_env': {'DF_FIDELITY_PROBE': 'dispatcher'}},
+        host={'verify_env': {'DF_FIDELITY_PROBE': 'host'}},
+        observe=lambda cfg: cfg.verify_env['DF_FIDELITY_PROBE'],
+        expected='dispatcher',
+    ),
+    'verify_cold_preprovision_command': _CarriedProbe(
+        dispatcher={'verify_cold_preprovision_command': 'echo dispatcher'},
+        host={'verify_cold_preprovision_command': 'echo host'},
+        observe=lambda cfg: cfg.verify_cold_preprovision_command,
+        expected='echo dispatcher',
+    ),
+    'module_configs_or_empty': _CarriedProbe(
+        dispatcher={},
+        host={},
+        observe=lambda cfg: sorted(cfg.module_configs_or_empty),
+        expected=['src/a'],
+    ),
+})
+
+# Three of the four past fidelity holes were latent on the zero-module route, so it is named.
+_ROUTES: Mapping[str, tuple[ModuleConfig, ...]] = MappingProxyType({
+    'zero_module': (),
+    'one_module': (ModuleConfig(prefix='src/a', test_command='true'),),
+})
+
+# Both sides hold an empty module registry on the zero-module route, so the case cannot discriminate.
+_UNDISCRIMINATING_CASES = frozenset({('module_configs_or_empty', 'zero_module')})
+
+
+def test_every_spec_carried_row_has_a_probe() -> None:
+    assert set(_CARRIED_PROBES) == set(_rows(Fidelity.SPEC_CARRIED))
+
+
+async def _config_the_remote_bundle_receives(
+    worktree: Path, dispatcher: OrchestratorConfig, host: OrchestratorConfig, modules: tuple[ModuleConfig, ...]
+) -> OrchestratorConfig:
+    spec = verify_runner.build_merge_verify_spec(dispatcher, list(modules), ('src/a/m.py',))
+    wire_spec = verify_runner.spec_from_json(verify_runner.spec_to_json(spec))
+    received: list[OrchestratorConfig] = []
+
+    async def record_scoped(_worktree: Path, config: OrchestratorConfig, *_args: object, **_kwargs: object) -> VerifyResult:
+        received.append(config)
+        return VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='')
+
+    async def clean_unscoped(*_args: object, **_kwargs: object) -> PostMergePyrightResult:
+        return PostMergePyrightResult()
+
+    result = await verify_runner.run_merge_verify_on_worktree(
+        worktree, host, wire_spec, run_scoped=record_scoped, run_unscoped=clean_unscoped
+    )
+    assert result.passed and len(received) == 1, (result, received)
+    return received[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('row', 'route'),
+    [
+        pytest.param(row, route, id=f'{row}-{route}')
+        for row in _CARRIED_PROBES
+        for route in _ROUTES
+        if (row, route) not in _UNDISCRIMINATING_CASES
+    ],
+)
+async def test_spec_carried_read_takes_the_dispatchers_value(tmp_path: Path, row: str, route: str) -> None:
+    probe = _CARRIED_PROBES[row]
+    received = await _config_the_remote_bundle_receives(
+        tmp_path,
+        OrchestratorConfig(**probe.dispatcher),
+        OrchestratorConfig(**probe.host),
+        _ROUTES[route],
+    )
+    assert probe.observe(received) == probe.expected, (
+        f'{row} on the {route} route: the remote bundle saw {probe.observe(received)!r}, '
+        f'not the dispatcher value {probe.expected!r}. Reclassify the row; do not change production.'
     )
