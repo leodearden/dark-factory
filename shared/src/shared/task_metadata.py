@@ -1591,11 +1591,6 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # written by orchestrator/src/orchestrator/main_health_fix_owner.py, which
         # also reads it back through find_tasks_by_metadata as its dedupe key.
         'main_health_signature',
-        # A re-arming predicate's streak record and its last structured verdict
-        # (plans/completion-driven-triggers-prd.md C1), written by
-        # orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._run_predicate.
-        'predicate_recheck',
-        'predicate_verdict',
     }
 )
 
