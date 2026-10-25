@@ -38,10 +38,12 @@ def _parent_pid_of(pid: int) -> int | None:
     plainly whitespace-delimited, immune to the ``(comm)`` field's embedded
     spaces and parens. Returns None -- never raises -- on a platform with no
     ``/proc``, on a race where *pid* exits mid-read, and on any unparseable
-    body, so every caller can treat the answer as a best-effort hint.
+    body, so every caller can treat the answer as a best-effort hint. The
+    ``Name:`` line carries the raw comm and is read with replacement, so a
+    non-UTF-8 name does not hide the parent.
     """
     try:
-        for line in Path(f'/proc/{pid}/status').read_text().splitlines():
+        for line in _read_proc_text(Path(f'/proc/{pid}/status')).splitlines():
             if line.startswith('PPid:'):
                 return int(line.split()[1])
     except (OSError, ValueError, IndexError):
