@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -412,7 +413,7 @@ def render_entity_block(payload: Mapping[str, Any], expected_name: str) -> str:
     raw_summary = node.get('summary')
     summary = raw_summary.strip() if isinstance(raw_summary, str) else ''
     heading = f'**{expected_name}** — {summary}' if summary else f'**{expected_name}**'
-    distinct = _distinct_facts(_edge_facts(payload.get('edges')), summary)
+    distinct = _newest_distinct_facts(_edge_facts(payload.get('edges')), summary)
     lines = [heading, *(edge.bullet() for edge in distinct[:ENTITY_BLOCK_MAX_EDGES])]
     if (omitted := len(distinct) - ENTITY_BLOCK_MAX_EDGES) > 0:
         lines.append(ENTITY_EDGES_OMITTED_NOTICE.format(count=omitted, name=expected_name))
@@ -447,17 +448,22 @@ def _edge_facts(edges: Any) -> list[_EdgeFact]:
     return parsed
 
 
-def _distinct_facts(facts: Sequence[_EdgeFact], summary: str) -> list[_EdgeFact]:
+def _newest_distinct_facts(facts: Sequence[_EdgeFact], summary: str) -> list[_EdgeFact]:
     """*facts*, newest ``valid_at`` first, minus each one *summary* already
-    contains or an earlier edge already carried; undated edges follow in reply order."""
+    states or an earlier edge already carried; undated edges follow in reply order."""
     seen: set[str] = set()
     distinct: list[_EdgeFact] = []
     for edge in sorted(facts, key=lambda edge: edge.valid_at or '', reverse=True):
-        if edge.fact in summary or edge.fact in seen:
+        if _states(summary, edge.fact) or edge.fact in seen:
             continue
         seen.add(edge.fact)
         distinct.append(edge)
     return distinct
+
+
+def _states(summary: str, fact: str) -> bool:
+    """Whether *fact* appears in *summary* bounded by whitespace or its ends, not inside longer text."""
+    return re.search(rf'(?<!\S){re.escape(fact)}(?!\S)', summary) is not None
 
 
 class MemoryFailure(Enum):

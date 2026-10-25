@@ -874,8 +874,27 @@ class TestRenderEntityBlock:
         rendered = render_entity_block(payload, 'Task 3609')
 
         assert [rendered.count(fact) for fact in facts] == [1, 1, 1], rendered
-        assert not [line for line in rendered.splitlines() if line.startswith('- ')]
+        assert not _bullet_lines(rendered.splitlines())
         assert rendered == '**Task 3609** — ' + summary
+
+    def test_a_fact_the_summary_states_mid_line_is_not_repeated(self):
+        fact = 'Task 3609 is related to task 3212.'
+        payload = {
+            'nodes': [_node('Task 3609', f'Task 3609 landed as commit abc123. {fact}')],
+            'edges': [_edge(fact)],
+        }
+
+        assert not _bullet_lines(render_entity_block(payload, 'Task 3609').splitlines())
+
+    def test_a_fact_that_only_prefixes_a_longer_summary_sentence_still_renders(self):
+        payload = {
+            'nodes': [_node('Task 1', 'Task 1 blocks task 20.')],
+            'edges': [_edge('Task 1 blocks task 2')],
+        }
+
+        assert _bullet_lines(render_entity_block(payload, 'Task 1').splitlines()) == [
+            '- Task 1 blocks task 2',
+        ]
 
     def test_an_edge_the_summary_does_not_contain_still_renders(self):
         held = 'Task 3609 landed as commit abc123.'
@@ -898,7 +917,7 @@ class TestRenderEntityBlock:
 
         lines = render_entity_block(payload, 'Task 3609').splitlines()
 
-        assert len([line for line in lines if fact in line]) == 1, lines
+        assert _bullet_lines(lines) == [f'- {fact} (2026-09-14)']
 
     def test_an_n_edge_node_renders_the_cap_and_names_the_rest(self):
         facts = _numbered_facts(ENTITY_BLOCK_MAX_EDGES + 3)
