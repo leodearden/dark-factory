@@ -2372,7 +2372,8 @@ def _three_unit_drain_sweep(tmp_path, heartbeats):
     return bin_dir, state_path, fleet_dir, trace_path, env
 
 
-def _assert_only_the_awaited_unit_is_halted(tmp_path, *, spawn_latency_secs=None):
+def _assert_only_the_awaited_unit_is_halted(tmp_path, *, spawn_latency_secs=None) -> float:
+    """Returns how long the sweep itself ran, in seconds."""
     awaited_polls = 3
     bin_dir, state_path, fleet_dir, trace_path, env = _three_unit_drain_sweep(
         tmp_path,
@@ -2394,9 +2395,11 @@ def _assert_only_the_awaited_unit_is_halted(tmp_path, *, spawn_latency_secs=None
             [_Rewrite(after="verifying", to=_hb_drain([]), polls=awaited_polls)],
         ),
     ):
+        started = time.monotonic()
         result = _run_sweep_while_progressing(
             bin_dir, state_path, fleet_dir, trace_path, "--drain", env=env,
         )
+        sweep_secs = time.monotonic() - started
 
     polls = read_drain_poll_trace(trace_path)
     context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -2421,6 +2424,7 @@ def _assert_only_the_awaited_unit_is_halted(tmp_path, *, spawn_latency_secs=None
     assert not list(fleet_dir.glob("*.drain.json")), (
         f"the sweep must release every request it wrote. {context}"
     )
+    return sweep_secs
 
 
 def test_a_later_units_admission_is_not_halted_while_an_earlier_units_verify_is_awaited(
@@ -2433,13 +2437,18 @@ def test_a_later_units_admission_is_not_halted_while_an_earlier_units_verify_is_
     _assert_only_the_awaited_unit_is_halted(tmp_path)
 
 
-# The sweep makes 19 interpreter starts, so 19 x 0.75 + its 3 one-second polls puts it past 15s on any host.
 _STARVED_SPAWN_LATENCY_SECS = 0.75
 
 
 def test_the_awaited_verify_sweep_completes_when_every_interpreter_start_is_starved(tmp_path):
-    _assert_only_the_awaited_unit_is_halted(
+    sweep_secs = _assert_only_the_awaited_unit_is_halted(
         tmp_path, spawn_latency_secs=_STARVED_SPAWN_LATENCY_SECS,
+    )
+    assert sweep_secs > _SWEEP_STALL_TIMEOUT_SECS, (
+        f"the starved sweep finished in {sweep_secs:.2f}s, inside the "
+        f"{_SWEEP_STALL_TIMEOUT_SECS}s stall bound, so a whole-run bound of that size "
+        "would not have killed it either and this guard proves nothing; raise "
+        "_STARVED_SPAWN_LATENCY_SECS"
     )
 
 
@@ -2464,7 +2473,11 @@ def test_a_sweep_that_only_repolls_the_same_verdict_is_reported_as_stalled(tmp_p
         [arg for arg in call if arg != "--user"] for call in _load_state(state_path)["calls"]
     ]
     assert exc_info.value.timeout == 3
-    assert polls and all(p == ("verifying", UNIT_R) for p in polls), polls
+    assert polls, (
+        "the stall fired before the gate's first poll, so this run never reached the "
+        "repolling it pins: the stretch before that poll outlasted stall_timeout"
+    )
+    assert all(p == ("verifying", UNIT_R) for p in polls), polls
     assert not [call for call in calls if call[:1] == ["restart"]], calls
 
 
