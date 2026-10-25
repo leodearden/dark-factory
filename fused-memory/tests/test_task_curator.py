@@ -67,7 +67,6 @@ from fused_memory.middleware.task_curator import (
     CURATOR_OUTPUT_SCHEMA,
     CURATOR_SINGLE_SPEC,
     TaskCurator,
-    _DegradedStreak,
     _parse_batch_decisions,
     _parse_decision,
     _parse_decision_dict,
@@ -1143,7 +1142,8 @@ class TestUnexpectedExceptionArmReports:
         )
         escalator.report_consecutive_degraded = AsyncMock(return_value=None)
         healthy = _agent_result({'action': 'drop', 'target_id': '42', 'justification': 'dup'})
-        invoke = AsyncMock(side_effect=[RuntimeError('llm down'), healthy])
+        unusable = _agent_result({'action': 'bogus'})
+        invoke = AsyncMock(side_effect=[RuntimeError('llm down'), *[unusable] * 5, healthy])
         curator = TaskCurator(
             config=_make_config(), taskmaster=None, escalator=escalator, invoke=invoke,
         )
@@ -1157,31 +1157,38 @@ class TestUnexpectedExceptionArmReports:
         with patch.object(curator, '_build_corpus', side_effect=corpus_with_target):
             with pytest.raises(CuratorFailureError, match='no orchestrator running'):
                 await curator.curate(candidate, project_id='p', project_root='/x')
-            assert _streak(curator).count == 0
+
+            # Uncounted: a fresh run still needs all five degradations to fire.
+            await _degrade(curator, 4, prefix='Deg')
+            escalator.report_consecutive_degraded.assert_not_awaited()
+            await _degrade(curator, 1, prefix='Fifth')
+            escalator.report_consecutive_degraded.assert_awaited_once()
+            assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
 
             # The identical payload again: had the first call cached its
             # degraded create, this would be served from cache without
             # reaching the LLM.
             result = await curator.curate(candidate, project_id='p', project_root='/x')
 
-        assert invoke.await_count == 2
+        assert invoke.await_count == 7
         assert result.action == 'drop'
-        escalator.report_consecutive_degraded.assert_not_awaited()
+        escalator.report_consecutive_degraded.assert_awaited_once()
 
 
-def _seed_streak(
-    curator: TaskCurator, *, count: int, alarm_fired: bool = False,
-    project_id: str = 'p',
+async def _degrade(
+    curator: TaskCurator, n: int, *, prefix: str, project_id: str = 'p',
 ) -> None:
-    """Start *project_id*'s degraded streak mid-run, as if *count* had elapsed."""
-    curator._degraded_streaks[project_id] = _DegradedStreak(
-        count=count, alarm_fired=alarm_fired,
-    )
+    """Drive *n* degraded curate() calls for *project_id* over an empty pool.
 
-
-def _streak(curator: TaskCurator, project_id: str = 'p') -> _DegradedStreak:
-    """*project_id*'s degraded streak; a never-started or reset one reads as zero."""
-    return curator._degraded_streaks.get(project_id, _DegradedStreak())
+    The curator's injected invoke must answer each with an unusable response.
+    Titles are distinct so the idempotency cache never serves one call from another.
+    """
+    with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
+        for i in range(n):
+            decision = await curator.curate(
+                CandidateTask(title=f'{prefix}{i}'), project_id=project_id, project_root='/x',
+            )
+            assert decision.degraded
 
 
 class TestConsecutiveDegradedAlarm:
@@ -1277,7 +1284,6 @@ class TestConsecutiveDegradedAlarm:
         assert kwargs['project_id'] == 'a'
         assert kwargs['project_root'] == '/a'
         assert kwargs['streak'] == 5
-        assert _streak(curator, 'b').count == 0
 
 
 class TestStartupSelfCheck:
@@ -2417,13 +2423,17 @@ class TestDegradedStreakBatchReset:
     @pytest.mark.asyncio
     async def test_successful_batch_resets_degraded_streak(self):
         """(1) A successful batch call clears counter AND latch."""
-        healthy = self._healthy_batch_result(2)
-        curator, _escalator = self._curator_with_escalator(AsyncMock(return_value=healthy))
+        invoke = invoke_by_role(
+            single=_agent_result({'action': 'bogus'}),
+            batch=self._healthy_batch_result(2),
+        )
+        curator, escalator = self._curator_with_escalator(invoke)
 
-        # Seed a streak that has already fired, so this pins both halves of
-        # the reset: a counter cleared but a latch left armed would silence
-        # the NEXT outage entirely.
-        _seed_streak(curator, count=3, alarm_fired=True)
+        # A run that has already fired, so this pins both halves of the
+        # reset: a counter cleared but a latch left armed would silence the
+        # NEXT outage entirely.
+        await _degrade(curator, 5, prefix='Before')
+        escalator.report_consecutive_degraded.assert_awaited_once()
 
         decisions = await curator.curate_batch_prepared(
             [_bundle('A'), _bundle('B')], 'p', '/x',
@@ -2433,48 +2443,41 @@ class TestDegradedStreakBatchReset:
         # path rather than _parse_batch_decisions's batch-item-missing
         # degradation, which would also produce 2 (degraded) decisions.
         assert [d.justification for d in decisions] == ['ok', 'ok']
-        assert _streak(curator).count == 0
-        assert _streak(curator).alarm_fired is False
+
+        await _degrade(curator, 5, prefix='After')
+        assert escalator.report_consecutive_degraded.await_count == 2
+        assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
 
     @pytest.mark.asyncio
     async def test_healthy_batches_between_degradations_do_not_fire_alarm(self):
         """(2) The production symptom end to end: four size-1 degradations,
         twenty healthy batch round-trips, one more degradation. A service doing
         twenty successful batch curations is not down, so the alarm must stay
-        silent and the streak must read 1, not 5."""
+        silent and the streak must read 1, not 5: exactly four further
+        degradations fire it."""
         invoke = invoke_by_role(
             single=_agent_result({'action': 'bogus', 'justification': 'x'}),
             batch=self._healthy_batch_result(2),
         )
         curator, escalator = self._curator_with_escalator(invoke)
 
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
+        await _degrade(curator, 4, prefix='Deg')
 
-        # A DISTINCT title per curate() call: identical titles hash to the same
-        # payload and the idempotency cache serves call 2..N from call 1's
-        # decision, so no later arm is ever entered and the streak never grows.
-        async def degrade(i: int):
-            return await curator.curate(
-                CandidateTask(title=f'Deg{i}'), project_id='p', project_root='/x',
+        # Distinct titles again, so every batch is a real round-trip.
+        for i in range(20):
+            await curator.curate_batch_prepared(
+                [_bundle(f'B{i}a'), _bundle(f'B{i}b')], 'p', '/x',
             )
 
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            for i in range(4):
-                await degrade(i)
-            assert _streak(curator).count == 4
-
-            # Distinct titles again, so every batch is a real round-trip.
-            for i in range(20):
-                await curator.curate_batch_prepared(
-                    [_bundle(f'B{i}a'), _bundle(f'B{i}b')], 'p', '/x',
-                )
-
-            await degrade(4)
-
+        await _degrade(curator, 1, prefix='After')
         escalator.report_consecutive_degraded.assert_not_awaited()
-        assert _streak(curator).count == 1
         assert invoke.await_count == 25
+
+        await _degrade(curator, 3, prefix='Run')
+        escalator.report_consecutive_degraded.assert_not_awaited()
+        await _degrade(curator, 1, prefix='Threshold')
+        escalator.report_consecutive_degraded.assert_awaited_once()
+        assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
 
     @pytest.mark.asyncio
     async def test_failed_batch_does_not_reset_degraded_streak(self):
@@ -2486,12 +2489,16 @@ class TestDegradedStreakBatchReset:
 
         The single calls the failed batch bisects into fail without a hang, so
         they defer, and a deferral is not part of the streak."""
+        unusable = _agent_result({'action': 'bogus'})
+        max_turns = AgentResult(success=False, output='x', subtype='error_max_turns')
+        single_answers = iter([*[unusable] * 5, max_turns, max_turns, *[unusable] * 5])
         invoke = invoke_by_role(
             batch=self._zot_result(),
-            single=AgentResult(success=False, output='x', subtype='error_max_turns'),
+            single=lambda _kwargs: next(single_answers),
         )
-        curator, _escalator = self._curator_with_escalator(invoke)
-        _seed_streak(curator, count=3, alarm_fired=True)
+        curator, escalator = self._curator_with_escalator(invoke)
+        await _degrade(curator, 5, prefix='Before')
+        escalator.report_consecutive_degraded.assert_awaited_once()
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
             decisions = await curator.curate_batch_prepared(
@@ -2500,8 +2507,9 @@ class TestDegradedStreakBatchReset:
 
         assert [d.action for d in decisions] == ['defer', 'defer']
 
-        assert _streak(curator).count == 3
-        assert _streak(curator).alarm_fired is True
+        # Still latched: five more degradations extend the run without re-firing.
+        await _degrade(curator, 5, prefix='After')
+        escalator.report_consecutive_degraded.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_decisionless_success_grows_streak_and_fires_alarm(self):
@@ -2519,10 +2527,12 @@ class TestDegradedStreakBatchReset:
             success=True, output='', cost_usd=0.03,
             structured_output={'wrong': []},
         )
-        curator, escalator = self._curator_with_escalator(AsyncMock(return_value=decisionless))
-        # Seeded just below threshold (5), so a reset that survives anywhere on
-        # this path shows up as an alarm that never fires.
-        _seed_streak(curator, count=4, alarm_fired=False)
+        invoke = invoke_by_role(single=_agent_result({'action': 'bogus'}), batch=decisionless)
+        curator, escalator = self._curator_with_escalator(invoke)
+        # Driven to just below threshold (5), so a reset that survives anywhere
+        # on this path shows up as an alarm that never fires.
+        await _degrade(curator, 4, prefix='Deg')
+        escalator.report_consecutive_degraded.assert_not_awaited()
 
         # Well-formed, prompt, success=True — and structurally unusable.
         decisions = await curator.curate_batch_prepared(
@@ -2533,10 +2543,9 @@ class TestDegradedStreakBatchReset:
             'batch-item-missing', 'batch-item-missing',
         ]
         assert all(d.degraded for d in decisions)
-        # Both items counted: 4 + 2.
-        assert _streak(curator).count == 6
-        assert _streak(curator).alarm_fired is True
+        # The batch's first item reaches the threshold.
         escalator.report_consecutive_degraded.assert_awaited_once()
+        assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
 
     @pytest.mark.asyncio
     async def test_partially_degraded_batch_still_resets(self):
@@ -2550,16 +2559,20 @@ class TestDegradedStreakBatchReset:
                 {'candidate_index': 0, 'action': 'create', 'justification': 'ok'},
             ]},
         )
-        curator, escalator = self._curator_with_escalator(AsyncMock(return_value=partial))
-        _seed_streak(curator, count=4)
+        invoke = invoke_by_role(single=_agent_result({'action': 'bogus'}), batch=partial)
+        curator, escalator = self._curator_with_escalator(invoke)
+        await _degrade(curator, 4, prefix='Before')
 
         decisions = await curator.curate_batch_prepared(
             [_bundle('A'), _bundle('B')], 'p', '/x',
         )
 
         assert [d.degraded for d in decisions] == [False, True]
-        assert _streak(curator).count == 0
+
+        await _degrade(curator, 4, prefix='After')
         escalator.report_consecutive_degraded.assert_not_awaited()
+        await _degrade(curator, 1, prefix='Fifth')
+        escalator.report_consecutive_degraded.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_decisionless_success_on_single_path_grows_streak(self):
@@ -2581,8 +2594,8 @@ class TestDegradedStreakBatchReset:
                 assert decision.action == 'create'
                 assert decision.degraded is True
 
-        assert _streak(curator).count == 5
         escalator.report_consecutive_degraded.assert_awaited_once()
+        assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
 
 
 class TestPayloadFailureDegradedness:
@@ -2638,8 +2651,8 @@ class TestPayloadFailureDegradedness:
                 assert 'missing-target' in decision.justification
                 assert decision.degraded is True
 
-        assert _streak(curator).count == 8
         escalator.report_consecutive_degraded.assert_awaited_once()
+        assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('marker,payload', PAYLOAD_FAILURES)
@@ -2657,8 +2670,8 @@ class TestPayloadFailureDegradedness:
                 assert marker in decision.justification
                 assert decision.degraded is True
 
-        assert _streak(curator).count == 8
         escalator.report_consecutive_degraded.assert_awaited_once()
+        assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('marker,payload', PAYLOAD_FAILURES)
@@ -2671,8 +2684,10 @@ class TestPayloadFailureDegradedness:
                 dict(payload, candidate_index=0), dict(payload, candidate_index=1),
             ]},
         )
-        curator, escalator = self._curator_with_escalator(AsyncMock(return_value=batch))
-        _seed_streak(curator, count=4)
+        invoke = invoke_by_role(single=_agent_result({'action': 'bogus'}), batch=batch)
+        curator, escalator = self._curator_with_escalator(invoke)
+        await _degrade(curator, 4, prefix='Deg')
+        escalator.report_consecutive_degraded.assert_not_awaited()
 
         decisions = await curator.curate_batch_prepared(
             [_bundle('A'), _bundle('B')], 'p', '/x',
@@ -2680,8 +2695,8 @@ class TestPayloadFailureDegradedness:
 
         assert all(d.action == 'create' and d.degraded for d in decisions)
         assert all(marker in d.justification for d in decisions)
-        assert _streak(curator).count == 6
         escalator.report_consecutive_degraded.assert_awaited_once()
+        assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
 
     @pytest.mark.asyncio
     async def test_state_veto_is_not_counted(self):
@@ -2715,7 +2730,6 @@ class TestPayloadFailureDegradedness:
                 assert 'invalid-combine-target' in decision.justification
                 assert decision.degraded is False
 
-        assert _streak(curator).count == 0
         escalator.report_consecutive_degraded.assert_not_awaited()
 
 
