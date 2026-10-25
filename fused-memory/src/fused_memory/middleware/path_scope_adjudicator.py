@@ -32,7 +32,7 @@ AdjudicationVerdict.should_allow_creation == True ← ONLY when verdict=='allow'
 Reuses:
 - ``shared.cli_invoke.invoke_with_cap_retry`` (same call shape as TaskCurator)
 - ``AgentResult`` / ``is_zero_output_timeout`` / ``AllAccountsCappedException``
-- Consecutive-ZOT circuit breaker (mirrors task_curator.py lines 505-543)
+- ``middleware/zero_output_breaker.py::ZeroOutputBreaker`` (shared with TaskCurator)
 """
 
 from __future__ import annotations
@@ -51,6 +51,8 @@ from shared.cli_invoke import (
     no_mcp_servers_config,
 )
 from shared.neutral_cwd import neutral_cli_cwd
+
+from fused_memory.middleware.zero_output_breaker import ZeroOutputBreaker
 
 if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
@@ -222,42 +224,10 @@ class PathScopeAdjudicator:
         self._cwd = cwd
         self._escalator = scope_violation_escalator
 
-        # Consecutive-ZOT circuit breaker (mirrors TaskCurator lines 505-543).
-        self._consecutive_zero_output_timeouts: int = 0
-        self._zero_output_breaker_open_until: float | None = None
-
-    # ------------------------------------------------------------------
-    # Circuit-breaker helpers (mirror task_curator.py 516-543)
-    # ------------------------------------------------------------------
-
-    def _breaker_open(self, now: float) -> bool:
-        """Return True while the ZOT breaker is tripped and cooldown has not elapsed."""
-        return (
-            self._zero_output_breaker_open_until is not None
-            and now < self._zero_output_breaker_open_until
+        self._zero_output_breaker = ZeroOutputBreaker(
+            threshold=config.zero_output_breaker_threshold,
+            cooldown_seconds=config.zero_output_breaker_cooldown_seconds,
         )
-
-    def _record_zero_output_timeout(self, now: float) -> None:
-        """Increment the consecutive-ZOT counter; open the breaker when threshold is reached."""
-        self._consecutive_zero_output_timeouts += 1
-        if (
-            self._consecutive_zero_output_timeouts
-            >= self._config.zero_output_breaker_threshold
-        ):
-            self._zero_output_breaker_open_until = (
-                now + self._config.zero_output_breaker_cooldown_seconds
-            )
-            logger.warning(
-                'path_scope_adjudicator: zero-output-breaker OPEN after %d consecutive ZOTs; '
-                'short-circuiting adjudicator LLM calls for %.0fs',
-                self._consecutive_zero_output_timeouts,
-                self._config.zero_output_breaker_cooldown_seconds,
-            )
-
-    def _reset_breaker(self) -> None:
-        """Reset the breaker on any real LLM success."""
-        self._consecutive_zero_output_timeouts = 0
-        self._zero_output_breaker_open_until = None
 
     # ------------------------------------------------------------------
     # Prompt builders
@@ -328,7 +298,7 @@ class PathScopeAdjudicator:
         now = time.monotonic()
 
         # --- Circuit-breaker gate ---
-        if self._breaker_open(now):
+        if self._zero_output_breaker.is_open(now):
             logger.debug(
                 'path_scope_adjudicator: breaker open; failing safe for project %r',
                 project_id,
@@ -392,7 +362,7 @@ class PathScopeAdjudicator:
             # config defect, not a transient hang.  Gate on both subtype and
             # cost_usd>0 so:
             #   (a) genuine ZOTs (timed_out=True, cost=0) still fall through to
-            #       _record_zero_output_timeout (the ZOT breaker path);
+            #       the ZOT breaker path;
             #   (b) zero-cost error_max_budget_usd from a schema-tool-denied
             #       pre-turn failure are NOT misclassified as a budget defect.
             if agent_result.subtype == BUDGET_EXHAUSTED_SUBTYPE and agent_result.cost_usd > 0:
@@ -435,11 +405,17 @@ class PathScopeAdjudicator:
                     llm_used=True,
                 )
 
-            if is_zero_output_timeout(agent_result):
-                # Capture a fresh timestamp so the cooldown window is measured
-                # from when the failure was observed, not from before the
-                # (potentially 60s) hung LLM call started — mirrors task_curator.py:935-938.
-                self._record_zero_output_timeout(time.monotonic())
+            # A fresh timestamp measures the cooldown from when the failure was
+            # observed, not from before the (potentially 60s) hung LLM call started.
+            if is_zero_output_timeout(agent_result) and self._zero_output_breaker.record_timeout(
+                time.monotonic()
+            ):
+                logger.warning(
+                    'path_scope_adjudicator: zero-output-breaker OPEN after %d consecutive ZOTs; '
+                    'short-circuiting adjudicator LLM calls for %.0fs',
+                    self._zero_output_breaker.consecutive_timeouts,
+                    self._zero_output_breaker.cooldown_seconds,
+                )
             reason = (
                 f'llm-failed: timed_out={agent_result.timed_out} '
                 f'subtype={agent_result.subtype!r}'
@@ -456,7 +432,7 @@ class PathScopeAdjudicator:
             )
 
         # --- Success: reset breaker and parse output ---
-        self._reset_breaker()
+        self._zero_output_breaker.close()
 
         structured = agent_result.structured_output
         if not isinstance(structured, dict):
