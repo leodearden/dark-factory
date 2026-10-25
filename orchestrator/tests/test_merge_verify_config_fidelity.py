@@ -11,6 +11,14 @@ graph and lists every ``OrchestratorConfig`` field, public property and public
 method it names.  It over-approximates on purpose: a ``ModuleConfig`` attribute
 with the same name counts too.
 
+WHAT THE CENSUS CANNOT SEE.  It reads names, so it misses a read whose name is
+computed: a non-literal ``getattr``, ``vars``, ``model_dump`` or ``__dict__``.
+On a parameter annotated ``OrchestratorConfig`` each of those shapes fails the
+guard.  On any other binding, such as an alias or a config held by another
+object, it passes unseen.  The census also follows only the calls it can resolve
+statically.  A read behind an injected callable other than the entry points, or
+behind a method called on an object other than ``self``, goes uncounted.
+
 THE THREE CLASSES.
 
 - ``SPEC_CARRIED``: the dispatcher's value rides the spec and wins on the
@@ -41,9 +49,10 @@ from pathlib import Path
 from types import FunctionType, MappingProxyType
 
 import pytest
+import yaml
 
 from orchestrator import verify, verify_runner
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import ModuleConfig, OrchestratorConfig, load_config
 from orchestrator.merge_lane import gates
 from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.verify import VerifyResult
@@ -215,6 +224,7 @@ class _ModuleIndex:
 @dataclass(frozen=True)
 class _Census:
     reads: Mapping[str, tuple[str, ...]]
+    dynamic_access: tuple[str, ...]
     visited_modules: frozenset[str]
 
 
@@ -322,6 +332,36 @@ def _config_names_read(node: _FunctionNode) -> Iterator[str]:
             yield sub.args[1].value
 
 
+_WHOLE_OBJECT_READS = frozenset({'model_dump', 'model_dump_json', '__dict__'})
+
+
+def _config_parameters(node: _FunctionNode) -> frozenset[str]:
+    return frozenset(
+        arg.arg
+        for fn in ast.walk(node)
+        if isinstance(fn, _FunctionNode)
+        for arg in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs)
+        if arg.annotation is not None and 'OrchestratorConfig' in ast.unparse(arg.annotation)
+    )
+
+
+def _dynamic_config_access(node: _FunctionNode) -> Iterator[str]:
+    config_names = _config_parameters(node)
+
+    def on_config(expr: ast.expr) -> bool:
+        return isinstance(expr, ast.Name) and expr.id in config_names
+
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.args and on_config(sub.args[0]):
+            computed_getattr = (
+                sub.func.id == 'getattr' and len(sub.args) >= 2 and not isinstance(sub.args[1], ast.Constant)
+            )
+            if computed_getattr or sub.func.id == 'vars':
+                yield ast.unparse(sub)
+        elif isinstance(sub, ast.Attribute) and sub.attr in _WHOLE_OBJECT_READS and on_config(sub.value):
+            yield ast.unparse(sub)
+
+
 @functools.cache
 def _merge_path_census() -> _Census:
     entries = [(fn.__module__, fn.__qualname__) for fn in _ENTRY_POINTS]
@@ -330,6 +370,7 @@ def _merge_path_census() -> _Census:
     visited: set[_FunctionKey] = set()
     queue = deque(entries)
     sites: defaultdict[str, set[str]] = defaultdict(set)
+    dynamic: set[str] = set()
     while queue:
         key = queue.popleft()
         if key in visited:
@@ -339,9 +380,11 @@ def _merge_path_census() -> _Census:
         node = _index(module).defs[qualname]
         for name in _config_names_read(node):
             sites[name].add(f'{module}::{qualname}')
+        dynamic.update(f'{module}::{qualname}: {expr}' for expr in _dynamic_config_access(node))
         queue.extend(callee for callee in _callees(module, qualname, node) if callee not in visited)
     return _Census(
         reads=MappingProxyType({name: tuple(sorted(where)) for name, where in sites.items()}),
+        dynamic_access=tuple(sorted(dynamic)),
         visited_modules=frozenset(module for module, _ in visited),
     )
 
@@ -368,6 +411,31 @@ def test_every_classified_row_is_still_read() -> None:
     assert not stale, (
         f'These MERGE_PATH_CONFIG_READS rows are no longer read on the merge path; delete them: {stale}'
     )
+
+
+def test_merge_path_reads_no_config_name_the_census_cannot_see() -> None:
+    dynamic = _merge_path_census().dynamic_access
+    assert not dynamic, (
+        'The merge path reads OrchestratorConfig through a computed name, so the census cannot '
+        'tell which fields it reads. Rewrite each as a literal attribute read:\n'
+        + '\n'.join(f'  {site}' for site in dynamic)
+    )
+
+
+def test_dynamic_access_check_flags_every_computed_shape() -> None:
+    source = (
+        'def f(config: OrchestratorConfig, other, name):\n'
+        '    getattr(config, name); vars(config); config.model_dump(); config.__dict__\n'
+        "    getattr(config, 'scope_cargo'); getattr(other, name); config.scope_cargo\n"
+    )
+    node = ast.parse(source).body[0]
+    assert isinstance(node, ast.FunctionDef)
+    assert set(_dynamic_config_access(node)) == {
+        'getattr(config, name)',
+        'vars(config)',
+        'config.model_dump',
+        'config.__dict__',
+    }
 
 
 def test_census_resolves_reads_across_modules() -> None:
@@ -402,12 +470,24 @@ def test_unread_candidates_stay_unread() -> None:
     )
 
 
+# Three of the four past fidelity holes were latent on the zero-module route, so it is named.
+_ROUTES: Mapping[str, tuple[ModuleConfig, ...]] = MappingProxyType({
+    'zero_module': (),
+    'one_module': (ModuleConfig(prefix='src/a', test_command='true'),),
+})
+
+
+def _on_every_route(value: object) -> Mapping[str, object]:
+    return MappingProxyType(dict.fromkeys(_ROUTES, value))
+
+
 @dataclass(frozen=True)
 class _CarriedProbe:
     dispatcher: Mapping[str, object]
     host: Mapping[str, object]
     observe: Callable[[OrchestratorConfig], object]
-    expected: object
+    expected: Mapping[str, object]
+    host_module_prefixes: tuple[str, ...] = ()
 
 
 _CARRIED_PROBES: Mapping[str, _CarriedProbe] = MappingProxyType({
@@ -415,46 +495,54 @@ _CARRIED_PROBES: Mapping[str, _CarriedProbe] = MappingProxyType({
         dispatcher={'merge_verify_workspace': True},
         host={'merge_verify_workspace': False},
         observe=lambda cfg: cfg.merge_verify_workspace,
-        expected=True,
+        expected=_on_every_route(True),
     ),
     'merge_verify_breadth': _CarriedProbe(
         dispatcher={'merge_verify_breadth': 'full'},
         host={'merge_verify_breadth': 'scoped'},
         observe=lambda cfg: cfg.merge_verify_breadth,
-        expected='full',
+        expected=_on_every_route('full'),
     ),
     'verify_env': _CarriedProbe(
         dispatcher={'verify_env': {'DF_FIDELITY_PROBE': 'dispatcher'}},
         host={'verify_env': {'DF_FIDELITY_PROBE': 'host'}},
         observe=lambda cfg: cfg.verify_env['DF_FIDELITY_PROBE'],
-        expected='dispatcher',
+        expected=_on_every_route('dispatcher'),
     ),
     'verify_cold_preprovision_command': _CarriedProbe(
         dispatcher={'verify_cold_preprovision_command': 'echo dispatcher'},
         host={'verify_cold_preprovision_command': 'echo host'},
         observe=lambda cfg: cfg.verify_cold_preprovision_command,
-        expected='echo dispatcher',
+        expected=_on_every_route('echo dispatcher'),
     ),
+    # Task 4536's hole: the host discovers a module of its own while the dispatcher ships the route's set.
     'module_configs_or_empty': _CarriedProbe(
         dispatcher={},
         host={},
+        host_module_prefixes=('src/b',),
         observe=lambda cfg: sorted(cfg.module_configs_or_empty),
-        expected=['src/a'],
+        expected=MappingProxyType({'zero_module': [], 'one_module': ['src/a']}),
     ),
 })
-
-# Three of the four past fidelity holes were latent on the zero-module route, so it is named.
-_ROUTES: Mapping[str, tuple[ModuleConfig, ...]] = MappingProxyType({
-    'zero_module': (),
-    'one_module': (ModuleConfig(prefix='src/a', test_command='true'),),
-})
-
-# Both sides hold an empty module registry on the zero-module route, so the case cannot discriminate.
-_UNDISCRIMINATING_CASES = frozenset({('module_configs_or_empty', 'zero_module')})
 
 
 def test_every_spec_carried_row_has_a_probe() -> None:
     assert set(_CARRIED_PROBES) == set(_rows(Fidelity.SPEC_CARRIED))
+    unrouted = sorted(row for row, probe in _CARRIED_PROBES.items() if set(probe.expected) != set(_ROUTES))
+    assert not unrouted, f'These probes do not state an expected value for every route: {unrouted}'
+
+
+def _load_host_config(root: Path, probe: _CarriedProbe, monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
+    """The host's config as its own orchestrator loads it: its YAML, then its module discovery walk."""
+    for prefix in probe.host_module_prefixes:
+        module_dir = root / prefix
+        module_dir.mkdir(parents=True)
+        (module_dir / 'orchestrator.yaml').write_text("test_command: 'true'\n", encoding='utf-8')
+    config_path = root / 'dark-factory-orchestrator.yaml'
+    config_path.write_text(yaml.safe_dump(dict(probe.host)), encoding='utf-8')
+    monkeypatch.setenv('ORCH_PROJECT_ROOT', str(root))
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+    return load_config(config_path)
 
 
 async def _config_the_remote_bundle_receives(
@@ -485,18 +573,26 @@ async def _config_the_remote_bundle_receives(
         pytest.param(row, route, id=f'{row}-{route}')
         for row in _CARRIED_PROBES
         for route in _ROUTES
-        if (row, route) not in _UNDISCRIMINATING_CASES
     ],
 )
-async def test_spec_carried_read_takes_the_dispatchers_value(tmp_path: Path, row: str, route: str) -> None:
+async def test_spec_carried_read_takes_the_dispatchers_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str, route: str
+) -> None:
     probe = _CARRIED_PROBES[row]
-    received = await _config_the_remote_bundle_receives(
-        tmp_path,
-        OrchestratorConfig.model_validate(dict(probe.dispatcher)),
-        OrchestratorConfig.model_validate(dict(probe.host)),
-        _ROUTES[route],
+    expected = probe.expected[route]
+    host_root = tmp_path / 'host'
+    host_root.mkdir()
+    host = _load_host_config(host_root, probe, monkeypatch)
+    assert probe.observe(host) != expected, (
+        f'{row} on the {route} route: the host already holds {expected!r}, so the case cannot '
+        'tell the dispatcher value from the host value. Give the probe a host value that differs.'
     )
-    assert probe.observe(received) == probe.expected, (
+    worktree = tmp_path / 'merge-worktree'
+    worktree.mkdir()
+    received = await _config_the_remote_bundle_receives(
+        worktree, OrchestratorConfig.model_validate(dict(probe.dispatcher)), host, _ROUTES[route]
+    )
+    assert probe.observe(received) == expected, (
         f'{row} on the {route} route: the remote bundle saw {probe.observe(received)!r}, '
-        f'not the dispatcher value {probe.expected!r}. Reclassify the row; do not change production.'
+        f'not the dispatcher value {expected!r}. Reclassify the row; do not change production.'
     )
