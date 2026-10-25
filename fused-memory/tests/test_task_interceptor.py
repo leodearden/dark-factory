@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,6 +17,7 @@ from _fm_helpers import _init_git_repo, make_8df8_scenario, poll_until
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 from shared.async_sqlite_base import CheckpointResult
 from shared.git_async import GitResult, run_git
+from shared.task_metadata import DoneProvenance
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TaskStatus
 
@@ -3515,6 +3516,68 @@ async def test_done_provenance_rejects_missing_when_required(
     assert result['success'] is False
     assert result['error'] == 'done_provenance_required'
     taskmaster.set_task_status.assert_not_called()
+
+
+def _assert_offers_every_caller_selectable_kind(text: str) -> None:
+    """``text`` names every kind a caller may supply by hand, the
+    operational-verified link field, and the canonical per-kind table. The
+    caller-selectable set is derived from the declared vocabulary, so a new
+    caller-selectable kind fails here until the guidance names it."""
+    declared = set(get_args(DoneProvenance.model_fields['kind'].annotation))
+    caller_selectable = declared - DETERMINISTIC_PROVENANCE_KINDS
+    assert caller_selectable
+    for kind in caller_selectable:
+        assert f'"{kind}"' in text, (kind, text)
+    assert 'escalation_id' in text, text
+    assert 'docs/task-authoring.md' in text, text
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_required_hint_offers_every_caller_selectable_kind(
+    taskmaster, reconciler, event_buffer, config_with_strict_provenance
+):
+    """The require=True refusal's hint is the first thing a blocked caller reads."""
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=config_with_strict_provenance,
+    )
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    assert result['error'] == 'done_provenance_required'
+    _assert_offers_every_caller_selectable_kind(result['hint'])
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_missing_warning_offers_every_caller_selectable_kind(
+    taskmaster, reconciler, event_buffer, caplog
+):
+    """The require=False warning names the same kinds as the strict refusal."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        await interceptor.set_task_status('1', 'done', '/project')
+
+    [warning] = [
+        record.getMessage()
+        for record in caplog.records
+        if 'without done_provenance' in record.getMessage()
+    ]
+    _assert_offers_every_caller_selectable_kind(warning)
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_kind_required_reason_offers_every_caller_selectable_kind(
+    taskmaster, reconciler, event_buffer
+):
+    """A payload with no kind is refused at parse with the same guidance."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', '/project', done_provenance={'note': 'x'},
+    )
+
+    assert result['error'] == 'done_provenance_invalid'
+    _assert_offers_every_caller_selectable_kind(result['reason'])
 
 
 @pytest.mark.asyncio
