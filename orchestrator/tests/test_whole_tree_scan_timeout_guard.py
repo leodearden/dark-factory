@@ -1115,3 +1115,38 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
             'module out of the guard family task-role verify runs.'
             f'\n\nOffending scanners:\n  {offender_list}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Formerly-mixed modules stay out of the family (task 4600).
+#
+# Each of these once carried the family mark only because ONE incidental
+# whole-tree scan sat beside many unrelated tests. Each scan now lives in a
+# dedicated *_guard.py module, and these modules must not drift back.
+# ---------------------------------------------------------------------------
+
+_FORMERLY_MIXED_MODULES = (
+    'test_lane_lifecycle_gitops.py',
+    'test_scheduler_hold_history.py',
+    'test_workflow_factory.py',
+    'test_eval_boundary_suite.py',
+    'test_mcp_post_transport.py',
+)
+
+
+@pytest.mark.parametrize('module_name', _FORMERLY_MIXED_MODULES)
+def test_formerly_mixed_module_is_not_a_family_member(module_name: str) -> None:
+    source = (_TESTS_DIR / module_name).read_text(encoding='utf-8')
+    reason = (
+        'Move the incidental whole-tree scan into a dedicated *_guard.py module. '
+        'A module-level family mark widens the hang ceiling of every unrelated '
+        f'test in {module_name} to WHOLE_TREE_SCAN_TEST_TIMEOUT '
+        f'({WHOLE_TREE_SCAN_TEST_TIMEOUT}s), and drags those tests into every '
+        'task-role verify (docs/task-role-pytest-floor.md).'
+    )
+    assert is_whole_tree_guard_module(source) is False, (
+        f'{module_name} carries the whole-tree guard family mark. {reason}'
+    )
+    assert _scans_whole_tree_py(source) is False, (
+        f'{module_name} sweeps a directory tree for *.py files. {reason}'
+    )
