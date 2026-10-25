@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -164,6 +165,24 @@ class Timeouts(BaseModel):
     census_synthesis_secs: int = 1800
 
 
+class PlanDeviationCensus(BaseModel):
+    """``plan_deviation_census`` block — the plan-deviation census's defaults
+    and the settings type it evaluates with. Validated not by pydantic but by
+    ``scripts/legibility/plan_deviation_census.py::settings_from_mapping``;
+    rationale: plans/plan-deviation-recording-prd.md D8."""
+
+    model_config = ConfigDict(extra='allow', frozen=True)
+
+    enabled: bool = True
+    rate_rise_factor: float = 2.0
+    min_records: int = 10
+    pattern_share: float = 0.5
+    prose_only_min: int = 3
+    cooldown_days: int = 7
+    horizon_days: int = 28
+    meta_roots: tuple[str, ...] = ('.worktrees/.task-meta',)
+
+
 def _require_absolute(value: str, *, field_name: str, detail: str) -> str:
     """Raise ``ValueError`` naming *field_name* when *value* isn't absolute.
 
@@ -192,7 +211,9 @@ class LegibilityConfig(BaseModel):
     list of additional archive roots the miner enumerates alongside
     ``~/.claude/projects`` (the ``shared.transcript_archive`` fleet-transcript
     tree); it defaults to ``[]`` — the byte-parity baseline in which only
-    ``~/.claude/projects`` is read.
+    ``~/.claude/projects`` is read. ``plan_deviation_census`` is kept RAW so a
+    bad value never fails ``load_config``; it is validated by
+    ``plan_deviation_census.py::settings_from_mapping``.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -207,6 +228,7 @@ class LegibilityConfig(BaseModel):
     census: Census = Field(default_factory=Census)
     models: Models = Field(default_factory=Models)
     timeouts: Timeouts = Field(default_factory=Timeouts)
+    plan_deviation_census: Any = None
 
     @field_validator('project_root')
     @classmethod
