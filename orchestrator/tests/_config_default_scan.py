@@ -47,6 +47,7 @@ import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from orchestrator.config import OrchestratorConfig
 
@@ -63,19 +64,12 @@ _UNRESOLVED = object()
 def _load_package_defaults() -> OrchestratorConfig:
     """Build an ``OrchestratorConfig`` from package defaults ONLY.
 
-    Saves and restores ``ORCH_CONFIG_PATH`` so the scan never depends on — and
-    never perturbs — the ambient config the rest of the suite relies on.
+    Overrides ``ORCH_CONFIG_PATH`` only for the construction, so the scan never
+    depends on — and never perturbs — the ambient config the rest of the suite
+    relies on.
     """
-    sentinel = object()
-    previous: Any = os.environ.get('ORCH_CONFIG_PATH', sentinel)
-    try:
-        os.environ['ORCH_CONFIG_PATH'] = _ABSENT_CONFIG_PATH
+    with mock.patch.dict(os.environ, {'ORCH_CONFIG_PATH': _ABSENT_CONFIG_PATH}):
         return OrchestratorConfig()
-    finally:
-        if previous is sentinel:
-            os.environ.pop('ORCH_CONFIG_PATH', None)
-        else:
-            os.environ['ORCH_CONFIG_PATH'] = previous
 
 
 #: Resolved once at import, per the note above.
