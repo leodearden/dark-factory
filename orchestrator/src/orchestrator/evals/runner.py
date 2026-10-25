@@ -665,9 +665,9 @@ async def collect_metrics(
 
     # Cost provenance (Invariant P5): the CLI's own cost figure is wrong for a
     # proxied endpoint, so resolve cost from the config price table by the run's
-    # model, tracking which source was used. collect_metrics is the IMPLEMENTER
-    # path (run_eval), so the model under test is config.models.implementer.
-    # ``run_architect_eval`` resolves through this SAME seam (task 3656) — with
+    # model, tracking which source was used. Every workflow cell's tokens come
+    # from the implementer, so cost resolves by config.models.implementer
+    # whatever *role* the cell is stamped with. ``run_architect_eval`` resolves through this SAME seam (task 3656) — with
     # ``model=EvalConfig.model`` and ``prices`` from its own eval orch config,
     # the leaves that actually produced its tokens — and then composes its
     # two-component (architect + plan-judge) label via ``compose_cost_source``.
