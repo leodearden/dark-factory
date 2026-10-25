@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import re
-import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -2224,60 +2223,61 @@ class TestZeroOutputBreakerBatchReset:
             ]},
         )
 
+    def _curator(self, invoke: AsyncMock) -> TaskCurator:
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        return TaskCurator(
+            config=config, taskmaster=None, escalator=escalator_double(), invoke=invoke,
+        )
+
+    async def _curate(self, curator: TaskCurator, title: str) -> CuratorDecision:
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
+            return await curator.curate(
+                CandidateTask(title=title), project_id='p', project_root='/x',
+            )
+
+    async def _assert_one_zot_from_open(
+        self, curator: TaskCurator, invoke: AsyncMock, *, titles: tuple[str, str],
+    ) -> None:
+        """The run stands at one ZOT below the threshold of 2: the next ZOT still
+        reaches the LLM and opens the breaker, so only the call after it defers."""
+        calls_before = invoke.await_count
+        zot_decision = await self._curate(curator, titles[0])
+        assert invoke.await_count == calls_before + 1
+        assert zot_decision.action == 'create'
+        assert zot_decision.degraded_by_zot is True
+
+        deferred = await self._curate(curator, titles[1])
+        assert deferred.action == 'defer'
+        assert deferred.defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
+        assert invoke.await_count == calls_before + 1
+
     @pytest.mark.asyncio
     async def test_healthy_batch_between_zots_does_not_open_breaker(self):
         """(2) Production symptom, end to end: ZOT, healthy batch, ZOT must NOT open
         the breaker — the healthy batch has to clear what the first ZOT left behind."""
-        config = _make_config()
-        config.curator.zero_output_breaker_threshold = 2
-        config.curator.zero_output_breaker_cooldown_seconds = 600.0
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-
         zot = self._zot_result()
-        healthy = self._healthy_batch_result(2)
-        mock_llm = AsyncMock(side_effect=[zot, healthy, zot])
+        invoke = AsyncMock(side_effect=[zot, self._healthy_batch_result(2), zot, zot])
+        curator = self._curator(invoke)
 
-        async def empty_corpus(*a, **k):
-            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator, invoke=mock_llm)
+        await self._curate(curator, 'Alpha')
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            # ZOT via curate() (counter → 1).
-            await curator.curate(
-                CandidateTask(title='Alpha'), project_id='p', project_root='/x',
-            )
-            # Healthy batch call — must reset counter to 0.
             await curator.curate_batch_prepared(
                 [_bundle('Batch1'), _bundle('Batch2')], 'p', '/x',
             )
-            # ZOT via curate() again (counter → 1, still under threshold=2).
-            await curator.curate(
-                CandidateTask(title='Bravo'), project_id='p', project_root='/x',
-            )
+        await self._curate(curator, 'Bravo')
+        assert invoke.await_count == 3
 
-        assert curator._zero_output_breaker_open_until is None
-        assert curator._consecutive_zero_output_timeouts == 1
-        # All three LLM-bound calls actually reached the LLM — nothing was
-        # short-circuited by a wrongly-opened breaker.
-        assert mock_llm.await_count == 3
+        await self._assert_one_zot_from_open(curator, invoke, titles=('Charlie', 'Delta'))
 
     @pytest.mark.asyncio
     async def test_successful_batch_resets_zot_counter(self):
         """(1) A successful batch call resets the counter."""
-        config = _make_config()
-        config.curator.zero_output_breaker_threshold = 2
-        config.curator.zero_output_breaker_cooldown_seconds = 600.0
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-        healthy = self._healthy_batch_result(2)
-        curator = TaskCurator(
-            config=config, taskmaster=None, escalator=escalator,
-            invoke=AsyncMock(return_value=healthy),
-        )
-
-        curator._record_zero_output_timeout(time.monotonic())
-        assert curator._consecutive_zero_output_timeouts == 1
+        zot = self._zot_result()
+        invoke = AsyncMock(side_effect=[zot, self._healthy_batch_result(2), zot, zot])
+        curator = self._curator(invoke)
+        await self._curate(curator, 'Seed ZOT')
 
         empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
         c1 = CandidateTask(title='Prepared candidate Gamma', description='gamma task details')
@@ -2296,7 +2296,10 @@ class TestZeroOutputBreakerBatchReset:
         # path rather than _parse_batch_decisions's batch-item-missing
         # degradation, which would also produce 2 (degraded) decisions.
         assert [d.justification for d in decisions] == ['ok', 'ok']
-        assert curator._consecutive_zero_output_timeouts == 0
+
+        await self._curate(curator, 'First ZOT after the reset')
+        await self._curate(curator, 'Still reaches the LLM')
+        assert invoke.await_count == 4
 
     @pytest.mark.asyncio
     async def test_failed_batch_does_not_reset_counter(self):
@@ -2307,29 +2310,20 @@ class TestZeroOutputBreakerBatchReset:
 
         The single calls the failed batch bisects into fail without a hang,
         so they neither count a ZOT nor reset the counter themselves."""
-        config = _make_config()
-        config.curator.zero_output_breaker_threshold = 2
-        config.curator.zero_output_breaker_cooldown_seconds = 600.0
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-        invoke = invoke_by_role(
-            batch=self._zot_result(),
-            single=AgentResult(success=False, output='x', subtype='error_max_turns'),
-        )
-        curator = TaskCurator(
-            config=config, taskmaster=None, escalator=escalator, invoke=invoke,
-        )
-
-        curator._record_zero_output_timeout(time.monotonic())
-        assert curator._consecutive_zero_output_timeouts == 1
+        zot = self._zot_result()
+        max_turns = AgentResult(success=False, output='x', subtype='error_max_turns')
+        single_answers = iter([zot, max_turns, max_turns, zot])
+        invoke = invoke_by_role(batch=zot, single=lambda _kwargs: next(single_answers))
+        curator = self._curator(invoke)
+        await self._curate(curator, 'Seed ZOT')
 
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
             await curator.curate_batch_prepared([_bundle('A'), _bundle('B')], 'p', '/x')
 
         assert [call.kwargs['role'] for call in invoke.await_args_list] == [
-            'task_curator_batch', 'task_curator', 'task_curator',
+            'task_curator', 'task_curator_batch', 'task_curator', 'task_curator',
         ]
-        assert curator._consecutive_zero_output_timeouts == 1
+        await self._assert_one_zot_from_open(curator, invoke, titles=('Probe', 'Deferred'))
 
     @pytest.mark.asyncio
     async def test_successful_batch_closes_already_open_breaker(self):
@@ -2351,23 +2345,19 @@ class TestZeroOutputBreakerBatchReset:
 
         An open breaker defers the whole batch at the public entry point, so
         this drives the bisecting dispatcher directly, as a sibling half does."""
-        config = _make_config()
-        config.curator.zero_output_breaker_threshold = 2
-        config.curator.zero_output_breaker_cooldown_seconds = 600.0
-        escalator = AsyncMock()
-        escalator.report_failure = AsyncMock(return_value=None)
-        healthy = self._healthy_batch_result(2)
-        curator = TaskCurator(
-            config=config, taskmaster=None, escalator=escalator,
-            invoke=AsyncMock(return_value=healthy),
+        zot = self._zot_result()
+        healthy_single = _agent_result({'action': 'create', 'justification': 'ok'})
+        invoke = AsyncMock(
+            side_effect=[zot, zot, self._healthy_batch_result(2), zot, healthy_single],
         )
+        curator = self._curator(invoke)
 
-        # Simulate a sibling bisect half having already tripped the breaker.
-        now = time.monotonic()
-        curator._record_zero_output_timeout(now)
-        curator._record_zero_output_timeout(now)
-        assert curator._consecutive_zero_output_timeouts == 2
-        assert curator._zero_output_breaker_open_until is not None
+        # A sibling bisect half has already tripped the breaker.
+        await self._curate(curator, 'Opener A')
+        await self._curate(curator, 'Opener B')
+        assert (await self._curate(curator, 'Blocked')).defer_reason is (
+            DeferReason.ZERO_OUTPUT_BREAKER_OPEN
+        )
 
         decisions = await curator._call_llm_batch_with_fallback(
             [CandidateTask(title='E'), CandidateTask(title='F')],
@@ -2377,10 +2367,13 @@ class TestZeroOutputBreakerBatchReset:
             'p',
             '/x',
         )
-
         assert len(decisions) == 2
-        assert curator._consecutive_zero_output_timeouts == 0
-        assert curator._zero_output_breaker_open_until is None
+
+        after_close = await self._curate(curator, 'Reaches the LLM')
+        assert after_close.degraded_by_zot is True
+        after_one_zot = await self._curate(curator, 'Counter was reset')
+        assert after_one_zot.action == 'create'
+        assert invoke.await_count == 5
 
 
 class TestDegradedStreakBatchReset:
@@ -6833,12 +6826,10 @@ class TestZeroOutputBreakerBatchPath:
             prepared_first, project_id='p', project_root='/x',
         )
 
-        # First batch: degrade-to-create, breaker now open.
+        # First batch: degrade-to-create; the second batch below proves the
+        # breaker opened.
         assert len(first_decisions) == 1
         assert first_decisions[0].action == 'create'
-        assert curator._zero_output_breaker_open_until is not None, (
-            'Breaker must be open after a batch ZOT trips the threshold'
-        )
         # Escalation bounded: threshold=1 means at most 1 report_failure call.
         assert escalator.report_failure.await_count <= 1
 
@@ -6861,7 +6852,7 @@ class TestZeroOutputBreakerBatchPath:
             assert d.action == 'defer'
             assert d.defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
 
-        # No LLM calls during second batch (breaker-open gate).
+        # No LLM calls during second batch: the batch ZOT opened the breaker.
         assert mock_llm.await_count == llm_calls_after_first
         # No new escalations from the short-circuited second batch.
         assert escalator.report_failure.await_count <= 1
