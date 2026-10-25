@@ -284,6 +284,11 @@ class UnscopedTypecheckSpec:
 class MergeVerifySpec:
     """Full pre-advance merge-verify bundle — PRD §A contract.
 
+    Which OrchestratorConfig names the merge path reads, and whether each rides
+    this spec, is classified and census-guarded in
+    ``orchestrator/tests/test_merge_verify_config_fidelity.py::MERGE_PATH_CONFIG_READS``;
+    adding a merge-path config read or a spec field means updating that table.
+
     Fields
     ------
     verify_commands     : one VerifyCommand per module, scoped to task_files
