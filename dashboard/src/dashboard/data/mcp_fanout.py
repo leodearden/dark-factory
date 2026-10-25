@@ -44,6 +44,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, Generic, TypeVar
 
 import httpx
+from shared.streak import KeyedStreaks
 
 # PEP 696 TypeVar defaults, via typing_extensions rather than typing: pyright
 # rejects `typing.TypeVar(default=...)` under this package's
@@ -81,7 +82,7 @@ K = TypeVarD('K', default=str)
 # each path/endpoint pair reports independently.
 _FANOUT_REWARN_EVERY = 500
 
-_failure_streaks: dict[tuple[str, str], int] = {}
+_failure_streaks: KeyedStreaks[tuple[str, str]] = KeyedStreaks(threshold=1)
 
 
 # ── bounded per-key lock acquisition (task 4789) ────────────────────
@@ -392,20 +393,18 @@ def log_fanout_failure(log_label: str, url: str, exc: BaseException) -> None:
     ``dashboard.data.memory`` so the whole invisible-failure class is closed
     with one policy rather than three divergent ones.
     """
-    key = (log_label, url)
-    streak = _failure_streaks.get(key, 0) + 1
-    _failure_streaks[key] = streak
+    step = _failure_streaks.failure((log_label, url))
     detail = describe_exc(exc)
-    if streak == 1:
+    if step.fired:
         logger.warning('%s failed for %s: %s', log_label, url, detail)
-    elif streak % _FANOUT_REWARN_EVERY == 0:
+    elif step.count % _FANOUT_REWARN_EVERY == 0:
         logger.warning(
             '%s still failing for %s (%d consecutive): %s',
-            log_label, url, streak, detail,
+            log_label, url, step.count, detail,
         )
     else:
         logger.debug(
-            '%s failed for %s (%d consecutive): %s', log_label, url, streak, detail,
+            '%s failed for %s (%d consecutive): %s', log_label, url, step.count, detail,
         )
 
 
@@ -417,7 +416,9 @@ def note_fanout_success(log_label: str, url: str) -> None:
     Bounded by construction: it fires only when a streak was actually open,
     i.e. at most once per opening WARNING.
     """
-    streak = _failure_streaks.pop((log_label, url), 0)
+    key = (log_label, url)
+    streak = _failure_streaks.count(key)
+    _failure_streaks.success(key)
     if streak:
         logger.warning(
             '%s recovered for %s after %d consecutive failure(s)',
@@ -433,7 +434,7 @@ def reset_failure_streaks() -> None:
     clean throttling state — otherwise an earlier test's failure would silently
     demote a later test's first WARNING to DEBUG.
     """
-    _failure_streaks.clear()
+    _failure_streaks.forget(_failure_streaks.tracked_keys)
 
 
 async def call_with_deadline(
@@ -850,9 +851,9 @@ class TTLCache(Generic[V, K]):
         # Per-INSTANCE (not module-level) consecutive-bypass streaks, keyed
         # by cache key. Per-instance because a key means something only
         # inside the cache that minted it: several live instances key on a
-        # bare string, so a module-level dict would let two caches' streaks
-        # collide.
-        self._bypass_streaks: dict[K, int] = {}
+        # bare string, so module-level streaks would let two caches collide.
+        # threshold=1, so a step's ``fired`` marks a streak's opening line.
+        self._bypass_streaks: KeyedStreaks[K] = KeyedStreaks(threshold=1)
         # The in-flight bypass task for a key, if any, stamped with the
         # monotonic time it started. Bounds concurrent bypass refreshes to
         # ONE per key (see _bypass_refresh) rather than one per timed-out
@@ -974,12 +975,7 @@ class TTLCache(Generic[V, K]):
         # sweep above so a lock idled out in THIS same pass has its streak
         # reclaimed in the same pass too, rather than lingering one more
         # sweep cycle.
-        dead_streaks = [
-            k for k in self._bypass_streaks
-            if k not in self._store and k not in self._locks
-        ]
-        for key in dead_streaks:
-            del self._bypass_streaks[key]
+        self._bypass_streaks.retain(lambda k: k in self._store or k in self._locks)
         # A tracked bypass entry is safe to drop once no caller can still be
         # waiting on it: its task has already finished (belt-and-braces —
         # _start_bypass's done-callback normally removes these itself, but
@@ -1273,8 +1269,9 @@ class TTLCache(Generic[V, K]):
         not time out again here, the inherited bypass did — and is about to
         supersede it with a fresh attempt.
         """
-        streak = self._bypass_streaks.get(key, 0) + 1
-        self._bypass_streaks[key] = streak
+        step = self._bypass_streaks.failure(key)
+        streak = step.count
+        loud = step.fired or streak % _LOCK_BYPASS_REWARN_EVERY == 0
         name = getattr(refresh, '__qualname__', repr(refresh))
         if reason == 'bypass_cap':
             opening = (
@@ -1287,7 +1284,7 @@ class TTLCache(Generic[V, K]):
                 'key %r at the live-bypass cap (%d, bound %.2fs, refresh=%s); '
                 'joining the newest live refresh (%d consecutive)'
             )
-            if streak == 1 or streak % _LOCK_BYPASS_REWARN_EVERY == 0:
+            if loud:
                 logger.warning(
                     opening, key, _MAX_LIVE_BYPASSES_PER_KEY,
                     _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak,
@@ -1322,7 +1319,7 @@ class TTLCache(Generic[V, K]):
                 'lock acquisition for key %r timed out after %.2fs '
                 '(refresh=%s), running without the lock (%d consecutive)'
             )
-        if streak == 1 or streak % _LOCK_BYPASS_REWARN_EVERY == 0:
+        if loud:
             logger.warning(opening, key, _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak)
         else:
             logger.debug(repeat, key, _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak)
@@ -1339,7 +1336,8 @@ class TTLCache(Generic[V, K]):
         call, so its recovery line appears on its next COLD miss rather than
         immediately; the bracket is still bounded and still closes.
         """
-        streak = self._bypass_streaks.pop(key, 0)
+        streak = self._bypass_streaks.count(key)
+        self._bypass_streaks.success(key)
         if streak:
             logger.warning(
                 'lock for key %r recovered after %d consecutive bypass(es)',
@@ -1544,6 +1542,6 @@ class TTLCache(Generic[V, K]):
         """
         self._store.clear()
         self._locks.clear()
-        self._bypass_streaks.clear()
+        self._bypass_streaks.forget(self._bypass_streaks.tracked_keys)
         self._bypass_tasks.clear()
         self._live_bypasses.clear()
