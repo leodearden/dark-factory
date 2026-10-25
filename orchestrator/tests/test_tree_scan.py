@@ -14,12 +14,15 @@ from types import ModuleType, SimpleNamespace
 from typing import NamedTuple
 
 import pytest
+from _git_fixtures import RepoSeed, seed_repo
+from _orch_helpers import git_env_with_ceiling
 from _tree_scan import (
     TREE_PASS_FIXTURE,
     ParsedModule,
     TreeAnalysis,
     TreePass,
     analyses_requested_by,
+    checkout_python_files,
     python_files,
 )
 
@@ -325,3 +328,99 @@ class TestPythonFiles:
 
         with pytest.raises(NotADirectoryError, match=re.escape(str(root))):
             python_files(root)
+
+
+_CHECKOUT_SEED = RepoSeed(
+    files=(
+        ('README.md', '# checkout\n'),
+        ('pkg/src/pkg/tracked.py', 'x = 1\n'),
+        ('skills/tool/scripts/deep.py', 'x = 1\n'),
+    ),
+    message='seed a checkout',
+)
+
+
+def _seed_checkout(repo: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    seed_repo(repo, _CHECKOUT_SEED)
+    monkeypatch.setenv(
+        'GIT_CEILING_DIRECTORIES', git_env_with_ceiling(repo)['GIT_CEILING_DIRECTORIES'],
+    )
+    return repo.resolve()
+
+
+class TestCheckoutPythonFiles:
+    def test_unions_git_tracked_files_with_on_disk_package_roots(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = _seed_checkout(tmp_path / 'repo', monkeypatch)
+        written = {
+            _write(repo, rel)
+            for rel in (
+                'pkg/src/pkg/new.py',
+                'pkg/tests/test_new.py',
+                'scripts/sub/tool.py',
+                'hooks/hook.py',
+                'top_level.py',
+            )
+        }
+        _write(repo, 'docs/untracked_elsewhere.py')
+
+        found = checkout_python_files(repo)
+
+        assert isinstance(found, tuple)
+        assert found == tuple(sorted({
+            repo / 'pkg/src/pkg/tracked.py',
+            repo / 'skills/tool/scripts/deep.py',
+            *written,
+        }))
+
+    def test_skip_parts_are_judged_relative_to_the_checkout_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = _seed_checkout(tmp_path / '.worktrees' / 'task', monkeypatch)
+        kept = _write(repo, 'pkg/src/pkg/kept.py')
+        for rel in (
+            'pkg/src/pkg/.venv/lib.py',
+            'pkg/tests/node_modules/module.py',
+            'scripts/__pycache__/cached.py',
+            'hooks/.worktrees/copy.py',
+        ):
+            _write(repo, rel)
+
+        found = checkout_python_files(repo)
+
+        assert kept in found
+        assert [
+            path for path in found
+            if {'.venv', 'node_modules', '__pycache__', '.worktrees'} & set(path.relative_to(repo).parts)
+        ] == []
+
+    def test_a_tracked_file_deleted_from_disk_is_not_returned(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = _seed_checkout(tmp_path / 'repo', monkeypatch)
+        (repo / 'skills/tool/scripts/deep.py').unlink()
+
+        assert checkout_python_files(repo) == (repo / 'pkg/src/pkg/tracked.py',)
+
+    def test_without_a_git_binary_it_returns_the_on_disk_set_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = _seed_checkout(tmp_path / 'repo', monkeypatch)
+        empty_bin = tmp_path / 'empty-bin'
+        empty_bin.mkdir()
+        monkeypatch.setenv('PATH', str(empty_bin))
+
+        assert checkout_python_files(repo) == (repo / 'pkg/src/pkg/tracked.py',)
+
+    def test_outside_a_repository_it_returns_the_on_disk_set_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        plain = (tmp_path / 'plain').resolve()
+        on_disk = _write(plain, 'pkg/src/pkg/on_disk.py')
+        _write(plain, 'skills/tool/scripts/deep.py')
+        monkeypatch.setenv(
+            'GIT_CEILING_DIRECTORIES', git_env_with_ceiling(plain)['GIT_CEILING_DIRECTORIES'],
+        )
+
+        assert checkout_python_files(plain) == (on_disk,)
