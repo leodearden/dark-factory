@@ -239,14 +239,9 @@ show freshness, because the heartbeat is the file's mtime.
 1. Drain all pending recon escalations
 2. Start the watcher: `scripts/watcher-rearm.sh` (background task, recon queue
    dir, NO --level, --timeout 3600)
-3. Wait for it to exit. Branch on its WATCHER_REARM_OUTCOME row and the
-   identical-retry cap in "Distinguishing the exits at step 3" below; don't
-   assume a fire:
-     FIRED   (exit 0, escalation JSON on stdout) → go to 4
-     CEILING (exit 124, NO escalation payload)   → the bounded slice just
-             expired; SKIP step 4 and fall through to the drain (5)
-     KILLED / ERROR (any OTHER rc) → per the table; never loop on the
-             identical call
+3. Wait for it to exit, then branch per "Distinguishing the exits at step 3"
+   below: FIRED → 4; CEILING → 5, skipping 4; KILLED / ERROR → that table's
+   row and its identical-retry cap
 4. Read the escalation from watcher output; fetch full detail via MCP
 5. Reap orphans again (step 0), then drain any other pending escalations
 6. Handle each
@@ -271,16 +266,15 @@ exists to prevent.
 | `WATCHER_REARM_OUTCOME: FIRED` | 0 | Go to step 4 and drain. Exit 0 with EMPTY stdout is a caught SIGTERM (`escalation.watcher` converts it to a clean `sys.exit(0)`; `scripts/watcher-rearm.sh` header), a non-fire that counts against the cap: this queue's **sole closer** must not silently skip a cycle on it. |
 | `WATCHER_REARM_OUTCOME: CEILING` | 124 | The bounded slice expired. Not an error, no report: skip step 4, re-drain and re-arm. The cap exempts it. |
 | `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Something reaped the background task (codebook `watcher-loop-harness-mismatch`). Re-touch the `recon-watcher-<project>` lease, then re-arm per the cap. Counts against the cap. |
-| `WATCHER_REARM_OUTCOME: ERROR` | any other; exit 2 prints NO marker | Read the stderr diagnostic before any retry. Exit 2 is a usage/env guard (most often an unset `DARK_FACTORY_ROOT`, `plans/confusion-census-2026-07-24.md` §1.5): it returns *instantly*, before the watcher runs (`scripts/watcher-rearm.sh` header), and recurs until the invocation is fixed. Counts against the cap. |
+| `WATCHER_REARM_OUTCOME: ERROR` | any other; exit 2 prints NO marker | Read the stderr diagnostic before any retry. Exit 2 is a usage/env guard (most often an unset `DARK_FACTORY_ROOT`, `plans/confusion-census-2026-07-24.md` §1.5): it returns *instantly*, before the watcher runs (`scripts/watcher-rearm.sh` header), and recurs until the invocation is fixed, so fix it instead of spending the retry on it. Every other rc counts against the cap. |
 
 **Identical-retry cap: 1.** After KILLED, ERROR, a missing marker or an
 empty-stdout FIRED, re-issue the identical invocation (same script, flags and
 background launch) at most once. If it fails again, change the invocation
 materially or stop the loop and report the outcome to the human; never loop on
-the identical call. Exit 2 is the exception: it is deterministic, so fix the
-invocation first and do not spend the retry. Falling through to "re-drain and
-re-arm" on a failing launch turns a mis-configured launch into a hot busy-loop
-of failed invocations while this queue's sole closer is not actually watching.
+the identical call. Falling through to "re-drain and re-arm" on a failing
+launch turns a mis-configured launch into a hot busy-loop of failed invocations
+while this queue's sole closer is not actually watching.
 
 ### Reaping orphans (standing authorization — Leo, esc-5793-2, 2026-09-23)
 
