@@ -80,8 +80,9 @@ turn stays near 107k tokens.
 **M7. Cost model.** The buffered mix (433 events) is 56% task events, 36% `memory_added`
 and 7% `memory_deleted`. Each event brings 0.15 unique-task context items. The per-event
 cost today is 65,000 / 268 ≈ 243 estimated tokens. At the raised caps it is ≈ 468
-(×1.93). A mean-preserving synthetic chunk of 268 events costs ≈ 116.5k estimated tokens
-at the raised caps. The analytic estimate is ≈ 127k. This is the fixture in
+(×1.93). A mean-preserving synthetic chunk of 268 events costs 114,265 estimated tokens
+at the raised caps, against a modelled ≈ 116.5k. The analytic estimate is ≈ 127k. This is
+the fixture in
 `fused-memory/tests/test_context_assembler.py::test_shipped_budget_holds_a_measured_backlog_chunk`.
 
 **M8. Backlog chunk wall clock.** Stage-1 p50 is 240s at 150-300 events and 889s at

@@ -444,7 +444,8 @@ reconciliation:
   opus_episode_limit: 500
   opus_memory_limit: 1000
   # Token-budget context assembly
-  token_budget: 65000
+  # Sized with context_assembler's per-item caps: plans/recon-evidence-caps-measurement-2026-10.md
+  token_budget: 130000
   context_search_limit: 5
   context_fetch_batch_size: 10
   # Caller bar for `deterministic-*` done provenance (task 5237, PRD C5).
