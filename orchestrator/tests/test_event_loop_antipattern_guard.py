@@ -19,11 +19,11 @@ Correct replacements by context:
   | sync driver / run_until_complete shape   | asyncio.run(coro)                           |
   | sync test building a placeholder future  | make_placeholder_future() (_orch_helpers)   |
 
-This test uses AST parsing to scan every *.py under orchestrator/tests/
-(recursively via rglob, so sub-packages are covered too), excluding itself,
-and fails immediately on any actual get_event_loop() *call* node.  Comments
-and string literals that mention the name are not flagged, avoiding false
-positives from docstrings that explain why NOT to use get_event_loop().
+This test uses AST parsing over every *.py under orchestrator/tests/
+(recursively, so sub-packages are covered too), excluding itself, and fails
+immediately on any actual get_event_loop() *call* node.  Comments and string
+literals that mention the name are not flagged, avoiding false positives from
+docstrings that explain why NOT to use get_event_loop().
 """
 from __future__ import annotations
 
@@ -32,18 +32,20 @@ from pathlib import Path
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _tree_scan import (
+    ORCHESTRATOR_TESTS,
+    TESTS_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+)
 
-# This guard AST-parses every *.py under orchestrator/tests/ -- 535 files at
-# authorship time -- via rglob. MEASURED at 6.70s/call unloaded and serial
-# (-n0) on a 32-core box, and CRASHED live rather than hypothetically: branch
-# task/3980 @ d4182e4642, loadavg ~423 --
-# "FAILED test_no_get_event_loop_in_orchestrator_tests" / "[gw21] node down",
-# session truncated at 19% (esc-3980-1).
-# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
-# ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# The family mark and shared group: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 _THIS_FILE = Path(__file__).name
 
@@ -58,31 +60,47 @@ def _find_get_event_loop_calls(source: str) -> list[int]:
         tree = ast.parse(source)
     except SyntaxError:
         return []
-    lines = []
-    for node in ast.walk(tree):
+    return _find_get_event_loop_calls_in(tree)
+
+
+def _find_get_event_loop_calls_in(tree: ast.Module) -> list[int]:
+    """:func:`_find_get_event_loop_calls` over an already-parsed module."""
+    return [
+        node.lineno
+        for node in ast.walk(tree)
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == 'get_event_loop'
-        ):
-            lines.append(node.lineno)
-    return lines
+        )
+    ]
 
 
-def test_no_get_event_loop_in_orchestrator_tests() -> None:
+def _get_event_loop_sites(module: ParsedModule) -> tuple[tuple[int, str], ...]:
+    """``(lineno, line_text)`` per get_event_loop() call; none if unparseable."""
+    try:
+        tree = module.tree
+    except SyntaxError:
+        return ()
+    source_lines = module.source.splitlines()
+    return tuple(
+        (lineno, source_lines[lineno - 1].strip() if lineno <= len(source_lines) else '')
+        for lineno in _find_get_event_loop_calls_in(tree)
+    )
+
+
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=ORCHESTRATOR_TESTS, extract=_get_event_loop_sites)
+TREE_ANALYSES = (ANALYSIS,)
+
+
+def test_no_get_event_loop_in_orchestrator_tests(tree_pass: TreePass) -> None:
     """No orchestrator test file may call asyncio.get_event_loop()."""
-    tests_dir = Path(__file__).parent
-    offenders: list[str] = []
-
-    for py_file in sorted(tests_dir.rglob('*.py')):
-        if py_file.name == _THIS_FILE:
-            continue  # skip the guard itself
-        source = py_file.read_text(encoding='utf-8')
-        source_lines = source.splitlines()
-        rel = py_file.relative_to(tests_dir)
-        for lineno in _find_get_event_loop_calls(source):
-            line_text = source_lines[lineno - 1].strip() if lineno <= len(source_lines) else ''
-            offenders.append(f'{rel}:{lineno}: {line_text}')
+    offenders = [
+        f'{py_file.relative_to(TESTS_DIR)}:{lineno}: {line_text}'
+        for py_file, sites in tree_pass.facts(ANALYSIS).items()
+        if py_file.name != _THIS_FILE  # skip the guard itself
+        for lineno, line_text in sites
+    ]
 
     if offenders:
         offender_list = '\n  '.join(offenders)
