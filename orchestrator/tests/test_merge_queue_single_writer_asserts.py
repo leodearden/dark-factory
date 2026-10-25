@@ -60,7 +60,7 @@ from typing import Literal, cast
 
 import pytest
 from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
-from _merge_lane_fakes import FakeVerifier
+from _merge_lane_fakes import FakeVerifier, lane_scene_config
 from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -90,7 +90,7 @@ def git_config() -> GitConfig:
 
 @pytest.fixture
 def config(tmp_path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=tmp_path, git=git_config)
+    return lane_scene_config(tmp_path, git_config)
 
 
 @pytest.fixture
@@ -134,7 +134,7 @@ def e2e_git_ops(git_config: GitConfig, e2e_git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def e2e_config(e2e_git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=e2e_git_repo, git=git_config)
+    return lane_scene_config(e2e_git_repo, git_config)
 
 
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
