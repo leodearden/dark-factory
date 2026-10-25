@@ -47,18 +47,11 @@ class EvalConfig:
     container_disk_gb: int = 50           # ~50 for baked images, 2.5× model size for :latest
 
     def __post_init__(self) -> None:
-        try:
-            role = RoleUnderTest(self.role)
-        except ValueError:
+        if self.role not in CANDIDATE_ROLES:
             raise ValueError(
-                f'EvalConfig {self.name!r}: unknown role {self.role!r}',
-            ) from None
-        if role not in CANDIDATE_ROLES:
-            raise ValueError(
-                f'EvalConfig {self.name!r}: role {role.value!r} is not a candidate '
+                f'EvalConfig {self.name!r}: role {self.role.value!r} is not a candidate '
                 f'role; expected one of {sorted(r.value for r in CANDIDATE_ROLES)}',
             )
-        self.role = role
 
 
 def _vllm_config(
