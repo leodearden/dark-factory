@@ -16477,7 +16477,10 @@ class TestZotDuplicateSweepWiring:
 
     @staticmethod
     async def _real_curator(cfg, stub_escalator, corpus, monkeypatch, project_id):
-        curator = TaskCurator(config=cfg, taskmaster=None, escalator=stub_escalator)
+        curator = TaskCurator(
+            config=cfg, taskmaster=None, escalator=stub_escalator,
+            invoke=AsyncMock(return_value=zot_agent_result()),
+        )
         monkeypatch.setattr(curator, 'search_corpus', corpus.search_corpus)
         monkeypatch.setattr(curator, 'record_task', corpus.record_task)
         await corpus.record_task(
@@ -16492,11 +16495,9 @@ class TestZotDuplicateSweepWiring:
             pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
             prompt_tokens=0,
         )
-        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(return_value=zot_agent_result())):
-            return await curator.curate(
-                candidate, project_id, _ZOT_PROJECT_ROOT, prepared=prepared,
-            )
+        return await curator.curate(
+            candidate, project_id, _ZOT_PROJECT_ROOT, prepared=prepared,
+        )
 
     async def _dispatch(self, interceptor, curator, candidate, decision, project_id):
         return await interceptor._dispatch_ticket_decision(

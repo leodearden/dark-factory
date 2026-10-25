@@ -45,11 +45,11 @@ import logging
 import os
 import time
 import uuid as uuid_mod
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from shared.cli_invoke import (
     AgentResult,
@@ -604,6 +604,9 @@ class _LazyRegistry:
         return self._entries
 
 
+CuratorInvoke: TypeAlias = Callable[..., Awaitable[AgentResult]]
+
+
 class TaskCurator:
     """LLM-judged drop/combine/create gate plus the Qdrant corpus backing it."""
 
@@ -617,8 +620,10 @@ class TaskCurator:
         prompt_store: PromptArtifactStore | None = None,
         config_dir_base: Path | None = None,
         cost_store: CostStore | None = None,
+        invoke: CuratorInvoke = invoke_with_cap_retry,
     ) -> None:
         self._config = config
+        self._invoke = invoke
         self._taskmaster = taskmaster
         self._usage_gate = usage_gate
         self._cost_store = cost_store
@@ -2892,7 +2897,7 @@ class TaskCurator:
         system_prompt = self._resolve_curator_prompt(CURATOR_SINGLE_SPEC)
         transcript_scope = self._transcript_scope(self._config.curator.timeout_seconds)
 
-        agent_result: AgentResult = await invoke_with_cap_retry(
+        agent_result: AgentResult = await self._invoke(
             usage_gate=self._usage_gate,
             label=f'task-curator[{project_id}]',
             project_id=project_id,
@@ -3009,7 +3014,7 @@ class TaskCurator:
         system_prompt = self._resolve_curator_prompt(CURATOR_BATCH_SPEC)
         transcript_scope = self._transcript_scope(timeout)
 
-        agent_result: AgentResult = await invoke_with_cap_retry(
+        agent_result: AgentResult = await self._invoke(
             usage_gate=self._usage_gate,
             label=f'task-curator-batch[{project_id}]',
             project_id=project_id,
