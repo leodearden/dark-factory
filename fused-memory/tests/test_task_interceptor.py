@@ -6028,6 +6028,67 @@ async def test_validate_done_provenance_rev_parse_rejection_reports_not_found(tm
 
 
 @pytest.mark.asyncio
+async def test_validate_done_provenance_rev_parse_rc1_reports_not_found(tmp_path, monkeypatch):
+    """Under `--verify --quiet`, rc=1 is git's verdict on the ref, so it
+    keeps the assertive wording; quiet stderr falls back to 'no such commit'."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)
+    _patch_rev_parse(monkeypatch, result=GitResult(1, '', ''))
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'merged', 'commit': sha},
+        str(tmp_path),
+        require=True,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert 'not found in' in err['reason']
+    assert 'no such commit' in err['reason']
+    assert 'could not be resolved in' not in err['reason']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('checkout', 'make_dir', 'expected_detail'),
+    [
+        ('not-a-repo', True, 'not a git repository'),
+        ('absent', False, 'cannot change to'),
+    ],
+    ids=['not-a-repository', 'missing-directory'],
+)
+async def test_validate_done_provenance_unreadable_checkout_reports_unresolved(
+    tmp_path, monkeypatch, checkout, make_dir, expected_detail
+):
+    """A project_root git cannot read as a repository never let rev-parse
+    evaluate the ref, so it must not be reported as "not found in"."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    project_root = tmp_path / checkout
+    if make_dir:
+        project_root.mkdir()
+    monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path))
+    monkeypatch.delenv('GIT_DIR', raising=False)
+    monkeypatch.delenv('GIT_WORK_TREE', raising=False)
+
+    err, resolved = await _validate_done_provenance(
+        '1',
+        {'kind': 'merged', 'commit': 'deadbeef' * 5},
+        str(project_root),
+        require=True,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert err['error'] == 'done_provenance_invalid'
+    assert 'could not be resolved in' in err['reason']
+    assert 'not found in' not in err['reason']
+    assert expected_detail in err['reason']
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('result', 'raise_exc', 'expected_detail'),
     [
@@ -6035,16 +6096,29 @@ async def test_validate_done_provenance_rev_parse_rejection_reports_not_found(tm
         (None, FileNotFoundError('git'), 'git binary not found'),
         (None, PermissionError('denied'), 'PermissionError: denied'),
         (GitResult(0, '', ''), None, 'empty rev-parse output'),
+        (
+            GitResult(128, '', 'fatal: not a git repository (or any of the parent directories): .git'),
+            None,
+            'fatal: not a git repository',
+        ),
+        (GitResult(128, '', ''), None, 'rev-parse failed'),
     ],
-    ids=['timeout', 'missing-binary', 'unexpected-exception', 'empty-output'],
+    ids=[
+        'timeout',
+        'missing-binary',
+        'unexpected-exception',
+        'empty-output',
+        'rc128-not-a-repo',
+        'rc128-empty-stderr',
+    ],
 )
 async def test_validate_done_provenance_rev_parse_failure_reports_unresolved(
     tmp_path, monkeypatch, result, raise_exc, expected_detail
 ):
     """A rev-parse that never rendered a verdict on the ref (timeout,
-    missing binary, unexpected error, empty output) must NOT be reported as
-    "not found in <project_root>" -- same honesty contract as the ancestor
-    check one step later."""
+    missing binary, unexpected error, empty output, a git-level rc=128)
+    must NOT be reported as "not found in <project_root>" -- same honesty
+    contract as the ancestor check one step later."""
     from fused_memory.middleware.task_interceptor import _validate_done_provenance
 
     sha = _init_git_repo(tmp_path)
