@@ -21,6 +21,7 @@ from orchestrator.agents.deviation_doctrine import render_deviation_doctrine
 from orchestrator.agents.roles import (
     _ESCALATION_TOOLS,
     _PLAN_DEVIATION_TOOLS,
+    _RECORD_STEP_DEVIATION,
     ESCALATE_INFO_CONTRACT,
     IMPLEMENTER_DEVIATION_DOCTRINE,
     ROLES,
@@ -41,10 +42,6 @@ _DOCTRINE_ROLES = frozenset({'implementer'})
 # Absence only, never presence: a tombstone cannot fail on a rewording of the
 # doctrine, only on the old sentence coming back (e.g. a bad conflict resolution).
 _RETIRED_INSTRUCTION = 'note it and stop. Do NOT modify the plan'
-
-
-def _bare_name(qualified: str) -> str:
-    return qualified.rsplit('__', 1)[-1]
 
 
 def _code_span(token: str) -> str:
@@ -121,24 +118,16 @@ class TestPlanDeviationToolGrant:
         artifacts = TaskArtifacts(tmp_path / 'wt')
         artifacts.init('5753', 'T', 'd')
         server = plan_tools.create_server(artifacts)
-        registry = {tool.name for tool in await server.list_tools()}
+        # Qualify the registry rather than parse the grant: no name is split apart.
+        registry = {_PLAN_TOOLS_PREFIX + tool.name for tool in await server.list_tools()}
 
-        foreign = sorted(
-            qualified for qualified in _PLAN_DEVIATION_TOOLS
-            if not qualified.startswith(_PLAN_TOOLS_PREFIX)
-        )
-        assert foreign == [], (
-            f'_PLAN_DEVIATION_TOOLS entries not on the plan-tools server: {foreign}. '
-            f'Every entry must start with {_PLAN_TOOLS_PREFIX!r}.'
-        )
-        unregistered = sorted(
-            qualified for qualified in _PLAN_DEVIATION_TOOLS
-            if _bare_name(qualified) not in registry
-        )
+        unregistered = sorted(set(_PLAN_DEVIATION_TOOLS) - registry)
         assert unregistered == [], (
             f'_PLAN_DEVIATION_TOOLS names tools plan_tools.create_server does not '
             f'register: {unregistered}. A granted name with no registered tool '
-            'leaves the role with a dead grant; fix the name or register the tool.'
+            'leaves the role with a dead grant. Every entry must be '
+            f'{_PLAN_TOOLS_PREFIX!r} plus a registered tool name; fix the name or '
+            'register the tool.'
         )
 
 
@@ -181,27 +170,17 @@ class TestImplementerDeviationDoctrine:
     def test_the_constant_is_the_render_for_the_granted_tool(self):
         # What keeps the constant derived by construction: re-hand-writing it in
         # roles.py, even word for word today, goes red on the next leaf edit.
-        rendered = render_deviation_doctrine(_bare_name(_PLAN_DEVIATION_TOOLS[0]))
+        rendered = render_deviation_doctrine(_RECORD_STEP_DEVIATION)
         assert rendered == IMPLEMENTER_DEVIATION_DOCTRINE
 
-    def test_doctrine_names_every_deviation_tool_by_bare_name(self):
-        missing = [
-            _bare_name(qualified) for qualified in _PLAN_DEVIATION_TOOLS
-            if _bare_name(qualified) not in IMPLEMENTER_DEVIATION_DOCTRINE
-        ]
-        assert missing == [], (
-            f'IMPLEMENTER_DEVIATION_DOCTRINE does not name deviation tools: {missing}. '
-            'Render it from the _PLAN_DEVIATION_TOOLS entry the role is granted.'
-        )
-
-    def test_doctrine_names_every_deviation_kind(self):
-        missing = [
-            kind for kind in sorted(DEVIATION_KINDS)
-            if _code_span(kind) not in IMPLEMENTER_DEVIATION_DOCTRINE
-        ]
-        assert missing == [], (
-            f'IMPLEMENTER_DEVIATION_DOCTRINE omits deviation kinds: {missing}. '
-            'Re-render it from shared.plan_deviation.DEVIATION_KINDS.'
+    def test_the_rendered_record_tool_is_one_implementer_holds(self):
+        # The equality above ties the prompt to _RECORD_STEP_DEVIATION; this ties
+        # that name to the grant, so the prompt never names a tool the role lacks.
+        qualified = _PLAN_TOOLS_PREFIX + _RECORD_STEP_DEVIATION
+        assert qualified in ROLES['implementer'].allowed_tools, (
+            f'IMPLEMENTER_DEVIATION_DOCTRINE names {_RECORD_STEP_DEVIATION!r}, but '
+            f'IMPLEMENTER is not granted {qualified!r}. Build _PLAN_DEVIATION_TOOLS '
+            'from _RECORD_STEP_DEVIATION in roles.py.'
         )
 
     # assert_role_set_matches_capability is not called: _DOCTRINE_ROLES is an

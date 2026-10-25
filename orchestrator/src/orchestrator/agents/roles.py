@@ -370,8 +370,10 @@ _PLAN_STATUS_TOOLS = [
 
 # Separate from _PLAN_STATUS_TOOLS because SIMPLE_TASK holds that list too and
 # has no frozen plan and no doctrine (plans/plan-deviation-recording-prd.md D14).
+# The bare name is held once: the doctrine prompt names it, the grant qualifies it.
+_RECORD_STEP_DEVIATION = 'record_step_deviation'
 _PLAN_DEVIATION_TOOLS = [
-    'mcp__plan-tools__record_step_deviation',
+    'mcp__plan-tools__' + _RECORD_STEP_DEVIATION,
 ]
 
 # The writer-facing metadata vocabulary spliced onto the tail of
@@ -1774,7 +1776,7 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 
 
 # The doctrine's text lives in orchestrator/src/orchestrator/agents/deviation_doctrine.py.
-IMPLEMENTER_DEVIATION_DOCTRINE = render_deviation_doctrine(_PLAN_DEVIATION_TOOLS[0].rsplit('__', 1)[-1])
+IMPLEMENTER_DEVIATION_DOCTRINE = render_deviation_doctrine(_RECORD_STEP_DEVIATION)
 
 
 IMPLEMENTER = AgentRole(
