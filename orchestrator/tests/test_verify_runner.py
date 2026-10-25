@@ -7760,14 +7760,15 @@ async def test_env_probe_master_against_a_real_sshd():
     The open must come back inside _SSH_PROBE_TIMEOUT_SECS even though ControlPersist keeps
     the backgrounded master for longer, the ControlPath under ~ must bind, and the probes
     must ride that master with the remote shell's own exit codes."""
-    from orchestrator import verify_runner as vr
-
     runner = gated_remote_runner('real-sshd', _REAL_SSHD_HOST, 'origin', '/')
     probe = await runner.env_probe_run()
 
-    control_path = next(opt for opt in vr._SSH_PROBE_OPTS if opt.startswith('ControlPath='))
-    check = await vr._default_subprocess_run(['ssh', '-o', control_path, '-O', 'check', _REAL_SSHD_HOST])
-    assert check[0] == 0, check
+    check = await asyncio.create_subprocess_exec(
+        'ssh', '-o', 'ControlPath=~/.df-env-probe-%C', '-O', 'check', _REAL_SSHD_HOST,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+    )
+    _, check_stderr = await check.communicate()
+    assert check.returncode == 0, check_stderr
     assert (await probe(['uname', '-s']))[0] == 0
     assert (await probe(['df-env-probe-absent-tool', '--version']))[0] == 127
 
