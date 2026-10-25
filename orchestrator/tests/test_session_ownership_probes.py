@@ -7,9 +7,13 @@ choices, and the ``EventProbes`` per-event memo.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
-from collections.abc import Callable
+import subprocess
+import sys
+from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 from _process_tree_fakes import claude_process_tree, counting_walks, fake_process_tree
@@ -48,6 +52,48 @@ def test_default_process_tree_reads_this_process_name() -> None:
 
 def test_default_process_tree_session_leader_is_this_process_session() -> None:
     assert ProcessTree().session_leader_pid() == os.getsid(0)
+
+
+# comm is arbitrary process-settable bytes; this child names itself b'\xff\xfe'
+# and stays alive until its stdin closes.
+_UNDECODABLE_NAME_CHILD = (
+    'import ctypes, sys\n'
+    "ctypes.CDLL(None).prctl(15, b'\\xff\\xfe', 0, 0, 0)\n"
+    "print('ready', flush=True)\n"
+    'sys.stdin.read()\n'
+)
+
+
+@contextlib.contextmanager
+def _undecodably_named_process() -> Iterator[int]:
+    """Yields the pid of a live child named b'\\xff\\xfe'; closing its stdin on exit releases it."""
+    child = subprocess.Popen(
+        [sys.executable, '-c', _UNDECODABLE_NAME_CHILD],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == b'ready'
+        assert Path(f'/proc/{child.pid}/comm').read_bytes() == b'\xff\xfe\n', (
+            'harness failure: the child did not rename itself to undecodable bytes'
+        )
+        yield child.pid
+    finally:
+        assert child.stdin is not None
+        child.stdin.close()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+
+
+@pytest.mark.timeout(15)
+def test_default_process_tree_reads_an_undecodable_name_as_replacement_characters() -> None:
+    with _undecodably_named_process() as pid:
+        assert ProcessTree().comm_of(pid) == '��'
 
 
 # ---------------------------------------------------------------------------
